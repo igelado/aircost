@@ -1,0 +1,700 @@
+[
+  {
+    "label": "2020 Sling TSi ZU-PVW",
+    "model": "Sling TSi",
+    "asking_price_usd": 270000,
+    "purchase_price_new_usd": 438000,
+    "age_years": 6,
+    "airframe_hours": 792,
+    "profile": "light_piston",
+    "source_url": "https://aerogurus.com/models/sling-tsi/under-750k",
+    "new_price_basis_source_url": "https://aerogurus.com/models/sling-tsi/under-750k",
+    "new_price_basis_notes": "Uses current new/near-new Sling TSi listing price from the same marketplace page.",
+    "notes": "Active asking price. Engine and propeller hours assumed equal to total time.",
+    "engine": {
+      "hours": 792,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 792,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 6000
+    }
+  },
+  {
+    "label": "2022 Sling TSi ZU-WNW",
+    "model": "Sling TSi",
+    "asking_price_usd": 273159,
+    "purchase_price_new_usd": 438000,
+    "age_years": 4,
+    "airframe_hours": 230,
+    "profile": "light_piston",
+    "source_url": "https://aerogurus.com/models/sling-tsi/under-750k",
+    "new_price_basis_source_url": "https://aerogurus.com/models/sling-tsi/under-750k",
+    "new_price_basis_notes": "Uses current new/near-new Sling TSi listing price from the same marketplace page.",
+    "notes": "Active asking price. Engine and propeller hours assumed equal to total time.",
+    "engine": {
+      "hours": 230,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 230,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 6000
+    }
+  },
+  {
+    "label": "2020 Sling TSi N716HC",
+    "model": "Sling TSi",
+    "asking_price_usd": 335000,
+    "purchase_price_new_usd": 438000,
+    "age_years": 6,
+    "airframe_hours": 420,
+    "profile": "light_piston",
+    "source_url": "https://aerogurus.com/models/sling-tsi/under-750k",
+    "new_price_basis_source_url": "https://aerogurus.com/models/sling-tsi/under-750k",
+    "new_price_basis_notes": "Uses current new/near-new Sling TSi listing price from the same marketplace page.",
+    "notes": "Active asking price. Engine and propeller hours assumed equal to total time.",
+    "engine": {
+      "hours": 420,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 420,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 6000
+    }
+  },
+  {
+    "label": "1956 Cessna 172 N5669A",
+    "model": "Cessna 172",
+    "asking_price_usd": 44900,
+    "purchase_price_new_usd": 465000,
+    "age_years": 70,
+    "airframe_hours": 5203,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1036,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1959 Cessna 172 N4043F",
+    "model": "Cessna 172",
+    "asking_price_usd": 54900,
+    "purchase_price_new_usd": 465000,
+    "age_years": 67,
+    "airframe_hours": 4213,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1885,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1962 Cessna 172C N8462X",
+    "model": "Cessna 172",
+    "asking_price_usd": 169000,
+    "purchase_price_new_usd": 465000,
+    "age_years": 64,
+    "airframe_hours": 4031,
+    "profile": "light_piston",
+    "source_url": "https://aircraftmerchants.com/N8462X",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Sale-pending asking price. Listing notes upgraded IFR panel, which current depreciation model does not value separately.",
+    "engine": {
+      "hours": 1215,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    },
+    "propeller": {
+      "hours": 881,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 5000
+    }
+  },
+  {
+    "label": "1960 Cessna 172A VH-CPC",
+    "model": "Cessna 172",
+    "asking_price_usd": 55475,
+    "purchase_price_new_usd": 465000,
+    "age_years": 66,
+    "airframe_hours": 3938,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Controller reports engine and propeller time as SOH.",
+    "engine": {
+      "hours": 1426,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    },
+    "propeller": {
+      "hours": 1606,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 5000
+    }
+  },
+  {
+    "label": "1975 Piper Archer N44800",
+    "model": "Piper Archer",
+    "asking_price_usd": 126000,
+    "purchase_price_new_usd": 584900,
+    "age_years": 51,
+    "airframe_hours": 6585,
+    "profile": "light_piston",
+    "source_url": "https://aircraftmerchants.com/N44800",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing reports full IFR panel and low-time O-360.",
+    "engine": {
+      "hours": 804,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 247,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 6000
+    }
+  },
+  {
+    "label": "1977 Piper Archer II",
+    "model": "Piper Archer",
+    "asking_price_usd": 177900,
+    "purchase_price_new_usd": 584900,
+    "age_years": 49,
+    "airframe_hours": 4650,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing notes Garmin upgrades, not modeled separately.",
+    "engine": {
+      "hours": 1170,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "1999 Piper Archer III",
+    "model": "Piper Archer",
+    "asking_price_usd": 161000,
+    "purchase_price_new_usd": 584900,
+    "age_years": 27,
+    "airframe_hours": 2615,
+    "profile": "light_piston",
+    "source_url": "https://alltheplanes.com/listing/1999-piper-archer-dd4e0279",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price from Barnstormers via AllThePlanes. Listing page omits airframe total; total time is taken from similar listing data on the page, so this case is lower confidence.",
+    "engine": {
+      "hours": 600,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2023 Piper Archer LX N644DF",
+    "model": "Piper Archer",
+    "asking_price_usd": 479900,
+    "purchase_price_new_usd": 584900,
+    "age_years": 3,
+    "airframe_hours": 709,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Engine hours assumed equal to listed SNEW time.",
+    "engine": {
+      "hours": 709,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "1965 Cessna 172G C-FSZK",
+    "model": "Cessna 172",
+    "asking_price_usd": 56173,
+    "purchase_price_new_usd": 465000,
+    "age_years": 61,
+    "airframe_hours": 6310,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1650,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1960 Cessna 172A N7556T",
+    "model": "Cessna 172",
+    "asking_price_usd": 59900,
+    "purchase_price_new_usd": 465000,
+    "age_years": 66,
+    "airframe_hours": 5747,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 2121,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1966 Cessna 172G CF-UEN",
+    "model": "Cessna 172",
+    "asking_price_usd": 62000,
+    "purchase_price_new_usd": 465000,
+    "age_years": 60,
+    "airframe_hours": 3229,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1389,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1962 Cessna 172C C-FCNM",
+    "model": "Cessna 172",
+    "asking_price_usd": 99500,
+    "purchase_price_new_usd": 465000,
+    "age_years": 64,
+    "airframe_hours": 2402.5,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 5,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1978 Cessna 172N C-GZWK",
+    "model": "Cessna 172",
+    "asking_price_usd": 104500,
+    "purchase_price_new_usd": 465000,
+    "age_years": 48,
+    "airframe_hours": 22000,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 600,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1965 Cessna 172G N3770L",
+    "model": "Cessna 172",
+    "asking_price_usd": 104900,
+    "purchase_price_new_usd": 465000,
+    "age_years": 61,
+    "airframe_hours": 4085,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Listing notes a custom panel, which current depreciation model does not value separately.",
+    "engine": {
+      "hours": 1533,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1968 Cessna 172K N78747",
+    "model": "Cessna 172",
+    "asking_price_usd": 119000,
+    "purchase_price_new_usd": 465000,
+    "age_years": 58,
+    "airframe_hours": 5744,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Listing notes avionics and performance upgrades, not modeled separately.",
+    "engine": {
+      "hours": 944,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    }
+  },
+  {
+    "label": "1980 Cessna 172N C-GMRR",
+    "model": "Cessna 172",
+    "asking_price_usd": 127114,
+    "purchase_price_new_usd": 465000,
+    "age_years": 46,
+    "airframe_hours": 3149.9,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/search?Manufacturer=CESSNA&ModelGroup=172&sort=2",
+    "new_price_basis_source_url": "https://www.theflightbrief.com/articles/true-cost-of-owning-a-cessna-172",
+    "new_price_basis_notes": "Uses a 2026 new Cessna 172S price reference.",
+    "notes": "Active asking price. Listing describes low airframe hours; propeller hours assumed equal to engine hours from listing text.",
+    "engine": {
+      "hours": 835.5,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 35000
+    },
+    "propeller": {
+      "hours": 835.5,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 5000
+    }
+  },
+  {
+    "label": "2001 Piper Archer III N5322X",
+    "model": "Piper Archer",
+    "asking_price_usd": 275000,
+    "purchase_price_new_usd": 584900,
+    "age_years": 25,
+    "airframe_hours": 4281,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 236,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "1998 Piper Archer III N917DK",
+    "model": "Piper Archer",
+    "asking_price_usd": 229950,
+    "purchase_price_new_usd": 584900,
+    "age_years": 28,
+    "airframe_hours": 1010,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing describes this as a low-time Archer III with no damage history.",
+    "engine": {
+      "hours": 1010,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2022 Piper Archer TX N469TF",
+    "model": "Piper Archer",
+    "asking_price_usd": 439900,
+    "purchase_price_new_usd": 584900,
+    "age_years": 4,
+    "airframe_hours": 4156,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1093,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2022 Piper Archer TX N232TF",
+    "model": "Piper Archer",
+    "asking_price_usd": 419900,
+    "purchase_price_new_usd": 584900,
+    "age_years": 4,
+    "airframe_hours": 4535,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1688,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2023 Piper Archer III N282BL",
+    "model": "Piper Archer",
+    "asking_price_usd": 550000,
+    "purchase_price_new_usd": 584900,
+    "age_years": 3,
+    "airframe_hours": 2034,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing uses a 2400-hour engine TBO.",
+    "engine": {
+      "hours": 2034,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2007 Piper Archer III N6095S",
+    "model": "Piper Archer",
+    "asking_price_usd": 174900,
+    "purchase_price_new_usd": 584900,
+    "age_years": 19,
+    "airframe_hours": 6700,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 2803,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "1998 Piper Archer III N4161Z",
+    "model": "Piper Archer",
+    "asking_price_usd": 99000,
+    "purchase_price_new_usd": 584900,
+    "age_years": 28,
+    "airframe_hours": 8732,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 3064,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "1979 Piper Archer II N2816N",
+    "model": "Piper Archer",
+    "asking_price_usd": 165000,
+    "purchase_price_new_usd": 584900,
+    "age_years": 47,
+    "airframe_hours": 10476,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/piper/archer/aircraft/",
+    "new_price_basis_notes": "Uses a current near-new 2025 Archer TX asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing reports zero-time engine and Garmin upgrades, not modeled separately.",
+    "engine": {
+      "hours": 0,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2024 Diamond DA40 NG N896PA",
+    "model": "Diamond DA40",
+    "asking_price_usd": 529000,
+    "purchase_price_new_usd": 699000,
+    "age_years": 2,
+    "airframe_hours": 800,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 NG asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 800,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2023 Diamond DA40 NG N627PS",
+    "model": "Diamond DA40",
+    "asking_price_usd": 570000,
+    "purchase_price_new_usd": 699000,
+    "age_years": 3,
+    "airframe_hours": 1000,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 NG asking price as the new/list-price basis.",
+    "notes": "Active asking price. Engine and propeller hours reported SNEW.",
+    "engine": {
+      "hours": 1000,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 1000,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 8000
+    }
+  },
+  {
+    "label": "2021 Diamond DA40 NG N131DA",
+    "model": "Diamond DA40",
+    "asking_price_usd": 564900,
+    "purchase_price_new_usd": 699000,
+    "age_years": 5,
+    "airframe_hours": 1725,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 NG asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing reports a zero-time replacement engine.",
+    "engine": {
+      "hours": 0,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2024 Diamond DA40 NG N362PS",
+    "model": "Diamond DA40",
+    "asking_price_usd": 535000,
+    "purchase_price_new_usd": 699000,
+    "age_years": 2,
+    "airframe_hours": 1234,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 NG asking price as the new/list-price basis.",
+    "notes": "Active asking price. Propeller hours not listed, so propeller adjustment omitted.",
+    "engine": {
+      "hours": 1100,
+      "tbo_hours": 1800,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2003 Diamond DA40 N909AZ",
+    "model": "Diamond DA40",
+    "asking_price_usd": 197000,
+    "purchase_price_new_usd": 580000,
+    "age_years": 23,
+    "airframe_hours": 5944.9,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 XLT asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing reports fresh engine and high propeller time.",
+    "engine": {
+      "hours": 54,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 2516.8,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 8000
+    }
+  },
+  {
+    "label": "2007 Diamond DA40 XLT",
+    "model": "Diamond DA40",
+    "asking_price_usd": 241250,
+    "purchase_price_new_usd": 580000,
+    "age_years": 19,
+    "airframe_hours": 4524.9,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 XLT asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing reports engine and propeller since overhaul.",
+    "engine": {
+      "hours": 485,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    },
+    "propeller": {
+      "hours": 484.5,
+      "tbo_hours": 2400,
+      "overhaul_cost_usd": 8000
+    }
+  },
+  {
+    "label": "2005 Diamond DA40 XLT",
+    "model": "Diamond DA40",
+    "asking_price_usd": 231773,
+    "purchase_price_new_usd": 580000,
+    "age_years": 21,
+    "airframe_hours": 1963,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 XLT asking price as the new/list-price basis.",
+    "notes": "Active asking price. Listing reports zero-time overhauled engine.",
+    "engine": {
+      "hours": 0,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2020 Diamond DA40 NG N514LA",
+    "model": "Diamond DA40",
+    "asking_price_usd": 474000,
+    "purchase_price_new_usd": 699000,
+    "age_years": 6,
+    "airframe_hours": 1414,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 NG asking price as the new/list-price basis.",
+    "notes": "Active asking price. Engine hours assumed equal to listed SNEW time.",
+    "engine": {
+      "hours": 1414,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  },
+  {
+    "label": "2007 Diamond DA40 XL N760DS",
+    "model": "Diamond DA40",
+    "asking_price_usd": 369000,
+    "purchase_price_new_usd": 580000,
+    "age_years": 19,
+    "airframe_hours": 1381,
+    "profile": "light_piston",
+    "source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_source_url": "https://www.controller.com/listings/for-sale/diamond/da40/aircraft",
+    "new_price_basis_notes": "Uses a current 2026 DA40 XLT asking price as the new/list-price basis.",
+    "notes": "Active asking price. Engine hours reported SNEW; propeller hours not listed.",
+    "engine": {
+      "hours": 1381,
+      "tbo_hours": 2000,
+      "overhaul_cost_usd": 42000
+    }
+  }
+]

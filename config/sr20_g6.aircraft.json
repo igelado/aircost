@@ -1,0 +1,23 @@
+{
+  "profile": "light_piston",
+  "purchase_price_new_usd": 579000,
+  "new_price_basis_factor": 1.0658248531,
+  "age_years": 3,
+  "airframe_hours": 75,
+  "engine_hours": 75,
+  "engine_tbo_hours": 2000,
+  "engine_overhaul_cost_usd": 52000,
+  "engine_count": 1,
+  "engine_value_baseline_life_fraction": 0,
+  "propeller_hours": 75,
+  "propeller_tbo_hours": 2600,
+  "propeller_overhaul_cost_usd": 8500,
+  "propeller_count": 1,
+  "propeller_value_baseline_life_fraction": 0,
+  "insurance_annual_usd": 9500,
+  "annual_inspection_usd": 5000,
+  "fuel_burn_gph": 11.5,
+  "oil_quarts_per_hour": 0.12,
+  "oil_price_per_quart": 12,
+  "other_maintenance_per_hour": 65
+}
