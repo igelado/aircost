@@ -1,0 +1,11 @@
+{
+  "years": 30,
+  "fixed_costs": {
+    "tie_down_annual_usd": 1800,
+    "property_tax_rate": 0.0125
+  },
+  "hourly_costs": {
+    "fuel_price_per_gallon": 7.75
+  },
+  "average_inflation_rate": 0.02
+}
