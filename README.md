@@ -108,6 +108,12 @@ The server uses axum, tokio, eoka, reqwest, and sqlx. It exposes listing
 preview, listing CRUD, and Chrome extension submission endpoints. Details are in
 [docs/webapp.md](docs/webapp.md).
 
+The current database-backed aircraft value model is documented in
+[docs/depreciation_model.md](docs/depreciation_model.md). The schema and
+listing/plugin write lifecycle are documented in [docs/database.md](docs/database.md).
+Gemini extraction, grounding, validation, and correction rules are documented in
+[docs/llm_usage.md](docs/llm_usage.md).
+
 Avionics metadata enrichment uses Gemini to fill missing avionics introduction
 years and equipment values:
 

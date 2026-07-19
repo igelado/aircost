@@ -1,139 +1,245 @@
-# Aircraft Depreciation Model
+# Aircraft Value Model
 
-This model estimates stable-market aircraft value from:
+This document describes the database-backed valuation model used by the Rust web
+application. The older Python scripts still exist as research utilities, but new
+web-app estimates are computed from the Rust code in `src/aircraft.rs`,
+`src/depreciation.rs`, and `src/fit.rs`.
 
-- purchase price when new
-- aircraft age
-- total airframe hours
-- engine hours since overhaul/new
-- propeller hours since overhaul/new
-- installed avionics model, introduction year, and reference equipment value
+The model estimates asking-market value. It is not a certified appraisal and it
+does not try to model tax depreciation.
 
-It is built as a practical appraisal-style model, not a tax depreciation schedule. Tax schedules such as straight-line or MACRS can be useful for accounting, but they do not explain aircraft resale value well because market value depends heavily on make/model comparables and maintenance status.
+## Identity Levels
 
-## Selected Model
+Aircraft identity is split into three levels:
 
-The selected model is a hybrid residual-value and half-life maintenance adjustment model:
+- Manufacturer: the aircraft maker, for example `Cessna` or `Cirrus`.
+- Model: the depreciation/economic family, for example `182 SKYLANE` or `SR22`.
+- Variant: the material configuration inside that family, for example `182T`,
+  `T182T`, `G6`, or `G6 TURBO`.
+
+Airframe depreciation coefficients are fitted per model when enough listing
+samples exist. Variant-specific rows hold operating and component metadata
+because engine, propeller, fuel burn, default avionics, and price points can
+differ by variant and model year.
+
+When a model does not have enough samples, it uses the generic database-fitted
+profile built from all listings. We do not use hard-coded maker/model fallback
+profiles for production estimation.
+
+## Required Inputs
+
+Each listing estimate needs these listing fields:
+
+- `model_year`
+- `asking_price_usd`
+- `added_at`, used as the valuation date
+- `airframe_hours`
+- `engine_hours`
+- `propeller_hours`
+- installed avionics, when the listing names concrete units
+
+Each selected model/variant also needs:
+
+- an `aircraft_model_spec_versions` row
+- a model-year price point in `aircraft_model_variant_price_points`
+- engine TBO and overhaul cost, either directly on the spec row or through
+  `engine_models`
+- propeller TBO and overhaul cost, either directly on the spec row or through
+  `propeller_models`
+- `average_inflation_rate`
+- default avionics for that variant/model year when listing avionics are absent
+
+If spec metadata or the model-year price point is missing, the API returns an
+`estimate_error` instead of inventing a value.
+
+## Airframe Basis
+
+`aircraft_model_variant_price_points` stores nominal new-purchase price points
+for a specific variant and model year. The value is the price basis for that
+aircraft when new, not today's replacement price.
+
+Factory/default avionics are stored separately. Before fitting or estimating,
+the code subtracts the replacement basis of the default avionics from the stored
+new price point. This avoids counting factory avionics both inside the airframe
+basis and again as avionics components. The airframe basis is floored at 20% of
+the model-year price point to prevent bad component data from erasing the
+airframe.
+
+For current and future valuation caps, the model also computes a replacement
+floor basis from the highest model-family price point available at or before the
+valuation year, adjusted into the valuation year's nominal dollars.
+
+## Inflation
+
+The model keeps graph output in nominal dollars for each year on the X axis. A
+listing observed in 2026 is compared to a 2026 nominal estimate. Historical new
+price points stay in their own nominal year and are brought forward only when
+the estimator needs a valuation-year dollar basis.
+
+The default average inflation rate is currently `0.025`. It is stored per
+variant spec row as `average_inflation_rate` so future enrichment or calibration
+can change it without changing code.
+
+## Airframe Formula
+
+The core airframe residual curve is:
 
 ```text
-effective_new_price = purchase_price_new * new_price_basis_factor
+dollar_basis_factor =
+  (1 + average_inflation_rate) ^ (valuation_year - purchase_price_reference_year)
+
+effective_new_price =
+  purchase_price_new_usd * dollar_basis_factor
 
 base_age_fraction =
-  residual_floor + (1 - residual_floor) * exp(-age_decay_rate * age_years)
+  long_run_residual_fraction
+  + (1 - long_run_residual_fraction) * exp(-age_decay_rate * age_years)
 
-new_to_used_discount =
-  new_to_used_discount_fraction * min(age_years / new_to_used_discount_years, 1)
+new_to_used_factor =
+  1 - new_to_used_discount_fraction
+      * min(age_years / new_to_used_discount_years, 1)
 
-age_fraction = base_age_fraction * (1 - new_to_used_discount)
-age_baseline_value = effective_new_price * age_fraction
+age_baseline_value =
+  effective_new_price * base_age_fraction * new_to_used_factor
+```
 
-expected_airframe_hours = age_years * profile_annual_airframe_hours
-airframe_factor = clamp(
-  (actual_airframe_hours / expected_airframe_hours) ^ log2(1 - doubling_discount),
-  1 - max_discount,
-  1 + max_premium
-)
+Airframe time then adjusts that baseline:
 
-utilization_adjusted_value =
-  age_baseline_value * airframe_factor * high_time_liquidity_factor
+```text
+expected_airframe_hours = age_years * annual_airframe_hours
+
+airframe_factor =
+  clamp(
+    (actual_airframe_hours / expected_airframe_hours)
+      ^ log2(1 - airframe_doubling_discount),
+    1 - max_airframe_discount,
+    1 + max_airframe_premium
+  )
+
+airframe_value =
+  max(
+    age_baseline_value * airframe_factor * high_time_liquidity_factor,
+    replacement_floor_basis_usd * replacement_floor_fraction
+  )
+```
+
+`annual_airframe_hours` is not stored in the aircraft profile. The current
+estimate uses the default annual-hours assumption from the valuation code. The
+aircraft detail graph accepts an annual-hours query parameter so users can
+change future utilization scenarios without mutating model parameters.
+
+## Engine And Propeller
+
+Engines and propellers are timed components. The base airframe curve is treated
+as a market-average aircraft with a configurable remaining-life baseline,
+normally `0.5`.
+
+```text
+consumed_fraction = min(hours_since_overhaul / tbo_hours, 1)
 
 component_adjustment =
-  count * overhaul_cost * (baseline_life_fraction - min(hours_since_overhaul / TBO, 1))
+  count
+  * overhaul_cost_usd_in_valuation_year
+  * (baseline_life_fraction - consumed_fraction)
+```
+
+A fresh component is a premium over the baseline. A run-out component is a
+deduction. Components beyond TBO are capped at run-out, not penalized beyond
+run-out.
+
+The generic fitted model learns the shared engine and propeller
+`baseline_life_fraction` from the current listing samples and writes the result
+to `component_depreciation_profiles`.
+
+## Avionics
+
+Avionics are independent depreciating components. Each `avionics_models` row can
+store:
+
+- concrete avionics manufacturer
+- concrete model or named suite
+- avionics type
+- introduced year
+- estimated unit value
+- value reference year
+- value source
+
+The value formula is:
+
+```text
+nominal_replacement_cost =
+  unit_replacement_cost_usd
+  * (1 + average_inflation_rate) ^ (valuation_year - value_reference_year)
+
+residual_fraction =
+  long_run_residual_fraction
+  + (1 - long_run_residual_fraction)
+    * exp(-age_decay_rate * avionics_age_years)
 
 avionics_component_value =
-  quantity * reference_unit_value *
-  (avionics_residual_floor + (1 - avionics_residual_floor) * exp(-avionics_decay_rate * avionics_age_years))
-
-raw_estimated_value = max(
-  effective_new_price * minimum_value_fraction,
-  utilization_adjusted_value + engine_adjustment + propeller_adjustment + avionics_value
-)
-
-valuation_basis = effective_new_price + avionics_replacement_basis
-estimated_value = min(valuation_basis, raw_estimated_value)
+  quantity * nominal_replacement_cost * residual_fraction
 ```
 
-By default, `baseline_life_fraction` is `0.5`, which means the age baseline is interpreted as an aircraft with mid-time engines and propellers. A zero-time engine adds half the overhaul cost; a run-out engine deducts half the overhaul cost; a component beyond TBO is still treated as run-out, not worse than run-out.
+If the listing has concrete installed avionics, those units drive the estimate.
+If listing avionics are absent or rejected as generic, the estimator falls back
+to `aircraft_model_variant_default_avionics` for that variant/model year.
 
-The cap at `effective_new_price` keeps this as a stable-market depreciation model. It prevents low-hour or zero-time component premiums from valuing an ordinary used aircraft above the current new-price basis before inflation is applied.
+## Final Estimate
 
-When avionics are included, the cap becomes `effective_new_price + avionics_replacement_basis`. That keeps the airframe model bounded while allowing an older airframe with a materially newer panel to be worth more than the same airframe with obsolete avionics.
+The final value is:
 
-## Avionics Components
+```text
+raw_estimated_value =
+  max(
+    effective_new_price * minimum_value_fraction,
+    airframe_value
+      + engine_adjustment
+      + propeller_adjustment
+      + avionics_value
+  )
 
-Avionics are not treated as variant text or one-off listing text. The database stores reference metadata on each `avionics_models` row:
+valuation_basis =
+  max(effective_new_price, replacement_floor_value)
+  + avionics_replacement_basis
 
-- `introduced_year`: first public release, certification, or common market introduction year
-- `estimated_unit_value_usd`: reference equipment value for one installed working unit or integrated suite
-- `value_reference_year`: dollar basis for the reference value
-- `value_source`: provenance for the reference value
+estimated_value = min(raw_estimated_value, valuation_basis)
+```
 
-The Rust admin command can ask Gemini to fill missing values:
+The cap prevents the model from valuing a normal used aircraft above its
+valuation basis while still allowing meaningful avionics upgrades to increase
+value above the comparable bare-airframe value.
+
+## Curve Generation
+
+The aircraft tab plots actual asking prices at the listing date, not at the
+aircraft build year. For each listing, the value curve spans from aircraft model
+year through current listing year plus 30 years.
+
+Past points use actual calendar years on the X axis. Future points project
+airframe hours from the current listing's hours using the user-selected annual
+hours slider. Engine and propeller projection currently uses the component
+baseline-life convention for the curve rather than forecasting overhaul events.
+
+## Refitting
+
+Depreciation profiles are fitted by grid search in `src/fit.rs`.
+
+The fitter:
+
+- builds a global `generic:all` profile from all usable listings
+- builds a `model:<aircraft_model_id>` profile for each model with enough
+  samples
+- minimizes mean absolute percentage error against asking price
+- stores RMSE and MAE metadata in `depreciation_profile_fit_metadata`
+- assigns model profiles to matching variant spec rows
+- assigns the generic profile to models without enough samples
+- updates generic engine and propeller baseline-life fractions
+
+Run it with:
 
 ```bash
-GEMINI_API_KEY=... cargo run --bin aircost-admin -- enrich-avionics --limit 10 --dry-run
-GEMINI_API_KEY=... cargo run --bin aircost-admin -- enrich-avionics --limit 10 --apply
+cargo run --bin aircost-admin -- fit-depreciation --apply
 ```
 
-The prompt requires non-null `introduced_year`, `estimated_unit_value_usd`, and `confidence`. Dry-run mode should be used before applying broad updates because avionics names parsed from listings can represent anything from one remote box to a whole integrated flight deck.
-
-The `new_to_used_discount` term can model a front-loaded resale loss when a profile's validation data supports it. It is profile-specific and may be zero. The calibrated `light_piston` profile does not force a separate first-year discount because the current asking-price sample includes low-time aircraft whose nominal asking prices are close to, or occasionally above, their current new-price basis after market inflation and scarcity are reflected.
-
-## Why This Model
-
-Public aircraft valuation guidance consistently points to a market baseline plus adjustments:
-
-- Aircraft Bluebook describes average retail values as used-aircraft market values for average or mid-time aircraft, then describes engine-time adjustments against TBO with run-out deductions capped at 100% TBO.
-- AOPA Aviation Finance says aircraft valuations start with year/make/model, then compare total airframe time and engine time since major overhaul to the industry average for that aircraft.
-- AOPA's Vref example indicates airframe hours matter less than engine status: in one Bonanza example, 20% above average airframe time reduced value by about 3%, while double average airframe time reduced value by 13%.
-- AVITAS/ISTAT definitions distinguish stable-market base value from current market value, which matches this model's baseline-versus-market-adjustment structure.
-- GlobalAir/Guardian Jet transaction analysis shows depreciation rates vary materially by model family, so a single universal age curve is not defensible.
-
-The most accurate public-domain approach for this project is therefore not a single straight-line depreciation formula. It is a profile-specific residual curve plus component reserve adjustments, with all assumptions exposed so they can later be calibrated from observed listing or transaction data.
-
-## Built-In Profiles
-
-| Profile | Age Decay | New-to-Used Discount | Long-Run Residual | Annual Airframe Hours | Airframe Discount at 2x Avg |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `light_piston` | 7.0% | 0% | 16% | 240 | 13% |
-| `complex_piston` | 4.5% | 11% | 34% | 140 | 15% |
-| `turboprop` | 6.0% | 12% | 20% | 300 | 18% |
-| `business_jet` | 7.5% | 15% | 8% | 360 | 20% |
-
-These are starting profiles, not immutable facts. The `light_piston` profile is calibrated against the validation dataset in this repository, which currently focuses on fixed-gear piston singles. For a specific model, calibrate `age_decay_rate`, `long_run_residual_fraction`, and `annual_airframe_hours` against real comparables.
-
-## Calibration Path
-
-For the next iteration, collect comparable aircraft with:
-
-- make/model/year
-- asking price and, when available, sale price
-- airframe total time
-- engine time since major overhaul or since new
-- propeller time since overhaul
-- installed avionics models, quantities, introduction years, and reference values
-- paint/interior condition
-- damage/logbook flags
-- market date
-
-Then fit a hedonic regression or gradient-boosted model for the market baseline and keep the half-life reserve adjustment as a transparent maintenance submodel. This gives better accuracy while preserving explainable component deductions.
-
-## Asking-Price Validation
-
-Run the validation harness with:
-
-```bash
-python3 scripts/validate_depreciation_model.py
-```
-
-The validation data in `data/depreciation_validation_listings.json` contains current asking-price listings with enough age, airframe-hour, and component-hour information to run the depreciation estimator. Each case also includes the new/list-price basis used by the model so the report can compare both `asking / new` and `modeled / new`. If a listing uses an original historical new price, `new_price_basis_factor` can convert that price into the validation dollar basis.
-
-The current `light_piston` constants were fit to reduce median percentage error across the included asking-price cases while leaving large avionics, condition, and market-location outliers visible. Asking prices are not sale prices, so large residuals can come from negotiation room, avionics, build quality, damage history, international market effects, and incomplete component data.
-
-## Sources
-
-- Aircraft Bluebook user guide: https://aircraftbluebook.com/user-guide
-- AOPA Aviation Finance, "How are Airplanes Valued?": https://finance.aopa.org/resources/2024/march/01/how-are-airplanes-valued
-- AOPA Pilot, "Airframe and Powerplant": https://www.aopa.org/news-and-media/all-news/2002/january/pilot/airframe-and-powerplant
-- AVITAS value definitions: https://www.avitas.com/about/value-definitions/
-- GlobalAir/Guardian Jet depreciation analysis: https://www.globalair.com/articles/what-drives-business-aircraft-depreciation-and-why-each-model-is-different/12076
+Adding, updating, or deleting a listing triggers a best-effort refit for the
+affected model. Broader refits can be run explicitly with the admin command.

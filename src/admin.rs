@@ -6,6 +6,7 @@ use aircost_rs::avionics::{
     enrich_missing_avionics_metadata, enrich_model_year_avionics_and_price_points,
     normalize_avionics_models,
 };
+use aircost_rs::cleanup::cleanup_orphan_records;
 use aircost_rs::db::{database_url_from_arg, DEFAULT_DATABASE_PATH};
 use aircost_rs::extract::GeminiListingExtractor;
 use aircost_rs::fit::fit_depreciation_profiles;
@@ -74,6 +75,11 @@ async fn main() -> Result<()> {
         AdminCommand::NormalizeAvionics { database, apply } => {
             let db = aircost_rs::db::AppDb::connect(&database).await?;
             let report = normalize_avionics_models(&db, apply).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AdminCommand::CleanupOrphans { database } => {
+            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let report = cleanup_orphan_records(&db).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         AdminCommand::CurateAvionics {
@@ -166,6 +172,9 @@ enum AdminCommand {
         database: String,
         apply: bool,
     },
+    CleanupOrphans {
+        database: String,
+    },
     CurateAvionics {
         database: String,
         apply: bool,
@@ -205,6 +214,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         "heal-aircraft-models" => parse_heal_aircraft_models_args(args),
         "enrich-avionics" => parse_enrich_avionics_args(args),
         "normalize-avionics" => parse_normalize_avionics_args(args),
+        "cleanup-orphans" => parse_cleanup_orphans_args(args),
         "curate-avionics" => parse_curate_avionics_args(args),
         "enrich-model-year-avionics" => parse_enrich_model_year_avionics_args(args),
         "enrich-aircraft-specs" => parse_enrich_aircraft_specs_args(args),
@@ -422,10 +432,32 @@ fn parse_normalize_avionics_args(args: impl IntoIterator<Item = String>) -> Resu
     })
 }
 
+fn parse_cleanup_orphans_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown cleanup-orphans argument: {arg}"),
+        }
+    }
+
+    Ok(AdminCommand::CleanupOrphans {
+        database: database_url_from_arg(database),
+    })
+}
+
 fn parse_curate_avionics_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     let mut database = None;
     let mut apply = false;
-    let mut limit = 100_i64;
+    let mut limit = i64::MAX;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -572,6 +604,6 @@ fn required_arg(value: Option<String>, name: &str) -> Result<String> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin normalize-variants --manufacturer Cirrus --model SR22 [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin heal-aircraft-models [--limit 100] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin normalize-avionics [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit 100] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin normalize-variants --manufacturer Cirrus --model SR22 [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin heal-aircraft-models [--limit 100] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin normalize-avionics [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
     );
 }

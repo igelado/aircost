@@ -4,12 +4,13 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::FromRow;
 
+use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
     AircraftPricePointContext, AvionicsMetadataContext, AvionicsNormalizationCandidate,
     AvionicsNormalizationContext, DefaultAvionicsContext, GeminiListingExtractor,
 };
-use crate::normalize::{normalize_avionics_model_name, normalize_name};
+use crate::normalize::{is_usable_avionics_label, normalize_avionics_model_name, normalize_name};
 
 const DEFAULT_VALUE_REFERENCE_YEAR: i64 = 2026;
 
@@ -99,6 +100,12 @@ impl From<anyhow::Error> for AvionicsStoreError {
     }
 }
 
+impl From<CleanupError> for AvionicsStoreError {
+    fn from(error: CleanupError) -> Self {
+        AvionicsStoreError::Database(error.to_string())
+    }
+}
+
 type StoreResult<T> = Result<T, AvionicsStoreError>;
 
 #[derive(Debug, FromRow)]
@@ -116,6 +123,8 @@ struct AvionicsModelNormalizeRow {
     id: i64,
     avionics_manufacturer_id: i64,
     avionics_type_id: i64,
+    manufacturer: String,
+    avionics_type: String,
     name: String,
     normalized_name: String,
     introduced_year: Option<i64>,
@@ -141,7 +150,7 @@ struct AvionicsDefaultProfileLinkRow {
     source_confidence: String,
 }
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, FromRow, Serialize)]
 struct AvionicsNormalizationInputRow {
     id: i64,
     manufacturer: String,
@@ -203,6 +212,8 @@ pub struct AvionicsNormalizationReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct AvionicsNormalizationItem {
     pub canonical_model_id: i64,
+    pub canonical_manufacturer: String,
+    pub canonical_avionics_type: String,
     pub canonical_name: String,
     pub canonical_normalized_name: String,
     pub source_model_ids: Vec<i64>,
@@ -287,16 +298,30 @@ pub async fn normalize_avionics_models(
             .clone();
         let item = AvionicsNormalizationItem {
             canonical_model_id: canonical.id,
+            canonical_manufacturer: canonical.manufacturer.clone(),
+            canonical_avionics_type: canonical.avionics_type.clone(),
             canonical_name: canonical.name.clone(),
             canonical_normalized_name: canonical_normalized_name.clone(),
             source_model_ids: rows.iter().map(|row| row.id).collect(),
             source_names: rows.iter().map(|row| row.name.clone()).collect(),
         };
         if apply {
-            apply_avionics_normalization_group(db, &canonical, &canonical_normalized_name, &rows)
-                .await?;
+            apply_avionics_normalization_group(
+                db,
+                &canonical,
+                canonical.avionics_manufacturer_id,
+                canonical.avionics_type_id,
+                &canonical.name,
+                &canonical_normalized_name,
+                &rows,
+            )
+            .await?;
         }
         items.push(item);
+    }
+
+    if apply {
+        cleanup_orphan_records(db).await?;
     }
 
     Ok(AvionicsNormalizationReport {
@@ -392,120 +417,113 @@ pub async fn curate_avionics_models_with_gemini(
         ));
     }
     let rows = avionics_models_for_gemini_normalization(db, limit).await?;
-    let mut groups: BTreeMap<(String, String), Vec<AvionicsNormalizationInputRow>> =
-        BTreeMap::new();
-    for row in rows {
-        groups
-            .entry((row.manufacturer.clone(), row.avionics_type.clone()))
-            .or_default()
-            .push(row);
+    let mut items = Vec::new();
+
+    if rows.len() < 2 {
+        return Ok(AvionicsNormalizationReport {
+            applied: apply,
+            items,
+        });
     }
 
-    let mut items = Vec::new();
-    for ((manufacturer, avionics_type), rows) in groups {
-        if rows.len() < 2 {
-            continue;
-        }
-        let context = AvionicsNormalizationContext {
-            manufacturer,
-            avionics_type,
-            models: rows
-                .iter()
-                .map(|row| AvionicsNormalizationCandidate {
-                    id: row.id,
-                    model: row.model.clone(),
-                    normalized_model: row.normalized_model.clone(),
-                    listing_count: row.listing_count,
-                    introduced_year: row.introduced_year,
-                    estimated_unit_value_usd: row.estimated_unit_value_usd,
-                })
-                .collect(),
-        };
-        let response = extractor.normalize_avionics_model_labels(&context).await?;
-        let response_groups = avionics_normalization_groups_from_response(&response, &rows)?;
-        for response_group in response_groups {
-            if response_group.rows.len() < 2
-                && response_group.rows.iter().all(|row| {
-                    normalize_avionics_model_name(&row.model)
-                        == normalize_avionics_model_name(&response_group.canonical_model)
-                })
-            {
-                continue;
-            }
-            let canonical_normalized_name =
-                normalize_avionics_model_name(&response_group.canonical_model);
-            let normalize_rows = avionics_normalize_rows_for_ids(
-                db,
-                &response_group
-                    .rows
-                    .iter()
-                    .map(|row| row.id)
-                    .collect::<Vec<_>>(),
-            )
-            .await?;
-            let mut normalize_rows = normalize_rows;
-            let manufacturer_id = normalize_rows
-                .first()
-                .map(|row| row.avionics_manufacturer_id)
-                .ok_or_else(|| {
-                    AvionicsStoreError::Model(
-                        "Gemini avionics normalization group had no rows".to_string(),
-                    )
-                })?;
-            let avionics_type_id = normalize_rows
-                .first()
-                .map(|row| row.avionics_type_id)
-                .expect("normalization group has a first row");
-            for collision in avionics_normalize_rows_for_manufacturer_normalized(
-                db,
-                manufacturer_id,
-                avionics_type_id,
-                &canonical_normalized_name,
-            )
-            .await?
-            {
-                if !normalize_rows.iter().any(|row| row.id == collision.id) {
-                    normalize_rows.push(collision);
-                }
-            }
-            let canonical_row = normalize_rows
-                .iter()
-                .min_by_key(|row| {
-                    (
-                        row.introduced_year.is_none() || row.estimated_unit_value_usd.is_none(),
-                        row.id,
-                    )
-                })
-                .expect("normalization response group is not empty")
-                .clone();
-            let item = AvionicsNormalizationItem {
-                canonical_model_id: canonical_row.id,
-                canonical_name: response_group.canonical_model.clone(),
-                canonical_normalized_name: canonical_normalized_name.clone(),
-                source_model_ids: normalize_rows.iter().map(|row| row.id).collect(),
-                source_names: normalize_rows.iter().map(|row| row.name.clone()).collect(),
-            };
-            if apply {
-                apply_avionics_normalization_group(
-                    db,
-                    &canonical_row,
-                    &canonical_normalized_name,
-                    &normalize_rows,
+    let context = AvionicsNormalizationContext {
+        models: rows
+            .iter()
+            .map(|row| AvionicsNormalizationCandidate {
+                id: row.id,
+                manufacturer: row.manufacturer.clone(),
+                avionics_type: row.avionics_type.clone(),
+                model: row.model.clone(),
+                normalized_model: row.normalized_model.clone(),
+                listing_count: row.listing_count,
+                introduced_year: row.introduced_year,
+                estimated_unit_value_usd: row.estimated_unit_value_usd,
+            })
+            .collect(),
+    };
+    let response = extractor.normalize_avionics_model_labels(&context).await?;
+    let response_groups = match avionics_normalization_groups_from_response(&response, &rows) {
+        Ok(groups) => groups,
+        Err(error) => {
+            let correction_context =
+                avionics_normalization_correction_context(&response, &rows, &error.to_string());
+            let corrected_response = extractor
+                .correct_avionics_model_label_normalization(
+                    &context,
+                    &response,
+                    &correction_context,
                 )
                 .await?;
-                execute_query!(
-                    db,
-                    r#"
-                    UPDATE avionics_models
-                    SET name = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                    "#,
-                    response_group.canonical_model.as_str(),
-                    canonical_row.id
-                )?;
-            }
-            items.push(item);
+            avionics_normalization_groups_from_response(&corrected_response, &rows)?
         }
+    };
+    for response_group in response_groups {
+        let canonical_normalized_name =
+            normalize_avionics_model_name(&response_group.canonical_model);
+        let manufacturer_id = ensure_named_row(
+            db,
+            "avionics_manufacturers",
+            &response_group.canonical_manufacturer,
+        )
+        .await?;
+        let avionics_type_id = ensure_named_row(
+            db,
+            "avionics_types",
+            &response_group.canonical_avionics_type,
+        )
+        .await?;
+        let mut normalize_rows = avionics_normalize_rows_for_ids(
+            db,
+            &response_group
+                .rows
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        for collision in avionics_normalize_rows_for_manufacturer_normalized(
+            db,
+            manufacturer_id,
+            avionics_type_id,
+            &canonical_normalized_name,
+        )
+        .await?
+        {
+            if !normalize_rows.iter().any(|row| row.id == collision.id) {
+                normalize_rows.push(collision);
+            }
+        }
+        if normalize_rows.len() < 2 {
+            continue;
+        }
+        let canonical_row = choose_canonical_avionics_row(
+            &normalize_rows,
+            manufacturer_id,
+            avionics_type_id,
+            &canonical_normalized_name,
+        )?;
+        let item = AvionicsNormalizationItem {
+            canonical_model_id: canonical_row.id,
+            canonical_manufacturer: response_group.canonical_manufacturer.clone(),
+            canonical_avionics_type: response_group.canonical_avionics_type.clone(),
+            canonical_name: response_group.canonical_model.clone(),
+            canonical_normalized_name: canonical_normalized_name.clone(),
+            source_model_ids: normalize_rows.iter().map(|row| row.id).collect(),
+            source_names: normalize_rows.iter().map(|row| row.name.clone()).collect(),
+        };
+        if apply {
+            apply_avionics_normalization_group(
+                db,
+                &canonical_row,
+                manufacturer_id,
+                avionics_type_id,
+                &response_group.canonical_model,
+                &canonical_normalized_name,
+                &normalize_rows,
+            )
+            .await?;
+        }
+        items.push(item);
     }
 
     Ok(AvionicsNormalizationReport {
@@ -550,6 +568,9 @@ pub async fn enrich_model_year_avionics_and_price_points(
         if apply {
             upsert_model_year_price_point(db, &item).await?;
             for avionics in &mut item.avionics {
+                if !is_usable_avionics_label(&avionics.manufacturer, &avionics.model) {
+                    continue;
+                }
                 upsert_default_avionics_profile_item(
                     db,
                     row.aircraft_model_variant_id,
@@ -600,6 +621,9 @@ pub async fn enrich_model_year_avionics_and_price_point_for_listing(
     if apply {
         upsert_model_year_price_point(db, &item).await?;
         for avionics in &mut item.avionics {
+            if !is_usable_avionics_label(&avionics.manufacturer, &avionics.model) {
+                continue;
+            }
             upsert_default_avionics_profile_item(
                 db,
                 row.aircraft_model_variant_id,
@@ -620,17 +644,23 @@ async fn avionics_models_for_normalization(
         AvionicsModelNormalizeRow,
         r#"
         SELECT
-          id,
-          avionics_manufacturer_id,
-          avionics_type_id,
-          name,
-          normalized_name,
-          introduced_year,
-          estimated_unit_value_usd,
-          value_reference_year,
-          value_source
-        FROM avionics_models
-        ORDER BY id
+          model.id,
+          model.avionics_manufacturer_id,
+          model.avionics_type_id,
+          mfr.name AS manufacturer,
+          avionics_type.name AS avionics_type,
+          model.name,
+          model.normalized_name,
+          model.introduced_year,
+          model.estimated_unit_value_usd,
+          model.value_reference_year,
+          model.value_source
+        FROM avionics_models model
+        JOIN avionics_manufacturers mfr
+          ON mfr.id = model.avionics_manufacturer_id
+        JOIN avionics_types avionics_type
+          ON avionics_type.id = model.avionics_type_id
+        ORDER BY model.id
         "#
     )?)
 }
@@ -675,8 +705,78 @@ async fn avionics_models_for_gemini_normalization(
 }
 
 struct AvionicsResponseNormalizationGroup {
+    canonical_manufacturer: String,
+    canonical_avionics_type: String,
     canonical_model: String,
     rows: Vec<AvionicsNormalizationInputRow>,
+}
+
+fn avionics_normalization_correction_context(
+    response: &Value,
+    rows: &[AvionicsNormalizationInputRow],
+    validation_error: &str,
+) -> Value {
+    let input_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+    let mut seen_counts = BTreeMap::<i64, i64>::new();
+    let mut invalid_source_ids = Vec::new();
+    let mut group_count = 0_usize;
+
+    if let Some(groups) = response.get("groups").and_then(Value::as_array) {
+        group_count = groups.len();
+        for group in groups {
+            if let Some(source_ids) = group.get("source_ids").and_then(Value::as_array) {
+                for source_id in source_ids {
+                    if let Some(source_id) = source_id.as_i64() {
+                        *seen_counts.entry(source_id).or_default() += 1;
+                    } else {
+                        invalid_source_ids.push(source_id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let missing_ids = input_ids
+        .iter()
+        .copied()
+        .filter(|id| !seen_counts.contains_key(id))
+        .collect::<Vec<_>>();
+    let repeated_ids = seen_counts
+        .iter()
+        .filter_map(|(id, count)| (*count > 1).then_some(*id))
+        .collect::<Vec<_>>();
+    let unexpected_ids = seen_counts
+        .keys()
+        .copied()
+        .filter(|id| !input_ids.contains(id))
+        .collect::<Vec<_>>();
+    let seen_input_id_count = seen_counts
+        .keys()
+        .filter(|id| input_ids.contains(id))
+        .count();
+    let missing_rows = rows
+        .iter()
+        .filter(|row| missing_ids.contains(&row.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let repeated_rows = rows
+        .iter()
+        .filter(|row| repeated_ids.contains(&row.id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "validation_error": validation_error,
+        "input_id_count": input_ids.len(),
+        "previous_response_group_count": group_count,
+        "previous_response_seen_input_id_count": seen_input_id_count,
+        "missing_ids": missing_ids,
+        "missing_rows": missing_rows,
+        "repeated_ids": repeated_ids,
+        "repeated_rows": repeated_rows,
+        "unexpected_ids": unexpected_ids,
+        "invalid_source_ids": invalid_source_ids,
+    })
 }
 
 fn avionics_normalization_groups_from_response(
@@ -697,6 +797,8 @@ fn avionics_normalization_groups_from_response(
     let mut output = Vec::new();
 
     for group in groups {
+        let canonical_manufacturer = required_string(group, "canonical_manufacturer")?;
+        let canonical_avionics_type = required_string(group, "canonical_type")?;
         let canonical_model = required_string(group, "canonical_model")?;
         let source_ids = group
             .get("source_ids")
@@ -737,6 +839,8 @@ fn avionics_normalization_groups_from_response(
         }
         if !group_rows.is_empty() {
             output.push(AvionicsResponseNormalizationGroup {
+                canonical_manufacturer,
+                canonical_avionics_type,
                 canonical_model,
                 rows: group_rows,
             });
@@ -745,9 +849,19 @@ fn avionics_normalization_groups_from_response(
 
     seen.sort_unstable();
     if seen != remaining {
-        return Err(AvionicsStoreError::Model(
-            "Gemini avionics normalization did not cover every input id exactly once".to_string(),
-        ));
+        let missing = remaining
+            .iter()
+            .copied()
+            .filter(|id| seen.binary_search(id).is_err())
+            .collect::<Vec<_>>();
+        let unexpected = seen
+            .iter()
+            .copied()
+            .filter(|id| remaining.binary_search(id).is_err())
+            .collect::<Vec<_>>();
+        return Err(AvionicsStoreError::Model(format!(
+            "Gemini avionics normalization did not cover every input id exactly once; missing_ids={missing:?}; unexpected_ids={unexpected:?}"
+        )));
     }
     Ok(output)
 }
@@ -778,25 +892,54 @@ async fn avionics_normalize_rows_for_manufacturer_normalized(
         AvionicsModelNormalizeRow,
         r#"
         SELECT
-          id,
-          avionics_manufacturer_id,
-          avionics_type_id,
-          name,
-          normalized_name,
-          introduced_year,
-          estimated_unit_value_usd,
-          value_reference_year,
-          value_source
-        FROM avionics_models
-        WHERE avionics_manufacturer_id = ?
-          AND avionics_type_id = ?
-          AND normalized_name = ?
-        ORDER BY id
+          model.id,
+          model.avionics_manufacturer_id,
+          model.avionics_type_id,
+          mfr.name AS manufacturer,
+          avionics_type.name AS avionics_type,
+          model.name,
+          model.normalized_name,
+          model.introduced_year,
+          model.estimated_unit_value_usd,
+          model.value_reference_year,
+          model.value_source
+        FROM avionics_models model
+        JOIN avionics_manufacturers mfr
+          ON mfr.id = model.avionics_manufacturer_id
+        JOIN avionics_types avionics_type
+          ON avionics_type.id = model.avionics_type_id
+        WHERE model.avionics_manufacturer_id = ?
+          AND model.avionics_type_id = ?
+          AND model.normalized_name = ?
+        ORDER BY model.id
         "#,
         manufacturer_id,
         avionics_type_id,
         normalized_name
     )?)
+}
+
+fn choose_canonical_avionics_row(
+    rows: &[AvionicsModelNormalizeRow],
+    canonical_manufacturer_id: i64,
+    canonical_avionics_type_id: i64,
+    canonical_normalized_name: &str,
+) -> StoreResult<AvionicsModelNormalizeRow> {
+    rows.iter()
+        .min_by_key(|row| {
+            (
+                row.avionics_manufacturer_id != canonical_manufacturer_id
+                    || row.avionics_type_id != canonical_avionics_type_id
+                    || row.normalized_name != canonical_normalized_name,
+                row.normalized_name != canonical_normalized_name,
+                row.introduced_year.is_none() || row.estimated_unit_value_usd.is_none(),
+                row.id,
+            )
+        })
+        .cloned()
+        .ok_or_else(|| {
+            AvionicsStoreError::Model("Gemini avionics normalization group had no rows".to_string())
+        })
 }
 
 async fn aircraft_model_year_profiles_to_enrich(
@@ -990,6 +1133,11 @@ fn model_year_profile_item_from_response(
         })?
         .iter()
         .map(default_avionics_item_from_response)
+        .filter_map(|result| match result {
+            Ok(item) if !is_usable_avionics_label(&item.manufacturer, &item.model) => None,
+            Ok(item) => Some(Ok(item)),
+            Err(error) => Some(Err(error)),
+        })
         .collect::<StoreResult<Vec<_>>>()?;
     Ok(AvionicsModelYearProfileItem {
         aircraft_model_variant_id: row.aircraft_model_variant_id,
@@ -1134,6 +1282,9 @@ async fn upsert_default_avionics_profile_item(
 async fn apply_avionics_normalization_group(
     db: &AppDb,
     canonical: &AvionicsModelNormalizeRow,
+    canonical_manufacturer_id: i64,
+    canonical_avionics_type_id: i64,
+    canonical_name: &str,
     canonical_normalized_name: &str,
     rows: &[AvionicsModelNormalizeRow],
 ) -> StoreResult<()> {
@@ -1186,6 +1337,9 @@ async fn apply_avionics_normalization_group(
         r#"
         UPDATE avionics_models
         SET
+          avionics_manufacturer_id = ?,
+          avionics_type_id = ?,
+          name = ?,
           normalized_name = ?,
           introduced_year = COALESCE(introduced_year, ?),
           estimated_unit_value_usd = COALESCE(estimated_unit_value_usd, ?),
@@ -1194,6 +1348,9 @@ async fn apply_avionics_normalization_group(
           updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         "#,
+        canonical_manufacturer_id,
+        canonical_avionics_type_id,
+        canonical_name.trim(),
         canonical_normalized_name,
         introduced_year,
         estimated_unit_value_usd,
@@ -1590,6 +1747,11 @@ async fn ensure_avionics_model(
     model: &str,
     avionics_type: &str,
 ) -> StoreResult<i64> {
+    if !is_usable_avionics_label(manufacturer, model) {
+        return Err(AvionicsStoreError::Model(format!(
+            "generic avionics labels cannot be stored: {manufacturer} {model}"
+        )));
+    }
     let manufacturer_id = ensure_named_row(db, "avionics_manufacturers", manufacturer).await?;
     let type_id = ensure_named_row(db, "avionics_types", avionics_type).await?;
     let normalized_model = normalize_avionics_model_name(model);

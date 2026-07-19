@@ -17,6 +17,7 @@ use crate::normalize::{canonical_manufacturer_name, normalize_name};
 
 const DEFAULT_GEMINI_MODEL: &str = "gemini-3.1-flash-lite";
 const DEFAULT_GEMINI_GROUNDING_MODEL: &str = "gemini-3.1-flash-lite";
+const DEFAULT_GEMINI_AVIONICS_REVIEW_MODEL: &str = "gemini-3.1-flash-lite";
 const DEFAULT_GEMINI_MAX_OUTPUT_TOKENS: u64 = 4096;
 const DEFAULT_GEMINI_TIMEOUT_SECONDS: u64 = 60;
 const DEFAULT_GEMINI_THINKING_LEVEL: &str = "low";
@@ -43,6 +44,16 @@ pub struct VariantConfirmationContext<'a> {
     pub source_url: Option<&'a str>,
     pub model_year: Option<i64>,
     pub listing_context: Option<&'a str>,
+}
+
+pub struct VariantLabelCorrectionContext<'a> {
+    pub manufacturer: &'a str,
+    pub model: &'a str,
+    pub variant: &'a str,
+    pub model_year: i64,
+    pub source_url: Option<&'a str>,
+    pub listing_context: Option<&'a str>,
+    pub issues: &'a [String],
 }
 
 #[derive(Debug, Serialize)]
@@ -73,9 +84,37 @@ pub struct AvionicsMetadataContext<'a> {
     pub value_reference_year: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AvionicsUnitResolutionCandidate {
+    pub manufacturer: String,
+    pub model: String,
+    pub avionics_type: String,
+    pub quantity: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AvionicsUnitResolutionContext {
+    pub aircraft_manufacturer: String,
+    pub aircraft_model: String,
+    pub aircraft_variant: String,
+    pub model_year: i64,
+    pub source_url: String,
+    pub listing_context: String,
+    pub candidate: AvionicsUnitResolutionCandidate,
+    pub value_reference_year: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AvionicsUnitResolutionCorrectionContext {
+    pub issues: Vec<String>,
+    pub secondary_check: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AvionicsNormalizationCandidate {
     pub id: i64,
+    pub manufacturer: String,
+    pub avionics_type: String,
     pub model: String,
     pub normalized_model: String,
     pub listing_count: i64,
@@ -85,8 +124,6 @@ pub struct AvionicsNormalizationCandidate {
 
 #[derive(Debug, Serialize)]
 pub struct AvionicsNormalizationContext {
-    pub manufacturer: String,
-    pub avionics_type: String,
     pub models: Vec<AvionicsNormalizationCandidate>,
 }
 
@@ -134,6 +171,7 @@ pub struct GeminiListingExtractor {
     api_key: String,
     url: String,
     grounded_url: String,
+    avionics_review_url: String,
     max_output_tokens: u64,
     thinking_level: Option<String>,
     browser: Arc<OnceCell<eoka::Browser>>,
@@ -160,6 +198,13 @@ impl GeminiListingExtractor {
         } else {
             format!("models/{grounding_model}")
         };
+        let avionics_review_model = env::var("AIRCOST_GEMINI_AVIONICS_REVIEW_MODEL")
+            .unwrap_or_else(|_| DEFAULT_GEMINI_AVIONICS_REVIEW_MODEL.to_string());
+        let avionics_review_model_path = if avionics_review_model.starts_with("models/") {
+            avionics_review_model
+        } else {
+            format!("models/{avionics_review_model}")
+        };
         let timeout_seconds = environment_u64(
             "AIRCOST_GEMINI_TIMEOUT_SECONDS",
             DEFAULT_GEMINI_TIMEOUT_SECONDS,
@@ -177,6 +222,9 @@ impl GeminiListingExtractor {
             ),
             grounded_url: format!(
                 "https://generativelanguage.googleapis.com/v1beta/{grounding_model_path}:generateContent"
+            ),
+            avionics_review_url: format!(
+                "https://generativelanguage.googleapis.com/v1beta/{avionics_review_model_path}:generateContent"
             ),
             max_output_tokens: environment_u64(
                 "AIRCOST_GEMINI_MAX_OUTPUT_TOKENS",
@@ -248,6 +296,18 @@ impl GeminiListingExtractor {
             .unwrap_or(false))
     }
 
+    pub async fn correct_aircraft_variant_label(
+        &self,
+        context: &VariantLabelCorrectionContext<'_>,
+    ) -> Result<Value> {
+        self.generate_json(
+            build_variant_label_correction_prompt(context),
+            gemini_variant_label_correction_response_schema(),
+            512,
+        )
+        .await
+    }
+
     pub async fn normalize_aircraft_variants(
         &self,
         context: &VariantNormalizationContext,
@@ -256,6 +316,24 @@ impl GeminiListingExtractor {
             build_variant_normalization_prompt(context),
             gemini_variant_normalization_response_schema(),
             2048,
+        )
+        .await
+    }
+
+    pub async fn correct_aircraft_variant_normalization(
+        &self,
+        context: &VariantNormalizationContext,
+        previous_response: &Value,
+        correction_context: &Value,
+    ) -> Result<Value> {
+        self.generate_json(
+            build_variant_normalization_correction_prompt(
+                context,
+                previous_response,
+                correction_context,
+            ),
+            gemini_variant_normalization_response_schema(),
+            4096,
         )
         .await
     }
@@ -272,14 +350,74 @@ impl GeminiListingExtractor {
         .await
     }
 
+    pub async fn resolve_avionics_unit(
+        &self,
+        context: &AvionicsUnitResolutionContext,
+    ) -> Result<Value> {
+        self.generate_grounded_json(
+            build_avionics_unit_resolution_prompt(context),
+            gemini_avionics_unit_resolution_response_schema(),
+            2048,
+        )
+        .await
+    }
+
+    pub async fn correct_avionics_unit_resolution(
+        &self,
+        context: &AvionicsUnitResolutionContext,
+        previous_response: &Value,
+        correction_context: &AvionicsUnitResolutionCorrectionContext,
+    ) -> Result<Value> {
+        self.generate_grounded_json(
+            build_avionics_unit_resolution_correction_prompt(
+                context,
+                previous_response,
+                correction_context,
+            ),
+            gemini_avionics_unit_resolution_response_schema(),
+            2048,
+        )
+        .await
+    }
+
+    pub async fn classify_avionics_unit_concreteness(
+        &self,
+        context: &AvionicsUnitResolutionContext,
+    ) -> Result<Value> {
+        self.generate_avionics_review_json(
+            build_avionics_unit_concreteness_prompt(context),
+            gemini_avionics_unit_concreteness_response_schema(),
+            1024,
+        )
+        .await
+    }
+
     pub async fn normalize_avionics_model_labels(
         &self,
         context: &AvionicsNormalizationContext,
     ) -> Result<Value> {
-        self.generate_json(
+        self.generate_grounded_json(
             build_avionics_normalization_prompt(context),
             gemini_avionics_normalization_response_schema(),
-            4096,
+            32_768,
+        )
+        .await
+    }
+
+    pub async fn correct_avionics_model_label_normalization(
+        &self,
+        context: &AvionicsNormalizationContext,
+        previous_response: &Value,
+        correction_context: &Value,
+    ) -> Result<Value> {
+        self.generate_json(
+            build_avionics_normalization_correction_prompt(
+                context,
+                previous_response,
+                correction_context,
+            ),
+            gemini_avionics_normalization_response_schema(),
+            32_768,
         )
         .await
     }
@@ -370,6 +508,45 @@ impl GeminiListingExtractor {
         }
     }
 
+    async fn generate_avionics_review_json(
+        &self,
+        prompt: String,
+        response_schema: Value,
+        max_output_tokens: u64,
+    ) -> Result<Value> {
+        let content = self
+            .generate_json_text_with_model_url(
+                prompt.clone(),
+                response_schema.clone(),
+                max_output_tokens,
+                false,
+                &self.avionics_review_url,
+            )
+            .await?;
+        match load_model_json(&content) {
+            Ok(value) => Ok(value),
+            Err(parse_error) => {
+                let repair_prompt =
+                    build_json_repair_prompt(&prompt, &content, &format!("{parse_error:#}"));
+                let repaired_content = self
+                    .generate_json_text_with_model_url(
+                        repair_prompt,
+                        response_schema,
+                        max_output_tokens,
+                        false,
+                        &self.avionics_review_url,
+                    )
+                    .await?;
+                load_model_json(&repaired_content).with_context(|| {
+                    format!(
+                        "Gemini avionics review returned invalid JSON after repair; original parse error: {parse_error:#}; repair response excerpt: {}",
+                        response_excerpt(&repaired_content)
+                    )
+                })
+            }
+        }
+    }
+
     async fn generate_json_text(
         &self,
         prompt: String,
@@ -396,6 +573,29 @@ impl GeminiListingExtractor {
         response_schema: Value,
         max_output_tokens: u64,
         google_search: bool,
+    ) -> Result<String> {
+        let url = if google_search {
+            &self.grounded_url
+        } else {
+            &self.url
+        };
+        self.generate_json_text_with_model_url(
+            prompt,
+            response_schema,
+            max_output_tokens,
+            google_search,
+            url,
+        )
+        .await
+    }
+
+    async fn generate_json_text_with_model_url(
+        &self,
+        prompt: String,
+        response_schema: Value,
+        max_output_tokens: u64,
+        google_search: bool,
+        url: &str,
     ) -> Result<String> {
         let mut generation_config = json!({
             "responseMimeType": "application/json",
@@ -429,11 +629,6 @@ impl GeminiListingExtractor {
             ]);
         }
 
-        let url = if google_search {
-            &self.grounded_url
-        } else {
-            &self.url
-        };
         let response = self
             .client
             .post(url)
@@ -518,7 +713,11 @@ Rules:\n\
 - If engine or propeller time is absent but the listing clearly says all times are since new, reuse total time for engine_hours and propeller_hours.\n\
 - registration_number may be an N-number or another registration value from Registration No/Reg/RN.\n\
 - model is the depreciation/economic model family. It groups closely related variants that share the same broad aircraft family for value curves. Do not include generation, trim, turbo, pressurized, retractable, package, or serial suffix details here unless they are part of the broad family name.\n\
-- variant is the exact advertised aircraft model designation from the listing. Include suffixes, generation labels, turbo/pressurized/retractable/amphibious/turbine modifiers, and marketing family words when present.\n\
+- variant is the concise aircraft configuration/designation label used for valuation grouping within the model family. Preserve material suffixes, generation labels, turbo/pressurized/retractable/amphibious/turbine modifiers, and other configuration-changing terms.\n\
+- variant must omit the manufacturer name and model year.\n\
+- variant must not repeat broad model-family or marketing-family words that are already represented by model unless that word is required to distinguish two material configurations in this model family.\n\
+- If one possible label is a concise alphanumeric code and another is the same code plus a redundant family word from model, return the concise code.\n\
+- If the variant is the model family plus a separable generation/configuration token, return only the generation/configuration token. Keep the model code only when the suffix is fused into an inseparable alphanumeric type designator.\n\
 - model and variant are allowed to be identical only when the listing gives no more specific designation than the family name.\n\
 - Do not convert model names to ICAO type designators.\n\
 - avionics must come from the listing text and should include fixed installed avionics only.\n\
@@ -569,6 +768,8 @@ Return JSON with exactly this shape:\n{}\n\n\
 Rules:\n\
 - Return same_model_family true when the extracted model and candidate model are the same depreciation/economic family, even if variants differ.\n\
 - Treat generation, trim, turbo, pressurized, retractable, package, and minor suffix differences as variant-level details unless they identify a materially different model family in the listing context.\n\
+- Return same_model_family true when extracted_model includes a variant suffix, generation, or configuration term attached to or adjacent to the base model code, and candidate_known_model is the broader family that should contain that variant.\n\
+- Do not require candidate_known_model to repeat every variant suffix or configuration term from extracted_model; those belong in variant.\n\
 - Return false when the strings refer to different broad model families, even if the manufacturer is the same or the names look similar.\n\
 - Use the listing context, year, and source URL only as supporting context.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
@@ -605,10 +806,11 @@ Decide whether the extracted variant and candidate known variant identify the sa
 Return JSON with exactly this shape:\n{}\n\n\
 Rules:\n\
 - Return same_variant true only when both values identify the same exact aircraft variant/configuration.\n\
-- Treat punctuation, word order, capitalization, redundant marketing words, and equivalent shorthand such as an appended T versus the word TURBO as non-material when the listing context supports the same configuration.\n\
+- Treat punctuation, word order, capitalization, redundant manufacturer/model-family/marketing-family words, and equivalent shorthand such as an appended T versus the word TURBO as non-material when the listing context supports the same configuration.\n\
 - Treat generation and configuration-changing terms such as normally aspirated versus turbo, pressurized, retractable, turbine, or amphibious as material unless both sides refer to the same configuration.\n\
 - Treat trim or package names as non-material unless the evidence shows that term is the only material distinction between variants.\n\
 - Return false when the candidate is only the same model family but not the same exact variant.\n\
+- Variant labels must omit manufacturer names and model years. Treat those as non-canonical noise when comparing variants.\n\
 - Use the extracted model family, candidate model family, listing context, year, and source URL only as supporting context.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
 Current extracted fields:\n\
@@ -633,6 +835,45 @@ Listing context:\n{listing_context}",
     )
 }
 
+fn build_variant_label_correction_prompt(context: &VariantLabelCorrectionContext<'_>) -> String {
+    let source_url = context.source_url.unwrap_or("");
+    let listing_context = context.listing_context.unwrap_or("");
+    format!(
+        "Correct one aircraft variant label before it is stored in an aircraft valuation database.\n\
+Return JSON with exactly this shape:\n{}\n\n\
+Rules:\n\
+- corrected_variant must be a concise exact aircraft variant/configuration label.\n\
+- corrected_variant must omit the manufacturer name.\n\
+- corrected_variant must omit the aircraft model year.\n\
+- corrected_variant must not repeat broad model-family or marketing-family words already represented by model unless that word is required to distinguish two material configurations in this model family.\n\
+- If one possible label is a concise alphanumeric code and another is the same code plus a redundant family word from model, return the concise code.\n\
+- If the variant is the model family plus a separable generation/configuration token, return only the generation/configuration token. Keep the model code only when the suffix is fused into an inseparable alphanumeric type designator.\n\
+- Do not drop material configuration words such as turbo, pressurized, retractable, amphibious, or turbine. If such a word is part of the variant, encode it in the concise corrected_variant using the best aircraft-designation form supported by the input and model family.\n\
+- Keep material variant/configuration terms such as turbo, pressurized, retractable, amphibious, turbine, generation, and trim/package only when they identify the advertised configuration.\n\
+- Do not convert the aircraft to an ICAO type designator.\n\
+- Do not include markdown, comments, nulls, or extra keys.\n\n\
+Input:\n\
+manufacturer: {}\n\
+model: {}\n\
+variant: {}\n\
+model_year: {}\n\
+source_url: {source_url}\n\
+issues: {}\n\n\
+Listing context:\n{listing_context}",
+        serde_json::to_string_pretty(&json!({
+            "corrected_variant": "string",
+            "confidence": "high, medium, or low",
+            "rationale": "short string"
+        }))
+        .unwrap(),
+        context.manufacturer,
+        context.model,
+        context.variant,
+        context.model_year,
+        serde_json::to_string_pretty(context.issues).unwrap(),
+    )
+}
+
 fn build_variant_normalization_prompt(context: &VariantNormalizationContext) -> String {
     format!(
         "We need to clean up variant labels for existing aircraft sale listings that all belong to one manufacturer and model family.\n\
@@ -642,6 +883,11 @@ Rules:\n\
 - Every source variant from the input must appear exactly once across source_variants.\n\
 - Do not invent source variant labels; source_variants must be copied exactly from the input variant values.\n\
 - canonical_variant must be a non-empty string and must not be null.\n\
+- canonical_variant must omit manufacturer names and model years.\n\
+- canonical_variant must not repeat broad model-family or marketing-family words that are already represented by the input model unless that word is required to distinguish two material configurations in this model family.\n\
+- If one source variant is a concise alphanumeric code and another source variant is the same code plus a redundant family word from the model family, group them and use the concise code as canonical_variant.\n\
+- If one source variant expresses a material turbo/pressurized/retractable/etc. configuration as a suffix code while another writes the same configuration as a word, group them and prefer the concise aircraft-designation form.\n\
+- If the source variant is the model family plus a separable generation/configuration token, canonical_variant should be only the generation/configuration token. Keep the model code only when the suffix is fused into an inseparable alphanumeric type designator.\n\
 - Group labels that differ only by capitalization, punctuation, separators, word order, redundant manufacturer/model family words, or equivalent shorthand such as an appended T versus the word TURBO.\n\
 - Keep variants separate when generation, normally aspirated versus turbo/pressurized/retractable/amphibious/turbine configuration, or another material aircraft configuration differs.\n\
 - Treat marketing/package words as non-canonical unless the provided evidence shows that term is the only material distinction between variants.\n\
@@ -661,6 +907,35 @@ Input:\n{}",
         }))
         .unwrap(),
         serde_json::to_string_pretty(context).unwrap()
+    )
+}
+
+fn build_variant_normalization_correction_prompt(
+    context: &VariantNormalizationContext,
+    previous_response: &Value,
+    correction_context: &Value,
+) -> String {
+    format!(
+        "Your previous aircraft variant normalization response was valid JSON but failed validation.\n\
+Return one complete corrected JSON object that satisfies the same schema and replaces the previous response.\n\
+Do not return a patch. Do not include markdown, comments, nulls, or extra keys.\n\n\
+Validation details:\n{}\n\n\
+Critical coverage rule:\n\
+- Every source variant from the input must appear exactly once across source_variants.\n\
+- Any input variant that is not a duplicate must be included as a singleton group.\n\
+- Do not omit unchanged singleton variants.\n\n\
+Specific correction instructions:\n\
+- For every label listed in missing_source_variants, add it exactly once to the full replacement response.\n\
+- If a missing source variant is an exact duplicate of a group already in previous_response, add that label to that group's source_variants.\n\
+- If a missing source variant is not an exact duplicate, create a singleton group for it using that same label as canonical_variant.\n\
+- If duplicated_source_variants is non-empty, remove duplicate occurrences and leave each repeated label in exactly one best-fitting group.\n\
+- If unknown_source_variants is non-empty, remove those labels because they were not in the input.\n\
+- Apply the original canonical-label rules when choosing canonical_variant: omit maker/year, remove redundant model-family words, and prefer the concise material aircraft-designation form.\n\n\
+Original task and input:\n{}\n\n\
+Previous response:\n{}",
+        serde_json::to_string_pretty(correction_context).unwrap(),
+        build_variant_normalization_prompt(context),
+        serde_json::to_string_pretty(previous_response).unwrap()
     )
 }
 
@@ -694,19 +969,151 @@ value_reference_year: {}",
     )
 }
 
+fn build_avionics_unit_resolution_prompt(context: &AvionicsUnitResolutionContext) -> String {
+    format!(
+        "Use Google Search grounding to verify one avionics candidate before it is stored in an aircraft valuation database.\n\
+Return JSON with exactly this shape:\n{}\n\n\
+Rules:\n\
+- Fill every field with a non-null value. Do not return null for any field.\n\
+- status must be concrete, factory_default, or reject.\n\
+- Use status=concrete only when the candidate identifies a real, concrete avionics unit, integrated suite, or named avionics package that exists as a product/configuration.\n\
+- Use status=factory_default when the candidate is generic, class-only, feature-only, unknown, or not a concrete product, and you can identify a concrete factory/default unit for the same aircraft model_year and avionics type.\n\
+- Use status=reject when the candidate is generic or nonexistent and no concrete factory/default replacement can be verified from reliable sources.\n\
+- If the candidate term could be generic rather than a concrete model, make extra effort to validate that exact term as one concrete product/configuration before using status=concrete.\n\
+- Treat status=concrete as invalid unless the source evidence supports one exact manufacturer/model or one exact named integrated suite/package, not just a capability, display size, equipment type, broad series/family, or multiple possible models.\n\
+- Do not treat generic features/classes as concrete units. Examples: ADS-B, WAAS GPS, Dual WAAS, Remote Transponder, Standard Audio Panel, Audio Controller, Autopilot, Synthetic Vision, Engine Monitor, radios, NAV/COM, GPS, Traffic, Datalink Weather, Backup Instruments.\n\
+- If the candidate appears to be a shorthand or malformed label, resolve it only when grounding or listing context identifies one exact unit. Otherwise use factory_default or reject.\n\
+- For concrete and factory_default, manufacturer/model/type must be the verified avionics manufacturer, exact model/package label, and avionics type. Do not return the aircraft manufacturer unless it is truly the avionics unit maker.\n\
+- For reject, set manufacturer, model, and type to empty strings, quantity to the input quantity, introduced_year to 0, estimated_unit_value_usd to 0, source_url and source_title to empty strings, confidence to low, and explain the reason in notes.\n\
+- type must be one of: GPS, NAV/COM, Transponder, Autopilot, Integrated Flight Deck, Audio Panel, Flight Display, Traffic, Datalink, Engine Monitor, Standby Instrument, or Unknown.\n\
+- introduced_year is the first public release, certification, or common market introduction year for the returned avionics model. Use 0 only for reject.\n\
+- estimated_unit_value_usd is a reasonable {} USD market value contribution for one installed working unit or suite. Use 0 only for reject.\n\
+- source_url and source_title must identify the best public source supporting the concrete unit or factory default. Use empty strings only for reject.\n\
+- notes must briefly say whether the original candidate was verified, corrected, replaced by factory default, or rejected.\n\
+- Do not include markdown, comments, nulls, or extra keys.\n\n\
+Context:\n{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "concrete, factory_default, or reject",
+            "manufacturer": "string",
+            "model": "string",
+            "type": "GPS, NAV/COM, Transponder, Autopilot, Integrated Flight Deck, Audio Panel, Flight Display, Traffic, Datalink, Engine Monitor, Standby Instrument, or Unknown",
+            "quantity": "integer",
+            "introduced_year": "integer",
+            "estimated_unit_value_usd": "number",
+            "confidence": "high, medium, or low",
+            "source_url": "string",
+            "source_title": "string",
+            "notes": "string"
+        }))
+        .unwrap(),
+        context.value_reference_year,
+        serde_json::to_string_pretty(context).unwrap()
+    )
+}
+
+fn build_avionics_unit_concreteness_prompt(context: &AvionicsUnitResolutionContext) -> String {
+    format!(
+        "Classify whether an extracted avionics candidate looks like one concrete avionics product/configuration or a generic/ambiguous label.\n\
+Return JSON with exactly this shape:\n{}\n\n\
+Rules:\n\
+- This is an independent validation check for a database ingestion pipeline.\n\
+- classification must be concrete, generic, or ambiguous.\n\
+- Use concrete only when the manufacturer/model/type together identify one specific avionics unit, installed integrated suite, or named avionics package.\n\
+- Use generic when the model is primarily an equipment class, capability, feature, display size, broad series/family, marketing descriptor, or standard-equipment phrase.\n\
+- Use ambiguous when it could refer to multiple models, a product family, a vendor line, or the manufacturer/type context is insufficient.\n\
+- manufacturer_is_avionics_maker must be false if the manufacturer looks like an aircraft maker, alias, installer, parenthetical label, unknown/generic value, or not the maker of the avionics unit.\n\
+- model_identifies_single_unit must be false if the model is class-only, feature-only, a broad series/family, slash-separated multiple model numbers, or a display/controller description rather than one exact unit.\n\
+- generic_indicators should list the concrete reasons for generic/ambiguous classifications. Use an empty array for a high-confidence concrete unit.\n\
+- Do not include markdown, comments, nulls, or extra keys.\n\n\
+Context:\n{}",
+        serde_json::to_string_pretty(&json!({
+            "classification": "concrete, generic, or ambiguous",
+            "manufacturer_is_avionics_maker": "boolean",
+            "model_identifies_single_unit": "boolean",
+            "confidence": "high, medium, or low",
+            "generic_indicators": ["string"],
+            "notes": "string"
+        }))
+        .unwrap(),
+        serde_json::to_string_pretty(context).unwrap()
+    )
+}
+
+fn build_avionics_unit_resolution_correction_prompt(
+    context: &AvionicsUnitResolutionContext,
+    previous_response: &Value,
+    correction_context: &AvionicsUnitResolutionCorrectionContext,
+) -> String {
+    format!(
+        "Use Google Search grounding to correct an avionics unit resolution before it is stored in an aircraft valuation database.\n\
+The previous answer was rejected by a generic local review. Return a corrected JSON object with exactly this shape:\n{}\n\n\
+Correction rules:\n\
+- Fill every field with a non-null value. Do not return null for any field.\n\
+- Address every issue in the review_context. Do not repeat the same problem.\n\
+- status must be concrete, factory_default, or reject.\n\
+- Use status=concrete only when a reliable public source verifies one exact avionics product, installed suite, or named package and supports the returned manufacturer/model.\n\
+- Use status=factory_default only when the original candidate is generic or malformed but a reliable source verifies a concrete factory/default replacement for the same aircraft year/model/variant and avionics type.\n\
+- Use status=reject when the previous response cannot be corrected to one verified concrete product/default.\n\
+- If the prior manufacturer was an alias, aircraft manufacturer, parenthetical label, distributor, installer, or otherwise not the avionics maker, replace it with the verified avionics manufacturer or reject.\n\
+- If the prior model was a capability, feature, equipment class, broad series/family, ambiguous slash-separated set, display description, controller description, or multiple possible products, replace it with one verified concrete unit/default or reject.\n\
+- For reject, set manufacturer, model, and type to empty strings, quantity to the input quantity, introduced_year to 0, estimated_unit_value_usd to 0, source_url and source_title to empty strings, confidence to low, and explain the reason in notes.\n\
+- For concrete and factory_default, source_url/source_title must support the corrected manufacturer/model and notes must briefly explain the correction.\n\
+- Do not include markdown, comments, nulls, or extra keys.\n\n\
+Original context:\n{}\n\n\
+Previous rejected response:\n{}\n\n\
+Review context:\n{}",
+        serde_json::to_string_pretty(&json!({
+            "status": "concrete, factory_default, or reject",
+            "manufacturer": "string",
+            "model": "string",
+            "type": "GPS, NAV/COM, Transponder, Autopilot, Integrated Flight Deck, Audio Panel, Flight Display, Traffic, Datalink, Engine Monitor, Standby Instrument, or Unknown",
+            "quantity": "integer",
+            "introduced_year": "integer",
+            "estimated_unit_value_usd": "number",
+            "confidence": "high, medium, or low",
+            "source_url": "string",
+            "source_title": "string",
+            "notes": "string"
+        }))
+        .unwrap(),
+        serde_json::to_string_pretty(context).unwrap(),
+        serde_json::to_string_pretty(previous_response).unwrap(),
+        serde_json::to_string_pretty(correction_context).unwrap(),
+    )
+}
+
 fn build_avionics_normalization_prompt(context: &AvionicsNormalizationContext) -> String {
     format!(
-        "We need to clean up avionics labels extracted from aircraft sale listings.\n\
-Group source avionics model rows that identify the same installed avionics unit, suite, or package, and choose one canonical display label per group.\n\
+        "Use Google Search grounding to clean up avionics labels extracted from aircraft sale listings.\n\
+Group source avionics model rows that identify the same installed avionics unit, suite, or package, and choose one canonical manufacturer, avionics type, and display model label per group.\n\
 Return JSON with exactly this shape:\n{}\n\n\
 Rules:\n\
 - Every input id must appear exactly once across source_ids.\n\
+- Rows that are not duplicates must still be returned as singleton groups with source_ids containing only that row id.\n\
+- The response is invalid if any input row is omitted, even when the row is unchanged.\n\
 - Do not invent source ids; source_ids must be copied from input models.\n\
+- canonical_manufacturer must be the avionics manufacturer or suite owner, not the aircraft manufacturer.\n\
+- canonical_type must be one of: GPS, NAV/COM, Transponder, Autopilot, Integrated Flight Deck, Audio Panel, Flight Display, Traffic, Datalink, Engine Monitor, Standby Instrument, or Unknown.\n\
 - canonical_model must be a non-empty string and must not be null.\n\
 - Group labels that differ only by capitalization, spacing, punctuation, hyphens, slash separators, plus signs, or redundant manufacturer words.\n\
 - Group obvious shorthand for the same unit or suite, for example G1000 NXi and G1000NXi.\n\
+- Group rows across different source manufacturers or avionics types when the source row is clearly misclassified but the model label identifies the same installed unit.\n\
+- When rows with the same model label have conflicting source avionics types, use grounding and the factual product role to choose canonical_type. Do not keep an obviously wrong source type.\n\
+- Only merge rows when they identify the exact same installed hardware, exact same integrated suite generation, or exact same software-defined avionics package.\n\
+- Do not create umbrella groups for a product family, product series, generation family, capability class, or vendor line.\n\
+- Keep different primary model numbers separate even when they share a product family, market role, connector, display size, or manufacturer.\n\
+- Keep different alphanumeric model designators separate when their digits or suffixes differ after removing spaces, hyphens, and manufacturer/family words. For example, 33ES and 330ES are different designators, not formatting variants.\n\
+- Keep different suffixes or generations separate when they materially change capabilities or market value, including W, WAAS, Xi, NXi, Plus, Touch+, R, ES, and part-number display revisions.\n\
 - Keep labels separate when they refer to materially different avionics generations, models, or units, for example G1000, G1000 NXi, Perspective, Perspective+, GTX 33, and GTX 345R.\n\
 - Keep a broad integrated suite separate from individual components unless the input evidence clearly shows both labels are duplicate names for the same parsed listing unit.\n\
+- Never merge individual components into an integrated suite or merge an integrated suite into individual components just because both appear in the same aircraft generation.\n\
+- Do not combine slash-separated distinct models into one canonical_model such as 430/530, 650/750, KAP/KFC, or 55X/60. Split them unless the slash is merely formatting for the exact same named unit.\n\
+- Examples that must stay separate unless an input row explicitly proves they are duplicate labels for the same parsed unit: GNS 430, GNS 430W, GNS 530, GTN 650, GTN 650Xi, GTN 750, GTN 750Xi, GNC 355, Aera 660, GPS 150, G5, GI 275, DFC90, DFC100, KAP 150, KFC 150, KMA 24, KMA 26, KT 74, KT 75, KT 76A, KT 76C, G1000, G1000 NXi, Perspective, Perspective+, and Perspective Touch+.\n\
+- Generic capability/class labels are not duplicates of specific product codes. Keep labels like WAAS GPS, Dual WAAS, ADS-B, ADS-B Out, Remote Transponder, Transponder/ADS-B, Standard Audio Panel, Audio Controller, Audio Control Panel, Autopilot, Datalink Weather, Synthetic Vision, Traffic, Stormscope, Engine Monitor, Engine & Fuel Monitoring, Backup Instruments, and Standard Radio/Navigation separate from specific model-numbered units unless the generic label itself includes the exact model code.\n\
+- If one row has a specific model number or named product and another row only has a capability, feature, generic standard-equipment phrase, or equipment class, keep them separate.\n\
+- Generic rows may only be grouped with other generic rows when the labels have the same meaning and neither row has a more specific model code.\n\
+- For shorthand labels like 430W, 540, 55X, 50, or 60, infer the canonical label only when the source manufacturer, type, and nearby labels clearly identify a specific product. Otherwise keep the row as a singleton with a conservative canonical label.\n\
+- Do not use generic canonical_model values such as Series, System Components, Generic, Miscellaneous, Navigation Suite, or Integrated Avionics unless every source row in that group is already the same generic label.\n\
 - Prefer concise canonical labels with the manufacturer omitted and the avionics code/version preserved.\n\
 - If unsure whether two labels identify the same hardware/suite, keep them separate.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
@@ -714,6 +1121,8 @@ Input:\n{}",
         serde_json::to_string_pretty(&json!({
             "groups": [
                 {
+                    "canonical_manufacturer": "string",
+                    "canonical_type": "string",
                     "canonical_model": "string",
                     "source_ids": ["integer"],
                     "rationale": "short string"
@@ -722,6 +1131,34 @@ Input:\n{}",
         }))
         .unwrap(),
         serde_json::to_string_pretty(context).unwrap()
+    )
+}
+
+fn build_avionics_normalization_correction_prompt(
+    context: &AvionicsNormalizationContext,
+    previous_response: &Value,
+    correction_context: &Value,
+) -> String {
+    format!(
+        "Your previous avionics normalization response was valid JSON but failed validation.\n\
+Return one complete corrected JSON object that satisfies the same schema and replaces the previous response.\n\
+Do not return a patch. Do not include markdown, comments, nulls, or extra keys.\n\n\
+Validation details:\n{}\n\n\
+Critical coverage rule:\n\
+- Every input id must appear exactly once across source_ids.\n\
+- Any input row that is not a duplicate must be included as a singleton group.\n\
+- Do not omit unchanged singleton rows.\n\n\
+Specific correction instructions:\n\
+- For every row listed in missing_rows, add its id exactly once to the full replacement response.\n\
+- If a missing row is an exact duplicate of a group already in previous_response, add that id to that group.\n\
+- If a missing row is not an exact duplicate, create a singleton group for it using that row's current manufacturer, avionics_type, and model as the canonical values.\n\
+- If repeated_ids is non-empty, remove the duplicate occurrence and leave each repeated id in exactly one best-fitting group.\n\
+- If unexpected_ids is non-empty, remove those ids because they were not in the input.\n\n\
+Original task and input:\n{}\n\n\
+Previous response:\n{}",
+        serde_json::to_string_pretty(correction_context).unwrap(),
+        build_avionics_normalization_prompt(context),
+        serde_json::to_string_pretty(previous_response).unwrap()
     )
 }
 
@@ -974,6 +1411,22 @@ fn gemini_variant_confirmation_response_schema() -> Value {
     })
 }
 
+fn gemini_variant_label_correction_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "corrected_variant": {"type": "string"},
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"]
+            },
+            "rationale": {"type": "string"}
+        },
+        "required": ["corrected_variant", "confidence", "rationale"],
+        "propertyOrdering": ["corrected_variant", "confidence", "rationale"],
+    })
+}
+
 fn gemini_variant_normalization_response_schema() -> Value {
     json!({
         "type": "object",
@@ -1020,6 +1473,112 @@ fn gemini_avionics_metadata_response_schema() -> Value {
     })
 }
 
+fn gemini_avionics_unit_resolution_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["concrete", "factory_default", "reject"]
+            },
+            "manufacturer": {"type": "string"},
+            "model": {"type": "string"},
+            "type": {
+                "type": "string",
+                "enum": [
+                    "GPS",
+                    "NAV/COM",
+                    "Transponder",
+                    "Autopilot",
+                    "Integrated Flight Deck",
+                    "Audio Panel",
+                    "Flight Display",
+                    "Traffic",
+                    "Datalink",
+                    "Engine Monitor",
+                    "Standby Instrument",
+                    "Unknown"
+                ]
+            },
+            "quantity": {"type": "integer"},
+            "introduced_year": {"type": "integer"},
+            "estimated_unit_value_usd": {"type": "number"},
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"]
+            },
+            "source_url": {"type": "string"},
+            "source_title": {"type": "string"},
+            "notes": {"type": "string"}
+        },
+        "required": [
+            "status",
+            "manufacturer",
+            "model",
+            "type",
+            "quantity",
+            "introduced_year",
+            "estimated_unit_value_usd",
+            "confidence",
+            "source_url",
+            "source_title",
+            "notes"
+        ],
+        "propertyOrdering": [
+            "status",
+            "manufacturer",
+            "model",
+            "type",
+            "quantity",
+            "introduced_year",
+            "estimated_unit_value_usd",
+            "confidence",
+            "source_url",
+            "source_title",
+            "notes"
+        ],
+    })
+}
+
+fn gemini_avionics_unit_concreteness_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": ["concrete", "generic", "ambiguous"]
+            },
+            "manufacturer_is_avionics_maker": {"type": "boolean"},
+            "model_identifies_single_unit": {"type": "boolean"},
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"]
+            },
+            "generic_indicators": {
+                "type": "array",
+                "items": {"type": "string"}
+            },
+            "notes": {"type": "string"}
+        },
+        "required": [
+            "classification",
+            "manufacturer_is_avionics_maker",
+            "model_identifies_single_unit",
+            "confidence",
+            "generic_indicators",
+            "notes"
+        ],
+        "propertyOrdering": [
+            "classification",
+            "manufacturer_is_avionics_maker",
+            "model_identifies_single_unit",
+            "confidence",
+            "generic_indicators",
+            "notes"
+        ],
+    })
+}
+
 fn gemini_avionics_normalization_response_schema() -> Value {
     json!({
         "type": "object",
@@ -1029,6 +1588,8 @@ fn gemini_avionics_normalization_response_schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "canonical_manufacturer": {"type": "string"},
+                        "canonical_type": {"type": "string"},
                         "canonical_model": {"type": "string"},
                         "source_ids": {
                             "type": "array",
@@ -1036,8 +1597,8 @@ fn gemini_avionics_normalization_response_schema() -> Value {
                         },
                         "rationale": {"type": "string"}
                     },
-                    "required": ["canonical_model", "source_ids", "rationale"],
-                    "propertyOrdering": ["canonical_model", "source_ids", "rationale"]
+                    "required": ["canonical_manufacturer", "canonical_type", "canonical_model", "source_ids", "rationale"],
+                    "propertyOrdering": ["canonical_manufacturer", "canonical_type", "canonical_model", "source_ids", "rationale"]
                 }
             }
         },
