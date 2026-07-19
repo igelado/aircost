@@ -2,7 +2,7 @@
 
 Tools for modeling aircraft depreciation and ownership costs.
 
-This first pass implements a market-value estimator from the aircraft's new purchase price, age, airframe hours, engine time, and propeller time. It is not a certified appraisal. Real appraisals need make/model/year comparable sales, logs, damage history, avionics, paint/interior, maintenance programs, and local market conditions.
+This first pass implements a market-value estimator from the aircraft's new purchase price, age, airframe hours, engine time, propeller time, and installed avionics. It is not a certified appraisal. Real appraisals need make/model/year comparable sales, logs, damage history, paint/interior, maintenance programs, and local market conditions.
 
 ## Model
 
@@ -12,6 +12,7 @@ The estimator uses a hybrid market-residual and maintenance-status model:
 2. Estimate an age-based baseline residual value using a profile-specific exponential decay curve with a long-run residual floor.
 3. Adjust that baseline for airframe hours relative to expected fleet utilization. The default piston-aircraft curve is calibrated to the public AOPA/Vref example where 20% above average airframe time reduced value by about 3%, and double average time reduced value by about 13%.
 4. Adjust engine and propeller value relative to the half-life convention used by aircraft price guides: a mid-time component is neutral, fresh overhaul adds value, run-out deducts value, and deduction is capped at run-out.
+5. Add installed avionics as separate depreciating components. Each avionics model stores an introduction year and reference equipment value, then depreciates on its own electronics curve so a newer panel can lift the value of an older airframe.
 
 The most accurate version of this model would use model-specific market baselines from Aircraft Bluebook, VREF, aircraft listing/sale data, or an appraiser's database. Without those comparables, this script exposes the assumptions as inputs so the curve can be calibrated per aircraft family.
 
@@ -94,6 +95,26 @@ python3 scripts/compare_purchase_rent_invest.py \
 ```
 
 The comparison reports the net position of each strategy over time. In the rent-and-invest case, yearly rental costs are withdrawn from the invested purchase price. Details are in [docs/purchase_vs_rent_invest.md](docs/purchase_vs_rent_invest.md).
+
+## Web Application
+
+Run the SQLx-backed Rust web app:
+
+```bash
+cargo run --bin aircost-web
+```
+
+The server uses axum, tokio, eoka, reqwest, and sqlx. It exposes listing
+preview, listing CRUD, and Chrome extension submission endpoints. Details are in
+[docs/webapp.md](docs/webapp.md).
+
+Avionics metadata enrichment uses Gemini to fill missing avionics introduction
+years and equipment values:
+
+```bash
+GEMINI_API_KEY=... cargo run --bin aircost-admin -- enrich-avionics --limit 10 --dry-run
+GEMINI_API_KEY=... cargo run --bin aircost-admin -- enrich-avionics --limit 10 --apply
+```
 
 ## Research Basis
 

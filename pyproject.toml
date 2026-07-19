@@ -3,8 +3,13 @@ name = "aircost"
 version = "0.1.0"
 description = "Aircraft depreciation and ownership cost modeling scripts."
 requires-python = ">=3.10"
+dependencies = [
+  "certifi>=2024.8.30",
+  "requests>=2.32.0",
+]
 
 [project.scripts]
+aircost-webapp = "aircost.webapp.server:main"
 compare-purchase-rent-invest = "aircost.cli.compare_purchase_rent_invest:main"
 estimate-aircraft-price = "aircost.cli.estimate_aircraft_price:main"
 project-aircraft-costs = "aircost.cli.project_aircraft_costs:main"
@@ -14,3 +19,6 @@ validate-depreciation-model = "aircost.cli.validate_depreciation_model:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["aircost*"]
