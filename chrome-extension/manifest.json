@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "AirCost Listing Capture",
+  "version": "0.1.0",
+  "description": "Submit rendered aircraft listing HTML to a local AirCost server.",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AirCost"
+  }
+}

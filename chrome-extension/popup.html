@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AirCost</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <section id="setup-view" class="view">
+      <h1>AirCost</h1>
+      <label>
+        Server
+        <input id="server-url" type="url" value="http://127.0.0.1:8001">
+      </label>
+      <label>
+        Username
+        <input id="username" type="text" value="developer">
+      </label>
+      <button id="register-button" type="button">Register</button>
+    </section>
+
+    <section id="capture-view" class="view hidden">
+      <header>
+        <h1>AirCost</h1>
+        <button id="reset-button" type="button">Reset</button>
+      </header>
+      <dl>
+        <dt>Server</dt>
+        <dd id="configured-server"></dd>
+        <dt>User</dt>
+        <dd id="configured-user"></dd>
+        <dt>Install</dt>
+        <dd id="configured-install"></dd>
+      </dl>
+      <button id="submit-button" type="button">Submit Page</button>
+    </section>
+
+    <pre id="status"></pre>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -4,4 +4,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.egg-info/
 *.swp
+*.sqlite3
+/.cargo/
+/target/

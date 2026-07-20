@@ -16,10 +16,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
       - name: Run unit tests
-        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest
+        run: cargo test
+
+      - name: Check build
+        run: cargo check
