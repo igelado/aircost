@@ -1,12 +1,22 @@
 {
   "manifest_version": 3,
   "name": "AirCost Listing Capture",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Submit rendered aircraft listing HTML to a local AirCost server.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": ["http://*/*", "https://*/*"],
+  "icons": {
+    "16": "icons/aircost-16.png",
+    "32": "icons/aircost-32.png",
+    "48": "icons/aircost-48.png",
+    "128": "icons/aircost-128.png"
+  },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "AirCost"
+    "default_title": "AirCost",
+    "default_icon": {
+      "16": "icons/aircost-16.png",
+      "32": "icons/aircost-32.png"
+    }
   }
 }
