@@ -148,6 +148,7 @@ impl From<CleanupError> for ListingStoreError {
 }
 
 type StoreResult<T> = Result<T, ListingStoreError>;
+pub type ListingProgressSender = tokio::sync::mpsc::UnboundedSender<Value>;
 #[cfg(test)]
 const MODEL_SIMILARITY_CONFIRMATION_THRESHOLD: f64 = 0.65;
 const MODEL_FAMILY_CANDIDATE_THRESHOLD: f64 = 0.35;
@@ -353,8 +354,34 @@ pub async fn create_listing(
     original_listing: Option<&Value>,
     extractor: Option<&GeminiListingExtractor>,
 ) -> StoreResult<SaleListing> {
+    create_listing_with_progress(db, user_id, preview, original_listing, extractor, None).await
+}
+
+pub async fn create_listing_with_progress(
+    db: &AppDb,
+    user_id: i64,
+    preview: &ListingPreview,
+    original_listing: Option<&Value>,
+    extractor: Option<&GeminiListingExtractor>,
+    progress: Option<&ListingProgressSender>,
+) -> StoreResult<SaleListing> {
+    emit_listing_progress(
+        progress,
+        "verifying_listing",
+        "Verifying extracted listing fields",
+    );
     let mut values = values_from_preview(preview, original_listing)?;
+    emit_listing_progress(
+        progress,
+        "normalizing_aircraft",
+        "Normalizing aircraft model and variant",
+    );
     canonicalize_aircraft_model_and_variant(db, &mut values, preview, extractor).await?;
+    emit_listing_progress(
+        progress,
+        "normalizing_avionics",
+        "Normalizing avionics units",
+    );
     resolve_listing_avionics_values(
         db,
         &mut values,
@@ -368,7 +395,13 @@ pub async fn create_listing(
         if let Some(listing_id) =
             unverified_listing_id_for_tail(db, user_id, registration_number).await?
         {
+            emit_listing_progress(progress, "saving_listing", "Updating existing listing");
             update_listing_values(db, listing_id, &values, true).await?;
+            emit_listing_progress(
+                progress,
+                "refreshing_estimates",
+                "Refreshing valuation inputs",
+            );
             complete_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
                 .await?;
             return get_listing(db, user_id, listing_id).await;
@@ -376,15 +409,37 @@ pub async fn create_listing(
     }
 
     if let Some(listing_id) = matching_verified_listing_id(db, &values).await? {
+        emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
         refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
+        emit_listing_progress(
+            progress,
+            "refreshing_estimates",
+            "Refreshing valuation inputs",
+        );
         complete_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
             .await?;
         return get_listing(db, user_id, listing_id).await;
     }
 
+    emit_listing_progress(progress, "saving_listing", "Saving listing");
     let listing_id = insert_listing(db, user_id, &values).await?;
+    emit_listing_progress(
+        progress,
+        "refreshing_estimates",
+        "Refreshing valuation inputs",
+    );
     complete_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
     get_listing(db, user_id, listing_id).await
+}
+
+fn emit_listing_progress(progress: Option<&ListingProgressSender>, stage: &str, message: &str) {
+    if let Some(progress) = progress {
+        let _ = progress.send(json!({
+            "stage": stage,
+            "status": "running",
+            "message": message,
+        }));
+    }
 }
 
 pub async fn heal_aircraft_models(

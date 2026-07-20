@@ -4,12 +4,13 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use ring::digest;
 use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{parse_listing_html, validate_source_url, GeminiListingExtractor};
-use crate::listings::{create_listing, ListingStoreError};
+use crate::listings::{create_listing_with_progress, ListingStoreError};
 use crate::models::{
     ListingPreview, PluginInstall, PluginSubmission, PluginSubmissionRequest, SaleListing, User,
 };
@@ -92,12 +93,20 @@ impl From<ListingStoreError> for PluginStoreError {
 }
 
 type StoreResult<T> = Result<T, PluginStoreError>;
+pub type PluginProgressSender = tokio::sync::mpsc::UnboundedSender<Value>;
 
 #[derive(Debug)]
 pub struct PluginSubmissionOutcome {
     pub submission: PluginSubmission,
     pub preview: Option<ListingPreview>,
     pub listing: Option<SaleListing>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PluginUrlStatus {
+    pub submitted: bool,
+    pub submission: Option<PluginSubmission>,
+    pub listing_id: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -119,6 +128,11 @@ struct PluginSubmissionHtmlRow {
     id: i64,
     source_url: String,
     rendered_html: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ListingIdRow {
+    id: i64,
 }
 
 pub async fn register_plugin_install(
@@ -149,6 +163,21 @@ pub async fn submit_plugin_html(
     request: &PluginSubmissionRequest,
     extractor: Option<&GeminiListingExtractor>,
 ) -> StoreResult<PluginSubmissionOutcome> {
+    submit_plugin_html_with_progress(db, user, request, extractor, None).await
+}
+
+pub async fn submit_plugin_html_with_progress(
+    db: &AppDb,
+    user: &User,
+    request: &PluginSubmissionRequest,
+    extractor: Option<&GeminiListingExtractor>,
+    progress: Option<&PluginProgressSender>,
+) -> StoreResult<PluginSubmissionOutcome> {
+    emit_plugin_progress(
+        progress,
+        "verifying_upload",
+        "Verifying upload request and signature",
+    );
     validate_submission_request(request)?;
     let install = plugin_install_for_user(db, user.id, request.plugin_install_id).await?;
     let rendered_html_sha256 = sha256_hex(request.rendered_html.as_bytes());
@@ -167,10 +196,24 @@ pub async fn submit_plugin_html(
     let mut canonical_listing_id = None;
 
     if let Some(extractor) = extractor {
+        emit_plugin_progress(
+            progress,
+            "extracting_listing",
+            "Extracting listing data from page",
+        );
         match parse_listing_html(&request.source_url, &request.rendered_html, extractor).await {
             Ok(parsed_preview) => {
                 extracted_listing_json = Some(json!(parsed_preview.parsed_listing));
-                match create_listing(db, user.id, &parsed_preview, None, Some(extractor)).await {
+                match create_listing_with_progress(
+                    db,
+                    user.id,
+                    &parsed_preview,
+                    None,
+                    Some(extractor),
+                    progress,
+                )
+                .await
+                {
                     Ok(created_listing) => {
                         canonical_listing_id = Some(created_listing.id);
                         listing = Some(created_listing);
@@ -190,6 +233,11 @@ pub async fn submit_plugin_html(
             Some("GEMINI_API_KEY must be set to extract plugin submissions".to_string());
     }
 
+    emit_plugin_progress(
+        progress,
+        "recording_submission",
+        "Recording plugin submission",
+    );
     let submission = insert_plugin_submission(
         db,
         user.id,
@@ -211,6 +259,50 @@ pub async fn submit_plugin_html(
     })
 }
 
+pub async fn plugin_url_status(
+    db: &AppDb,
+    user: &User,
+    source_url: &str,
+) -> StoreResult<PluginUrlStatus> {
+    validate_source_url(source_url)?;
+    let submission = query_as_optional!(
+        db,
+        PluginSubmissionRow,
+        r#"
+        SELECT
+          id,
+          user_id,
+          plugin_install_id,
+          source_url,
+          submitted_at,
+          rendered_html_sha256,
+          signature_base64,
+          extracted_listing_json,
+          extraction_error,
+          canonical_listing_id
+        FROM plugin_submissions
+        WHERE user_id = ? AND source_url = ?
+        ORDER BY submitted_at DESC, id DESC
+        LIMIT 1
+        "#,
+        user.id,
+        source_url
+    )?;
+    let submission = submission.map(plugin_submission_from_row).transpose()?;
+    let listing_id = match submission
+        .as_ref()
+        .and_then(|submission| submission.canonical_listing_id)
+    {
+        Some(listing_id) => Some(listing_id),
+        None => latest_listing_id_for_source_url(db, user.id, source_url).await?,
+    };
+    Ok(PluginUrlStatus {
+        submitted: submission.is_some() || listing_id.is_some(),
+        submission,
+        listing_id,
+    })
+}
+
 pub async fn reprocess_plugin_submission(
     db: &AppDb,
     user: &User,
@@ -228,7 +320,16 @@ pub async fn reprocess_plugin_submission(
         match parse_listing_html(&stored.source_url, &stored.rendered_html, extractor).await {
             Ok(parsed_preview) => {
                 extracted_listing_json = Some(json!(parsed_preview.parsed_listing));
-                match create_listing(db, user.id, &parsed_preview, None, Some(extractor)).await {
+                match create_listing_with_progress(
+                    db,
+                    user.id,
+                    &parsed_preview,
+                    None,
+                    Some(extractor),
+                    None,
+                )
+                .await
+                {
                     Ok(created_listing) => {
                         canonical_listing_id = Some(created_listing.id);
                         listing = Some(created_listing);
@@ -263,6 +364,38 @@ pub async fn reprocess_plugin_submission(
         preview,
         listing,
     })
+}
+
+async fn latest_listing_id_for_source_url(
+    db: &AppDb,
+    user_id: i64,
+    source_url: &str,
+) -> StoreResult<Option<i64>> {
+    let row = query_as_optional!(
+        db,
+        ListingIdRow,
+        r#"
+        SELECT id
+        FROM aircraft_sale_listings
+        WHERE source_url = ?
+          AND (is_verified = TRUE OR created_by_user_id = ?)
+        ORDER BY added_at DESC, id DESC
+        LIMIT 1
+        "#,
+        source_url,
+        user_id
+    )?;
+    Ok(row.map(|row| row.id))
+}
+
+fn emit_plugin_progress(progress: Option<&PluginProgressSender>, stage: &str, message: &str) {
+    if let Some(progress) = progress {
+        let _ = progress.send(json!({
+            "stage": stage,
+            "status": "running",
+            "message": message,
+        }));
+    }
 }
 
 pub fn signature_message(

@@ -4,9 +4,9 @@
 
 body {
   margin: 0;
-  width: 320px;
+  width: 430px;
   color: #17202a;
-  background: #f7f9fb;
+  background: #f6f8fa;
   font: 13px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -14,31 +14,47 @@ main {
   padding: 14px;
 }
 
-h1 {
-  margin: 0 0 12px;
+h1,
+h2 {
+  margin: 0;
   font-size: 16px;
   font-weight: 650;
 }
 
-header {
+h2 {
+  font-size: 14px;
+}
+
+header,
+.status-row,
+.section-heading,
+.fieldset-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
 
+.header-actions {
+  display: flex;
+  gap: 6px;
+}
+
 label {
   display: block;
-  margin: 10px 0;
+  min-width: 0;
   font-weight: 600;
 }
 
-input {
+input,
+select {
   width: 100%;
+  min-width: 0;
   margin-top: 4px;
-  padding: 8px;
+  padding: 7px;
   border: 1px solid #c7d0d9;
   border-radius: 6px;
+  background: #fff;
   font: inherit;
 }
 
@@ -59,20 +75,26 @@ button:disabled {
   opacity: 0.55;
 }
 
-#reset-button {
+.ghost-button,
+.icon-button {
   width: auto;
-  min-height: 28px;
-  padding: 0 10px;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0 9px;
   color: #176b87;
   background: transparent;
   border: 1px solid #8bb3c2;
 }
 
-dl {
+.icon-button {
+  font-weight: 750;
+}
+
+.config-list {
   display: grid;
-  grid-template-columns: 62px 1fr;
+  grid-template-columns: 56px 1fr;
   gap: 4px 8px;
-  margin: 4px 0 12px;
+  margin: 10px 0 12px;
 }
 
 dt {
@@ -84,8 +106,149 @@ dd {
   overflow-wrap: anywhere;
 }
 
+.panel {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #d7e0e7;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.status-pill {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-pill.is-submitted {
+  color: #115c2f;
+  background: #e5f6ec;
+  border-color: #b9dfc8;
+}
+
+.status-pill.is-new {
+  color: #6a4a00;
+  background: #fff4cf;
+  border-color: #edd384;
+}
+
+.status-pill.is-error {
+  color: #8b1d1d;
+  background: #fde7e7;
+  border-color: #efb7b7;
+}
+
+.status-pill.is-unknown {
+  color: #4f5b66;
+  background: #eef2f5;
+  border-color: #cdd8df;
+}
+
+.current-url {
+  margin-top: 8px;
+  color: #52616c;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.progress-list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.progress-list:empty {
+  display: none;
+}
+
+.progress-list li {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 5px 0;
+  color: #52616c;
+}
+
+.progress-list li::before {
+  width: 10px;
+  height: 10px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: #c5d0d8;
+  content: "";
+}
+
+.progress-list li.is-running::before {
+  background: #176b87;
+}
+
+.progress-list li.is-complete::before {
+  background: #20824d;
+}
+
+.progress-list li.is-error::before {
+  background: #c53d3d;
+}
+
+.progress-title {
+  display: block;
+  color: #17202a;
+  font-weight: 650;
+}
+
+.progress-message {
+  display: block;
+  font-size: 12px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.avionics-fieldset {
+  margin: 12px 0;
+  padding: 10px 0 0;
+  border: 0;
+  border-top: 1px solid #d7e0e7;
+}
+
+.fieldset-heading {
+  margin-bottom: 8px;
+  font-weight: 700;
+}
+
+.avionics-list {
+  display: grid;
+  gap: 8px;
+}
+
+.avionics-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1.2fr 1fr 54px 30px;
+  gap: 6px;
+  align-items: end;
+}
+
+.avionics-row .icon-button {
+  height: 32px;
+  min-width: 30px;
+  padding: 0;
+}
+
+#listing-id-label {
+  color: #52616c;
+  font-size: 12px;
+}
+
 pre {
-  max-height: 190px;
+  max-height: 150px;
   overflow: auto;
   margin: 12px 0 0;
   padding: 8px;
