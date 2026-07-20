@@ -80,6 +80,27 @@ Stores generic component model parameters. Engine and propeller use
 `baseline_life_fraction`; avionics use an age decay rate and long-run residual
 fraction.
 
+`valuation_snapshots`, `valuation_snapshot_rows`
+
+Freeze the listing-only training contract, selection policy, duplicate groups,
+row hashes, included and excluded records, and authoritative feature JSON.
+Snapshot rows retain copied source listing IDs rather than cascading from live
+listings.
+
+`valuation_model_versions`, `valuation_model_artifacts`,
+`valuation_fold_predictions`
+
+Store candidate/active/retired structural or DNN versions, hash-verified
+artifacts, and grouped held-out predictions. Only one version of each model
+kind can be active. Activation verifies validation gates and the artifact hash,
+then retires the previous active version and activates the candidate in one
+transaction.
+
+`valuation_refresh_state`
+
+Records that listing mutations have made the latest frozen snapshot stale.
+Listing writes no longer trigger an implicit best-effort model refit.
+
 Rental tables (`rental_clubs`, `rental_club_cost_versions`,
 `rental_aircraft_offerings`, `rental_rate_versions`) are separate roots that can
 also reference aircraft variants.
@@ -168,6 +189,18 @@ cargo run --bin aircost-admin -- fit-depreciation --dry-run
 ```
 
 Use `--apply` only after reviewing the report.
+
+Listing-only valuation is an explicit staged workflow:
+
+```bash
+cargo run --bin aircost-admin -- snapshot-valuations --max-age-days 180 --apply
+cargo run --bin aircost-admin -- fit-valuation --kind structural --snapshot-id ID --apply
+cargo run --bin aircost-admin -- validate-valuation --model-version-id ID
+cargo run --bin aircost-admin -- activate-valuation --model-version-id ID
+```
+
+Snapshotting and fitting default to dry run. Fitting persists only a candidate;
+activation always requires a separate command.
 
 ## Schema Design Rules
 

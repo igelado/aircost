@@ -376,6 +376,11 @@ function renderAircraftDetail() {
   renderAircraftParams(detail);
   renderAircraftChart(detail);
   renderAircraftValueTable(detail);
+  const listingOnly = (detail.listings || []).some((listing) => listing.valuation_model_kind);
+  elements.aircraftAnnualHours.disabled = listingOnly;
+  elements.aircraftAnnualHours.title = listingOnly
+    ? "Future utilization is learned from the frozen listing snapshot."
+    : "Set projected annual airframe hours.";
   const listingCount = detail.listings?.length || 0;
   setAircraftMessage(detail.message || `${listingCount} listing values modeled.`);
 }
@@ -388,6 +393,30 @@ function clearAircraftDetail() {
 }
 
 function renderAircraftParams(detail) {
+  const valuation = (detail.listings || []).find((listing) => listing.valuation_model_kind);
+  if (valuation) {
+    const breakdown = valuation.valuation_breakdown || {};
+    elements.aircraftParams.replaceChildren(
+      paramRow("Model", valuation.valuation_model_kind),
+      paramRow(
+        "Model version",
+        valuation.valuation_model_version_id > 0
+          ? String(valuation.valuation_model_version_id)
+          : "snapshot fallback",
+      ),
+      paramRow("Snapshot", String(valuation.valuation_snapshot_id ?? "-")),
+      paramRow("Support", titleCase(valuation.valuation_support || "low")),
+      paramRow("Estimated range", formatEstimateRange(valuation)),
+      paramRow("Global anchor", formatCurrency(breakdown.global_anchor_usd, "USD")),
+      paramRow("Age factor", formatPercent(breakdown.age_factor, 1)),
+      paramRow("Expected hours", formatUnit(breakdown.expected_airframe_hours, "h", 0)),
+      paramRow("Hours factor", formatPercent(breakdown.hours_factor, 1)),
+      paramRow("Manufacturer factor", formatPercent(breakdown.manufacturer_factor, 1)),
+      paramRow("Model factor", formatPercent(breakdown.model_factor, 1)),
+      paramRow("Variant factor", formatPercent(breakdown.variant_factor, 1)),
+    );
+    return;
+  }
   const spec = detail.spec;
   if (!spec) {
     elements.aircraftParams.replaceChildren(paramRow("Status", "Spec metadata missing"));
@@ -701,7 +730,27 @@ function aircraftValueRow(listing, detail) {
 
 function estimateCell(listing) {
   if (Number.isFinite(finiteNumber(listing.estimated_value_usd))) {
-    return textCell(formatCurrency(listing.estimated_value_usd, "USD"));
+    const cell = document.createElement("td");
+    cell.className = "estimate-cell";
+    const value = document.createElement("strong");
+    value.textContent = formatCurrency(listing.estimated_value_usd, "USD");
+    cell.append(value);
+    if (
+      Number.isFinite(finiteNumber(listing.estimated_value_low_usd)) &&
+      Number.isFinite(finiteNumber(listing.estimated_value_high_usd))
+    ) {
+      const range = document.createElement("small");
+      range.textContent = formatEstimateRange(listing);
+      cell.append(range);
+    }
+    if (listing.valuation_support) {
+      const support = document.createElement("span");
+      support.className = `support-pill support-${listing.valuation_support}`;
+      support.textContent = titleCase(listing.valuation_support);
+      support.title = `${titleCase(listing.valuation_support)} comparable support`;
+      cell.append(support);
+    }
+    return cell;
   }
   const cell = textCell(listing.estimate_error ? "Error" : "-");
   if (listing.estimate_error) {
@@ -740,6 +789,7 @@ function renderAircraftChart(detail) {
       ),
   );
   const valuationYear = aircraftValuationYear(detail);
+  const listingOnly = listings.some((listing) => listing.valuation_model_kind);
   const askPoints = listings
     .map((listing) => ({
       listing,
@@ -776,7 +826,9 @@ function renderAircraftChart(detail) {
     ...curvePoints.map((point) => point.year),
     ...askPoints.map((point) => point.year),
     ...estimatePoints.map((point) => point.year),
-    ...listings.map((listing) => finiteNumber(listing.model_year)).filter(Number.isFinite),
+    ...(listingOnly
+      ? []
+      : listings.map((listing) => finiteNumber(listing.model_year)).filter(Number.isFinite)),
     valuationYear,
   );
   const xMax = Math.max(
@@ -837,6 +889,20 @@ function renderAircraftChart(detail) {
   }
 
   drawLegend(svg, margin.left + 8, margin.top + 8);
+}
+
+function formatEstimateRange(listing) {
+  const low = finiteNumber(listing.estimated_value_low_usd);
+  const high = finiteNumber(listing.estimated_value_high_usd);
+  if (!Number.isFinite(low) || !Number.isFinite(high)) {
+    return "-";
+  }
+  return `${formatCurrency(low, "USD")} – ${formatCurrency(high, "USD")}`;
+}
+
+function titleCase(value) {
+  const text = String(value || "");
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "";
 }
 
 function renderEmptyChart(message) {

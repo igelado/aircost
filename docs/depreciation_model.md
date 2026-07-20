@@ -8,6 +8,32 @@ web-app estimates are computed from the Rust code in `src/aircraft.rs`,
 The model estimates asking-market value. It is not a certified appraisal and it
 does not try to model tax depreciation.
 
+## Listing-Only Valuation
+
+The serving successor is implemented under `src/valuation/`. It freezes a
+deduplicated snapshot of active USD listings, fits a pooled log-price model,
+and persists a versioned artifact before activation. The bounded shared curve
+is:
+
+```text
+R(age) = floor + (1 - floor) * exp(-decay * age)
+```
+
+Manufacturer, model, and variant log-price offsets are ridge-shrunk toward the
+global anchor. A shared non-positive coefficient adjusts for total airframe
+hours relative to a robust listing-derived age-hours trend. The first artifact
+does not use new-price records, inflation, TBO, overhaul cost, or assigned
+avionics values.
+
+Grouped out-of-fold residuals calibrate a multiplicative error range and a
+high/medium/low support grade. Projections cover horizons zero through thirty,
+hold today's market scale constant, and advance hours at a utilization rate
+learned from the snapshot. If no structural artifact is active, the newest
+valid snapshot serves an adjusted-comparable weighted-median fallback.
+
+The older estimator documented below remains available for compatibility and
+operating-cost metadata, but it is not an input to a listing-only estimate.
+
 ## Identity Levels
 
 Aircraft identity is split into three levels:

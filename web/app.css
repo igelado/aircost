@@ -820,6 +820,41 @@ label span,
   font-weight: 700;
 }
 
+.estimate-cell strong,
+.estimate-cell small {
+  display: block;
+  white-space: nowrap;
+}
+
+.estimate-cell small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.support-pill {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.support-high {
+  border-color: #86efac;
+  color: #166534;
+}
+
+.support-medium {
+  border-color: #fde68a;
+  color: #854d0e;
+}
+
 .placeholder-panel p {
   margin: 0;
 }

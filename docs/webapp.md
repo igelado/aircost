@@ -29,6 +29,12 @@ The same header also accepts the dev auth subject:
 X-User-Email: developer
 ```
 
+At startup the server loads one hash-verified structural valuation artifact
+into shared application state. If no artifact is active, it builds the
+adjusted-comparable fallback from the newest frozen snapshot. A corrupt active
+artifact fails startup rather than creating or repairing weights during a
+request.
+
 ## Listing Preview
 
 Preview parsing fetches or normalizes listing data without writing anything to
@@ -273,3 +279,9 @@ When adding a listing with the same tail number:
   the verified row.
 - If a verified listing for that tail has different values, the API creates a
   new unverified row with the new values.
+
+Listing estimate responses include the point estimate, low/high range,
+estimated error fraction, support grade, model kind/version, snapshot ID,
+listing-only factor breakdown, and a constant-today-dollar value curve for
+horizons zero through thirty. The listing-only path does not require aircraft
+spec metadata or a model-year new-price record.

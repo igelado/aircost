@@ -18,7 +18,6 @@ use crate::extract::{
     ModelFamilyConfirmationContext, VariantConfirmationContext, VariantLabelCorrectionContext,
     VariantNormalizationCandidate, VariantNormalizationContext, VariantNormalizationExample,
 };
-use crate::fit::fit_depreciation_profile_for_model;
 use crate::models::{AircraftSummary, ListingPreview, ParsedAvionics, SaleListing};
 use crate::normalize::{is_usable_avionics_label, normalize_avionics_model_name, normalize_name};
 
@@ -155,7 +154,6 @@ const MODEL_FAMILY_CANDIDATE_THRESHOLD: f64 = 0.35;
 const MODEL_FAMILY_CANDIDATE_LIMIT: usize = 5;
 const VARIANT_SIMILARITY_CONFIRMATION_THRESHOLD: f64 = 0.35;
 const KNOWN_VARIANT_CANDIDATE_LIMIT: usize = 5;
-const DEPRECIATION_REFIT_MIN_MODEL_SAMPLES: usize = 4;
 const AVIONICS_VALUE_REFERENCE_YEAR: i64 = 2026;
 
 #[derive(Clone, Debug)]
@@ -718,7 +716,7 @@ pub async fn update_listing(
     complete_listing_ingestion(db, listing_id, extractor, None).await?;
     let updated = get_listing(db, user_id, listing_id).await?;
     if updated.aircraft.aircraft_model_id != old_model_id {
-        refit_depreciation_profile_for_model_best_effort(db, old_model_id).await;
+        mark_valuation_snapshot_stale_best_effort(db, old_model_id).await;
     }
     cleanup_orphan_records(db).await?;
     Ok(updated)
@@ -736,7 +734,7 @@ pub async fn delete_listing(db: &AppDb, user_id: i64, listing_id: i64) -> StoreR
         listing_id
     )?;
     if let Some(model_id) = model_id {
-        refit_depreciation_profile_for_model_best_effort(db, model_id).await;
+        mark_valuation_snapshot_stale_best_effort(db, model_id).await;
     }
     cleanup_orphan_records(db).await?;
     Ok(())
@@ -2532,7 +2530,7 @@ async fn complete_listing_ingestion(
         let _ = normalize_avionics_models(db, true).await;
     }
     if let Ok(Some(identity)) = listing_aircraft_identity(db, listing_id).await {
-        refit_depreciation_profile_for_model_best_effort(db, identity.aircraft_model_id).await;
+        mark_valuation_snapshot_stale_best_effort(db, identity.aircraft_model_id).await;
     }
     let _ = cleanup_orphan_records(db).await;
     Ok(())
@@ -2625,15 +2623,25 @@ fn model_variants_need_normalization(variants: &[ModelVariantRow]) -> bool {
     })
 }
 
-async fn refit_depreciation_profile_for_model_best_effort(db: &AppDb, aircraft_model_id: i64) {
-    let _ = fit_depreciation_profile_for_model(
-        db,
-        aircraft_model_id,
-        true,
-        DEPRECIATION_REFIT_MIN_MODEL_SAMPLES,
-        None,
-    )
-    .await;
+async fn mark_valuation_snapshot_stale_best_effort(db: &AppDb, aircraft_model_id: i64) {
+    let sql = db.sql(
+        r#"
+        INSERT INTO valuation_refresh_state (id, listings_changed_at, reason)
+        VALUES (1, CURRENT_TIMESTAMP, ?)
+        ON CONFLICT (id) DO UPDATE SET
+          listings_changed_at = CURRENT_TIMESTAMP,
+          reason = excluded.reason
+        "#,
+    );
+    let reason = format!("listing mutation affected aircraft model {aircraft_model_id}");
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let _ = sqlx::query(&sql).bind(&reason).execute(pool).await;
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let _ = sqlx::query(&sql).bind(&reason).execute(pool).await;
+        }
+    }
 }
 
 fn values_match_i64(left: i64, right: i64) -> bool {

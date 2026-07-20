@@ -318,6 +318,80 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics (
   UNIQUE (aircraft_sale_listing_id, avionics_model_id)
 );
 
+CREATE TABLE IF NOT EXISTS valuation_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  capture_time TEXT NOT NULL,
+  input_sha256 TEXT NOT NULL UNIQUE,
+  selection_policy_json TEXT NOT NULL,
+  feature_schema_version INTEGER NOT NULL,
+  included_count INTEGER NOT NULL,
+  excluded_count INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS valuation_snapshot_rows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_id INTEGER NOT NULL REFERENCES valuation_snapshots(id) ON DELETE CASCADE,
+  source_listing_id INTEGER NOT NULL,
+  duplicate_group_key TEXT NOT NULL,
+  inclusion_flag INTEGER NOT NULL CHECK (inclusion_flag IN (0, 1)),
+  exclusion_reason TEXT,
+  feature_json TEXT NOT NULL,
+  target_price_usd REAL,
+  row_sha256 TEXT NOT NULL,
+  UNIQUE (snapshot_id, source_listing_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_valuation_snapshot_rows_snapshot_inclusion
+  ON valuation_snapshot_rows (snapshot_id, inclusion_flag, source_listing_id);
+
+CREATE TABLE IF NOT EXISTS valuation_model_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  snapshot_id INTEGER NOT NULL REFERENCES valuation_snapshots(id),
+  model_kind TEXT NOT NULL CHECK (model_kind IN ('structural', 'dnn')),
+  artifact_format_version INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('candidate', 'active', 'retired')),
+  metrics_json TEXT NOT NULL,
+  configuration_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_valuation_model_versions_one_active_kind
+  ON valuation_model_versions (model_kind) WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS valuation_model_artifacts (
+  model_version_id INTEGER NOT NULL
+    REFERENCES valuation_model_versions(id) ON DELETE CASCADE,
+  artifact_name TEXT NOT NULL,
+  artifact_bytes BLOB NOT NULL,
+  sha256 TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  PRIMARY KEY (model_version_id, artifact_name)
+);
+
+CREATE TABLE IF NOT EXISTS valuation_fold_predictions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_version_id INTEGER NOT NULL
+    REFERENCES valuation_model_versions(id) ON DELETE CASCADE,
+  fold_id TEXT NOT NULL,
+  duplicate_group_key TEXT NOT NULL,
+  source_listing_id INTEGER NOT NULL,
+  actual_price_usd REAL NOT NULL,
+  predicted_price_usd REAL NOT NULL,
+  log_error REAL NOT NULL,
+  absolute_percentage_error REAL NOT NULL,
+  support_grade TEXT NOT NULL CHECK (support_grade IN ('low', 'medium', 'high'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_valuation_fold_predictions_model
+  ON valuation_fold_predictions (model_version_id, fold_id);
+
+CREATE TABLE IF NOT EXISTS valuation_refresh_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  listings_changed_at TEXT NOT NULL,
+  reason TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rental_clubs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_by_user_id INTEGER NOT NULL REFERENCES users(id),
