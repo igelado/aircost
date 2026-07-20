@@ -243,45 +243,7 @@ async fn plugin_submission_stream_handler(
     Json(payload): Json<PluginSubmissionRequest>,
 ) -> Result<Response, ApiError> {
     let user = load_current_user(&state.db, &headers).await?;
-    let db = state.db.clone();
-    let extractor = state.extractor.clone();
-    let valuation_model = state.valuation_model.clone();
-    let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
-
-    tokio::spawn(async move {
-        let _ = progress_sender.send(json!({
-            "stage": "received_upload",
-            "status": "running",
-            "message": "Received upload",
-        }));
-        let result = submit_plugin_html_with_progress(
-            &db,
-            &user,
-            &payload,
-            extractor.as_ref(),
-            Some(&progress_sender),
-        )
-        .await;
-        match result {
-            Ok(outcome) => {
-                let mut response =
-                    plugin_submission_response(&db, valuation_model.as_ref(), user, outcome).await;
-                if let Some(object) = response.as_object_mut() {
-                    object.insert("stage".to_string(), json!("complete"));
-                    object.insert("status".to_string(), json!("complete"));
-                    object.insert("message".to_string(), json!("Upload complete"));
-                }
-                let _ = progress_sender.send(response);
-            }
-            Err(error) => {
-                let _ = progress_sender.send(json!({
-                    "stage": "error",
-                    "status": "error",
-                    "message": error.to_string(),
-                }));
-            }
-        }
-    });
+    let progress_receiver = start_plugin_submission_job(state, user, payload);
 
     let stream = UnboundedReceiverStream::new(progress_receiver).map(|event| {
         let line = match serde_json::to_string(&event) {
@@ -303,6 +265,69 @@ async fn plugin_submission_stream_handler(
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(Body::from_stream(stream))
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?)
+}
+
+/// Starts server-owned processing after Axum has received and authenticated the
+/// complete upload. The returned receiver only observes progress: dropping it
+/// (for example, when the extension popup closes) does not own or cancel the
+/// spawned job.
+fn start_plugin_submission_job(
+    state: AppState,
+    user: User,
+    payload: PluginSubmissionRequest,
+) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+    let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    tokio::spawn(async move {
+        run_plugin_submission_job(state, user, payload, progress_sender).await;
+    });
+
+    progress_receiver
+}
+
+async fn run_plugin_submission_job(
+    state: AppState,
+    user: User,
+    payload: PluginSubmissionRequest,
+    progress_sender: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
+    let _ = progress_sender.send(json!({
+        "stage": "received_upload",
+        "status": "running",
+        "message": "Received upload",
+    }));
+    let result = submit_plugin_html_with_progress(
+        &state.db,
+        &user,
+        &payload,
+        state.extractor.as_ref(),
+        Some(&progress_sender),
+    )
+    .await;
+    match result {
+        Ok(outcome) => {
+            let mut response = plugin_submission_response(
+                &state.db,
+                state.valuation_model.as_ref(),
+                user,
+                outcome,
+            )
+            .await;
+            if let Some(object) = response.as_object_mut() {
+                object.insert("stage".to_string(), json!("complete"));
+                object.insert("status".to_string(), json!("complete"));
+                object.insert("message".to_string(), json!("Upload complete"));
+            }
+            let _ = progress_sender.send(response);
+        }
+        Err(error) => {
+            let _ = progress_sender.send(json!({
+                "stage": "error",
+                "status": "error",
+                "message": error.to_string(),
+            }));
+        }
+    }
 }
 
 async fn reprocess_plugin_submission_handler(
@@ -624,3 +649,73 @@ impl From<anyhow::Error> for ApiError {
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
+
+#[cfg(test)]
+mod tests {
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
+    use ring::rand::SystemRandom;
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+
+    use super::{start_plugin_submission_job, AppState};
+    use crate::db::AppDb;
+    use crate::models::PluginSubmissionRequest;
+    use crate::plugin::{
+        plugin_url_status, register_plugin_install, sha256_hex, signature_message,
+    };
+
+    #[tokio::test]
+    async fn background_upload_survives_progress_disconnect() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let public_key_base64 = BASE64_STANDARD.encode(key_pair.public_key().as_ref());
+        let install = register_plugin_install(&db, &user, &public_key_base64)
+            .await
+            .unwrap();
+        let source_url = "https://example.test/disconnected-progress";
+        let rendered_html = "<html><body>aircraft listing</body></html>";
+        let rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
+        let message = signature_message(install.id, source_url, &rendered_html_sha256);
+        let signature = key_pair.sign(&rng, message.as_bytes()).unwrap();
+        let request = PluginSubmissionRequest {
+            plugin_install_id: install.id,
+            source_url: source_url.to_string(),
+            rendered_html: rendered_html.to_string(),
+            signature: BASE64_STANDARD.encode(signature.as_ref()),
+        };
+        let progress = start_plugin_submission_job(
+            AppState {
+                db: db.clone(),
+                extractor: None,
+                valuation_model: None,
+            },
+            user.clone(),
+            request,
+        );
+
+        // Model the browser closing the extension popup immediately after the
+        // server accepts the upload and returns its progress response.
+        drop(progress);
+
+        let mut completed = None;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            let status = plugin_url_status(&db, &user, source_url).await.unwrap();
+            if status.submission.is_some() {
+                completed = Some(status);
+                break;
+            }
+        }
+        let completed = completed.expect("background upload should finish after disconnect");
+        assert!(completed.submitted);
+        assert!(completed
+            .submission
+            .and_then(|submission| submission.extraction_error)
+            .is_some_and(|error| error.contains("GEMINI_API_KEY")));
+    }
+}
