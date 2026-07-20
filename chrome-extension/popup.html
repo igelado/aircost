@@ -9,122 +9,165 @@
 <body>
   <main>
     <section id="setup-view" class="view">
-      <h1>AirCost</h1>
-      <label>
-        Server
-        <input id="server-url" type="url" value="http://127.0.0.1:8001">
-      </label>
-      <label>
-        Username
-        <input id="username" type="text" value="developer">
-      </label>
-      <button id="register-button" type="button">Register</button>
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">A</span>
+        <div>
+          <h1>Connect AirCost</h1>
+          <p>Capture aircraft listings from your browser.</p>
+        </div>
+      </div>
+      <div class="panel setup-panel">
+        <label>
+          AirCost server
+          <input id="server-url" type="url" value="http://127.0.0.1:8001" autocomplete="url">
+        </label>
+        <label>
+          Username
+          <input id="username" type="text" value="developer" autocomplete="username">
+        </label>
+        <button id="register-button" type="button">Connect browser</button>
+      </div>
+      <div id="setup-notice" class="notice hidden" role="status" aria-live="polite"></div>
     </section>
 
     <section id="capture-view" class="view hidden">
-      <header>
-        <h1>AirCost</h1>
+      <header class="app-header">
+        <div class="brand-lockup compact">
+          <span class="brand-mark" aria-hidden="true">A</span>
+          <h1>AirCost</h1>
+        </div>
         <div class="header-actions">
-          <button id="refresh-status-button" class="icon-button" type="button" aria-label="Refresh listing status" title="Refresh listing status">R</button>
-          <button id="reset-button" class="ghost-button" type="button">Reset</button>
+          <button id="refresh-status-button" class="icon-button" type="button" aria-label="Refresh listing status" title="Refresh listing status">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+          </button>
+          <button id="settings-button" class="icon-button" type="button" aria-label="Open connection settings" title="Connection settings" aria-expanded="false" aria-controls="settings-panel">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.56V21h-4v-.08A1.7 1.7 0 0 0 9 19.37a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.63 15 1.7 1.7 0 0 0 3.08 14H3v-4h.08A1.7 1.7 0 0 0 4.63 9a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.63h.01A1.7 1.7 0 0 0 10 3.08V3h4v.08A1.7 1.7 0 0 0 15 4.63a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.37 9v.01A1.7 1.7 0 0 0 20.92 10H21v4h-.08A1.7 1.7 0 0 0 19.4 15Z"/></svg>
+          </button>
         </div>
       </header>
 
-      <dl class="config-list">
-        <dt>Server</dt>
-        <dd id="configured-server"></dd>
-        <dt>User</dt>
-        <dd id="configured-user"></dd>
-        <dt>Install</dt>
-        <dd id="configured-install"></dd>
-      </dl>
+      <div class="connection-row">
+        <span class="connection-dot" aria-hidden="true"></span>
+        <span>Connected to AirCost</span>
+      </div>
 
-      <section class="panel">
-        <div class="status-row">
-          <span id="submission-badge" class="status-pill is-unknown">Checking</span>
-          <button id="submit-button" type="button">Submit Page</button>
+      <section id="settings-panel" class="panel settings-panel hidden" aria-labelledby="settings-heading">
+        <div class="section-heading">
+          <h2 id="settings-heading">Connection</h2>
+          <button id="reset-button" class="text-button danger" type="button">Reset connection</button>
         </div>
-        <div id="current-url" class="current-url"></div>
+        <dl class="config-list">
+          <dt>Server</dt><dd id="configured-server"></dd>
+          <dt>User</dt><dd id="configured-user"></dd>
+          <dt>Install</dt><dd id="configured-install"></dd>
+        </dl>
       </section>
 
-      <ol id="progress-list" class="progress-list" aria-live="polite"></ol>
+      <section class="page-card" aria-labelledby="page-hostname">
+        <div class="page-heading">
+          <div class="page-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6M8 13h8M8 17h6"/></svg>
+          </div>
+          <div class="page-copy">
+            <h2 id="page-hostname">Current page</h2>
+            <p id="current-url" class="current-url">Checking active tab…</p>
+          </div>
+          <span id="submission-badge" class="status-pill is-unknown">Checking</span>
+        </div>
 
-      <section id="listing-editor" class="panel hidden">
+        <div id="new-page-actions" class="page-actions hidden">
+          <button id="submit-button" type="button">Add to AirCost</button>
+        </div>
+
+        <div id="existing-entry" class="existing-entry hidden">
+          <div class="existing-summary">
+            <span class="success-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="m7 12 3 3 7-7"/></svg>
+            </span>
+            <div>
+              <strong id="existing-entry-title">Already in AirCost</strong>
+              <span id="existing-entry-meta"></span>
+            </div>
+          </div>
+          <div class="button-row">
+            <button id="edit-listing-button" class="secondary-button" type="button" aria-expanded="false" aria-controls="listing-editor">Edit details</button>
+            <button id="refresh-page-button" class="text-button" type="button">Refresh from page</button>
+          </div>
+        </div>
+      </section>
+
+      <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+      <div id="recovery-actions" class="recovery-actions hidden">
+        <button id="retry-upload-button" class="secondary-button hidden" type="button">Retry upload</button>
+        <button id="retry-status-button" class="secondary-button hidden" type="button">Refresh status</button>
+        <button id="reprocess-button" class="secondary-button hidden" type="button">Reprocess extraction</button>
+      </div>
+
+      <details id="workflow-details" class="workflow-card hidden">
+        <summary id="workflow-summary">Processing details</summary>
+        <div class="pipeline-wrap">
+          <ol id="pipeline" class="pipeline" aria-label="Listing processing progress">
+            <li data-pipeline-stage="capture"><span class="pipeline-marker" aria-hidden="true"></span><span>Capture</span></li>
+            <li data-pipeline-stage="verify"><span class="pipeline-marker" aria-hidden="true"></span><span>Verify</span></li>
+            <li data-pipeline-stage="analyze"><span class="pipeline-marker" aria-hidden="true"></span><span>Analyze</span></li>
+            <li data-pipeline-stage="normalize"><span class="pipeline-marker" aria-hidden="true"></span><span>Normalize</span></li>
+            <li data-pipeline-stage="save"><span class="pipeline-marker" aria-hidden="true"></span><span>Save</span></li>
+          </ol>
+          <div id="active-stage" class="active-stage" aria-live="polite">
+            <span id="active-stage-eyebrow">Preparing</span>
+            <strong id="active-stage-title">Ready to capture</strong>
+            <p id="active-stage-message">The listing will be securely sent to AirCost.</p>
+          </div>
+          <details class="technical-details">
+            <summary>Technical details</summary>
+            <ol id="technical-progress" class="technical-progress"></ol>
+          </details>
+        </div>
+      </details>
+
+      <section id="listing-editor" class="panel listing-editor hidden" aria-labelledby="listing-editor-heading">
         <div class="section-heading">
-          <h2>Listing</h2>
-          <span id="listing-id-label"></span>
+          <div>
+            <h2 id="listing-editor-heading">Listing details</h2>
+            <span id="listing-id-label"></span>
+          </div>
+          <button id="close-editor-button" class="icon-button" type="button" aria-label="Close listing editor" title="Close editor">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
         </div>
         <form id="listing-editor-form">
           <div class="form-grid">
-            <label>
-              Manufacturer
-              <input name="manufacturer" required autocomplete="off">
-            </label>
-            <label>
-              Model
-              <input name="model" required autocomplete="off">
-            </label>
-            <label>
-              Variant
-              <input name="variant" required autocomplete="off">
-            </label>
-            <label>
-              Year
-              <input name="model_year" type="number" min="1900" max="2039" step="1" required>
-            </label>
-            <label>
-              Ask
-              <input name="asking_price_usd" type="number" min="0" step="1000" required>
-            </label>
-            <label>
-              Currency
-              <input name="currency" maxlength="3" required>
-            </label>
-            <label>
-              Status
-              <select name="status">
-                <option value="active">Active</option>
-                <option value="pending">Pending</option>
-                <option value="sold">Sold</option>
-                <option value="unknown">Unknown</option>
-              </select>
-            </label>
-            <label>
-              Tail
-              <input name="registration_number" autocomplete="off">
-            </label>
-            <label>
-              Serial
-              <input name="serial_number" autocomplete="off">
-            </label>
-            <label>
-              Airframe h
-              <input name="airframe_hours" type="number" min="0" step="0.1" required>
-            </label>
-            <label>
-              Engine h
-              <input name="engine_hours" type="number" min="0" step="0.1" required>
-            </label>
-            <label>
-              Prop h
-              <input name="propeller_hours" type="number" min="0" step="0.1" required>
-            </label>
+            <label>Manufacturer<input name="manufacturer" required autocomplete="off"></label>
+            <label>Model<input name="model" required autocomplete="off"></label>
+            <label>Variant<input name="variant" required autocomplete="off"></label>
+            <label>Year<input name="model_year" type="number" min="1900" max="2039" step="1" required></label>
+            <label>Ask<input name="asking_price_usd" type="number" min="0" step="1000" required></label>
+            <label>Currency<input name="currency" maxlength="3" required></label>
+            <label>Status<select name="status"><option value="active">Active</option><option value="pending">Pending</option><option value="sold">Sold</option><option value="unknown">Unknown</option></select></label>
+            <label>Tail<input name="registration_number" autocomplete="off"></label>
+            <label>Serial<input name="serial_number" autocomplete="off"></label>
+            <label>Airframe h<input name="airframe_hours" type="number" min="0" step="0.1" required></label>
+            <label>Engine h<input name="engine_hours" type="number" min="0" step="0.1" required></label>
+            <label>Prop h<input name="propeller_hours" type="number" min="0" step="0.1" required></label>
           </div>
 
-          <fieldset class="avionics-fieldset">
+          <fieldset class="avionics-fieldset" aria-labelledby="avionics-heading">
             <div class="fieldset-heading">
-              <span>Avionics</span>
-              <button class="icon-button" id="add-avionics-button" type="button" aria-label="Add avionics" title="Add avionics">+</button>
+              <span id="avionics-heading">Avionics</span>
+              <button class="icon-button" id="add-avionics-button" type="button" aria-label="Add avionics" title="Add avionics">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+              </button>
             </div>
             <div id="avionics-list" class="avionics-list"></div>
           </fieldset>
 
-          <button id="save-listing-button" type="submit">Save Listing</button>
+          <div class="editor-actions">
+            <button id="cancel-listing-button" class="secondary-button" type="button">Cancel</button>
+            <button id="save-listing-button" type="submit">Save changes</button>
+          </div>
         </form>
       </section>
     </section>
-
-    <pre id="status"></pre>
   </main>
   <script src="popup.js"></script>
 </body>
