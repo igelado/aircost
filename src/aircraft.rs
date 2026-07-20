@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -15,6 +16,10 @@ use crate::extract::{
 };
 use crate::html_clean::clean_listing_html_with_limit;
 use crate::normalize::normalize_name;
+use crate::valuation::{
+    ComponentObservation, ComponentTimeBasis, SupportGrade, ValuationBreakdown, ValuationModel,
+    ValuationQuery,
+};
 
 const DEFAULT_VALUE_REFERENCE_YEAR: i64 = 2026;
 // Rounded long-run CPI-U average over roughly the last 20 completed years.
@@ -189,6 +194,8 @@ struct AircraftSpecVersionRow {
 #[derive(Debug, FromRow)]
 struct AircraftListingPointRow {
     id: i64,
+    manufacturer_id: i64,
+    model_id: i64,
     aircraft_model_variant_id: i64,
     is_verified: bool,
     source_url: Option<String>,
@@ -202,6 +209,13 @@ struct AircraftListingPointRow {
     airframe_hours: f64,
     engine_hours: f64,
     propeller_hours: f64,
+}
+
+#[derive(Debug, FromRow)]
+struct ListingEquipmentTokenRow {
+    manufacturer: String,
+    model: String,
+    quantity: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -360,6 +374,14 @@ pub struct AircraftListingValuePoint {
     pub engine_hours: f64,
     pub propeller_hours: f64,
     pub estimated_value_usd: Option<f64>,
+    pub estimated_value_low_usd: Option<f64>,
+    pub estimated_value_high_usd: Option<f64>,
+    pub estimated_error_fraction: Option<f64>,
+    pub valuation_support: Option<SupportGrade>,
+    pub valuation_model_kind: Option<String>,
+    pub valuation_model_version_id: Option<i64>,
+    pub valuation_snapshot_id: Option<i64>,
+    pub valuation_breakdown: Option<ValuationBreakdown>,
     pub estimate_error: Option<String>,
     pub breakdown: Option<AircraftValueBreakdown>,
     pub value_curve: Vec<AircraftValueCurvePoint>,
@@ -399,6 +421,13 @@ pub struct AircraftValueCurvePoint {
     pub engine_hours: f64,
     pub propeller_hours: f64,
     pub estimated_value_usd: Option<f64>,
+    pub estimated_value_low_usd: Option<f64>,
+    pub estimated_value_high_usd: Option<f64>,
+    pub depreciation_usd: Option<f64>,
+    pub depreciation_fraction: Option<f64>,
+    pub one_year_depreciation_fraction: Option<f64>,
+    pub estimated_error_fraction: Option<f64>,
+    pub valuation_support: Option<SupportGrade>,
     pub estimate_error: Option<String>,
 }
 
@@ -486,6 +515,17 @@ pub async fn aircraft_variant_detail(
     variant_id: i64,
     curve_annual_airframe_hours: Option<f64>,
 ) -> StoreResult<AircraftVariantDetail> {
+    aircraft_variant_detail_with_model(db, user_id, variant_id, curve_annual_airframe_hours, None)
+        .await
+}
+
+pub async fn aircraft_variant_detail_with_model(
+    db: &AppDb,
+    user_id: i64,
+    variant_id: i64,
+    curve_annual_airframe_hours: Option<f64>,
+    valuation_model: Option<&Arc<dyn ValuationModel>>,
+) -> StoreResult<AircraftVariantDetail> {
     let option = aircraft_option_for_variant(db, user_id, variant_id).await?;
     let spec_row = aircraft_spec_for_variant(db, option.model_id, variant_id).await?;
     let spec = spec_row.as_ref().map(spec_detail_from_row);
@@ -493,11 +533,23 @@ pub async fn aircraft_variant_detail(
     let rows = listing_points_for_variant(db, user_id, variant_id).await?;
     let mut listings = Vec::with_capacity(rows.len());
     for row in rows {
-        listings.push(listing_value_point(db, &row, spec_ref, curve_annual_airframe_hours).await?);
+        listings.push(
+            listing_value_point(
+                db,
+                &row,
+                spec_ref,
+                curve_annual_airframe_hours,
+                valuation_model.map(Arc::as_ref),
+            )
+            .await?,
+        );
     }
-    let message = match spec_ref {
-        Some(_) => None,
-        None => Some("Aircraft spec metadata has not been enriched for this variant.".to_string()),
+    let message = match (valuation_model, spec_ref) {
+        (Some(_), _) => None,
+        (None, Some(_)) => None,
+        (None, None) => {
+            Some("Aircraft spec metadata has not been enriched for this variant.".to_string())
+        }
     };
     Ok(AircraftVariantDetail {
         option,
@@ -512,12 +564,31 @@ pub async fn aircraft_listing_value(
     user_id: i64,
     listing_id: i64,
 ) -> StoreResult<AircraftListingValuePoint> {
+    aircraft_listing_value_with_model(db, user_id, listing_id, None).await
+}
+
+pub async fn aircraft_listing_value_with_model(
+    db: &AppDb,
+    user_id: i64,
+    listing_id: i64,
+    valuation_model: Option<&Arc<dyn ValuationModel>>,
+) -> StoreResult<AircraftListingValuePoint> {
     let row = listing_point_for_listing(db, user_id, listing_id)
         .await?
         .ok_or_else(|| AircraftStoreError::NotFound("listing not found".to_string()))?;
+    if valuation_model.is_some() {
+        return listing_value_point(db, &row, None, None, valuation_model.map(Arc::as_ref)).await;
+    }
     let option = aircraft_option_for_variant(db, user_id, row.aircraft_model_variant_id).await?;
     let spec_row = aircraft_spec_for_variant(db, option.model_id, option.variant_id).await?;
-    listing_value_point(db, &row, spec_row.as_ref(), None).await
+    listing_value_point(
+        db,
+        &row,
+        spec_row.as_ref(),
+        None,
+        valuation_model.map(Arc::as_ref),
+    )
+    .await
 }
 
 pub async fn enrich_aircraft_specs_from_plugin_submissions(
@@ -801,24 +872,31 @@ async fn listing_points_for_variant(
         AircraftListingPointRow,
         r#"
         SELECT
-          id,
-          aircraft_model_variant_id,
-          is_verified,
-          source_url,
-          model_year,
-          asking_price_usd,
-          currency,
-          added_at,
-          status,
-          registration_number,
-          serial_number,
-          airframe_hours,
-          engine_hours,
-          propeller_hours
-        FROM aircraft_sale_listings
-        WHERE aircraft_model_variant_id = ?
-          AND (is_verified = TRUE OR created_by_user_id = ?)
-        ORDER BY model_year, airframe_hours, id
+          listing.id,
+          manufacturer.id AS manufacturer_id,
+          model.id AS model_id,
+          listing.aircraft_model_variant_id,
+          listing.is_verified,
+          listing.source_url,
+          listing.model_year,
+          listing.asking_price_usd,
+          listing.currency,
+          listing.added_at,
+          listing.status,
+          listing.registration_number,
+          listing.serial_number,
+          listing.airframe_hours,
+          listing.engine_hours,
+          listing.propeller_hours
+        FROM aircraft_sale_listings listing
+        JOIN aircraft_model_variants variant
+          ON variant.id = listing.aircraft_model_variant_id
+        JOIN aircraft_models model ON model.id = variant.aircraft_model_id
+        JOIN aircraft_manufacturers manufacturer
+          ON manufacturer.id = model.aircraft_manufacturer_id
+        WHERE listing.aircraft_model_variant_id = ?
+          AND (listing.is_verified = TRUE OR listing.created_by_user_id = ?)
+        ORDER BY listing.model_year, listing.airframe_hours, listing.id
         "#,
         variant_id,
         user_id
@@ -835,23 +913,30 @@ async fn listing_point_for_listing(
         AircraftListingPointRow,
         r#"
         SELECT
-          id,
-          aircraft_model_variant_id,
-          is_verified,
-          source_url,
-          model_year,
-          asking_price_usd,
-          currency,
-          added_at,
-          status,
-          registration_number,
-          serial_number,
-          airframe_hours,
-          engine_hours,
-          propeller_hours
-        FROM aircraft_sale_listings
-        WHERE id = ?
-          AND (is_verified = TRUE OR created_by_user_id = ?)
+          listing.id,
+          manufacturer.id AS manufacturer_id,
+          model.id AS model_id,
+          listing.aircraft_model_variant_id,
+          listing.is_verified,
+          listing.source_url,
+          listing.model_year,
+          listing.asking_price_usd,
+          listing.currency,
+          listing.added_at,
+          listing.status,
+          listing.registration_number,
+          listing.serial_number,
+          listing.airframe_hours,
+          listing.engine_hours,
+          listing.propeller_hours
+        FROM aircraft_sale_listings listing
+        JOIN aircraft_model_variants variant
+          ON variant.id = listing.aircraft_model_variant_id
+        JOIN aircraft_models model ON model.id = variant.aircraft_model_id
+        JOIN aircraft_manufacturers manufacturer
+          ON manufacturer.id = model.aircraft_manufacturer_id
+        WHERE listing.id = ?
+          AND (listing.is_verified = TRUE OR listing.created_by_user_id = ?)
         "#,
         listing_id,
         user_id
@@ -863,6 +948,7 @@ async fn listing_value_point(
     row: &AircraftListingPointRow,
     spec: Option<&AircraftSpecVersionRow>,
     curve_annual_airframe_hours: Option<f64>,
+    valuation_model: Option<&dyn ValuationModel>,
 ) -> StoreResult<AircraftListingValuePoint> {
     let mut point = AircraftListingValuePoint {
         listing_id: row.id,
@@ -879,10 +965,83 @@ async fn listing_value_point(
         engine_hours: row.engine_hours,
         propeller_hours: row.propeller_hours,
         estimated_value_usd: None,
+        estimated_value_low_usd: None,
+        estimated_value_high_usd: None,
+        estimated_error_fraction: None,
+        valuation_support: None,
+        valuation_model_kind: None,
+        valuation_model_version_id: None,
+        valuation_snapshot_id: None,
+        valuation_breakdown: None,
         estimate_error: None,
         breakdown: None,
         value_curve: Vec::new(),
     };
+
+    if let Some(model) = valuation_model {
+        let valuation_year = year_from_date_prefix(&row.added_at).unwrap_or(2026);
+        let equipment_tokens = listing_equipment_tokens(db, row.id).await?;
+        let technical_field_count = 3
+            + u32::from(row.registration_number.is_some())
+            + u32::from(row.serial_number.is_some())
+            + u32::from(!equipment_tokens.is_empty());
+        let query = ValuationQuery {
+            category_key: None,
+            manufacturer_id: Some(row.manufacturer_id),
+            model_id: Some(row.model_id),
+            variant_id: Some(row.aircraft_model_variant_id),
+            model_year: row.model_year,
+            valuation_year,
+            airframe_hours: Some(row.airframe_hours),
+            engine_times: vec![ComponentObservation {
+                time_hours: Some(row.engine_hours),
+                basis: ComponentTimeBasis::Unknown,
+                count: 1,
+            }],
+            propeller_times: vec![ComponentObservation {
+                time_hours: Some(row.propeller_hours),
+                basis: ComponentTimeBasis::Unknown,
+                count: 1,
+            }],
+            equipment_tokens,
+            technical_field_count,
+        };
+        match model.estimate(&query) {
+            Ok(estimate) => {
+                point.estimated_value_usd = Some(estimate.estimated_value_usd);
+                point.estimated_value_low_usd = Some(estimate.low_value_usd);
+                point.estimated_value_high_usd = Some(estimate.high_value_usd);
+                point.estimated_error_fraction = Some(estimate.estimated_error_fraction);
+                point.valuation_support = Some(estimate.support);
+                point.valuation_model_kind = Some(estimate.model_kind);
+                point.valuation_model_version_id = Some(estimate.model_version_id);
+                point.valuation_snapshot_id = Some(estimate.snapshot_id);
+                point.valuation_breakdown = Some(estimate.breakdown);
+                point.value_curve = estimate
+                    .depreciation
+                    .into_iter()
+                    .map(|curve| AircraftValueCurvePoint {
+                        valuation_year: curve.valuation_year,
+                        age_years: curve.age_years,
+                        airframe_hours: curve.airframe_hours.unwrap_or(row.airframe_hours),
+                        engine_hours: row.engine_hours,
+                        propeller_hours: row.propeller_hours,
+                        estimated_value_usd: Some(curve.estimated_value_usd),
+                        estimated_value_low_usd: Some(curve.low_value_usd),
+                        estimated_value_high_usd: Some(curve.high_value_usd),
+                        depreciation_usd: Some(curve.depreciation_usd),
+                        depreciation_fraction: Some(curve.depreciation_fraction),
+                        one_year_depreciation_fraction: Some(curve.one_year_depreciation_fraction),
+                        estimated_error_fraction: Some(curve.estimated_error_fraction),
+                        valuation_support: Some(curve.support),
+                        estimate_error: None,
+                    })
+                    .collect();
+            }
+            Err(error) => point.estimate_error = Some(error.to_string()),
+        }
+        return Ok(point);
+    }
 
     let Some(spec) = spec else {
         point.estimate_error = Some("aircraft spec metadata missing".to_string());
@@ -1148,6 +1307,13 @@ fn listing_value_curve(
                     engine_hours,
                     propeller_hours,
                     estimated_value_usd: Some(estimate.estimated_value_usd),
+                    estimated_value_low_usd: None,
+                    estimated_value_high_usd: None,
+                    depreciation_usd: None,
+                    depreciation_fraction: None,
+                    one_year_depreciation_fraction: None,
+                    estimated_error_fraction: None,
+                    valuation_support: None,
                     estimate_error: None,
                 },
                 Err(error) => AircraftValueCurvePoint {
@@ -1157,6 +1323,13 @@ fn listing_value_curve(
                     engine_hours,
                     propeller_hours,
                     estimated_value_usd: None,
+                    estimated_value_low_usd: None,
+                    estimated_value_high_usd: None,
+                    depreciation_usd: None,
+                    depreciation_fraction: None,
+                    one_year_depreciation_fraction: None,
+                    estimated_error_fraction: None,
+                    valuation_support: None,
                     estimate_error: Some(error),
                 },
             }
@@ -1192,6 +1365,39 @@ async fn listing_avionics_estimates(
         "#,
         listing_id
     )?)
+}
+
+async fn listing_equipment_tokens(db: &AppDb, listing_id: i64) -> StoreResult<Vec<String>> {
+    let rows = query_as_all!(
+        db,
+        ListingEquipmentTokenRow,
+        r#"
+        SELECT
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          link.quantity
+        FROM aircraft_sale_listing_avionics link
+        JOIN avionics_models model ON model.id = link.avionics_model_id
+        JOIN avionics_manufacturers manufacturer
+          ON manufacturer.id = model.avionics_manufacturer_id
+        WHERE link.aircraft_sale_listing_id = ?
+          AND link.source = 'listing'
+        ORDER BY manufacturer.name, model.name
+        "#,
+        listing_id
+    )?;
+    let mut tokens = Vec::new();
+    for row in rows {
+        let token = format!(
+            "{}:{}",
+            normalize_name(&row.manufacturer),
+            normalize_name(&row.model)
+        );
+        for _ in 0..row.quantity.max(1) {
+            tokens.push(token.clone());
+        }
+    }
+    Ok(tokens)
 }
 
 async fn model_year_default_avionics_estimates(

@@ -333,6 +333,18 @@ pub fn expected_airframe_hours(age_years: f64, annual_airframe_hours: f64) -> f6
     }
 }
 
+/// Shared bounded age curve for listing-only valuation artifacts.
+///
+/// Callers are responsible for enforcing the persisted artifact bounds. This
+/// helper deliberately has no inflation, purchase-price, or component inputs.
+pub fn listing_only_age_residual_fraction(
+    age_years: f64,
+    long_run_floor: f64,
+    decay_rate: f64,
+) -> f64 {
+    long_run_floor + (1.0 - long_run_floor) * (-decay_rate * age_years.max(0.0)).exp()
+}
+
 pub fn airframe_utilization_factor(
     actual_hours: f64,
     expected_hours: f64,

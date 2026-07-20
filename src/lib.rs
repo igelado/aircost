@@ -11,3 +11,4 @@ pub mod models;
 pub mod normalize;
 pub mod plugin;
 pub mod server;
+pub mod valuation;

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
@@ -15,7 +16,8 @@ use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
 
 use crate::aircraft::{
-    aircraft_listing_value, aircraft_options, aircraft_variant_detail, AircraftStoreError,
+    aircraft_listing_value_with_model, aircraft_options, aircraft_variant_detail_with_model,
+    AircraftStoreError,
 };
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
@@ -30,6 +32,8 @@ use crate::plugin::{
     plugin_url_status, register_plugin_install, reprocess_plugin_submission, submit_plugin_html,
     submit_plugin_html_with_progress, PluginStoreError, PluginSubmissionOutcome,
 };
+use crate::valuation::store::load_serving_model;
+use crate::valuation::ValuationModel;
 
 pub struct ServerConfig {
     pub host: String,
@@ -41,6 +45,7 @@ pub struct ServerConfig {
 struct AppState {
     db: AppDb,
     extractor: Option<GeminiListingExtractor>,
+    valuation_model: Option<Arc<dyn ValuationModel>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,9 +60,11 @@ struct PluginSubmissionStatusQuery {
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
     let db = AppDb::connect(&config.database_url).await?;
+    let valuation_model = load_serving_model(&db).await?;
     let state = AppState {
         db,
         extractor: GeminiListingExtractor::from_environment().ok(),
+        valuation_model,
     };
     let app = router(state);
     let address = format!("{}:{}", config.host, config.port);
@@ -191,7 +198,8 @@ async fn plugin_submission_handler(
     let outcome = submit_plugin_html(&state.db, &user, &payload, state.extractor.as_ref())
         .await
         .map_err(ApiError::from)?;
-    let response = plugin_submission_response(&state.db, user, outcome).await;
+    let response =
+        plugin_submission_response(&state.db, state.valuation_model.as_ref(), user, outcome).await;
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }
 
@@ -210,9 +218,14 @@ async fn plugin_submission_status_handler(
         None => None,
     };
     let listing_estimate = match listing.as_ref() {
-        Some(listing) => aircraft_listing_value(&state.db, user.id, listing.id)
-            .await
-            .ok(),
+        Some(listing) => aircraft_listing_value_with_model(
+            &state.db,
+            user.id,
+            listing.id,
+            state.valuation_model.as_ref(),
+        )
+        .await
+        .ok(),
         None => None,
     };
     Ok(Json(json!({
@@ -232,6 +245,7 @@ async fn plugin_submission_stream_handler(
     let user = load_current_user(&state.db, &headers).await?;
     let db = state.db.clone();
     let extractor = state.extractor.clone();
+    let valuation_model = state.valuation_model.clone();
     let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
 
     tokio::spawn(async move {
@@ -250,7 +264,8 @@ async fn plugin_submission_stream_handler(
         .await;
         match result {
             Ok(outcome) => {
-                let mut response = plugin_submission_response(&db, user, outcome).await;
+                let mut response =
+                    plugin_submission_response(&db, valuation_model.as_ref(), user, outcome).await;
                 if let Some(object) = response.as_object_mut() {
                     object.insert("stage".to_string(), json!("complete"));
                     object.insert("status".to_string(), json!("complete"));
@@ -301,7 +316,7 @@ async fn reprocess_plugin_submission_handler(
             .await
             .map_err(ApiError::from)?;
     Ok(Json(
-        plugin_submission_response(&state.db, user, outcome).await,
+        plugin_submission_response(&state.db, state.valuation_model.as_ref(), user, outcome).await,
     ))
 }
 
@@ -323,9 +338,14 @@ async fn create_listing_handler(
     )
     .await
     .map_err(ApiError::from)?;
-    let listing_estimate = aircraft_listing_value(&state.db, user_for_response.id, listing.id)
-        .await
-        .ok();
+    let listing_estimate = aircraft_listing_value_with_model(
+        &state.db,
+        user_for_response.id,
+        listing.id,
+        state.valuation_model.as_ref(),
+    )
+    .await
+    .ok();
 
     Ok((
         StatusCode::CREATED,
@@ -376,9 +396,14 @@ async fn update_listing_handler(
     )
     .await
     .map_err(ApiError::from)?;
-    let listing_estimate = aircraft_listing_value(&state.db, user_for_response.id, listing.id)
-        .await
-        .ok();
+    let listing_estimate = aircraft_listing_value_with_model(
+        &state.db,
+        user_for_response.id,
+        listing.id,
+        state.valuation_model.as_ref(),
+    )
+    .await
+    .ok();
     Ok(Json(json!({
         "current_user": user_for_response,
         "listing": listing,
@@ -426,9 +451,15 @@ async fn aircraft_variant_detail_handler(
         }
         None => None,
     };
-    let detail = aircraft_variant_detail(&state.db, user.id, variant_id, annual_hours)
-        .await
-        .map_err(ApiError::from)?;
+    let detail = aircraft_variant_detail_with_model(
+        &state.db,
+        user.id,
+        variant_id,
+        annual_hours,
+        state.valuation_model.as_ref(),
+    )
+    .await
+    .map_err(ApiError::from)?;
     Ok(Json(json!({"current_user": user, "aircraft": detail})))
 }
 
@@ -492,11 +523,16 @@ fn user_email(headers: &HeaderMap) -> Option<String> {
 
 async fn plugin_submission_response(
     db: &AppDb,
+    valuation_model: Option<&Arc<dyn ValuationModel>>,
     user: User,
     outcome: PluginSubmissionOutcome,
 ) -> Value {
     let listing_estimate = match outcome.listing.as_ref() {
-        Some(listing) => aircraft_listing_value(db, user.id, listing.id).await.ok(),
+        Some(listing) => {
+            aircraft_listing_value_with_model(db, user.id, listing.id, valuation_model)
+                .await
+                .ok()
+        }
         None => None,
     };
     json!({
