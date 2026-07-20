@@ -44,6 +44,14 @@ URL preview mode uses the Gemini API. The server first converts listing HTML to
 compact plain text, then asks Gemini to return the listing fields as strict
 JSON. Manual JSON mode does not use Gemini.
 
+Plugin uploads are server-owned once the complete signed request has been
+received and authenticated. Closing the extension popup or otherwise dropping
+the streamed progress response stops only the live progress display; extraction,
+normalization, listing persistence, and valuation continue in the server task.
+Reopening the popup queries the stored submission and listing state. An upload
+interrupted before the complete request reaches the server must be retried, and
+in-flight work is not preserved across a server process restart.
+
 Set the API key in the environment before starting the server. For local
 development, load the key from `~/.keys/gemini.key`:
 
