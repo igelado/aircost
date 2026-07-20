@@ -170,6 +170,14 @@ pub async fn validate_model_version(
     db: &AppDb,
     model_version_id: i64,
 ) -> Result<StoredModelValidation, ValuationError> {
+    if model_kind(db, model_version_id).await?.as_deref() == Some("dnn") {
+        #[cfg(feature = "dnn")]
+        return super::dnn::validate_dnn_model_version(db, model_version_id).await;
+        #[cfg(not(feature = "dnn"))]
+        return Err(ValuationError::InvalidArtifact(
+            "DNN validation requires rebuilding with --features dnn".to_string(),
+        ));
+    }
     let row = load_artifact_row(db, model_version_id).await?;
     validate_stored_row(&row)
 }
@@ -178,6 +186,14 @@ pub async fn activate_model_version(
     db: &AppDb,
     model_version_id: i64,
 ) -> Result<StoredModelValidation, ValuationError> {
+    if model_kind(db, model_version_id).await?.as_deref() == Some("dnn") {
+        #[cfg(feature = "dnn")]
+        return super::dnn::activate_dnn_model_version(db, model_version_id).await;
+        #[cfg(not(feature = "dnn"))]
+        return Err(ValuationError::InvalidArtifact(
+            "DNN activation requires rebuilding with --features dnn".to_string(),
+        ));
+    }
     let select = db.sql(
         r#"
         SELECT
@@ -259,6 +275,12 @@ pub async fn activate_model_version(
 pub async fn load_serving_model(
     db: &AppDb,
 ) -> Result<Option<Arc<dyn ValuationModel>>, ValuationError> {
+    #[cfg(feature = "dnn")]
+    match super::dnn::load_active_dnn_model(db).await {
+        Ok(Some(model)) => return Ok(Some(model)),
+        Ok(None) => {}
+        Err(error) => eprintln!("active DNN artifact rejected; using structural fallback: {error}"),
+    }
     let active_id_sql =
         "SELECT id FROM valuation_model_versions WHERE model_kind = 'structural' AND state = 'active' ORDER BY id DESC LIMIT 1";
     let active_id = match db.backend() {
@@ -293,6 +315,30 @@ pub async fn load_serving_model(
         }
     }
     Ok(None)
+}
+
+pub async fn load_structural_model_version(
+    db: &AppDb,
+    model_version_id: i64,
+) -> Result<Arc<dyn ValuationModel>, ValuationError> {
+    let row = load_artifact_row(db, model_version_id).await?;
+    validate_stored_row(&row)?;
+    let artifact: StructuralArtifactV1 = serde_json::from_slice(&row.artifact_bytes)?;
+    Ok(Arc::new(StructuralModel::new(model_version_id, artifact)?))
+}
+
+async fn model_kind(db: &AppDb, model_version_id: i64) -> Result<Option<String>, ValuationError> {
+    let sql = db.sql("SELECT model_kind FROM valuation_model_versions WHERE id = ?");
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => Ok(sqlx::query_scalar::<_, String>(&sql)
+            .bind(model_version_id)
+            .fetch_optional(pool)
+            .await?),
+        DatabaseBackend::Postgres(pool) => Ok(sqlx::query_scalar::<_, String>(&sql)
+            .bind(model_version_id)
+            .fetch_optional(pool)
+            .await?),
+    }
 }
 
 async fn load_artifact_row(

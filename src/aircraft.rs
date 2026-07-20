@@ -981,6 +981,10 @@ async fn listing_value_point(
     if let Some(model) = valuation_model {
         let valuation_year = year_from_date_prefix(&row.added_at).unwrap_or(2026);
         let equipment_tokens = listing_equipment_tokens(db, row.id).await?;
+        let technical_field_count = 3
+            + u32::from(row.registration_number.is_some())
+            + u32::from(row.serial_number.is_some())
+            + u32::from(!equipment_tokens.is_empty());
         let query = ValuationQuery {
             category_key: None,
             manufacturer_id: Some(row.manufacturer_id),
@@ -1000,6 +1004,7 @@ async fn listing_value_point(
                 count: 1,
             }],
             equipment_tokens,
+            technical_field_count,
         };
         match model.estimate(&query) {
             Ok(estimate) => {

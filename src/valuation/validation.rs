@@ -35,6 +35,20 @@ pub struct FoldPrediction {
     pub support: SupportGrade,
 }
 
+impl FoldPrediction {
+    pub fn absolute_percentage_error(&self) -> f64 {
+        self.absolute_percentage_error
+    }
+
+    pub fn signed_percentage_error(&self) -> f64 {
+        self.signed_percentage_error
+    }
+
+    pub fn absolute_log_error(&self) -> f64 {
+        self.log_error
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ValidationMetrics {
     pub prediction_count: usize,
@@ -43,6 +57,25 @@ pub struct ValidationMetrics {
     pub q80_absolute_percentage_error: f64,
     pub log_rmse: f64,
     pub empirical_interval_coverage: f64,
+}
+
+impl ValidationMetrics {
+    pub fn from_predictions(predictions: &[FoldPrediction]) -> Result<Self, ValuationError> {
+        if predictions.is_empty()
+            || predictions.iter().any(|prediction| {
+                !prediction.actual_price_usd.is_finite()
+                    || prediction.actual_price_usd <= 0.0
+                    || !prediction.predicted_price_usd.is_finite()
+                    || prediction.predicted_price_usd <= 0.0
+            })
+        {
+            return Err(ValuationError::Fit(
+                "metrics need finite positive actual and predicted prices".to_string(),
+            ));
+        }
+        let bands = calibrate_error_bands(predictions);
+        Ok(metrics(predictions, bands.global.q80_abs_log_error))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -525,6 +558,16 @@ fn percentile(mut values: Vec<f64>, percentile: f64) -> f64 {
         .round()
         .clamp(0.0, (values.len() - 1) as f64) as usize;
     values[index]
+}
+
+pub fn quantile(sorted: &[f64], probability: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let position = probability.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower as f64)
 }
 
 #[cfg(test)]

@@ -11,7 +11,14 @@ use aircost_rs::db::{database_url_from_arg, DEFAULT_DATABASE_PATH};
 use aircost_rs::extract::GeminiListingExtractor;
 use aircost_rs::fit::{fit_depreciation_profiles, fit_structural_valuation};
 use aircost_rs::listings::{heal_aircraft_models, normalize_variants_for_model};
+#[cfg(feature = "dnn")]
+use aircost_rs::valuation::dataset::load_snapshot;
 use aircost_rs::valuation::dataset::{create_snapshot, SnapshotPolicy};
+#[cfg(feature = "dnn")]
+use aircost_rs::valuation::dnn::{
+    evaluate_candidate_gates, fit_dnn_candidate, persist_dnn_candidate, structural_baseline_config,
+    structural_baseline_id, DnnFitConfig,
+};
 use aircost_rs::valuation::store::{activate_model_version, validate_model_version};
 use anyhow::{bail, Context, Result};
 
@@ -161,12 +168,64 @@ async fn main() -> Result<()> {
         }
         AdminCommand::FitValuation {
             database,
+            kind,
             snapshot_id,
             apply,
+            maximum_epochs,
         } => {
             let db = aircost_rs::db::AppDb::connect(&database).await?;
-            let report = fit_structural_valuation(&db, snapshot_id, apply).await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            match kind.as_str() {
+                "structural" => {
+                    let report = fit_structural_valuation(&db, snapshot_id, apply).await?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                "dnn" => {
+                    #[cfg(not(feature = "dnn"))]
+                    {
+                        let _ = (db, snapshot_id, apply, maximum_epochs);
+                        bail!("DNN fitting requires rebuilding aircost-admin with --features dnn");
+                    }
+                    #[cfg(feature = "dnn")]
+                    {
+                        let rows = load_snapshot(&db, snapshot_id).await?;
+                        let baseline_model_version_id =
+                            structural_baseline_id(&db, snapshot_id).await?;
+                        let structural_fit_config =
+                            structural_baseline_config(&db, baseline_model_version_id).await?;
+                        let mut report = fit_dnn_candidate(
+                            &rows,
+                            &DnnFitConfig {
+                                snapshot_id,
+                                baseline_model_version_id,
+                                structural_fit_config,
+                                maximum_epochs,
+                                ..DnnFitConfig::default()
+                            },
+                        )?;
+                        let gate_report = evaluate_candidate_gates(&db, &report).await?;
+                        let persisted_model_version_id = if apply {
+                            Some(persist_dnn_candidate(&db, &mut report).await?)
+                        } else {
+                            None
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "snapshot_id": snapshot_id,
+                                "deduplicated_listings": report.artifact.metadata.group_counts.total,
+                                "capacity": report.artifact.metadata.capacity,
+                                "parameter_count_per_member": report.artifact.metadata.parameter_count_per_member,
+                                "training_schedule": report.artifact.metadata.training_schedule,
+                                "ensemble_metrics": report.metrics,
+                                "activation_gates": gate_report.activation_gates,
+                                "persisted_model_version_id": persisted_model_version_id,
+                                "dry_run": !apply,
+                            }))?
+                        );
+                    }
+                }
+                _ => bail!("unknown valuation model kind: {kind}"),
+            }
         }
         AdminCommand::ValidateValuation {
             database,
@@ -247,8 +306,10 @@ enum AdminCommand {
     },
     FitValuation {
         database: String,
+        kind: String,
         snapshot_id: i64,
         apply: bool,
+        maximum_epochs: usize,
     },
     ValidateValuation {
         database: String,
@@ -407,6 +468,7 @@ fn parse_fit_valuation_args(args: impl IntoIterator<Item = String>) -> Result<Ad
     let mut apply = false;
     let mut snapshot_id = None;
     let mut kind = None;
+    let mut maximum_epochs = 500_usize;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -424,6 +486,12 @@ fn parse_fit_valuation_args(args: impl IntoIterator<Item = String>) -> Result<Ad
                 );
             }
             "--kind" => kind = Some(args.next().context("--kind requires a value")?),
+            "--maximum-epochs" => {
+                let value = args.next().context("--maximum-epochs requires a value")?;
+                maximum_epochs = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --maximum-epochs value: {value}"))?;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -431,13 +499,12 @@ fn parse_fit_valuation_args(args: impl IntoIterator<Item = String>) -> Result<Ad
             _ => bail!("unknown fit-valuation argument: {arg}"),
         }
     }
-    if kind.as_deref().unwrap_or("structural") != "structural" {
-        bail!("this build supports only --kind structural");
-    }
     Ok(AdminCommand::FitValuation {
         database: database_url_from_arg(database),
+        kind: kind.unwrap_or_else(|| "structural".to_string()),
         snapshot_id: snapshot_id.context("--snapshot-id is required")?,
         apply,
+        maximum_epochs,
     })
 }
 
@@ -779,6 +846,6 @@ fn required_arg(value: Option<String>, name: &str) -> Result<String> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin normalize-variants --manufacturer Cirrus --model SR22 [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin heal-aircraft-models [--limit 100] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin normalize-avionics [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural --snapshot-id ID [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin normalize-variants --manufacturer Cirrus --model SR22 [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin heal-aircraft-models [--limit 100] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin normalize-avionics [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
     );
 }

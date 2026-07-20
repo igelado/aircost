@@ -1,0 +1,5 @@
+# Burn Flex's half-precision GEMM kernels use AArch64 FP16 instructions when
+# compiling on ARM. Restrict the flag to that target so normal x86 builds are
+# unchanged. The runtime serving tensors remain f32.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+fp16"]

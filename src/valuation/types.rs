@@ -20,6 +20,7 @@ fn one_component() -> i64 {
 pub enum ComponentTimeBasis {
     SinceNew,
     SinceOverhaul,
+    SinceInspection,
     TimeRemaining,
     #[default]
     Unknown,
@@ -40,6 +41,8 @@ pub struct ValuationQuery {
     pub propeller_times: Vec<ComponentObservation>,
     #[serde(default)]
     pub equipment_tokens: Vec<String>,
+    #[serde(default)]
+    pub technical_field_count: u32,
 }
 
 impl ValuationQuery {
@@ -75,6 +78,11 @@ impl ValuationQuery {
 
     pub fn age(&self) -> f64 {
         (self.valuation_year - self.model_year).max(0) as f64
+    }
+
+    pub fn age_years(&self) -> Result<f64, ValuationError> {
+        self.validate()?;
+        Ok(self.age())
     }
 }
 
@@ -169,7 +177,22 @@ impl TrainingListing {
             engine_times: self.engine_times.clone(),
             propeller_times: self.propeller_times.clone(),
             equipment_tokens: self.equipment_tokens.clone(),
+            technical_field_count: self.technical_field_count,
         }
+    }
+
+    pub fn query(&self) -> ValuationQuery {
+        self.as_query()
+    }
+
+    pub fn validate(&self) -> Result<(), ValuationError> {
+        if !self.asking_price_usd.is_finite() || self.asking_price_usd <= 0.0 {
+            return Err(ValuationError::Fit(format!(
+                "listing {} has an invalid USD asking price",
+                self.listing_id
+            )));
+        }
+        self.as_query().validate()
     }
 }
 
@@ -231,6 +254,15 @@ pub struct ErrorBands {
     pub manufacturers: BTreeMap<i64, ErrorBand>,
     pub models: BTreeMap<i64, ErrorBand>,
     pub variants: BTreeMap<i64, ErrorBand>,
+}
+
+impl ErrorBands {
+    pub fn q80(&self, support: SupportGrade) -> f64 {
+        self.by_support
+            .get(&support)
+            .unwrap_or(&self.global)
+            .q80_abs_log_error
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

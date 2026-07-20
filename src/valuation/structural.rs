@@ -857,6 +857,7 @@ mod tests {
             engine_times: vec![],
             propeller_times: vec![],
             equipment_tokens: vec![],
+            technical_field_count: 0,
         };
         let estimate = model.estimate(&query).unwrap();
         assert!(estimate.estimated_value_usd.is_finite());
@@ -900,6 +901,7 @@ mod tests {
             engine_times: vec![],
             propeller_times: vec![],
             equipment_tokens: vec![],
+            technical_field_count: 0,
         };
         let global = model.estimate(&base_query).unwrap().estimated_value_usd;
         let mut manufacturer_query = base_query.clone();

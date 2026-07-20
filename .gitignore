@@ -7,5 +7,6 @@ venv/
 *.egg-info/
 *.swp
 *.sqlite3
-/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 /target/

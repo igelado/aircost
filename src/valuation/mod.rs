@@ -5,6 +5,8 @@
 
 pub mod comparable;
 pub mod dataset;
+#[cfg(feature = "dnn")]
+pub mod dnn;
 pub mod store;
 pub mod structural;
 pub mod types;
