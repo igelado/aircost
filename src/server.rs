@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
+use std::convert::Infallible;
+
 use axum::{
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
@@ -8,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
 
 use crate::aircraft::{
@@ -23,8 +27,8 @@ use crate::models::{
     PreviewRequest, User,
 };
 use crate::plugin::{
-    register_plugin_install, reprocess_plugin_submission, submit_plugin_html, PluginStoreError,
-    PluginSubmissionOutcome,
+    plugin_url_status, register_plugin_install, reprocess_plugin_submission, submit_plugin_html,
+    submit_plugin_html_with_progress, PluginStoreError, PluginSubmissionOutcome,
 };
 
 pub struct ServerConfig {
@@ -42,6 +46,11 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct AircraftVariantQuery {
     annual_hours: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginSubmissionStatusQuery {
+    source_url: String,
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
@@ -71,6 +80,14 @@ fn router(state: AppState) -> Router {
         .route("/api/users/current", get(current_user_handler))
         .route("/api/plugin/register", post(register_plugin_handler))
         .route("/api/plugin/submissions", post(plugin_submission_handler))
+        .route(
+            "/api/plugin/submissions/status",
+            get(plugin_submission_status_handler),
+        )
+        .route(
+            "/api/plugin/submissions/stream",
+            post(plugin_submission_stream_handler),
+        )
         .route(
             "/api/plugin/submissions/{id}/reprocess",
             post(reprocess_plugin_submission_handler),
@@ -176,6 +193,101 @@ async fn plugin_submission_handler(
         .map_err(ApiError::from)?;
     let response = plugin_submission_response(&state.db, user, outcome).await;
     Ok((StatusCode::CREATED, Json(response)).into_response())
+}
+
+async fn plugin_submission_status_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PluginSubmissionStatusQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    let user_for_response = user.clone();
+    let status = plugin_url_status(&state.db, &user, &query.source_url)
+        .await
+        .map_err(ApiError::from)?;
+    let listing = match status.listing_id {
+        Some(listing_id) => get_listing(&state.db, user.id, listing_id).await.ok(),
+        None => None,
+    };
+    let listing_estimate = match listing.as_ref() {
+        Some(listing) => aircraft_listing_value(&state.db, user.id, listing.id)
+            .await
+            .ok(),
+        None => None,
+    };
+    Ok(Json(json!({
+        "current_user": user_for_response,
+        "submitted": status.submitted,
+        "submission": status.submission,
+        "listing": listing,
+        "listing_estimate": listing_estimate,
+    })))
+}
+
+async fn plugin_submission_stream_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<PluginSubmissionRequest>,
+) -> Result<Response, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    let db = state.db.clone();
+    let extractor = state.extractor.clone();
+    let (progress_sender, progress_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
+
+    tokio::spawn(async move {
+        let _ = progress_sender.send(json!({
+            "stage": "received_upload",
+            "status": "running",
+            "message": "Received upload",
+        }));
+        let result = submit_plugin_html_with_progress(
+            &db,
+            &user,
+            &payload,
+            extractor.as_ref(),
+            Some(&progress_sender),
+        )
+        .await;
+        match result {
+            Ok(outcome) => {
+                let mut response = plugin_submission_response(&db, user, outcome).await;
+                if let Some(object) = response.as_object_mut() {
+                    object.insert("stage".to_string(), json!("complete"));
+                    object.insert("status".to_string(), json!("complete"));
+                    object.insert("message".to_string(), json!("Upload complete"));
+                }
+                let _ = progress_sender.send(response);
+            }
+            Err(error) => {
+                let _ = progress_sender.send(json!({
+                    "stage": "error",
+                    "status": "error",
+                    "message": error.to_string(),
+                }));
+            }
+        }
+    });
+
+    let stream = UnboundedReceiverStream::new(progress_receiver).map(|event| {
+        let line = match serde_json::to_string(&event) {
+            Ok(serialized) => format!("{serialized}\n"),
+            Err(error) => format!(
+                "{}\n",
+                json!({
+                    "stage": "error",
+                    "status": "error",
+                    "message": format!("could not serialize progress event: {error}"),
+                })
+            ),
+        };
+        Ok::<Bytes, Infallible>(Bytes::from(line))
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::CREATED)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?)
 }
 
 async fn reprocess_plugin_submission_handler(

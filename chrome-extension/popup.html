@@ -24,9 +24,13 @@
     <section id="capture-view" class="view hidden">
       <header>
         <h1>AirCost</h1>
-        <button id="reset-button" type="button">Reset</button>
+        <div class="header-actions">
+          <button id="refresh-status-button" class="icon-button" type="button" aria-label="Refresh listing status" title="Refresh listing status">R</button>
+          <button id="reset-button" class="ghost-button" type="button">Reset</button>
+        </div>
       </header>
-      <dl>
+
+      <dl class="config-list">
         <dt>Server</dt>
         <dd id="configured-server"></dd>
         <dt>User</dt>
@@ -34,7 +38,90 @@
         <dt>Install</dt>
         <dd id="configured-install"></dd>
       </dl>
-      <button id="submit-button" type="button">Submit Page</button>
+
+      <section class="panel">
+        <div class="status-row">
+          <span id="submission-badge" class="status-pill is-unknown">Checking</span>
+          <button id="submit-button" type="button">Submit Page</button>
+        </div>
+        <div id="current-url" class="current-url"></div>
+      </section>
+
+      <ol id="progress-list" class="progress-list" aria-live="polite"></ol>
+
+      <section id="listing-editor" class="panel hidden">
+        <div class="section-heading">
+          <h2>Listing</h2>
+          <span id="listing-id-label"></span>
+        </div>
+        <form id="listing-editor-form">
+          <div class="form-grid">
+            <label>
+              Manufacturer
+              <input name="manufacturer" required autocomplete="off">
+            </label>
+            <label>
+              Model
+              <input name="model" required autocomplete="off">
+            </label>
+            <label>
+              Variant
+              <input name="variant" required autocomplete="off">
+            </label>
+            <label>
+              Year
+              <input name="model_year" type="number" min="1900" max="2039" step="1" required>
+            </label>
+            <label>
+              Ask
+              <input name="asking_price_usd" type="number" min="0" step="1000" required>
+            </label>
+            <label>
+              Currency
+              <input name="currency" maxlength="3" required>
+            </label>
+            <label>
+              Status
+              <select name="status">
+                <option value="active">Active</option>
+                <option value="pending">Pending</option>
+                <option value="sold">Sold</option>
+                <option value="unknown">Unknown</option>
+              </select>
+            </label>
+            <label>
+              Tail
+              <input name="registration_number" autocomplete="off">
+            </label>
+            <label>
+              Serial
+              <input name="serial_number" autocomplete="off">
+            </label>
+            <label>
+              Airframe h
+              <input name="airframe_hours" type="number" min="0" step="0.1" required>
+            </label>
+            <label>
+              Engine h
+              <input name="engine_hours" type="number" min="0" step="0.1" required>
+            </label>
+            <label>
+              Prop h
+              <input name="propeller_hours" type="number" min="0" step="0.1" required>
+            </label>
+          </div>
+
+          <fieldset class="avionics-fieldset">
+            <div class="fieldset-heading">
+              <span>Avionics</span>
+              <button class="icon-button" id="add-avionics-button" type="button" aria-label="Add avionics" title="Add avionics">+</button>
+            </div>
+            <div id="avionics-list" class="avionics-list"></div>
+          </fieldset>
+
+          <button id="save-listing-button" type="submit">Save Listing</button>
+        </form>
+      </section>
     </section>
 
     <pre id="status"></pre>
