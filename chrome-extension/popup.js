@@ -17,30 +17,87 @@ const STAGE_LABELS = {
   error: "Error",
 };
 
+const PIPELINE_STAGES = [
+  { id: "capture", title: "Capturing this page" },
+  { id: "verify", title: "Verifying the upload" },
+  { id: "analyze", title: "Analyzing the listing" },
+  { id: "normalize", title: "Normalizing aircraft data" },
+  { id: "save", title: "Saving to AirCost" },
+];
+
+const STAGE_TO_PIPELINE = {
+  capturing_page: "capture",
+  signing_upload: "verify",
+  sending_upload: "verify",
+  received_upload: "verify",
+  verifying_upload: "verify",
+  extracting_listing: "analyze",
+  verifying_listing: "analyze",
+  normalizing_aircraft: "normalize",
+  normalizing_avionics: "normalize",
+  saving_listing: "save",
+  refreshing_estimates: "save",
+  recording_submission: "save",
+  complete: "save",
+};
+
 const setupView = document.querySelector("#setup-view");
 const captureView = document.querySelector("#capture-view");
 const registerButton = document.querySelector("#register-button");
 const submitButton = document.querySelector("#submit-button");
+const refreshPageButton = document.querySelector("#refresh-page-button");
 const refreshStatusButton = document.querySelector("#refresh-status-button");
+const settingsButton = document.querySelector("#settings-button");
+const settingsPanel = document.querySelector("#settings-panel");
 const resetButton = document.querySelector("#reset-button");
-const statusOutput = document.querySelector("#status");
+const setupNotice = document.querySelector("#setup-notice");
+const notice = document.querySelector("#notice");
 const submissionBadge = document.querySelector("#submission-badge");
+const pageHostname = document.querySelector("#page-hostname");
 const currentUrlOutput = document.querySelector("#current-url");
-const progressList = document.querySelector("#progress-list");
+const newPageActions = document.querySelector("#new-page-actions");
+const existingEntry = document.querySelector("#existing-entry");
+const existingEntryTitle = document.querySelector("#existing-entry-title");
+const existingEntryMeta = document.querySelector("#existing-entry-meta");
+const editListingButton = document.querySelector("#edit-listing-button");
+const workflowDetails = document.querySelector("#workflow-details");
+const workflowSummary = document.querySelector("#workflow-summary");
+const pipeline = document.querySelector("#pipeline");
+const activeStageEyebrow = document.querySelector("#active-stage-eyebrow");
+const activeStageTitle = document.querySelector("#active-stage-title");
+const activeStageMessage = document.querySelector("#active-stage-message");
+const technicalProgress = document.querySelector("#technical-progress");
+const recoveryActions = document.querySelector("#recovery-actions");
+const retryUploadButton = document.querySelector("#retry-upload-button");
+const retryStatusButton = document.querySelector("#retry-status-button");
+const reprocessButton = document.querySelector("#reprocess-button");
 const listingEditor = document.querySelector("#listing-editor");
 const listingEditorForm = document.querySelector("#listing-editor-form");
+const listingEditorHeading = document.querySelector("#listing-editor-heading");
 const listingIdLabel = document.querySelector("#listing-id-label");
+const closeEditorButton = document.querySelector("#close-editor-button");
+const cancelListingButton = document.querySelector("#cancel-listing-button");
+const saveListingButton = document.querySelector("#save-listing-button");
 const addAvionicsButton = document.querySelector("#add-avionics-button");
 const avionicsList = document.querySelector("#avionics-list");
 
 let activeListing = null;
 let activeSubmission = null;
+let currentPipelineStage = null;
 
 document.addEventListener("DOMContentLoaded", refreshView);
 registerButton.addEventListener("click", registerPlugin);
 submitButton.addEventListener("click", submitCurrentPage);
+refreshPageButton.addEventListener("click", submitCurrentPage);
 refreshStatusButton.addEventListener("click", refreshListingStatus);
+retryStatusButton.addEventListener("click", refreshListingStatus);
+retryUploadButton.addEventListener("click", submitCurrentPage);
+reprocessButton.addEventListener("click", reprocessExtraction);
+settingsButton.addEventListener("click", toggleSettings);
 resetButton.addEventListener("click", resetConfig);
+editListingButton.addEventListener("click", openListingEditor);
+closeEditorButton.addEventListener("click", closeListingEditor);
+cancelListingButton.addEventListener("click", closeListingEditor);
 listingEditorForm.addEventListener("submit", saveListingEdits);
 addAvionicsButton.addEventListener("click", () => addAvionicsRow());
 
@@ -52,19 +109,20 @@ async function refreshView() {
     document.querySelector("#configured-install").textContent = String(config.pluginInstallId);
     setupView.classList.add("hidden");
     captureView.classList.remove("hidden");
-    setStatus("Checking current page.");
+    closeSettings();
     await refreshListingStatus();
   } else {
     setupView.classList.remove("hidden");
     captureView.classList.add("hidden");
     clearListingState();
-    setStatus("Register this browser first.");
+    setSetupNotice("Connect this browser to begin.", "info");
   }
 }
 
 async function registerPlugin() {
   try {
     setBusy(registerButton, true);
+    setSetupNotice("Creating a secure browser identity…", "info");
     const serverUrl = normalizeServerUrl(document.querySelector("#server-url").value);
     const username = document.querySelector("#username").value.trim() || "developer";
     const keyPair = await crypto.subtle.generateKey(
@@ -94,10 +152,9 @@ async function registerPlugin() {
       privateKeyJwk,
       publicKeyBase64,
     });
-    setStatus(`Registered install ${pluginInstallId}`);
     await refreshView();
   } catch (error) {
-    setStatus(error.message);
+    setSetupNotice(error.message, "error");
   } finally {
     setBusy(registerButton, false);
   }
@@ -106,27 +163,35 @@ async function registerPlugin() {
 async function refreshListingStatus() {
   try {
     setBusy(refreshStatusButton, true);
+    hideRecoveryActions();
+    closeListingEditor();
+    setSubmissionBadge("unknown", "Checking");
+    setNotice("Checking this page in AirCost…", "info");
     const config = await loadConfig();
     if (!config?.serverUrl || !config?.username) {
       return;
     }
     const capture = await captureActiveTab({ includeHtml: false });
-    currentUrlOutput.textContent = capture.sourceUrl;
+    setPageIdentity(capture.sourceUrl);
     const url = new URL(`${config.serverUrl}/api/plugin/submissions/status`);
     url.searchParams.set("source_url", capture.sourceUrl);
     const response = await fetch(url.toString(), {
-      headers: {
-        "X-User-Email": config.username,
-      },
+      headers: { "X-User-Email": config.username },
     });
     const payload = await parseJsonResponse(response);
     setSubmissionState(payload);
     await setActionBadge(Boolean(payload.submitted), capture.tabId);
-    setStatus(payload.submitted ? "This listing has been uploaded." : "This listing has not been uploaded.");
+    if (payload.submission?.extraction_error) {
+      setNotice(`AirCost captured this page, but extraction needs attention: ${payload.submission.extraction_error}`, "error");
+      showRecoveryActions(["reprocess", "upload"]);
+    } else {
+      hideNotice();
+    }
   } catch (error) {
-    clearListingState();
+    clearListingState({ preservePage: true });
     setSubmissionBadge("error", "Status error");
-    setStatus(error.message);
+    setNotice(`Could not check this page: ${error.message}`, "error");
+    showRecoveryActions(["status"]);
   } finally {
     setBusy(refreshStatusButton, false);
   }
@@ -134,8 +199,10 @@ async function refreshListingStatus() {
 
 async function submitCurrentPage() {
   try {
-    setBusy(submitButton, true);
-    resetProgress();
+    setSubmissionBusy(true);
+    hideRecoveryActions();
+    setNotice("AirCost is processing this page…", "info");
+    resetPipeline();
     const config = await loadConfig();
     if (!config?.pluginInstallId || !config?.privateKeyJwk) {
       throw new Error("Plugin is not registered.");
@@ -143,7 +210,7 @@ async function submitCurrentPage() {
 
     recordProgress("capturing_page", "running", "Reading the active tab.");
     const capture = await captureActiveTab({ includeHtml: true });
-    currentUrlOutput.textContent = capture.sourceUrl;
+    setPageIdentity(capture.sourceUrl);
     recordProgress("capturing_page", "complete", "Page captured.");
 
     recordProgress("signing_upload", "running", "Signing the captured document.");
@@ -161,9 +228,9 @@ async function submitCurrentPage() {
       privateKey,
       new TextEncoder().encode(message),
     );
-    recordProgress("signing_upload", "complete", "Signature ready.");
+    recordProgress("signing_upload", "complete", "Secure signature ready.");
 
-    recordProgress("sending_upload", "running", "Uploading rendered HTML.");
+    recordProgress("sending_upload", "running", "Uploading rendered page content.");
     const response = await fetch(`${config.serverUrl}/api/plugin/submissions/stream`, {
       method: "POST",
       headers: {
@@ -178,33 +245,72 @@ async function submitCurrentPage() {
       }),
     });
     const payload = await readProgressResponse(response);
-    recordProgress("sending_upload", "complete", "Upload delivered.");
     setSubmissionState(payload);
     await setActionBadge(true, capture.tabId);
-    const listingId = payload.listing?.id ? ` listing ${payload.listing.id}` : "";
-    const error = payload.submission?.extraction_error
-      ? ` Extraction issue: ${payload.submission.extraction_error}`
-      : "";
-    setStatus(`Submitted submission ${payload.submission?.id || "-"}${listingId}.${error}`);
+    finishPipeline(payload.submission?.extraction_error);
+    if (payload.submission?.extraction_error) {
+      setNotice(`Page captured, but extraction needs attention: ${payload.submission.extraction_error}`, "error");
+      showRecoveryActions(["reprocess", "upload"]);
+    } else {
+      setNotice("Saved to AirCost.", "success");
+    }
   } catch (error) {
     recordProgress("error", "error", error.message);
     setSubmissionBadge("error", "Upload error");
-    setStatus(error.message);
+    setNotice(`Could not add this page: ${error.message}`, "error");
+    showRecoveryActions(["upload", "status"]);
   } finally {
-    setBusy(submitButton, false);
+    setSubmissionBusy(false);
+  }
+}
+
+async function reprocessExtraction() {
+  if (!activeSubmission?.id) {
+    setNotice("No saved submission is available to reprocess.", "error");
+    return;
+  }
+  try {
+    setBusy(reprocessButton, true);
+    hideRecoveryActions();
+    setNotice("Reprocessing the saved page…", "info");
+    resetPipeline("analyze");
+    const config = await loadConfig();
+    const response = await fetch(
+      `${config.serverUrl}/api/plugin/submissions/${activeSubmission.id}/reprocess`,
+      {
+        method: "POST",
+        headers: { "X-User-Email": config.username },
+      },
+    );
+    const payload = await parseJsonResponse(response);
+    setSubmissionState(payload);
+    if (payload.submission?.extraction_error) {
+      setPipelineError("analyze", payload.submission.extraction_error);
+      setNotice(`Extraction still needs attention: ${payload.submission.extraction_error}`, "error");
+      showRecoveryActions(["reprocess", "upload"]);
+    } else {
+      finishPipeline();
+      setNotice("Listing extracted and saved to AirCost.", "success");
+    }
+  } catch (error) {
+    setPipelineError("analyze", error.message);
+    setNotice(`Could not reprocess this submission: ${error.message}`, "error");
+    showRecoveryActions(["reprocess", "upload"]);
+  } finally {
+    setBusy(reprocessButton, false);
   }
 }
 
 async function saveListingEdits(event) {
   event.preventDefault();
   if (!activeListing?.id) {
-    setStatus("No uploaded listing is available to edit.");
+    setNotice("No uploaded listing is available to edit.", "error");
     return;
   }
   try {
     const config = await loadConfig();
-    setBusy(document.querySelector("#save-listing-button"), true);
-    setStatus("Saving listing edits.");
+    setBusy(saveListingButton, true);
+    setNotice("Saving listing changes…", "info");
     const response = await fetch(`${config.serverUrl}/api/listings/${activeListing.id}`, {
       method: "PATCH",
       headers: {
@@ -220,11 +326,11 @@ async function saveListingEdits(event) {
       listing: payload.listing,
       listing_estimate: payload.listing_estimate,
     });
-    setStatus(`Updated listing ${payload.listing.id}.`);
+    setNotice(`Listing #${payload.listing.id} updated.`, "success");
   } catch (error) {
-    setStatus(error.message);
+    setNotice(`Could not save listing changes: ${error.message}`, "error");
   } finally {
-    setBusy(document.querySelector("#save-listing-button"), false);
+    setBusy(saveListingButton, false);
   }
 }
 
@@ -300,67 +406,151 @@ function handleProgressEvent(event) {
 }
 
 function recordProgress(stage, status, message) {
-  if (status === "running") {
-    markRunningStagesComplete(stage);
+  appendTechnicalProgress(stage, status, message);
+  if (status === "error" || stage === "error") {
+    setPipelineError(currentPipelineStage || "capture", message);
+    return;
   }
-  let item = Array.from(progressList.children).find((node) => node.dataset.stage === stage);
-  if (!item) {
-    item = document.createElement("li");
-    item.dataset.stage = stage;
-    const title = document.createElement("span");
-    title.className = "progress-title";
-    const body = document.createElement("span");
-    body.className = "progress-message";
-    const content = document.createElement("span");
-    content.append(title, body);
-    item.append(content);
-    progressList.append(item);
+
+  const pipelineStage = STAGE_TO_PIPELINE[stage] || currentPipelineStage || "capture";
+  currentPipelineStage = pipelineStage;
+  const currentIndex = PIPELINE_STAGES.findIndex((item) => item.id === pipelineStage);
+  for (const [index, item] of PIPELINE_STAGES.entries()) {
+    const element = pipeline.querySelector(`[data-pipeline-stage="${item.id}"]`);
+    element.className = index < currentIndex || (stage === "complete" && status === "complete")
+      ? "is-complete"
+      : index === currentIndex
+        ? status === "complete" ? "is-complete" : "is-active"
+        : "";
+    element.removeAttribute("aria-current");
   }
-  item.className = `is-${status}`;
-  item.querySelector(".progress-title").textContent = STAGE_LABELS[stage] || stage;
-  item.querySelector(".progress-message").textContent = message || "";
-  if (stage === "complete") {
-    markRunningStagesComplete(stage);
+  const activeElement = pipeline.querySelector(`[data-pipeline-stage="${pipelineStage}"]`);
+  if (status !== "complete" && stage !== "complete") {
+    activeElement.setAttribute("aria-current", "step");
   }
+  const stageDefinition = PIPELINE_STAGES[currentIndex];
+  activeStageEyebrow.textContent = `${currentIndex + 1} of ${PIPELINE_STAGES.length}`;
+  activeStageTitle.textContent = stageDefinition.title;
+  activeStageMessage.textContent = message || STAGE_LABELS[stage] || "Processing…";
 }
 
-function markRunningStagesComplete(exceptStage) {
-  for (const item of progressList.children) {
-    if (item.dataset.stage !== exceptStage && item.classList.contains("is-running")) {
-      item.className = "is-complete";
+function appendTechnicalProgress(stage, status, message) {
+  const item = document.createElement("li");
+  const label = STAGE_LABELS[stage] || stage;
+  item.textContent = `${status === "complete" ? "✓" : status === "error" ? "!" : "›"} ${label}: ${message || ""}`;
+  technicalProgress.append(item);
+  technicalProgress.scrollTop = technicalProgress.scrollHeight;
+}
+
+function resetPipeline(startAt = "capture") {
+  workflowDetails.classList.remove("hidden", "is-success", "is-error");
+  workflowDetails.open = true;
+  workflowSummary.textContent = "Processing listing";
+  technicalProgress.replaceChildren();
+  currentPipelineStage = startAt;
+  const startIndex = PIPELINE_STAGES.findIndex((item) => item.id === startAt);
+  for (const [index, item] of PIPELINE_STAGES.entries()) {
+    const element = pipeline.querySelector(`[data-pipeline-stage="${item.id}"]`);
+    element.className = index < startIndex ? "is-complete" : index === startIndex ? "is-active" : "";
+    element.toggleAttribute("aria-current", index === startIndex);
+    if (index === startIndex) {
+      element.setAttribute("aria-current", "step");
     }
   }
+  activeStageEyebrow.textContent = `${startIndex + 1} of ${PIPELINE_STAGES.length}`;
+  activeStageTitle.textContent = PIPELINE_STAGES[startIndex].title;
+  activeStageMessage.textContent = startAt === "analyze"
+    ? "Running extraction again from the saved page."
+    : "Reading the current page from your active tab.";
 }
 
-function resetProgress() {
-  progressList.replaceChildren();
+function finishPipeline(extractionError = null) {
+  for (const item of PIPELINE_STAGES) {
+    const element = pipeline.querySelector(`[data-pipeline-stage="${item.id}"]`);
+    element.className = "is-complete";
+    element.removeAttribute("aria-current");
+  }
+  activeStageEyebrow.textContent = "Complete";
+  activeStageTitle.textContent = extractionError ? "Page captured" : "Saved to AirCost";
+  activeStageMessage.textContent = extractionError
+    ? "The upload is stored, but listing extraction needs attention."
+    : "The listing is ready in AirCost.";
+  workflowDetails.classList.add("is-success");
+  workflowSummary.textContent = extractionError ? "Captured by AirCost" : "Saved to AirCost";
+  workflowDetails.open = false;
+}
+
+function setPipelineError(stage, message) {
+  const pipelineStage = STAGE_TO_PIPELINE[stage] || stage || currentPipelineStage || "capture";
+  currentPipelineStage = pipelineStage;
+  const currentIndex = PIPELINE_STAGES.findIndex((item) => item.id === pipelineStage);
+  for (const [index, item] of PIPELINE_STAGES.entries()) {
+    const element = pipeline.querySelector(`[data-pipeline-stage="${item.id}"]`);
+    element.className = index < currentIndex ? "is-complete" : index === currentIndex ? "is-error" : "";
+    element.toggleAttribute("aria-current", index === currentIndex);
+    if (index === currentIndex) {
+      element.setAttribute("aria-current", "step");
+    }
+  }
+  activeStageEyebrow.textContent = "Needs attention";
+  activeStageTitle.textContent = `${PIPELINE_STAGES[currentIndex]?.title || "Processing"} failed`;
+  activeStageMessage.textContent = message || "AirCost could not finish this step.";
+  workflowDetails.classList.remove("hidden", "is-success");
+  workflowDetails.classList.add("is-error");
+  workflowDetails.open = true;
+  workflowSummary.textContent = "Processing needs attention";
 }
 
 function setSubmissionState(payload) {
   activeSubmission = payload.submission || null;
   activeListing = payload.listing || null;
+  closeListingEditor();
   if (payload.submitted || activeSubmission || activeListing) {
-    const label = activeSubmission?.id ? `Uploaded #${activeSubmission.id}` : "Uploaded";
-    setSubmissionBadge("submitted", label);
+    setSubmissionBadge("submitted", "In AirCost");
+    newPageActions.classList.add("hidden");
+    existingEntry.classList.remove("hidden");
+    if (activeListing) {
+      const aircraft = activeListing.aircraft;
+      const aircraftName = [activeListing.model_year, aircraft?.manufacturer, aircraft?.model, aircraft?.variant]
+        .filter(Boolean)
+        .join(" ");
+      existingEntryTitle.textContent = "Already in AirCost";
+      existingEntryMeta.textContent = `${aircraftName || "Saved listing"} · Listing #${activeListing.id}`;
+      editListingButton.textContent = activeListing.is_verified ? "View details" : "Edit details";
+      editListingButton.classList.remove("hidden");
+      populateListingForm(activeListing);
+    } else {
+      existingEntryTitle.textContent = "Captured by AirCost";
+      existingEntryMeta.textContent = activeSubmission?.id
+        ? `Submission #${activeSubmission.id}`
+        : "Awaiting listing details";
+      editListingButton.classList.add("hidden");
+    }
   } else {
     activeSubmission = null;
-    setSubmissionBadge("new", "Not uploaded");
-  }
-  if (activeListing) {
-    populateListingForm(activeListing);
-    listingEditor.classList.remove("hidden");
-  } else {
-    listingEditor.classList.add("hidden");
+    activeListing = null;
+    setSubmissionBadge("new", "Not added");
+    existingEntry.classList.add("hidden");
+    newPageActions.classList.remove("hidden");
   }
 }
 
-function clearListingState() {
+function clearListingState({ preservePage = false } = {}) {
   activeListing = null;
   activeSubmission = null;
-  currentUrlOutput.textContent = "";
-  listingEditor.classList.add("hidden");
-  resetProgress();
+  closeListingEditor();
+  existingEntry.classList.add("hidden");
+  newPageActions.classList.add("hidden");
+  workflowDetails.classList.add("hidden");
+  technicalProgress.replaceChildren();
+  hideRecoveryActions();
   setSubmissionBadge("unknown", "Checking");
+  if (!preservePage) {
+    pageHostname.textContent = "Current page";
+    currentUrlOutput.textContent = "Checking active tab…";
+    currentUrlOutput.removeAttribute("title");
+    currentUrlOutput.removeAttribute("aria-label");
+  }
 }
 
 function setSubmissionBadge(kind, text) {
@@ -368,8 +558,39 @@ function setSubmissionBadge(kind, text) {
   submissionBadge.textContent = text;
 }
 
+function setPageIdentity(sourceUrl) {
+  currentUrlOutput.textContent = sourceUrl;
+  currentUrlOutput.title = sourceUrl;
+  currentUrlOutput.setAttribute("aria-label", `Current page URL: ${sourceUrl}`);
+  try {
+    pageHostname.textContent = new URL(sourceUrl).hostname || "Current page";
+  } catch {
+    pageHostname.textContent = "Current page";
+  }
+}
+
+function openListingEditor() {
+  if (!activeListing) {
+    return;
+  }
+  populateListingForm(activeListing);
+  listingEditor.classList.remove("hidden");
+  editListingButton.setAttribute("aria-expanded", "true");
+  listingEditorHeading.textContent = activeListing.is_verified ? "Listing details" : "Edit listing details";
+  const firstField = listingEditorForm.querySelector("input:not(:disabled), select:not(:disabled)");
+  firstField?.focus();
+}
+
+function closeListingEditor() {
+  listingEditor.classList.add("hidden");
+  editListingButton.setAttribute("aria-expanded", "false");
+  if (activeListing) {
+    populateListingForm(activeListing);
+  }
+}
+
 function populateListingForm(listing) {
-  listingIdLabel.textContent = `#${listing.id}`;
+  listingIdLabel.textContent = `Listing #${listing.id}${listing.is_verified ? " · Verified" : ""}`;
   setField("manufacturer", listing.aircraft?.manufacturer || "");
   setField("model", listing.aircraft?.model || "");
   setField("variant", listing.aircraft?.variant || "");
@@ -388,10 +609,12 @@ function populateListingForm(listing) {
     addAvionicsRow(item);
   }
   const disabled = Boolean(listing.is_verified);
-  for (const field of listingEditorForm.elements) {
+  for (const field of listingEditorForm.querySelectorAll("[name]")) {
     field.disabled = disabled;
   }
   addAvionicsButton.disabled = disabled;
+  saveListingButton.classList.toggle("hidden", disabled);
+  cancelListingButton.textContent = disabled ? "Close" : "Cancel";
 }
 
 function readListingForm() {
@@ -425,9 +648,9 @@ function addAvionicsRow(item = {}) {
   const remove = document.createElement("button");
   remove.className = "icon-button";
   remove.type = "button";
-  remove.textContent = "x";
   remove.setAttribute("aria-label", "Remove avionics");
   remove.title = "Remove avionics";
+  remove.append(createSvgIcon(["M6 6l12 12", "M18 6 6 18"]));
   remove.addEventListener("click", () => {
     row.remove();
     if (!avionicsList.children.length) {
@@ -436,6 +659,18 @@ function addAvionicsRow(item = {}) {
   });
   row.append(remove);
   avionicsList.append(row);
+}
+
+function createSvgIcon(paths) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  for (const pathData of paths) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pathData);
+    svg.append(path);
+  }
+  return svg;
 }
 
 function avionicsInput(name, placeholder, value = "", type = "text") {
@@ -479,12 +714,7 @@ function readAvionicsRows() {
     if (!manufacturer || !model) {
       throw new Error("Avionics rows need maker and model.");
     }
-    avionics.push({
-      manufacturer,
-      model,
-      type,
-      quantity: Math.max(quantity, 1),
-    });
+    avionics.push({ manufacturer, model, type, quantity: Math.max(quantity, 1) });
   }
   return avionics;
 }
@@ -547,10 +777,22 @@ async function captureActiveTab({ includeHtml } = { includeHtml: true }) {
   return { ...result.result, tabId: tab.id };
 }
 
+function toggleSettings() {
+  const shouldOpen = settingsPanel.classList.contains("hidden");
+  settingsPanel.classList.toggle("hidden", !shouldOpen);
+  settingsButton.setAttribute("aria-expanded", String(shouldOpen));
+  settingsButton.setAttribute("aria-label", shouldOpen ? "Close connection settings" : "Open connection settings");
+}
+
+function closeSettings() {
+  settingsPanel.classList.add("hidden");
+  settingsButton.setAttribute("aria-expanded", "false");
+  settingsButton.setAttribute("aria-label", "Open connection settings");
+}
+
 async function resetConfig() {
   await chrome.storage.local.clear();
   clearListingState();
-  setStatus("Configuration reset.");
   await refreshView();
 }
 
@@ -604,8 +846,14 @@ async function setActionBadge(submitted, tabId) {
   const details = { tabId, text: submitted ? "OK" : "" };
   await chrome.action.setBadgeText(details).catch(() => {});
   await chrome.action
-    .setBadgeBackgroundColor({ tabId, color: submitted ? "#20824d" : "#4f5b66" })
+    .setBadgeBackgroundColor({ tabId, color: submitted ? "#16754a" : "#566273" })
     .catch(() => {});
+}
+
+function setSubmissionBusy(busy) {
+  setBusy(submitButton, busy);
+  setBusy(refreshPageButton, busy);
+  setBusy(retryUploadButton, busy);
 }
 
 function setBusy(button, busy) {
@@ -614,6 +862,32 @@ function setBusy(button, busy) {
   }
 }
 
-function setStatus(message) {
-  statusOutput.textContent = message;
+function setNotice(message, kind = "info") {
+  notice.textContent = message;
+  notice.className = `notice is-${kind}`;
+}
+
+function hideNotice() {
+  notice.textContent = "";
+  notice.className = "notice hidden";
+}
+
+function setSetupNotice(message, kind = "info") {
+  setupNotice.textContent = message;
+  setupNotice.className = `notice is-${kind}`;
+}
+
+function showRecoveryActions(actions) {
+  const visibleActions = new Set(actions);
+  retryUploadButton.classList.toggle("hidden", !visibleActions.has("upload"));
+  retryStatusButton.classList.toggle("hidden", !visibleActions.has("status"));
+  reprocessButton.classList.toggle("hidden", !visibleActions.has("reprocess") || !activeSubmission?.id);
+  recoveryActions.classList.toggle("hidden", !Array.from(recoveryActions.children).some((button) => !button.classList.contains("hidden")));
+}
+
+function hideRecoveryActions() {
+  recoveryActions.classList.add("hidden");
+  for (const button of recoveryActions.children) {
+    button.classList.add("hidden");
+  }
 }
