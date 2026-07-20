@@ -43,7 +43,11 @@ When work is ready, open a pull request. Before considering it done:
 
 ## Design Rules
 
-- Favor clean design and implementation over maximizing code reuse.
+- Favor clean design and implementation over patching over existing code.
+- Always look for generic implementations that can handle many of the cases,
+  instead of creating a per-case custom implementation.
+- Always look for ways to simplify the existing code and reducing the code
+  size when addint new functionality.
 - Favor simple generic strategies over custom handling for individual makers,
   models, or listings.
 - Add the least code that preserves the required functionality and invariants.
