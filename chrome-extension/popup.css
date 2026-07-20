@@ -1,5 +1,6 @@
 :root {
   color-scheme: light;
+  --popup-width: 520px;
   --ink: #17202f;
   --muted: #647184;
   --line: #dce3e9;
@@ -21,9 +22,18 @@
   box-sizing: border-box;
 }
 
+/* Chrome sizes an action popup from its intrinsic document width. Keep this
+   fixed rather than viewport-relative to avoid a narrow shrink-to-fit loop. */
+html {
+  width: var(--popup-width);
+  min-width: var(--popup-width);
+}
+
 body {
   margin: 0;
-  width: 430px;
+  width: var(--popup-width);
+  min-width: var(--popup-width);
+  max-width: var(--popup-width);
   min-height: 220px;
   color: var(--ink);
   background: var(--canvas);
@@ -80,24 +90,20 @@ h2 {
 }
 
 .brand-mark {
-  display: grid;
   width: 34px;
   height: 34px;
   flex: 0 0 auto;
-  place-items: center;
-  border-radius: 10px;
-  color: #fff;
-  background: linear-gradient(145deg, #07859a, #075969);
-  box-shadow: 0 4px 10px rgb(8 111 130 / 20%);
-  font-size: 18px;
-  font-weight: 800;
+}
+
+.brand-mark img {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .brand-lockup.compact .brand-mark {
   width: 30px;
   height: 30px;
-  border-radius: 9px;
-  font-size: 15px;
 }
 
 .app-header,
@@ -719,24 +725,6 @@ dd {
 
 .hidden {
   display: none !important;
-}
-
-@media (max-width: 390px) {
-  body {
-    width: 100vw;
-  }
-
-  main {
-    padding: 14px;
-  }
-
-  .form-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .avionics-row {
-    grid-template-columns: 1fr 1fr;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
