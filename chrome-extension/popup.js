@@ -1,4 +1,8 @@
 const SIGNATURE_PREFIX = "aircost-plugin-v1";
+const START_UPLOAD_MESSAGE = "aircost:start-upload";
+const UPLOAD_PROGRESS_MESSAGE = "aircost:upload-progress";
+const BACKGROUND_UPLOAD_STATE_KEY = "aircostBackgroundUpload";
+const BACKGROUND_UPLOAD_MAX_AGE_MS = 30 * 60 * 1000;
 
 const STAGE_LABELS = {
   capturing_page: "Capturing page",
@@ -84,6 +88,7 @@ const avionicsList = document.querySelector("#avionics-list");
 let activeListing = null;
 let activeSubmission = null;
 let currentPipelineStage = null;
+let backgroundStatusTimer = null;
 
 document.addEventListener("DOMContentLoaded", refreshView);
 registerButton.addEventListener("click", registerPlugin);
@@ -162,6 +167,8 @@ async function registerPlugin() {
 
 async function refreshListingStatus() {
   try {
+    clearTimeout(backgroundStatusTimer);
+    backgroundStatusTimer = null;
     setBusy(refreshStatusButton, true);
     hideRecoveryActions();
     closeListingEditor();
@@ -179,6 +186,12 @@ async function refreshListingStatus() {
       headers: { "X-User-Email": config.username },
     });
     const payload = await parseJsonResponse(response);
+    const backgroundUpload = await loadBackgroundUpload(capture.sourceUrl);
+    if (!payload.submitted && backgroundUpload) {
+      showBackgroundUpload(backgroundUpload);
+      await setActionBadge(false, capture.tabId);
+      return;
+    }
     setSubmissionState(payload);
     await setActionBadge(Boolean(payload.submitted), capture.tabId);
     if (payload.submission?.extraction_error) {
@@ -198,6 +211,7 @@ async function refreshListingStatus() {
 }
 
 async function submitCurrentPage() {
+  let uploadObserver = null;
   try {
     setSubmissionBusy(true);
     hideRecoveryActions();
@@ -231,20 +245,37 @@ async function submitCurrentPage() {
     recordProgress("signing_upload", "complete", "Secure signature ready.");
 
     recordProgress("sending_upload", "running", "Uploading rendered page content.");
-    const response = await fetch(`${config.serverUrl}/api/plugin/submissions/stream`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-User-Email": config.username,
-      },
-      body: JSON.stringify({
+    const jobId = crypto.randomUUID();
+    uploadObserver = observeBackgroundUpload(jobId);
+    const accepted = await chrome.runtime.sendMessage({
+      type: START_UPLOAD_MESSAGE,
+      jobId,
+      tabId: capture.tabId,
+      serverUrl: config.serverUrl,
+      username: config.username,
+      payload: {
         plugin_install_id: config.pluginInstallId,
         source_url: capture.sourceUrl,
         rendered_html: capture.renderedHtml,
         signature: arrayBufferToBase64(signature),
-      }),
+      },
     });
-    const payload = await readProgressResponse(response);
+    if (!accepted?.ok) {
+      throw new Error(accepted?.error || "Background upload did not start.");
+    }
+    recordProgress("sending_upload", "complete", "Upload accepted; AirCost now owns processing.");
+    const result = await uploadObserver.promise;
+    if (result.kind === "detached") {
+      setSubmissionBadge("unknown", "Processing");
+      setNotice("AirCost is continuing on the server. Reopen or refresh to check the result.", "info");
+      showRecoveryActions(["status"]);
+      scheduleBackgroundStatusRefresh();
+      return;
+    }
+    if (result.kind === "error") {
+      throw new Error(result.event.message || "Upload processing failed.");
+    }
+    const payload = result.event;
     setSubmissionState(payload);
     await setActionBadge(true, capture.tabId);
     finishPipeline(payload.submission?.extraction_error);
@@ -255,6 +286,7 @@ async function submitCurrentPage() {
       setNotice("Saved to AirCost.", "success");
     }
   } catch (error) {
+    uploadObserver?.cancel();
     recordProgress("error", "error", error.message);
     setSubmissionBadge("error", "Upload error");
     setNotice(`Could not add this page: ${error.message}`, "error");
@@ -334,75 +366,87 @@ async function saveListingEdits(event) {
   }
 }
 
-async function readProgressResponse(response) {
-  if (!response.ok) {
-    await parseJsonResponse(response);
-  }
-  const contentType = response.headers.get("content-type") || "";
-  if (!response.body || !contentType.includes("application/x-ndjson")) {
-    return parseJsonResponse(response);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let finalPayload = null;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const event = parseProgressLine(line);
-      if (event) {
-        handleProgressEvent(event);
-        if (event.status === "error") {
-          throw new Error(event.message || "Upload failed.");
-        }
-        if (event.stage === "complete") {
-          finalPayload = event;
-        }
-      }
-    }
-  }
-
-  const finalEvent = parseProgressLine(buffer);
-  if (finalEvent) {
-    handleProgressEvent(finalEvent);
-    if (finalEvent.status === "error") {
-      throw new Error(finalEvent.message || "Upload failed.");
-    }
-    if (finalEvent.stage === "complete") {
-      finalPayload = finalEvent;
-    }
-  }
-
-  if (!finalPayload) {
-    throw new Error("Upload finished without a completion response.");
-  }
-  return finalPayload;
-}
-
-function parseProgressLine(line) {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return null;
-  }
-  try {
-    return JSON.parse(trimmed);
-  } catch (error) {
-    throw new Error(`Invalid progress update: ${error.message}`);
-  }
-}
-
 function handleProgressEvent(event) {
   const stage = event.stage || "upload";
   const status = event.status || "running";
   recordProgress(stage, status, event.message || STAGE_LABELS[stage] || stage);
+}
+
+function observeBackgroundUpload(jobId) {
+  let listener;
+  const promise = new Promise((resolve) => {
+    listener = (message) => {
+      if (message?.type !== UPLOAD_PROGRESS_MESSAGE || message.jobId !== jobId) {
+        return;
+      }
+      handleProgressEvent(message.event || {});
+      if (message.lifecycle === "complete") {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve({ kind: "complete", event: message.event });
+      } else if (message.lifecycle === "error") {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve({ kind: "error", event: message.event || {} });
+      } else if (message.lifecycle === "detached") {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve({ kind: "detached", event: message.event || {} });
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+  });
+  return {
+    promise,
+    cancel() {
+      if (listener) {
+        chrome.runtime.onMessage.removeListener(listener);
+      }
+    },
+  };
+}
+
+async function loadBackgroundUpload(sourceUrl) {
+  const stored = await chrome.storage.local.get(BACKGROUND_UPLOAD_STATE_KEY);
+  const upload = stored[BACKGROUND_UPLOAD_STATE_KEY];
+  if (!upload || upload.sourceUrl !== sourceUrl) {
+    return null;
+  }
+  if (Date.now() - Number(upload.updatedAt || upload.startedAt || 0) > BACKGROUND_UPLOAD_MAX_AGE_MS) {
+    return null;
+  }
+  return upload;
+}
+
+function showBackgroundUpload(upload) {
+  activeSubmission = null;
+  activeListing = null;
+  closeListingEditor();
+  newPageActions.classList.add("hidden");
+  existingEntry.classList.add("hidden");
+  const pipelineStage = STAGE_TO_PIPELINE[upload.stage] || currentPipelineStage || "verify";
+  resetPipeline(pipelineStage);
+
+  if (upload.lifecycle === "error") {
+    setSubmissionBadge("error", "Upload error");
+    setPipelineError(pipelineStage, upload.message);
+    setNotice(`AirCost could not finish this upload: ${upload.message}`, "error");
+    showRecoveryActions(["upload", "status"]);
+    return;
+  }
+
+  recordProgress(upload.stage || "received_upload", "running", upload.message);
+  setSubmissionBadge("unknown", "Processing");
+  setNotice(
+    upload.lifecycle === "detached"
+      ? "Live updates ended, but AirCost is continuing on the server."
+      : "AirCost is processing this page in the background.",
+    "info",
+  );
+  showRecoveryActions(["status"]);
+  scheduleBackgroundStatusRefresh();
+}
+
+function scheduleBackgroundStatusRefresh() {
+  clearTimeout(backgroundStatusTimer);
+  backgroundStatusTimer = setTimeout(refreshListingStatus, 2500);
 }
 
 function recordProgress(stage, status, message) {

@@ -22,6 +22,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Chrome extension
+        run: |
+          node --check chrome-extension/background.js
+          node --check chrome-extension/popup.js
+          node --test chrome-extension/*.test.mjs
+
       - name: Run unit tests
         run: cargo test
 
