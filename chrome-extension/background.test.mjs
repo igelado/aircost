@@ -23,6 +23,9 @@ function loadBackground(fetchImpl) {
     },
     storage: {
       local: {
+        async get(key) {
+          return { [key]: storage[key] };
+        },
         async set(values) {
           Object.assign(storage, values);
         },
@@ -44,16 +47,16 @@ function loadBackground(fetchImpl) {
   return { listener, storage, sentMessages };
 }
 
-function uploadMessage() {
+function uploadMessage({ jobId = "job-123", sourceUrl = "https://example.com/aircraft/123" } = {}) {
   return {
     type: "aircost:start-upload",
-    jobId: "job-123",
+    jobId,
     tabId: 4,
     serverUrl: "http://127.0.0.1:8001",
     username: "developer",
     payload: {
       plugin_install_id: 1,
-      source_url: "https://example.com/aircraft/123",
+      source_url: sourceUrl,
       rendered_html: "<html>listing</html>",
       signature: "signed",
     },
@@ -86,6 +89,10 @@ async function waitFor(check) {
   assert.fail("Timed out waiting for background upload state");
 }
 
+function uploadState(harness, jobId = "job-123") {
+  return harness.storage.aircostBackgroundUploads?.[jobId];
+}
+
 test("finishes an upload when the popup closes during transport", async () => {
   let request;
   const progress = [
@@ -102,12 +109,12 @@ test("finishes an upload when the popup closes during transport", async () => {
   });
 
   invokeAfterPopupClosed(harness.listener, uploadMessage());
-  await waitFor(() => harness.storage.aircostBackgroundUpload?.lifecycle === "complete");
+  await waitFor(() => uploadState(harness)?.lifecycle === "complete");
 
   assert.equal(request.url, "http://127.0.0.1:8001/api/plugin/submissions/stream");
   assert.equal(JSON.parse(request.options.body).rendered_html, "<html>listing</html>");
-  assert.equal(harness.storage.aircostBackgroundUpload.stage, "complete");
-  assert.equal(harness.storage.aircostBackgroundUpload.acceptedAt > 0, true);
+  assert.equal(uploadState(harness).stage, "complete");
+  assert.equal(uploadState(harness).acceptedAt > 0, true);
   assert.equal(harness.sentMessages.some((message) => message.lifecycle === "complete"), true);
 });
 
@@ -132,10 +139,10 @@ test("records detached progress without reporting server normalization failure",
 
   const accepted = await invoke(harness.listener, uploadMessage());
   assert.equal(accepted.ok, true);
-  await waitFor(() => harness.storage.aircostBackgroundUpload?.lifecycle === "detached");
+  await waitFor(() => uploadState(harness)?.lifecycle === "detached");
 
-  assert.equal(harness.storage.aircostBackgroundUpload.stage, "normalizing_aircraft");
-  assert.match(harness.storage.aircostBackgroundUpload.message, /continuing on the server/);
+  assert.equal(uploadState(harness).stage, "normalizing_aircraft");
+  assert.match(uploadState(harness).message, /continuing on the server/);
 });
 
 test("reports a transport error when the server never accepts the upload", async () => {
@@ -146,6 +153,30 @@ test("reports a transport error when the server never accepts the upload", async
   const accepted = await invoke(harness.listener, uploadMessage());
   assert.equal(accepted.ok, false);
   assert.equal(accepted.error, "server unavailable");
-  await waitFor(() => harness.storage.aircostBackgroundUpload?.lifecycle === "error");
-  assert.equal(harness.storage.aircostBackgroundUpload.acceptedAt, undefined);
+  await waitFor(() => uploadState(harness)?.lifecycle === "error");
+  assert.equal(uploadState(harness).acceptedAt, undefined);
+});
+
+test("tracks multiple concurrent uploads independently", async () => {
+  const harness = loadBackground(async () => new Response(
+    '{"stage":"complete","status":"complete","submission":{"id":42}}\n',
+    { status: 200, headers: { "content-type": "application/x-ndjson" } },
+  ));
+  const first = uploadMessage();
+  const second = uploadMessage({
+    jobId: "job-456",
+    sourceUrl: "https://example.com/aircraft/456",
+  });
+
+  const accepted = await Promise.all([
+    invoke(harness.listener, first),
+    invoke(harness.listener, second),
+  ]);
+  assert.equal(accepted.every((response) => response.ok), true);
+  await waitFor(() => uploadState(harness, "job-123")?.lifecycle === "complete"
+    && uploadState(harness, "job-456")?.lifecycle === "complete");
+
+  assert.equal(uploadState(harness, "job-123").sourceUrl, first.payload.source_url);
+  assert.equal(uploadState(harness, "job-456").sourceUrl, second.payload.source_url);
+  assert.equal(Object.keys(harness.storage.aircostBackgroundUploads).length, 2);
 });

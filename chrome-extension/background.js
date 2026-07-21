@@ -1,6 +1,10 @@
 const START_UPLOAD_MESSAGE = "aircost:start-upload";
 const UPLOAD_PROGRESS_MESSAGE = "aircost:upload-progress";
-const BACKGROUND_UPLOAD_STATE_KEY = "aircostBackgroundUpload";
+const BACKGROUND_UPLOADS_STATE_KEY = "aircostBackgroundUploads";
+const MAX_STORED_UPLOADS = 25;
+const MAX_UPLOAD_AGE_MS = 24 * 60 * 60 * 1000;
+
+let stateWriteQueue = Promise.resolve();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== START_UPLOAD_MESSAGE) {
@@ -167,7 +171,7 @@ async function publishProgress(job, event, lifecycle) {
     message: event.message || "AirCost is processing this listing.",
     updatedAt: Date.now(),
   };
-  await chrome.storage.local.set({ [BACKGROUND_UPLOAD_STATE_KEY]: state });
+  await saveUploadState(state);
   await chrome.runtime.sendMessage({
     type: UPLOAD_PROGRESS_MESSAGE,
     jobId: job.jobId,
@@ -181,6 +185,26 @@ async function publishProgress(job, event, lifecycle) {
       .setBadgeBackgroundColor({ tabId: job.tabId, color: "#16754a" })
       .catch(() => {});
   }
+}
+
+function saveUploadState(state) {
+  stateWriteQueue = stateWriteQueue
+    .catch(() => {})
+    .then(async () => {
+      const stored = await chrome.storage.local.get(BACKGROUND_UPLOADS_STATE_KEY);
+      const cutoff = Date.now() - MAX_UPLOAD_AGE_MS;
+      const uploads = Object.values(stored[BACKGROUND_UPLOADS_STATE_KEY] || {})
+        .filter((upload) => upload.jobId !== state.jobId && upload.updatedAt >= cutoff);
+      uploads.push(state);
+      uploads.sort((left, right) => right.updatedAt - left.updatedAt);
+      const limited = uploads.slice(0, MAX_STORED_UPLOADS);
+      await chrome.storage.local.set({
+        [BACKGROUND_UPLOADS_STATE_KEY]: Object.fromEntries(
+          limited.map((upload) => [upload.jobId, upload]),
+        ),
+      });
+    });
+  return stateWriteQueue;
 }
 
 async function responseError(response) {

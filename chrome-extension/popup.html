@@ -118,12 +118,26 @@
             <strong id="active-stage-title">Ready to capture</strong>
             <p id="active-stage-message">The listing will be securely sent to AirCost.</p>
           </div>
-          <details class="technical-details">
-            <summary>Technical details</summary>
-            <ol id="technical-progress" class="technical-progress"></ol>
-          </details>
+          <div class="technical-details">
+            <button id="technical-details-toggle" class="technical-details-toggle" type="button" aria-expanded="false" aria-controls="technical-details-panel">Technical details</button>
+            <div id="technical-details-panel" class="technical-details-panel hidden">
+              <p id="technical-progress-empty" class="technical-progress-empty">No technical events yet.</p>
+              <ol id="technical-progress" class="technical-progress"></ol>
+            </div>
+          </div>
         </div>
       </details>
+
+      <section id="recent-uploads" class="panel recent-uploads hidden" aria-labelledby="recent-uploads-heading">
+        <div class="recent-uploads-heading">
+          <div>
+            <h2 id="recent-uploads-heading">Recent uploads</h2>
+            <p>Background work continues as you capture more pages.</p>
+          </div>
+          <span id="recent-uploads-count" class="recent-uploads-count"></span>
+        </div>
+        <ol id="recent-uploads-list" class="recent-uploads-list"></ol>
+      </section>
 
       <section id="listing-editor" class="panel listing-editor hidden" aria-labelledby="listing-editor-heading">
         <div class="section-heading">
