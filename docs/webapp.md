@@ -44,11 +44,17 @@ URL preview mode uses the Gemini API. The server first converts listing HTML to
 compact plain text, then asks Gemini to return the listing fields as strict
 JSON. Manual JSON mode does not use Gemini.
 
-Plugin uploads are server-owned once the complete signed request has been
-received and authenticated. Closing the extension popup or otherwise dropping
-the streamed progress response stops only the live progress display; extraction,
-normalization, listing persistence, and valuation continue in the server task.
-Reopening the popup queries the stored submission and listing state. An upload
+The extension popup hands each signed capture to its background service worker,
+which owns the upload independently of the popup. Plugin uploads become
+server-owned once the complete signed request has been received and
+authenticated. Closing the popup therefore does not interrupt either the upload
+or subsequent extraction, normalization, listing persistence, and valuation.
+The service worker stores its latest progress locally, and a reopened popup
+queries the server for the authoritative submission and listing state. It keeps
+a bounded 24-hour history of up to 25 jobs so multiple captures can run at once
+and their latest stages remain visible in the popup. The popup releases its
+upload action as soon as the server accepts a page, allowing the user to move to
+the next listing while extraction and normalization continue. An upload
 interrupted before the complete request reaches the server must be retried, and
 in-flight work is not preserved across a server process restart.
 
@@ -149,7 +155,12 @@ Only one of `source_url` and `listing` is allowed per request.
 ## Chrome Extension Capture
 
 The unpacked Chrome extension in `chrome-extension/` submits rendered page HTML
-from the user's browser instead of asking the server to fetch listing URLs.
+from the user's browser instead of asking the server to fetch listing URLs. The
+popup captures and signs the page, then hands the signed payload to the
+extension's background service worker. The service worker continues the upload
+if the popup closes and persists per-upload progress for the next time the popup
+opens. The recent-uploads panel shows the current stage of concurrent and
+completed jobs.
 
 Register the extension install:
 

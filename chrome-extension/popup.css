@@ -639,16 +639,56 @@ dd {
   font-size: 11px;
 }
 
-.technical-details summary {
+.technical-details-toggle {
+  position: relative;
   width: max-content;
+  min-height: 28px;
+  padding: 4px 18px 4px 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
   cursor: pointer;
+  font-size: 11px;
   font-weight: 650;
+}
+
+.technical-details-toggle:hover:not(:disabled) {
+  border: 0;
+  color: var(--brand-dark);
+  background: transparent;
+}
+
+.technical-details-toggle::after {
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: "";
+  transform: translateY(-65%) rotate(45deg);
+  transition: transform 140ms ease;
+}
+
+.technical-details-toggle[aria-expanded="true"]::after {
+  transform: translateY(-30%) rotate(225deg);
+}
+
+.technical-details-panel {
+  margin-top: 3px;
+}
+
+.technical-progress-empty {
+  padding: 8px;
+  border-radius: 7px;
+  background: #f6f8fa;
 }
 
 .technical-progress {
   max-height: 110px;
   overflow: auto;
-  margin: 7px 0 0;
+  margin: 0;
   padding: 8px 8px 8px 27px;
   border-radius: 7px;
   background: #f6f8fa;
@@ -661,6 +701,135 @@ dd {
 
 .technical-progress li + li {
   margin-top: 3px;
+}
+
+.recent-uploads {
+  margin-top: 10px;
+  padding: 12px;
+}
+
+.recent-uploads-heading,
+.recent-upload-main,
+.recent-upload-status {
+  display: flex;
+  align-items: center;
+}
+
+.recent-uploads-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.recent-uploads-heading p {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.recent-uploads-count {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.recent-uploads-list {
+  display: grid;
+  max-height: 230px;
+  overflow-y: auto;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recent-upload {
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid #e2e7ec;
+  border-radius: 8px;
+  background: #f8fafb;
+}
+
+.recent-upload-main {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.recent-upload-copy {
+  display: grid;
+  min-width: 0;
+}
+
+.recent-upload-copy strong,
+.recent-upload-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-upload-copy strong {
+  font-size: 11px;
+}
+
+.recent-upload-copy span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.recent-upload-status {
+  flex: 0 0 auto;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.recent-upload-status::before {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--brand);
+  content: "";
+}
+
+.recent-upload.is-complete .recent-upload-status {
+  color: var(--success);
+}
+
+.recent-upload.is-complete .recent-upload-status::before {
+  background: var(--success);
+}
+
+.recent-upload.is-error .recent-upload-status {
+  color: var(--danger);
+}
+
+.recent-upload.is-error .recent-upload-status::before {
+  background: var(--danger);
+}
+
+.recent-upload-progress {
+  height: 3px;
+  overflow: hidden;
+  margin-top: 7px;
+  border-radius: 999px;
+  background: #dfe6eb;
+}
+
+.recent-upload-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand);
+}
+
+.recent-upload.is-complete .recent-upload-progress span {
+  background: var(--success);
+}
+
+.recent-upload.is-error .recent-upload-progress span {
+  background: var(--danger);
 }
 
 .listing-editor {

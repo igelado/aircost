@@ -1,4 +1,8 @@
 const SIGNATURE_PREFIX = "aircost-plugin-v1";
+const START_UPLOAD_MESSAGE = "aircost:start-upload";
+const UPLOAD_PROGRESS_MESSAGE = "aircost:upload-progress";
+const BACKGROUND_UPLOADS_STATE_KEY = "aircostBackgroundUploads";
+const BACKGROUND_UPLOAD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const STAGE_LABELS = {
   capturing_page: "Capturing page",
@@ -66,7 +70,13 @@ const pipeline = document.querySelector("#pipeline");
 const activeStageEyebrow = document.querySelector("#active-stage-eyebrow");
 const activeStageTitle = document.querySelector("#active-stage-title");
 const activeStageMessage = document.querySelector("#active-stage-message");
+const technicalDetailsToggle = document.querySelector("#technical-details-toggle");
+const technicalDetailsPanel = document.querySelector("#technical-details-panel");
 const technicalProgress = document.querySelector("#technical-progress");
+const technicalProgressEmpty = document.querySelector("#technical-progress-empty");
+const recentUploads = document.querySelector("#recent-uploads");
+const recentUploadsCount = document.querySelector("#recent-uploads-count");
+const recentUploadsList = document.querySelector("#recent-uploads-list");
 const recoveryActions = document.querySelector("#recovery-actions");
 const retryUploadButton = document.querySelector("#retry-upload-button");
 const retryStatusButton = document.querySelector("#retry-status-button");
@@ -84,6 +94,8 @@ const avionicsList = document.querySelector("#avionics-list");
 let activeListing = null;
 let activeSubmission = null;
 let currentPipelineStage = null;
+let backgroundStatusTimer = null;
+let activeSourceUrl = "";
 
 document.addEventListener("DOMContentLoaded", refreshView);
 registerButton.addEventListener("click", registerPlugin);
@@ -100,6 +112,14 @@ closeEditorButton.addEventListener("click", closeListingEditor);
 cancelListingButton.addEventListener("click", closeListingEditor);
 listingEditorForm.addEventListener("submit", saveListingEdits);
 addAvionicsButton.addEventListener("click", () => addAvionicsRow());
+technicalDetailsToggle.addEventListener("click", toggleTechnicalDetails);
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type !== UPLOAD_PROGRESS_MESSAGE) {
+    return false;
+  }
+  void refreshRecentUploads();
+  return false;
+});
 
 async function refreshView() {
   const config = await loadConfig();
@@ -162,6 +182,8 @@ async function registerPlugin() {
 
 async function refreshListingStatus() {
   try {
+    clearTimeout(backgroundStatusTimer);
+    backgroundStatusTimer = null;
     setBusy(refreshStatusButton, true);
     hideRecoveryActions();
     closeListingEditor();
@@ -179,6 +201,14 @@ async function refreshListingStatus() {
       headers: { "X-User-Email": config.username },
     });
     const payload = await parseJsonResponse(response);
+    const uploads = await loadBackgroundUploads();
+    renderRecentUploads(uploads);
+    const backgroundUpload = loadBackgroundUpload(capture.sourceUrl, uploads);
+    if (!payload.submitted && backgroundUpload) {
+      showBackgroundUpload(backgroundUpload);
+      await setActionBadge(false, capture.tabId);
+      return;
+    }
     setSubmissionState(payload);
     await setActionBadge(Boolean(payload.submitted), capture.tabId);
     if (payload.submission?.extraction_error) {
@@ -188,6 +218,7 @@ async function refreshListingStatus() {
       hideNotice();
     }
   } catch (error) {
+    await refreshRecentUploads().catch(() => {});
     clearListingState({ preservePage: true });
     setSubmissionBadge("error", "Status error");
     setNotice(`Could not check this page: ${error.message}`, "error");
@@ -198,6 +229,7 @@ async function refreshListingStatus() {
 }
 
 async function submitCurrentPage() {
+  let uploadObserver = null;
   try {
     setSubmissionBusy(true);
     hideRecoveryActions();
@@ -231,36 +263,71 @@ async function submitCurrentPage() {
     recordProgress("signing_upload", "complete", "Secure signature ready.");
 
     recordProgress("sending_upload", "running", "Uploading rendered page content.");
-    const response = await fetch(`${config.serverUrl}/api/plugin/submissions/stream`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-User-Email": config.username,
-      },
-      body: JSON.stringify({
+    const jobId = crypto.randomUUID();
+    uploadObserver = observeBackgroundUpload(jobId);
+    const accepted = await chrome.runtime.sendMessage({
+      type: START_UPLOAD_MESSAGE,
+      jobId,
+      tabId: capture.tabId,
+      serverUrl: config.serverUrl,
+      username: config.username,
+      payload: {
         plugin_install_id: config.pluginInstallId,
         source_url: capture.sourceUrl,
         rendered_html: capture.renderedHtml,
         signature: arrayBufferToBase64(signature),
-      }),
+      },
     });
-    const payload = await readProgressResponse(response);
-    setSubmissionState(payload);
-    await setActionBadge(true, capture.tabId);
-    finishPipeline(payload.submission?.extraction_error);
-    if (payload.submission?.extraction_error) {
-      setNotice(`Page captured, but extraction needs attention: ${payload.submission.extraction_error}`, "error");
-      showRecoveryActions(["reprocess", "upload"]);
-    } else {
-      setNotice("Saved to AirCost.", "success");
+    if (!accepted?.ok) {
+      throw new Error(accepted?.error || "Background upload did not start.");
     }
+    recordProgress("sending_upload", "complete", "Upload accepted; AirCost now owns processing.");
+    setSubmissionBadge("unknown", "Processing");
+    setNotice("Upload received. You can move to the next listing while AirCost finishes this one.", "success");
+    showRecoveryActions(["status"]);
+    scheduleBackgroundStatusRefresh();
+    void monitorAcceptedUpload(uploadObserver.promise, capture);
   } catch (error) {
+    uploadObserver?.cancel();
     recordProgress("error", "error", error.message);
     setSubmissionBadge("error", "Upload error");
     setNotice(`Could not add this page: ${error.message}`, "error");
     showRecoveryActions(["upload", "status"]);
   } finally {
     setSubmissionBusy(false);
+  }
+}
+
+async function monitorAcceptedUpload(resultPromise, capture) {
+  const result = await resultPromise;
+  await refreshRecentUploads().catch(() => {});
+  if (activeSourceUrl !== capture.sourceUrl) {
+    return;
+  }
+  if (result.kind === "detached") {
+    setSubmissionBadge("unknown", "Processing");
+    setNotice("AirCost is continuing on the server. Reopen or refresh to check the result.", "info");
+    showRecoveryActions(["status"]);
+    scheduleBackgroundStatusRefresh();
+    return;
+  }
+  if (result.kind === "error") {
+    recordProgress("error", "error", result.event.message || "Upload processing failed.");
+    setSubmissionBadge("error", "Upload error");
+    setNotice(`Could not add this page: ${result.event.message || "Upload processing failed."}`, "error");
+    showRecoveryActions(["upload", "status"]);
+    return;
+  }
+
+  const payload = result.event;
+  setSubmissionState(payload);
+  await setActionBadge(true, capture.tabId);
+  finishPipeline(payload.submission?.extraction_error);
+  if (payload.submission?.extraction_error) {
+    setNotice(`Page captured, but extraction needs attention: ${payload.submission.extraction_error}`, "error");
+    showRecoveryActions(["reprocess", "upload"]);
+  } else {
+    setNotice("Saved to AirCost.", "success");
   }
 }
 
@@ -334,75 +401,161 @@ async function saveListingEdits(event) {
   }
 }
 
-async function readProgressResponse(response) {
-  if (!response.ok) {
-    await parseJsonResponse(response);
-  }
-  const contentType = response.headers.get("content-type") || "";
-  if (!response.body || !contentType.includes("application/x-ndjson")) {
-    return parseJsonResponse(response);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let finalPayload = null;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const event = parseProgressLine(line);
-      if (event) {
-        handleProgressEvent(event);
-        if (event.status === "error") {
-          throw new Error(event.message || "Upload failed.");
-        }
-        if (event.stage === "complete") {
-          finalPayload = event;
-        }
-      }
-    }
-  }
-
-  const finalEvent = parseProgressLine(buffer);
-  if (finalEvent) {
-    handleProgressEvent(finalEvent);
-    if (finalEvent.status === "error") {
-      throw new Error(finalEvent.message || "Upload failed.");
-    }
-    if (finalEvent.stage === "complete") {
-      finalPayload = finalEvent;
-    }
-  }
-
-  if (!finalPayload) {
-    throw new Error("Upload finished without a completion response.");
-  }
-  return finalPayload;
-}
-
-function parseProgressLine(line) {
-  const trimmed = line.trim();
-  if (!trimmed) {
-    return null;
-  }
-  try {
-    return JSON.parse(trimmed);
-  } catch (error) {
-    throw new Error(`Invalid progress update: ${error.message}`);
-  }
-}
-
 function handleProgressEvent(event) {
   const stage = event.stage || "upload";
   const status = event.status || "running";
   recordProgress(stage, status, event.message || STAGE_LABELS[stage] || stage);
+}
+
+function observeBackgroundUpload(jobId) {
+  let listener;
+  const promise = new Promise((resolve) => {
+    listener = (message) => {
+      if (message?.type !== UPLOAD_PROGRESS_MESSAGE || message.jobId !== jobId) {
+        return;
+      }
+      handleProgressEvent(message.event || {});
+      if (message.lifecycle === "complete") {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve({ kind: "complete", event: message.event });
+      } else if (message.lifecycle === "error") {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve({ kind: "error", event: message.event || {} });
+      } else if (message.lifecycle === "detached") {
+        chrome.runtime.onMessage.removeListener(listener);
+        resolve({ kind: "detached", event: message.event || {} });
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+  });
+  return {
+    promise,
+    cancel() {
+      if (listener) {
+        chrome.runtime.onMessage.removeListener(listener);
+      }
+    },
+  };
+}
+
+async function loadBackgroundUploads() {
+  const stored = await chrome.storage.local.get(BACKGROUND_UPLOADS_STATE_KEY);
+  const cutoff = Date.now() - BACKGROUND_UPLOAD_MAX_AGE_MS;
+  return Object.values(stored[BACKGROUND_UPLOADS_STATE_KEY] || {})
+    .filter((upload) => Number(upload.updatedAt || upload.startedAt || 0) >= cutoff)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function loadBackgroundUpload(sourceUrl, uploads) {
+  return uploads.find((upload) => upload.sourceUrl === sourceUrl) || null;
+}
+
+async function refreshRecentUploads() {
+  renderRecentUploads(await loadBackgroundUploads());
+}
+
+function renderRecentUploads(uploads) {
+  recentUploadsList.replaceChildren();
+  recentUploads.classList.toggle("hidden", uploads.length === 0);
+  recentUploadsCount.textContent = uploads.length === 1 ? "1 upload" : `${uploads.length} uploads`;
+  for (const upload of uploads) {
+    const item = document.createElement("li");
+    item.className = `recent-upload is-${upload.lifecycle}`;
+
+    const main = document.createElement("div");
+    main.className = "recent-upload-main";
+    const copy = document.createElement("div");
+    copy.className = "recent-upload-copy";
+    const title = document.createElement("strong");
+    const url = document.createElement("span");
+    title.textContent = uploadHostname(upload.sourceUrl);
+    url.textContent = upload.sourceUrl;
+    url.title = upload.sourceUrl;
+    copy.append(title, url);
+
+    const status = document.createElement("span");
+    status.className = "recent-upload-status";
+    status.textContent = uploadStatusLabel(upload);
+    main.append(copy, status);
+
+    const progress = document.createElement("div");
+    progress.className = "recent-upload-progress";
+    progress.setAttribute("role", "progressbar");
+    const progressValue = uploadProgressPercent(upload);
+    progress.setAttribute("aria-label", `${title.textContent} upload progress`);
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", "100");
+    progress.setAttribute("aria-valuenow", String(progressValue));
+    const progressFill = document.createElement("span");
+    progressFill.style.width = `${progressValue}%`;
+    progress.append(progressFill);
+    item.append(main, progress);
+    recentUploadsList.append(item);
+  }
+}
+
+function uploadHostname(sourceUrl) {
+  try {
+    return new URL(sourceUrl).hostname || "Aircraft listing";
+  } catch {
+    return "Aircraft listing";
+  }
+}
+
+function uploadStatusLabel(upload) {
+  if (upload.lifecycle === "complete") {
+    return "Saved";
+  }
+  if (upload.lifecycle === "error") {
+    return "Failed";
+  }
+  if (upload.lifecycle === "detached") {
+    return "On server";
+  }
+  return STAGE_LABELS[upload.stage] || "Processing";
+}
+
+function uploadProgressPercent(upload) {
+  if (upload.lifecycle === "complete") {
+    return 100;
+  }
+  const pipelineStage = STAGE_TO_PIPELINE[upload.stage] || "verify";
+  const index = PIPELINE_STAGES.findIndex((stage) => stage.id === pipelineStage);
+  return Math.max(10, Math.round(((index + 0.5) / PIPELINE_STAGES.length) * 100));
+}
+
+function showBackgroundUpload(upload) {
+  activeSubmission = null;
+  activeListing = null;
+  closeListingEditor();
+  newPageActions.classList.add("hidden");
+  existingEntry.classList.add("hidden");
+  const pipelineStage = STAGE_TO_PIPELINE[upload.stage] || currentPipelineStage || "verify";
+  resetPipeline(pipelineStage, { preserveTechnicalDetails: true });
+
+  if (upload.lifecycle === "error") {
+    setSubmissionBadge("error", "Upload error");
+    setPipelineError(pipelineStage, upload.message);
+    setNotice(`AirCost could not finish this upload: ${upload.message}`, "error");
+    showRecoveryActions(["upload", "status"]);
+    return;
+  }
+
+  recordProgress(upload.stage || "received_upload", "running", upload.message);
+  setSubmissionBadge("unknown", "Processing");
+  setNotice(
+    upload.lifecycle === "detached"
+      ? "Live updates ended, but AirCost is continuing on the server."
+      : "AirCost is processing this page in the background.",
+    "info",
+  );
+  showRecoveryActions(["status"]);
+  scheduleBackgroundStatusRefresh();
+}
+
+function scheduleBackgroundStatusRefresh() {
+  clearTimeout(backgroundStatusTimer);
+  backgroundStatusTimer = setTimeout(refreshListingStatus, 2500);
 }
 
 function recordProgress(stage, status, message) {
@@ -435,6 +588,7 @@ function recordProgress(stage, status, message) {
 }
 
 function appendTechnicalProgress(stage, status, message) {
+  technicalProgressEmpty.classList.add("hidden");
   const item = document.createElement("li");
   const label = STAGE_LABELS[stage] || stage;
   item.textContent = `${status === "complete" ? "✓" : status === "error" ? "!" : "›"} ${label}: ${message || ""}`;
@@ -442,11 +596,15 @@ function appendTechnicalProgress(stage, status, message) {
   technicalProgress.scrollTop = technicalProgress.scrollHeight;
 }
 
-function resetPipeline(startAt = "capture") {
+function resetPipeline(startAt = "capture", { preserveTechnicalDetails = false } = {}) {
   workflowDetails.classList.remove("hidden", "is-success", "is-error");
   workflowDetails.open = true;
   workflowSummary.textContent = "Processing listing";
   technicalProgress.replaceChildren();
+  technicalProgressEmpty.classList.remove("hidden");
+  if (!preserveTechnicalDetails) {
+    closeTechnicalDetails();
+  }
   currentPipelineStage = startAt;
   const startIndex = PIPELINE_STAGES.findIndex((item) => item.id === startAt);
   for (const [index, item] of PIPELINE_STAGES.entries()) {
@@ -543,6 +701,8 @@ function clearListingState({ preservePage = false } = {}) {
   newPageActions.classList.add("hidden");
   workflowDetails.classList.add("hidden");
   technicalProgress.replaceChildren();
+  technicalProgressEmpty.classList.remove("hidden");
+  closeTechnicalDetails();
   hideRecoveryActions();
   setSubmissionBadge("unknown", "Checking");
   if (!preservePage) {
@@ -558,7 +718,19 @@ function setSubmissionBadge(kind, text) {
   submissionBadge.textContent = text;
 }
 
+function toggleTechnicalDetails() {
+  const shouldOpen = technicalDetailsPanel.classList.contains("hidden");
+  technicalDetailsPanel.classList.toggle("hidden", !shouldOpen);
+  technicalDetailsToggle.setAttribute("aria-expanded", String(shouldOpen));
+}
+
+function closeTechnicalDetails() {
+  technicalDetailsPanel.classList.add("hidden");
+  technicalDetailsToggle.setAttribute("aria-expanded", "false");
+}
+
 function setPageIdentity(sourceUrl) {
+  activeSourceUrl = sourceUrl;
   currentUrlOutput.textContent = sourceUrl;
   currentUrlOutput.title = sourceUrl;
   currentUrlOutput.setAttribute("aria-label", `Current page URL: ${sourceUrl}`);
