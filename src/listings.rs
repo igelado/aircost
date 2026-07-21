@@ -728,15 +728,40 @@ pub async fn delete_listing(db: &AppDb, user_id: i64, listing_id: i64) -> StoreR
     let model_id = listing_aircraft_identity(db, listing_id)
         .await?
         .map(|identity| identity.aircraft_model_id);
-    execute_query!(
-        db,
-        "DELETE FROM aircraft_sale_listings WHERE id = ?",
-        listing_id
-    )?;
+    detach_submission_and_delete_listing(db, listing_id).await?;
     if let Some(model_id) = model_id {
         mark_valuation_snapshot_stale_best_effort(db, model_id).await;
     }
     cleanup_orphan_records(db).await?;
+    Ok(())
+}
+
+async fn detach_submission_and_delete_listing(db: &AppDb, listing_id: i64) -> StoreResult<()> {
+    let detach_submission = db.sql(
+        "UPDATE plugin_submissions SET canonical_listing_id = NULL WHERE canonical_listing_id = ?",
+    );
+    let delete_listing = db.sql("DELETE FROM aircraft_sale_listings WHERE id = ?");
+
+    macro_rules! execute_in_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            sqlx::query(&detach_submission)
+                .bind(listing_id)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(&delete_listing)
+                .bind(listing_id)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            Ok::<(), sqlx::Error>(())
+        }};
+    }
+
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => execute_in_transaction!(pool)?,
+        DatabaseBackend::Postgres(pool) => execute_in_transaction!(pool)?,
+    }
     Ok(())
 }
 
@@ -3317,6 +3342,118 @@ mod tests {
             propeller_hours: 357.0,
             avionics: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn delete_listing_preserves_and_detaches_plugin_submission() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        execute_query!(&db, "DROP TABLE plugin_submissions")
+            .expect("new submission table should be replaceable");
+        execute_query!(
+            &db,
+            r#"
+            CREATE TABLE plugin_submissions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL REFERENCES users(id),
+              plugin_install_id INTEGER NOT NULL REFERENCES plugin_installs(id),
+              source_url TEXT NOT NULL,
+              submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              rendered_html TEXT NOT NULL,
+              rendered_html_sha256 TEXT NOT NULL,
+              signature_base64 TEXT NOT NULL,
+              extracted_listing_json TEXT,
+              extraction_error TEXT,
+              canonical_listing_id INTEGER REFERENCES aircraft_sale_listings(id)
+            )
+            "#
+        )
+        .expect("legacy restrictive submission foreign key should seed");
+        let variant_id = super::ensure_aircraft_model_variant(&db, "Cessna", "182 Skylane", "182T")
+            .await
+            .expect("variant should seed");
+        let listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id,
+              created_by_user_id,
+              source_url,
+              model_year,
+              asking_price_usd,
+              currency,
+              status,
+              airframe_hours,
+              engine_hours,
+              propeller_hours
+            )
+            VALUES (?, ?, 'https://example.test/listing', 2023, 699000, 'USD', 'active', 357, 357, 357)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id
+        )
+        .expect("listing should seed");
+        let install_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO plugin_installs (user_id, public_key_base64)
+            VALUES (?, 'test-key')
+            RETURNING id
+            "#,
+            user.id
+        )
+        .expect("plugin install should seed");
+        let submission_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id,
+              plugin_install_id,
+              source_url,
+              rendered_html,
+              rendered_html_sha256,
+              signature_base64,
+              canonical_listing_id
+            )
+            VALUES (?, ?, 'https://example.test/listing', '<html></html>', 'hash', 'signature', ?)
+            RETURNING id
+            "#,
+            user.id,
+            install_id,
+            listing_id
+        )
+        .expect("plugin submission should seed");
+
+        super::delete_listing(&db, user.id, listing_id)
+            .await
+            .expect("listing deletion should detach the retained submission");
+
+        let listing_count = query_scalar_one!(
+            &db,
+            i64,
+            "SELECT COUNT(*) FROM aircraft_sale_listings WHERE id = ?",
+            listing_id
+        )
+        .expect("listing count should load");
+        let canonical_listing_id = query_scalar_one!(
+            &db,
+            Option<i64>,
+            "SELECT canonical_listing_id FROM plugin_submissions WHERE id = ?",
+            submission_id
+        )
+        .expect("submission should remain queryable");
+
+        assert_eq!(listing_count, 0);
+        assert_eq!(canonical_listing_id, None);
     }
 
     #[tokio::test]

@@ -151,8 +151,11 @@ also refit on a best-effort basis. Orphan cleanup runs after the update.
 
 ## Removal Path
 
-`DELETE /api/listings/{id}` removes the listing, refits the affected model, and
-runs orphan cleanup.
+`DELETE /api/listings/{id}` detaches any retained plugin submissions from their
+canonical listing, removes the listing, refits the affected model, and runs
+orphan cleanup. The detach and listing deletion are atomic. Plugin submissions
+retain their signed rendered HTML and extraction history after the canonical
+listing is removed.
 
 The cleanup code deletes unreferenced generated child records first, then
 removes unreferenced lookup rows:

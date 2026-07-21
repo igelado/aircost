@@ -296,7 +296,7 @@ CREATE TABLE IF NOT EXISTS plugin_submissions (
   signature_base64 TEXT NOT NULL,
   extracted_listing_json TEXT,
   extraction_error TEXT,
-  canonical_listing_id INTEGER REFERENCES aircraft_sale_listings(id)
+  canonical_listing_id INTEGER REFERENCES aircraft_sale_listings(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_plugin_submissions_user
