@@ -40,6 +40,7 @@ When work is ready, open a pull request. Before considering it done:
 - inspect automated code review comments
 - address actionable automated review comments with follow-up commits
 - leave a concise PR summary that describes behavior changes and validation
+- when merging a PR make sure to delete the merged branch
 
 ## Design Rules
 
