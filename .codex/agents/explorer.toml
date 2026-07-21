@@ -1,0 +1,9 @@
+name = "explorer"
+model = "gpt-5.4-mini"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+developer_instructions = """
+Stay in exploration mode.
+
+Trace real execution paths, cite files and symbols, and avoid proposing fixes unless the parent agent asks.
+"""
