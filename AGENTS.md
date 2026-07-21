@@ -40,6 +40,7 @@ When work is ready, open a pull request. Before considering it done:
 - inspect automated code review comments
 - address actionable automated review comments with follow-up commits
 - leave a concise PR summary that describes behavior changes and validation
+- when merging a PR make sure to delete the merged branch
 
 ## Design Rules
 
@@ -92,6 +93,26 @@ Use admin commands for database healing and fitting. Prefer dry runs first:
 
 ```bash
 cargo run --bin aircost-admin -- heal-aircraft-models --dry-run
+
+# Agent Delegation Rules
+
+When the task matches one of these patterns, delegate to the appropriate custom agent:
+
+## Exploration / Questions about existing code
+- "How does X work?", "Where is Y defined?", "Trace the flow of Z"
+- → Use `explorer` agent(s). Spawn multiple if the question spans independent modules.
+
+## Implementation with a defined spec
+- "Add support for X", "Fix the error caused by Y", "Implement functionality Z"
+- → Use `developer` agent. For multi-module changes, spawn one per module boundary.
+
+## Code generator with detailed spec and implementation instructions
+- "Implement X according to the spec", "Add feature Y as described in DESIGN.md"
+- → Use `coder` agent. For fully specified changes with implementation instructions.
+
+## When NOT to delegate
+- Simple single-file edits, quick questions, or tasks that need tight back-and-forth iteration.
+- Keep these in the main agent thread.
 cargo run --bin aircost-admin -- curate-avionics --dry-run
 cargo run --bin aircost-admin -- fit-depreciation --dry-run
 ```
