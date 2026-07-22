@@ -7,7 +7,9 @@ use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
 use crate::valuation::store::StoredModelValidation;
-use crate::valuation::validation::{FoldPrediction, ValidationMetrics, ValidationReport};
+use crate::valuation::validation::{
+    FoldPrediction, ValidationMetrics, ValidationReport, VALIDATION_EVIDENCE_VERSION,
+};
 use crate::valuation::{StructuralFitConfig, SupportGrade, ValuationError};
 
 use super::artifact::{sha256_hex, DnnArtifactMetadataV1, DnnArtifactV1, MemberArtifact};
@@ -16,6 +18,8 @@ use super::DnnValuationModel;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DnnStoredMetricsV1 {
+    #[serde(default)]
+    pub validation_evidence_version: u32,
     pub dnn_metrics: ValidationMetrics,
     pub activation_gates: ActivationGateReport,
     pub baseline_model_version_id: i64,
@@ -44,7 +48,7 @@ pub async fn structural_baseline_id(db: &AppDb, snapshot_id: i64) -> Result<i64,
         r#"
         SELECT id
         FROM valuation_model_versions
-        WHERE snapshot_id = ? AND model_kind = 'structural'
+        WHERE snapshot_id = ? AND model_kind = 'structural' AND state = 'active'
         ORDER BY id DESC
         LIMIT 1
         "#,
@@ -64,11 +68,18 @@ pub async fn structural_baseline_id(db: &AppDb, snapshot_id: i64) -> Result<i64,
         }
     }
     .map_err(|error| ValuationError::Database(error.to_string()))?;
-    id.ok_or_else(|| {
+    let id = id.ok_or_else(|| {
         ValuationError::Fit(format!(
-            "snapshot {snapshot_id} has no structural baseline model version"
+            "snapshot {snapshot_id} has no active structural baseline model version"
         ))
-    })
+    })?;
+    let validation = crate::valuation::store::validate_structural_model_version(db, id).await?;
+    if !validation.activation_gates_pass {
+        return Err(ValuationError::ValidationGate(format!(
+            "active structural baseline {id} does not satisfy current validation evidence requirements"
+        )));
+    }
+    Ok(id)
 }
 
 pub async fn structural_baseline_config(
@@ -148,6 +159,13 @@ pub async fn evaluate_candidate_gates(
             "structural baseline model {baseline_id} does not exist"
         ))
     })?;
+    let baseline_validation =
+        crate::valuation::store::validate_structural_model_version(db, baseline_id).await?;
+    if baseline_validation.state != "active" || !baseline_validation.activation_gates_pass {
+        return Err(ValuationError::ValidationGate(format!(
+            "DNN baseline {baseline_id} must be an active structural model that passes current validation evidence requirements"
+        )));
+    }
     if baseline.snapshot_id != report.artifact.metadata.snapshot_id {
         return Err(ValuationError::ValidationGate(
             "DNN and structural baseline must use the same snapshot".to_string(),
@@ -202,6 +220,7 @@ pub async fn evaluate_candidate_gates(
         &bootstrap_improvements,
     );
     Ok(DnnStoredMetricsV1 {
+        validation_evidence_version: VALIDATION_EVIDENCE_VERSION,
         dnn_metrics: report.metrics.clone(),
         activation_gates: gates,
         baseline_model_version_id: baseline_id,
@@ -246,6 +265,7 @@ fn paired_bootstrap_improvements(
         .map(|prediction| {
             (
                 (
+                    prediction.fold_id.as_str(),
                     prediction.duplicate_group_key.as_str(),
                     prediction.listing_id,
                 ),
@@ -258,6 +278,7 @@ fn paired_bootstrap_improvements(
         .filter_map(|prediction| {
             structural_by_key
                 .get(&(
+                    prediction.fold_id.as_str(),
                     prediction.duplicate_group_key.as_str(),
                     prediction.listing_id,
                 ))
@@ -489,7 +510,7 @@ async fn baseline_exists(
         r#"
         SELECT COUNT(*)
         FROM valuation_model_versions
-        WHERE id = ? AND snapshot_id = ? AND model_kind = 'structural'
+        WHERE id = ? AND snapshot_id = ? AND model_kind = 'structural' AND state = 'active'
         "#,
     );
     let count = match db.backend() {
@@ -536,6 +557,12 @@ fn validate_dnn_record(
     }
     artifact.load_members::<burn::backend::Flex>(&Default::default())?;
     let metrics: DnnStoredMetricsV1 = serde_json::from_str(&row.metrics_json)?;
+    if metrics.validation_evidence_version != VALIDATION_EVIDENCE_VERSION {
+        return Err(ValuationError::InvalidArtifact(format!(
+            "DNN validation evidence version {} does not match current version {VALIDATION_EVIDENCE_VERSION}",
+            metrics.validation_evidence_version
+        )));
+    }
     if metrics.baseline_model_version_id != artifact.metadata.baseline_model_version_id {
         return Err(ValuationError::InvalidArtifact(
             "DNN metrics and metadata reference different structural baselines".to_string(),
@@ -559,12 +586,20 @@ pub async fn validate_dnn_model_version(
     let row = load_version_row(db, model_version_id).await?;
     let artifacts = load_artifact_rows(db, model_version_id).await?;
     let (artifact, metadata_hash) = build_artifact(artifacts)?;
-    let has_baseline = baseline_exists(
+    let mut has_baseline = baseline_exists(
         db,
         artifact.metadata.baseline_model_version_id,
         artifact.metadata.snapshot_id,
     )
     .await?;
+    if has_baseline {
+        let baseline_validation = crate::valuation::store::validate_structural_model_version(
+            db,
+            artifact.metadata.baseline_model_version_id,
+        )
+        .await?;
+        has_baseline = baseline_validation.activation_gates_pass;
+    }
     validate_dnn_record(&row, &artifact, metadata_hash, has_baseline)
 }
 
@@ -596,6 +631,12 @@ pub async fn activate_dnn_model_version(
     db: &AppDb,
     model_version_id: i64,
 ) -> Result<StoredModelValidation, ValuationError> {
+    let preflight = validate_dnn_model_version(db, model_version_id).await?;
+    if !preflight.activation_gates_pass {
+        return Err(ValuationError::ValidationGate(
+            "DNN candidate did not pass current paired activation gates".to_string(),
+        ));
+    }
     let version_sql = db.sql(
         r#"
         SELECT id AS model_version_id, snapshot_id, model_kind, state,
@@ -736,6 +777,7 @@ mod tests {
                 engine_times: vec![],
                 propeller_times: vec![],
                 equipment_tokens: vec![],
+                valuation_facts: vec![],
                 technical_field_count: 3,
             })
             .collect()
@@ -750,10 +792,15 @@ mod tests {
             INSERT INTO valuation_snapshots (
               capture_time, input_sha256, selection_policy_json,
               feature_schema_version, included_count, excluded_count
-            ) VALUES ('2026-07-20', lower(hex(randomblob(32))), '{}', 1, 3, 0)
+            ) VALUES (
+              '2026-07-20', lower(hex(randomblob(32))),
+              '{"faa_admission":{"schema_version":1,"included_listings":{}}}',
+              ?, 3, 0
+            )
             RETURNING id
             "#,
         )
+        .bind(crate::valuation::FEATURE_SCHEMA_VERSION as i64)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -806,6 +853,15 @@ mod tests {
         .await
         .unwrap();
         let mut metrics: DnnStoredMetricsV1 = serde_json::from_str(&metrics_json).unwrap();
+        metrics.validation_evidence_version = 0;
+        sqlx::query("UPDATE valuation_model_versions SET metrics_json = ? WHERE id = ?")
+            .bind(serde_json::to_string(&metrics).unwrap())
+            .bind(dnn_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(validate_dnn_model_version(&db, dnn_id).await.is_err());
+        metrics.validation_evidence_version = VALIDATION_EVIDENCE_VERSION;
         metrics.activation_gates = ActivationGateReport {
             median_error_gate: true,
             paired_win_fraction: 1.0,
@@ -823,12 +879,41 @@ mod tests {
             .unwrap();
         let activated = activate_dnn_model_version(&db, dnn_id).await.unwrap();
         assert_eq!(activated.state, "active");
+        let baseline_state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM valuation_model_versions WHERE id = ?",
+        )
+        .bind(baseline_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(baseline_state, "active");
         let model = load_active_dnn_model(&db).await.unwrap().unwrap();
         assert!(model
             .estimate(&rows()[0].as_query())
             .unwrap()
             .estimated_value_usd
             .is_finite());
+
+        let mut replacement_structural = fit_structural(&rows(), &structural_config).unwrap();
+        replacement_structural.snapshot_id = snapshot_id;
+        let replacement_id = persist_structural_candidate(
+            &db,
+            snapshot_id,
+            &replacement_structural,
+            &structural_report,
+            &structural_config,
+        )
+        .await
+        .unwrap();
+        activate_model_version(&db, replacement_id).await.unwrap();
+        let dnn_state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM valuation_model_versions WHERE id = ?",
+        )
+        .bind(dnn_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(dnn_state, "retired");
 
         sqlx::query(
             "UPDATE valuation_model_artifacts SET artifact_bytes = ? WHERE model_version_id = ? AND artifact_name = 'member-00.safetensors'",

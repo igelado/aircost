@@ -11,6 +11,9 @@ use super::types::{
 use super::ValuationModel;
 
 const GROUPED_FOLD_SEED: &str = "aircost-valuation-folds-v1";
+const CALIBRATION_SPLIT_SEED: &str = "aircost-valuation-calibration-v1";
+const BASELINE_NON_INFERIORITY_MARGIN: f64 = 0.02;
+pub(crate) const VALIDATION_EVIDENCE_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Fold {
@@ -52,6 +55,8 @@ impl FoldPrediction {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ValidationMetrics {
     pub prediction_count: usize,
+    #[serde(default)]
+    pub unique_aircraft_count: usize,
     pub median_absolute_percentage_error: f64,
     pub mean_signed_percentage_error: f64,
     pub q80_absolute_percentage_error: f64,
@@ -73,8 +78,9 @@ impl ValidationMetrics {
                 "metrics need finite positive actual and predicted prices".to_string(),
             ));
         }
-        let bands = calibrate_error_bands(predictions);
-        Ok(metrics(predictions, bands.global.q80_abs_log_error))
+        let (calibration, evaluation) = split_calibration_evaluation(predictions);
+        let bands = calibrate_error_bands(&calibration);
+        Ok(metrics(&evaluation, bands.global.q80_abs_log_error))
     }
 }
 
@@ -91,11 +97,25 @@ pub struct StabilityReport {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ValidationReport {
+    #[serde(default)]
+    pub validation_evidence_version: u32,
     pub fold_strategy: String,
     pub structural_metrics: ValidationMetrics,
     pub comparable_metrics: ValidationMetrics,
     pub median_baseline_metrics: ValidationMetrics,
     pub leave_one_model_out_metrics: ValidationMetrics,
+    #[serde(default)]
+    pub calibration_aircraft_count: usize,
+    #[serde(default)]
+    pub evaluation_aircraft_count: usize,
+    #[serde(default)]
+    pub comparable_shadow_evidence: bool,
+    #[serde(default)]
+    pub leave_one_model_out_required: bool,
+    #[serde(default)]
+    pub leave_one_model_out_evidence: bool,
+    #[serde(default)]
+    pub scope_warnings: Vec<String>,
     pub error_bands: ErrorBands,
     pub stability: StabilityReport,
     pub activation_gates_pass: bool,
@@ -162,24 +182,28 @@ pub fn validate_structural(
     let structural_predictions = evaluate_structural(rows, config, &folds)?;
     let comparable_predictions = evaluate_comparable(rows, &folds)?;
     let median_predictions = evaluate_median_baseline(rows, &folds);
-    let error_bands = calibrate_error_bands(&structural_predictions);
-    let structural_metrics = metrics(
-        &structural_predictions,
-        error_bands.global.q80_abs_log_error,
-    );
+    let (structural_calibration, structural_evaluation) =
+        split_calibration_evaluation(&structural_predictions);
+    let (comparable_calibration, comparable_evaluation) =
+        split_calibration_evaluation(&comparable_predictions);
+    let (median_calibration, median_evaluation) = split_calibration_evaluation(&median_predictions);
+    let error_bands = calibrate_error_bands(&structural_calibration);
+    let structural_metrics = metrics(&structural_evaluation, error_bands.global.q80_abs_log_error);
     let comparable_metrics = metrics(
-        &comparable_predictions,
-        calibrate_error_bands(&comparable_predictions)
+        &comparable_evaluation,
+        calibrate_error_bands(&comparable_calibration)
             .global
             .q80_abs_log_error,
     );
     let median_baseline_metrics = metrics(
-        &median_predictions,
-        calibrate_error_bands(&median_predictions)
+        &median_evaluation,
+        calibrate_error_bands(&median_calibration)
             .global
             .q80_abs_log_error,
     );
     let leave_one_model_out_predictions = evaluate_leave_one_model_out(rows, config)?;
+    let leave_one_model_out_required = distinct_model_count(rows) >= 2;
+    let leave_one_model_out_evidence = !leave_one_model_out_predictions.is_empty();
     let leave_one_model_out_metrics = metrics(
         &leave_one_model_out_predictions,
         calibrate_error_bands(&leave_one_model_out_predictions)
@@ -188,9 +212,21 @@ pub fn validate_structural(
     );
     let stability = resampling_stability(rows, config)?;
     let mut gate_reasons = Vec::new();
+    let mut scope_warnings = Vec::new();
     if structural_predictions.is_empty() && rows.len() >= 2 {
         gate_reasons.push("no grouped out-of-fold predictions were produced".to_string());
     }
+    if leave_one_model_out_required && !leave_one_model_out_evidence {
+        gate_reasons.push(
+            "leave-one-model-out validation was required but produced no evidence".to_string(),
+        );
+    } else if !leave_one_model_out_required {
+        scope_warnings.push(
+            "leave-one-model-out validation is unavailable because the snapshot represents only one model; metrics describe within-model performance only"
+                .to_string(),
+        );
+    }
+    comparable_activation_gate_reasons(&structural_metrics, &comparable_metrics, &mut gate_reasons);
     if structural_metrics.prediction_count > 0
         && structural_metrics.median_absolute_percentage_error
             > median_baseline_metrics.median_absolute_percentage_error
@@ -222,18 +258,66 @@ pub fn validate_structural(
             gate_reasons.push("empirical range coverage is outside 70%..90%".to_string());
         }
     }
+    let comparable_shadow_evidence = comparable_metrics.unique_aircraft_count
+        == structural_metrics.unique_aircraft_count
+        && comparable_metrics.unique_aircraft_count > 0;
     Ok(ValidationReport {
+        validation_evidence_version: VALIDATION_EVIDENCE_VERSION,
         fold_strategy,
         structural_metrics,
         comparable_metrics,
         median_baseline_metrics,
         leave_one_model_out_metrics,
+        calibration_aircraft_count: distinct_prediction_group_count(&structural_calibration),
+        evaluation_aircraft_count: distinct_prediction_group_count(&structural_evaluation),
+        comparable_shadow_evidence,
+        leave_one_model_out_required,
+        leave_one_model_out_evidence,
+        scope_warnings,
         error_bands,
         stability,
         activation_gates_pass: gate_reasons.is_empty(),
         gate_reasons,
         fold_predictions: structural_predictions,
     })
+}
+
+fn comparable_activation_gate_reasons(
+    structural: &ValidationMetrics,
+    comparable: &ValidationMetrics,
+    reasons: &mut Vec<String>,
+) {
+    if structural.prediction_count == 0 || comparable.prediction_count == 0 {
+        reasons.push(
+            "structural and adjusted-comparable shadow evaluation both need predictions"
+                .to_string(),
+        );
+        return;
+    }
+    if structural.median_absolute_percentage_error
+        > comparable.median_absolute_percentage_error + BASELINE_NON_INFERIORITY_MARGIN
+    {
+        reasons.push(
+            "structural median error is more than 2 percentage points worse than adjusted-comparable"
+                .to_string(),
+        );
+    }
+    if structural.q80_absolute_percentage_error
+        > comparable.q80_absolute_percentage_error + BASELINE_NON_INFERIORITY_MARGIN
+    {
+        reasons.push(
+            "structural 80th-percentile error is more than 2 percentage points worse than adjusted-comparable"
+                .to_string(),
+        );
+    }
+    if structural.mean_signed_percentage_error.abs()
+        > comparable.mean_signed_percentage_error.abs() + BASELINE_NON_INFERIORITY_MARGIN
+    {
+        reasons.push(
+            "structural absolute signed bias is more than 2 percentage points worse than adjusted-comparable"
+                .to_string(),
+        );
+    }
 }
 
 pub fn fit_validated_structural(
@@ -382,7 +466,7 @@ fn prediction(
 }
 
 pub fn calibrate_error_bands(predictions: &[FoldPrediction]) -> ErrorBands {
-    if predictions.len() < 2 {
+    if distinct_prediction_group_count(predictions) < 2 {
         return ErrorBands::default();
     }
     let mut bands = ErrorBands {
@@ -419,7 +503,17 @@ fn grouped_bands(
 }
 
 fn band<'a>(predictions: impl Iterator<Item = &'a FoldPrediction>) -> ErrorBand {
-    let errors: Vec<f64> = predictions.map(|prediction| prediction.log_error).collect();
+    let mut by_aircraft: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for prediction in predictions {
+        by_aircraft
+            .entry(&prediction.duplicate_group_key)
+            .or_default()
+            .push(prediction.log_error);
+    }
+    let errors: Vec<f64> = by_aircraft
+        .into_values()
+        .map(|values| percentile(values, 0.5))
+        .collect();
     ErrorBand {
         median_abs_log_error: percentile(errors.clone(), 0.5),
         q80_abs_log_error: percentile(errors.clone(), 0.8),
@@ -427,7 +521,7 @@ fn band<'a>(predictions: impl Iterator<Item = &'a FoldPrediction>) -> ErrorBand 
     }
 }
 
-fn metrics(predictions: &[FoldPrediction], q80: f64) -> ValidationMetrics {
+pub(crate) fn metrics(predictions: &[FoldPrediction], q80: f64) -> ValidationMetrics {
     if predictions.is_empty() {
         return ValidationMetrics::default();
     }
@@ -453,12 +547,51 @@ fn metrics(predictions: &[FoldPrediction], q80: f64) -> ValidationMetrics {
         / predictions.len() as f64;
     ValidationMetrics {
         prediction_count: predictions.len(),
+        unique_aircraft_count: distinct_prediction_group_count(predictions),
         median_absolute_percentage_error: percentile(absolute.clone(), 0.5),
         mean_signed_percentage_error: signed_mean,
         q80_absolute_percentage_error: percentile(absolute, 0.8),
         log_rmse,
         empirical_interval_coverage: coverage,
     }
+}
+
+pub(crate) fn split_calibration_evaluation(
+    predictions: &[FoldPrediction],
+) -> (Vec<FoldPrediction>, Vec<FoldPrediction>) {
+    let mut keyed_groups = predictions
+        .iter()
+        .map(|prediction| prediction.duplicate_group_key.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|key| {
+            let digest = Sha256::digest(format!("{CALIBRATION_SPLIT_SEED}:{key}").as_bytes());
+            (digest.to_vec(), key)
+        })
+        .collect::<Vec<_>>();
+    keyed_groups.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(right.1)));
+    if keyed_groups.len() < 2 {
+        return (predictions.to_vec(), predictions.to_vec());
+    }
+    let calibration_count = keyed_groups.len() / 2;
+    let calibration_groups = keyed_groups
+        .iter()
+        .take(calibration_count)
+        .map(|(_, key)| *key)
+        .collect::<BTreeSet<_>>();
+    let (calibration, evaluation): (Vec<_>, Vec<_>) =
+        predictions.iter().cloned().partition(|prediction| {
+            calibration_groups.contains(prediction.duplicate_group_key.as_str())
+        });
+    (calibration, evaluation)
+}
+
+fn distinct_prediction_group_count(predictions: &[FoldPrediction]) -> usize {
+    predictions
+        .iter()
+        .map(|prediction| prediction.duplicate_group_key.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 fn resampling_stability(
@@ -549,6 +682,13 @@ fn distinct_group_count(rows: &[TrainingListing]) -> usize {
         .len()
 }
 
+fn distinct_model_count(rows: &[TrainingListing]) -> usize {
+    rows.iter()
+        .map(|row| row.model_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 fn percentile(mut values: Vec<f64>, percentile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -589,7 +729,25 @@ mod tests {
             engine_times: vec![],
             propeller_times: vec![],
             equipment_tokens: vec![],
+            valuation_facts: vec![],
             technical_field_count: 3,
+        }
+    }
+
+    fn fold_prediction(fold: &str, group: &str, error: f64) -> FoldPrediction {
+        FoldPrediction {
+            fold_id: fold.to_string(),
+            duplicate_group_key: group.to_string(),
+            listing_id: 1,
+            manufacturer_id: 1,
+            model_id: 1,
+            variant_id: 1,
+            actual_price_usd: 100.0,
+            predicted_price_usd: 100.0 * error.exp(),
+            log_error: error,
+            absolute_percentage_error: error.exp() - 1.0,
+            signed_percentage_error: error.exp() - 1.0,
+            support: SupportGrade::Low,
         }
     }
 
@@ -622,6 +780,76 @@ mod tests {
         let low = estimate * (-q80).exp();
         let high = estimate * q80.exp();
         assert!((estimate.ln() - low.ln() - (high.ln() - estimate.ln())).abs() < 1e-12);
+    }
+
+    #[test]
+    fn residual_bands_count_unique_aircraft_not_repeated_folds() {
+        let predictions = vec![
+            fold_prediction("repeat-1", "aircraft-a", 0.10),
+            fold_prediction("repeat-2", "aircraft-a", 0.20),
+            fold_prediction("repeat-1", "aircraft-b", 0.30),
+            fold_prediction("repeat-2", "aircraft-b", 0.40),
+        ];
+        let bands = calibrate_error_bands(&predictions);
+        assert_eq!(bands.global.residual_count, 2);
+    }
+
+    #[test]
+    fn calibration_and_evaluation_use_disjoint_aircraft() {
+        let predictions = (0..8)
+            .flat_map(|aircraft| {
+                ["repeat-1", "repeat-2"]
+                    .map(move |fold| fold_prediction(fold, &format!("aircraft-{aircraft}"), 0.10))
+            })
+            .collect::<Vec<_>>();
+        let (calibration, evaluation) = split_calibration_evaluation(&predictions);
+        let calibration_groups = calibration
+            .iter()
+            .map(|prediction| prediction.duplicate_group_key.as_str())
+            .collect::<BTreeSet<_>>();
+        let evaluation_groups = evaluation
+            .iter()
+            .map(|prediction| prediction.duplicate_group_key.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(calibration_groups.is_disjoint(&evaluation_groups));
+        assert_eq!(calibration_groups.len() + evaluation_groups.len(), 8);
+    }
+
+    #[test]
+    fn one_model_snapshot_reports_limited_scope_without_fake_lomo_evidence() {
+        let rows = vec![
+            row(1, "a", 1, 100_000.0),
+            row(2, "b", 1, 110_000.0),
+            row(3, "c", 1, 120_000.0),
+        ];
+        let report = validate_structural(&rows, &StructuralFitConfig::default()).unwrap();
+        assert!(!report.leave_one_model_out_required);
+        assert!(!report.leave_one_model_out_evidence);
+        assert!(!report
+            .gate_reasons
+            .iter()
+            .any(|reason| reason.contains("leave-one-model-out")));
+        assert!(report
+            .scope_warnings
+            .iter()
+            .any(|warning| warning.contains("within-model performance only")));
+    }
+
+    #[test]
+    fn structural_must_remain_close_to_comparable_shadow() {
+        let structural = ValidationMetrics {
+            prediction_count: 10,
+            median_absolute_percentage_error: 0.25,
+            ..ValidationMetrics::default()
+        };
+        let comparable = ValidationMetrics {
+            prediction_count: 10,
+            median_absolute_percentage_error: 0.10,
+            ..ValidationMetrics::default()
+        };
+        let mut reasons = Vec::new();
+        comparable_activation_gate_reasons(&structural, &comparable, &mut reasons);
+        assert!(reasons.iter().any(|reason| reason.contains("median error")));
     }
 
     #[test]

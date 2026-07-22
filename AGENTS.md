@@ -1,8 +1,7 @@
 # Coding Agent Guide
 
 This project models aircraft ownership economics and asking-market values. The
-current web application is Rust-first. Older Python scripts remain in the repo
-as reference utilities, but new app behavior should be implemented in Rust.
+application and administrative tooling are implemented in Rust.
 
 ## Documentation Map
 
@@ -58,6 +57,10 @@ When work is ready, open a pull request. Before considering it done:
   migration scripts when needed.
 - Remove obsolete fields and compatibility paths during active development
   instead of preserving dead behavior.
+- Represent compound domain concepts as module hierarchies: use
+  `aircraft::curation` or `gemini::interactions`, not top-level modules such as
+  `aircraft_curation` or `gemini_interactions`. Do not keep flat compatibility
+  aliases after moving a module.
 - Treat generated lookup rows as disposable when no root record references them.
 
 ## Data And LLM Guardrails
@@ -93,6 +96,9 @@ Use admin commands for database healing and fitting. Prefer dry runs first:
 
 ```bash
 cargo run --bin aircost-admin -- heal-aircraft-models --dry-run
+cargo run --bin aircost-admin -- curate-avionics --dry-run
+cargo run --bin aircost-admin -- fit-depreciation --dry-run
+```
 
 # Agent Delegation Rules
 
@@ -113,6 +119,3 @@ When the task matches one of these patterns, delegate to the appropriate custom 
 ## When NOT to delegate
 - Simple single-file edits, quick questions, or tasks that need tight back-and-forth iteration.
 - Keep these in the main agent thread.
-cargo run --bin aircost-admin -- curate-avionics --dry-run
-cargo run --bin aircost-admin -- fit-depreciation --dry-run
-```

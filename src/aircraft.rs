@@ -1,3 +1,10 @@
+pub mod catalog;
+pub mod curation;
+pub mod faa;
+pub mod observations;
+pub mod reference;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -5,6 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::FromRow;
 
+use self::faa::{audit_listing_admission, require_listing_admission, AircraftAdmissionError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::depreciation::{
     avionics_replacement_basis, default_avionics_profile, estimate_aircraft_value_in_year,
@@ -14,10 +22,13 @@ use crate::depreciation::{
 use crate::extract::{
     AircraftSpecListingContext, AircraftSpecMetadataContext, GeminiListingExtractor,
 };
-use crate::html_clean::clean_listing_html_with_limit;
+use crate::html::clean::clean_listing_html_with_limit;
 use crate::normalize::normalize_name;
+use crate::valuation::dataset::{
+    equipment_feature_token, require_snapshot_faa_admission, technical_field_count,
+};
 use crate::valuation::{
-    ComponentObservation, ComponentTimeBasis, SupportGrade, ValuationBreakdown, ValuationModel,
+    source_backed_component_observation, SupportGrade, ValuationBreakdown, ValuationModel,
     ValuationQuery,
 };
 
@@ -114,6 +125,15 @@ impl From<anyhow::Error> for AircraftStoreError {
     }
 }
 
+fn aircraft_admission_store_error(error: AircraftAdmissionError) -> AircraftStoreError {
+    let message = error.to_string();
+    match error {
+        AircraftAdmissionError::Rejected { .. } => AircraftStoreError::Model(message),
+        AircraftAdmissionError::LookupFailed { .. } => AircraftStoreError::Database(message),
+        AircraftAdmissionError::ListingNotFound { .. } => AircraftStoreError::NotFound(message),
+    }
+}
+
 type StoreResult<T> = Result<T, AircraftStoreError>;
 
 macro_rules! execute_query {
@@ -139,6 +159,12 @@ struct AircraftVariantOptionRow {
     variant_id: i64,
     variant: String,
     listing_count: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct AircraftOptionListingRow {
+    variant_id: i64,
+    listing_id: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -187,6 +213,10 @@ struct AircraftSpecVersionRow {
     annual_inspection_usd: Option<f64>,
     other_maintenance_per_hour: Option<f64>,
     source_url: Option<String>,
+    configuration_scope: String,
+    source_confidence: Option<String>,
+    evidence_kind: String,
+    is_valuation_eligible: bool,
     created_at: String,
     updated_at: String,
 }
@@ -207,26 +237,62 @@ struct AircraftListingPointRow {
     registration_number: Option<String>,
     serial_number: Option<String>,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    engine_time_basis: String,
+    engine_time_evidence: Option<String>,
+    engine_time_confidence: Option<String>,
+    propeller_hours: Option<f64>,
+    propeller_time_basis: String,
+    propeller_time_evidence: Option<String>,
+    propeller_time_confidence: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
 struct ListingEquipmentTokenRow {
+    equipment_kind: String,
     manufacturer: String,
     model: String,
     quantity: i64,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Clone, Debug, FromRow)]
 struct AvionicsEstimateRow {
+    avionics_model_id: i64,
     manufacturer: String,
     model: String,
-    avionics_type: String,
     quantity: i64,
     introduced_year: Option<i64>,
-    estimated_unit_value_usd: Option<f64>,
+    installed_value_contribution_usd: Option<f64>,
+    replacement_cost_usd: Option<f64>,
     value_reference_year: Option<i64>,
+    valuation_scope: String,
+    configuration_action: String,
+    replaces_avionics_model_id: Option<i64>,
+    source_confidence: Option<String>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct AvionicsSuiteComponentRow {
+    suite_model_id: i64,
+    component_model_id: i64,
+    quantity: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AvionicsConfigurationLink {
+    pub avionics_model_id: i64,
+    pub quantity: i64,
+    pub configuration_action: String,
+    pub replaces_avionics_model_id: Option<i64>,
+    pub source_confidence: Option<String>,
+    pub valuation_scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AvionicsSuiteMembership {
+    pub suite_model_id: i64,
+    pub component_model_id: i64,
+    pub quantity: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -237,6 +303,7 @@ struct AircraftModelYearPricePointRow {
 
 #[derive(Debug, FromRow)]
 struct ReplacementBasisRow {
+    model_year: i64,
     purchase_price_new_usd: f64,
     purchase_price_reference_year: i64,
     average_inflation_rate: f64,
@@ -244,11 +311,12 @@ struct ReplacementBasisRow {
 
 #[derive(Debug, FromRow)]
 struct PluginSpecEvidenceRow {
+    listing_id: i64,
     model_year: i64,
     asking_price_usd: f64,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    propeller_hours: Option<f64>,
     source_url: String,
     rendered_html: String,
 }
@@ -264,8 +332,8 @@ struct ListingSpecSeedRow {
     model_year: i64,
     asking_price_usd: f64,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    propeller_hours: Option<f64>,
     source_url: Option<String>,
 }
 
@@ -335,6 +403,10 @@ pub struct AircraftSpecDetail {
     pub annual_inspection_usd: Option<f64>,
     pub other_maintenance_per_hour: Option<f64>,
     pub source_url: Option<String>,
+    pub configuration_scope: String,
+    pub source_confidence: Option<String>,
+    pub evidence_kind: String,
+    pub is_valuation_eligible: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -371,8 +443,8 @@ pub struct AircraftListingValuePoint {
     pub registration_number: Option<String>,
     pub serial_number: Option<String>,
     pub airframe_hours: f64,
-    pub engine_hours: f64,
-    pub propeller_hours: f64,
+    pub engine_hours: Option<f64>,
+    pub propeller_hours: Option<f64>,
     pub estimated_value_usd: Option<f64>,
     pub estimated_value_low_usd: Option<f64>,
     pub estimated_value_high_usd: Option<f64>,
@@ -381,6 +453,8 @@ pub struct AircraftListingValuePoint {
     pub valuation_model_kind: Option<String>,
     pub valuation_model_version_id: Option<i64>,
     pub valuation_snapshot_id: Option<i64>,
+    pub valuation_calibrated: bool,
+    pub valuation_warning: Option<String>,
     pub valuation_breakdown: Option<ValuationBreakdown>,
     pub estimate_error: Option<String>,
     pub breakdown: Option<AircraftValueBreakdown>,
@@ -418,8 +492,8 @@ pub struct AircraftValueCurvePoint {
     pub valuation_year: i64,
     pub age_years: f64,
     pub airframe_hours: f64,
-    pub engine_hours: f64,
-    pub propeller_hours: f64,
+    pub engine_hours: Option<f64>,
+    pub propeller_hours: Option<f64>,
     pub estimated_value_usd: Option<f64>,
     pub estimated_value_low_usd: Option<f64>,
     pub estimated_value_high_usd: Option<f64>,
@@ -435,6 +509,9 @@ pub struct AircraftValueCurvePoint {
 pub struct AircraftSpecEnrichmentReport {
     pub applied: bool,
     pub value_reference_year: i64,
+    pub faa_admitted_evidence_count: usize,
+    pub faa_rejected_evidence_count: usize,
+    pub faa_rejections: Vec<String>,
     pub variants: Vec<AircraftSpecEnrichmentItem>,
 }
 
@@ -467,6 +544,11 @@ pub struct AircraftSpecEnrichmentItem {
     pub powerplant_source_url: String,
     pub powerplant_source_title: String,
     pub powerplant_source_confidence: String,
+    pub configuration_scope: String,
+    pub evidence_kind: String,
+    pub source_confidence: String,
+    pub is_valuation_eligible: bool,
+    pub valuation_eligibility_notes: Vec<String>,
     pub annual_inspection_usd: f64,
     pub other_maintenance_per_hour: f64,
     pub confidence: String,
@@ -475,7 +557,7 @@ pub struct AircraftSpecEnrichmentItem {
 }
 
 pub async fn aircraft_options(db: &AppDb, user_id: i64) -> StoreResult<Vec<AircraftVariantOption>> {
-    let rows = query_as_all!(
+    let mut rows = query_as_all!(
         db,
         AircraftVariantOptionRow,
         r#"
@@ -494,7 +576,8 @@ pub async fn aircraft_options(db: &AppDb, user_id: i64) -> StoreResult<Vec<Aircr
           ON mfr.id = model.aircraft_manufacturer_id
         JOIN aircraft_sale_listings l
           ON l.aircraft_model_variant_id = variant.id
-        WHERE l.is_verified = TRUE OR l.created_by_user_id = ?
+        WHERE l.ingestion_state = 'ready'
+          AND (l.is_verified = TRUE OR l.created_by_user_id = ?)
         GROUP BY
           mfr.id,
           mfr.name,
@@ -506,6 +589,37 @@ pub async fn aircraft_options(db: &AppDb, user_id: i64) -> StoreResult<Vec<Aircr
         "#,
         user_id
     )?;
+    let listing_rows = query_as_all!(
+        db,
+        AircraftOptionListingRow,
+        r#"
+        SELECT
+          l.aircraft_model_variant_id AS variant_id,
+          l.id AS listing_id
+        FROM aircraft_sale_listings l
+        WHERE l.ingestion_state = 'ready'
+          AND (l.is_verified = TRUE OR l.created_by_user_id = ?)
+        ORDER BY l.aircraft_model_variant_id, l.id
+        "#,
+        user_id
+    )?;
+    let listing_ids = listing_rows
+        .iter()
+        .map(|row| row.listing_id)
+        .collect::<BTreeSet<_>>();
+    let admission = audit_listing_admission(db, Some(&listing_ids))
+        .await
+        .map_err(aircraft_admission_store_error)?;
+    let mut admitted_counts = BTreeMap::<i64, i64>::new();
+    for listing in listing_rows {
+        if admission.is_admitted(listing.listing_id) {
+            *admitted_counts.entry(listing.variant_id).or_default() += 1;
+        }
+    }
+    rows.retain_mut(|row| {
+        row.listing_count = admitted_counts.get(&row.variant_id).copied().unwrap_or(0);
+        row.listing_count > 0
+    });
     Ok(rows.into_iter().map(option_from_row).collect())
 }
 
@@ -526,13 +640,19 @@ pub async fn aircraft_variant_detail_with_model(
     curve_annual_airframe_hours: Option<f64>,
     valuation_model: Option<&Arc<dyn ValuationModel>>,
 ) -> StoreResult<AircraftVariantDetail> {
-    let option = aircraft_option_for_variant(db, user_id, variant_id).await?;
+    require_valuation_model_faa_admission(db, valuation_model.map(Arc::as_ref)).await?;
+    let mut option = aircraft_option_for_variant(db, user_id, variant_id).await?;
     let spec_row = aircraft_spec_for_variant(db, option.model_id, variant_id).await?;
     let spec = spec_row.as_ref().map(spec_detail_from_row);
     let spec_ref = spec_row.as_ref();
     let rows = listing_points_for_variant(db, user_id, variant_id).await?;
     let mut listings = Vec::with_capacity(rows.len());
     for row in rows {
+        match require_listing_admission(db, row.id).await {
+            Ok(_) => {}
+            Err(AircraftAdmissionError::Rejected { .. }) => continue,
+            Err(error) => return Err(aircraft_admission_store_error(error)),
+        }
         listings.push(
             listing_value_point(
                 db,
@@ -540,16 +660,18 @@ pub async fn aircraft_variant_detail_with_model(
                 spec_ref,
                 curve_annual_airframe_hours,
                 valuation_model.map(Arc::as_ref),
+                false,
             )
             .await?,
         );
     }
+    option.listing_count = listings.len() as i64;
     let message = match (valuation_model, spec_ref) {
         (Some(_), _) => None,
-        (None, Some(_)) => None,
-        (None, None) => {
-            Some("Aircraft spec metadata has not been enriched for this variant.".to_string())
-        }
+        (None, _) => Some(
+            "Listing-only valuation unavailable: no approved model artifact or eligible comparable snapshot is available."
+                .to_string(),
+        ),
     };
     Ok(AircraftVariantDetail {
         option,
@@ -573,22 +695,35 @@ pub async fn aircraft_listing_value_with_model(
     listing_id: i64,
     valuation_model: Option<&Arc<dyn ValuationModel>>,
 ) -> StoreResult<AircraftListingValuePoint> {
+    require_listing_admission(db, listing_id)
+        .await
+        .map_err(aircraft_admission_store_error)?;
+    require_valuation_model_faa_admission(db, valuation_model.map(Arc::as_ref)).await?;
     let row = listing_point_for_listing(db, user_id, listing_id)
         .await?
         .ok_or_else(|| AircraftStoreError::NotFound("listing not found".to_string()))?;
-    if valuation_model.is_some() {
-        return listing_value_point(db, &row, None, None, valuation_model.map(Arc::as_ref)).await;
-    }
-    let option = aircraft_option_for_variant(db, user_id, row.aircraft_model_variant_id).await?;
-    let spec_row = aircraft_spec_for_variant(db, option.model_id, option.variant_id).await?;
     listing_value_point(
         db,
         &row,
-        spec_row.as_ref(),
+        None,
         None,
         valuation_model.map(Arc::as_ref),
+        false,
     )
     .await
+}
+
+async fn require_valuation_model_faa_admission(
+    db: &AppDb,
+    valuation_model: Option<&dyn ValuationModel>,
+) -> StoreResult<()> {
+    let Some(valuation_model) = valuation_model else {
+        return Ok(());
+    };
+    require_snapshot_faa_admission(db, valuation_model.snapshot_id())
+        .await
+        .map_err(|error| AircraftStoreError::Model(error.to_string()))?;
+    Ok(())
 }
 
 pub async fn enrich_aircraft_specs_from_plugin_submissions(
@@ -611,9 +746,24 @@ pub async fn enrich_aircraft_specs_from_plugin_submissions(
         aircraft_variants_missing_specs(db, limit).await?
     };
     let mut items = Vec::with_capacity(variants.len());
+    let mut faa_admitted_evidence_count = 0usize;
+    let mut faa_rejections = Vec::new();
 
     for variant in variants {
-        let evidence = plugin_spec_evidence_for_variant(db, variant.variant_id).await?;
+        let candidates = plugin_spec_evidence_for_variant(db, variant.variant_id).await?;
+        let mut evidence = Vec::with_capacity(SPEC_EVIDENCE_LIMIT as usize);
+        for row in candidates {
+            match require_listing_admission(db, row.listing_id).await {
+                Ok(_) => {
+                    faa_admitted_evidence_count += 1;
+                    evidence.push(row);
+                    if evidence.len() >= SPEC_EVIDENCE_LIMIT as usize {
+                        break;
+                    }
+                }
+                Err(error) => faa_rejections.push(error.to_string()),
+            }
+        }
         if evidence.is_empty() {
             continue;
         }
@@ -642,9 +792,17 @@ pub async fn enrich_aircraft_specs_from_plugin_submissions(
             listing_contexts: &listing_contexts,
         };
         let response = extractor.estimate_aircraft_spec_metadata(&context).await?;
-        let mut item =
-            spec_enrichment_item_from_response(&variant, &response, listing_contexts.len())?;
-        if apply {
+        let listing_source_urls = evidence
+            .iter()
+            .map(|row| row.source_url.as_str())
+            .collect::<Vec<_>>();
+        let mut item = spec_enrichment_item_from_response(
+            &variant,
+            &response,
+            listing_contexts.len(),
+            &listing_source_urls,
+        )?;
+        if apply && item.is_valuation_eligible {
             let source_url = evidence.first().map(|row| row.source_url.as_str());
             item.applied_spec_id = if refresh_existing {
                 Some(upsert_aircraft_spec(db, &item, value_reference_year, source_url).await?)
@@ -658,6 +816,9 @@ pub async fn enrich_aircraft_specs_from_plugin_submissions(
     Ok(AircraftSpecEnrichmentReport {
         applied: apply,
         value_reference_year,
+        faa_admitted_evidence_count,
+        faa_rejected_evidence_count: faa_rejections.len(),
+        faa_rejections,
         variants: items,
     })
 }
@@ -671,6 +832,9 @@ pub async fn enrich_aircraft_spec_for_listing_if_missing(
     let Some(extractor) = extractor else {
         return Ok(());
     };
+    require_listing_admission(db, listing_id)
+        .await
+        .map_err(aircraft_admission_store_error)?;
     let row = listing_spec_seed(db, listing_id).await?;
     if aircraft_spec_exists_for_variant(db, row.model_id, row.variant_id).await? {
         return Ok(());
@@ -690,8 +854,8 @@ pub async fn enrich_aircraft_spec_for_listing_if_missing(
                 row.model_year,
                 row.asking_price_usd,
                 row.airframe_hours,
-                row.engine_hours,
-                row.propeller_hours,
+                optional_hours_text(row.engine_hours),
+                optional_hours_text(row.propeller_hours),
             );
             synthetic_text.as_str()
         }
@@ -727,7 +891,14 @@ pub async fn enrich_aircraft_spec_for_listing_if_missing(
         },
         &response,
         1,
+        &[source_url],
     )?;
+    if !item.is_valuation_eligible {
+        return Err(AircraftStoreError::Model(format!(
+            "aircraft factory spec evidence rejected: {}",
+            item.valuation_eligibility_notes.join("; ")
+        )));
+    }
     item.applied_spec_id = Some(
         insert_aircraft_spec(
             db,
@@ -764,6 +935,7 @@ async fn aircraft_option_for_variant(
           ON mfr.id = model.aircraft_manufacturer_id
         LEFT JOIN aircraft_sale_listings l
           ON l.aircraft_model_variant_id = variant.id
+          AND l.ingestion_state = 'ready'
           AND (l.is_verified = TRUE OR l.created_by_user_id = ?)
         WHERE variant.id = ?
         GROUP BY
@@ -835,6 +1007,10 @@ async fn aircraft_spec_for_variant(
           spec.annual_inspection_usd,
           spec.other_maintenance_per_hour,
           spec.source_url,
+          spec.configuration_scope,
+          spec.source_confidence,
+          spec.evidence_kind,
+          spec.is_valuation_eligible,
           spec.created_at,
           spec.updated_at
         FROM aircraft_model_spec_versions spec
@@ -852,6 +1028,10 @@ async fn aircraft_spec_for_variant(
           ON prop_mfr.id = prop_model.propeller_manufacturer_id
         WHERE spec.aircraft_model_id = ?
           AND spec.aircraft_model_variant_id = ?
+          AND spec.configuration_scope = 'factory_default'
+          AND spec.is_valuation_eligible = TRUE
+          AND spec.source_confidence = 'high'
+          AND spec.evidence_kind = 'authoritative_reference'
         ORDER BY
           spec.effective_from DESC,
           spec.id DESC
@@ -887,7 +1067,13 @@ async fn listing_points_for_variant(
           listing.serial_number,
           listing.airframe_hours,
           listing.engine_hours,
-          listing.propeller_hours
+          listing.engine_time_basis,
+          listing.engine_time_evidence,
+          listing.engine_time_confidence,
+          listing.propeller_hours,
+          listing.propeller_time_basis,
+          listing.propeller_time_evidence,
+          listing.propeller_time_confidence
         FROM aircraft_sale_listings listing
         JOIN aircraft_model_variants variant
           ON variant.id = listing.aircraft_model_variant_id
@@ -895,6 +1081,7 @@ async fn listing_points_for_variant(
         JOIN aircraft_manufacturers manufacturer
           ON manufacturer.id = model.aircraft_manufacturer_id
         WHERE listing.aircraft_model_variant_id = ?
+          AND listing.ingestion_state = 'ready'
           AND (listing.is_verified = TRUE OR listing.created_by_user_id = ?)
         ORDER BY listing.model_year, listing.airframe_hours, listing.id
         "#,
@@ -928,7 +1115,13 @@ async fn listing_point_for_listing(
           listing.serial_number,
           listing.airframe_hours,
           listing.engine_hours,
-          listing.propeller_hours
+          listing.engine_time_basis,
+          listing.engine_time_evidence,
+          listing.engine_time_confidence,
+          listing.propeller_hours,
+          listing.propeller_time_basis,
+          listing.propeller_time_evidence,
+          listing.propeller_time_confidence
         FROM aircraft_sale_listings listing
         JOIN aircraft_model_variants variant
           ON variant.id = listing.aircraft_model_variant_id
@@ -936,6 +1129,7 @@ async fn listing_point_for_listing(
         JOIN aircraft_manufacturers manufacturer
           ON manufacturer.id = model.aircraft_manufacturer_id
         WHERE listing.id = ?
+          AND listing.ingestion_state = 'ready'
           AND (listing.is_verified = TRUE OR listing.created_by_user_id = ?)
         "#,
         listing_id,
@@ -949,6 +1143,7 @@ async fn listing_value_point(
     spec: Option<&AircraftSpecVersionRow>,
     curve_annual_airframe_hours: Option<f64>,
     valuation_model: Option<&dyn ValuationModel>,
+    allow_uncalibrated_compatibility: bool,
 ) -> StoreResult<AircraftListingValuePoint> {
     let mut point = AircraftListingValuePoint {
         listing_id: row.id,
@@ -972,6 +1167,8 @@ async fn listing_value_point(
         valuation_model_kind: None,
         valuation_model_version_id: None,
         valuation_snapshot_id: None,
+        valuation_calibrated: false,
+        valuation_warning: None,
         valuation_breakdown: None,
         estimate_error: None,
         breakdown: None,
@@ -979,12 +1176,21 @@ async fn listing_value_point(
     };
 
     if let Some(model) = valuation_model {
-        let valuation_year = year_from_date_prefix(&row.added_at).unwrap_or(2026);
+        let valuation_year = match model.market_year() {
+            Ok(year) => year,
+            Err(error) => {
+                point.estimate_error = Some(error.to_string());
+                return Ok(point);
+            }
+        };
         let equipment_tokens = listing_equipment_tokens(db, row.id).await?;
-        let technical_field_count = 3
-            + u32::from(row.registration_number.is_some())
-            + u32::from(row.serial_number.is_some())
-            + u32::from(!equipment_tokens.is_empty());
+        let technical_field_count = technical_field_count(
+            row.engine_hours.is_some(),
+            row.propeller_hours.is_some(),
+            row.registration_number.is_some(),
+            row.serial_number.is_some(),
+            !equipment_tokens.is_empty(),
+        );
         let query = ValuationQuery {
             category_key: None,
             manufacturer_id: Some(row.manufacturer_id),
@@ -993,16 +1199,20 @@ async fn listing_value_point(
             model_year: row.model_year,
             valuation_year,
             airframe_hours: Some(row.airframe_hours),
-            engine_times: vec![ComponentObservation {
-                time_hours: Some(row.engine_hours),
-                basis: ComponentTimeBasis::Unknown,
-                count: 1,
-            }],
-            propeller_times: vec![ComponentObservation {
-                time_hours: Some(row.propeller_hours),
-                basis: ComponentTimeBasis::Unknown,
-                count: 1,
-            }],
+            engine_times: vec![source_backed_component_observation(
+                row.engine_hours,
+                &row.engine_time_basis,
+                row.engine_time_evidence.as_deref(),
+                row.engine_time_confidence.as_deref(),
+                1,
+            )],
+            propeller_times: vec![source_backed_component_observation(
+                row.propeller_hours,
+                &row.propeller_time_basis,
+                row.propeller_time_evidence.as_deref(),
+                row.propeller_time_confidence.as_deref(),
+                1,
+            )],
             equipment_tokens,
             technical_field_count,
         };
@@ -1013,9 +1223,17 @@ async fn listing_value_point(
                 point.estimated_value_high_usd = Some(estimate.high_value_usd);
                 point.estimated_error_fraction = Some(estimate.estimated_error_fraction);
                 point.valuation_support = Some(estimate.support);
+                point.valuation_calibrated =
+                    matches!(estimate.model_kind.as_str(), "structural" | "dnn");
                 point.valuation_model_kind = Some(estimate.model_kind);
                 point.valuation_model_version_id = Some(estimate.model_version_id);
                 point.valuation_snapshot_id = Some(estimate.snapshot_id);
+                if !point.valuation_calibrated {
+                    point.valuation_warning = Some(
+                        "No approved model artifact is active; estimate uses an adjusted-comparable snapshot fallback."
+                            .to_string(),
+                    );
+                }
                 point.valuation_breakdown = Some(estimate.breakdown);
                 point.value_curve = estimate
                     .depreciation
@@ -1040,6 +1258,17 @@ async fn listing_value_point(
             }
             Err(error) => point.estimate_error = Some(error.to_string()),
         }
+        return Ok(point);
+    }
+
+    if !allow_uncalibrated_compatibility {
+        point.valuation_warning = Some(
+            "No approved model artifact or eligible comparable snapshot is available.".to_string(),
+        );
+        point.estimate_error = Some(
+            "Listing-only valuation unavailable: no approved model artifact or eligible comparable snapshot is available."
+                .to_string(),
+        );
         return Ok(point);
     }
 
@@ -1068,9 +1297,12 @@ async fn listing_value_point(
         return Ok(point);
     };
     let purchase_price_reference_year = price_point.purchase_price_reference_year;
-    let default_avionics_rows =
+    let raw_default_avionics_rows =
         model_year_default_avionics_estimates(db, row.aircraft_model_variant_id, row.model_year)
             .await?;
+    let suite_memberships = avionics_suite_memberships(db).await?;
+    let default_avionics_rows =
+        effective_avionics_rows(&raw_default_avionics_rows, &[], &suite_memberships);
     let purchase_price_new_usd = airframe_basis_excluding_default_avionics(
         price_point.purchase_price_new_usd,
         &default_avionics_rows,
@@ -1079,22 +1311,18 @@ async fn listing_value_point(
         spec.average_inflation_rate,
     );
     let age_years = (valuation_year - row.model_year).max(0) as f64;
-    let mut avionics_rows = listing_avionics_estimates(db, row.id).await?;
-    let mut avionics = avionics_components_from_rows(
+    let listing_avionics_rows = listing_avionics_estimates(db, row.id).await?;
+    let avionics_rows = effective_avionics_rows(
+        &raw_default_avionics_rows,
+        &listing_avionics_rows,
+        &suite_memberships,
+    );
+    let avionics = avionics_components_from_rows(
         &avionics_rows,
         valuation_year,
         spec_effective_year,
         spec.average_inflation_rate,
     );
-    if avionics.is_empty() {
-        avionics_rows = default_avionics_rows;
-        avionics = avionics_components_from_rows(
-            &avionics_rows,
-            valuation_year,
-            spec_effective_year,
-            spec.average_inflation_rate,
-        );
-    }
     match estimate_listing_value(
         spec,
         profile.clone(),
@@ -1103,8 +1331,8 @@ async fn listing_value_point(
         valuation_year,
         age_years,
         row.airframe_hours,
-        row.engine_hours,
-        row.propeller_hours,
+        known_component_time(row.engine_hours, &row.engine_time_basis),
+        known_component_time(row.propeller_hours, &row.propeller_time_basis),
         &avionics,
         replacement_floor_basis_usd,
     ) {
@@ -1200,8 +1428,8 @@ fn estimate_listing_value(
     valuation_year: i64,
     age_years: f64,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    propeller_hours: Option<f64>,
     avionics: &[AvionicsComponent],
     replacement_floor_basis_usd: Option<f64>,
 ) -> Result<PriceEstimate, String> {
@@ -1294,8 +1522,8 @@ fn listing_value_curve(
                 valuation_year,
                 age_years,
                 airframe_hours,
-                engine_hours,
-                propeller_hours,
+                Some(engine_hours),
+                Some(propeller_hours),
                 &avionics,
                 replacement_floor_basis_usd,
             );
@@ -1304,8 +1532,8 @@ fn listing_value_curve(
                     valuation_year,
                     age_years,
                     airframe_hours,
-                    engine_hours,
-                    propeller_hours,
+                    engine_hours: Some(engine_hours),
+                    propeller_hours: Some(propeller_hours),
                     estimated_value_usd: Some(estimate.estimated_value_usd),
                     estimated_value_low_usd: None,
                     estimated_value_high_usd: None,
@@ -1320,8 +1548,8 @@ fn listing_value_curve(
                     valuation_year,
                     age_years,
                     airframe_hours,
-                    engine_hours,
-                    propeller_hours,
+                    engine_hours: Some(engine_hours),
+                    propeller_hours: Some(propeller_hours),
                     estimated_value_usd: None,
                     estimated_value_low_usd: None,
                     estimated_value_high_usd: None,
@@ -1346,21 +1574,43 @@ async fn listing_avionics_estimates(
         AvionicsEstimateRow,
         r#"
         SELECT
+          model.id AS avionics_model_id,
           mfr.name AS manufacturer,
           model.name AS model,
-          avionics_type.name AS avionics_type,
           link.quantity,
           model.introduced_year,
-          model.estimated_unit_value_usd,
-          model.value_reference_year
+          CASE
+            WHEN model.value_basis = 'installed_contribution'
+              AND model.estimated_unit_value_usd >= 0
+              AND model.replacement_cost_usd >= model.estimated_unit_value_usd
+              AND model.value_reference_year IS NOT NULL
+              AND model.value_source IS NOT NULL
+              AND TRIM(model.value_source) <> ''
+            THEN model.estimated_unit_value_usd
+          END AS installed_value_contribution_usd,
+          model.replacement_cost_usd,
+          model.value_reference_year,
+          model.valuation_scope,
+          link.configuration_action,
+          link.replaces_avionics_model_id,
+          link.source_confidence
         FROM aircraft_sale_listing_avionics link
         JOIN avionics_models model
           ON model.id = link.avionics_model_id
         JOIN avionics_manufacturers mfr
           ON mfr.id = model.avionics_manufacturer_id
-        JOIN avionics_types avionics_type
-          ON avionics_type.id = model.avionics_type_id
         WHERE link.aircraft_sale_listing_id = ?
+          AND link.source = 'listing'
+          AND model.catalog_status = 'approved'
+          AND (
+            link.replaces_avionics_model_id IS NULL
+            OR EXISTS (
+              SELECT 1
+              FROM avionics_models replaced_model
+              WHERE replaced_model.id = link.replaces_avionics_model_id
+                AND replaced_model.catalog_status = 'approved'
+            )
+          )
         ORDER BY link.id
         "#,
         listing_id
@@ -1373,6 +1623,7 @@ async fn listing_equipment_tokens(db: &AppDb, listing_id: i64) -> StoreResult<Ve
         ListingEquipmentTokenRow,
         r#"
         SELECT
+          'avionics' AS equipment_kind,
           manufacturer.name AS manufacturer,
           model.name AS model,
           link.quantity
@@ -1382,17 +1633,61 @@ async fn listing_equipment_tokens(db: &AppDb, listing_id: i64) -> StoreResult<Ve
           ON manufacturer.id = model.avionics_manufacturer_id
         WHERE link.aircraft_sale_listing_id = ?
           AND link.source = 'listing'
-        ORDER BY manufacturer.name, model.name
+          AND link.configuration_action IN ('installed', 'replaces')
+          AND link.source_confidence = 'high'
+          AND model.catalog_status = 'approved'
+          AND (
+            link.replaces_avionics_model_id IS NULL
+            OR EXISTS (
+              SELECT 1
+              FROM avionics_models replaced_model
+              WHERE replaced_model.id = link.replaces_avionics_model_id
+                AND replaced_model.catalog_status = 'approved'
+            )
+          )
+        UNION ALL
+        SELECT
+          'engine' AS equipment_kind,
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          1 AS quantity
+        FROM aircraft_sale_listings listing
+        JOIN engine_models model ON model.id = listing.installed_engine_model_id
+        JOIN engine_manufacturers manufacturer
+          ON manufacturer.id = model.engine_manufacturer_id
+        WHERE listing.id = ?
+          AND listing.installed_engine_confidence = 'high'
+        UNION ALL
+        SELECT
+          'propeller' AS equipment_kind,
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          1 AS quantity
+        FROM aircraft_sale_listings listing
+        JOIN propeller_models model ON model.id = listing.installed_propeller_model_id
+        JOIN propeller_manufacturers manufacturer
+          ON manufacturer.id = model.propeller_manufacturer_id
+        WHERE listing.id = ?
+          AND listing.installed_propeller_confidence = 'high'
+        UNION ALL
+        SELECT
+          'fact' AS equipment_kind,
+          fact.fact_kind AS manufacturer,
+          fact.fact_value AS model,
+          1 AS quantity
+        FROM aircraft_sale_listing_facts fact
+        WHERE fact.aircraft_sale_listing_id = ?
+          AND fact.source_confidence = 'high'
+        ORDER BY equipment_kind, manufacturer, model
         "#,
+        listing_id,
+        listing_id,
+        listing_id,
         listing_id
     )?;
     let mut tokens = Vec::new();
     for row in rows {
-        let token = format!(
-            "{}:{}",
-            normalize_name(&row.manufacturer),
-            normalize_name(&row.model)
-        );
+        let token = equipment_feature_token(&row.equipment_kind, &row.manufacturer, &row.model);
         for _ in 0..row.quantity.max(1) {
             tokens.push(token.clone());
         }
@@ -1410,27 +1705,72 @@ async fn model_year_default_avionics_estimates(
         AvionicsEstimateRow,
         r#"
         SELECT
+          model.id AS avionics_model_id,
           mfr.name AS manufacturer,
           model.name AS model,
-          avionics_type.name AS avionics_type,
           default_avionics.quantity,
           model.introduced_year,
-          model.estimated_unit_value_usd,
-          model.value_reference_year
+          CASE
+            WHEN model.value_basis = 'installed_contribution'
+              AND model.estimated_unit_value_usd >= 0
+              AND model.replacement_cost_usd >= model.estimated_unit_value_usd
+              AND model.value_reference_year IS NOT NULL
+              AND model.value_source IS NOT NULL
+              AND TRIM(model.value_source) <> ''
+            THEN model.estimated_unit_value_usd
+          END AS installed_value_contribution_usd,
+          model.replacement_cost_usd,
+          model.value_reference_year,
+          model.valuation_scope,
+          'installed' AS configuration_action,
+          NULL AS replaces_avionics_model_id,
+          default_avionics.source_confidence
         FROM aircraft_model_variant_default_avionics default_avionics
         JOIN avionics_models model
           ON model.id = default_avionics.avionics_model_id
         JOIN avionics_manufacturers mfr
           ON mfr.id = model.avionics_manufacturer_id
-        JOIN avionics_types avionics_type
-          ON avionics_type.id = model.avionics_type_id
         WHERE default_avionics.aircraft_model_variant_id = ?
           AND default_avionics.model_year = ?
+          AND model.catalog_status = 'approved'
+          AND default_avionics.source_confidence = 'high'
+          AND default_avionics.quantity > 0
+          AND TRIM(default_avionics.source_url) <> ''
+          AND LOWER(default_avionics.source_url) NOT LIKE '%/listing/%'
+          AND LOWER(default_avionics.source_url) NOT LIKE '%/listings/%'
+          AND LOWER(default_avionics.source_url) NOT LIKE '%/aircraft-for-sale/%'
+          AND LOWER(default_avionics.source_url) NOT LIKE '%/classifieds/%'
         ORDER BY default_avionics.id
         "#,
         aircraft_model_variant_id,
         model_year
     )?)
+}
+
+async fn avionics_suite_memberships(db: &AppDb) -> StoreResult<Vec<AvionicsSuiteMembership>> {
+    let rows = query_as_all!(
+        db,
+        AvionicsSuiteComponentRow,
+        r#"
+        SELECT membership.suite_model_id, membership.component_model_id, membership.quantity
+        FROM avionics_suite_components membership
+        JOIN avionics_models suite
+          ON suite.id = membership.suite_model_id
+         AND suite.catalog_status = 'approved'
+        JOIN avionics_models component
+          ON component.id = membership.component_model_id
+         AND component.catalog_status = 'approved'
+        ORDER BY membership.suite_model_id, membership.component_model_id
+        "#
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AvionicsSuiteMembership {
+            suite_model_id: row.suite_model_id,
+            component_model_id: row.component_model_id,
+            quantity: row.quantity,
+        })
+        .collect())
 }
 
 async fn model_year_price_point(
@@ -1446,6 +1786,9 @@ async fn model_year_price_point(
         FROM aircraft_model_variant_price_points
         WHERE aircraft_model_variant_id = ?
           AND model_year = ?
+          AND source_confidence = 'high'
+          AND evidence_kind = 'direct_model_year'
+          AND is_valuation_eligible = TRUE
         "#,
         aircraft_model_variant_id,
         model_year
@@ -1461,6 +1804,7 @@ async fn model_family_replacement_basis_rows(
         ReplacementBasisRow,
         r#"
         SELECT
+          price_point.model_year,
           price_point.purchase_price_new_usd,
           price_point.purchase_price_reference_year,
           spec.average_inflation_rate
@@ -1471,11 +1815,22 @@ async fn model_family_replacement_basis_rows(
           ON spec.aircraft_model_id = variant.aircraft_model_id
          AND spec.aircraft_model_variant_id = variant.id
         WHERE variant.aircraft_model_id = ?
+          AND price_point.source_confidence = 'high'
+          AND price_point.evidence_kind = 'direct_model_year'
+          AND price_point.is_valuation_eligible = TRUE
+          AND spec.configuration_scope = 'factory_default'
+          AND spec.is_valuation_eligible = TRUE
+          AND spec.source_confidence = 'high'
+          AND spec.evidence_kind = 'authoritative_reference'
           AND spec.id = (
             SELECT latest.id
             FROM aircraft_model_spec_versions latest
             WHERE latest.aircraft_model_id = variant.aircraft_model_id
               AND latest.aircraft_model_variant_id = variant.id
+              AND latest.configuration_scope = 'factory_default'
+              AND latest.is_valuation_eligible = TRUE
+              AND latest.source_confidence = 'high'
+              AND latest.evidence_kind = 'authoritative_reference'
             ORDER BY latest.effective_from DESC, latest.id DESC
             LIMIT 1
           )
@@ -1486,6 +1841,7 @@ async fn model_family_replacement_basis_rows(
 
 fn replacement_basis_for_year(rows: &[ReplacementBasisRow], valuation_year: i64) -> Option<f64> {
     rows.iter()
+        .filter(|row| row.model_year <= valuation_year)
         .filter(|row| row.purchase_price_reference_year <= valuation_year)
         .filter_map(|row| {
             nominal_dollar_factor(
@@ -1497,6 +1853,132 @@ fn replacement_basis_for_year(rows: &[ReplacementBasisRow], valuation_year: i64)
             .map(|factor| row.purchase_price_new_usd * factor)
         })
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn avionics_configuration_link(row: &AvionicsEstimateRow) -> AvionicsConfigurationLink {
+    AvionicsConfigurationLink {
+        avionics_model_id: row.avionics_model_id,
+        quantity: row.quantity,
+        configuration_action: row.configuration_action.clone(),
+        replaces_avionics_model_id: row.replaces_avionics_model_id,
+        source_confidence: row.source_confidence.clone(),
+        valuation_scope: row.valuation_scope.clone(),
+    }
+}
+
+fn is_high_confidence(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("high"))
+}
+
+/// Resolve a factory configuration plus explicit listing deltas into one set
+/// of installed avionics quantities.
+///
+/// Only high-confidence links can add, replace, or remove equipment. A suite
+/// membership consumes the quantities bundled by the suite, preventing the
+/// integrated suite and the same constituent hardware from being valued
+/// additively. Any quantity above the declared bundled count remains an
+/// independently installed unit.
+pub(crate) fn resolve_avionics_configuration(
+    factory_defaults: &[AvionicsConfigurationLink],
+    listing_deltas: &[AvionicsConfigurationLink],
+    suite_memberships: &[AvionicsSuiteMembership],
+) -> BTreeMap<i64, i64> {
+    let mut quantities = BTreeMap::<i64, i64>::new();
+    let integrated_suite_ids = factory_defaults
+        .iter()
+        .chain(listing_deltas)
+        .filter(|link| link.valuation_scope == "integrated_suite")
+        .map(|link| link.avionics_model_id)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for link in factory_defaults
+        .iter()
+        .filter(|link| is_high_confidence(link.source_confidence.as_deref()))
+    {
+        quantities
+            .entry(link.avionics_model_id)
+            .and_modify(|quantity| *quantity = (*quantity).max(link.quantity.max(1)))
+            .or_insert_with(|| link.quantity.max(1));
+    }
+
+    for link in listing_deltas
+        .iter()
+        .filter(|link| is_high_confidence(link.source_confidence.as_deref()))
+    {
+        match link.configuration_action.as_str() {
+            "removes" => {
+                if let Some(replaced_id) = link.replaces_avionics_model_id {
+                    quantities.remove(&replaced_id);
+                }
+            }
+            "replaces" => {
+                let Some(replaced_id) = link.replaces_avionics_model_id else {
+                    continue;
+                };
+                quantities.remove(&replaced_id);
+                quantities
+                    .entry(link.avionics_model_id)
+                    .and_modify(|quantity| *quantity = (*quantity).max(link.quantity.max(1)))
+                    .or_insert_with(|| link.quantity.max(1));
+            }
+            "installed" => {
+                quantities
+                    .entry(link.avionics_model_id)
+                    .and_modify(|quantity| *quantity = (*quantity).max(link.quantity.max(1)))
+                    .or_insert_with(|| link.quantity.max(1));
+            }
+            _ => {}
+        }
+    }
+
+    for membership in suite_memberships {
+        if !integrated_suite_ids.contains(&membership.suite_model_id) {
+            continue;
+        }
+        let Some(suite_quantity) = quantities.get(&membership.suite_model_id).copied() else {
+            continue;
+        };
+        let bundled_quantity = suite_quantity.saturating_mul(membership.quantity.max(1));
+        if let Some(component_quantity) = quantities.get_mut(&membership.component_model_id) {
+            *component_quantity = component_quantity.saturating_sub(bundled_quantity);
+        }
+    }
+    quantities.retain(|_, quantity| *quantity > 0);
+    quantities
+}
+
+fn effective_avionics_rows(
+    factory_defaults: &[AvionicsEstimateRow],
+    listing_deltas: &[AvionicsEstimateRow],
+    suite_memberships: &[AvionicsSuiteMembership],
+) -> Vec<AvionicsEstimateRow> {
+    let quantities = resolve_avionics_configuration(
+        &factory_defaults
+            .iter()
+            .map(avionics_configuration_link)
+            .collect::<Vec<_>>(),
+        &listing_deltas
+            .iter()
+            .map(avionics_configuration_link)
+            .collect::<Vec<_>>(),
+        suite_memberships,
+    );
+    let rows_by_id = factory_defaults
+        .iter()
+        .chain(listing_deltas)
+        .map(|row| (row.avionics_model_id, row))
+        .collect::<BTreeMap<_, _>>();
+
+    quantities
+        .into_iter()
+        .filter_map(|(model_id, quantity)| {
+            rows_by_id.get(&model_id).map(|row| {
+                let mut row = (*row).clone();
+                row.quantity = quantity;
+                row
+            })
+        })
+        .collect()
 }
 
 fn avionics_components_from_rows(
@@ -1512,18 +1994,22 @@ fn avionics_components_from_rows(
             if introduced_year > valuation_year {
                 return None;
             }
-            let unit_replacement_cost_usd = row.estimated_unit_value_usd?;
-            (unit_replacement_cost_usd >= 0.0).then(|| AvionicsComponent {
-                name: format!("{} {} {}", row.manufacturer, row.model, row.avionics_type),
-                introduced_year,
-                valuation_year,
-                value_reference_year: row
-                    .value_reference_year
-                    .unwrap_or(fallback_value_reference_year),
-                average_inflation_rate,
-                unit_replacement_cost_usd,
-                quantity: row.quantity.max(1),
-                profile: profile.clone(),
+            let installed_value_contribution_usd = row.installed_value_contribution_usd?;
+            let replacement_cost_usd = row.replacement_cost_usd?;
+            (installed_value_contribution_usd >= 0.0 && replacement_cost_usd >= 0.0).then(|| {
+                AvionicsComponent {
+                    name: format!("{} {}", row.manufacturer, row.model),
+                    introduced_year,
+                    valuation_year,
+                    value_reference_year: row
+                        .value_reference_year
+                        .unwrap_or(fallback_value_reference_year),
+                    average_inflation_rate,
+                    installed_value_contribution_usd,
+                    replacement_cost_usd,
+                    quantity: row.quantity.max(1),
+                    profile: profile.clone(),
+                }
             })
         })
         .collect()
@@ -1632,7 +2118,12 @@ async fn aircraft_variants_missing_specs(
           FROM aircraft_model_spec_versions spec
           WHERE spec.aircraft_model_id = model.id
             AND spec.aircraft_model_variant_id = variant.id
+            AND spec.configuration_scope = 'factory_default'
+            AND spec.is_valuation_eligible = TRUE
+            AND spec.source_confidence = 'high'
+            AND spec.evidence_kind = 'authoritative_reference'
         )
+          AND l.ingestion_state = 'ready'
         GROUP BY
           mfr.id,
           mfr.name,
@@ -1673,6 +2164,7 @@ async fn aircraft_variants_with_plugin_evidence(
           ON l.aircraft_model_variant_id = variant.id
         JOIN plugin_submissions submission
           ON submission.canonical_listing_id = l.id
+        WHERE l.ingestion_state = 'ready'
         GROUP BY
           mfr.id,
           mfr.name,
@@ -1697,6 +2189,7 @@ async fn plugin_spec_evidence_for_variant(
         PluginSpecEvidenceRow,
         r#"
         SELECT
+          listing.id AS listing_id,
           listing.model_year,
           listing.asking_price_usd,
           listing.airframe_hours,
@@ -1708,11 +2201,10 @@ async fn plugin_spec_evidence_for_variant(
         JOIN aircraft_sale_listings listing
           ON listing.id = submission.canonical_listing_id
         WHERE listing.aircraft_model_variant_id = ?
+          AND listing.ingestion_state = 'ready'
         ORDER BY listing.added_at DESC, submission.submitted_at DESC
-        LIMIT ?
         "#,
-        variant_id,
-        SPEC_EVIDENCE_LIMIT
+        variant_id
     )?)
 }
 
@@ -1729,6 +2221,10 @@ async fn aircraft_spec_exists_for_variant(
         FROM aircraft_model_spec_versions
         WHERE aircraft_model_id = ?
           AND aircraft_model_variant_id = ?
+          AND configuration_scope = 'factory_default'
+          AND is_valuation_eligible = TRUE
+          AND source_confidence = 'high'
+          AND evidence_kind = 'authoritative_reference'
         LIMIT 1
         "#,
         model_id,
@@ -1763,6 +2259,7 @@ async fn listing_spec_seed(db: &AppDb, listing_id: i64) -> StoreResult<ListingSp
         JOIN aircraft_manufacturers mfr
           ON mfr.id = model.aircraft_manufacturer_id
         WHERE listing.id = ?
+          AND listing.ingestion_state <> 'quarantined'
         "#,
         listing_id
     )?;
@@ -1773,7 +2270,7 @@ async fn insert_aircraft_spec(
     db: &AppDb,
     item: &AircraftSpecEnrichmentItem,
     value_reference_year: i64,
-    source_url: Option<&str>,
+    _listing_source_url: Option<&str>,
 ) -> StoreResult<i64> {
     let profile_id = depreciation_profile_id(db, &item.depreciation_profile)
         .await?
@@ -1793,6 +2290,8 @@ async fn insert_aircraft_spec(
         &item.powerplant_source_url,
         &item.powerplant_source_title,
         &item.powerplant_source_confidence,
+        &item.evidence_kind,
+        item.is_valuation_eligible,
     )
     .await?;
     let propeller_model_id = ensure_propeller_model(
@@ -1805,6 +2304,8 @@ async fn insert_aircraft_spec(
         &item.powerplant_source_url,
         &item.powerplant_source_title,
         &item.powerplant_source_confidence,
+        &item.evidence_kind,
+        item.is_valuation_eligible,
     )
     .await?;
     let effective_from = format!("{value_reference_year:04}-01-01");
@@ -1833,9 +2334,13 @@ async fn insert_aircraft_spec(
           propeller_value_baseline_life_fraction,
           annual_inspection_usd,
           other_maintenance_per_hour,
-          source_url
+          source_url,
+          configuration_scope,
+          source_confidence,
+          evidence_kind,
+          is_valuation_eligible
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
         item.model_id,
@@ -1858,7 +2363,11 @@ async fn insert_aircraft_spec(
         item.propeller_value_baseline_life_fraction,
         item.annual_inspection_usd,
         item.other_maintenance_per_hour,
-        source_url,
+        item.powerplant_source_url.as_str(),
+        item.configuration_scope.as_str(),
+        item.source_confidence.as_str(),
+        item.evidence_kind.as_str(),
+        item.is_valuation_eligible,
     )?)
 }
 
@@ -1866,13 +2375,13 @@ async fn upsert_aircraft_spec(
     db: &AppDb,
     item: &AircraftSpecEnrichmentItem,
     value_reference_year: i64,
-    source_url: Option<&str>,
+    listing_source_url: Option<&str>,
 ) -> StoreResult<i64> {
     if let Some(spec_id) = latest_aircraft_spec_id(db, item.model_id, item.variant_id).await? {
-        update_aircraft_spec(db, spec_id, item, value_reference_year, source_url).await?;
+        update_aircraft_spec(db, spec_id, item, value_reference_year, listing_source_url).await?;
         Ok(spec_id)
     } else {
-        insert_aircraft_spec(db, item, value_reference_year, source_url).await
+        insert_aircraft_spec(db, item, value_reference_year, listing_source_url).await
     }
 }
 
@@ -1889,6 +2398,7 @@ async fn latest_aircraft_spec_id(
         FROM aircraft_model_spec_versions
         WHERE aircraft_model_id = ?
           AND aircraft_model_variant_id = ?
+          AND configuration_scope = 'factory_default'
         ORDER BY effective_from DESC, id DESC
         LIMIT 1
         "#,
@@ -1902,7 +2412,7 @@ async fn update_aircraft_spec(
     spec_id: i64,
     item: &AircraftSpecEnrichmentItem,
     value_reference_year: i64,
-    source_url: Option<&str>,
+    _listing_source_url: Option<&str>,
 ) -> StoreResult<()> {
     let profile_id = depreciation_profile_id(db, &item.depreciation_profile)
         .await?
@@ -1922,6 +2432,8 @@ async fn update_aircraft_spec(
         &item.powerplant_source_url,
         &item.powerplant_source_title,
         &item.powerplant_source_confidence,
+        &item.evidence_kind,
+        item.is_valuation_eligible,
     )
     .await?;
     let propeller_model_id = ensure_propeller_model(
@@ -1934,6 +2446,8 @@ async fn update_aircraft_spec(
         &item.powerplant_source_url,
         &item.powerplant_source_title,
         &item.powerplant_source_confidence,
+        &item.evidence_kind,
+        item.is_valuation_eligible,
     )
     .await?;
     let effective_from = format!("{value_reference_year:04}-01-01");
@@ -1961,6 +2475,10 @@ async fn update_aircraft_spec(
           annual_inspection_usd = ?,
           other_maintenance_per_hour = ?,
           source_url = ?,
+          configuration_scope = ?,
+          source_confidence = ?,
+          evidence_kind = ?,
+          is_valuation_eligible = ?,
           updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         "#,
@@ -1982,7 +2500,11 @@ async fn update_aircraft_spec(
         item.propeller_value_baseline_life_fraction,
         item.annual_inspection_usd,
         item.other_maintenance_per_hour,
-        source_url,
+        item.powerplant_source_url.as_str(),
+        item.configuration_scope.as_str(),
+        item.source_confidence.as_str(),
+        item.evidence_kind.as_str(),
+        item.is_valuation_eligible,
         spec_id
     )?;
     Ok(())
@@ -1998,6 +2520,8 @@ async fn ensure_engine_model(
     source_url: &str,
     source_title: &str,
     source_confidence: &str,
+    evidence_kind: &str,
+    is_valuation_eligible: bool,
 ) -> StoreResult<i64> {
     let manufacturer_id = ensure_engine_manufacturer(db, manufacturer).await?;
     let normalized_model = normalize_name(model);
@@ -2014,9 +2538,11 @@ async fn ensure_engine_model(
           value_reference_year,
           source_url,
           source_title,
-          source_confidence
+          source_confidence,
+          evidence_kind,
+          is_valuation_eligible
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (engine_manufacturer_id, normalized_name) DO UPDATE SET
           name = excluded.name,
           tbo_hours = COALESCE(excluded.tbo_hours, engine_models.tbo_hours),
@@ -2025,6 +2551,8 @@ async fn ensure_engine_model(
           source_url = COALESCE(excluded.source_url, engine_models.source_url),
           source_title = COALESCE(excluded.source_title, engine_models.source_title),
           source_confidence = COALESCE(excluded.source_confidence, engine_models.source_confidence),
+          evidence_kind = excluded.evidence_kind,
+          is_valuation_eligible = excluded.is_valuation_eligible,
           updated_at = CURRENT_TIMESTAMP
         RETURNING id
         "#,
@@ -2037,6 +2565,8 @@ async fn ensure_engine_model(
         optional_non_empty(source_url),
         optional_non_empty(source_title),
         optional_non_empty(source_confidence),
+        evidence_kind,
+        is_valuation_eligible,
     )?)
 }
 
@@ -2050,6 +2580,8 @@ async fn ensure_propeller_model(
     source_url: &str,
     source_title: &str,
     source_confidence: &str,
+    evidence_kind: &str,
+    is_valuation_eligible: bool,
 ) -> StoreResult<i64> {
     let manufacturer_id = ensure_propeller_manufacturer(db, manufacturer).await?;
     let normalized_model = normalize_name(model);
@@ -2066,9 +2598,11 @@ async fn ensure_propeller_model(
           value_reference_year,
           source_url,
           source_title,
-          source_confidence
+          source_confidence,
+          evidence_kind,
+          is_valuation_eligible
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (propeller_manufacturer_id, normalized_name) DO UPDATE SET
           name = excluded.name,
           tbo_hours = COALESCE(excluded.tbo_hours, propeller_models.tbo_hours),
@@ -2077,6 +2611,8 @@ async fn ensure_propeller_model(
           source_url = COALESCE(excluded.source_url, propeller_models.source_url),
           source_title = COALESCE(excluded.source_title, propeller_models.source_title),
           source_confidence = COALESCE(excluded.source_confidence, propeller_models.source_confidence),
+          evidence_kind = excluded.evidence_kind,
+          is_valuation_eligible = excluded.is_valuation_eligible,
           updated_at = CURRENT_TIMESTAMP
         RETURNING id
         "#,
@@ -2089,6 +2625,8 @@ async fn ensure_propeller_model(
         optional_non_empty(source_url),
         optional_non_empty(source_title),
         optional_non_empty(source_confidence),
+        evidence_kind,
+        is_valuation_eligible,
     )?)
 }
 
@@ -2227,6 +2765,10 @@ fn spec_detail_from_row(row: &AircraftSpecVersionRow) -> AircraftSpecDetail {
         annual_inspection_usd: row.annual_inspection_usd,
         other_maintenance_per_hour: row.other_maintenance_per_hour,
         source_url: row.source_url.clone(),
+        configuration_scope: row.configuration_scope.clone(),
+        source_confidence: row.source_confidence.clone(),
+        evidence_kind: row.evidence_kind.clone(),
+        is_valuation_eligible: row.is_valuation_eligible,
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
     }
@@ -2234,7 +2776,7 @@ fn spec_detail_from_row(row: &AircraftSpecVersionRow) -> AircraftSpecDetail {
 
 fn timed_component(
     name: &str,
-    hours_since_overhaul: f64,
+    hours_since_overhaul: Option<f64>,
     count: i64,
     tbo_hours: Option<f64>,
     overhaul_cost_usd: Option<f64>,
@@ -2243,6 +2785,7 @@ fn timed_component(
     valuation_year: i64,
     average_inflation_rate: f64,
 ) -> Option<TimedComponent> {
+    let hours_since_overhaul = hours_since_overhaul?;
     let tbo_hours = tbo_hours?;
     let overhaul_cost_usd = overhaul_cost_usd?;
     (count > 0 && tbo_hours > 0.0 && overhaul_cost_usd >= 0.0).then(|| TimedComponent {
@@ -2258,12 +2801,93 @@ fn timed_component(
     })
 }
 
+fn known_component_time(hours: Option<f64>, basis: &str) -> Option<f64> {
+    matches!(basis, "SNEW" | "SMOH" | "SFOH" | "SPOH")
+        .then_some(hours)
+        .flatten()
+        .filter(|hours| hours.is_finite() && *hours >= 0.0)
+}
+
+fn optional_hours_text(value: Option<f64>) -> String {
+    value
+        .map(|hours| hours.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn spec_enrichment_item_from_response(
     variant: &AircraftVariantOption,
     response: &Value,
     evidence_count: usize,
+    listing_source_urls: &[&str],
 ) -> StoreResult<AircraftSpecEnrichmentItem> {
     let depreciation_profile = required_string(response, "depreciation_profile")?;
+    let powerplant_source_url = required_string(response, "powerplant_source_url")?;
+    let powerplant_source_confidence =
+        required_confidence(response, "powerplant_source_confidence")?;
+    let configuration_scope = match required_string(response, "configuration_scope")?.as_str() {
+        "factory" => "factory_default".to_string(),
+        "listing_installed" => "listing_specific".to_string(),
+        value => {
+            return Err(AircraftStoreError::Model(format!(
+                "Gemini aircraft spec response configuration_scope is invalid: {value}"
+            )))
+        }
+    };
+    let evidence_kind = required_string(response, "evidence_kind")?.to_ascii_lowercase();
+    if !matches!(
+        evidence_kind.as_str(),
+        "authoritative_reference" | "listing_only"
+    ) {
+        return Err(AircraftStoreError::Model(format!(
+            "Gemini aircraft spec response evidence_kind is invalid: {evidence_kind}"
+        )));
+    }
+    let source_confidence = required_confidence(response, "source_confidence")?;
+    let model_marked_eligible = response
+        .get("is_valuation_eligible")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let overall_confidence = required_confidence(response, "confidence")?;
+    let mut valuation_eligibility_notes = Vec::new();
+    if configuration_scope != "factory_default" {
+        valuation_eligibility_notes.push("configuration is listing-specific".to_string());
+    }
+    if evidence_kind != "authoritative_reference" {
+        valuation_eligibility_notes
+            .push("factory configuration lacks authoritative evidence".to_string());
+    }
+    if source_confidence != "high" || powerplant_source_confidence != "high" {
+        valuation_eligibility_notes.push("factory source confidence is not high".to_string());
+    }
+    if overall_confidence != "high" {
+        valuation_eligibility_notes.push("overall spec confidence is not high".to_string());
+    }
+    if !model_marked_eligible {
+        valuation_eligibility_notes
+            .push("grounded response marked the spec ineligible".to_string());
+    }
+    if !(powerplant_source_url.starts_with("https://")
+        || powerplant_source_url.starts_with("http://"))
+    {
+        valuation_eligibility_notes.push("powerplant source URL is not http(s)".to_string());
+    }
+    if looks_like_sale_listing_url(&powerplant_source_url)
+        || listing_source_urls
+            .iter()
+            .filter(|url| !url.is_empty())
+            .any(|url| urls_match(url, &powerplant_source_url))
+    {
+        valuation_eligibility_notes
+            .push("powerplant source is one of the ordinary sale listings".to_string());
+    }
+    let engine_manufacturer = required_string(response, "engine_manufacturer")?;
+    let propeller_manufacturer = required_string(response, "propeller_manufacturer")?;
+    if normalize_name(&engine_manufacturer) == normalize_name(&variant.manufacturer)
+        || normalize_name(&propeller_manufacturer) == normalize_name(&variant.manufacturer)
+    {
+        valuation_eligibility_notes
+            .push("aircraft manufacturer was returned as a component manufacturer".to_string());
+    }
     Ok(AircraftSpecEnrichmentItem {
         manufacturer_id: variant.manufacturer_id,
         manufacturer: variant.manufacturer.clone(),
@@ -2277,7 +2901,7 @@ fn spec_enrichment_item_from_response(
         fuel_burn_gph: required_min_f64(response, "fuel_burn_gph", 0.0)?,
         oil_quarts_per_hour: required_min_f64(response, "oil_quarts_per_hour", 0.0)?,
         oil_price_per_quart_usd: required_min_f64(response, "oil_price_per_quart_usd", 0.0)?,
-        engine_manufacturer: required_string(response, "engine_manufacturer")?,
+        engine_manufacturer,
         engine_model: required_string(response, "engine_model")?,
         engine_count: required_min_i64(response, "engine_count", 0)?,
         engine_tbo_hours: required_min_f64(response, "engine_tbo_hours", 0.0)?,
@@ -2297,14 +2921,19 @@ fn spec_enrichment_item_from_response(
             response,
             "propeller_value_baseline_life_fraction",
         )?,
-        propeller_manufacturer: required_string(response, "propeller_manufacturer")?,
+        propeller_manufacturer,
         propeller_model: required_string(response, "propeller_model")?,
-        powerplant_source_url: required_string(response, "powerplant_source_url")?,
+        powerplant_source_url,
         powerplant_source_title: required_string(response, "powerplant_source_title")?,
-        powerplant_source_confidence: required_string(response, "powerplant_source_confidence")?,
+        powerplant_source_confidence,
+        configuration_scope,
+        evidence_kind,
+        source_confidence,
+        is_valuation_eligible: valuation_eligibility_notes.is_empty(),
+        valuation_eligibility_notes,
         annual_inspection_usd: required_min_f64(response, "annual_inspection_usd", 0.0)?,
         other_maintenance_per_hour: required_min_f64(response, "other_maintenance_per_hour", 0.0)?,
-        confidence: required_string(response, "confidence")?,
+        confidence: overall_confidence,
         evidence_count,
         applied_spec_id: None,
     })
@@ -2322,6 +2951,39 @@ fn required_string(response: &Value, field_name: &str) -> StoreResult<String> {
                 "Gemini aircraft spec response missing {field_name}"
             ))
         })
+}
+
+fn required_confidence(response: &Value, field_name: &str) -> StoreResult<String> {
+    let confidence = required_string(response, field_name)?.to_ascii_lowercase();
+    if !matches!(confidence.as_str(), "high" | "medium" | "low") {
+        return Err(AircraftStoreError::Model(format!(
+            "Gemini aircraft spec response {field_name} must be high, medium, or low"
+        )));
+    }
+    Ok(confidence)
+}
+
+fn urls_match(left: &str, right: &str) -> bool {
+    let Ok(left) = url::Url::parse(left) else {
+        return left.trim_end_matches('/') == right.trim_end_matches('/');
+    };
+    let Ok(right) = url::Url::parse(right) else {
+        return false;
+    };
+    left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.path().trim_end_matches('/') == right.path().trim_end_matches('/')
+}
+
+fn looks_like_sale_listing_url(value: &str) -> bool {
+    let path = url::Url::parse(value)
+        .ok()
+        .map(|url| url.path().to_ascii_lowercase())
+        .unwrap_or_else(|| value.to_ascii_lowercase());
+    path.contains("/listing/")
+        || path.contains("/listings/")
+        || path.contains("/aircraft-for-sale/")
+        || path.contains("/classifieds/")
 }
 
 fn required_min_f64(response: &Value, field_name: &str, minimum: f64) -> StoreResult<f64> {
@@ -2379,4 +3041,721 @@ fn year_from_effective_from(effective_from: &str) -> i64 {
 
 fn year_from_date_prefix(value: &str) -> Option<i64> {
     value.get(0..4).and_then(|year| year.parse::<i64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        aircraft_listing_value_with_model, aircraft_options, avionics_suite_memberships,
+        enrich_aircraft_spec_for_listing_if_missing, listing_avionics_estimates,
+        listing_value_point, model_year_default_avionics_estimates,
+        require_valuation_model_faa_admission, resolve_avionics_configuration,
+        spec_enrichment_item_from_response, AircraftListingPointRow, AircraftVariantOption,
+        AvionicsConfigurationLink, AvionicsSuiteMembership,
+    };
+    use crate::db::{AppDb, DatabaseBackend};
+    use crate::extract::GeminiListingExtractor;
+    use crate::valuation::{
+        ComparableConfig, ComparableModel, TrainingListing, ValuationError, ValuationEstimate,
+        ValuationModel, ValuationQuery,
+    };
+    use serde_json::{json, Value};
+
+    fn link(
+        model_id: i64,
+        quantity: i64,
+        action: &str,
+        replaces: Option<i64>,
+        confidence: &str,
+    ) -> AvionicsConfigurationLink {
+        AvionicsConfigurationLink {
+            avionics_model_id: model_id,
+            quantity,
+            configuration_action: action.to_string(),
+            replaces_avionics_model_id: replaces,
+            source_confidence: Some(confidence.to_string()),
+            valuation_scope: "unit".to_string(),
+        }
+    }
+
+    struct SnapshotOnlyModel {
+        snapshot_id: i64,
+    }
+
+    impl ValuationModel for SnapshotOnlyModel {
+        fn model_version_id(&self) -> i64 {
+            1
+        }
+
+        fn model_kind(&self) -> &'static str {
+            "test"
+        }
+
+        fn snapshot_id(&self) -> i64 {
+            self.snapshot_id
+        }
+
+        fn market_year(&self) -> Result<i64, ValuationError> {
+            Ok(2026)
+        }
+
+        fn estimate(&self, _query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
+            Err(ValuationError::InvalidQuery(
+                "test model does not estimate".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_model_is_rejected_when_its_snapshot_predates_faa_manifests() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let snapshot_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO valuation_snapshots (
+              capture_time, input_sha256, selection_policy_json,
+              feature_schema_version, included_count, excluded_count
+            ) VALUES ('2026-07-20', lower(hex(randomblob(32))), '{}', ?, 0, 0)
+            RETURNING id
+            "#,
+        )
+        .bind(crate::valuation::FEATURE_SCHEMA_VERSION as i64)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let model = SnapshotOnlyModel { snapshot_id };
+
+        let error = require_valuation_model_faa_admission(&db, Some(&model))
+            .await
+            .expect_err("a cached pre-FAA model must not remain serving");
+
+        assert!(error.to_string().contains("predates the mandatory FAA"));
+    }
+
+    #[tokio::test]
+    async fn direct_valuation_rejects_a_retained_non_n_listing() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Gate Test', 'gate test')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, 'Model', 'model')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'variant')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, model_year,
+              asking_price_usd, airframe_hours, registration_number,
+              ingestion_state, ingestion_completed_at
+            ) VALUES (1, 1, 2020, 200000, 1000, 'C-GABC', 'ready', CURRENT_TIMESTAMP)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let error = aircraft_listing_value_with_model(&db, 1, listing_id, None)
+            .await
+            .expect_err("a retained foreign aircraft must never receive a valuation");
+
+        assert!(error.to_string().contains("non_n_registration"));
+        assert!(
+            aircraft_options(&db, 1).await.unwrap().is_empty(),
+            "a foreign-only variant must not appear as a valuation option"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_spec_enrichment_rejects_before_gemini_and_persistence() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Gate Test', 'gate test')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, 'Model', 'model')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'variant')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, model_year,
+              asking_price_usd, airframe_hours, ingestion_state,
+              ingestion_completed_at
+            ) VALUES (1, 1, 2020, 200000, 1000, 'ready', CURRENT_TIMESTAMP)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        let error = enrich_aircraft_spec_for_listing_if_missing(
+            &db,
+            Some(&extractor),
+            listing_id,
+            Some("This text must never be sent to Gemini."),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("missing_registration"));
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_model_spec_versions")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    async fn insert_test_avionics_model(
+        db: &AppDb,
+        manufacturer_id: i64,
+        type_id: i64,
+        name: &str,
+        normalized_name: &str,
+        identifier: &str,
+        catalog_status: &str,
+        valuation_scope: &str,
+    ) -> i64 {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let model_id = if catalog_status == "approved" {
+            sqlx::query_scalar(
+                r#"
+                INSERT INTO avionics_models (
+                  avionics_manufacturer_id, name, normalized_name,
+                  manufacturer_identifier_kind, manufacturer_identifier,
+                  normalized_manufacturer_identifier, identity_source_url,
+                  identity_source_title, identity_evidence_text, identity_evidence_kind,
+                  identity_confidence, catalog_reviewed_at, introduced_year,
+                  estimated_unit_value_usd, value_basis, replacement_cost_usd,
+                  value_reference_year, value_source, valuation_scope
+                ) VALUES (
+                  ?, ?, ?, 'manufacturer_model_number', ?, ?,
+                  'https://www.garmin.com/aviation/test-product/',
+                  'Garmin test product',
+                  'Manufacturer reference identifies this exact test product.',
+                  'authoritative_reference', 'very_high', CURRENT_TIMESTAMP, 2020,
+                  10000, 'installed_contribution', 20000, 2026,
+                  'authoritative test fixture', ?
+                ) RETURNING id
+                "#,
+            )
+            .bind(manufacturer_id)
+            .bind(name)
+            .bind(normalized_name)
+            .bind(identifier)
+            .bind(
+                identifier
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
+            )
+            .bind(valuation_scope)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        } else {
+            sqlx::query_scalar(
+                r#"
+                INSERT INTO avionics_models (
+                  avionics_manufacturer_id, name, normalized_name,
+                  introduced_year, estimated_unit_value_usd, value_basis,
+                  replacement_cost_usd, value_reference_year, value_source,
+                  valuation_scope
+                ) VALUES (
+                  ?, ?, ?, 2020, 99999, 'installed_contribution',
+                  120000, 2026, 'legacy unreviewed fixture', ?
+                ) RETURNING id
+                "#,
+            )
+            .bind(manufacturer_id)
+            .bind(name)
+            .bind(normalized_name)
+            .bind(valuation_scope)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        if catalog_status == "approved" {
+            sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+                .bind(model_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        model_id
+    }
+
+    #[test]
+    fn listing_avionics_are_deltas_from_factory_configuration() {
+        let defaults = vec![
+            link(1, 1, "installed", None, "high"),
+            link(2, 1, "installed", None, "high"),
+        ];
+        let listing = vec![
+            link(3, 1, "replaces", Some(1), "high"),
+            link(4, 1, "installed", None, "high"),
+        ];
+
+        let resolved = resolve_avionics_configuration(&defaults, &listing, &[]);
+
+        assert_eq!(resolved.get(&1), None);
+        assert_eq!(resolved.get(&2), Some(&1));
+        assert_eq!(resolved.get(&3), Some(&1));
+        assert_eq!(resolved.get(&4), Some(&1));
+    }
+
+    #[test]
+    fn weak_listing_evidence_cannot_replace_factory_equipment() {
+        let defaults = vec![link(1, 1, "installed", None, "high")];
+        let listing = vec![link(2, 1, "replaces", Some(1), "low")];
+
+        let resolved = resolve_avionics_configuration(&defaults, &listing, &[]);
+
+        assert_eq!(resolved.get(&1), Some(&1));
+        assert_eq!(resolved.get(&2), None);
+    }
+
+    #[test]
+    fn integrated_suite_consumes_only_its_bundled_component_quantity() {
+        let listing = vec![
+            AvionicsConfigurationLink {
+                valuation_scope: "integrated_suite".to_string(),
+                ..link(10, 1, "installed", None, "high")
+            },
+            link(11, 3, "installed", None, "high"),
+        ];
+        let memberships = vec![AvionicsSuiteMembership {
+            suite_model_id: 10,
+            component_model_id: 11,
+            quantity: 2,
+        }];
+
+        let resolved = resolve_avionics_configuration(&[], &listing, &memberships);
+
+        assert_eq!(resolved.get(&10), Some(&1));
+        assert_eq!(resolved.get(&11), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn legacy_unreviewed_catalog_rows_are_excluded_from_valuation_inputs() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Test', 'test')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, 'Model', 'model')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'variant')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, model_year,
+              asking_price_usd, airframe_hours
+            ) VALUES (1, 1, 2020, 100000, 1000)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', 'garmin') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Flight Display', 'flight display') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let approved_suite_id = insert_test_avionics_model(
+            &db,
+            manufacturer_id,
+            type_id,
+            "Approved Suite",
+            "approved suite",
+            "APPROVED-SUITE-1",
+            "approved",
+            "integrated_suite",
+        )
+        .await;
+        let transponder_type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Transponder', 'transponder') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(approved_suite_id)
+        .bind(transponder_type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let approved_component_id = insert_test_avionics_model(
+            &db,
+            manufacturer_id,
+            type_id,
+            "Approved Display",
+            "approved display",
+            "APPROVED-DISPLAY-1",
+            "approved",
+            "unit",
+        )
+        .await;
+        let unreviewed_id = insert_test_avionics_model(
+            &db,
+            manufacturer_id,
+            type_id,
+            "Legacy Guess",
+            "legacy guess",
+            "",
+            "unreviewed",
+            "unit",
+        )
+        .await;
+
+        // These rows model associations preserved by the one-time migration.
+        sqlx::query("DROP TRIGGER aircraft_sale_listing_avionics_approved_insert")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER aircraft_model_variant_default_avionics_approved_insert")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER avionics_suite_components_approved_insert")
+            .execute(pool)
+            .await
+            .unwrap();
+        for model_id in [approved_suite_id, unreviewed_id] {
+            sqlx::query(
+                r#"
+                INSERT INTO aircraft_sale_listing_avionics (
+                  aircraft_sale_listing_id, avionics_model_id, source_confidence
+                ) VALUES (?, ?, 'high')
+                "#,
+            )
+            .bind(listing_id)
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO aircraft_model_variant_default_avionics (
+                  aircraft_model_variant_id, model_year, avionics_model_id,
+                  quantity, source_url, source_title, source_notes, source_confidence
+                ) VALUES (
+                  1, 2020, ?, 1, 'https://example.test/factory-reference',
+                  'Factory reference', 'Fixture', 'high'
+                )
+                "#,
+            )
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, 1), (?, ?, 1)",
+        )
+        .bind(approved_suite_id)
+        .bind(approved_component_id)
+        .bind(approved_suite_id)
+        .bind(unreviewed_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let listing_rows = listing_avionics_estimates(&db, listing_id).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM avionics_model_types WHERE avionics_model_id = ?",
+            )
+            .bind(approved_suite_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            2,
+            "the fixture must exercise a multi-capability physical product"
+        );
+        assert_eq!(
+            listing_rows
+                .iter()
+                .map(|row| row.avionics_model_id)
+                .collect::<Vec<_>>(),
+            vec![approved_suite_id]
+        );
+        let default_rows = model_year_default_avionics_estimates(&db, 1, 2020)
+            .await
+            .unwrap();
+        assert_eq!(
+            default_rows
+                .iter()
+                .map(|row| row.avionics_model_id)
+                .collect::<Vec<_>>(),
+            vec![approved_suite_id]
+        );
+        assert_eq!(
+            avionics_suite_memberships(&db).await.unwrap(),
+            vec![AvionicsSuiteMembership {
+                suite_model_id: approved_suite_id,
+                component_model_id: approved_component_id,
+                quantity: 1,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_listing_only_model_never_exposes_legacy_as_primary_estimate() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let row = AircraftListingPointRow {
+            id: 1,
+            manufacturer_id: 1,
+            model_id: 1,
+            aircraft_model_variant_id: 1,
+            is_verified: false,
+            source_url: None,
+            model_year: 2000,
+            asking_price_usd: 100_000.0,
+            currency: "USD".to_string(),
+            added_at: "2026-07-20".to_string(),
+            status: "active".to_string(),
+            registration_number: None,
+            serial_number: None,
+            airframe_hours: 1_000.0,
+            engine_hours: None,
+            engine_time_basis: "unknown".to_string(),
+            engine_time_evidence: None,
+            engine_time_confidence: None,
+            propeller_hours: None,
+            propeller_time_basis: "unknown".to_string(),
+            propeller_time_evidence: None,
+            propeller_time_confidence: None,
+        };
+        let point = listing_value_point(&db, &row, None, None, None, false)
+            .await
+            .unwrap();
+        assert!(point.estimated_value_usd.is_none());
+        assert!(point.value_curve.is_empty());
+        assert!(point
+            .estimate_error
+            .is_some_and(|error| error.contains("Listing-only valuation unavailable")));
+    }
+
+    #[tokio::test]
+    async fn serving_uses_the_models_snapshot_market_year() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let row = AircraftListingPointRow {
+            id: 1,
+            manufacturer_id: 1,
+            model_id: 1,
+            aircraft_model_variant_id: 1,
+            is_verified: false,
+            source_url: None,
+            model_year: 2000,
+            asking_price_usd: 100_000.0,
+            currency: "USD".to_string(),
+            added_at: "2025-12-31".to_string(),
+            status: "active".to_string(),
+            registration_number: None,
+            serial_number: Some("MARKET-YEAR-1".to_string()),
+            airframe_hours: 1_000.0,
+            engine_hours: None,
+            engine_time_basis: "unknown".to_string(),
+            engine_time_evidence: None,
+            engine_time_confidence: None,
+            propeller_hours: None,
+            propeller_time_basis: "unknown".to_string(),
+            propeller_time_evidence: None,
+            propeller_time_confidence: None,
+        };
+        let training = TrainingListing {
+            listing_id: 10,
+            duplicate_group_key: "serial:TRAINING-1".to_string(),
+            category_key: None,
+            manufacturer_id: 1,
+            model_id: 1,
+            variant_id: 1,
+            model_year: 2000,
+            snapshot_year: 2030,
+            asking_price_usd: 100_000.0,
+            airframe_hours: Some(1_000.0),
+            engine_times: vec![],
+            propeller_times: vec![],
+            equipment_tokens: vec![],
+            valuation_facts: vec![],
+            technical_field_count: 2,
+        };
+        let model =
+            ComparableModel::new(0, 7, vec![training], ComparableConfig::default()).unwrap();
+
+        let point = listing_value_point(&db, &row, None, None, Some(&model), false)
+            .await
+            .unwrap();
+
+        assert!(point.estimated_value_usd.is_some());
+        assert_eq!(point.value_curve[0].valuation_year, 2030);
+        assert_eq!(point.value_curve[0].age_years, 30.0);
+    }
+
+    fn factory_spec_response() -> Value {
+        json!({
+            "depreciation_profile": "generic:all",
+            "fuel_burn_gph": 13.0,
+            "oil_quarts_per_hour": 0.1,
+            "oil_price_per_quart_usd": 12.0,
+            "engine_manufacturer": "Continental",
+            "engine_model": "O-470-R",
+            "engine_count": 1,
+            "engine_tbo_hours": 1500.0,
+            "engine_overhaul_cost_usd": 40000.0,
+            "engine_value_baseline_life_fraction": 0.5,
+            "propeller_manufacturer": "McCauley",
+            "propeller_model": "D2A34C58",
+            "propeller_count": 1,
+            "propeller_tbo_hours": 2000.0,
+            "propeller_overhaul_cost_usd": 10000.0,
+            "propeller_value_baseline_life_fraction": 0.5,
+            "powerplant_source_url": "https://www.faa.gov/aircraft/reference.pdf",
+            "powerplant_source_title": "Type certificate data",
+            "powerplant_source_confidence": "high",
+            "configuration_scope": "factory",
+            "evidence_kind": "authoritative_reference",
+            "source_confidence": "high",
+            "is_valuation_eligible": true,
+            "annual_inspection_usd": 2500.0,
+            "other_maintenance_per_hour": 35.0,
+            "confidence": "high"
+        })
+    }
+
+    fn variant() -> AircraftVariantOption {
+        AircraftVariantOption {
+            manufacturer_id: 1,
+            manufacturer: "Airframe Maker".to_string(),
+            model_id: 2,
+            model: "Family".to_string(),
+            variant_id: 3,
+            variant: "Variant".to_string(),
+            listing_count: 1,
+        }
+    }
+
+    #[test]
+    fn authoritative_factory_spec_is_eligible() {
+        let item = spec_enrichment_item_from_response(
+            &variant(),
+            &factory_spec_response(),
+            1,
+            &["https://market.example/listing/1"],
+        )
+        .unwrap();
+
+        assert_eq!(item.configuration_scope, "factory_default");
+        assert!(item.is_valuation_eligible);
+        assert!(item.valuation_eligibility_notes.is_empty());
+    }
+
+    #[test]
+    fn sale_listing_cannot_seed_factory_spec() {
+        let mut response = factory_spec_response();
+        response["powerplant_source_url"] =
+            json!("https://market.example/listing/1?tracking=ignored");
+        let item = spec_enrichment_item_from_response(
+            &variant(),
+            &response,
+            1,
+            &["https://market.example/listing/1"],
+        )
+        .unwrap();
+
+        assert!(!item.is_valuation_eligible);
+        assert!(item
+            .valuation_eligibility_notes
+            .iter()
+            .any(|note| note.contains("sale listings")));
+    }
+
+    #[test]
+    fn unrelated_sale_listing_url_cannot_pose_as_authoritative_spec_evidence() {
+        let mut response = factory_spec_response();
+        response["powerplant_source_url"] =
+            json!("https://another-market.example/aircraft-for-sale/reference-looking-title");
+        let item = spec_enrichment_item_from_response(
+            &variant(),
+            &response,
+            1,
+            &["https://market.example/listing/1"],
+        )
+        .unwrap();
+
+        assert!(!item.is_valuation_eligible);
+        assert!(item
+            .valuation_eligibility_notes
+            .iter()
+            .any(|note| note.contains("sale listings")));
+    }
 }

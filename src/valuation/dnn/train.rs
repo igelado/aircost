@@ -10,7 +10,8 @@ use burn::tensor::Device;
 use serde::{Deserialize, Serialize};
 
 use crate::valuation::validation::{
-    calibrate_error_bands, grouped_folds, FoldPrediction, ValidationMetrics,
+    calibrate_error_bands, grouped_folds, metrics, split_calibration_evaluation, FoldPrediction,
+    ValidationMetrics,
 };
 use crate::valuation::{
     fit_structural, GroupCounts, StructuralArtifactV1, StructuralFitConfig, SupportGrade,
@@ -129,6 +130,7 @@ pub fn evaluate_activation_gates(
         .map(|prediction| {
             (
                 (
+                    prediction.fold_id.as_str(),
                     prediction.duplicate_group_key.as_str(),
                     prediction.listing_id,
                 ),
@@ -141,6 +143,7 @@ pub fn evaluate_activation_gates(
         .filter_map(|prediction| {
             structural_by_listing
                 .get(&(
+                    prediction.fold_id.as_str(),
                     prediction.duplicate_group_key.as_str(),
                     prediction.listing_id,
                 ))
@@ -300,7 +303,9 @@ fn evaluate_dnn_with_schedule(
             });
         }
     }
-    let metrics = ValidationMetrics::from_predictions(&predictions)?;
+    let (calibration, evaluation) = split_calibration_evaluation(&predictions);
+    let error_bands = calibrate_error_bands(&calibration);
+    let metrics = metrics(&evaluation, error_bands.global.q80_abs_log_error);
     Ok(DnnEvaluation {
         fold_predictions: predictions,
         metrics,
@@ -371,7 +376,10 @@ fn fit_final_ensemble(
             outer_selected_epochs: outer_selected_epochs.to_vec(),
         },
         group_counts: group_counts(rows),
-        error_bands: calibrate_error_bands(fold_predictions),
+        error_bands: {
+            let (calibration, _) = split_calibration_evaluation(fold_predictions);
+            calibrate_error_bands(&calibration)
+        },
         utilization_rates: utilization_rates(rows),
         smoke_input,
         smoke_log_prediction,
@@ -717,17 +725,38 @@ fn bootstrap_groups(rows: &[TrainingListing], seed: u64) -> Vec<TrainingListing>
 }
 
 fn support_for_rows(training: &[TrainingListing], held_out: &TrainingListing) -> SupportGrade {
-    let exact_model = unique_matching_groups(training, |row| row.model_id == held_out.model_id);
+    let exact_variant =
+        unique_matching_groups(training, |row| row.variant_id == held_out.variant_id);
+    let near_variant = unique_matching_groups(training, |row| {
+        row.variant_id == held_out.variant_id && feature_distance_is_near(row, held_out)
+    });
+    let near_model = unique_matching_groups(training, |row| {
+        row.model_id == held_out.model_id && feature_distance_is_near(row, held_out)
+    });
     let same_manufacturer = unique_matching_groups(training, |row| {
         row.manufacturer_id == held_out.manufacturer_id
     });
-    if exact_model >= 5 {
+    if near_variant >= 5 {
         SupportGrade::High
-    } else if exact_model >= 2 || same_manufacturer >= 5 {
+    } else if near_variant >= 2
+        || exact_variant >= 5
+        || near_model >= 5
+        || (exact_variant >= 2 && same_manufacturer >= 5)
+    {
         SupportGrade::Medium
     } else {
         SupportGrade::Low
     }
+}
+
+fn feature_distance_is_near(left: &TrainingListing, right: &TrainingListing) -> bool {
+    let age_near = (left.age() - right.age()).abs() <= 12.0;
+    let hours_near = match (left.airframe_hours, right.airframe_hours) {
+        (Some(left), Some(right)) => (left.ln_1p() - right.ln_1p()).abs() <= 2.5_f64.ln(),
+        (None, None) => true,
+        _ => false,
+    };
+    age_near && hours_near
 }
 
 fn unique_matching_groups(
@@ -836,6 +865,23 @@ fn median(mut values: Vec<f64>) -> f64 {
 mod tests {
     use super::*;
 
+    fn fold_prediction(fold: &str, error: f64) -> FoldPrediction {
+        FoldPrediction {
+            fold_id: fold.to_string(),
+            duplicate_group_key: "aircraft-1".to_string(),
+            listing_id: 1,
+            manufacturer_id: 1,
+            model_id: 1,
+            variant_id: 1,
+            actual_price_usd: 100.0,
+            predicted_price_usd: 100.0 * (1.0 + error),
+            log_error: (1.0 + error).ln(),
+            absolute_percentage_error: error,
+            signed_percentage_error: error,
+            support: SupportGrade::Low,
+        }
+    }
+
     fn synthetic_rows(count: usize) -> Vec<TrainingListing> {
         (0..count)
             .map(|index| {
@@ -855,6 +901,7 @@ mod tests {
                     engine_times: vec![],
                     propeller_times: vec![],
                     equipment_tokens: vec![],
+                    valuation_facts: vec![],
                     technical_field_count: 5,
                 }
             })
@@ -883,6 +930,28 @@ mod tests {
         let second = bootstrap_groups(&rows, 17);
         assert_eq!(first, second);
         assert_eq!(first.len(), rows.len());
+    }
+
+    #[test]
+    fn paired_activation_comparison_keeps_repeated_folds_distinct() {
+        let structural = vec![
+            fold_prediction("fold-a", 0.10),
+            fold_prediction("fold-b", 0.90),
+        ];
+        let dnn = vec![
+            fold_prediction("fold-a", 0.20),
+            fold_prediction("fold-b", 0.80),
+        ];
+        let report = evaluate_activation_gates(
+            &dnn,
+            &structural,
+            &ValidationMetrics::default(),
+            &ValidationMetrics::default(),
+            true,
+            &[true],
+        );
+        assert_eq!(report.paired_win_fraction, 0.5);
+        assert!(!report.paired_win_gate);
     }
 
     #[test]

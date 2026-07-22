@@ -9,7 +9,7 @@ use crate::valuation::{
 
 use super::DnnCapacity;
 
-pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+pub const FEATURE_SCHEMA_VERSION: u32 = crate::valuation::FEATURE_SCHEMA_VERSION;
 pub const DEFAULT_EQUIPMENT_BUCKETS: usize = 128;
 pub const DEFAULT_MAX_EQUIPMENT_ITEMS: usize = 16;
 pub const RESIDUAL_NUMERIC_FEATURES: usize = 7;
@@ -425,6 +425,7 @@ mod tests {
             engine_times: vec![],
             propeller_times: vec![],
             equipment_tokens: vec!["Garmin G1000".to_string()],
+            valuation_facts: vec![],
             technical_field_count: 7,
         }
     }

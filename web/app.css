@@ -139,6 +139,47 @@ button {
   color: var(--muted);
 }
 
+.topbar-status {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.valuation-status {
+  min-height: 32px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.valuation-status.is-loading,
+.valuation-status.is-comparable {
+  border-color: #e3ba70;
+  background: #fff4d8;
+  color: var(--warning);
+}
+
+.valuation-status.is-calibrated {
+  border-color: #8fc9c2;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.valuation-status.is-unavailable {
+  border-color: #efaaa2;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.valuation-status.has-warning {
+  box-shadow: 0 0 0 2px rgba(154, 91, 0, 0.14);
+}
+
 .user-chip {
   min-height: 32px;
   max-width: 240px;
@@ -487,6 +528,45 @@ tbody tr:hover {
 .status-pill.sold {
   background: #e8eaed;
   color: #444c52;
+}
+
+.listing-status-cell {
+  overflow: visible;
+  white-space: normal;
+}
+
+.status-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ingestion-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #e8eaed;
+  color: #444c52;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.ingestion-pill.ready {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.ingestion-pill.incomplete {
+  background: #fff3d6;
+  color: var(--warning);
+}
+
+.ingestion-pill.quarantined {
+  background: #fde8e7;
+  color: var(--danger);
 }
 
 .listing-dialog {
@@ -923,6 +1003,11 @@ label span,
 
   .topbar {
     display: grid;
+  }
+
+  .topbar-status {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .metrics-row {

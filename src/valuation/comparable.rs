@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::structural::{age_factor, median, support_for_counts};
+use super::structural::{age_factor, median, support_for_counts_with_hours};
 use super::types::{
     DepreciationPoint, GroupCounts, TrainingListing, ValuationBreakdown, ValuationError,
     ValuationEstimate, ValuationQuery,
@@ -66,6 +66,12 @@ impl ComparableModel {
         {
             return Err(ValuationError::InvalidArtifact(
                 "invalid comparable configuration".to_string(),
+            ));
+        }
+        let market_year = rows[0].snapshot_year;
+        if rows.iter().any(|row| row.snapshot_year != market_year) {
+            return Err(ValuationError::InvalidArtifact(
+                "comparable rows must share one snapshot market year".to_string(),
             ));
         }
         let counts = count_groups(&rows);
@@ -160,9 +166,14 @@ impl ValuationModel for ComparableModel {
         self.snapshot_id
     }
 
+    fn market_year(&self) -> Result<i64, ValuationError> {
+        Ok(self.rows[0].snapshot_year)
+    }
+
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
         let value_now = self.predicted_value(query)?;
-        let support = support_for_counts(&self.counts, query);
+        let expected_log_hours = (self.expected_hours_per_year * query.age().max(1.0)).ln_1p();
+        let support = support_for_counts_with_hours(&self.counts, query, Some(expected_log_hours));
         let base_q80 = self.config.q80_abs_log_error;
         let mut depreciation = Vec::with_capacity(31);
         for horizon in 0..=30_i64 {
@@ -227,10 +238,18 @@ impl ValuationModel for ComparableModel {
 
 fn count_groups(rows: &[TrainingListing]) -> GroupCounts {
     let mut counts = GroupCounts {
-        total: rows.len(),
+        total: 0,
         ..GroupCounts::default()
     };
+    let mut seen = BTreeSet::new();
     for row in rows {
+        if !seen.insert(row.duplicate_group_key.as_str()) {
+            continue;
+        }
+        counts.total += 1;
+        if let Some(category) = &row.category_key {
+            *counts.categories.entry(category.clone()).or_default() += 1;
+        }
         *counts.manufacturers.entry(row.manufacturer_id).or_default() += 1;
         *counts.models.entry(row.model_id).or_default() += 1;
         *counts.variants.entry(row.variant_id).or_default() += 1;
@@ -281,6 +300,7 @@ mod tests {
             engine_times: vec![],
             propeller_times: vec![],
             equipment_tokens: vec![],
+            valuation_facts: vec![],
             technical_field_count: 4,
         }
     }
@@ -308,5 +328,21 @@ mod tests {
         .unwrap();
         let estimate = model.estimate(&row(3, 0.0).as_query()).unwrap();
         assert!(estimate.estimated_value_usd <= 110_000.0);
+    }
+
+    #[test]
+    fn comparable_requires_one_snapshot_market_year() {
+        let mut other_year = row(2, 110_000.0);
+        other_year.snapshot_year = 2025;
+        let error = ComparableModel::new(
+            0,
+            4,
+            vec![row(1, 100_000.0), other_year],
+            ComparableConfig::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must share one snapshot market year"));
     }
 }

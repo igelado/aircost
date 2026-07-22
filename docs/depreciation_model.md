@@ -1,8 +1,7 @@
 # Aircraft Value Model
 
 This document describes the database-backed valuation model used by the Rust web
-application. The older Python scripts still exist as research utilities, but new
-web-app estimates are computed from the Rust code in `src/aircraft.rs`,
+application. Estimates are computed from the Rust code in `src/aircraft.rs`,
 `src/depreciation.rs`, and `src/fit.rs`.
 
 The model estimates asking-market value. It is not a certified appraisal and it
@@ -26,13 +25,36 @@ does not use new-price records, inflation, TBO, overhaul cost, or assigned
 avionics values.
 
 Grouped out-of-fold residuals calibrate a multiplicative error range and a
-high/medium/low support grade. Projections cover horizons zero through thirty,
-hold today's market scale constant, and advance hours at a utilization rate
-learned from the snapshot. If no structural artifact is active, the newest
-valid snapshot serves an adjusted-comparable weighted-median fallback.
+high/medium/low support grade. Aircraft groups are deterministically divided
+between error-band calibration and metric evaluation, so interval coverage is
+not reported on the residuals that set the interval. Repeated-fold residuals
+from one physical aircraft count once when an error band is selected.
+
+Structural and adjusted-comparable predictions are always evaluated together.
+Activation requires structural median error, 80th-percentile error, and
+absolute bias to remain within two percentage points of the comparable shadow,
+in addition to the absolute safety gates. Once the snapshot contains multiple
+models, empty leave-one-model-out validation blocks activation. A one-model
+snapshot may still serve within that model, but its validation report carries a
+scope warning and does not claim leave-one-model-out evidence.
+Validation reports carry an evidence-policy version and independent calibration,
+evaluation, and comparable-shadow counts. Artifacts created before this policy,
+or artifacts/snapshots using an older feature schema, must be refit before they
+can be activated or served.
+
+Support requires exact-variant observations and proximity to the observed
+age/hours trend for a high grade. Broad model counts alone can provide at most
+medium support. Projections cover horizons zero through thirty, hold today's
+market scale constant, and advance hours at a utilization rate learned from
+the snapshot. If no structural artifact is active, an eligible newest snapshot
+with at least five valid, deduplicated aircraft groups can serve an explicitly
+uncalibrated adjusted-comparable fallback.
 
 The older estimator documented below remains available for compatibility and
-operating-cost metadata, but it is not an input to a listing-only estimate.
+operating-cost metadata, but it is not an input to a listing-only estimate. If
+neither an approved artifact nor an eligible comparable snapshot exists, the
+primary market estimate fails closed; the compatibility result is never placed
+in `estimated_value_usd`.
 
 ## Identity Levels
 
@@ -78,6 +100,14 @@ Each selected model/variant also needs:
 If spec metadata or the model-year price point is missing, the API returns an
 `estimate_error` instead of inventing a value.
 
+Compatibility metadata is usable only when its provenance is explicit. A
+variant spec must be a valuation-eligible `factory_default` backed by
+authoritative, high-confidence evidence. A configuration observed on one sale
+listing is listing-specific and cannot seed the shared variant spec. Engine and
+propeller identities extracted from a listing remain listing facts; their TBO
+or overhaul-cost metadata is used only after that reusable component row has
+separate authoritative evidence.
+
 ## Airframe Basis
 
 `aircraft_model_variant_price_points` stores nominal new-purchase price points
@@ -90,6 +120,12 @@ new price point. This avoids counting factory avionics both inside the airframe
 basis and again as avionics components. The airframe basis is floored at 20% of
 the model-year price point to prevent bad component data from erasing the
 airframe.
+
+Serving accepts only high-confidence, exact-model-year direct price evidence.
+Interpolated, inferred, other-year, low-confidence, homepage-only, and
+unexplained discontinuous points remain stored for review but are marked
+ineligible. Automated enrichment cannot replace an existing point with weaker
+evidence.
 
 For current and future valuation caps, the model also computes a replacement
 floor basis from the highest model-family price point available at or before the
@@ -184,17 +220,24 @@ store:
 
 - concrete avionics manufacturer
 - concrete model or named suite
-- avionics type
+- one or more capabilities through `avionics_model_types`
 - introduced year
 - estimated unit value
 - value reference year
 - value source
 
+Installed resale contribution and replacement cost are separate values. The
+former is added to the asking-market estimate; the latter is used only for the
+airframe subtraction and valuation cap. An unreviewed legacy value is neither.
+An integrated suite can declare exact component membership. When both the suite
+and one of those components are present, the bundled quantity is consumed once
+rather than added twice.
+
 The value formula is:
 
 ```text
-nominal_replacement_cost =
-  unit_replacement_cost_usd
+nominal_installed_contribution =
+  installed_value_contribution_usd
   * (1 + average_inflation_rate) ^ (valuation_year - value_reference_year)
 
 residual_fraction =
@@ -203,12 +246,13 @@ residual_fraction =
     * exp(-age_decay_rate * avionics_age_years)
 
 avionics_component_value =
-  quantity * nominal_replacement_cost * residual_fraction
+  quantity * nominal_installed_contribution * residual_fraction
 ```
 
-If the listing has concrete installed avionics, those units drive the estimate.
-If listing avionics are absent or rejected as generic, the estimator falls back
-to `aircraft_model_variant_default_avionics` for that variant/model year.
+The effective panel starts from high-confidence factory defaults. A listing's
+high-confidence `installed`, `replaces`, and `removes` actions then apply as
+explicit deltas. A partial listing equipment list no longer discards every
+factory default, and weak evidence cannot remove or replace default equipment.
 
 ## Final Estimate
 

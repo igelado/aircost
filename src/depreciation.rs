@@ -45,7 +45,13 @@ pub struct AvionicsComponent {
     pub valuation_year: i64,
     pub value_reference_year: i64,
     pub average_inflation_rate: f64,
-    pub unit_replacement_cost_usd: f64,
+    /// Asking-market contribution of one installed, working unit in
+    /// `value_reference_year` dollars.
+    pub installed_value_contribution_usd: f64,
+    /// Cost to replace and integrate one unit in `value_reference_year`
+    /// dollars. This is a valuation cap/basis, not the amount added to the
+    /// aircraft's asking-market value.
+    pub replacement_cost_usd: f64,
     pub quantity: i64,
     pub profile: AvionicsProfile,
 }
@@ -425,8 +431,8 @@ pub fn timed_component_adjustment(component: Option<&TimedComponent>) -> Result<
 
 pub fn avionics_component_value(component: &AvionicsComponent) -> Result<f64, String> {
     require_non_negative(
-        &format!("{}.unit_replacement_cost_usd", component.name),
-        component.unit_replacement_cost_usd,
+        &format!("{}.installed_value_contribution_usd", component.name),
+        component.installed_value_contribution_usd,
     )?;
     if component.quantity < 1 {
         return Err(format!("{}.quantity must be at least 1", component.name));
@@ -446,11 +452,12 @@ pub fn avionics_component_value(component: &AvionicsComponent) -> Result<f64, St
         component.valuation_year,
         component.average_inflation_rate,
     )?;
-    let nominal_replacement_cost = component.unit_replacement_cost_usd * dollar_basis_factor;
+    let nominal_installed_contribution =
+        component.installed_value_contribution_usd * dollar_basis_factor;
     let residual_fraction = component.profile.long_run_residual_fraction
         + (1.0 - component.profile.long_run_residual_fraction)
             * (-component.profile.age_decay_rate * age_years).exp();
-    Ok(nominal_replacement_cost * residual_fraction * component.quantity as f64)
+    Ok(nominal_installed_contribution * residual_fraction * component.quantity as f64)
 }
 
 pub fn avionics_total_value(components: &[AvionicsComponent]) -> Result<f64, String> {
@@ -465,8 +472,8 @@ pub fn avionics_replacement_basis(components: &[AvionicsComponent]) -> Result<f6
         .iter()
         .map(|component| {
             require_non_negative(
-                &format!("{}.unit_replacement_cost_usd", component.name),
-                component.unit_replacement_cost_usd,
+                &format!("{}.replacement_cost_usd", component.name),
+                component.replacement_cost_usd,
             )?;
             if component.quantity < 1 {
                 return Err(format!("{}.quantity must be at least 1", component.name));
@@ -476,9 +483,7 @@ pub fn avionics_replacement_basis(components: &[AvionicsComponent]) -> Result<f6
                 component.valuation_year,
                 component.average_inflation_rate,
             )?;
-            Ok(component.unit_replacement_cost_usd
-                * dollar_basis_factor
-                * component.quantity as f64)
+            Ok(component.replacement_cost_usd * dollar_basis_factor * component.quantity as f64)
         })
         .try_fold(0.0, |sum, value| value.map(|value| sum + value))
 }
@@ -603,7 +608,8 @@ mod tests {
                 valuation_year: 2026,
                 value_reference_year: 2026,
                 average_inflation_rate: 0.0,
-                unit_replacement_cost_usd: 20_000.0,
+                installed_value_contribution_usd: 12_000.0,
+                replacement_cost_usd: 20_000.0,
                 quantity: 1,
                 profile: default_avionics_profile(),
             }],
@@ -626,7 +632,8 @@ mod tests {
             valuation_year: 2026,
             value_reference_year: 2026,
             average_inflation_rate: 0.0,
-            unit_replacement_cost_usd: 20_000.0,
+            installed_value_contribution_usd: 20_000.0,
+            replacement_cost_usd: 30_000.0,
             quantity: 1,
             profile: default_avionics_profile(),
         }];
@@ -645,7 +652,8 @@ mod tests {
             valuation_year: 2026,
             value_reference_year: 2026,
             average_inflation_rate: 0.0,
-            unit_replacement_cost_usd: 15_000.0,
+            installed_value_contribution_usd: 15_000.0,
+            replacement_cost_usd: 25_000.0,
             quantity: 1,
             profile: default_avionics_profile(),
         };
@@ -667,6 +675,27 @@ mod tests {
 
         assert!((0.60..0.62).contains(&past));
         assert!((2.09..2.11).contains(&future));
+    }
+
+    #[test]
+    fn installed_contribution_and_replacement_basis_are_distinct() {
+        let component = AvionicsComponent {
+            name: "Installed GPS".to_string(),
+            introduced_year: 2020,
+            valuation_year: 2026,
+            value_reference_year: 2026,
+            average_inflation_rate: 0.0,
+            installed_value_contribution_usd: 12_000.0,
+            replacement_cost_usd: 24_000.0,
+            quantity: 1,
+            profile: default_avionics_profile(),
+        };
+
+        assert_eq!(avionics_component_value(&component).unwrap(), 12_000.0);
+        assert_eq!(
+            super::avionics_replacement_basis(&[component]).unwrap(),
+            24_000.0
+        );
     }
 
     #[test]

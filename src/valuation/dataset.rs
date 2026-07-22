@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
+use crate::aircraft::faa::{
+    audit_listing_admission, ListingAdmissionEvidence, ListingAdmissionReport,
+};
 use crate::db::{AppDb, DatabaseBackend};
+use crate::models::is_plausible_asking_price_usd;
 
-use super::types::{ComponentObservation, ComponentTimeBasis, TrainingListing, ValuationError};
+use super::types::{
+    source_backed_component_observation, SourceBackedValuationFact, TrainingListing, ValuationError,
+};
 use super::FEATURE_SCHEMA_VERSION;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -27,6 +33,21 @@ impl Default for SnapshotPolicy {
             minimum_model_year: 1900,
         }
     }
+}
+
+const FAA_ADMISSION_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+struct SnapshotFaaAdmissionManifest {
+    schema_version: u32,
+    included_listings: BTreeMap<i64, ListingAdmissionEvidence>,
+}
+
+#[derive(Serialize)]
+struct PersistedSnapshotPolicy<'a> {
+    #[serde(flatten)]
+    policy: &'a SnapshotPolicy,
+    faa_admission: SnapshotFaaAdmissionManifest,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -72,19 +93,37 @@ struct ListingRow {
     currency: String,
     added_at: String,
     status: String,
+    ingestion_state: String,
     registration_number: Option<String>,
     serial_number: Option<String>,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    engine_time_basis: String,
+    engine_time_evidence: Option<String>,
+    engine_time_confidence: Option<String>,
+    propeller_hours: Option<f64>,
+    propeller_time_basis: String,
+    propeller_time_evidence: Option<String>,
+    propeller_time_confidence: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
 struct EquipmentRow {
     listing_id: i64,
+    namespace: String,
     manufacturer: String,
     model: String,
     quantity: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct FactRow {
+    listing_id: i64,
+    fact_kind: String,
+    fact_value: String,
+    evidence_text: String,
+    source_url: Option<String>,
+    source_confidence: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -95,6 +134,7 @@ struct SnapshotDbRow {
 
 #[derive(Debug, FromRow)]
 struct FrozenDbRow {
+    source_listing_id: i64,
     feature_json: String,
 }
 
@@ -115,16 +155,38 @@ pub async fn create_snapshot(
         ));
     }
     let listings = load_listing_rows(db).await?;
+    let listing_ids = listings
+        .iter()
+        .map(|listing| listing.id)
+        .collect::<BTreeSet<_>>();
+    let faa_admission = audit_listing_admission(db, Some(&listing_ids))
+        .await
+        .map_err(|error| ValuationError::Database(error.to_string()))?;
     let equipment = load_equipment(db).await?;
+    let facts = load_facts(db).await?;
     let mut prepared = Vec::with_capacity(listings.len());
     for listing in listings {
-        let tokens = equipment.get(&listing.id).cloned().unwrap_or_default();
+        let mut tokens = equipment.get(&listing.id).cloned().unwrap_or_default();
+        let valuation_facts = facts.get(&listing.id).cloned().unwrap_or_default();
+        tokens.extend(
+            valuation_facts
+                .iter()
+                .filter(|fact| fact.confidence == "high")
+                .map(fact_token),
+        );
+        tokens.sort();
         let duplicate_group_key = duplicate_key(&listing);
-        let reason = exclusion_reason(&listing, policy, capture_day, snapshot_year);
-        let technical_field_count = 3
-            + u32::from(listing.registration_number.is_some())
-            + u32::from(listing.serial_number.is_some())
-            + u32::from(!tokens.is_empty());
+        let reason = faa_admission
+            .exclusion_reason(listing.id)
+            .map(|reason| format!("faa_{reason}"))
+            .or_else(|| exclusion_reason(&listing, policy, capture_day, snapshot_year));
+        let technical_field_count = technical_field_count(
+            listing.engine_hours.is_some(),
+            listing.propeller_hours.is_some(),
+            listing.registration_number.is_some(),
+            listing.serial_number.is_some(),
+            !tokens.is_empty(),
+        );
         let training = TrainingListing {
             listing_id: listing.id,
             duplicate_group_key: duplicate_group_key.clone(),
@@ -136,28 +198,39 @@ pub async fn create_snapshot(
             snapshot_year,
             asking_price_usd: listing.asking_price_usd,
             airframe_hours: finite_nonnegative(listing.airframe_hours),
-            engine_times: vec![ComponentObservation {
-                time_hours: finite_nonnegative(listing.engine_hours),
-                basis: ComponentTimeBasis::Unknown,
-                count: 1,
-            }],
-            propeller_times: vec![ComponentObservation {
-                time_hours: finite_nonnegative(listing.propeller_hours),
-                basis: ComponentTimeBasis::Unknown,
-                count: 1,
-            }],
+            engine_times: vec![source_backed_component_observation(
+                listing.engine_hours,
+                &listing.engine_time_basis,
+                listing.engine_time_evidence.as_deref(),
+                listing.engine_time_confidence.as_deref(),
+                1,
+            )],
+            propeller_times: vec![source_backed_component_observation(
+                listing.propeller_hours,
+                &listing.propeller_time_basis,
+                listing.propeller_time_evidence.as_deref(),
+                listing.propeller_time_confidence.as_deref(),
+                1,
+            )],
             equipment_tokens: tokens,
+            valuation_facts,
             technical_field_count,
         };
         let feature_json = serde_json::to_string(&training)?;
-        let target = finite_positive(listing.asking_price_usd);
+        let target = is_plausible_asking_price_usd(listing.asking_price_usd)
+            .then_some(listing.asking_price_usd);
         let row_sha256 = sha256_hex(
             format!(
-                "{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}",
                 listing.id,
                 duplicate_group_key,
                 feature_json,
-                target.map(|value| value.to_string()).unwrap_or_default()
+                target.map(|value| value.to_string()).unwrap_or_default(),
+                faa_admission
+                    .admission_evidence(listing.id)
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_default()
             )
             .as_bytes(),
         );
@@ -175,12 +248,38 @@ pub async fn create_snapshot(
     }
     deduplicate(&mut prepared);
     prepared.sort_by_key(|row| row.listing_id);
-    let policy_json = serde_json::to_string(policy)?;
+    let frozen_included_listings = prepared
+        .iter()
+        .filter(|row| row.included)
+        .map(|row| {
+            faa_admission
+                .admission_evidence(row.listing_id)
+                .cloned()
+                .map(|evidence| (row.listing_id, evidence))
+                .ok_or_else(|| {
+                    ValuationError::ValidationGate(format!(
+                        "listing {} was selected without frozen FAA admission evidence",
+                        row.listing_id
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let policy_json = serde_json::to_string(&PersistedSnapshotPolicy {
+        policy,
+        faa_admission: SnapshotFaaAdmissionManifest {
+            schema_version: FAA_ADMISSION_MANIFEST_VERSION,
+            included_listings: frozen_included_listings.clone(),
+        },
+    })?;
     let mut snapshot_material = format!("{policy_json}\n{FEATURE_SCHEMA_VERSION}\n");
     for row in &prepared {
         snapshot_material.push_str(&format!(
-            "{}|{}|{}|{}\n",
-            row.listing_id, row.duplicate_group_key, row.included, row.row_sha256
+            "{}|{}|{}|{}|{}\n",
+            row.listing_id,
+            row.duplicate_group_key,
+            row.included,
+            row.exclusion_reason.as_deref().unwrap_or_default(),
+            row.row_sha256
         ));
     }
     let input_sha256 = sha256_hex(snapshot_material.as_bytes());
@@ -194,6 +293,21 @@ pub async fn create_snapshot(
         excluded_count,
     );
     if apply {
+        let included_ids = frozen_included_listings
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let final_admission = audit_listing_admission(db, Some(&included_ids))
+            .await
+            .map_err(|error| ValuationError::Database(error.to_string()))?;
+        if final_admission.excluded_count != 0
+            || !admission_evidence_matches(&final_admission, &frozen_included_listings)
+        {
+            return Err(ValuationError::ValidationGate(
+                "FAA admission identity or release changed while building the valuation snapshot; retry the operation"
+                    .to_string(),
+            ));
+        }
         let snapshot_id = persist_snapshot(
             db,
             policy,
@@ -214,9 +328,29 @@ pub async fn load_snapshot(
     db: &AppDb,
     snapshot_id: i64,
 ) -> Result<Vec<TrainingListing>, ValuationError> {
+    let version_sql = db.sql("SELECT feature_schema_version FROM valuation_snapshots WHERE id = ?");
+    let feature_schema_version = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => sqlx::query_scalar::<_, i64>(&version_sql)
+            .bind(snapshot_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|version| version as u32),
+        DatabaseBackend::Postgres(pool) => sqlx::query_scalar::<_, i32>(&version_sql)
+            .bind(snapshot_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|version| version as u32),
+    }
+    .ok_or_else(|| ValuationError::Database(format!("snapshot {snapshot_id} not found")))?;
+    if feature_schema_version != FEATURE_SCHEMA_VERSION {
+        return Err(ValuationError::InvalidArtifact(format!(
+            "snapshot {snapshot_id} feature schema {feature_schema_version} does not match current schema {FEATURE_SCHEMA_VERSION}"
+        )));
+    }
+    require_snapshot_faa_admission(db, snapshot_id).await?;
     let sql = db.sql(
         r#"
-        SELECT feature_json
+        SELECT source_listing_id, feature_json
         FROM valuation_snapshot_rows
         WHERE snapshot_id = ? AND inclusion_flag = TRUE
         ORDER BY source_listing_id
@@ -237,8 +371,132 @@ pub async fn load_snapshot(
         }
     };
     rows.into_iter()
-        .map(|row| serde_json::from_str(&row.feature_json).map_err(ValuationError::from))
+        .map(|row| {
+            let training: TrainingListing = serde_json::from_str(&row.feature_json)?;
+            if training.listing_id != row.source_listing_id {
+                return Err(ValuationError::InvalidArtifact(format!(
+                    "snapshot {snapshot_id} row source listing {} disagrees with feature listing {}",
+                    row.source_listing_id, training.listing_id
+                )));
+            }
+            Ok(training)
+        })
         .collect()
+}
+
+/// Re-evaluate the frozen included listing IDs against the current regulator
+/// release. This keeps exclusion accounting observable without modifying the
+/// immutable valuation snapshot.
+pub async fn snapshot_faa_admission_report(
+    db: &AppDb,
+    snapshot_id: i64,
+) -> Result<ListingAdmissionReport, ValuationError> {
+    let sql = db.sql(
+        r#"
+        SELECT source_listing_id
+        FROM valuation_snapshot_rows
+        WHERE snapshot_id = ? AND inclusion_flag = TRUE
+        ORDER BY source_listing_id
+        "#,
+    );
+    let listing_ids = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .bind(snapshot_id)
+                .fetch_all(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .bind(snapshot_id)
+                .fetch_all(pool)
+                .await?
+        }
+    }
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    audit_listing_admission(db, Some(&listing_ids))
+        .await
+        .map_err(|error| ValuationError::Database(error.to_string()))
+}
+
+/// Reject a legacy or externally modified snapshot when even one frozen
+/// included row is not currently FAA-admitted. Filtering a frozen snapshot at
+/// load time would change its training material without changing its hash, so
+/// callers must build a fresh snapshot instead.
+pub async fn require_snapshot_faa_admission(
+    db: &AppDb,
+    snapshot_id: i64,
+) -> Result<ListingAdmissionReport, ValuationError> {
+    let report = snapshot_faa_admission_report(db, snapshot_id).await?;
+    if report.excluded_count == 0 {
+        let manifest = load_snapshot_faa_manifest(db, snapshot_id).await?;
+        if manifest.schema_version != FAA_ADMISSION_MANIFEST_VERSION {
+            return Err(ValuationError::ValidationGate(format!(
+                "valuation snapshot {snapshot_id} FAA admission manifest schema {} does not match current schema {FAA_ADMISSION_MANIFEST_VERSION}",
+                manifest.schema_version
+            )));
+        }
+        if !admission_evidence_matches(&report, &manifest.included_listings) {
+            return Err(ValuationError::ValidationGate(format!(
+                "valuation snapshot {snapshot_id} FAA admission identity or provenance changed; create a fresh valuation snapshot"
+            )));
+        }
+        return Ok(report);
+    }
+    let reasons = report
+        .exclusions
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ValuationError::ValidationGate(format!(
+        "valuation snapshot {snapshot_id} contains {} FAA-ineligible included listing(s) ({reasons}); create a fresh valuation snapshot",
+        report.excluded_count
+    )))
+}
+
+fn admission_evidence_matches(
+    report: &ListingAdmissionReport,
+    frozen: &BTreeMap<i64, ListingAdmissionEvidence>,
+) -> bool {
+    frozen.len() == report.admitted_count
+        && frozen
+            .iter()
+            .all(|(listing_id, evidence)| report.admission_evidence(*listing_id) == Some(evidence))
+}
+
+async fn load_snapshot_faa_manifest(
+    db: &AppDb,
+    snapshot_id: i64,
+) -> Result<SnapshotFaaAdmissionManifest, ValuationError> {
+    let sql = db.sql("SELECT selection_policy_json FROM valuation_snapshots WHERE id = ?");
+    let policy_json = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_scalar::<_, String>(&sql)
+                .bind(snapshot_id)
+                .fetch_optional(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_scalar::<_, String>(&sql)
+                .bind(snapshot_id)
+                .fetch_optional(pool)
+                .await?
+        }
+    }
+    .ok_or_else(|| ValuationError::Database(format!("snapshot {snapshot_id} not found")))?;
+    let policy: serde_json::Value = serde_json::from_str(&policy_json)?;
+    let manifest = policy.get("faa_admission").ok_or_else(|| {
+        ValuationError::ValidationGate(format!(
+            "valuation snapshot {snapshot_id} predates the mandatory FAA admission manifest; create a fresh valuation snapshot"
+        ))
+    })?;
+    serde_json::from_value(manifest.clone()).map_err(|error| {
+        ValuationError::InvalidArtifact(format!(
+            "valuation snapshot {snapshot_id} has an invalid FAA admission manifest: {error}"
+        ))
+    })
 }
 
 pub async fn newest_snapshot(
@@ -283,11 +541,18 @@ async fn load_listing_rows(db: &AppDb) -> Result<Vec<ListingRow>, ValuationError
           listing.currency,
           listing.added_at,
           listing.status,
+          listing.ingestion_state,
           listing.registration_number,
           listing.serial_number,
           listing.airframe_hours,
           listing.engine_hours,
-          listing.propeller_hours
+          listing.engine_time_basis,
+          listing.engine_time_evidence,
+          listing.engine_time_confidence,
+          listing.propeller_hours,
+          listing.propeller_time_basis,
+          listing.propeller_time_evidence,
+          listing.propeller_time_confidence
         FROM aircraft_sale_listings listing
         JOIN aircraft_model_variants variant
           ON variant.id = listing.aircraft_model_variant_id
@@ -307,10 +572,47 @@ async fn load_listing_rows(db: &AppDb) -> Result<Vec<ListingRow>, ValuationError
     })
 }
 
+async fn load_facts(
+    db: &AppDb,
+) -> Result<BTreeMap<i64, Vec<SourceBackedValuationFact>>, ValuationError> {
+    let sql = r#"
+        SELECT
+          aircraft_sale_listing_id AS listing_id,
+          fact_kind,
+          fact_value,
+          evidence_text,
+          source_url,
+          source_confidence
+        FROM aircraft_sale_listing_facts
+        ORDER BY aircraft_sale_listing_id, fact_kind, id
+    "#;
+    let rows = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => sqlx::query_as::<_, FactRow>(sql).fetch_all(pool).await?,
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, FactRow>(sql).fetch_all(pool).await?
+        }
+    };
+    let mut facts = BTreeMap::new();
+    for row in rows {
+        facts
+            .entry(row.listing_id)
+            .or_insert_with(Vec::new)
+            .push(SourceBackedValuationFact {
+                kind: row.fact_kind,
+                value: row.fact_value,
+                evidence_text: row.evidence_text,
+                source_url: row.source_url,
+                confidence: row.source_confidence,
+            });
+    }
+    Ok(facts)
+}
+
 async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, ValuationError> {
     let sql = r#"
         SELECT
           link.aircraft_sale_listing_id AS listing_id,
+          'avionics' AS namespace,
           manufacturer.name AS manufacturer,
           model.name AS model,
           link.quantity
@@ -319,7 +621,43 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
         JOIN avionics_manufacturers manufacturer
           ON manufacturer.id = model.avionics_manufacturer_id
         WHERE link.source = 'listing'
-        ORDER BY link.aircraft_sale_listing_id, manufacturer.name, model.name
+          AND link.configuration_action IN ('installed', 'replaces')
+          AND link.source_confidence = 'high'
+          AND model.catalog_status = 'approved'
+          AND (
+            link.replaces_avionics_model_id IS NULL
+            OR EXISTS (
+              SELECT 1
+              FROM avionics_models replaced_model
+              WHERE replaced_model.id = link.replaces_avionics_model_id
+                AND replaced_model.catalog_status = 'approved'
+            )
+          )
+        UNION ALL
+        SELECT
+          listing.id AS listing_id,
+          'engine' AS namespace,
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          1 AS quantity
+        FROM aircraft_sale_listings listing
+        JOIN engine_models model ON model.id = listing.installed_engine_model_id
+        JOIN engine_manufacturers manufacturer
+          ON manufacturer.id = model.engine_manufacturer_id
+        WHERE listing.installed_engine_confidence = 'high'
+        UNION ALL
+        SELECT
+          listing.id AS listing_id,
+          'propeller' AS namespace,
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          1 AS quantity
+        FROM aircraft_sale_listings listing
+        JOIN propeller_models model ON model.id = listing.installed_propeller_model_id
+        JOIN propeller_manufacturers manufacturer
+          ON manufacturer.id = model.propeller_manufacturer_id
+        WHERE listing.installed_propeller_confidence = 'high'
+        ORDER BY listing_id, namespace, manufacturer, model
     "#;
     let rows = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
@@ -335,11 +673,7 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
     };
     let mut equipment = BTreeMap::new();
     for row in rows {
-        let token = format!(
-            "{}:{}",
-            normalize_identifier(&row.manufacturer),
-            normalize_identifier(&row.model)
-        );
+        let token = equipment_feature_token(&row.namespace, &row.manufacturer, &row.model);
         for _ in 0..row.quantity.max(1) {
             equipment
                 .entry(row.listing_id)
@@ -350,30 +684,69 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
     Ok(equipment)
 }
 
+fn fact_token(fact: &SourceBackedValuationFact) -> String {
+    equipment_feature_token("fact", &fact.kind, &fact.value)
+}
+
+pub(crate) fn equipment_feature_token(
+    namespace: &str,
+    manufacturer_or_kind: &str,
+    model_or_value: &str,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        normalize_token_segment(namespace),
+        normalize_token_segment(manufacturer_or_kind),
+        normalize_token_segment(model_or_value)
+    )
+}
+
+pub(crate) fn technical_field_count(
+    has_engine_time: bool,
+    has_propeller_time: bool,
+    has_registration: bool,
+    has_serial: bool,
+    has_usable_feature_tokens: bool,
+) -> u32 {
+    1 + u32::from(has_engine_time)
+        + u32::from(has_propeller_time)
+        + u32::from(has_registration)
+        + u32::from(has_serial)
+        + u32::from(has_usable_feature_tokens)
+}
+
+fn normalize_token_segment(value: &str) -> String {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
 fn exclusion_reason(
     listing: &ListingRow,
     policy: &SnapshotPolicy,
     capture_day: i64,
     snapshot_year: i64,
 ) -> Option<String> {
+    if listing.ingestion_state != "ready" {
+        return Some(format!("ingestion_{}", listing.ingestion_state));
+    }
     if listing.status != "active" {
         return Some("inactive".to_string());
     }
-    if listing.currency != "USD"
-        || !listing.asking_price_usd.is_finite()
-        || listing.asking_price_usd <= 0.0
-    {
-        return Some("non_usd_or_nonpositive_price".to_string());
+    if listing.currency != "USD" || !is_plausible_asking_price_usd(listing.asking_price_usd) {
+        return Some("non_usd_or_implausible_price".to_string());
     }
     if listing.model_year < policy.minimum_model_year
         || listing.model_year > snapshot_year
-        || [
-            listing.airframe_hours,
-            listing.engine_hours,
-            listing.propeller_hours,
-        ]
-        .iter()
-        .any(|hours| !hours.is_finite() || *hours < 0.0)
+        || !listing.airframe_hours.is_finite()
+        || !(0.0..=100_000.0).contains(&listing.airframe_hours)
+        || [listing.engine_hours, listing.propeller_hours]
+            .iter()
+            .flatten()
+            .any(|hours| !hours.is_finite() || !(0.0..=100_000.0).contains(hours))
     {
         return Some("implausible_year_or_hours".to_string());
     }
@@ -597,8 +970,8 @@ fn duplicate_key(listing: &ListingRow) -> String {
         listing.variant_id,
         listing.model_year,
         listing.airframe_hours / 25.0,
-        listing.engine_hours / 25.0,
-        listing.propeller_hours / 25.0
+        listing.engine_hours.unwrap_or(-1.0) / 25.0,
+        listing.propeller_hours.unwrap_or(-1.0) / 25.0
     )
 }
 
@@ -612,10 +985,6 @@ fn normalize_identifier(value: &str) -> String {
 
 fn finite_nonnegative(value: f64) -> Option<f64> {
     (value.is_finite() && value >= 0.0).then_some(value)
-}
-
-fn finite_positive(value: f64) -> Option<f64> {
-    (value.is_finite() && value > 0.0).then_some(value)
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -676,7 +1045,30 @@ pub fn current_capture_time() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use crate::aircraft::faa::{parse_release, store_release, ReleaseMetadata, ReleaseReaders};
+
     use super::*;
+
+    const FAA_AIRCRAFT_REFERENCE: &str = "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED,TC-DATA-SHEET,TC-DATA-HOLDER\n2072738,CESSNA AIRCRAFT CO,182T,4,1,1,0,01,004,CLASS 1,0145,3A13,TEXTRON AVIATION INC\n";
+    const FAA_ENGINE_REFERENCE: &str =
+        "CODE,MFR,MODEL,TYPE,HORSEPOWER,THRUST\n41528,LYCOMING,IO-540-AB1A5,1,00230,000000\n";
+
+    async fn seed_faa_aircraft(db: &AppDb) {
+        let master = "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n123,S123,2072738,41528,2010\n124,S124,2072738,41528,2011\n";
+        let release = parse_release(
+            ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
+            ReleaseReaders::new(
+                Cursor::new(master),
+                Cursor::new(FAA_AIRCRAFT_REFERENCE),
+                Cursor::new(FAA_ENGINE_REFERENCE),
+            ),
+            ["N123", "N124"],
+        )
+        .unwrap();
+        store_release(db, &release).await.unwrap();
+    }
 
     async fn insert_listing(db: &AppDb) {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -705,10 +1097,12 @@ mod tests {
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, is_verified, source_url,
               model_year, asking_price_usd, currency, added_at, status,
+              ingestion_state, ingestion_completed_at,
               registration_number, serial_number, airframe_hours, engine_hours,
               propeller_hours
             ) VALUES (1, 1, FALSE, 'https://example.test/listing', 2010, 175000,
-              'USD', '2026-07-01T00:00:00Z', 'active', 'N123', 'S123', 1000, 500, 300)
+              'USD', '2026-07-01T00:00:00Z', 'active', 'ready',
+              '2026-07-01T00:00:00Z', 'N123', 'S123', 1000, 500, 300)
             "#,
         )
         .execute(pool)
@@ -723,10 +1117,31 @@ mod tests {
         assert_eq!(parse_date_days("2026-07-20T00:00:00Z"), Some(20_654));
     }
 
+    #[test]
+    fn high_confidence_fact_tokens_are_deterministic() {
+        let fact = SourceBackedValuationFact {
+            kind: "engine_conversion".to_string(),
+            value: "Air Plains IO-550-D / 300 HP".to_string(),
+            evidence_text: "Air Plains IO-550-D conversion".to_string(),
+            source_url: Some("https://example.test/listing".to_string()),
+            confidence: "high".to_string(),
+        };
+        assert_eq!(
+            fact_token(&fact),
+            "fact:engine_conversion:air_plains_io_550_d_300_hp"
+        );
+        assert_eq!(
+            fact_token(&fact),
+            equipment_feature_token("fact", &fact.kind, &fact.value)
+        );
+        assert_eq!(technical_field_count(true, false, true, false, true), 4);
+    }
+
     #[tokio::test]
     async fn sqlite_snapshot_is_listing_only_and_round_trips() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         insert_listing(&db).await;
+        seed_faa_aircraft(&db).await;
         let policy = SnapshotPolicy {
             capture_time: "2026-07-20T00:00:00Z".to_string(),
             max_listing_age_days: 60,
@@ -740,5 +1155,219 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].asking_price_usd, 175_000.0);
         assert_eq!(rows[0].airframe_hours, Some(1000.0));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_faa_exclusions_and_rejects_contaminated_legacy_rows() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        insert_listing(&db).await;
+        seed_faa_aircraft(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        for (registration, serial) in [
+            ("C-GABC", "FOREIGN"),
+            ("N123", "CONFLICT"),
+            ("N999", "UNCOVERED"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO aircraft_sale_listings (
+                  aircraft_model_variant_id, created_by_user_id, source_url,
+                  model_year, asking_price_usd, currency, added_at, status,
+                  ingestion_state, ingestion_completed_at, registration_number,
+                  serial_number, airframe_hours
+                ) VALUES (
+                  1, 1, 'https://example.test/other', 2010, 175000, 'USD',
+                  '2026-07-01T00:00:00Z', 'active', 'ready',
+                  '2026-07-01T00:00:00Z', ?, ?, 1000
+                )
+                "#,
+            )
+            .bind(registration)
+            .bind(serial)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let policy = SnapshotPolicy {
+            capture_time: "2026-07-20T00:00:00Z".to_string(),
+            max_listing_age_days: 60,
+            ..SnapshotPolicy::default()
+        };
+        let report = create_snapshot(&db, &policy, true).await.unwrap();
+        assert_eq!(report.included_count, 1);
+        assert_eq!(report.excluded_count, 3);
+        assert_eq!(report.exclusions.get("faa_non_n_registration"), Some(&1));
+        assert_eq!(report.exclusions.get("faa_serial_conflict"), Some(&1));
+        assert_eq!(
+            report.exclusions.get("faa_registration_not_covered"),
+            Some(&1)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM aircraft_sale_listings")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            4
+        );
+
+        let snapshot_id = report.snapshot_id.unwrap();
+        sqlx::query(
+            r#"
+            UPDATE valuation_snapshot_rows
+            SET inclusion_flag = TRUE, exclusion_reason = NULL
+            WHERE snapshot_id = ? AND source_listing_id = 3
+            "#,
+        )
+        .bind(snapshot_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let error = load_snapshot(&db, snapshot_id).await.unwrap_err();
+        assert!(error.to_string().contains("FAA-ineligible"));
+        assert!(error.to_string().contains("serial_conflict=1"));
+        assert!(error
+            .to_string()
+            .contains("create a fresh valuation snapshot"));
+    }
+
+    #[tokio::test]
+    async fn frozen_snapshot_rejects_an_eligible_to_eligible_identity_swap() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        insert_listing(&db).await;
+        seed_faa_aircraft(&db).await;
+        let policy = SnapshotPolicy {
+            capture_time: "2026-07-20T00:00:00Z".to_string(),
+            max_listing_age_days: 60,
+            ..SnapshotPolicy::default()
+        };
+        let report = create_snapshot(&db, &policy, true).await.unwrap();
+        let snapshot_id = report.snapshot_id.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            "UPDATE aircraft_sale_listings SET registration_number = 'N124', serial_number = 'S124' WHERE id = 1",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = load_snapshot(&db, snapshot_id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("FAA admission identity or provenance changed"));
+    }
+
+    #[tokio::test]
+    async fn legacy_unreviewed_avionics_do_not_become_training_features() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        insert_listing(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', 'garmin') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Transponder', 'transponder') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let approved_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier, identity_source_url,
+              identity_source_title, identity_evidence_text, identity_evidence_kind,
+              identity_confidence, catalog_reviewed_at
+            ) VALUES (
+              ?, 'GTX 345R', 'gtx345r',
+              'manufacturer_part_number', '011-03378-40', '0110337840',
+              'https://static.garmin.com/manuals/gtx345r.pdf',
+              'GTX 345R installation manual',
+              'The manufacturer manual identifies the GTX 345R and its part number.',
+              'authoritative_reference', 'very_high', CURRENT_TIMESTAMP
+            ) RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let unreviewed_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name
+            ) VALUES (?, 'Legacy Guess', 'legacy guess')
+            RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for model_id in [approved_id, unreviewed_id] {
+            sqlx::query(
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+            )
+            .bind(model_id)
+            .bind(type_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let gps_type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('GPS', 'gps') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(approved_id)
+        .bind(gps_type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+            .bind(approved_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        // A migrated database can legitimately contain associations created
+        // before the approved-only trigger existed.
+        sqlx::query("DROP TRIGGER aircraft_sale_listing_avionics_approved_insert")
+            .execute(pool)
+            .await
+            .unwrap();
+        for model_id in [approved_id, unreviewed_id] {
+            sqlx::query(
+                r#"
+                INSERT INTO aircraft_sale_listing_avionics (
+                  aircraft_sale_listing_id, avionics_model_id, source_confidence
+                ) VALUES (1, ?, 'high')
+                "#,
+            )
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let equipment = load_equipment(&db).await.unwrap();
+        assert_eq!(
+            equipment.get(&1),
+            Some(&vec!["avionics:garmin:gtx_345r".to_string()])
+        );
     }
 }

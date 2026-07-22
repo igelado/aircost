@@ -32,7 +32,7 @@ use crate::plugin::{
     plugin_url_status, register_plugin_install, reprocess_plugin_submission, submit_plugin_html,
     submit_plugin_html_with_progress, PluginStoreError, PluginSubmissionOutcome,
 };
-use crate::valuation::store::load_serving_model;
+use crate::valuation::store::{load_serving_valuation, ServingValuationStatus};
 use crate::valuation::ValuationModel;
 
 pub struct ServerConfig {
@@ -46,6 +46,7 @@ struct AppState {
     db: AppDb,
     extractor: Option<GeminiListingExtractor>,
     valuation_model: Option<Arc<dyn ValuationModel>>,
+    valuation_status: ServingValuationStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,11 +61,16 @@ struct PluginSubmissionStatusQuery {
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
     let db = AppDb::connect(&config.database_url).await?;
-    let valuation_model = load_serving_model(&db).await?;
+    let serving_valuation = load_serving_valuation(&db).await?;
+    for warning in &serving_valuation.status.warnings {
+        eprintln!("valuation warning: {warning}");
+    }
+    let extractor = GeminiListingExtractor::from_environment_with_usage(&db).ok();
     let state = AppState {
         db,
-        extractor: GeminiListingExtractor::from_environment().ok(),
-        valuation_model,
+        extractor,
+        valuation_model: serving_valuation.model,
+        valuation_status: serving_valuation.status,
     };
     let app = router(state);
     let address = format!("{}:{}", config.host, config.port);
@@ -84,6 +90,7 @@ fn router(state: AppState) -> Router {
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(javascript))
         .route("/health", get(health))
+        .route("/api/valuation/status", get(valuation_status_handler))
         .route("/api/users/current", get(current_user_handler))
         .route("/api/plugin/register", post(register_plugin_handler))
         .route("/api/plugin/submissions", post(plugin_submission_handler))
@@ -137,8 +144,12 @@ async fn javascript() -> impl IntoResponse {
     )
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"ok": true}))
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"ok": true, "valuation": state.valuation_status}))
+}
+
+async fn valuation_status_handler(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"valuation": state.valuation_status}))
 }
 
 async fn current_user_handler(
@@ -606,6 +617,13 @@ impl From<ListingStoreError> for ApiError {
             ListingStoreError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
             ListingStoreError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
             ListingStoreError::State(message) => ApiError::new(StatusCode::CONFLICT, message),
+            ListingStoreError::Ingestion {
+                listing_id,
+                message,
+            } => ApiError::new(
+                StatusCode::CONFLICT,
+                format!("listing {listing_id} was quarantined: {message}"),
+            ),
             ListingStoreError::Database(message) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
             }
@@ -663,6 +681,7 @@ mod tests {
     use crate::plugin::{
         plugin_url_status, register_plugin_install, sha256_hex, signature_message,
     };
+    use crate::valuation::store::{ServingValuationState, ServingValuationStatus};
 
     #[tokio::test]
     async fn background_upload_survives_progress_disconnect() {
@@ -693,6 +712,15 @@ mod tests {
                 db: db.clone(),
                 extractor: None,
                 valuation_model: None,
+                valuation_status: ServingValuationStatus {
+                    state: ServingValuationState::Unavailable,
+                    calibrated: false,
+                    listing_only_available: false,
+                    model_kind: None,
+                    model_version_id: None,
+                    snapshot_id: None,
+                    warnings: vec![],
+                },
             },
             user.clone(),
             request,
