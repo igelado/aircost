@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod inspection;
 pub mod repopulate;
 
 use std::collections::BTreeMap;

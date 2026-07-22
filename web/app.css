@@ -935,6 +935,310 @@ label span,
   color: #854d0e;
 }
 
+.avionics-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.8fr) repeat(3, minmax(150px, 1fr)) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.avionics-message {
+  min-height: 22px;
+  padding: 4px 12px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.avionics-message.error,
+.detail-state.error {
+  color: var(--danger);
+}
+
+.avionics-table-shell {
+  min-height: 360px;
+}
+
+.avionics-table {
+  min-width: 1080px;
+}
+
+.avionics-table th:nth-child(1) {
+  width: 22%;
+}
+
+.avionics-table th:nth-child(2) {
+  width: 13%;
+}
+
+.avionics-table th:nth-child(3) {
+  width: 20%;
+}
+
+.avionics-table th:nth-child(4) {
+  width: 15%;
+}
+
+.avionics-table th:nth-child(5) {
+  width: 12%;
+}
+
+.avionics-table th:nth-child(6) {
+  width: 12%;
+}
+
+.avionics-table th:nth-child(7) {
+  width: 84px;
+}
+
+.avionics-identity-cell strong,
+.avionics-identity-cell small,
+.avionics-identifier-cell strong,
+.avionics-identifier-cell small,
+.avionics-status-cell small,
+.avionics-value-cell strong,
+.avionics-value-cell small,
+.avionics-usage-cell strong,
+.avionics-usage-cell small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.avionics-identity-cell small,
+.avionics-identifier-cell small,
+.avionics-status-cell small,
+.avionics-value-cell small,
+.avionics-usage-cell small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.avionics-status-cell {
+  overflow: visible;
+  white-space: normal;
+}
+
+.avionics-status-cell .status-pill {
+  text-transform: none;
+}
+
+.avionics-status-cell .catalog-incomplete {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+.catalog-status-curated,
+.catalog-status-approved,
+.catalog-status-active,
+.catalog-status-verified {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.catalog-status-candidate,
+.catalog-status-review-required,
+.catalog-status-pending {
+  background: #fff3d6;
+  color: var(--warning);
+}
+
+.catalog-status-rejected,
+.catalog-status-invalid {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.catalog-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+}
+
+.catalog-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 21px;
+  max-width: 100%;
+  padding: 2px 7px;
+  overflow: hidden;
+  border: 1px solid #b8d8d4;
+  border-radius: 999px;
+  background: #f0faf8;
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-chip-overflow {
+  border-color: var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+.catalog-inspect-button {
+  min-height: 32px;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.catalog-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 54px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.catalog-pagination > div {
+  display: flex;
+  gap: 8px;
+}
+
+.avionics-detail-dialog {
+  width: min(960px, calc(100vw - 32px));
+  max-height: min(900px, calc(100vh - 32px));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 24px 80px rgba(25, 32, 36, 0.24);
+}
+
+.avionics-detail-dialog::backdrop {
+  background: rgba(25, 32, 36, 0.42);
+}
+
+.avionics-detail-dialog[open] {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.avionics-detail-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-height: 180px;
+  overflow: auto;
+  padding: 14px;
+  outline: none;
+}
+
+.avionics-detail-section {
+  min-width: 0;
+  align-self: start;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.avionics-detail-section h3 {
+  margin: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.avionics-detail-section > .catalog-chip-list,
+.avionics-detail-section > .detail-state,
+.avionics-detail-section > .detail-evidence,
+.avionics-detail-section > .detail-list {
+  margin: 0;
+  padding: 12px;
+}
+
+.detail-definition-list {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(0, 1.2fr);
+  margin: 0;
+}
+
+.detail-definition-list dt,
+.detail-definition-list dd {
+  min-width: 0;
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.detail-definition-list dt {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.detail-definition-list dd {
+  text-align: right;
+}
+
+.detail-definition-list dt:nth-last-of-type(1),
+.detail-definition-list dd:last-child {
+  border-bottom: 0;
+}
+
+.detail-evidence {
+  color: var(--text);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.detail-list {
+  padding-left: 30px !important;
+  color: var(--warning);
+}
+
+.detail-list li + li {
+  margin-top: 5px;
+}
+
+.detail-record-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.detail-record-list li {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-record-list li:last-child {
+  border-bottom: 0;
+}
+
+.detail-record-list strong,
+.detail-record-list span,
+.detail-record-list a {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.detail-record-list span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.detail-record-list a {
+  margin-top: 5px;
+  color: var(--accent-strong);
+  font-size: 11px;
+}
+
 .placeholder-panel p {
   margin: 0;
 }
@@ -958,7 +1262,8 @@ label span,
   }
 
   .table-toolbar,
-  .aircraft-toolbar {
+  .aircraft-toolbar,
+  .avionics-toolbar {
     grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
@@ -982,7 +1287,7 @@ label span,
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
   .nav-tab {
@@ -997,7 +1302,8 @@ label span,
   .metrics-row,
   .form-grid,
   .table-toolbar,
-  .aircraft-toolbar {
+  .aircraft-toolbar,
+  .avionics-toolbar {
     grid-template-columns: 1fr;
   }
 
@@ -1029,5 +1335,87 @@ label span,
 
   .form-actions {
     flex-direction: column-reverse;
+  }
+
+  .avionics-table-shell {
+    min-height: 280px;
+    overflow: visible;
+    padding: 10px;
+  }
+
+  .avionics-table,
+  .avionics-table tbody,
+  .avionics-table tr,
+  .avionics-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .avionics-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .avionics-table tr {
+    margin-bottom: 10px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .avionics-table tr:last-child {
+    margin-bottom: 0;
+  }
+
+  .avionics-table td {
+    display: grid;
+    grid-template-columns: minmax(112px, 0.7fr) minmax(0, 1.3fr);
+    gap: 10px;
+    min-height: 38px;
+    border-bottom: 1px solid var(--line);
+    overflow: visible;
+    text-align: left;
+    text-overflow: initial;
+    white-space: normal;
+  }
+
+  .avionics-table td::before {
+    align-self: start;
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .avionics-table td:last-child {
+    border-bottom: 0;
+  }
+
+  .catalog-inspect-button {
+    width: 100%;
+  }
+
+  .catalog-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .catalog-pagination > div,
+  .catalog-pagination .button {
+    width: 100%;
+  }
+
+  .avionics-detail-dialog {
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
+  }
+
+  .avionics-detail-body {
+    grid-template-columns: 1fr;
   }
 }

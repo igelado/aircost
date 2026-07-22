@@ -1,7 +1,10 @@
+import { initializeAvionicsInspector } from "/avionics.js";
+
 const USER_HEADER = "developer";
 const VIEW_TITLES = {
   "listings-panel": ["Listings", "Sale listings and aircraft details"],
   "aircraft-panel": ["Aircraft", "Model parameters and depreciation curves"],
+  "avionics-panel": ["Avionics", "Catalog identities, capabilities, values, and usage"],
   "comparisons-panel": ["Comparisons", "Purchase, rental, and investment runs"],
   "rentals-panel": ["Rentals", "Club and rental aircraft profiles"],
 };
@@ -51,9 +54,20 @@ const state = {
 };
 
 const elements = {};
+let avionicsInspector;
 
 document.addEventListener("DOMContentLoaded", () => {
   collectElements();
+  avionicsInspector = initializeAvionicsInspector({
+    api,
+    finiteNumber,
+    formatCurrency,
+    formatDate,
+    formatNumber,
+    formatPercent,
+    selectOption,
+    setButtonBusy,
+  });
   bindEvents();
   addAvionicsRow();
   loadValuationStatus();
@@ -235,6 +249,9 @@ function activatePanel(panelId) {
   const [title, subtitle] = VIEW_TITLES[panelId] || VIEW_TITLES["listings-panel"];
   elements.viewTitle.textContent = title;
   elements.viewSubtitle.textContent = subtitle;
+  if (panelId === "avionics-panel") {
+    avionicsInspector.activate();
+  }
 }
 
 async function loadCurrentUser() {

@@ -19,6 +19,10 @@ use crate::aircraft::{
     aircraft_listing_value_with_model, aircraft_options, aircraft_variant_detail_with_model,
     AircraftStoreError,
 };
+use crate::avionics::inspection::{
+    avionics_catalog_options, get_avionics_catalog_detail, list_avionics_catalog,
+    AvionicsCatalogQuery, AvionicsInspectionError,
+};
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
 use crate::listings::{
@@ -89,6 +93,7 @@ fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(javascript))
+        .route("/avionics.js", get(avionics_javascript))
         .route("/health", get(health))
         .route("/api/valuation/status", get(valuation_status_handler))
         .route("/api/users/current", get(current_user_handler))
@@ -112,6 +117,9 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/listings/preview", post(preview_listing_handler))
         .route("/api/aircraft/options", get(aircraft_options_handler))
+        .route("/api/avionics", get(list_avionics_handler))
+        .route("/api/avionics/options", get(avionics_options_handler))
+        .route("/api/avionics/{id}", get(avionics_detail_handler))
         .route(
             "/api/aircraft/variants/{id}",
             get(aircraft_variant_detail_handler),
@@ -141,6 +149,16 @@ async fn javascript() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         APP_JS,
+    )
+}
+
+async fn avionics_javascript() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        AVIONICS_JS,
     )
 }
 
@@ -470,6 +488,35 @@ async fn aircraft_options_handler(
     Ok(Json(json!({"current_user": user, "options": options})))
 }
 
+async fn list_avionics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AvionicsCatalogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    let catalog = list_avionics_catalog(&state.db, user.id, query).await?;
+    Ok(Json(json!({"current_user": user, "catalog": catalog})))
+}
+
+async fn avionics_options_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    let options = avionics_catalog_options(&state.db, user.id).await?;
+    Ok(Json(json!({"current_user": user, "options": options})))
+}
+
+async fn avionics_detail_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(avionics_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    let avionics = get_avionics_catalog_detail(&state.db, user.id, avionics_id).await?;
+    Ok(Json(json!({"current_user": user, "avionics": avionics})))
+}
+
 async fn aircraft_variant_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -658,6 +705,22 @@ impl From<AircraftStoreError> for ApiError {
     }
 }
 
+impl From<AvionicsInspectionError> for ApiError {
+    fn from(error: AvionicsInspectionError) -> Self {
+        match error {
+            AvionicsInspectionError::Validation(message) => {
+                ApiError::new(StatusCode::BAD_REQUEST, message)
+            }
+            AvionicsInspectionError::NotFound(message) => {
+                ApiError::new(StatusCode::NOT_FOUND, message)
+            }
+            AvionicsInspectionError::Database(message) => {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
@@ -667,21 +730,76 @@ impl From<anyhow::Error> for ApiError {
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
+const AVIONICS_JS: &str = include_str!("../web/avionics.js");
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::{Query, State};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
-    use super::{start_plugin_submission_job, AppState};
+    use super::{
+        avionics_options_handler, list_avionics_handler, start_plugin_submission_job, AppState,
+    };
+    use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::db::AppDb;
     use crate::models::PluginSubmissionRequest;
     use crate::plugin::{
         plugin_url_status, register_plugin_install, sha256_hex, signature_message,
     };
     use crate::valuation::store::{ServingValuationState, ServingValuationStatus};
+
+    fn test_state(db: AppDb) -> AppState {
+        AppState {
+            db,
+            extractor: None,
+            valuation_model: None,
+            valuation_status: ServingValuationStatus {
+                state: ServingValuationState::Unavailable,
+                calibrated: false,
+                listing_only_available: false,
+                model_kind: None,
+                model_version_id: None,
+                snapshot_id: None,
+                warnings: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn avionics_routes_authenticate_and_surface_query_validation() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let state = test_state(db);
+        let options = avionics_options_handler(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(options.0["options"]["statuses"].is_array());
+
+        let invalid = list_avionics_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(AvionicsCatalogQuery {
+                limit: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+
+        let mut unknown_headers = HeaderMap::new();
+        unknown_headers.insert(
+            "x-user-email",
+            HeaderValue::from_static("missing@example.test"),
+        );
+        let unauthorized = avionics_options_handler(State(state), unknown_headers)
+            .await
+            .unwrap_err();
+        assert_eq!(unauthorized.status, StatusCode::UNAUTHORIZED);
+    }
 
     #[tokio::test]
     async fn background_upload_survives_progress_disconnect() {
@@ -707,24 +825,7 @@ mod tests {
             rendered_html: rendered_html.to_string(),
             signature: BASE64_STANDARD.encode(signature.as_ref()),
         };
-        let progress = start_plugin_submission_job(
-            AppState {
-                db: db.clone(),
-                extractor: None,
-                valuation_model: None,
-                valuation_status: ServingValuationStatus {
-                    state: ServingValuationState::Unavailable,
-                    calibrated: false,
-                    listing_only_available: false,
-                    model_kind: None,
-                    model_version_id: None,
-                    snapshot_id: None,
-                    warnings: vec![],
-                },
-            },
-            user.clone(),
-            request,
-        );
+        let progress = start_plugin_submission_job(test_state(db.clone()), user.clone(), request);
 
         // Model the browser closing the extension popup immediately after the
         // server accepts the upload and returns its progress response.
