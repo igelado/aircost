@@ -66,6 +66,15 @@ pub const CURATED_AVIONICS_TYPES: &[&str] = &[
 
 const SYSTEM_PROMPT: &str = "You extract aircraft sale listing fields from plain text. Return only a single valid JSON object with the requested keys. Never infer missing component times or condition facts; preserve nulls and source evidence exactly as requested.";
 
+const AVIONICS_GROUNDING_SOURCE_POLICY: &str = r#"Authoritative-source policy:
+- Prefer the avionics manufacturer's official product page, specification, installation/maintenance manual, service publication, dated price list, or lifecycle notice for marketed identity, part/model numbers, capabilities, suite composition, lifecycle, and price.
+- FAA DRS TSO Index of Articles (TSOI), FAA TSO authorization records, and EASA ETSO authorizations can corroborate an article holder, model/part number, and minimum approved standard. A TSO/ETSO authorization is design-and-production approval; it is not installation approval, proof that the unit is installed in this aircraft, a complete capability description, factory-default evidence, or valuation evidence.
+- An FAA STC, AML, or PMA may establish approved applicability or configuration eligibility. It does not prove actual installation on a listing aircraft and does not by itself establish factory-standard equipment.
+- FCC equipment authorization is supplemental evidence only for RF-capable hardware. An FCC ID can identify a transmitter or internal radio module and need not map one-to-one to a marketed avionics product.
+- FAA ADS-B equipment lists are narrow corroborating sources, not a complete avionics catalog. Treat manufacturer-supplied or stale entries accordingly.
+- Ordinary aircraft listings, retailer pages, forums, scraped catalogs, and model memory are discovery material, never authoritative product-identity, factory-default, or value evidence.
+- Preserve conflicts between sources. When the evidence does not distinguish a hardware suffix, generation, remote/panel form factor, suite composition, or part-number variant, return unresolved rather than collapsing products."#;
+
 pub struct ModelFamilyConfirmationContext<'a> {
     pub manufacturer: &'a str,
     pub extracted_model: &'a str,
@@ -239,7 +248,7 @@ pub struct AircraftSpecMetadataContext<'a> {
 #[derive(Clone)]
 pub struct GeminiListingExtractor {
     client: Client,
-    visual_client: Option<GeminiInteractionsClient>,
+    interactions_client: Option<GeminiInteractionsClient>,
     api_key: String,
     runtime_config: Arc<GeminiRuntimeConfig>,
     endpoint_override: Option<String>,
@@ -287,7 +296,7 @@ impl GeminiListingExtractor {
                 .timeout(Duration::from_secs(1))
                 .build()
                 .expect("test HTTP client must build"),
-            visual_client: None,
+            interactions_client: None,
             api_key: "test-key".to_string(),
             runtime_config: Arc::new(runtime_config),
             endpoint_override: Some(url.into()),
@@ -322,7 +331,7 @@ impl GeminiListingExtractor {
             .timeout(Duration::from_secs(timeout_seconds))
             .build()
             .context("could not create Gemini HTTP client")?;
-        let visual_client = GeminiInteractionsClient::with_options(
+        let interactions_client = GeminiInteractionsClient::with_options(
             &api_key,
             Duration::from_secs(timeout_seconds),
             RetryPolicy::default(),
@@ -331,7 +340,7 @@ impl GeminiListingExtractor {
 
         Ok(Self {
             client,
-            visual_client: Some(visual_client),
+            interactions_client: Some(interactions_client),
             api_key,
             runtime_config: Arc::new(runtime_config),
             endpoint_override: None,
@@ -344,8 +353,8 @@ impl GeminiListingExtractor {
     }
 
     pub fn with_usage_store(mut self, store: UsageStore) -> Self {
-        self.visual_client = self
-            .visual_client
+        self.interactions_client = self
+            .interactions_client
             .take()
             .map(|client| client.with_usage_store(store.clone()));
         self.usage_store = Some(store);
@@ -388,7 +397,7 @@ impl GeminiListingExtractor {
         source_url: &str,
         retained_html: &str,
     ) -> Result<Option<(VisualIdentifierResolution, usize)>> {
-        let Some(client) = self.visual_client.as_ref() else {
+        let Some(client) = self.interactions_client.as_ref() else {
             return Ok(None);
         };
         let discovery = match discover_listing_media(source_url, retained_html) {
@@ -1423,6 +1432,7 @@ Rules:\n\
 - Prefer manufacturer product pages, installation manuals, FAA/STC documents, reputable avionics shops, or equipment market references.\n\
 - confidence must be high, medium, or low.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
+{AVIONICS_GROUNDING_SOURCE_POLICY}\n\n\
 manufacturer: {}\n\
 model: {}\n\
 avionics_types: {}\n\
@@ -1493,6 +1503,7 @@ Rules:\n\
 - reason must briefly explain the evidence-based identity decision.\n\
 - Never return prices, installed contributions, replacement costs, or other valuation metadata.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
+{AVIONICS_GROUNDING_SOURCE_POLICY}\n\n\
 Context:\n{}",
         serde_json::to_string_pretty(&json!({
             "status": "existing_match, propose_new, reject, or unresolved",
@@ -1565,6 +1576,7 @@ Correction rules:\n\
 - Never substitute factory/default equipment for an ambiguous listing candidate.\n\
 - Address every review issue using authoritative evidence. Do not guess and do not return any prices or value metadata.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
+{AVIONICS_GROUNDING_SOURCE_POLICY}\n\n\
 Original context:\n{}\n\n\
 Previous rejected response:\n{}\n\n\
 Review context:\n{}",
@@ -1614,6 +1626,7 @@ Rules:\n\
 - Evaluate approved and legacy-unreviewed candidates identically as product identities. catalog_status is not evidence that products are same or different.\n\
 - Do not return canonical ids other than the supplied catalog_id, and never return prices, installed values, replacement costs, or other valuation metadata.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
+{AVIONICS_GROUNDING_SOURCE_POLICY}\n\n\
 Context:\n{}",
         serde_json::to_string_pretty(&json!({
             "proposal_decision": "confirmed_same_as_input or not_confirmed",
@@ -3428,6 +3441,30 @@ mod tests {
             payload["catalog_candidates"][0]["manufacturer_identifier_kind"],
             "none"
         );
+    }
+
+    #[test]
+    fn avionics_grounding_prompts_preserve_regulatory_source_boundaries() {
+        let context = avionics_identity_context();
+        let identity_prompt = build_avionics_unit_resolution_prompt(&context);
+        for required in [
+            "FAA DRS TSO Index of Articles",
+            "not installation approval",
+            "FCC equipment authorization is supplemental evidence only",
+            "return unresolved rather than collapsing products",
+        ] {
+            assert!(identity_prompt.contains(required), "missing {required:?}");
+        }
+
+        let observed_types = vec!["Transponder".to_string()];
+        let metadata_prompt = build_avionics_metadata_prompt(&AvionicsMetadataContext {
+            manufacturer: "Garmin",
+            model: "GTX 345R",
+            avionics_types: &observed_types,
+            value_reference_year: 2026,
+        });
+        assert!(metadata_prompt.contains("A TSO/ETSO authorization"));
+        assert!(metadata_prompt.contains("not a complete avionics catalog"));
     }
 
     #[test]
