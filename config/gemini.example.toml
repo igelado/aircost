@@ -28,6 +28,21 @@ model = "gemini-3.5-flash"
 thinking_level = "low"
 max_output_tokens = 8192
 
+[tasks.avionics_search_grounding]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.avionics_url_verification]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.avionics_structure]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 12000
+
 [tasks.aircraft_visual_identity]
 model = "gemini-3.1-flash-lite"
 thinking_level = "low"

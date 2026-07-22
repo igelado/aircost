@@ -38,6 +38,9 @@ pub enum GeminiTask {
     GroundedMetadata,
     AvionicsIdentity,
     AvionicsReview,
+    AvionicsSearchGrounding,
+    AvionicsUrlVerification,
+    AvionicsStructure,
     AircraftVisualIdentity,
     AircraftSearchGrounding,
     AircraftUrlVerification,
@@ -47,11 +50,14 @@ pub enum GeminiTask {
 }
 
 impl GeminiTask {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::ListingExtraction,
         Self::GroundedMetadata,
         Self::AvionicsIdentity,
         Self::AvionicsReview,
+        Self::AvionicsSearchGrounding,
+        Self::AvionicsUrlVerification,
+        Self::AvionicsStructure,
         Self::AircraftVisualIdentity,
         Self::AircraftSearchGrounding,
         Self::AircraftUrlVerification,
@@ -66,6 +72,9 @@ impl GeminiTask {
             Self::GroundedMetadata => "AIRCOST_GEMINI_GROUNDED_METADATA",
             Self::AvionicsIdentity => "AIRCOST_GEMINI_AVIONICS_IDENTITY",
             Self::AvionicsReview => "AIRCOST_GEMINI_AVIONICS_REVIEW",
+            Self::AvionicsSearchGrounding => "AIRCOST_GEMINI_AVIONICS_SEARCH_GROUNDING",
+            Self::AvionicsUrlVerification => "AIRCOST_GEMINI_AVIONICS_URL_VERIFICATION",
+            Self::AvionicsStructure => "AIRCOST_GEMINI_AVIONICS_STRUCTURE",
             Self::AircraftVisualIdentity => "AIRCOST_GEMINI_AIRCRAFT_VISUAL_IDENTITY",
             Self::AircraftSearchGrounding => "AIRCOST_GEMINI_AIRCRAFT_SEARCH_GROUNDING",
             Self::AircraftUrlVerification => "AIRCOST_GEMINI_AIRCRAFT_URL_VERIFICATION",
@@ -81,6 +90,9 @@ impl GeminiTask {
             Self::GroundedMetadata => "grounded_metadata",
             Self::AvionicsIdentity => "avionics_identity",
             Self::AvionicsReview => "avionics_review",
+            Self::AvionicsSearchGrounding => "avionics_search_grounding",
+            Self::AvionicsUrlVerification => "avionics_url_verification",
+            Self::AvionicsStructure => "avionics_structure",
             Self::AircraftVisualIdentity => "aircraft_visual_identity",
             Self::AircraftSearchGrounding => "aircraft_search_grounding",
             Self::AircraftUrlVerification => "aircraft_url_verification",
@@ -274,6 +286,8 @@ impl Default for GeminiRuntimeConfig {
             ),
         );
         for task in [
+            GeminiTask::AvionicsSearchGrounding,
+            GeminiTask::AvionicsUrlVerification,
             GeminiTask::AircraftSearchGrounding,
             GeminiTask::AircraftUrlVerification,
             GeminiTask::AircraftCatalogAdjudication,
@@ -288,14 +302,16 @@ impl Default for GeminiRuntimeConfig {
                 ),
             );
         }
-        tasks.insert(
-            GeminiTask::AircraftStructure,
-            TaskRoute::new(
-                DEFAULT_GROUNDED_MODEL,
-                ThinkingLevel::Low,
-                DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
-            ),
-        );
+        for task in [GeminiTask::AvionicsStructure, GeminiTask::AircraftStructure] {
+            tasks.insert(
+                task,
+                TaskRoute::new(
+                    DEFAULT_GROUNDED_MODEL,
+                    ThinkingLevel::Low,
+                    DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
+                ),
+            );
+        }
         Self {
             version: GEMINI_CONFIG_VERSION,
             tasks,
@@ -702,12 +718,69 @@ mod tests {
         );
         assert_eq!(
             config
+                .route(GeminiTask::AvionicsSearchGrounding)
+                .thinking_level,
+            ThinkingLevel::Medium
+        );
+        assert_eq!(
+            config
+                .route(GeminiTask::AvionicsUrlVerification)
+                .max_output_tokens,
+            12_000
+        );
+        assert_eq!(
+            config.route(GeminiTask::AvionicsStructure).thinking_level,
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            config
                 .route(GeminiTask::AircraftSearchGrounding)
                 .max_output_tokens,
             12_000
         );
         assert_eq!(config.tasks.len(), GeminiTask::ALL.len());
         config.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn avionics_interactions_tasks_have_stable_names_and_environment_routes() {
+        let cases = [
+            (
+                GeminiTask::AvionicsSearchGrounding,
+                "avionics_search_grounding",
+                "AIRCOST_GEMINI_AVIONICS_SEARCH_GROUNDING",
+            ),
+            (
+                GeminiTask::AvionicsUrlVerification,
+                "avionics_url_verification",
+                "AIRCOST_GEMINI_AVIONICS_URL_VERIFICATION",
+            ),
+            (
+                GeminiTask::AvionicsStructure,
+                "avionics_structure",
+                "AIRCOST_GEMINI_AVIONICS_STRUCTURE",
+            ),
+        ];
+        let mut environment = BTreeMap::new();
+        for (task, name, prefix) in cases {
+            assert_eq!(task.as_str(), name);
+            assert_eq!(task.environment_prefix(), prefix);
+            assert_eq!(
+                serde_json::from_str::<GeminiTask>(&format!("\"{name}\""))
+                    .expect("task name should deserialize"),
+                task
+            );
+            environment.insert(format!("{prefix}_MODEL"), "gemini-3.5-flash-lite".into());
+            environment.insert(format!("{prefix}_MAX_OUTPUT_TOKENS"), "6144".into());
+        }
+
+        let config = GeminiRuntimeConfig::from_environment_reader(map_environment(environment))
+            .expect("avionics task environment routes should load");
+        for (task, _, _) in cases {
+            let route = config.route(task);
+            assert_eq!(route.model, "gemini-3.5-flash-lite");
+            assert_eq!(route.max_output_tokens, 6_144);
+        }
     }
 
     #[test]
