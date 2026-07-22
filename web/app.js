@@ -6,19 +6,31 @@ const VIEW_TITLES = {
   "rentals-panel": ["Rentals", "Club and rental aircraft profiles"],
 };
 const AVIONICS_TYPES = [
-  "Integrated Flight Deck",
   "GPS",
-  "NAV/COM",
-  "COM",
   "NAV",
+  "COM",
   "Transponder",
   "Autopilot",
+  "Flight Director",
+  "Integrated Flight Deck",
   "Audio Panel",
   "Flight Display",
+  "Navigation Indicator",
   "Traffic",
   "Datalink",
+  "Weather Radar",
+  "Lightning Detection",
+  "Terrain Awareness",
   "Engine Monitor",
-  "Unknown",
+  "Standby Instrument",
+  "ELT",
+  "ADF",
+  "DME",
+  "AHRS",
+  "Air Data Computer",
+  "Radar Altimeter",
+  "Magnetometer",
+  "Clock/Timer",
 ];
 const SVG_NS = "http://www.w3.org/2000/svg";
 const ICONS = {
@@ -35,6 +47,7 @@ const state = {
   aircraftAnnualHoursVariantId: null,
   aircraftAnnualHoursTimer: null,
   editingListingId: null,
+  valuationStatus: null,
 };
 
 const elements = {};
@@ -43,6 +56,7 @@ document.addEventListener("DOMContentLoaded", () => {
   collectElements();
   bindEvents();
   addAvionicsRow();
+  loadValuationStatus();
   loadCurrentUser();
   loadListings();
   loadAircraftOptions();
@@ -55,6 +69,7 @@ function collectElements() {
     viewTitle: "#view-title",
     viewSubtitle: "#view-subtitle",
     currentUser: "#current-user",
+    valuationStatus: "#valuation-status",
     listingSearch: "#listing-search",
     manufacturerFilter: "#manufacturer-filter",
     modelFilter: "#model-filter",
@@ -100,6 +115,47 @@ function collectElements() {
     elements[key] = selector.startsWith(".")
       ? Array.from(document.querySelectorAll(selector))
       : document.querySelector(selector);
+  }
+}
+
+async function loadValuationStatus() {
+  try {
+    const payload = await api("/api/valuation/status");
+    state.valuationStatus = payload.valuation || null;
+    renderValuationStatus();
+  } catch (error) {
+    state.valuationStatus = {
+      state: "unavailable",
+      calibrated: false,
+      warnings: [`Could not load valuation status: ${error.message}`],
+    };
+    renderValuationStatus();
+  }
+}
+
+function renderValuationStatus() {
+  const status = state.valuationStatus;
+  const badge = elements.valuationStatus;
+  badge.className = "valuation-status";
+  if (!status || status.state === "unavailable") {
+    badge.classList.add("is-unavailable");
+    badge.textContent = "Valuation unavailable";
+  } else if (status.state === "comparable_fallback") {
+    badge.classList.add("is-comparable");
+    badge.textContent = `Comparable fallback · snapshot ${status.snapshot_id ?? "-"}`;
+  } else {
+    badge.classList.add("is-calibrated");
+    const version = status.model_version_id ? ` v${status.model_version_id}` : "";
+    const snapshot = status.snapshot_id ? ` · snapshot ${status.snapshot_id}` : "";
+    badge.textContent = `Calibrated ${status.model_kind || "model"}${version}${snapshot}`;
+  }
+  if ((status?.warnings || []).length) {
+    badge.classList.add("has-warning");
+    badge.textContent += " · warning";
+  }
+  badge.title = (status?.warnings || []).join("\n");
+  if (state.aircraftDetail) {
+    renderAircraftDetail();
   }
 }
 
@@ -377,10 +433,13 @@ function renderAircraftDetail() {
   renderAircraftChart(detail);
   renderAircraftValueTable(detail);
   const listingOnly = (detail.listings || []).some((listing) => listing.valuation_model_kind);
-  elements.aircraftAnnualHours.disabled = listingOnly;
-  elements.aircraftAnnualHours.title = listingOnly
-    ? "Future utilization is learned from the frozen listing snapshot."
-    : "Set projected annual airframe hours.";
+  const valuationUnavailable = state.valuationStatus?.state === "unavailable";
+  elements.aircraftAnnualHours.disabled = listingOnly || valuationUnavailable;
+  elements.aircraftAnnualHours.title = valuationUnavailable
+    ? "Market valuation is unavailable until an approved model or eligible snapshot is loaded."
+    : listingOnly
+      ? "Future utilization is learned from the frozen listing snapshot."
+      : "Set projected annual airframe hours.";
   const listingCount = detail.listings?.length || 0;
   setAircraftMessage(detail.message || `${listingCount} listing values modeled.`);
 }
@@ -405,6 +464,7 @@ function renderAircraftParams(detail) {
           : "snapshot fallback",
       ),
       paramRow("Snapshot", String(valuation.valuation_snapshot_id ?? "-")),
+      paramRow("Calibration", valuation.valuation_calibrated ? "Calibrated" : "Uncalibrated fallback"),
       paramRow("Support", titleCase(valuation.valuation_support || "low")),
       paramRow("Estimated range", formatEstimateRange(valuation)),
       paramRow("Global anchor", formatCurrency(breakdown.global_anchor_usd, "USD")),
@@ -414,6 +474,13 @@ function renderAircraftParams(detail) {
       paramRow("Manufacturer factor", formatPercent(breakdown.manufacturer_factor, 1)),
       paramRow("Model factor", formatPercent(breakdown.model_factor, 1)),
       paramRow("Variant factor", formatPercent(breakdown.variant_factor, 1)),
+    );
+    return;
+  }
+  if (state.valuationStatus?.state === "unavailable") {
+    elements.aircraftParams.replaceChildren(
+      paramRow("Valuation", "Unavailable"),
+      paramRow("Reason", state.valuationStatus.warnings?.at(-1) || "No approved serving model"),
     );
     return;
   }
@@ -636,7 +703,12 @@ function listingRow(listing) {
     textCell(String(listing.model_year || "-")),
     textCell(formatHours(listing.airframe_hours)),
     textCell(formatCurrency(listing.asking_price_usd, listing.currency)),
-    statusCell(listing.status, listing.is_verified),
+    statusCell(
+      listing.status,
+      listing.is_verified,
+      listing.ingestion_state,
+      listing.ingestion_error,
+    ),
     textCell(formatDate(listing.added_at)),
     actionsCell(listing),
   );
@@ -650,13 +722,26 @@ function textCell(value) {
   return cell;
 }
 
-function statusCell(status, verified) {
+function statusCell(status, verified, ingestionState, ingestionError) {
   const cell = document.createElement("td");
+  cell.className = "listing-status-cell";
+  const stack = document.createElement("div");
+  stack.className = "status-stack";
   const pill = document.createElement("span");
   pill.className = `status-pill ${status || "unknown"}${verified ? " verified" : ""}`;
   pill.textContent = status || "unknown";
   pill.title = verified ? `${status || "unknown"} verified` : status || "unknown";
-  cell.append(pill);
+  stack.append(pill);
+
+  const ingestionPill = document.createElement("span");
+  const normalizedState = ingestionState || "unknown";
+  ingestionPill.className = `ingestion-pill ${normalizedState}`;
+  ingestionPill.textContent = normalizedState;
+  ingestionPill.title = ingestionError
+    ? `Ingestion ${normalizedState}: ${ingestionError}`
+    : `Ingestion ${normalizedState}`;
+  stack.append(ingestionPill);
+  cell.append(stack);
   return cell;
 }
 
@@ -752,7 +837,8 @@ function estimateCell(listing) {
     }
     return cell;
   }
-  const cell = textCell(listing.estimate_error ? "Error" : "-");
+  const unavailable = listing.estimate_error?.includes("Listing-only valuation unavailable");
+  const cell = textCell(listing.estimate_error ? (unavailable ? "Unavailable" : "Error") : "-");
   if (listing.estimate_error) {
     cell.className = "estimate-error";
     cell.title = listing.estimate_error;
@@ -1129,7 +1215,10 @@ function readAvionicsRows() {
   for (const row of rows) {
     const manufacturer = row.querySelector('[name="avionics_manufacturer"]').value.trim();
     const model = row.querySelector('[name="avionics_model"]').value.trim();
-    const type = row.querySelector('[name="avionics_type"]').value;
+    const types = Array.from(
+      row.querySelector('[name="avionics_types"]').selectedOptions,
+      (option) => option.value,
+    );
     const quantity = Number.parseInt(row.querySelector('[name="avionics_quantity"]').value, 10) || 1;
     const hasAnyValue = manufacturer || model;
     if (!hasAnyValue) {
@@ -1138,10 +1227,13 @@ function readAvionicsRows() {
     if (!manufacturer || !model) {
       throw new Error("Avionics rows need manufacturer and model.");
     }
+    if (!types.length) {
+      throw new Error("Avionics rows need at least one capability.");
+    }
     avionics.push({
       manufacturer,
       model,
-      type,
+      types,
       quantity: Math.max(quantity, 1),
     });
   }
@@ -1154,7 +1246,7 @@ function addAvionicsRow(item = {}) {
   row.append(
     avionicsInput("avionics_manufacturer", "Manufacturer", item.manufacturer),
     avionicsInput("avionics_model", "Model", item.model),
-    avionicsTypeSelect(item.type || item.avionics_type),
+    avionicsTypeSelect(item.types || item.avionics_types),
     avionicsInput("avionics_quantity", "Qty", item.quantity || 1, "number"),
     removeAvionicsButton(row),
   );
@@ -1174,14 +1266,19 @@ function avionicsInput(name, placeholder, value = "", type = "text") {
   return input;
 }
 
-function avionicsTypeSelect(value = "Unknown") {
+function avionicsTypeSelect(values = []) {
   const select = document.createElement("select");
-  select.name = "avionics_type";
+  select.name = "avionics_types";
+  select.multiple = true;
+  select.size = 3;
+  select.title = "Select one or more avionics capabilities";
+  select.setAttribute("aria-label", "Avionics capabilities");
+  const selectedTypes = new Set(Array.isArray(values) ? values : []);
   for (const type of AVIONICS_TYPES) {
     const option = document.createElement("option");
     option.value = type;
     option.textContent = type;
-    option.selected = type === value;
+    option.selected = selectedTypes.has(type);
     select.append(option);
   }
   return select;

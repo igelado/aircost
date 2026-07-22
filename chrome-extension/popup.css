@@ -870,7 +870,7 @@ dd {
   display: grid;
   grid-template-columns: 1.2fr 1.2fr 1fr 48px 32px;
   gap: 5px;
-  align-items: end;
+  align-items: start;
 }
 
 .avionics-row input,

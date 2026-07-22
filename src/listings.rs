@@ -6,20 +6,32 @@ use serde_json::{json, Value};
 use sqlx::FromRow;
 
 use crate::aircraft::enrich_aircraft_spec_for_listing_if_missing;
+use crate::aircraft::faa::{
+    normalize_serial_key, require_aircraft_admission, require_listing_admission,
+    AircraftAdmissionError, AircraftGrounding,
+};
+use crate::avionics::catalog::{
+    resolve_avionics_identity, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
+    AvionicsIdentityRequest,
+};
 use crate::avionics::{
     enrich_listing_avionics_metadata, enrich_model_year_avionics_and_price_point_for_listing,
-    normalize_avionics_models,
 };
 use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
-    optional_f64, optional_i64, optional_string, AvionicsUnitResolutionCandidate,
-    AvionicsUnitResolutionContext, AvionicsUnitResolutionCorrectionContext, GeminiListingExtractor,
+    optional_f64, optional_i64, optional_string, GeminiListingExtractor,
     ModelFamilyConfirmationContext, VariantConfirmationContext, VariantLabelCorrectionContext,
     VariantNormalizationCandidate, VariantNormalizationContext, VariantNormalizationExample,
 };
-use crate::models::{AircraftSummary, ListingPreview, ParsedAvionics, SaleListing};
-use crate::normalize::{is_usable_avionics_label, normalize_avionics_model_name, normalize_name};
+use crate::models::{
+    is_plausible_asking_price_usd, AircraftSummary, ListingPreview, ListingValuationFact,
+    ParsedAvionics, ParsedAvionicsReference, ParsedInstalledComponent, SaleListing,
+};
+use crate::normalize::{
+    is_usable_avionics_label, normalize_avionics_manufacturer_name, normalize_avionics_model_name,
+    normalize_name,
+};
 
 macro_rules! execute_query {
     ($db:expr, $sql:expr $(, $bind:expr)* $(,)?) => {{
@@ -111,6 +123,7 @@ pub enum ListingStoreError {
     NotFound(String),
     Permission(String),
     State(String),
+    Ingestion { listing_id: i64, message: String },
     Database(String),
 }
 
@@ -122,6 +135,10 @@ impl fmt::Display for ListingStoreError {
             | ListingStoreError::Permission(message)
             | ListingStoreError::State(message)
             | ListingStoreError::Database(message) => write!(formatter, "{message}"),
+            ListingStoreError::Ingestion {
+                listing_id,
+                message,
+            } => write!(formatter, "listing {listing_id} was quarantined: {message}"),
         }
     }
 }
@@ -154,7 +171,6 @@ const MODEL_FAMILY_CANDIDATE_THRESHOLD: f64 = 0.35;
 const MODEL_FAMILY_CANDIDATE_LIMIT: usize = 5;
 const VARIANT_SIMILARITY_CONFIRMATION_THRESHOLD: f64 = 0.35;
 const KNOWN_VARIANT_CANDIDATE_LIMIT: usize = 5;
-const AVIONICS_VALUE_REFERENCE_YEAR: i64 = 2026;
 
 #[derive(Clone, Debug)]
 struct ListingValues {
@@ -169,48 +185,57 @@ struct ListingValues {
     registration_number: Option<String>,
     serial_number: Option<String>,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    engine_time_basis: String,
+    engine_time_evidence: Option<String>,
+    engine_time_confidence: Option<String>,
+    propeller_hours: Option<f64>,
+    propeller_time_basis: String,
+    propeller_time_evidence: Option<String>,
+    propeller_time_confidence: Option<String>,
+    installed_engine_model_id: Option<i64>,
+    installed_engine: Option<ParsedInstalledComponent>,
+    installed_engine_evidence_text: Option<String>,
+    installed_engine_confidence: Option<String>,
+    installed_propeller_model_id: Option<i64>,
+    installed_propeller: Option<ParsedInstalledComponent>,
+    installed_propeller_evidence_text: Option<String>,
+    installed_propeller_confidence: Option<String>,
     avionics: Vec<ListingAvionicsValue>,
+    valuation_facts: Vec<ListingValuationFact>,
 }
 
 #[derive(Clone, Debug)]
 struct ListingAvionicsValue {
+    avionics_model_id: Option<i64>,
     manufacturer: String,
     model: String,
-    avionics_type: String,
+    avionics_types: Vec<String>,
     quantity: i64,
     source: String,
     source_notes: Option<String>,
-    introduced_year: Option<i64>,
-    estimated_unit_value_usd: Option<f64>,
-    value_reference_year: Option<i64>,
+    source_confidence: Option<String>,
+    configuration_action: String,
+    replaces: Option<ParsedAvionicsReference>,
+    replaces_avionics_model_id: Option<i64>,
 }
 
 impl ListingAvionicsValue {
     fn from_parsed(item: ParsedAvionics) -> Self {
         Self {
+            avionics_model_id: None,
             manufacturer: item.manufacturer,
             model: item.model,
-            avionics_type: item.avionics_type,
+            avionics_types: item.avionics_types,
             quantity: item.quantity,
             source: "listing".to_string(),
-            source_notes: None,
-            introduced_year: None,
-            estimated_unit_value_usd: None,
-            value_reference_year: None,
+            source_notes: item.source_evidence_text,
+            source_confidence: item.source_confidence,
+            configuration_action: item.configuration_action,
+            replaces: item.replaces,
+            replaces_avionics_model_id: None,
         }
     }
-}
-
-#[derive(Debug, FromRow)]
-struct VerifiedAvionicsModelRow {
-    manufacturer: String,
-    model: String,
-    avionics_type: String,
-    introduced_year: i64,
-    estimated_unit_value_usd: f64,
-    value_reference_year: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -226,11 +251,28 @@ struct ListingRow {
     currency: String,
     added_at: String,
     status: String,
+    ingestion_state: String,
+    ingestion_error: Option<String>,
+    ingestion_completed_at: Option<String>,
     registration_number: Option<String>,
     serial_number: Option<String>,
     airframe_hours: f64,
-    engine_hours: f64,
-    propeller_hours: f64,
+    engine_hours: Option<f64>,
+    engine_time_basis: String,
+    engine_time_evidence: Option<String>,
+    engine_time_confidence: Option<String>,
+    propeller_hours: Option<f64>,
+    propeller_time_basis: String,
+    propeller_time_evidence: Option<String>,
+    propeller_time_confidence: Option<String>,
+    installed_engine_model_id: Option<i64>,
+    installed_engine_source_url: Option<String>,
+    installed_engine_evidence_text: Option<String>,
+    installed_engine_confidence: Option<String>,
+    installed_propeller_model_id: Option<i64>,
+    installed_propeller_source_url: Option<String>,
+    installed_propeller_evidence_text: Option<String>,
+    installed_propeller_confidence: Option<String>,
     created_at: String,
     updated_at: String,
     aircraft_manufacturer: String,
@@ -239,17 +281,50 @@ struct ListingRow {
 }
 
 #[derive(Debug, FromRow)]
-struct ParsedAvionicsRow {
+struct ListingFactRow {
+    fact_kind: String,
+    fact_value: String,
+    evidence_text: String,
+    source_url: Option<String>,
+    source_confidence: String,
+}
+
+#[derive(Debug, FromRow)]
+struct InstalledComponentIdentityRow {
     manufacturer: String,
     model: String,
-    avionics_type: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ParsedAvionicsRow {
+    avionics_model_id: i64,
+    manufacturer: String,
+    model: String,
     quantity: i64,
+    configuration_action: String,
+    source_notes: Option<String>,
+    source_confidence: Option<String>,
+    replaces_avionics_model_id: Option<i64>,
+    replaces_manufacturer: Option<String>,
+    replaces_model: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct AvionicsCapabilityRow {
+    avionics_model_id: i64,
+    avionics_type: String,
 }
 
 #[derive(Debug, FromRow)]
 struct ListingOwnerRow {
     created_by_user_id: i64,
     is_verified: bool,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct MissingIdentitySourceCandidateRow {
+    id: i64,
+    serial_number: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -284,6 +359,11 @@ struct ModelVariantRow {
 struct AircraftModelGroupRow {
     aircraft_manufacturer: String,
     aircraft_model: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ListingAdmissionRow {
+    listing_id: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -369,6 +449,38 @@ pub async fn create_listing_with_progress(
         "Verifying extracted listing fields",
     );
     let mut values = values_from_preview(preview, original_listing)?;
+    let missing_identity_source_candidate = match values.source_url.as_deref() {
+        Some(source_url) => {
+            unverified_listing_for_missing_identity_source(db, user_id, source_url).await?
+        }
+        None => None,
+    };
+    let admission_serial = serial_evidence_for_identity_repair_admission(
+        values.serial_number.as_deref(),
+        missing_identity_source_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.serial_number.as_deref()),
+    )?;
+    let grounding = require_aircraft_admission(
+        db,
+        values.registration_number.as_deref(),
+        admission_serial.as_deref(),
+    )
+    .await
+    .map_err(listing_admission_error)?;
+    apply_faa_grounding_identity(&mut values, &grounding);
+    let identity_repair_listing_id = match (
+        values.source_url.as_deref(),
+        missing_identity_source_candidate.as_ref(),
+    ) {
+        (Some(source_url), Some(candidate)) => {
+            persist_faa_identity_for_missing_identity_source(
+                db, user_id, source_url, candidate, &grounding,
+            )
+            .await?
+        }
+        _ => None,
+    };
     emit_listing_progress(
         progress,
         "normalizing_aircraft",
@@ -389,6 +501,22 @@ pub async fn create_listing_with_progress(
     )
     .await?;
 
+    // Prefer the exact source row repaired above. Looking it up again by tail
+    // could select a different, newer listing if the user has retained more
+    // than one observation for the same aircraft.
+    if let Some(listing_id) = identity_repair_listing_id {
+        emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
+        update_listing_values(db, listing_id, &values, true).await?;
+        emit_listing_progress(
+            progress,
+            "refreshing_estimates",
+            "Refreshing valuation inputs",
+        );
+        finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
+            .await?;
+        return get_listing(db, user_id, listing_id).await;
+    }
+
     if let Some(registration_number) = &values.registration_number {
         if let Some(listing_id) =
             unverified_listing_id_for_tail(db, user_id, registration_number).await?
@@ -400,7 +528,24 @@ pub async fn create_listing_with_progress(
                 "refreshing_estimates",
                 "Refreshing valuation inputs",
             );
-            complete_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
+            finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
+                .await?;
+            return get_listing(db, user_id, listing_id).await;
+        }
+    }
+
+    if let Some(source_url) = values.source_url.as_deref() {
+        if let Some(listing_id) =
+            unverified_listing_id_for_missing_identity_source(db, user_id, source_url).await?
+        {
+            emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
+            update_listing_values(db, listing_id, &values, true).await?;
+            emit_listing_progress(
+                progress,
+                "refreshing_estimates",
+                "Refreshing valuation inputs",
+            );
+            finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
                 .await?;
             return get_listing(db, user_id, listing_id).await;
         }
@@ -414,7 +559,8 @@ pub async fn create_listing_with_progress(
             "refreshing_estimates",
             "Refreshing valuation inputs",
         );
-        complete_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
+        mark_listing_incomplete(db, listing_id).await?;
+        finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
             .await?;
         return get_listing(db, user_id, listing_id).await;
     }
@@ -426,7 +572,7 @@ pub async fn create_listing_with_progress(
         "refreshing_estimates",
         "Refreshing valuation inputs",
     );
-    complete_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
+    finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
     get_listing(db, user_id, listing_id).await
 }
 
@@ -452,6 +598,16 @@ pub async fn heal_aircraft_models(
         ));
     }
     let model_groups = aircraft_model_groups(db, limit).await?;
+    // Preflight the complete bounded run before calling Gemini or mutating any
+    // model. A later ungrounded group must not leave a partially healed batch.
+    for model_group in &model_groups {
+        require_model_listings_faa_admitted(
+            db,
+            &model_group.aircraft_manufacturer,
+            &model_group.aircraft_model,
+        )
+        .await?;
+    }
     let mut reports = Vec::with_capacity(model_groups.len());
     for model_group in model_groups {
         reports.push(
@@ -473,6 +629,17 @@ pub async fn heal_aircraft_models(
 }
 
 pub async fn normalize_variants_for_model(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    manufacturer: &str,
+    model: &str,
+    apply: bool,
+) -> StoreResult<VariantNormalizationReport> {
+    require_model_listings_faa_admitted(db, manufacturer, model).await?;
+    normalize_variants_for_model_after_admission(db, extractor, manufacturer, model, apply).await
+}
+
+async fn normalize_variants_for_model_after_admission(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
     manufacturer: &str,
@@ -629,6 +796,49 @@ pub async fn normalize_variants_for_model(
     })
 }
 
+async fn require_model_listings_faa_admitted(
+    db: &AppDb,
+    manufacturer: &str,
+    model: &str,
+) -> StoreResult<()> {
+    let manufacturer_key = normalize_name(manufacturer);
+    let model_key = normalize_name(model);
+    let listings = query_as_all!(
+        db,
+        ListingAdmissionRow,
+        r#"
+        SELECT listing.id AS listing_id
+        FROM aircraft_sale_listings listing
+        JOIN aircraft_model_variants variant
+          ON variant.id = listing.aircraft_model_variant_id
+        JOIN aircraft_models model
+          ON model.id = variant.aircraft_model_id
+        JOIN aircraft_manufacturers manufacturer
+          ON manufacturer.id = model.aircraft_manufacturer_id
+        WHERE manufacturer.normalized_name = ?
+          AND model.normalized_name = ?
+        ORDER BY listing.id
+        "#,
+        manufacturer_key.as_str(),
+        model_key.as_str()
+    )?;
+    for listing in listings {
+        require_listing_admission(db, listing.listing_id)
+            .await
+            .map_err(listing_admission_error)?;
+    }
+    Ok(())
+}
+
+fn listing_admission_error(error: AircraftAdmissionError) -> ListingStoreError {
+    let message = error.to_string();
+    match error {
+        AircraftAdmissionError::Rejected { .. } => ListingStoreError::Validation(message),
+        AircraftAdmissionError::LookupFailed { .. }
+        | AircraftAdmissionError::ListingNotFound { .. } => ListingStoreError::State(message),
+    }
+}
+
 pub async fn list_listings(db: &AppDb, user_id: i64) -> StoreResult<Vec<SaleListing>> {
     let rows = query_as_all!(
         db,
@@ -702,6 +912,14 @@ pub async fn update_listing(
     let old_model_id = current.aircraft.aircraft_model_id;
     let mut values = values_from_listing(&current);
     merge_update_fields(&mut values, listing)?;
+    let grounding = require_aircraft_admission(
+        db,
+        values.registration_number.as_deref(),
+        values.serial_number.as_deref(),
+    )
+    .await
+    .map_err(listing_admission_error)?;
+    apply_faa_grounding_identity(&mut values, &grounding);
     let source_url = values.source_url.clone();
     correct_nonconforming_variant_label_with_context(
         &mut values,
@@ -713,7 +931,7 @@ pub async fn update_listing(
     resolve_listing_avionics_values(db, &mut values, extractor, source_url.as_deref(), None)
         .await?;
     update_listing_values(db, listing_id, &values, false).await?;
-    complete_listing_ingestion(db, listing_id, extractor, None).await?;
+    finalize_listing_ingestion(db, listing_id, extractor, None).await?;
     let updated = get_listing(db, user_id, listing_id).await?;
     if updated.aircraft.aircraft_model_id != old_model_id {
         mark_valuation_snapshot_stale_best_effort(db, old_model_id).await;
@@ -769,6 +987,8 @@ async fn insert_listing(db: &AppDb, user_id: i64, values: &ListingValues) -> Sto
     let aircraft_model_variant_id =
         ensure_aircraft_model_variant(db, &values.manufacturer, &values.model, &values.variant)
             .await?;
+    let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
+    let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;
     let listing_id = query_scalar_one!(
         db,
         i64,
@@ -783,13 +1003,28 @@ async fn insert_listing(db: &AppDb, user_id: i64, values: &ListingValues) -> Sto
           currency,
           added_at,
           status,
+          ingestion_state,
           registration_number,
           serial_number,
           airframe_hours,
           engine_hours,
-          propeller_hours
+          engine_time_basis,
+          engine_time_evidence,
+          engine_time_confidence,
+          propeller_hours,
+          propeller_time_basis,
+          propeller_time_evidence,
+          propeller_time_confidence,
+          installed_engine_model_id,
+          installed_engine_source_url,
+          installed_engine_evidence_text,
+          installed_engine_confidence,
+          installed_propeller_model_id,
+          installed_propeller_source_url,
+          installed_propeller_evidence_text,
+          installed_propeller_confidence
         )
-        VALUES (?, ?, FALSE, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, FALSE, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
         aircraft_model_variant_id,
@@ -803,10 +1038,29 @@ async fn insert_listing(db: &AppDb, user_id: i64, values: &ListingValues) -> Sto
         values.serial_number.as_deref(),
         values.airframe_hours,
         values.engine_hours,
-        values.propeller_hours
+        values.engine_time_basis.as_str(),
+        values.engine_time_evidence.as_deref(),
+        values.engine_time_confidence.as_deref(),
+        values.propeller_hours,
+        values.propeller_time_basis.as_str(),
+        values.propeller_time_evidence.as_deref(),
+        values.propeller_time_confidence.as_deref(),
+        installed_engine_model_id,
+        installed_engine_model_id.and(values.source_url.as_deref()),
+        values.installed_engine_evidence_text.as_deref(),
+        values.installed_engine_confidence.as_deref(),
+        installed_propeller_model_id,
+        installed_propeller_model_id.and(values.source_url.as_deref()),
+        values.installed_propeller_evidence_text.as_deref(),
+        values.installed_propeller_confidence.as_deref()
     )?;
 
-    replace_listing_avionics(db, listing_id, &values.avionics).await?;
+    if let Err(error) = replace_listing_avionics(db, listing_id, &values.avionics).await {
+        return quarantine_after_error(db, listing_id, error).await;
+    }
+    if let Err(error) = replace_listing_facts(db, listing_id, values).await {
+        return quarantine_after_error(db, listing_id, error).await;
+    }
     Ok(listing_id)
 }
 
@@ -819,6 +1073,8 @@ async fn update_listing_values(
     let aircraft_model_variant_id =
         ensure_aircraft_model_variant(db, &values.manufacturer, &values.model, &values.variant)
             .await?;
+    let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
+    let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;
     let added_at_assignment = if update_added_at {
         ", added_at = CURRENT_TIMESTAMP"
     } else {
@@ -834,11 +1090,28 @@ async fn update_listing_values(
               asking_price_usd = ?,
               currency = ?,
               status = ?,
+              ingestion_state = 'incomplete',
+              ingestion_error = NULL,
+              ingestion_completed_at = NULL,
               registration_number = ?,
               serial_number = ?,
               airframe_hours = ?,
               engine_hours = ?,
+              engine_time_basis = ?,
+              engine_time_evidence = ?,
+              engine_time_confidence = ?,
               propeller_hours = ?,
+              propeller_time_basis = ?,
+              propeller_time_evidence = ?,
+              propeller_time_confidence = ?,
+              installed_engine_model_id = ?,
+              installed_engine_source_url = ?,
+              installed_engine_evidence_text = ?,
+              installed_engine_confidence = ?,
+              installed_propeller_model_id = ?,
+              installed_propeller_source_url = ?,
+              installed_propeller_evidence_text = ?,
+              installed_propeller_confidence = ?,
               updated_at = CURRENT_TIMESTAMP
               {added_at_assignment}
             WHERE id = ?
@@ -857,10 +1130,29 @@ async fn update_listing_values(
         values.serial_number.as_deref(),
         values.airframe_hours,
         values.engine_hours,
+        values.engine_time_basis.as_str(),
+        values.engine_time_evidence.as_deref(),
+        values.engine_time_confidence.as_deref(),
         values.propeller_hours,
+        values.propeller_time_basis.as_str(),
+        values.propeller_time_evidence.as_deref(),
+        values.propeller_time_confidence.as_deref(),
+        installed_engine_model_id,
+        installed_engine_model_id.and(values.source_url.as_deref()),
+        values.installed_engine_evidence_text.as_deref(),
+        values.installed_engine_confidence.as_deref(),
+        installed_propeller_model_id,
+        installed_propeller_model_id.and(values.source_url.as_deref()),
+        values.installed_propeller_evidence_text.as_deref(),
+        values.installed_propeller_confidence.as_deref(),
         listing_id
     )?;
-    replace_listing_avionics(db, listing_id, &values.avionics).await?;
+    if let Err(error) = replace_listing_avionics(db, listing_id, &values.avionics).await {
+        return quarantine_after_error(db, listing_id, error).await;
+    }
+    if let Err(error) = replace_listing_facts(db, listing_id, values).await {
+        return quarantine_after_error(db, listing_id, error).await;
+    }
     Ok(())
 }
 
@@ -881,15 +1173,43 @@ fn values_from_preview(
         registration_number: parsed.registration_number.clone(),
         serial_number: parsed.serial_number.clone(),
         airframe_hours: required_f64(parsed.airframe_hours, "airframe_hours")?,
-        engine_hours: required_f64(parsed.engine_hours, "engine_hours")?,
-        propeller_hours: required_f64(parsed.propeller_hours, "propeller_hours")?,
+        engine_hours: parsed.engine_hours,
+        engine_time_basis: parsed.engine_time_basis.clone(),
+        engine_time_evidence: parsed.engine_time_evidence.clone(),
+        engine_time_confidence: parsed.engine_time_confidence.clone(),
+        propeller_hours: parsed.propeller_hours,
+        propeller_time_basis: parsed.propeller_time_basis.clone(),
+        propeller_time_evidence: parsed.propeller_time_evidence.clone(),
+        propeller_time_confidence: parsed.propeller_time_confidence.clone(),
+        installed_engine_model_id: None,
+        installed_engine: parsed.installed_engine.clone(),
+        installed_engine_evidence_text: parsed
+            .installed_engine
+            .as_ref()
+            .map(|component| component.evidence_text.clone()),
+        installed_engine_confidence: parsed
+            .installed_engine
+            .as_ref()
+            .map(|component| component.confidence.clone()),
+        installed_propeller_model_id: None,
+        installed_propeller: parsed.installed_propeller.clone(),
+        installed_propeller_evidence_text: parsed
+            .installed_propeller
+            .as_ref()
+            .map(|component| component.evidence_text.clone()),
+        installed_propeller_confidence: parsed
+            .installed_propeller
+            .as_ref()
+            .map(|component| component.confidence.clone()),
         avionics: parsed
             .avionics
             .clone()
             .into_iter()
             .map(ListingAvionicsValue::from_parsed)
             .collect(),
+        valuation_facts: parsed.valuation_facts.clone(),
     };
+    validate_listing_values(&values)?;
     Ok(values)
 }
 
@@ -1026,455 +1346,348 @@ async fn resolve_listing_avionics_values(
     source_url: Option<&str>,
     listing_context: Option<&str>,
 ) -> StoreResult<()> {
-    let Some(extractor) = extractor else {
-        values
-            .avionics
-            .retain(|item| is_usable_avionics_label(&item.manufacturer, &item.model));
-        return Ok(());
-    };
     let listing_context = listing_context
         .map(listing_context_excerpt)
         .unwrap_or_default();
-    let mut resolved = Vec::new();
-    let mut seen = HashSet::new();
+    let mut resolved: Vec<ListingAvionicsValue> = Vec::new();
+    let mut unresolved = Vec::new();
 
     for item in values.avionics.clone() {
-        if let Some(cached) = existing_verified_avionics_value(db, &item).await? {
-            let key = (
-                normalize_name(&cached.manufacturer),
-                normalize_avionics_model_name(&cached.model),
-                normalize_name(&cached.avionics_type),
-            );
-            if seen.insert(key) {
-                resolved.push(cached);
-            }
+        let Some(extractor) = extractor else {
+            unresolved.push(format!(
+                "{} {} (Gemini identity resolver unavailable)",
+                item.manufacturer, item.model
+            ));
             continue;
-        }
-        let context = AvionicsUnitResolutionContext {
-            aircraft_manufacturer: values.manufacturer.clone(),
-            aircraft_model: values.model.clone(),
-            aircraft_variant: values.variant.clone(),
-            model_year: values.model_year,
-            source_url: source_url.unwrap_or("").to_string(),
-            listing_context: listing_context.clone(),
-            candidate: AvionicsUnitResolutionCandidate {
-                manufacturer: item.manufacturer.clone(),
-                model: item.model.clone(),
-                avionics_type: item.avionics_type.clone(),
-                quantity: item.quantity.max(1),
-            },
-            value_reference_year: AVIONICS_VALUE_REFERENCE_YEAR,
         };
-        let (resolution_result, secondary_check_result) = tokio::join!(
-            extractor.resolve_avionics_unit(&context),
-            extractor.classify_avionics_unit_concreteness(&context)
+        let identity_request = listing_avionics_identity_request(
+            values,
+            source_url,
+            &listing_context,
+            &item.manufacturer,
+            &item.model,
+            &item.avionics_types,
+            item.quantity,
         );
-        let mut response = resolution_result.map_err(|error| {
-            ListingStoreError::State(format!(
-                "Gemini avionics unit grounding failed for {} {}: {error:#}",
-                item.manufacturer, item.model
-            ))
-        })?;
-        let secondary_check = secondary_check_result.map_err(|error| {
-            ListingStoreError::State(format!(
-                "Gemini avionics concreteness check failed for {} {}: {error:#}",
-                item.manufacturer, item.model
-            ))
-        })?;
-        let mut issues = avionics_resolution_review_issues(&context, &response);
-        issues.extend(avionics_secondary_check_review_issues(
-            &context,
-            &response,
-            &secondary_check,
-        ));
-        if !issues.is_empty() {
-            response = extractor
-                .correct_avionics_unit_resolution(
-                    &context,
-                    &response,
-                    &AvionicsUnitResolutionCorrectionContext {
-                        issues,
-                        secondary_check: Some(secondary_check),
-                    },
-                )
-                .await
-                .map_err(|error| {
-                    ListingStoreError::State(format!(
-                        "Gemini avionics unit correction failed for {} {}: {error:#}",
-                        item.manufacturer, item.model
-                    ))
-                })?;
-            let remaining_issues = avionics_resolution_review_issues(&context, &response);
-            if !remaining_issues.is_empty() {
+        let identity = match resolve_avionics_identity(db, extractor, &identity_request)
+            .await
+            .map_err(|error| {
+                ListingStoreError::State(format!(
+                    "avionics identity resolution failed for {} {}: {error}",
+                    item.manufacturer, item.model
+                ))
+            })? {
+            AvionicsIdentityOutcome::Approved(identity) => identity,
+            AvionicsIdentityOutcome::Rejected { .. } => continue,
+            AvionicsIdentityOutcome::Unresolved { reason } => {
+                unresolved.push(format!("{} {} ({reason})", item.manufacturer, item.model));
                 continue;
             }
-        }
-        let Some(resolved_item) = listing_avionics_value_from_resolution(&item, &response)? else {
+        };
+        let resolved_item = listing_avionics_value_from_catalog(&item, &identity);
+        let Some(resolved_item) = resolve_listing_avionics_replacement(
+            db,
+            values,
+            resolved_item,
+            extractor,
+            source_url,
+            &listing_context,
+            &mut unresolved,
+        )
+        .await?
+        else {
             continue;
         };
-        let key = (
-            normalize_name(&resolved_item.manufacturer),
-            normalize_avionics_model_name(&resolved_item.model),
-            normalize_name(&resolved_item.avionics_type),
-        );
-        if seen.insert(key) {
-            resolved.push(resolved_item);
-        }
+        resolved.push(resolved_item);
     }
 
-    values.avionics = resolved;
+    if !unresolved.is_empty() {
+        unresolved.sort();
+        unresolved.dedup();
+        return Err(ListingStoreError::Validation(format!(
+            "unresolved avionics catalog mappings: {}",
+            unresolved.join(", ")
+        )));
+    }
+    values.avionics = coalesce_resolved_listing_avionics(resolved)?;
     Ok(())
 }
 
-fn avionics_resolution_review_issues(
-    context: &AvionicsUnitResolutionContext,
-    response: &Value,
-) -> Vec<String> {
-    let mut issues = Vec::new();
-    let status = response
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if status == "reject" {
-        return issues;
+fn listing_avionics_identity_request(
+    values: &ListingValues,
+    source_url: Option<&str>,
+    listing_context: &str,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+    quantity: i64,
+) -> AvionicsIdentityRequest {
+    AvionicsIdentityRequest {
+        aircraft_manufacturer: values.manufacturer.clone(),
+        aircraft_model: values.model.clone(),
+        aircraft_variant: values.variant.clone(),
+        model_year: values.model_year,
+        source_url: source_url.unwrap_or("").to_string(),
+        listing_context: listing_context.to_string(),
+        requires_listing_evidence: true,
+        manufacturer: manufacturer.to_string(),
+        model: model.to_string(),
+        avionics_types: avionics_types.to_vec(),
+        quantity: quantity.max(1),
     }
-    if status != "concrete" && status != "factory_default" {
-        issues.push("status must be concrete, factory_default, or reject".to_string());
-        return issues;
-    }
-
-    let manufacturer = response
-        .get("manufacturer")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let model = response
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let avionics_type = response
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let source_url = response
-        .get("source_url")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let source_title = response
-        .get("source_title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let confidence = response
-        .get("confidence")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let notes = response
-        .get("notes")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-
-    if !is_usable_avionics_label(manufacturer, model) {
-        issues.push("manufacturer/model is empty or uses a generic manufacturer label".to_string());
-    }
-    if source_url.is_empty() || source_title.is_empty() {
-        issues.push(
-            "concrete or factory_default resolution must include a source_url and source_title"
-                .to_string(),
-        );
-    }
-    if confidence == "low" {
-        issues.push("low confidence cannot be stored as verified avionics metadata".to_string());
-    }
-    if manufacturer.contains('(') || manufacturer.contains(')') {
-        issues.push(
-            "manufacturer contains a parenthetical alias; return the verified avionics maker only"
-                .to_string(),
-        );
-    }
-
-    let manufacturer_norm = normalize_name(manufacturer);
-    let aircraft_manufacturer_norm = normalize_name(&context.aircraft_manufacturer);
-    if !aircraft_manufacturer_norm.is_empty()
-        && (manufacturer_norm == aircraft_manufacturer_norm
-            || manufacturer_norm
-                .split_whitespace()
-                .any(|token| token == aircraft_manufacturer_norm))
-    {
-        issues.push(
-            "manufacturer appears to be the aircraft maker or an aircraft-maker alias, not the avionics maker"
-                .to_string(),
-        );
-    }
-
-    let model_norm = normalize_avionics_model_name(model);
-    let type_norm = normalize_name(avionics_type);
-    if !type_norm.is_empty()
-        && (model_norm == type_norm
-            || (!model_has_specific_designator(model)
-                && model_norm.ends_with(&format!(" {type_norm}"))))
-    {
-        issues.push(
-            "model appears to be only an equipment class or capability instead of a concrete unit"
-                .to_string(),
-        );
-    }
-    if model_norm
-        .split_whitespace()
-        .any(|token| token == "series" || token == "family")
-    {
-        issues.push(
-            "model appears to be a broad product series/family instead of one exact unit"
-                .to_string(),
-        );
-    }
-    if combines_multiple_model_numbers(model) {
-        issues.push(
-            "model appears to combine multiple possible units; return one exact unit or reject"
-                .to_string(),
-        );
-    }
-    let notes_norm = normalize_name(notes);
-    if status == "concrete"
-        && (notes_norm.contains(" generic ")
-            || notes_norm.starts_with("generic ")
-            || notes_norm.ends_with(" generic"))
-    {
-        issues.push("notes describe the candidate as generic while status is concrete".to_string());
-    }
-
-    issues
 }
 
-fn avionics_secondary_check_review_issues(
-    context: &AvionicsUnitResolutionContext,
-    response: &Value,
-    secondary_check: &Value,
-) -> Vec<String> {
-    let mut issues = Vec::new();
-    let status = response
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if status != "concrete" {
-        return issues;
+async fn resolve_listing_avionics_replacement(
+    db: &AppDb,
+    values: &ListingValues,
+    mut item: ListingAvionicsValue,
+    extractor: &GeminiListingExtractor,
+    source_url: Option<&str>,
+    listing_context: &str,
+    unresolved: &mut Vec<String>,
+) -> StoreResult<Option<ListingAvionicsValue>> {
+    if item.configuration_action == "installed" {
+        if item.replaces.is_some() || item.replaces_avionics_model_id.is_some() {
+            return Err(ListingStoreError::Validation(format!(
+                "installed avionics cannot also declare a replacement target: {} {}",
+                item.manufacturer, item.model
+            )));
+        }
+        return Ok(Some(item));
     }
-
-    let classification = secondary_check
-        .get("classification")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let confidence = secondary_check
-        .get("confidence")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if confidence == "low" {
-        return issues;
-    }
-
-    let response_manufacturer = response
-        .get("manufacturer")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let response_model = response
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let same_candidate_label = normalize_name(response_manufacturer)
-        == normalize_name(&context.candidate.manufacturer)
-        && normalize_avionics_model_name(response_model)
-            == normalize_avionics_model_name(&context.candidate.model);
-
-    if same_candidate_label && (classification == "generic" || classification == "ambiguous") {
-        issues.push(format!(
-            "secondary classifier marked the original candidate as {classification}; do not store the unchanged candidate as concrete unless a source proves it is one exact unit"
-        ));
-    }
-    if same_candidate_label
-        && secondary_check
-            .get("manufacturer_is_avionics_maker")
-            .and_then(Value::as_bool)
-            == Some(false)
-    {
-        issues.push(
-            "secondary classifier says the candidate manufacturer is not a verified avionics maker"
-                .to_string(),
-        );
-    }
-    if same_candidate_label
-        && secondary_check
-            .get("model_identifies_single_unit")
-            .and_then(Value::as_bool)
-            == Some(false)
-    {
-        issues.push(
-            "secondary classifier says the candidate model does not identify one exact unit"
-                .to_string(),
-        );
-    }
-
-    issues
+    let Some(replaced) = item.replaces.as_ref() else {
+        return Err(ListingStoreError::Validation(format!(
+            "avionics action {} requires a concrete replacement target: {} {}",
+            item.configuration_action, item.manufacturer, item.model
+        )));
+    };
+    let request = listing_avionics_identity_request(
+        values,
+        source_url,
+        listing_context,
+        &replaced.manufacturer,
+        &replaced.model,
+        &replaced.avionics_types,
+        1,
+    );
+    let identity = match resolve_avionics_identity(db, extractor, &request)
+        .await
+        .map_err(|error| {
+            ListingStoreError::State(format!(
+                "replacement avionics identity resolution failed for {} {}: {error}",
+                replaced.manufacturer, replaced.model
+            ))
+        })? {
+        AvionicsIdentityOutcome::Approved(identity) => identity,
+        AvionicsIdentityOutcome::Rejected { reason }
+        | AvionicsIdentityOutcome::Unresolved { reason } => {
+            unresolved.push(format!(
+                "replacement {} {} ({reason})",
+                replaced.manufacturer, replaced.model
+            ));
+            return Ok(None);
+        }
+    };
+    item.replaces = Some(ParsedAvionicsReference {
+        manufacturer: identity.manufacturer.clone(),
+        model: identity.model.clone(),
+        avionics_types: identity.avionics_types.clone(),
+    });
+    item.replaces_avionics_model_id = Some(identity.id);
+    Ok(Some(item))
 }
 
-fn model_has_specific_designator(value: &str) -> bool {
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '+')
-        .any(|token| {
-            token.chars().any(|character| character.is_ascii_digit()) || token.contains('+')
-        })
+fn listing_avionics_value_from_catalog(
+    original: &ListingAvionicsValue,
+    identity: &ApprovedAvionicsIdentity,
+) -> ListingAvionicsValue {
+    let identity_notes = format!(
+        "Curated catalog id {}; {} Evidence: {} — {}",
+        identity.id, identity.reason, identity.evidence_title, identity.evidence
+    );
+    let source_notes = original
+        .source_notes
+        .as_deref()
+        .map(|notes| format!("{notes} {identity_notes}"))
+        .unwrap_or(identity_notes);
+    ListingAvionicsValue {
+        avionics_model_id: Some(identity.id),
+        manufacturer: identity.manufacturer.clone(),
+        model: identity.model.clone(),
+        avionics_types: identity.avionics_types.clone(),
+        quantity: original.quantity.max(1),
+        source: original.source.clone(),
+        source_notes: Some(source_notes),
+        // Product identity and installation evidence are independent. A
+        // grounded catalog match must never upgrade a weak listing mention.
+        source_confidence: original.source_confidence.clone(),
+        configuration_action: original.configuration_action.clone(),
+        replaces: original.replaces.clone(),
+        replaces_avionics_model_id: original.replaces_avionics_model_id,
+    }
 }
 
-fn combines_multiple_model_numbers(value: &str) -> bool {
-    if !value.contains('/') {
-        return false;
-    }
-    let mut numeric_groups = 0;
-    let mut in_digits = false;
-    for character in value.chars() {
-        if character.is_ascii_digit() {
-            if !in_digits {
-                numeric_groups += 1;
-                in_digits = true;
-            }
-        } else {
-            in_digits = false;
+fn merged_avionics_types(left: &[String], right: &[String]) -> Vec<String> {
+    let mut merged = left.to_vec();
+    for avionics_type in right {
+        if !merged
+            .iter()
+            .any(|known| normalize_name(known) == normalize_name(avionics_type))
+        {
+            merged.push(avionics_type.clone());
         }
     }
-    numeric_groups > 1
+    merged.sort_by_key(|value| normalize_name(value));
+    merged
 }
 
-async fn existing_verified_avionics_value(
-    db: &AppDb,
-    item: &ListingAvionicsValue,
-) -> StoreResult<Option<ListingAvionicsValue>> {
-    if !is_usable_avionics_label(&item.manufacturer, &item.model) {
-        return Ok(None);
+fn merge_duplicate_listing_avionics(
+    existing: &mut ListingAvionicsValue,
+    incoming: &ListingAvionicsValue,
+) -> StoreResult<()> {
+    let existing_model_id = existing.avionics_model_id.filter(|id| *id > 0);
+    let incoming_model_id = incoming.avionics_model_id.filter(|id| *id > 0);
+    if existing_model_id.is_none() || existing_model_id != incoming_model_id {
+        return Err(ListingStoreError::State(
+            "only rows for the same resolved avionics catalog product can be coalesced".to_string(),
+        ));
     }
-    let manufacturer = normalize_name(&item.manufacturer);
-    let avionics_type = normalize_name(&item.avionics_type);
-    let model = normalize_avionics_model_name(&item.model);
-    let row = query_as_optional!(
-        db,
-        VerifiedAvionicsModelRow,
-        r#"
-        SELECT
-          mfr.name AS manufacturer,
-          model.name AS model,
-          avionics_type.name AS avionics_type,
-          model.introduced_year,
-          model.estimated_unit_value_usd,
-          model.value_reference_year
-        FROM avionics_models model
-        JOIN avionics_manufacturers mfr
-          ON mfr.id = model.avionics_manufacturer_id
-        JOIN avionics_types avionics_type
-          ON avionics_type.id = model.avionics_type_id
-        WHERE mfr.normalized_name = ?
-          AND avionics_type.normalized_name = ?
-          AND model.normalized_name = ?
-          AND model.introduced_year IS NOT NULL
-          AND model.estimated_unit_value_usd IS NOT NULL
-          AND model.value_reference_year IS NOT NULL
-        "#,
-        manufacturer.as_str(),
-        avionics_type.as_str(),
-        model.as_str()
+    if normalize_avionics_manufacturer_name(&existing.manufacturer)
+        != normalize_avionics_manufacturer_name(&incoming.manufacturer)
+        || normalize_avionics_model_name(&existing.model)
+            != normalize_avionics_model_name(&incoming.model)
+    {
+        return Err(ListingStoreError::Validation(format!(
+            "catalog avionics model {} was paired with conflicting canonical identities",
+            existing_model_id.expect("resolved catalog id checked above")
+        )));
+    }
+
+    let replacement_semantics_match = match existing.configuration_action.as_str() {
+        "installed" => {
+            incoming.configuration_action == "installed"
+                && existing.replaces.is_none()
+                && incoming.replaces.is_none()
+                && existing.replaces_avionics_model_id.is_none()
+                && incoming.replaces_avionics_model_id.is_none()
+        }
+        "replaces" | "removes" => {
+            incoming.configuration_action == existing.configuration_action
+                && matches!(
+                    (
+                        existing.replaces_avionics_model_id,
+                        incoming.replaces_avionics_model_id
+                    ),
+                    (Some(existing_target), Some(incoming_target))
+                        if existing_target > 0 && existing_target == incoming_target
+                )
+                && matching_avionics_reference(
+                    existing.replaces.as_ref(),
+                    incoming.replaces.as_ref(),
+                )
+        }
+        _ => false,
+    };
+    if !replacement_semantics_match {
+        return Err(ListingStoreError::Validation(format!(
+            "catalog avionics model {} has conflicting installation actions or replacement targets",
+            existing_model_id.expect("resolved catalog id checked above")
+        )));
+    }
+
+    // Multiple capability mentions describe one physical unit, not additive
+    // quantities. Preserve all evidence, and let the weakest mention govern
+    // confidence so a strong duplicate cannot upgrade a weak one.
+    existing.quantity = existing.quantity.max(incoming.quantity);
+    existing.avionics_types =
+        merged_avionics_types(&existing.avionics_types, &incoming.avionics_types);
+    existing.source_notes = merged_source_notes(
+        existing.source_notes.as_deref(),
+        incoming.source_notes.as_deref(),
+    );
+    existing.source_confidence = conservative_source_confidence(
+        existing.source_confidence.as_deref(),
+        incoming.source_confidence.as_deref(),
     )?;
-    Ok(row.map(|row| ListingAvionicsValue {
-        manufacturer: row.manufacturer,
-        model: row.model,
-        avionics_type: row.avionics_type,
-        quantity: item.quantity.max(1),
-        source: item.source.clone(),
-        source_notes: Some("reused previously grounded avionics metadata".to_string()),
-        introduced_year: Some(row.introduced_year),
-        estimated_unit_value_usd: Some(row.estimated_unit_value_usd),
-        value_reference_year: Some(row.value_reference_year),
-    }))
+    Ok(())
 }
 
-fn listing_avionics_value_from_resolution(
-    original: &ListingAvionicsValue,
-    response: &Value,
-) -> StoreResult<Option<ListingAvionicsValue>> {
-    let status = required_string(response.get("status").and_then(Value::as_str), "status")?;
-    if status == "reject" {
-        return Ok(None);
+fn matching_avionics_reference(
+    left: Option<&ParsedAvionicsReference>,
+    right: Option<&ParsedAvionicsReference>,
+) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    normalize_avionics_manufacturer_name(&left.manufacturer)
+        == normalize_avionics_manufacturer_name(&right.manufacturer)
+        && normalize_avionics_model_name(&left.model) == normalize_avionics_model_name(&right.model)
+        && canonical_avionics_types(&left.avionics_types)
+            == canonical_avionics_types(&right.avionics_types)
+}
+
+fn merged_source_notes(left: Option<&str>, right: Option<&str>) -> Option<String> {
+    let mut notes = Vec::new();
+    for note in [left, right].into_iter().flatten() {
+        for line in note.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if !notes.contains(&line) {
+                notes.push(line);
+            }
+        }
     }
-    if status != "concrete" && status != "factory_default" {
-        return Err(ListingStoreError::Validation(format!(
-            "Gemini avionics resolution returned invalid status: {status}"
-        )));
+    (!notes.is_empty()).then(|| notes.join("\n"))
+}
+
+fn conservative_source_confidence(
+    left: Option<&str>,
+    right: Option<&str>,
+) -> StoreResult<Option<String>> {
+    fn rank(confidence: &str) -> Option<u8> {
+        match confidence {
+            "low" => Some(0),
+            "medium" => Some(1),
+            "high" => Some(2),
+            _ => None,
+        }
     }
 
-    let manufacturer = required_string(
-        response.get("manufacturer").and_then(Value::as_str),
-        "manufacturer",
-    )?;
-    let model = required_string(response.get("model").and_then(Value::as_str), "model")?;
-    if !is_usable_avionics_label(&manufacturer, &model) {
+    for confidence in [left, right].into_iter().flatten() {
+        if rank(confidence).is_none() {
+            return Err(ListingStoreError::Validation(format!(
+                "invalid avionics source confidence while coalescing duplicates: {confidence}"
+            )));
+        }
+    }
+    let (Some(left), Some(right)) = (left, right) else {
         return Ok(None);
-    }
-    let avionics_type = required_string(response.get("type").and_then(Value::as_str), "type")?;
-    let introduced_year = required_i64(
-        response.get("introduced_year").and_then(Value::as_i64),
-        "introduced_year",
-    )?;
-    if introduced_year < 1900 || introduced_year > 2100 {
-        return Err(ListingStoreError::Validation(format!(
-            "Gemini avionics resolution introduced_year out of range: {introduced_year}"
-        )));
-    }
-    let estimated_unit_value_usd = required_f64(
-        response
-            .get("estimated_unit_value_usd")
-            .and_then(Value::as_f64),
-        "estimated_unit_value_usd",
-    )?;
-    if estimated_unit_value_usd < 0.0 {
-        return Err(ListingStoreError::Validation(format!(
-            "Gemini avionics resolution estimated_unit_value_usd must be non-negative: {estimated_unit_value_usd}"
-        )));
-    }
-    let notes = required_string(response.get("notes").and_then(Value::as_str), "notes")?;
-    let source = if status == "factory_default" {
-        "factory_default"
-    } else {
-        "listing"
     };
-    let source_notes = if status == "factory_default" {
-        Some(format!(
-            "Factory default replacement for rejected listing avionics '{} {}': {}",
-            original.manufacturer, original.model, notes
-        ))
-    } else {
-        Some(notes)
-    };
+    let left_rank = rank(left).expect("confidence values checked above");
+    let right_rank = rank(right).expect("confidence values checked above");
+    Ok(Some(
+        if left_rank <= right_rank { left } else { right }.to_string(),
+    ))
+}
 
-    Ok(Some(ListingAvionicsValue {
-        manufacturer,
-        model,
-        avionics_type,
-        quantity: optional_i64(response.get("quantity"))
-            .unwrap_or(original.quantity)
-            .max(1),
-        source: source.to_string(),
-        source_notes,
-        introduced_year: Some(introduced_year),
-        estimated_unit_value_usd: Some(estimated_unit_value_usd),
-        value_reference_year: Some(AVIONICS_VALUE_REFERENCE_YEAR),
-    }))
+fn coalesce_resolved_listing_avionics(
+    avionics: impl IntoIterator<Item = ListingAvionicsValue>,
+) -> StoreResult<Vec<ListingAvionicsValue>> {
+    let mut coalesced: Vec<ListingAvionicsValue> = Vec::new();
+    let mut seen = HashMap::<i64, usize>::new();
+    for item in avionics {
+        let avionics_model_id = item.avionics_model_id.filter(|id| *id > 0).ok_or_else(|| {
+            ListingStoreError::Validation(format!(
+                "avionics must resolve to a catalog id before persistence: {} {}",
+                item.manufacturer, item.model
+            ))
+        })?;
+        if let Some(index) = seen.get(&avionics_model_id).copied() {
+            merge_duplicate_listing_avionics(&mut coalesced[index], &item)?;
+        } else {
+            seen.insert(avionics_model_id, coalesced.len());
+            coalesced.push(item);
+        }
+    }
+    Ok(coalesced)
 }
 
 async fn canonicalize_variant_from_known_candidates(
@@ -2175,7 +2388,7 @@ fn token_dice_score(left_tokens: &HashSet<String>, right_tokens: &HashSet<String
     if left_tokens.is_empty() || right_tokens.is_empty() {
         return 0.0;
     }
-    let intersection = left_tokens.intersection(&right_tokens).count();
+    let intersection = left_tokens.intersection(right_tokens).count();
     (2.0 * intersection as f64) / (left_tokens.len() + right_tokens.len()) as f64
 }
 
@@ -2271,13 +2484,28 @@ fn values_from_listing(listing: &SaleListing) -> ListingValues {
         serial_number: listing.serial_number.clone(),
         airframe_hours: listing.airframe_hours,
         engine_hours: listing.engine_hours,
+        engine_time_basis: listing.engine_time_basis.clone(),
+        engine_time_evidence: listing.engine_time_evidence.clone(),
+        engine_time_confidence: listing.engine_time_confidence.clone(),
         propeller_hours: listing.propeller_hours,
+        propeller_time_basis: listing.propeller_time_basis.clone(),
+        propeller_time_evidence: listing.propeller_time_evidence.clone(),
+        propeller_time_confidence: listing.propeller_time_confidence.clone(),
+        installed_engine_model_id: listing.installed_engine_model_id,
+        installed_engine: None,
+        installed_engine_evidence_text: listing.installed_engine_evidence_text.clone(),
+        installed_engine_confidence: listing.installed_engine_confidence.clone(),
+        installed_propeller_model_id: listing.installed_propeller_model_id,
+        installed_propeller: None,
+        installed_propeller_evidence_text: listing.installed_propeller_evidence_text.clone(),
+        installed_propeller_confidence: listing.installed_propeller_confidence.clone(),
         avionics: listing
             .avionics
             .clone()
             .into_iter()
             .map(ListingAvionicsValue::from_parsed)
             .collect(),
+        valuation_facts: listing.valuation_facts.clone(),
     }
 }
 
@@ -2302,9 +2530,47 @@ fn merge_update_fields(values: &mut ListingValues, listing: &Value) -> StoreResu
             "airframe_hours" => {
                 values.airframe_hours = required_f64(optional_f64(Some(value)), key)?
             }
-            "engine_hours" => values.engine_hours = required_f64(optional_f64(Some(value)), key)?,
-            "propeller_hours" => {
-                values.propeller_hours = required_f64(optional_f64(Some(value)), key)?
+            "engine_hours" => values.engine_hours = optional_f64(Some(value)),
+            "engine_time_basis" => {
+                values.engine_time_basis = component_time_basis_from_value(value, key)?
+            }
+            "engine_time_evidence" => values.engine_time_evidence = optional_string(Some(value)),
+            "engine_time_confidence" => {
+                values.engine_time_confidence = optional_confidence_from_value(value, key)?
+            }
+            "propeller_hours" => values.propeller_hours = optional_f64(Some(value)),
+            "propeller_time_basis" => {
+                values.propeller_time_basis = component_time_basis_from_value(value, key)?
+            }
+            "propeller_time_evidence" => {
+                values.propeller_time_evidence = optional_string(Some(value))
+            }
+            "propeller_time_confidence" => {
+                values.propeller_time_confidence = optional_confidence_from_value(value, key)?
+            }
+            "installed_engine" => {
+                values.installed_engine = installed_component_from_value(value, key)?;
+                values.installed_engine_model_id = None;
+                values.installed_engine_evidence_text = values
+                    .installed_engine
+                    .as_ref()
+                    .map(|component| component.evidence_text.clone());
+                values.installed_engine_confidence = values
+                    .installed_engine
+                    .as_ref()
+                    .map(|component| component.confidence.clone());
+            }
+            "installed_propeller" => {
+                values.installed_propeller = installed_component_from_value(value, key)?;
+                values.installed_propeller_model_id = None;
+                values.installed_propeller_evidence_text = values
+                    .installed_propeller
+                    .as_ref()
+                    .map(|component| component.evidence_text.clone());
+                values.installed_propeller_confidence = values
+                    .installed_propeller
+                    .as_ref()
+                    .map(|component| component.confidence.clone());
             }
             "registration_number" => values.registration_number = optional_string(Some(value)),
             "serial_number" => values.serial_number = optional_string(Some(value)),
@@ -2313,6 +2579,7 @@ fn merge_update_fields(values: &mut ListingValues, listing: &Value) -> StoreResu
             }
             "source_url" => values.source_url = optional_string(Some(value)),
             "avionics" => values.avionics = avionics_from_value(value),
+            "valuation_facts" => values.valuation_facts = valuation_facts_from_value(value)?,
             _ => {
                 return Err(ListingStoreError::Validation(format!(
                     "unsupported listing field: {key}"
@@ -2320,7 +2587,44 @@ fn merge_update_fields(values: &mut ListingValues, listing: &Value) -> StoreResu
             }
         }
     }
+    validate_listing_values(values)?;
     Ok(())
+}
+
+fn installed_component_from_value(
+    value: &Value,
+    field_name: &str,
+) -> StoreResult<Option<ParsedInstalledComponent>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value.as_object().ok_or_else(|| {
+        ListingStoreError::Validation(format!("{field_name} must be an object or null"))
+    })?;
+    let confidence = required_string_from_value(
+        object.get("confidence").unwrap_or(&Value::Null),
+        &format!("{field_name}.confidence"),
+    )?;
+    if !matches!(confidence.as_str(), "high" | "medium" | "low") {
+        return Err(ListingStoreError::Validation(format!(
+            "{field_name}.confidence must be high, medium, or low"
+        )));
+    }
+    Ok(Some(ParsedInstalledComponent {
+        manufacturer: required_string_from_value(
+            object.get("manufacturer").unwrap_or(&Value::Null),
+            &format!("{field_name}.manufacturer"),
+        )?,
+        model: required_string_from_value(
+            object.get("model").unwrap_or(&Value::Null),
+            &format!("{field_name}.model"),
+        )?,
+        evidence_text: required_string_from_value(
+            object.get("evidence_text").unwrap_or(&Value::Null),
+            &format!("{field_name}.evidence_text"),
+        )?,
+        confidence,
+    }))
 }
 
 fn avionics_from_value(value: &Value) -> Vec<ListingAvionicsValue> {
@@ -2333,16 +2637,288 @@ fn avionics_from_value(value: &Value) -> Vec<ListingAvionicsValue> {
             let object = item.as_object()?;
             let manufacturer = optional_string(object.get("manufacturer"))?;
             let model = optional_string(object.get("model"))?;
-            let avionics_type =
-                optional_string(object.get("type")).unwrap_or_else(|| "Unknown".to_string());
+            let avionics_types = avionics_types_from_object(object);
             Some(ListingAvionicsValue::from_parsed(ParsedAvionics {
                 manufacturer,
                 model,
-                avionics_type,
+                avionics_types,
                 quantity: optional_i64(object.get("quantity")).unwrap_or(1),
+                configuration_action: optional_string(object.get("configuration_action"))
+                    .unwrap_or_else(|| "installed".to_string()),
+                replaces: parsed_avionics_reference(object.get("replaces")),
+                source_evidence_text: optional_string(object.get("source_evidence_text")),
+                source_confidence: optional_string(object.get("source_confidence")),
             }))
         })
         .collect()
+}
+
+fn parsed_avionics_reference(value: Option<&Value>) -> Option<ParsedAvionicsReference> {
+    let object = value?.as_object()?;
+    Some(ParsedAvionicsReference {
+        manufacturer: optional_string(object.get("manufacturer"))?,
+        model: optional_string(object.get("model"))?,
+        avionics_types: avionics_types_from_object(object),
+    })
+}
+
+fn avionics_types_from_object(object: &serde_json::Map<String, Value>) -> Vec<String> {
+    string_array(object.get("types"))
+}
+
+fn string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn valuation_facts_from_value(value: &Value) -> StoreResult<Vec<ListingValuationFact>> {
+    let Some(items) = value.as_array() else {
+        return Err(ListingStoreError::Validation(
+            "valuation_facts must be an array".to_string(),
+        ));
+    };
+    items
+        .iter()
+        .map(|item| {
+            let object = item.as_object().ok_or_else(|| {
+                ListingStoreError::Validation("each valuation fact must be an object".to_string())
+            })?;
+            Ok(ListingValuationFact {
+                kind: required_string_from_value(
+                    object.get("kind").unwrap_or(&Value::Null),
+                    "valuation_facts.kind",
+                )?,
+                value: required_string_from_value(
+                    object.get("value").unwrap_or(&Value::Null),
+                    "valuation_facts.value",
+                )?,
+                evidence_text: required_string_from_value(
+                    object.get("evidence_text").unwrap_or(&Value::Null),
+                    "valuation_facts.evidence_text",
+                )?,
+                source_url: optional_string(object.get("source_url")),
+                confidence: required_string_from_value(
+                    object.get("confidence").unwrap_or(&Value::Null),
+                    "valuation_facts.confidence",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn component_time_basis_from_value(value: &Value, field_name: &str) -> StoreResult<String> {
+    let value = optional_string(Some(value)).unwrap_or_else(|| "unknown".to_string());
+    if matches!(
+        value.as_str(),
+        "SNEW" | "SMOH" | "SFOH" | "SPOH" | "unknown"
+    ) {
+        Ok(value)
+    } else {
+        Err(ListingStoreError::Validation(format!(
+            "{field_name} must be SNEW, SMOH, SFOH, SPOH, or unknown"
+        )))
+    }
+}
+
+fn optional_confidence_from_value(value: &Value, field_name: &str) -> StoreResult<Option<String>> {
+    let value = optional_string(Some(value));
+    if value
+        .as_deref()
+        .is_none_or(|value| matches!(value, "high" | "medium" | "low"))
+    {
+        Ok(value)
+    } else {
+        Err(ListingStoreError::Validation(format!(
+            "{field_name} must be high, medium, low, or null"
+        )))
+    }
+}
+
+fn validate_listing_values(values: &ListingValues) -> StoreResult<()> {
+    if !is_plausible_asking_price_usd(values.asking_price_usd) {
+        return Err(ListingStoreError::Validation(
+            "asking_price_usd must be between 1000 and 250000000".to_string(),
+        ));
+    }
+    if !values.airframe_hours.is_finite() || !(0.0..=100_000.0).contains(&values.airframe_hours) {
+        return Err(ListingStoreError::Validation(
+            "airframe_hours must be between 0 and 100000".to_string(),
+        ));
+    }
+    validate_component_time(
+        "engine",
+        values.engine_hours,
+        &values.engine_time_basis,
+        values.engine_time_evidence.as_deref(),
+        values.engine_time_confidence.as_deref(),
+    )?;
+    validate_installed_component(
+        "engine",
+        values.source_url.as_deref(),
+        values.installed_engine_model_id,
+        values.installed_engine.as_ref(),
+        values.installed_engine_evidence_text.as_deref(),
+        values.installed_engine_confidence.as_deref(),
+    )?;
+    validate_installed_component(
+        "propeller",
+        values.source_url.as_deref(),
+        values.installed_propeller_model_id,
+        values.installed_propeller.as_ref(),
+        values.installed_propeller_evidence_text.as_deref(),
+        values.installed_propeller_confidence.as_deref(),
+    )?;
+    validate_component_time(
+        "propeller",
+        values.propeller_hours,
+        &values.propeller_time_basis,
+        values.propeller_time_evidence.as_deref(),
+        values.propeller_time_confidence.as_deref(),
+    )?;
+    let allowed_fact_kinds = [
+        "restoration",
+        "damage_history",
+        "log_completeness",
+        "paint_condition",
+        "interior_condition",
+        "engine_conversion",
+        "airframe_conversion",
+        "major_modification",
+    ];
+    for fact in &values.valuation_facts {
+        if !allowed_fact_kinds.contains(&fact.kind.as_str())
+            || fact.value.trim().is_empty()
+            || fact.evidence_text.trim().is_empty()
+            || (fact.source_url.is_none() && values.source_url.is_none())
+            || !matches!(fact.confidence.as_str(), "high" | "medium" | "low")
+        {
+            return Err(ListingStoreError::Validation(format!(
+                "invalid source-backed valuation fact: {}",
+                fact.kind
+            )));
+        }
+    }
+    for item in &values.avionics {
+        if canonical_avionics_types(&item.avionics_types).is_empty() {
+            return Err(ListingStoreError::Validation(format!(
+                "avionics capability types are required for {} {}",
+                item.manufacturer, item.model
+            )));
+        }
+        if !matches!(
+            item.configuration_action.as_str(),
+            "installed" | "replaces" | "removes"
+        ) {
+            return Err(ListingStoreError::Validation(format!(
+                "invalid avionics configuration action: {}",
+                item.configuration_action
+            )));
+        }
+        if matches!(item.configuration_action.as_str(), "replaces" | "removes")
+            && item.replaces.is_none()
+            && item.replaces_avionics_model_id.is_none()
+        {
+            return Err(ListingStoreError::Validation(format!(
+                "avionics action {} requires a concrete replaces target",
+                item.configuration_action
+            )));
+        }
+        if item.configuration_action == "installed"
+            && (item.replaces.is_some() || item.replaces_avionics_model_id.is_some())
+        {
+            return Err(ListingStoreError::Validation(
+                "installed avionics cannot declare a replacement target".to_string(),
+            ));
+        }
+        if item
+            .replaces
+            .as_ref()
+            .is_some_and(|replaced| canonical_avionics_types(&replaced.avionics_types).is_empty())
+        {
+            return Err(ListingStoreError::Validation(
+                "replacement avionics capability types are required".to_string(),
+            ));
+        }
+        if item.source_notes.is_none() != item.source_confidence.is_none()
+            || item
+                .source_confidence
+                .as_deref()
+                .is_some_and(|value| !matches!(value, "high" | "medium" | "low"))
+        {
+            return Err(ListingStoreError::Validation(
+                "avionics evidence and confidence must be supplied together".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_installed_component(
+    component_name: &str,
+    listing_source_url: Option<&str>,
+    model_id: Option<i64>,
+    component: Option<&ParsedInstalledComponent>,
+    evidence: Option<&str>,
+    confidence: Option<&str>,
+) -> StoreResult<()> {
+    let present = model_id.is_some() || component.is_some();
+    if present
+        && (listing_source_url.is_none()
+            || evidence.is_none_or(str::is_empty)
+            || !confidence.is_some_and(|value| matches!(value, "high" | "medium" | "low")))
+    {
+        return Err(ListingStoreError::Validation(format!(
+            "installed {component_name} requires source URL, evidence, and confidence"
+        )));
+    }
+    if !present && (evidence.is_some() || confidence.is_some()) {
+        return Err(ListingStoreError::Validation(format!(
+            "installed {component_name} evidence cannot exist without a component model"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_component_time(
+    component: &str,
+    hours: Option<f64>,
+    basis: &str,
+    evidence: Option<&str>,
+    confidence: Option<&str>,
+) -> StoreResult<()> {
+    if hours.is_some_and(|hours| !hours.is_finite() || !(0.0..=100_000.0).contains(&hours)) {
+        return Err(ListingStoreError::Validation(format!(
+            "{component}_hours must be null or between 0 and 100000"
+        )));
+    }
+    if !matches!(basis, "SNEW" | "SMOH" | "SFOH" | "SPOH" | "unknown") {
+        return Err(ListingStoreError::Validation(format!(
+            "{component}_time_basis is invalid"
+        )));
+    }
+    if hours.is_none() && basis != "unknown" {
+        return Err(ListingStoreError::Validation(format!(
+            "{component}_time_basis must be unknown when hours are missing"
+        )));
+    }
+    if evidence.is_none() != confidence.is_none() {
+        return Err(ListingStoreError::Validation(format!(
+            "{component} time evidence and confidence must be provided together"
+        )));
+    }
+    if confidence.is_some_and(|value| !matches!(value, "high" | "medium" | "low")) {
+        return Err(ListingStoreError::Validation(format!(
+            "{component}_time_confidence is invalid"
+        )));
+    }
+    Ok(())
 }
 
 async fn unverified_listing_id_for_tail(
@@ -2365,6 +2941,214 @@ async fn unverified_listing_id_for_tail(
         user_id,
         registration_number
     )?)
+}
+
+async fn unverified_listing_id_for_missing_identity_source(
+    db: &AppDb,
+    user_id: i64,
+    source_url: &str,
+) -> StoreResult<Option<i64>> {
+    Ok(
+        unverified_listing_for_missing_identity_source(db, user_id, source_url)
+            .await?
+            .map(|candidate| candidate.id),
+    )
+}
+
+async fn unverified_listing_for_missing_identity_source(
+    db: &AppDb,
+    user_id: i64,
+    source_url: &str,
+) -> StoreResult<Option<MissingIdentitySourceCandidateRow>> {
+    Ok(query_as_optional!(
+        db,
+        MissingIdentitySourceCandidateRow,
+        r#"
+        SELECT id, serial_number
+        FROM aircraft_sale_listings
+        WHERE created_by_user_id = ?
+          AND is_verified = FALSE
+          AND source_url = ?
+          AND (registration_number IS NULL OR TRIM(registration_number) = '')
+        ORDER BY added_at DESC, id DESC
+        LIMIT 1
+        "#,
+        user_id,
+        source_url
+    )?)
+}
+
+fn serial_evidence_for_identity_repair_admission(
+    extracted_serial: Option<&str>,
+    retained_serial: Option<&str>,
+) -> StoreResult<Option<String>> {
+    let extracted_serial = extracted_serial
+        .map(str::trim)
+        .filter(|serial| !serial.is_empty());
+    let retained_serial = retained_serial
+        .map(str::trim)
+        .filter(|serial| !serial.is_empty());
+    match (extracted_serial, retained_serial) {
+        (Some(extracted), Some(retained)) => {
+            let same_serial = extracted == retained
+                || matches!(
+                    (normalize_serial_key(extracted), normalize_serial_key(retained)),
+                    (Some(extracted_key), Some(retained_key)) if extracted_key == retained_key
+                );
+            if !same_serial {
+                return Err(ListingStoreError::Validation(
+                    "cannot repair aircraft identity; extracted serial conflicts with the retained same-source serial"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(retained.to_string()))
+        }
+        (Some(extracted), None) => Ok(Some(extracted.to_string())),
+        (None, Some(retained)) => Ok(Some(retained.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Persist regulator-primary identity before fallible aircraft/avionics
+/// enrichment. This deliberately changes no ingestion or listing metadata: a
+/// quarantined legacy row remains quarantined until the complete ingestion
+/// workflow succeeds.
+///
+/// The conditional update is a compare-and-set. It cannot overwrite identity
+/// populated by a concurrent worker, and it avoids introducing an obvious
+/// duplicate when another unverified row for this user already has the same
+/// canonical N-number. If another worker completed the same source repair, the
+/// follow-up read returns that exact row so the caller can continue safely.
+async fn persist_faa_identity_for_missing_identity_source(
+    db: &AppDb,
+    user_id: i64,
+    source_url: &str,
+    candidate: &MissingIdentitySourceCandidateRow,
+    grounding: &AircraftGrounding,
+) -> StoreResult<Option<i64>> {
+    let faa_serial = grounding
+        .manufacturer_serial_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|serial| !serial.is_empty());
+    let repaired_id = query_scalar_optional!(
+        db,
+        i64,
+        r#"
+        UPDATE aircraft_sale_listings
+        SET
+          registration_number = ?,
+          serial_number = COALESCE(?, serial_number)
+        WHERE id = ?
+          AND created_by_user_id = ?
+          AND is_verified = FALSE
+          AND source_url = ?
+          AND (
+            registration_number IS NULL
+            OR TRIM(registration_number) = ''
+          )
+          AND (
+            serial_number = ?
+            OR (serial_number IS NULL AND ? IS NULL)
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listings duplicate
+            WHERE duplicate.id <> aircraft_sale_listings.id
+              AND duplicate.created_by_user_id = ?
+              AND duplicate.is_verified = FALSE
+              AND UPPER(TRIM(duplicate.registration_number)) = UPPER(?)
+          )
+        RETURNING id
+        "#,
+        grounding.n_number.as_str(),
+        faa_serial,
+        candidate.id,
+        user_id,
+        source_url,
+        candidate.serial_number.as_deref(),
+        candidate.serial_number.as_deref(),
+        user_id,
+        grounding.n_number.as_str()
+    )?;
+    if repaired_id.is_some() {
+        return Ok(repaired_id);
+    }
+
+    // A racing worker may have performed the same compare-and-set between our
+    // FAA lookup and update. Continue only when the exact source now carries
+    // the exact admitted identity and expected post-repair serial; a different
+    // identity or changed retained serial is never overwritten.
+    let expected_serial = faa_serial
+        .map(ToOwned::to_owned)
+        .or_else(|| candidate.serial_number.clone());
+    let concurrently_repaired_id = query_scalar_optional!(
+        db,
+        i64,
+        r#"
+        SELECT id
+        FROM aircraft_sale_listings
+        WHERE id = ?
+          AND created_by_user_id = ?
+          AND is_verified = FALSE
+          AND source_url = ?
+          AND UPPER(TRIM(registration_number)) = UPPER(?)
+          AND (
+            serial_number = ?
+            OR (serial_number IS NULL AND ? IS NULL)
+          )
+        "#,
+        candidate.id,
+        user_id,
+        source_url,
+        grounding.n_number.as_str(),
+        expected_serial.as_deref(),
+        expected_serial.as_deref()
+    )?;
+    if concurrently_repaired_id.is_some() {
+        return Ok(concurrently_repaired_id);
+    }
+
+    let competing_listing_id = query_scalar_optional!(
+        db,
+        i64,
+        r#"
+        SELECT id
+        FROM aircraft_sale_listings
+        WHERE id <> ?
+          AND created_by_user_id = ?
+          AND is_verified = FALSE
+          AND UPPER(TRIM(registration_number)) = UPPER(?)
+        ORDER BY added_at DESC, id DESC
+        LIMIT 1
+        "#,
+        candidate.id,
+        user_id,
+        grounding.n_number.as_str()
+    )?;
+    if let Some(competing_listing_id) = competing_listing_id {
+        return Err(ListingStoreError::State(format!(
+            "cannot repair listing {} from source {source_url}; canonical registration {} already belongs to unverified listing {competing_listing_id}",
+            candidate.id, grounding.n_number
+        )));
+    }
+
+    Err(ListingStoreError::State(format!(
+        "cannot repair listing {} from source {source_url}; retained identity changed during FAA admission",
+        candidate.id
+    )))
+}
+
+fn apply_faa_grounding_identity(values: &mut ListingValues, grounding: &AircraftGrounding) {
+    values.registration_number = Some(grounding.n_number.clone());
+    if let Some(faa_serial) = grounding
+        .manufacturer_serial_raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|serial| !serial.is_empty())
+    {
+        values.serial_number = Some(faa_serial.to_string());
+    }
 }
 
 async fn matching_verified_listing_id(
@@ -2393,13 +3177,14 @@ async fn matching_verified_listing_id(
           ON mfr.id = model.aircraft_manufacturer_id
         WHERE UPPER(l.registration_number) = UPPER(?)
           AND l.is_verified = TRUE
+          AND l.ingestion_state = 'ready'
         ORDER BY l.added_at DESC, l.id DESC
         "#,
         registration_number
     )?;
     for row in rows {
         let listing = listing_from_row(db, row).await?;
-        if listing_matches_values(&listing, values) {
+        if listing_matches_values(db, &listing, values).await? {
             return Ok(Some(listing.id));
         }
     }
@@ -2427,23 +3212,51 @@ async fn refresh_listing_timestamp(
     Ok(())
 }
 
-fn listing_matches_values(listing: &SaleListing, values: &ListingValues) -> bool {
+async fn listing_matches_values(
+    db: &AppDb,
+    listing: &SaleListing,
+    values: &ListingValues,
+) -> StoreResult<bool> {
     for (left, right) in [
         (&listing.aircraft.manufacturer, &values.manufacturer),
         (&listing.aircraft.model, &values.model),
         (&listing.aircraft.variant, &values.variant),
     ] {
         if normalize_name(left) != normalize_name(right) {
-            return false;
+            return Ok(false);
         }
     }
 
-    values_match_i64(listing.model_year, values.model_year)
+    let scalar_fields_match = values_match_i64(listing.model_year, values.model_year)
         && values_match_f64(listing.asking_price_usd, values.asking_price_usd)
         && values_match_text(Some(&listing.currency), Some(&values.currency))
         && values_match_f64(listing.airframe_hours, values.airframe_hours)
-        && values_match_f64(listing.engine_hours, values.engine_hours)
-        && values_match_f64(listing.propeller_hours, values.propeller_hours)
+        && values_match_optional_f64(listing.engine_hours, values.engine_hours)
+        && values_match_text(
+            Some(&listing.engine_time_basis),
+            Some(&values.engine_time_basis),
+        )
+        && values_match_text(
+            listing.engine_time_evidence.as_deref(),
+            values.engine_time_evidence.as_deref(),
+        )
+        && values_match_text(
+            listing.engine_time_confidence.as_deref(),
+            values.engine_time_confidence.as_deref(),
+        )
+        && values_match_optional_f64(listing.propeller_hours, values.propeller_hours)
+        && values_match_text(
+            Some(&listing.propeller_time_basis),
+            Some(&values.propeller_time_basis),
+        )
+        && values_match_text(
+            listing.propeller_time_evidence.as_deref(),
+            values.propeller_time_evidence.as_deref(),
+        )
+        && values_match_text(
+            listing.propeller_time_confidence.as_deref(),
+            values.propeller_time_confidence.as_deref(),
+        )
         && values_match_text(Some(&listing.status), Some(&values.status))
         && values_match_text(
             listing.registration_number.as_deref(),
@@ -2454,17 +3267,49 @@ fn listing_matches_values(listing: &SaleListing, values: &ListingValues) -> bool
             values.serial_number.as_deref(),
         )
         && canonical_parsed_avionics(&listing.avionics) == canonical_avionics(&values.avionics)
+        && canonical_valuation_facts(&listing.valuation_facts)
+            == canonical_valuation_facts(&values.valuation_facts);
+    if !scalar_fields_match {
+        return Ok(false);
+    }
+
+    Ok(
+        canonical_listing_engine(db, listing).await? == canonical_values_engine(db, values).await?
+            && canonical_listing_propeller(db, listing).await?
+                == canonical_values_propeller(db, values).await?,
+    )
 }
 
-fn canonical_parsed_avionics(value: &[ParsedAvionics]) -> Vec<(String, String, String, i64)> {
+type CanonicalAvionics = (
+    String,
+    String,
+    Vec<String>,
+    i64,
+    String,
+    Option<(String, String, Vec<String>)>,
+    String,
+    String,
+);
+
+fn canonical_parsed_avionics(value: &[ParsedAvionics]) -> Vec<CanonicalAvionics> {
     let mut canonical = value
         .iter()
         .map(|item| {
             (
                 normalize_name(&item.manufacturer),
                 normalize_avionics_model_name(&item.model),
-                normalize_name(&item.avionics_type),
+                canonical_avionics_types(&item.avionics_types),
                 item.quantity.max(1),
+                item.configuration_action.clone(),
+                item.replaces.as_ref().map(|replaced| {
+                    (
+                        normalize_name(&replaced.manufacturer),
+                        normalize_avionics_model_name(&replaced.model),
+                        canonical_avionics_types(&replaced.avionics_types),
+                    )
+                }),
+                normalize_name(item.source_evidence_text.as_deref().unwrap_or("")),
+                normalize_name(item.source_confidence.as_deref().unwrap_or("")),
             )
         })
         .collect::<HashSet<_>>()
@@ -2474,15 +3319,174 @@ fn canonical_parsed_avionics(value: &[ParsedAvionics]) -> Vec<(String, String, S
     canonical
 }
 
-fn canonical_avionics(value: &[ListingAvionicsValue]) -> Vec<(String, String, String, i64)> {
+fn canonical_avionics(value: &[ListingAvionicsValue]) -> Vec<CanonicalAvionics> {
     let mut canonical = value
         .iter()
         .map(|item| {
             (
                 normalize_name(&item.manufacturer),
                 normalize_avionics_model_name(&item.model),
-                normalize_name(&item.avionics_type),
+                canonical_avionics_types(&item.avionics_types),
                 item.quantity.max(1),
+                item.configuration_action.clone(),
+                item.replaces.as_ref().map(|replaced| {
+                    (
+                        normalize_name(&replaced.manufacturer),
+                        normalize_avionics_model_name(&replaced.model),
+                        canonical_avionics_types(&replaced.avionics_types),
+                    )
+                }),
+                normalize_name(item.source_notes.as_deref().unwrap_or("")),
+                normalize_name(item.source_confidence.as_deref().unwrap_or("")),
+            )
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    canonical.sort();
+    canonical
+}
+
+fn canonical_avionics_types(avionics_types: &[String]) -> Vec<String> {
+    let mut values = avionics_types
+        .iter()
+        .map(|value| normalize_name(value))
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+type CanonicalInstalledComponent = (String, String, String, String);
+
+fn canonical_installed_component(
+    identity: Option<InstalledComponentIdentityRow>,
+    evidence_text: Option<&str>,
+    source_confidence: Option<&str>,
+) -> Option<CanonicalInstalledComponent> {
+    identity.map(|identity| {
+        (
+            normalize_name(&identity.manufacturer),
+            normalize_name(&identity.model),
+            normalize_name(evidence_text.unwrap_or("")),
+            normalize_name(source_confidence.unwrap_or("")),
+        )
+    })
+}
+
+async fn engine_identity(
+    db: &AppDb,
+    model_id: Option<i64>,
+) -> StoreResult<Option<InstalledComponentIdentityRow>> {
+    let Some(model_id) = model_id else {
+        return Ok(None);
+    };
+    Ok(query_as_optional!(
+        db,
+        InstalledComponentIdentityRow,
+        r#"
+        SELECT manufacturer.name AS manufacturer, model.name AS model
+        FROM engine_models model
+        JOIN engine_manufacturers manufacturer
+          ON manufacturer.id = model.engine_manufacturer_id
+        WHERE model.id = ?
+        "#,
+        model_id
+    )?)
+}
+
+async fn propeller_identity(
+    db: &AppDb,
+    model_id: Option<i64>,
+) -> StoreResult<Option<InstalledComponentIdentityRow>> {
+    let Some(model_id) = model_id else {
+        return Ok(None);
+    };
+    Ok(query_as_optional!(
+        db,
+        InstalledComponentIdentityRow,
+        r#"
+        SELECT manufacturer.name AS manufacturer, model.name AS model
+        FROM propeller_models model
+        JOIN propeller_manufacturers manufacturer
+          ON manufacturer.id = model.propeller_manufacturer_id
+        WHERE model.id = ?
+        "#,
+        model_id
+    )?)
+}
+
+async fn canonical_listing_engine(
+    db: &AppDb,
+    listing: &SaleListing,
+) -> StoreResult<Option<CanonicalInstalledComponent>> {
+    Ok(canonical_installed_component(
+        engine_identity(db, listing.installed_engine_model_id).await?,
+        listing.installed_engine_evidence_text.as_deref(),
+        listing.installed_engine_confidence.as_deref(),
+    ))
+}
+
+async fn canonical_values_engine(
+    db: &AppDb,
+    values: &ListingValues,
+) -> StoreResult<Option<CanonicalInstalledComponent>> {
+    let identity = match &values.installed_engine {
+        Some(component) => Some(InstalledComponentIdentityRow {
+            manufacturer: component.manufacturer.clone(),
+            model: component.model.clone(),
+        }),
+        None => engine_identity(db, values.installed_engine_model_id).await?,
+    };
+    Ok(canonical_installed_component(
+        identity,
+        values.installed_engine_evidence_text.as_deref(),
+        values.installed_engine_confidence.as_deref(),
+    ))
+}
+
+async fn canonical_listing_propeller(
+    db: &AppDb,
+    listing: &SaleListing,
+) -> StoreResult<Option<CanonicalInstalledComponent>> {
+    Ok(canonical_installed_component(
+        propeller_identity(db, listing.installed_propeller_model_id).await?,
+        listing.installed_propeller_evidence_text.as_deref(),
+        listing.installed_propeller_confidence.as_deref(),
+    ))
+}
+
+async fn canonical_values_propeller(
+    db: &AppDb,
+    values: &ListingValues,
+) -> StoreResult<Option<CanonicalInstalledComponent>> {
+    let identity = match &values.installed_propeller {
+        Some(component) => Some(InstalledComponentIdentityRow {
+            manufacturer: component.manufacturer.clone(),
+            model: component.model.clone(),
+        }),
+        None => propeller_identity(db, values.installed_propeller_model_id).await?,
+    };
+    Ok(canonical_installed_component(
+        identity,
+        values.installed_propeller_evidence_text.as_deref(),
+        values.installed_propeller_confidence.as_deref(),
+    ))
+}
+
+type CanonicalValuationFact = (String, String, String, String);
+
+fn canonical_valuation_facts(value: &[ListingValuationFact]) -> Vec<CanonicalValuationFact> {
+    let mut canonical = value
+        .iter()
+        .map(|fact| {
+            (
+                normalize_name(&fact.kind),
+                normalize_name(&fact.value),
+                normalize_name(&fact.evidence_text),
+                normalize_name(&fact.confidence),
             )
         })
         .collect::<HashSet<_>>()
@@ -2501,9 +3505,11 @@ async fn complete_listing_ingestion(
     if let Some(extractor) = extractor {
         let _ = heal_listing_aircraft_variants_if_needed(db, listing_id, extractor).await;
     }
-    let _ = normalize_avionics_models(db, true).await;
-    let _ =
-        enrich_aircraft_spec_for_listing_if_missing(db, extractor, listing_id, listing_text).await;
+    enrich_aircraft_spec_for_listing_if_missing(db, extractor, listing_id, listing_text)
+        .await
+        .map_err(|error| {
+            ListingStoreError::State(format!("aircraft specification enrichment failed: {error}"))
+        })?;
 
     if listing_missing_avionics_metadata_count(db, listing_id).await? > 0 {
         let extractor = extractor.ok_or_else(|| {
@@ -2551,14 +3557,83 @@ async fn complete_listing_ingestion(
         }
     }
 
-    if extractor.is_some() {
-        let _ = normalize_avionics_models(db, true).await;
-    }
     if let Ok(Some(identity)) = listing_aircraft_identity(db, listing_id).await {
         mark_valuation_snapshot_stale_best_effort(db, identity.aircraft_model_id).await;
     }
     let _ = cleanup_orphan_records(db).await;
     Ok(())
+}
+
+async fn finalize_listing_ingestion(
+    db: &AppDb,
+    listing_id: i64,
+    extractor: Option<&GeminiListingExtractor>,
+    listing_text: Option<&str>,
+) -> StoreResult<()> {
+    match complete_listing_ingestion(db, listing_id, extractor, listing_text).await {
+        Ok(()) => {
+            mark_listing_ready(db, listing_id).await?;
+            Ok(())
+        }
+        Err(error) => quarantine_after_error(db, listing_id, error).await,
+    }
+}
+
+async fn mark_listing_incomplete(db: &AppDb, listing_id: i64) -> StoreResult<()> {
+    execute_query!(
+        db,
+        r#"
+        UPDATE aircraft_sale_listings
+        SET ingestion_state = 'incomplete',
+            ingestion_error = NULL,
+            ingestion_completed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+        listing_id
+    )?;
+    Ok(())
+}
+
+async fn mark_listing_ready(db: &AppDb, listing_id: i64) -> StoreResult<()> {
+    execute_query!(
+        db,
+        r#"
+        UPDATE aircraft_sale_listings
+        SET ingestion_state = 'ready',
+            ingestion_error = NULL,
+            ingestion_completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+        listing_id
+    )?;
+    Ok(())
+}
+
+async fn quarantine_after_error<T>(
+    db: &AppDb,
+    listing_id: i64,
+    error: ListingStoreError,
+) -> StoreResult<T> {
+    let message = error.to_string();
+    execute_query!(
+        db,
+        r#"
+        UPDATE aircraft_sale_listings
+        SET ingestion_state = 'quarantined',
+            ingestion_error = ?,
+            ingestion_completed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+        message.as_str(),
+        listing_id
+    )?;
+    Err(ListingStoreError::Ingestion {
+        listing_id,
+        message,
+    })
 }
 
 async fn listing_missing_avionics_metadata_count(db: &AppDb, listing_id: i64) -> StoreResult<i64> {
@@ -2572,9 +3647,29 @@ async fn listing_missing_avionics_metadata_count(db: &AppDb, listing_id: i64) ->
           ON model.id = link.avionics_model_id
         WHERE link.aircraft_sale_listing_id = ?
           AND (
-            model.introduced_year IS NULL
+            model.catalog_status <> 'approved'
+            OR model.introduced_year IS NULL
             OR model.estimated_unit_value_usd IS NULL
+            OR model.estimated_unit_value_usd < 0
+            OR model.value_basis <> 'installed_contribution'
+            OR model.replacement_cost_usd IS NULL
+            OR model.replacement_cost_usd < model.estimated_unit_value_usd
             OR model.value_reference_year IS NULL
+            OR model.value_reference_year < 1900
+            OR model.value_reference_year > 2200
+            OR model.value_source IS NULL
+            OR TRIM(model.value_source) = ''
+            OR (
+              model.valuation_scope = 'integrated_suite'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM avionics_suite_components membership
+                JOIN avionics_models component
+                  ON component.id = membership.component_model_id
+                WHERE membership.suite_model_id = model.id
+                  AND component.catalog_status = 'approved'
+              )
+            )
           )
         "#,
         listing_id
@@ -2598,12 +3693,44 @@ async fn listing_needs_model_year_price_or_default_avionics(
               FROM aircraft_model_variant_price_points price_point
               WHERE price_point.aircraft_model_variant_id = listing.aircraft_model_variant_id
                 AND price_point.model_year = listing.model_year
+                AND price_point.purchase_price_reference_year = price_point.model_year
+                AND price_point.source_confidence = 'high'
+                AND price_point.evidence_kind = 'direct_model_year'
+                AND price_point.is_valuation_eligible = TRUE
             )
             OR NOT EXISTS (
               SELECT 1
               FROM aircraft_model_variant_default_avionics default_avionics
+              JOIN avionics_models model
+                ON model.id = default_avionics.avionics_model_id
               WHERE default_avionics.aircraft_model_variant_id = listing.aircraft_model_variant_id
                 AND default_avionics.model_year = listing.model_year
+                AND default_avionics.source_confidence = 'high'
+                AND default_avionics.quantity > 0
+                AND TRIM(default_avionics.source_url) <> ''
+                AND LOWER(default_avionics.source_url) NOT LIKE '%/listing/%'
+                AND LOWER(default_avionics.source_url) NOT LIKE '%/listings/%'
+                AND LOWER(default_avionics.source_url) NOT LIKE '%/aircraft-for-sale/%'
+                AND LOWER(default_avionics.source_url) NOT LIKE '%/classifieds/%'
+                AND model.catalog_status = 'approved'
+                AND model.introduced_year IS NOT NULL
+                AND model.estimated_unit_value_usd >= 0
+                AND model.value_basis = 'installed_contribution'
+                AND model.replacement_cost_usd >= model.estimated_unit_value_usd
+                AND model.value_reference_year BETWEEN 1900 AND 2200
+                AND model.value_source IS NOT NULL
+                AND TRIM(model.value_source) <> ''
+                AND (
+                  model.valuation_scope <> 'integrated_suite'
+                  OR EXISTS (
+                    SELECT 1
+                    FROM avionics_suite_components membership
+                    JOIN avionics_models component
+                      ON component.id = membership.component_model_id
+                    WHERE membership.suite_model_id = model.id
+                      AND component.catalog_status = 'approved'
+                  )
+                )
             )
           )
         "#,
@@ -2675,6 +3802,14 @@ fn values_match_i64(left: i64, right: i64) -> bool {
 
 fn values_match_f64(left: f64, right: f64) -> bool {
     (left - right).abs() <= 0.01
+}
+
+fn values_match_optional_f64(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => values_match_f64(left, right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn values_match_text(left: Option<&str>, right: Option<&str>) -> bool {
@@ -2801,6 +3936,7 @@ async fn ensure_aircraft_model_variant(
     )?)
 }
 
+#[cfg(test)]
 async fn ensure_avionics_model(
     db: &AppDb,
     manufacturer: &str,
@@ -2815,37 +3951,109 @@ async fn ensure_avionics_model(
     let manufacturer_id = ensure_named_row(db, "avionics_manufacturers", manufacturer).await?;
     let type_id = ensure_named_row(db, "avionics_types", avionics_type).await?;
     let normalized_model = normalize_avionics_model_name(model);
-    execute_query!(
-        db,
-        r#"
-        INSERT INTO avionics_models (
-          avionics_manufacturer_id,
-          avionics_type_id,
-          name,
-          normalized_name
-        )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT (avionics_manufacturer_id, avionics_type_id, normalized_name) DO NOTHING
-        "#,
-        manufacturer_id,
-        type_id,
-        model,
-        normalized_model.as_str()
-    )?;
-    Ok(query_scalar_one!(
+    let model_id = query_scalar_one!(
         db,
         i64,
         r#"
-        SELECT id
-        FROM avionics_models
-        WHERE avionics_manufacturer_id = ?
-          AND avionics_type_id = ?
-          AND normalized_name = ?
+        INSERT INTO avionics_models (
+          avionics_manufacturer_id,
+          name,
+          normalized_name
+        )
+        VALUES (?, ?, ?)
+        RETURNING id
         "#,
         manufacturer_id,
-        type_id,
+        model,
         normalized_model.as_str()
-    )?)
+    )?;
+    execute_query!(
+        db,
+        "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        model_id,
+        type_id,
+    )?;
+    Ok(model_id)
+}
+
+async fn resolve_installed_engine_model_id(
+    db: &AppDb,
+    values: &ListingValues,
+) -> StoreResult<Option<i64>> {
+    if values.installed_engine_model_id.is_some() {
+        return Ok(values.installed_engine_model_id);
+    }
+    let Some(component) = &values.installed_engine else {
+        return Ok(None);
+    };
+    let manufacturer_id =
+        ensure_named_row(db, "engine_manufacturers", &component.manufacturer).await?;
+    let normalized_model = normalize_name(&component.model);
+    execute_query!(
+        db,
+        r#"
+        INSERT INTO engine_models (
+          engine_manufacturer_id, name, normalized_name,
+          source_url, source_title, source_confidence, evidence_kind, is_valuation_eligible
+        ) VALUES (?, ?, ?, ?, 'sale listing installed engine evidence', ?, 'listing_only', FALSE)
+        ON CONFLICT (engine_manufacturer_id, normalized_name) DO NOTHING
+        "#,
+        manufacturer_id,
+        component.model.as_str(),
+        normalized_model.as_str(),
+        values.source_url.as_deref(),
+        component.confidence.as_str()
+    )?;
+    Ok(Some(query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT id FROM engine_models
+        WHERE engine_manufacturer_id = ? AND normalized_name = ?
+        "#,
+        manufacturer_id,
+        normalized_model.as_str()
+    )?))
+}
+
+async fn resolve_installed_propeller_model_id(
+    db: &AppDb,
+    values: &ListingValues,
+) -> StoreResult<Option<i64>> {
+    if values.installed_propeller_model_id.is_some() {
+        return Ok(values.installed_propeller_model_id);
+    }
+    let Some(component) = &values.installed_propeller else {
+        return Ok(None);
+    };
+    let manufacturer_id =
+        ensure_named_row(db, "propeller_manufacturers", &component.manufacturer).await?;
+    let normalized_model = normalize_name(&component.model);
+    execute_query!(
+        db,
+        r#"
+        INSERT INTO propeller_models (
+          propeller_manufacturer_id, name, normalized_name,
+          source_url, source_title, source_confidence, evidence_kind, is_valuation_eligible
+        ) VALUES (?, ?, ?, ?, 'sale listing installed propeller evidence', ?, 'listing_only', FALSE)
+        ON CONFLICT (propeller_manufacturer_id, normalized_name) DO NOTHING
+        "#,
+        manufacturer_id,
+        component.model.as_str(),
+        normalized_model.as_str(),
+        values.source_url.as_deref(),
+        component.confidence.as_str()
+    )?;
+    Ok(Some(query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT id FROM propeller_models
+        WHERE propeller_manufacturer_id = ? AND normalized_name = ?
+        "#,
+        manufacturer_id,
+        normalized_model.as_str()
+    )?))
 }
 
 async fn ensure_named_row(db: &AppDb, table: &str, name: &str) -> StoreResult<i64> {
@@ -2863,87 +4071,230 @@ async fn ensure_named_row(db: &AppDb, table: &str, name: &str) -> StoreResult<i6
     )?)
 }
 
+async fn validated_catalog_avionics_model_id(
+    db: &AppDb,
+    avionics_model_id: i64,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+) -> StoreResult<i64> {
+    let manufacturer = normalize_avionics_manufacturer_name(manufacturer);
+    let model = normalize_avionics_model_name(model);
+    let matching_rows = query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT COUNT(*)
+        FROM avionics_models model
+        JOIN avionics_manufacturers mfr
+          ON mfr.id = model.avionics_manufacturer_id
+        WHERE model.id = ?
+          AND model.catalog_status = 'approved'
+          AND mfr.normalized_name = ?
+          AND model.normalized_name = ?
+        "#,
+        avionics_model_id,
+        manufacturer.as_str(),
+        model.as_str()
+    )?;
+    if matching_rows != 1 {
+        return Err(ListingStoreError::Validation(format!(
+            "avionics catalog id {avionics_model_id} does not match its canonical identity"
+        )));
+    }
+    let stored_types = catalog_avionics_types(db, avionics_model_id).await?;
+    if canonical_avionics_types(avionics_types) != canonical_avionics_types(&stored_types) {
+        return Err(ListingStoreError::Validation(format!(
+            "avionics catalog id {avionics_model_id} capability set does not match its canonical identity"
+        )));
+    }
+    Ok(avionics_model_id)
+}
+
+async fn catalog_avionics_types(db: &AppDb, avionics_model_id: i64) -> StoreResult<Vec<String>> {
+    Ok(query_as_all!(
+        db,
+        AvionicsCapabilityRow,
+        r#"
+        SELECT membership.avionics_model_id, avionics_type.name AS avionics_type
+        FROM avionics_model_types membership
+        JOIN avionics_types avionics_type
+          ON avionics_type.id = membership.avionics_type_id
+        WHERE membership.avionics_model_id = ?
+        ORDER BY avionics_type.normalized_name
+        "#,
+        avionics_model_id
+    )?
+    .into_iter()
+    .map(|row| row.avionics_type)
+    .collect())
+}
+
 async fn replace_listing_avionics(
     db: &AppDb,
     listing_id: i64,
     avionics: &[ListingAvionicsValue],
 ) -> StoreResult<()> {
-    execute_query!(
-        db,
-        "DELETE FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
-        listing_id
+    struct PreparedListingAvionics {
+        avionics_model_id: i64,
+        quantity: i64,
+        source: String,
+        source_notes: Option<String>,
+        source_confidence: Option<String>,
+        configuration_action: String,
+        replaces_avionics_model_id: Option<i64>,
+    }
+
+    // Coalesce by physical catalog product before validation and persistence.
+    // This is deliberately repeated at the storage boundary so no caller can
+    // accidentally delegate conflict resolution to the database upsert.
+    let avionics = coalesce_resolved_listing_avionics(
+        avionics
+            .iter()
+            .filter(|item| is_usable_avionics_label(&item.manufacturer, &item.model))
+            .cloned(),
     )?;
-    for item in avionics {
-        if !is_usable_avionics_label(&item.manufacturer, &item.model) {
-            continue;
-        }
-        let avionics_model_id =
-            ensure_avionics_model(db, &item.manufacturer, &item.model, &item.avionics_type).await?;
-        if let (Some(introduced_year), Some(estimated_unit_value_usd), Some(value_reference_year)) = (
-            item.introduced_year,
-            item.estimated_unit_value_usd,
-            item.value_reference_year,
-        ) {
-            update_avionics_model_metadata(
-                db,
-                avionics_model_id,
-                introduced_year,
-                estimated_unit_value_usd,
-                value_reference_year,
-            )
-            .await?;
-        }
-        execute_query!(
+
+    // Validate the entire replacement set before touching existing links.
+    // The transaction below then makes trigger/race failures all-or-nothing.
+    let mut prepared = Vec::new();
+    for item in &avionics {
+        let avionics_model_id = validated_catalog_avionics_model_id(
             db,
-            r#"
+            item.avionics_model_id.ok_or_else(|| {
+                ListingStoreError::Validation(format!(
+                    "avionics must resolve to a catalog id before persistence: {} {}",
+                    item.manufacturer, item.model
+                ))
+            })?,
+            &item.manufacturer,
+            &item.model,
+            &item.avionics_types,
+        )
+        .await?;
+        let replaces_avionics_model_id = match item.configuration_action.as_str() {
+            "installed" if item.replaces.is_none() && item.replaces_avionics_model_id.is_none() => {
+                None
+            }
+            "replaces" | "removes" => {
+                let replaced = item.replaces.as_ref().ok_or_else(|| {
+                    ListingStoreError::Validation(
+                        "replacement/removal avionics requires a canonical catalog identity"
+                            .to_string(),
+                    )
+                })?;
+                Some(
+                    validated_catalog_avionics_model_id(
+                        db,
+                        item.replaces_avionics_model_id.ok_or_else(|| {
+                            ListingStoreError::Validation(
+                                "replacement/removal avionics must resolve to a catalog id"
+                                    .to_string(),
+                            )
+                        })?,
+                        &replaced.manufacturer,
+                        &replaced.model,
+                        &replaced.avionics_types,
+                    )
+                    .await?,
+                )
+            }
+            _ => {
+                return Err(ListingStoreError::Validation(format!(
+                    "invalid catalog-backed avionics action: {}",
+                    item.configuration_action
+                )))
+            }
+        };
+        prepared.push(PreparedListingAvionics {
+            avionics_model_id,
+            quantity: item.quantity.max(1),
+            source: item.source.clone(),
+            source_notes: item.source_notes.clone(),
+            source_confidence: item.source_confidence.clone(),
+            configuration_action: item.configuration_action.clone(),
+            replaces_avionics_model_id,
+        });
+    }
+
+    let delete_sql =
+        db.sql("DELETE FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?");
+    let insert_sql = db.sql(
+        r#"
             INSERT INTO aircraft_sale_listing_avionics (
               aircraft_sale_listing_id,
               avionics_model_id,
               quantity,
               source,
-              source_notes
+              source_notes,
+              source_confidence,
+              configuration_action,
+              replaces_avionics_model_id
             )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (aircraft_sale_listing_id, avionics_model_id)
-            DO UPDATE SET
-              quantity = EXCLUDED.quantity,
-              source = EXCLUDED.source,
-              source_notes = EXCLUDED.source_notes,
-              updated_at = CURRENT_TIMESTAMP
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-            listing_id,
-            avionics_model_id,
-            item.quantity.max(1),
-            item.source.as_str(),
-            item.source_notes.as_deref()
-        )?;
+    );
+    macro_rules! replace_in_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            sqlx::query(&delete_sql)
+                .bind(listing_id)
+                .execute(&mut *transaction)
+                .await?;
+            for item in &prepared {
+                sqlx::query(&insert_sql)
+                    .bind(listing_id)
+                    .bind(item.avionics_model_id)
+                    .bind(item.quantity)
+                    .bind(item.source.as_str())
+                    .bind(item.source_notes.as_deref())
+                    .bind(item.source_confidence.as_deref())
+                    .bind(item.configuration_action.as_str())
+                    .bind(item.replaces_avionics_model_id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+        }};
+    }
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => replace_in_transaction!(pool),
+        DatabaseBackend::Postgres(pool) => replace_in_transaction!(pool),
     }
     Ok(())
 }
 
-async fn update_avionics_model_metadata(
+async fn replace_listing_facts(
     db: &AppDb,
-    avionics_model_id: i64,
-    introduced_year: i64,
-    estimated_unit_value_usd: f64,
-    value_reference_year: i64,
+    listing_id: i64,
+    values: &ListingValues,
 ) -> StoreResult<()> {
     execute_query!(
         db,
-        r#"
-        UPDATE avionics_models
-        SET introduced_year = COALESCE(introduced_year, ?),
-            estimated_unit_value_usd = COALESCE(estimated_unit_value_usd, ?),
-            value_reference_year = COALESCE(value_reference_year, ?),
-            value_source = COALESCE(value_source, 'gemini-grounded'),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        "#,
-        introduced_year,
-        estimated_unit_value_usd,
-        value_reference_year,
-        avionics_model_id
+        "DELETE FROM aircraft_sale_listing_facts WHERE aircraft_sale_listing_id = ?",
+        listing_id
     )?;
+    for fact in &values.valuation_facts {
+        execute_query!(
+            db,
+            r#"
+            INSERT INTO aircraft_sale_listing_facts (
+              aircraft_sale_listing_id,
+              fact_kind,
+              fact_value,
+              evidence_text,
+              source_url,
+              source_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            listing_id,
+            fact.kind.as_str(),
+            fact.value.as_str(),
+            fact.evidence_text.as_str(),
+            fact.source_url.as_deref().or(values.source_url.as_deref()),
+            fact.confidence.as_str()
+        )?;
+    }
     Ok(())
 }
 
@@ -2967,7 +4318,24 @@ async fn listing_from_row(db: &AppDb, row: ListingRow) -> StoreResult<SaleListin
         serial_number: row.serial_number,
         airframe_hours: row.airframe_hours,
         engine_hours: row.engine_hours,
+        engine_time_basis: row.engine_time_basis,
+        engine_time_evidence: row.engine_time_evidence,
+        engine_time_confidence: row.engine_time_confidence,
         propeller_hours: row.propeller_hours,
+        propeller_time_basis: row.propeller_time_basis,
+        propeller_time_evidence: row.propeller_time_evidence,
+        propeller_time_confidence: row.propeller_time_confidence,
+        installed_engine_model_id: row.installed_engine_model_id,
+        installed_engine_source_url: row.installed_engine_source_url,
+        installed_engine_evidence_text: row.installed_engine_evidence_text,
+        installed_engine_confidence: row.installed_engine_confidence,
+        installed_propeller_model_id: row.installed_propeller_model_id,
+        installed_propeller_source_url: row.installed_propeller_source_url,
+        installed_propeller_evidence_text: row.installed_propeller_evidence_text,
+        installed_propeller_confidence: row.installed_propeller_confidence,
+        ingestion_state: row.ingestion_state,
+        ingestion_error: row.ingestion_error,
+        ingestion_completed_at: row.ingestion_completed_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
         aircraft: AircraftSummary {
@@ -2978,26 +4346,36 @@ async fn listing_from_row(db: &AppDb, row: ListingRow) -> StoreResult<SaleListin
             aircraft_model_variant_id,
         },
         avionics: listing_avionics(db, listing_id).await?,
+        valuation_facts: listing_facts(db, listing_id).await?,
     })
 }
 
 async fn listing_avionics(db: &AppDb, listing_id: i64) -> StoreResult<Vec<ParsedAvionics>> {
+    let capabilities = listing_avionics_capabilities(db, listing_id).await?;
     let rows = query_as_all!(
         db,
         ParsedAvionicsRow,
         r#"
         SELECT
+          model.id AS avionics_model_id,
           mfr.name AS manufacturer,
           model.name AS model,
-          avionics_type.name AS avionics_type,
-          link.quantity
+          link.quantity,
+          link.configuration_action,
+          link.source_notes,
+          link.source_confidence,
+          replaces_model.id AS replaces_avionics_model_id,
+          replaces_mfr.name AS replaces_manufacturer,
+          replaces_model.name AS replaces_model
         FROM aircraft_sale_listing_avionics link
         JOIN avionics_models model
           ON model.id = link.avionics_model_id
         JOIN avionics_manufacturers mfr
           ON mfr.id = model.avionics_manufacturer_id
-        JOIN avionics_types avionics_type
-          ON avionics_type.id = model.avionics_type_id
+        LEFT JOIN avionics_models replaces_model
+          ON replaces_model.id = link.replaces_avionics_model_id
+        LEFT JOIN avionics_manufacturers replaces_mfr
+          ON replaces_mfr.id = replaces_model.avionics_manufacturer_id
         WHERE link.aircraft_sale_listing_id = ?
         ORDER BY link.id
         "#,
@@ -3008,8 +4386,94 @@ async fn listing_avionics(db: &AppDb, listing_id: i64) -> StoreResult<Vec<Parsed
         .map(|row| ParsedAvionics {
             manufacturer: row.manufacturer,
             model: row.model,
-            avionics_type: row.avionics_type,
+            avionics_types: capabilities
+                .get(&row.avionics_model_id)
+                .cloned()
+                .unwrap_or_default(),
             quantity: row.quantity,
+            configuration_action: row.configuration_action,
+            replaces: match (
+                row.replaces_avionics_model_id,
+                row.replaces_manufacturer,
+                row.replaces_model,
+            ) {
+                (Some(avionics_model_id), Some(manufacturer), Some(model)) => {
+                    Some(ParsedAvionicsReference {
+                        manufacturer,
+                        model,
+                        avionics_types: capabilities
+                            .get(&avionics_model_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                }
+                _ => None,
+            },
+            source_evidence_text: row.source_notes,
+            source_confidence: row.source_confidence,
+        })
+        .collect())
+}
+
+async fn listing_avionics_capabilities(
+    db: &AppDb,
+    listing_id: i64,
+) -> StoreResult<HashMap<i64, Vec<String>>> {
+    let rows = query_as_all!(
+        db,
+        AvionicsCapabilityRow,
+        r#"
+        SELECT
+          membership.avionics_model_id,
+          avionics_type.name AS avionics_type
+        FROM avionics_model_types membership
+        JOIN avionics_types avionics_type
+          ON avionics_type.id = membership.avionics_type_id
+        WHERE EXISTS (
+          SELECT 1
+          FROM aircraft_sale_listing_avionics link
+          WHERE link.aircraft_sale_listing_id = ?
+            AND (
+              link.avionics_model_id = membership.avionics_model_id
+              OR link.replaces_avionics_model_id = membership.avionics_model_id
+            )
+        )
+        ORDER BY
+          membership.avionics_model_id,
+          avionics_type.normalized_name
+        "#,
+        listing_id
+    )?;
+    let mut capabilities = HashMap::new();
+    for row in rows {
+        capabilities
+            .entry(row.avionics_model_id)
+            .or_insert_with(Vec::new)
+            .push(row.avionics_type);
+    }
+    Ok(capabilities)
+}
+
+async fn listing_facts(db: &AppDb, listing_id: i64) -> StoreResult<Vec<ListingValuationFact>> {
+    let rows = query_as_all!(
+        db,
+        ListingFactRow,
+        r#"
+        SELECT fact_kind, fact_value, evidence_text, source_url, source_confidence
+        FROM aircraft_sale_listing_facts
+        WHERE aircraft_sale_listing_id = ?
+        ORDER BY fact_kind, id
+        "#,
+        listing_id
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ListingValuationFact {
+            kind: row.fact_kind,
+            value: row.fact_value,
+            evidence_text: row.evidence_text,
+            source_url: row.source_url,
+            confidence: row.source_confidence,
         })
         .collect())
 }
@@ -3046,20 +4510,77 @@ fn required_f64(value: Option<f64>, field_name: &str) -> StoreResult<f64> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
+    use crate::aircraft::faa::{parse_release, store_release, ReleaseMetadata, ReleaseReaders};
+    use crate::avionics::catalog::ApprovedAvionicsIdentity;
     use crate::db::{AppDb, DatabaseBackend};
-    use crate::extract::{
-        preview_manual_listing, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
-    };
+    use crate::extract::preview_manual_listing;
+    use crate::models::ParsedAvionics;
 
     use super::{
-        avionics_resolution_review_issues, avionics_secondary_check_review_issues,
-        model_similarity, variant_label_issues, variant_normalization_groups_from_response,
-        ListingValues, ModelVariantRow, MODEL_SIMILARITY_CONFIRMATION_THRESHOLD,
+        coalesce_resolved_listing_avionics, listing_avionics_value_from_catalog, model_similarity,
+        replace_listing_avionics, resolve_listing_avionics_values, variant_label_issues,
+        variant_normalization_groups_from_response, ListingAvionicsValue, ListingValues,
+        ModelVariantRow, MODEL_SIMILARITY_CONFIRMATION_THRESHOLD,
     };
+
+    const FAA_AIRCRAFT_REFERENCE: &str = "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED,TC-DATA-SHEET,TC-DATA-HOLDER\n2072738,CESSNA AIRCRAFT CO,182T,4,1,1,0,01,004,CLASS 1,0145,3A13,TEXTRON AVIATION INC\n";
+    const FAA_ENGINE_REFERENCE: &str =
+        "CODE,MFR,MODEL,TYPE,HORSEPOWER,THRUST\n41528,LYCOMING,IO-540-AB1A5,1,00230,000000\n";
+
+    async fn seed_faa_aircraft(db: &AppDb, n_number: &str, serial: &str) {
+        let suffix = n_number
+            .strip_prefix('N')
+            .expect("test FAA N-number must include N prefix");
+        let master = format!(
+            "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n{suffix},{serial},2072738,41528,2023\n"
+        );
+        let digest_seed = n_number.bytes().fold(0_u64, |state, byte| {
+            state.wrapping_mul(31).wrapping_add(u64::from(byte))
+        });
+        let release = parse_release(
+            ReleaseMetadata::official("2026-07-20", format!("{digest_seed:064x}")),
+            ReleaseReaders::new(
+                Cursor::new(master),
+                Cursor::new(FAA_AIRCRAFT_REFERENCE),
+                Cursor::new(FAA_ENGINE_REFERENCE),
+            ),
+            [n_number],
+        )
+        .expect("test FAA release should parse");
+        store_release(db, &release)
+            .await
+            .expect("test FAA release should store");
+    }
+
+    async fn seed_blank_identity_listing(db: &AppDb, user_id: i64, source_url: &str) -> i64 {
+        let variant_id = super::ensure_aircraft_model_variant(db, "Cessna", "182", "182T")
+            .await
+            .expect("variant should seed");
+        query_scalar_one!(
+            db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, is_verified,
+              source_url, model_year, asking_price_usd, currency, status,
+              ingestion_state, ingestion_error, registration_number, serial_number,
+              airframe_hours
+            )
+            VALUES (?, ?, FALSE, ?, 2023, 525000, 'USD', 'active',
+                    'quarantined', 'legacy identity is missing', NULL, NULL, 400)
+            RETURNING id
+            "#,
+            variant_id,
+            user_id,
+            source_url
+        )
+        .expect("legacy listing should seed")
+    }
 
     #[test]
     fn model_similarity_handles_compact_codes_without_special_cases() {
@@ -3137,155 +4658,296 @@ mod tests {
     }
 
     #[test]
-    fn avionics_resolution_review_flags_structural_generic_indicators() {
-        let context =
-            avionics_resolution_context("Cessna", "300 Series Audio Panel", "Audio Panel");
-        let issues = avionics_resolution_review_issues(
-            &context,
-            &json!({
-                "status": "concrete",
-                "manufacturer": "ARC (Cessna)",
-                "model": "300 Series Audio Control Panel",
-                "type": "Audio Panel",
-                "quantity": 1,
-                "introduced_year": 1970,
-                "estimated_unit_value_usd": 300,
-                "confidence": "medium",
-                "source_url": "https://example.com",
-                "source_title": "Example",
-                "notes": "verified"
-            }),
+    fn installed_component_requires_a_listing_source_url() {
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.source_url = None;
+        values.installed_engine = Some(crate::models::ParsedInstalledComponent {
+            manufacturer: "Continental".to_string(),
+            model: "IO-550-D".to_string(),
+            evidence_text: "Continental IO-550-D installed".to_string(),
+            confidence: "high".to_string(),
+        });
+        values.installed_engine_evidence_text = Some("Continental IO-550-D installed".to_string());
+        values.installed_engine_confidence = Some("high".to_string());
+
+        let error = super::validate_listing_values(&values)
+            .expect_err("unsourced installed component must be rejected");
+        assert!(error.to_string().contains("requires source URL"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_classifier_cannot_assign_even_exact_looking_avionics() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        super::ensure_avionics_model(&db, "Garmin", "GTX 345R", "Transponder")
+            .await
+            .expect("known catalog model should seed");
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![
+            ListingAvionicsValue::from_parsed(parsed_avionics("GTX 345R")),
+            ListingAvionicsValue::from_parsed(parsed_avionics("Imaginary 999")),
+        ];
+
+        let error = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            None,
+            Some("https://example.com/listing"),
+            None,
+        )
+        .await
+        .expect_err("unknown equipment requires a classifier or curation");
+        assert!(error.to_string().contains("Imaginary 999"));
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                "SELECT COUNT(*) FROM avionics_models WHERE normalized_name = 'imaginary999'"
+            )
+            .expect("unknown model count should load"),
+            0
         );
 
-        assert!(issues
-            .iter()
-            .any(|issue| issue.contains("parenthetical alias")));
-        assert!(issues.iter().any(|issue| issue.contains("aircraft maker")));
-        assert!(issues.iter().any(|issue| issue.contains("series/family")));
+        let error = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            None,
+            Some("https://example.com/listing"),
+            None,
+        )
+        .await
+        .expect_err("string equality is retrieval help, not identity proof");
+        assert!(error
+            .to_string()
+            .contains("Gemini identity resolver unavailable"));
+    }
+
+    #[tokio::test]
+    async fn persistence_rejects_free_form_replacement_target() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let model_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "GTX 345R", "Transponder")
+                .await
+                .expect("known catalog model should seed");
+        let mut candidate = approved_avionics_identity();
+        candidate.id = model_id;
+        let mut item = listing_avionics_value_from_catalog(
+            &ListingAvionicsValue::from_parsed(parsed_avionics("GTX 345R")),
+            &candidate,
+        );
+        item.configuration_action = "replaces".to_string();
+        item.replaces = Some(crate::models::ParsedAvionicsReference {
+            manufacturer: "Unknown Maker".to_string(),
+            model: "Imaginary 999".to_string(),
+            avionics_types: vec!["Transponder".to_string()],
+        });
+        item.replaces_avionics_model_id = None;
+
+        let error = replace_listing_avionics(&db, 999999, &[item])
+            .await
+            .expect_err("raw replacement identity must not be created");
+        assert!(error.to_string().contains("must resolve to a catalog id"));
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                "SELECT COUNT(*) FROM avionics_models WHERE normalized_name = 'imaginary999'"
+            )
+            .expect("unknown model count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_read_exposes_all_types_once_for_one_physical_product() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Cessna', 'cessna')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, '182', '182')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, '182T', '182t')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            "INSERT INTO aircraft_sale_listings (aircraft_model_variant_id, created_by_user_id, model_year, asking_price_usd, airframe_hours) VALUES (1, 1, 2020, 300000, 1000) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let avionics_model_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "GNX 375", "GPS")
+                .await
+                .unwrap();
+        let transponder_type_id = super::ensure_named_row(&db, "avionics_types", "Transponder")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(avionics_model_id)
+        .bind(transponder_type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id, source_confidence) VALUES (?, ?, 'high')",
+        )
+        .bind(listing_id)
+        .bind(avionics_model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let avionics = super::listing_avionics(&db, listing_id).await.unwrap();
+
+        assert_eq!(avionics.len(), 1, "capabilities must not duplicate a unit");
+        assert_eq!(avionics[0].model, "GNX 375");
+        assert_eq!(avionics[0].avionics_types, vec!["GPS", "Transponder"]);
     }
 
     #[test]
-    fn avionics_resolution_review_flags_class_and_multi_model_outputs() {
-        let class_context = avionics_resolution_context("Cirrus", "ADS-B", "Transponder");
-        let class_issues = avionics_resolution_review_issues(
-            &class_context,
-            &json!({
-                "status": "concrete",
-                "manufacturer": "Garmin",
-                "model": "ADS-B Transponder",
-                "type": "Transponder",
-                "quantity": 1,
-                "introduced_year": 2016,
-                "estimated_unit_value_usd": 2000,
-                "confidence": "medium",
-                "source_url": "https://example.com",
-                "source_title": "Example",
-                "notes": "verified"
-            }),
+    fn gnx_duplicate_capability_mentions_coalesce_without_creating_extra_units() {
+        let gps = resolved_avionics_value(
+            375,
+            &["GPS"],
+            "installed",
+            None,
+            Some("GNX 375 GPS navigator installed"),
+            Some("high"),
+            1,
         );
-        assert!(class_issues
-            .iter()
-            .any(|issue| issue.contains("equipment class")));
+        let transponder = resolved_avionics_value(
+            375,
+            &["Transponder"],
+            "installed",
+            None,
+            Some("GNX 375 Mode S transponder installed"),
+            Some("medium"),
+            2,
+        );
 
-        let multi_context = avionics_resolution_context("Cirrus", "GNS 430/530", "NAV/COM");
-        let multi_issues = avionics_resolution_review_issues(
-            &multi_context,
-            &json!({
-                "status": "concrete",
-                "manufacturer": "Garmin",
-                "model": "GNS 430/530 Series",
-                "type": "NAV/COM",
-                "quantity": 1,
-                "introduced_year": 1998,
-                "estimated_unit_value_usd": 5000,
-                "confidence": "medium",
-                "source_url": "https://example.com",
-                "source_title": "Example",
-                "notes": "verified"
-            }),
+        let coalesced = coalesce_resolved_listing_avionics([gps, transponder])
+            .expect("identical installation semantics should coalesce");
+
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].quantity, 2, "quantity uses max, not sum");
+        assert_eq!(coalesced[0].avionics_types, vec!["GPS", "Transponder"]);
+        assert_eq!(
+            coalesced[0].source_notes.as_deref(),
+            Some("GNX 375 GPS navigator installed\nGNX 375 Mode S transponder installed")
         );
-        assert!(multi_issues
-            .iter()
-            .any(|issue| issue.contains("series/family")));
-        assert!(multi_issues
-            .iter()
-            .any(|issue| issue.contains("multiple possible units")));
+        assert_eq!(
+            coalesced[0].source_confidence.as_deref(),
+            Some("medium"),
+            "the weaker duplicate evidence must govern"
+        );
     }
 
     #[test]
-    fn avionics_resolution_review_accepts_concrete_sourced_unit() {
-        let context = avionics_resolution_context("Cessna", "GTX 345R", "Transponder");
-        let issues = avionics_resolution_review_issues(
-            &context,
-            &json!({
-                "status": "concrete",
-                "manufacturer": "Garmin",
-                "model": "GTX 345R",
-                "type": "Transponder",
-                "quantity": 1,
-                "introduced_year": 2016,
-                "estimated_unit_value_usd": 4500,
-                "confidence": "high",
-                "source_url": "https://example.com",
-                "source_title": "Example",
-                "notes": "verified exact unit"
-            }),
+    fn duplicate_catalog_product_with_conflicting_action_is_rejected() {
+        let installed = resolved_avionics_value(
+            375,
+            &["GPS"],
+            "installed",
+            None,
+            Some("GNX 375 installed"),
+            Some("high"),
+            1,
+        );
+        let replaces = resolved_avionics_value(
+            375,
+            &["Transponder"],
+            "replaces",
+            Some(327),
+            Some("GNX 375 replaces GTX 327"),
+            Some("high"),
+            1,
         );
 
-        assert!(issues.is_empty(), "{issues:?}");
+        let error = coalesce_resolved_listing_avionics([installed, replaces])
+            .expect_err("conflicting configuration actions must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("conflicting installation actions"));
     }
 
     #[test]
-    fn secondary_avionics_review_flags_unchanged_generic_candidate() {
-        let context = avionics_resolution_context("Cessna", "ADS-B Transponder", "Transponder");
-        let issues = avionics_secondary_check_review_issues(
-            &context,
-            &json!({
-                "status": "concrete",
-                "manufacturer": "Garmin",
-                "model": "ADS-B Transponder",
-                "type": "Transponder"
-            }),
-            &json!({
-                "classification": "generic",
-                "manufacturer_is_avionics_maker": true,
-                "model_identifies_single_unit": false,
-                "confidence": "high",
-                "generic_indicators": ["capability label"],
-                "notes": "not one exact model"
-            }),
+    fn duplicate_catalog_product_with_different_replacement_targets_is_rejected() {
+        let replaces_gtx_327 = resolved_avionics_value(
+            375,
+            &["GPS"],
+            "replaces",
+            Some(327),
+            Some("GNX 375 replaces GTX 327"),
+            Some("high"),
+            1,
+        );
+        let replaces_gtx_330 = resolved_avionics_value(
+            375,
+            &["Transponder"],
+            "replaces",
+            Some(330),
+            Some("GNX 375 replaces GTX 330"),
+            Some("high"),
+            1,
         );
 
-        assert!(issues
-            .iter()
-            .any(|issue| issue.contains("secondary classifier")));
-        assert!(issues
-            .iter()
-            .any(|issue| issue.contains("does not identify one exact unit")));
+        let error = coalesce_resolved_listing_avionics([replaces_gtx_327, replaces_gtx_330])
+            .expect_err("different replacement targets must fail closed");
+
+        assert!(error.to_string().contains("replacement targets"));
     }
 
     #[test]
-    fn secondary_avionics_review_allows_corrected_concrete_unit() {
-        let context = avionics_resolution_context("Cessna", "ADS-B Transponder", "Transponder");
-        let issues = avionics_secondary_check_review_issues(
-            &context,
-            &json!({
-                "status": "concrete",
-                "manufacturer": "Garmin",
-                "model": "GTX 345R",
-                "type": "Transponder"
-            }),
-            &json!({
-                "classification": "generic",
-                "manufacturer_is_avionics_maker": true,
-                "model_identifies_single_unit": false,
-                "confidence": "high",
-                "generic_indicators": ["capability label"],
-                "notes": "not one exact model"
-            }),
+    fn duplicate_catalog_product_cannot_spoof_a_shared_replacement_id() {
+        let replaces_gtx_327 = resolved_avionics_value(
+            375,
+            &["GPS"],
+            "replaces",
+            Some(327),
+            Some("GNX 375 replaces GTX 327"),
+            Some("high"),
+            1,
         );
+        let mut conflicting_reference = resolved_avionics_value(
+            375,
+            &["Transponder"],
+            "replaces",
+            Some(327),
+            Some("GNX 375 replaces a different unit"),
+            Some("high"),
+            1,
+        );
+        conflicting_reference
+            .replaces
+            .as_mut()
+            .expect("replacement reference should exist")
+            .model = "GTX 330".to_string();
 
-        assert!(issues.is_empty(), "{issues:?}");
+        let error = coalesce_resolved_listing_avionics([replaces_gtx_327, conflicting_reference])
+            .expect_err("a shared numeric id must not hide conflicting target evidence");
+
+        assert!(error.to_string().contains("replacement targets"));
     }
 
     fn model_variant_row(
@@ -3303,25 +4965,96 @@ mod tests {
         }
     }
 
-    fn avionics_resolution_context(
-        aircraft_manufacturer: &str,
+    fn approved_avionics_identity() -> ApprovedAvionicsIdentity {
+        ApprovedAvionicsIdentity {
+            id: 42,
+            manufacturer: "Garmin".to_string(),
+            model: "GTX 345R".to_string(),
+            avionics_types: vec!["Transponder".to_string()],
+            manufacturer_identifier_kind: "manufacturer_part_number".to_string(),
+            manufacturer_identifier: "011-03520-00".to_string(),
+            evidence_url: "https://static.garmin.com/manuals/gtx345r.pdf".to_string(),
+            evidence_title: "GTX 345R installation manual".to_string(),
+            evidence: "The manual identifies the model and part number.".to_string(),
+            reason: "Authoritative manufacturer manual.".to_string(),
+        }
+    }
+
+    async fn ensure_approved_test_avionics_model(
+        db: &AppDb,
+        manufacturer: &str,
         model: &str,
         avionics_type: &str,
-    ) -> AvionicsUnitResolutionContext {
-        AvionicsUnitResolutionContext {
-            aircraft_manufacturer: aircraft_manufacturer.to_string(),
-            aircraft_model: "182 SKYLANE".to_string(),
-            aircraft_variant: "182T".to_string(),
-            model_year: 2009,
-            source_url: "https://example.com/listing".to_string(),
-            listing_context: String::new(),
-            candidate: AvionicsUnitResolutionCandidate {
-                manufacturer: "Garmin".to_string(),
-                model: model.to_string(),
-                avionics_type: avionics_type.to_string(),
-                quantity: 1,
-            },
-            value_reference_year: 2026,
+    ) -> super::StoreResult<i64> {
+        let id = super::ensure_avionics_model(db, manufacturer, model, avionics_type).await?;
+        let identifier = format!("TEST-{id}");
+        let normalized_identifier = format!("test{id}");
+        execute_query!(
+            db,
+            r#"
+            UPDATE avionics_models
+            SET catalog_status = 'approved',
+                manufacturer_identifier_kind = 'manufacturer_part_number',
+                manufacturer_identifier = ?,
+                normalized_manufacturer_identifier = ?,
+                identity_source_url = 'https://manufacturer.example/manuals/test.pdf',
+                identity_source_title = 'Manufacturer test manual',
+                identity_evidence_text = 'The manufacturer manual identifies this test product and part number.',
+                identity_evidence_kind = 'authoritative_reference',
+                identity_confidence = 'very_high',
+                catalog_reviewed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            "#,
+            identifier.as_str(),
+            normalized_identifier.as_str(),
+            id
+        )?;
+        Ok(id)
+    }
+
+    fn parsed_avionics(model: &str) -> ParsedAvionics {
+        ParsedAvionics {
+            manufacturer: "Garmin".to_string(),
+            model: model.to_string(),
+            avionics_types: vec!["Transponder".to_string()],
+            quantity: 1,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some(format!("{model} installed")),
+            source_confidence: Some("high".to_string()),
+        }
+    }
+
+    fn resolved_avionics_value(
+        avionics_model_id: i64,
+        avionics_types: &[&str],
+        configuration_action: &str,
+        replaces_avionics_model_id: Option<i64>,
+        source_notes: Option<&str>,
+        source_confidence: Option<&str>,
+        quantity: i64,
+    ) -> ListingAvionicsValue {
+        ListingAvionicsValue {
+            avionics_model_id: Some(avionics_model_id),
+            manufacturer: "Garmin".to_string(),
+            model: "GNX 375".to_string(),
+            avionics_types: avionics_types
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            quantity,
+            source: "listing".to_string(),
+            source_notes: source_notes.map(ToString::to_string),
+            source_confidence: source_confidence.map(ToString::to_string),
+            configuration_action: configuration_action.to_string(),
+            replaces: replaces_avionics_model_id.map(|target| {
+                crate::models::ParsedAvionicsReference {
+                    manufacturer: "Garmin".to_string(),
+                    model: format!("GTX {target}"),
+                    avionics_types: vec!["Transponder".to_string()],
+                }
+            }),
+            replaces_avionics_model_id,
         }
     }
 
@@ -3338,9 +5071,24 @@ mod tests {
             serial_number: Some("18283243".to_string()),
             status: "active".to_string(),
             airframe_hours: 357.0,
-            engine_hours: 357.0,
-            propeller_hours: 357.0,
+            engine_hours: Some(357.0),
+            engine_time_basis: "SNEW".to_string(),
+            engine_time_evidence: Some("357 hours since new".to_string()),
+            engine_time_confidence: Some("high".to_string()),
+            propeller_hours: Some(357.0),
+            propeller_time_basis: "SNEW".to_string(),
+            propeller_time_evidence: Some("357 hours since new".to_string()),
+            propeller_time_confidence: Some("high".to_string()),
+            installed_engine_model_id: None,
+            installed_engine: None,
+            installed_engine_evidence_text: None,
+            installed_engine_confidence: None,
+            installed_propeller_model_id: None,
+            installed_propeller: None,
+            installed_propeller_evidence_text: None,
+            installed_propeller_confidence: None,
             avionics: Vec::new(),
+            valuation_facts: Vec::new(),
         }
     }
 
@@ -3474,21 +5222,30 @@ mod tests {
             .current_user(None)
             .await
             .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
         let variant_id =
             super::ensure_aircraft_model_variant(&db, "Cessna", "182 Skylane", "182T Skylane")
                 .await
                 .expect("variant should seed");
-        let avionics_model_id =
-            super::ensure_avionics_model(&db, "Garmin", "G1000 NXi", "Integrated Flight Deck")
-                .await
-                .expect("avionics model should seed");
+        let avionics_model_id = ensure_approved_test_avionics_model(
+            &db,
+            "Garmin",
+            "G1000 NXi",
+            "Integrated Flight Deck",
+        )
+        .await
+        .expect("avionics model should seed");
         execute_query!(
             &db,
             r#"
             UPDATE avionics_models
             SET introduced_year = 2017,
                 estimated_unit_value_usd = 50000,
-                value_reference_year = 2026
+                value_basis = 'installed_contribution',
+                replacement_cost_usd = 65000,
+                value_reference_year = 2026,
+                value_source = 'gemini',
+                valuation_scope = 'unit'
             WHERE id = ?
             "#,
             avionics_model_id
@@ -3505,9 +5262,14 @@ mod tests {
               source_url,
               source_title,
               source_notes,
-              source_confidence
+              source_confidence,
+              evidence_kind,
+              is_valuation_eligible
             )
-            VALUES (?, 2023, 699000, 2023, 'https://example.test', 'test', 'test fixture', 'high')
+            VALUES (
+              ?, 2023, 699000, 2023, 'https://example.test', 'test', 'test fixture',
+              'high', 'direct_model_year', TRUE
+            )
             "#,
             variant_id
         )
@@ -3531,7 +5293,7 @@ mod tests {
             avionics_model_id
         )
         .expect("default avionics should seed");
-        let preview = preview_manual_listing(&json!({
+        let mut preview = preview_manual_listing(&json!({
             "manufacturer": "Cessna",
             "model": "182 Skylane",
             "variant": "182T Skylane",
@@ -3539,13 +5301,24 @@ mod tests {
             "asking_price_usd": 699000,
             "currency": "USD",
             "airframe_hours": 357,
-            "engine_hours": 357,
-            "propeller_hours": 357,
             "status": "active",
-            "registration_number": "NTEST1",
+            "registration_number": "N123T",
             "serial_number": "TESTSERIAL",
+            "installed_engine": {
+                "manufacturer": "Lycoming",
+                "model": "IO-540-AB1A5",
+                "evidence_text": "Lycoming IO-540-AB1A5 installed",
+                "confidence": "high"
+            },
+            "valuation_facts": [{
+                "kind": "engine_conversion",
+                "value": "Air Plains 300 HP conversion",
+                "evidence_text": "Air Plains 300 HP engine conversion",
+                "confidence": "high"
+            }],
             "avionics": []
         }));
+        preview.source_url = Some("https://example.test/listing".to_string());
 
         let listing = super::create_listing(&db, user.id, &preview, None, None)
             .await
@@ -3562,9 +5335,821 @@ mod tests {
         assert_eq!(listing.aircraft.manufacturer, "Cessna");
         assert_eq!(listing.aircraft.model, "182 Skylane");
         assert_eq!(listing.aircraft.variant, "182T Skylane");
-        assert_eq!(listing.registration_number.as_deref(), Some("NTEST1"));
+        assert_eq!(listing.registration_number.as_deref(), Some("N123T"));
+        assert_eq!(listing.engine_hours, None);
+        assert_eq!(listing.propeller_hours, None);
+        assert!(listing.installed_engine_model_id.is_some());
+        assert_eq!(listing.valuation_facts.len(), 1);
+        assert_eq!(listing.ingestion_state, "ready");
+        assert!(listing.ingestion_error.is_none());
+        assert!(listing.ingestion_completed_at.is_some());
+
+        let values = super::values_from_listing(&listing);
+        assert!(super::listing_matches_values(&db, &listing, &values)
+            .await
+            .expect("same evidence-backed listing should match"));
+
+        let mut changed_fact = values.clone();
+        changed_fact.valuation_facts[0].value = "Air Plains 310 HP conversion".to_string();
+        assert!(!super::listing_matches_values(&db, &listing, &changed_fact)
+            .await
+            .expect("fact comparison should run"));
+
+        let mut changed_engine = values;
+        changed_engine.installed_engine_model_id = None;
+        changed_engine.installed_engine = Some(crate::models::ParsedInstalledComponent {
+            manufacturer: "Continental".to_string(),
+            model: "IO-550-D".to_string(),
+            evidence_text: "Continental IO-550-D installed".to_string(),
+            confidence: "high".to_string(),
+        });
+        changed_engine.installed_engine_evidence_text =
+            Some("Continental IO-550-D installed".to_string());
+        assert!(
+            !super::listing_matches_values(&db, &listing, &changed_engine)
+                .await
+                .expect("installed engine comparison should run")
+        );
 
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn non_n_listing_is_rejected_before_model_work_or_existing_row_update() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        let variant_id = super::ensure_aircraft_model_variant(&db, "Cessna", "182", "182T")
+            .await
+            .expect("existing aircraft identity should seed");
+        let existing_listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, currency, status, registration_number,
+              serial_number, airframe_hours
+            ) VALUES (?, ?, 'https://example.test/foreign', 2022, 250000, 'USD', 'active',
+                      'C-GABC', 'FOREIGN-1', 500)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id
+        )
+        .expect("existing foreign listing should seed");
+        let catalog_counts_before = query_as_optional!(
+            &db,
+            (i64, i64, i64),
+            r#"
+            SELECT
+              (SELECT count(*) FROM aircraft_manufacturers),
+              (SELECT count(*) FROM aircraft_models),
+              (SELECT count(*) FROM aircraft_model_variants)
+            "#
+        )
+        .expect("catalog counts should load")
+        .expect("count query returns one row");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2022,
+            "asking_price_usd": 999000,
+            "currency": "USD",
+            "airframe_hours": 500,
+            "status": "active",
+            "registration_number": "C-GABC",
+            "serial_number": "FOREIGN-1",
+            "avionics": [{
+                "manufacturer": "Imaginary",
+                "model": "Model 9000",
+                "types": ["GPS"],
+                "source_evidence_text": "Imaginary Model 9000 installed",
+                "source_confidence": "high"
+            }]
+        }));
+        preview.source_url = Some("https://example.test/foreign".to_string());
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("non-N registration must fail before model-assisted work");
+        assert!(matches!(error, super::ListingStoreError::Validation(_)));
+        assert!(error.to_string().contains("non_n_registration"));
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                f64,
+                "SELECT asking_price_usd FROM aircraft_sale_listings WHERE id = ?",
+                existing_listing_id
+            )
+            .expect("existing price should load"),
+            250000.0
+        );
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT count(*) FROM aircraft_sale_listings")
+                .expect("listing count should load"),
+            1
+        );
+        let legacy_error = super::require_model_listings_faa_admitted(&db, "Cessna", "182")
+            .await
+            .expect_err("legacy variant curation must preflight every source listing");
+        assert!(legacy_error.to_string().contains("non_n_registration"));
+        let update_error = super::update_listing(
+            &db,
+            user.id,
+            existing_listing_id,
+            &json!({"asking_price_usd": 888000}),
+            None,
+        )
+        .await
+        .expect_err("an existing non-N listing must not reach update normalization");
+        assert!(update_error.to_string().contains("non_n_registration"));
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                f64,
+                "SELECT asking_price_usd FROM aircraft_sale_listings WHERE id = ?",
+                existing_listing_id
+            )
+            .expect("existing price should remain unchanged"),
+            250000.0
+        );
+        assert_eq!(
+            query_as_optional!(
+                &db,
+                (i64, i64, i64),
+                r#"
+                SELECT
+                  (SELECT count(*) FROM aircraft_manufacturers),
+                  (SELECT count(*) FROM aircraft_models),
+                  (SELECT count(*) FROM aircraft_model_variants)
+                "#
+            )
+            .expect("catalog counts should reload")
+            .expect("count query returns one row"),
+            catalog_counts_before
+        );
+    }
+
+    #[tokio::test]
+    async fn uncovered_n_number_is_rejected_before_model_work_or_insert() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N111AA", "SERIAL-111").await;
+        let catalog_counts_before = query_as_optional!(
+            &db,
+            (i64, i64, i64),
+            r#"
+            SELECT
+              (SELECT count(*) FROM aircraft_manufacturers),
+              (SELECT count(*) FROM aircraft_models),
+              (SELECT count(*) FROM aircraft_model_variants)
+            "#
+        )
+        .expect("catalog counts should load")
+        .expect("count query returns one row");
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Test Aircraft",
+            "model": "Model 2",
+            "variant": "Variant B",
+            "model_year": 2021,
+            "asking_price_usd": 150000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N222BB",
+            "serial_number": "SERIAL-222",
+            "avionics": []
+        }));
+        preview.source_url = Some("https://example.test/uncovered".to_string());
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("an N-number outside current projection must fail closed");
+        assert!(error.to_string().contains("registration_not_covered"));
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT count(*) FROM aircraft_sale_listings")
+                .expect("listing count should load"),
+            0
+        );
+        assert_eq!(
+            query_as_optional!(
+                &db,
+                (i64, i64, i64),
+                r#"
+                SELECT
+                  (SELECT count(*) FROM aircraft_manufacturers),
+                  (SELECT count(*) FROM aircraft_models),
+                  (SELECT count(*) FROM aircraft_model_variants)
+                "#
+            )
+            .expect("catalog counts should reload")
+            .expect("count query returns one row"),
+            catalog_counts_before
+        );
+    }
+
+    #[tokio::test]
+    async fn source_reprocessing_repairs_blank_identity_with_canonical_faa_values() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let variant_id = super::ensure_aircraft_model_variant(&db, "Cessna", "182", "182T")
+            .await
+            .expect("variant should seed");
+        let source_url = "https://example.test/listing/identity-recovery";
+        let legacy_listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, is_verified,
+              source_url, model_year, asking_price_usd, currency, status,
+              ingestion_state, ingestion_error, registration_number, serial_number,
+              airframe_hours
+            )
+            VALUES (?, ?, FALSE, ?, 2023, 525000, 'USD', 'active',
+                    'quarantined', 'legacy identity is missing', NULL, NULL, 400)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id,
+            source_url
+        )
+        .expect("legacy listing should seed");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "n-123t",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+
+        let _ = super::create_listing(&db, user.id, &preview, None, None).await;
+
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT count(*) FROM aircraft_sale_listings")
+                .expect("listing count should load"),
+            1
+        );
+        let identity = query_as_optional!(
+            &db,
+            (String, String),
+            "SELECT registration_number, serial_number FROM aircraft_sale_listings WHERE id = ?",
+            legacy_listing_id
+        )
+        .expect("identity should load")
+        .expect("legacy listing should remain");
+        assert_eq!(identity.0, "N123T");
+        assert_eq!(identity.1, "TESTSERIAL");
+    }
+
+    #[tokio::test]
+    async fn source_identity_repair_survives_downstream_avionics_failure() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let source_url = "https://example.test/listing/identity-before-enrichment";
+        let listing_id = seed_blank_identity_listing(&db, user.id, source_url).await;
+        let before = super::get_listing(&db, user.id, listing_id)
+            .await
+            .expect("legacy listing should load");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "n-123t",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+        preview.parsed_listing.avionics = vec![parsed_avionics("Imaginary 999")];
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("unavailable avionics resolver should fail downstream ingestion");
+        assert!(error
+            .to_string()
+            .contains("Gemini identity resolver unavailable"));
+
+        let after = super::get_listing(&db, user.id, listing_id)
+            .await
+            .expect("repaired listing should remain");
+        let mut expected = before;
+        expected.registration_number = Some("N123T".to_string());
+        expected.serial_number = Some("TESTSERIAL".to_string());
+        assert_eq!(after, expected);
+        assert_eq!(after.ingestion_state, "quarantined");
+        assert_eq!(
+            after.ingestion_error.as_deref(),
+            Some("legacy identity is missing")
+        );
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT count(*) FROM aircraft_sale_listings")
+                .expect("listing count should load"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_retained_serial_blocks_source_identity_repair() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let source_url = "https://example.test/listing/conflicting-retained-serial";
+        let listing_id = seed_blank_identity_listing(&db, user.id, source_url).await;
+        execute_query!(
+            &db,
+            "UPDATE aircraft_sale_listings SET serial_number = 'CONFLICTING-SERIAL' WHERE id = ?",
+            listing_id
+        )
+        .expect("conflicting retained serial should seed");
+        let before = super::get_listing(&db, user.id, listing_id)
+            .await
+            .expect("legacy listing should load");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N123T",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("retained serial must participate in FAA admission");
+        assert!(error.to_string().contains("serial_conflict"));
+        assert_eq!(
+            super::get_listing(&db, user.id, listing_id)
+                .await
+                .expect("conflicting legacy listing should remain"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_retained_serial_fails_identity_compare_and_set_closed() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let source_url = "https://example.test/listing/racing-retained-serial";
+        let listing_id = seed_blank_identity_listing(&db, user.id, source_url).await;
+        let candidate =
+            super::unverified_listing_for_missing_identity_source(&db, user.id, source_url)
+                .await
+                .expect("candidate lookup should succeed")
+                .expect("blank source candidate should exist");
+        let grounding = crate::aircraft::faa::require_aircraft_admission(
+            &db,
+            Some("N123T"),
+            candidate.serial_number.as_deref(),
+        )
+        .await
+        .expect("blank retained serial should pass FAA admission");
+
+        execute_query!(
+            &db,
+            "UPDATE aircraft_sale_listings SET serial_number = 'CHANGED-DURING-ADMISSION' WHERE id = ?",
+            listing_id
+        )
+        .expect("concurrent serial change should be simulated");
+        let before_repair = super::get_listing(&db, user.id, listing_id)
+            .await
+            .expect("changed listing should load");
+
+        let error = super::persist_faa_identity_for_missing_identity_source(
+            &db, user.id, source_url, &candidate, &grounding,
+        )
+        .await
+        .expect_err("stale retained evidence must fail closed");
+        assert!(error
+            .to_string()
+            .contains("retained identity changed during FAA admission"));
+        assert_eq!(
+            super::get_listing(&db, user.id, listing_id)
+                .await
+                .expect("stale candidate listing should remain"),
+            before_repair
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_faa_admission_does_not_mutate_same_source_blank_listing() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let source_url = "https://example.test/listing/rejected-identity";
+        let listing_id = seed_blank_identity_listing(&db, user.id, source_url).await;
+        let before = super::get_listing(&db, user.id, listing_id)
+            .await
+            .expect("legacy listing should load");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N999ZZ",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("an uncovered N-number must fail FAA admission");
+        assert!(error.to_string().contains("registration_not_covered"));
+        assert_eq!(
+            super::get_listing(&db, user.id, listing_id)
+                .await
+                .expect("legacy listing should remain"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn different_source_does_not_receive_admitted_identity() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let listing_id = seed_blank_identity_listing(
+            &db,
+            user.id,
+            "https://example.test/listing/original-source",
+        )
+        .await;
+        let before = super::get_listing(&db, user.id, listing_id)
+            .await
+            .expect("legacy listing should load");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N123T",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some("https://example.test/listing/different-source".to_string());
+        preview.parsed_listing.avionics = vec![parsed_avionics("Imaginary 999")];
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("downstream failure should prevent a new listing insert");
+        assert!(error
+            .to_string()
+            .contains("Gemini identity resolver unavailable"));
+        assert_eq!(
+            super::get_listing(&db, user.id, listing_id)
+                .await
+                .expect("unrelated source listing should remain"),
+            before
+        );
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT count(*) FROM aircraft_sale_listings")
+                .expect("listing count should load"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn source_identity_repair_does_not_duplicate_an_existing_unverified_tail() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let variant_id = super::ensure_aircraft_model_variant(&db, "Cessna", "182", "182T")
+            .await
+            .expect("variant should seed");
+        let existing_tail_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, is_verified,
+              source_url, model_year, asking_price_usd, currency, status,
+              ingestion_state, ingestion_error, registration_number, serial_number,
+              airframe_hours
+            )
+            VALUES (?, ?, FALSE, 'https://example.test/listing/existing-tail',
+                    2023, 525000, 'USD', 'active', 'quarantined',
+                    'awaiting enrichment', 'N123T', 'TESTSERIAL', 400)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id
+        )
+        .expect("existing tail listing should seed");
+        let blank_source = "https://example.test/listing/blank-duplicate";
+        let blank_id = seed_blank_identity_listing(&db, user.id, blank_source).await;
+        let existing_before = super::get_listing(&db, user.id, existing_tail_id)
+            .await
+            .expect("existing tail listing should load");
+        let blank_before = super::get_listing(&db, user.id, blank_id)
+            .await
+            .expect("blank listing should load");
+
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N123T",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(blank_source.to_string());
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("competing retained tail must block source identity repair");
+        assert!(error
+            .to_string()
+            .contains("already belongs to unverified listing"));
+        assert!(error.to_string().contains(&existing_tail_id.to_string()));
+        assert_eq!(
+            super::get_listing(&db, user.id, existing_tail_id)
+                .await
+                .expect("existing tail listing should remain"),
+            existing_before
+        );
+        assert_eq!(
+            super::get_listing(&db, user.id, blank_id)
+                .await
+                .expect("blank source listing should remain"),
+            blank_before
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_valuation_grade_avionics_price_and_suite_membership() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        let variant_id = super::ensure_aircraft_model_variant(&db, "Test", "Readiness", "Suite")
+            .await
+            .expect("variant should seed");
+        let suite_id = ensure_approved_test_avionics_model(
+            &db,
+            "Garmin",
+            "Test Integrated Suite",
+            "Integrated Flight Deck",
+        )
+        .await
+        .expect("suite should seed");
+        let component_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "Test Display", "Display")
+                .await
+                .expect("component should seed");
+        let listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, currency, status, airframe_hours
+            ) VALUES (?, ?, 'https://example.test/readiness', 2024, 500000, 'USD', 'active', 100)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id
+        )
+        .expect("listing should seed");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, source, source_notes,
+              source_confidence
+            ) VALUES (?, ?, 'listing', 'explicitly installed suite', 'high')
+            "#,
+            listing_id,
+            suite_id
+        )
+        .expect("listing avionics should seed");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_model_variant_price_points (
+              aircraft_model_variant_id, model_year, purchase_price_new_usd,
+              purchase_price_reference_year, source_url, source_title,
+              source_notes, source_confidence
+            ) VALUES (?, 2024, 500000, 2024, 'https://example.test', 'test', 'legacy', 'high')
+            "#,
+            variant_id
+        )
+        .expect("legacy price should seed");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_model_variant_default_avionics (
+              aircraft_model_variant_id, model_year, avionics_model_id, quantity,
+              source_url, source_title, source_notes, source_confidence
+            ) VALUES (?, 2024, ?, 1, 'https://example.test', 'test', 'default suite', 'high')
+            "#,
+            variant_id,
+            suite_id
+        )
+        .expect("default avionics should seed");
+
+        assert_eq!(
+            super::listing_missing_avionics_metadata_count(&db, listing_id)
+                .await
+                .expect("missing metadata should count"),
+            1
+        );
+        assert!(
+            super::listing_needs_model_year_price_or_default_avionics(&db, listing_id)
+                .await
+                .expect("legacy records should be incomplete")
+        );
+
+        execute_query!(
+            &db,
+            r#"
+            UPDATE avionics_models
+            SET introduced_year = 2020,
+                estimated_unit_value_usd = 40000,
+                value_basis = 'installed_contribution',
+                replacement_cost_usd = 55000,
+                value_reference_year = 2026,
+                value_source = 'gemini',
+                valuation_scope = 'integrated_suite'
+            WHERE id = ?
+            "#,
+            suite_id
+        )
+        .expect("rich suite metadata should seed");
+        execute_query!(
+            &db,
+            r#"
+            UPDATE aircraft_model_variant_price_points
+            SET evidence_kind = 'direct_model_year', is_valuation_eligible = TRUE
+            WHERE aircraft_model_variant_id = ? AND model_year = 2024
+            "#,
+            variant_id
+        )
+        .expect("price should become eligible");
+
+        assert_eq!(
+            super::listing_missing_avionics_metadata_count(&db, listing_id)
+                .await
+                .expect("suite membership should still be required"),
+            1
+        );
+        assert!(
+            super::listing_needs_model_year_price_or_default_avionics(&db, listing_id)
+                .await
+                .expect("default suite should still be incomplete")
+        );
+
+        execute_query!(
+            &db,
+            "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, 1)",
+            suite_id,
+            component_id
+        )
+        .expect("suite membership should seed");
+        assert_eq!(
+            super::listing_missing_avionics_metadata_count(&db, listing_id)
+                .await
+                .expect("rich suite should be complete"),
+            0
+        );
+        assert!(
+            !super::listing_needs_model_year_price_or_default_avionics(&db, listing_id)
+                .await
+                .expect("valuation-grade records should be complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_completion_quarantines_staged_listing() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123QT", "QTEST").await;
+        let preview = preview_manual_listing(&json!({
+            "manufacturer": "Test Aircraft",
+            "model": "Model 1",
+            "variant": "Variant A",
+            "model_year": 2020,
+            "asking_price_usd": 125000,
+            "currency": "USD",
+            "airframe_hours": 500,
+            "status": "active",
+            "registration_number": "N123QT",
+            "serial_number": "QTEST",
+            "avionics": []
+        }));
+
+        let error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("missing required enrichment should quarantine the row");
+        let super::ListingStoreError::Ingestion { listing_id, .. } = error else {
+            panic!("expected an ingestion error")
+        };
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects sqlite")
+        };
+        let state: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT ingestion_state, ingestion_error, ingestion_completed_at FROM aircraft_sale_listings WHERE id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .expect("quarantined listing should remain queryable");
+        assert_eq!(state.0, "quarantined");
+        assert!(state.1.is_some());
+        assert!(state.2.is_none());
     }
 }

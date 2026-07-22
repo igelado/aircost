@@ -115,23 +115,12 @@ impl DnnValuationModel {
     }
 
     fn support(&self, query: &ValuationQuery) -> SupportGrade {
-        let model_count = query
-            .model_id
-            .and_then(|id| self.metadata.group_counts.models.get(&id))
-            .copied()
-            .unwrap_or(0);
-        let manufacturer_count = query
-            .manufacturer_id
-            .and_then(|id| self.metadata.group_counts.manufacturers.get(&id))
-            .copied()
-            .unwrap_or(0);
-        if model_count >= 5 {
-            SupportGrade::High
-        } else if model_count >= 2 || manufacturer_count >= 5 {
-            SupportGrade::Medium
-        } else {
-            SupportGrade::Low
-        }
+        let expected_log_hours = (self.utilization(query) * query.age().max(1.0)).ln_1p();
+        crate::valuation::structural::support_for_counts_with_hours(
+            &self.metadata.group_counts,
+            query,
+            Some(expected_log_hours),
+        )
     }
 
     fn utilization(&self, query: &ValuationQuery) -> f64 {
@@ -155,6 +144,17 @@ impl ValuationModel for DnnValuationModel {
 
     fn snapshot_id(&self) -> i64 {
         self.metadata.snapshot_id
+    }
+
+    fn market_year(&self) -> Result<i64, ValuationError> {
+        self.fallback
+            .as_ref()
+            .ok_or_else(|| {
+                ValuationError::InvalidArtifact(
+                    "DNN serving requires its approved structural baseline".to_string(),
+                )
+            })?
+            .market_year()
     }
 
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
@@ -325,6 +325,7 @@ mod tests {
             engine_times: vec![],
             propeller_times: vec![],
             equipment_tokens: vec!["Garmin GNS 430W".to_string()],
+            valuation_facts: vec![],
             technical_field_count: 6,
         }
     }
@@ -371,6 +372,22 @@ mod tests {
         )
         .unwrap();
         artifact.members[0].bytes[0] ^= 0xff;
+        assert!(DnnValuationModel::load(&artifact, None).is_err());
+    }
+
+    #[test]
+    fn stale_feature_schema_prevents_loading() {
+        let row = one_listing();
+        let mut artifact = fit_dnn(
+            &[row],
+            &DnnFitConfig {
+                maximum_epochs: 1,
+                ..DnnFitConfig::default()
+            },
+        )
+        .unwrap();
+        artifact.metadata.encoder.feature_schema_version =
+            crate::valuation::FEATURE_SCHEMA_VERSION.saturating_sub(1);
         assert!(DnnValuationModel::load(&artifact, None).is_err());
     }
 }

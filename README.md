@@ -14,94 +14,23 @@ The estimator uses a hybrid market-residual and maintenance-status model:
 4. Adjust engine and propeller value relative to the half-life convention used by aircraft price guides: a mid-time component is neutral, fresh overhaul adds value, run-out deducts value, and deduction is capped at run-out.
 5. Add installed avionics as separate depreciating components. Each avionics model stores an introduction year and reference equipment value, then depreciates on its own electronics curve so a newer panel can lift the value of an older airframe.
 
-The most accurate version of this model would use model-specific market baselines from Aircraft Bluebook, VREF, aircraft listing/sale data, or an appraiser's database. Without those comparables, this script exposes the assumptions as inputs so the curve can be calibrated per aircraft family.
+The database-backed implementation combines listing-derived comparable and
+structural models with explicit maintenance and equipment adjustments. Model
+artifacts, validation evidence, and activation state are versioned in the
+database.
 
-## Example
-
-```bash
-python3 -m aircost.cli.estimate_aircraft_price \
-  --profile light_piston \
-  --purchase-price-new 520000 \
-  --age-years 12 \
-  --airframe-hours 3200 \
-  --engine-hours 900 \
-  --engine-tbo-hours 2000 \
-  --engine-overhaul-cost 42000 \
-  --propeller-hours 900 \
-  --propeller-tbo-hours 2400 \
-  --propeller-overhaul-cost 6000
-```
-
-Use `--json` for machine-readable output.
-
-Validate the depreciation model against current asking-price listings:
-
-```bash
-python3 scripts/validate_depreciation_model.py
-```
-
-Validation data lives in `data/depreciation_validation_listings.json`. These are asking prices, not confirmed sale prices, so treat the output as a calibration diagnostic rather than appraisal accuracy. The current validation set covers Sling TSi, Cessna 172, Piper Archer, and Diamond DA40 listings from multiple marketplaces.
-
-## Annual Cost Projection
-
-Project yearly fixed costs, hourly costs, and depreciation:
-
-```bash
-python3 scripts/project_aircraft_costs.py \
-  --aircraft-config config/aircraft.example.json \
-  --cost-config config/costs.example.json \
-  --annual-flight-hours 120
-```
-
-The normal output is itemized by year. Use `--summary` for a compact table and `--json` for machine-readable output. Details are in [docs/annual_cost_model.md](docs/annual_cost_model.md).
-
-Aircraft-specific costs and operating assumptions, such as insurance, annual inspection, fuel burn, oil type/price, oil consumption, and maintenance rate, live in `config/aircraft.example.json`. Shared scenario/location costs, such as tie-down, property tax rate, fuel price, and average inflation rate, live in `config/costs.example.json`. Annual flight hours are a required command-line input so each scenario is explicit.
-
-## Rental Cost Projection
-
-Project yearly rental costs:
-
-```bash
-python3 scripts/project_rental_costs.py \
-  --rental-config config/rental.example.json \
-  --annual-flight-hours 120
-```
-
-Rental analysis includes fixed insurance and club costs, plus a rental rate per flight hour. Details are in [docs/rental_cost_model.md](docs/rental_cost_model.md).
-
-## Investment Return Projection
-
-Project how a given amount of money grows at a given return rate with reinvested semiannual payments:
-
-```bash
-python3 scripts/project_investment_returns.py \
-  --investment-config config/investment.example.json \
-  --initial-amount 90000
-```
-
-Investment analysis does not apply inflation. The investment config contains return assumptions only; standalone runs pass the invested principal with `--initial-amount`, and the purchase-vs-rent comparison uses the aircraft purchase price. It assumes municipal-bond-style semiannual dividend/coupon reinvestment by default. Details are in [docs/investment_return_model.md](docs/investment_return_model.md).
-
-## Purchase vs Rent and Invest
-
-Compare buying an aircraft against renting another aircraft while investing the purchase price:
-
-```bash
-python3 scripts/compare_purchase_rent_invest.py \
-  --aircraft-config config/aircraft.example.json \
-  --cost-config config/costs.example.json \
-  --rental-config config/rental.example.json \
-  --investment-config config/investment.example.json \
-  --annual-flight-hours 120
-```
-
-The comparison reports the net position of each strategy over time. In the rent-and-invest case, yearly rental costs are withdrawn from the invested purchase price. Details are in [docs/purchase_vs_rent_invest.md](docs/purchase_vs_rent_invest.md).
-
-## Web Application
+## Running AirCost
 
 Run the SQLx-backed Rust web app:
 
 ```bash
 cargo run --bin aircost-web
+```
+
+Run administrative workflows with:
+
+```bash
+cargo run --bin aircost-admin -- --help
 ```
 
 The server uses axum, tokio, eoka, reqwest, and sqlx. It exposes listing

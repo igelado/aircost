@@ -1,0 +1,78 @@
+# Runtime Gemini task routing. This file contains no credentials and is loaded
+# automatically when AIRCOST_GEMINI_CONFIG is not set. Keep model IDs pinned so
+# accounting and comparisons remain reproducible.
+version = 1
+
+[tasks.listing_extraction]
+model = "gemini-3.5-flash-lite"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.grounded_metadata]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.avionics_identity]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.avionics_review]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 8192
+
+[tasks.aircraft_visual_identity]
+model = "gemini-3.1-flash-lite"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.aircraft_search_grounding]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.aircraft_url_verification]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.aircraft_structure]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 12000
+
+[tasks.aircraft_catalog_adjudication]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.aircraft_hierarchy_verification]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[benchmark]
+sample_size = 4
+seed = 20260721
+
+[[benchmark.matrices]]
+task = "listing_extraction"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+thinking_levels = ["low"]
+
+[[benchmark.matrices]]
+task = "grounded_metadata"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
+thinking_levels = ["low"]
+
+[[benchmark.matrices]]
+task = "avionics_identity"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
+thinking_levels = ["low"]
+
+[[benchmark.matrices]]
+task = "aircraft_visual_identity"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+thinking_levels = ["low"]

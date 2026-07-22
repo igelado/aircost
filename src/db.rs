@@ -14,8 +14,12 @@ pub const DEFAULT_DATABASE_PATH: &str = "data/aircost.sqlite3";
 pub const DEFAULT_DATABASE_URL: &str = "sqlite://data/aircost.sqlite3";
 pub const DEVELOPER_EMAIL: &str = "developer@localhost";
 const DEVELOPER_AUTH_SUBJECT: &str = "developer";
-const SQLITE_SCHEMA_SQL: &str = include_str!("../aircost/webapp/schema.sql");
-const POSTGRES_SCHEMA_SQL: &str = include_str!("../aircost/webapp/schema.postgres.sql");
+const SQLITE_SCHEMA_SQL: &str = include_str!("../schema/sqlite.sql");
+const POSTGRES_SCHEMA_SQL: &str = include_str!("../schema/postgres.sql");
+const VALUATION_DATA_HARDENING_MIGRATION: &str = "20260720_valuation_data_hardening";
+const AVIONICS_CATALOG_CURATION_MIGRATION: &str = "20260721_avionics_catalog_curation";
+const AVIONICS_MULTI_TYPE_MIGRATION: &str = "20260721_avionics_multi_type";
+const AIRCRAFT_REFERENCE_CATALOG_MIGRATION: &str = "20260722_aircraft_reference_catalog";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -48,6 +52,7 @@ impl AppDb {
             let db = Self {
                 backend: DatabaseBackend::Postgres(pool),
             };
+            db.ensure_required_migrations().await?;
             db.initialize().await?;
             Ok(db)
         } else {
@@ -64,6 +69,7 @@ impl AppDb {
             let db = Self {
                 backend: DatabaseBackend::Sqlite(pool),
             };
+            db.ensure_required_migrations().await?;
             db.initialize().await?;
             Ok(db)
         }
@@ -113,6 +119,234 @@ impl AppDb {
             }
         };
         user.with_context(|| format!("unknown user: {identity}"))
+    }
+
+    async fn ensure_required_migrations(&self) -> Result<()> {
+        let missing_valuation_hardening = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                SELECT
+                  EXISTS (
+                    SELECT 1
+                    FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'aircraft_sale_listings'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pragma_table_info('aircraft_sale_listings')
+                    WHERE name = 'ingestion_state'
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                SELECT
+                  to_regclass('aircraft_sale_listings') IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_attribute
+                    WHERE attrelid = to_regclass('aircraft_sale_listings')
+                      AND attname = 'ingestion_state'
+                      AND NOT attisdropped
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if missing_valuation_hardening {
+            bail!(migration_required_message(
+                self.kind(),
+                "aircraft_sale_listings",
+                "ingestion_state",
+                VALUATION_DATA_HARDENING_MIGRATION,
+            ));
+        }
+
+        let missing_avionics_curation = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                SELECT
+                  EXISTS (
+                    SELECT 1
+                    FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'avionics_models'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pragma_table_info('avionics_models')
+                    WHERE name = 'catalog_status'
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                SELECT
+                  to_regclass('avionics_models') IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_attribute
+                    WHERE attrelid = to_regclass('avionics_models')
+                      AND attname = 'catalog_status'
+                      AND NOT attisdropped
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if missing_avionics_curation {
+            bail!(migration_required_message(
+                self.kind(),
+                "avionics_models",
+                "catalog_status",
+                AVIONICS_CATALOG_CURATION_MIGRATION,
+            ));
+        }
+
+        let missing_avionics_multi_type = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                SELECT
+                  EXISTS (
+                    SELECT 1
+                    FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'avionics_models'
+                  )
+                  AND (
+                    NOT EXISTS (
+                      SELECT 1
+                      FROM sqlite_schema
+                      WHERE type = 'table' AND name = 'avionics_model_types'
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM pragma_table_info('avionics_models')
+                      WHERE name = 'avionics_type_id'
+                    )
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                SELECT
+                  to_regclass('avionics_models') IS NOT NULL
+                  AND (
+                    to_regclass('avionics_model_types') IS NULL
+                    OR EXISTS (
+                      SELECT 1
+                      FROM pg_attribute
+                      WHERE attrelid = to_regclass('avionics_models')
+                        AND attname = 'avionics_type_id'
+                        AND NOT attisdropped
+                    )
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if missing_avionics_multi_type {
+            bail!(avionics_multi_type_migration_required_message(self.kind()));
+        }
+
+        let missing_aircraft_reference_catalog = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT
+                      EXISTS (
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND name = 'aircraft_sale_listings'
+                      )
+                      AND (
+                        NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'aircraft_identity_observations'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'aircraft_engine_catalog_models'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'aircraft_propeller_catalog_models'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'faa_registry_snapshots'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'faa_registry_aircraft'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'faa_registry_aircraft_references'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'faa_registry_engine_references'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table' AND name = 'faa_registry_coverage'
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT
+                      to_regclass('aircraft_sale_listings') IS NOT NULL
+                      AND (
+                        to_regclass('aircraft_identity_observations') IS NULL
+                        OR to_regclass('aircraft_engine_catalog_models') IS NULL
+                        OR to_regclass('aircraft_propeller_catalog_models') IS NULL
+                        OR to_regclass('faa_registry_snapshots') IS NULL
+                        OR to_regclass('faa_registry_aircraft') IS NULL
+                        OR to_regclass('faa_registry_aircraft_references') IS NULL
+                        OR to_regclass('faa_registry_engine_references') IS NULL
+                        OR to_regclass('faa_registry_coverage') IS NULL
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if missing_aircraft_reference_catalog {
+            bail!(aircraft_reference_catalog_migration_required_message(
+                self.kind()
+            ));
+        }
+        Ok(())
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -359,10 +593,177 @@ async fn execute_statements<'a, E>(executor: E, sql: &str) -> Result<()>
 where
     E: Executor<'a> + Copy,
 {
-    for statement in sql.split(';').map(str::trim).filter(|sql| !sql.is_empty()) {
+    for statement in split_sql_statements(sql) {
         executor.execute(statement).await?;
     }
     Ok(())
+}
+
+/// Split the checked-in schema files without breaking trigger bodies, quoted
+/// strings, or PostgreSQL dollar-quoted function definitions.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut dollar_quote: Option<String> = None;
+
+    while index < bytes.len() {
+        if line_comment {
+            if bytes[index] == b'\n' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = dollar_quote.as_deref() {
+            if bytes[index..].starts_with(delimiter.as_bytes()) {
+                index += delimiter.len();
+                dollar_quote = None;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if single_quoted {
+            if bytes[index] == b'\'' {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                } else {
+                    single_quoted = false;
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if double_quoted {
+            if bytes[index] == b'"' {
+                if bytes.get(index + 1) == Some(&b'"') {
+                    index += 2;
+                } else {
+                    double_quoted = false;
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            line_comment = true;
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'\'' {
+            single_quoted = true;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'"' {
+            double_quoted = true;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'$' {
+            if let Some(delimiter) = dollar_quote_delimiter(&sql[index..]) {
+                index += delimiter.len();
+                dollar_quote = Some(delimiter.to_string());
+                continue;
+            }
+        }
+        if bytes[index] == b';' {
+            let candidate = sql[start..index].trim();
+            if !candidate.is_empty() && !sqlite_trigger_body_is_open(candidate) {
+                statements.push(candidate);
+                start = index + 1;
+            }
+        }
+        index += 1;
+    }
+
+    let trailing = sql[start..].trim();
+    if !trailing.is_empty() {
+        statements.push(trailing);
+    }
+    statements
+}
+
+fn dollar_quote_delimiter(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return None;
+    }
+    let end = bytes[1..].iter().position(|byte| *byte == b'$')? + 1;
+    if bytes[1..end]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        Some(&value[..=end])
+    } else {
+        None
+    }
+}
+
+fn sqlite_trigger_body_is_open(statement: &str) -> bool {
+    let statement = strip_leading_sql_comments(statement);
+    let uppercase = statement.to_ascii_uppercase();
+    let mut words = uppercase
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|word| !word.is_empty());
+    if words.next() != Some("CREATE") {
+        return false;
+    }
+    let second = words.next();
+    let trigger = if second == Some("TEMP") || second == Some("TEMPORARY") {
+        words.next()
+    } else {
+        second
+    };
+    trigger == Some("TRIGGER")
+        && words.any(|word| word == "BEGIN")
+        && !uppercase.trim_end().ends_with("END")
+}
+
+fn strip_leading_sql_comments(mut value: &str) -> &str {
+    loop {
+        value = value.trim_start();
+        if let Some(line_comment) = value.strip_prefix("--") {
+            value = line_comment
+                .find('\n')
+                .map(|newline| &line_comment[newline + 1..])
+                .unwrap_or("");
+            continue;
+        }
+        if let Some(block_comment) = value.strip_prefix("/*") {
+            value = block_comment
+                .find("*/")
+                .map(|end| &block_comment[end + 2..])
+                .unwrap_or("");
+            continue;
+        }
+        return value;
+    }
 }
 
 fn postgres_placeholders(sql: &str) -> String {
@@ -380,10 +781,254 @@ fn postgres_placeholders(sql: &str) -> String {
     converted
 }
 
+fn migration_required_message(
+    kind: DatabaseKind,
+    table: &str,
+    column: &str,
+    migration: &str,
+) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: existing `{table}` is missing `{column}`; \
+         back up the database, apply `migrations/{migration}.{backend}.sql`, then restart aircost"
+    )
+}
+
+fn avionics_multi_type_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: existing avionics catalog must use the \
+         `avionics_model_types` capability table without scalar `avionics_models.avionics_type_id`; \
+         back up the database, apply `migrations/{AVIONICS_MULTI_TYPE_MIGRATION}.{backend}.sql`, \
+         then restart aircost"
+    )
+}
+
+fn aircraft_reference_catalog_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: existing aircraft data is missing the clean \
+         aircraft identity/reference catalogs or FAA registry projection; back up the \
+         database, apply `migrations/{AIRCRAFT_REFERENCE_CATALOG_MIGRATION}.{backend}.sql`, then \
+         restart aircost"
+    )
+}
+
 pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
     if is_database_url(database_url) || !database_url.trim().is_empty() {
         Ok(())
     } else {
         bail!("database URL cannot be empty")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::Executor;
+
+    use super::{
+        aircraft_reference_catalog_migration_required_message,
+        avionics_multi_type_migration_required_message, migration_required_message,
+        split_sql_statements, AppDb, DatabaseBackend, DatabaseKind,
+        AVIONICS_CATALOG_CURATION_MIGRATION, VALUATION_DATA_HARDENING_MIGRATION,
+    };
+
+    async fn sqlite_db_with_statements(statements: &[&str]) -> AppDb {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("SQLite test database should connect");
+        for statement in statements {
+            pool.execute(*statement)
+                .await
+                .expect("legacy test schema should be created");
+        }
+        AppDb {
+            backend: DatabaseBackend::Sqlite(pool),
+        }
+    }
+
+    #[test]
+    fn schema_splitter_preserves_sqlite_trigger_bodies() {
+        let sql = "CREATE TABLE example (id INTEGER);\n\
+                   CREATE TRIGGER example_guard BEFORE INSERT ON example\n\
+                   BEGIN\n\
+                     SELECT RAISE(ABORT, 'invalid; value');\n\
+                   END;\n\
+                   CREATE INDEX example_id ON example (id);";
+        let statements = split_sql_statements(sql);
+        assert_eq!(statements.len(), 3);
+        assert!(statements[1].contains("SELECT RAISE"));
+        assert!(statements[1].ends_with("END"));
+    }
+
+    #[test]
+    fn schema_splitter_preserves_commented_sqlite_trigger_bodies() {
+        let sql = "CREATE TABLE example (id INTEGER);\n\
+                   -- Approval is staged before this trigger.\n\
+                   /* Keep the trigger body in one statement. */\n\
+                   CREATE TRIGGER example_guard BEFORE INSERT ON example\n\
+                   BEGIN\n\
+                     SELECT RAISE(ABORT, 'invalid; value');\n\
+                   END;\n\
+                   CREATE INDEX example_id ON example (id);";
+        let statements = split_sql_statements(sql);
+        assert_eq!(statements.len(), 3);
+        assert!(statements[1].contains("CREATE TRIGGER"));
+        assert!(statements[1].contains("SELECT RAISE"));
+        assert!(statements[1].ends_with("END"));
+    }
+
+    #[test]
+    fn schema_splitter_preserves_postgres_function_bodies() {
+        let sql = "CREATE OR REPLACE FUNCTION guard() RETURNS TRIGGER\n\
+                   LANGUAGE plpgsql AS $function$\n\
+                   BEGIN\n\
+                     RAISE EXCEPTION 'invalid; value';\n\
+                     RETURN NEW;\n\
+                   END;\n\
+                   $function$;\n\
+                   CREATE TRIGGER guard_insert BEFORE INSERT ON example\n\
+                   FOR EACH ROW EXECUTE FUNCTION guard();";
+        let statements = split_sql_statements(sql);
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("RETURN NEW;"));
+        assert!(statements[1].starts_with("CREATE TRIGGER"));
+    }
+
+    #[tokio::test]
+    async fn legacy_listing_schema_requires_valuation_hardening_first() {
+        let db = sqlite_db_with_statements(&[
+            "CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE avionics_models (id INTEGER PRIMARY KEY)",
+        ])
+        .await;
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("legacy listing schema must fail preflight")
+            .to_string();
+        assert!(error.contains("`aircraft_sale_listings` is missing `ingestion_state`"));
+        assert!(error.contains("migrations/20260720_valuation_data_hardening.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn hardened_listing_with_legacy_avionics_requires_catalog_migration() {
+        let db = sqlite_db_with_statements(&[
+            "CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY, ingestion_state TEXT)",
+            "CREATE TABLE avionics_models (id INTEGER PRIMARY KEY)",
+        ])
+        .await;
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("legacy avionics schema must fail preflight")
+            .to_string();
+        assert!(error.contains("`avionics_models` is missing `catalog_status`"));
+        assert!(error.contains("migrations/20260721_avionics_catalog_curation.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn curated_catalog_requires_join_only_multi_type_migration() {
+        let db = sqlite_db_with_statements(&[
+            "CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY, ingestion_state TEXT)",
+            "CREATE TABLE avionics_models (id INTEGER PRIMARY KEY, catalog_status TEXT, avionics_type_id INTEGER)",
+        ])
+        .await;
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("scalar avionics catalog must fail preflight")
+            .to_string();
+        assert!(error.contains("`avionics_model_types` capability table"));
+        assert!(error.contains("without scalar `avionics_models.avionics_type_id`"));
+        assert!(error.contains("migrations/20260721_avionics_multi_type.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn join_only_avionics_catalog_passes_migration_preflight() {
+        let db = sqlite_db_with_statements(&[
+            "CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY, ingestion_state TEXT)",
+            "CREATE TABLE avionics_models (id INTEGER PRIMARY KEY, catalog_status TEXT)",
+            "CREATE TABLE avionics_model_types (avionics_model_id INTEGER, avionics_type_id INTEGER)",
+            "CREATE TABLE aircraft_identity_observations (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE aircraft_engine_catalog_models (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE aircraft_propeller_catalog_models (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE faa_registry_snapshots (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE faa_registry_aircraft (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE faa_registry_aircraft_references (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE faa_registry_engine_references (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE faa_registry_coverage (id INTEGER PRIMARY KEY)",
+        ])
+        .await;
+        db.ensure_required_migrations()
+            .await
+            .expect("join-only catalog should pass preflight");
+    }
+
+    #[tokio::test]
+    async fn existing_database_requires_clean_aircraft_reference_catalog() {
+        let db = sqlite_db_with_statements(&[
+            "CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY, ingestion_state TEXT)",
+            "CREATE TABLE avionics_models (id INTEGER PRIMARY KEY, catalog_status TEXT)",
+            "CREATE TABLE avionics_model_types (avionics_model_id INTEGER, avionics_type_id INTEGER)",
+            "CREATE TABLE engine_models (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE propeller_models (id INTEGER PRIMARY KEY)",
+        ])
+        .await;
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("legacy aircraft reference storage must fail preflight")
+            .to_string();
+        assert!(error.contains("clean aircraft identity/reference catalog"));
+        assert!(error.contains("20260722_aircraft_reference_catalog.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn empty_database_passes_preflight_and_initializes_fresh_schema() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("fresh database should initialize");
+        db.ensure_required_migrations()
+            .await
+            .expect("fresh schema should pass subsequent preflight");
+    }
+
+    #[test]
+    fn migration_messages_select_the_backend_specific_script() {
+        let sqlite = migration_required_message(
+            DatabaseKind::Sqlite,
+            "aircraft_sale_listings",
+            "ingestion_state",
+            VALUATION_DATA_HARDENING_MIGRATION,
+        );
+        assert!(sqlite.contains("20260720_valuation_data_hardening.sqlite.sql"));
+
+        let postgres = migration_required_message(
+            DatabaseKind::Postgres,
+            "avionics_models",
+            "catalog_status",
+            AVIONICS_CATALOG_CURATION_MIGRATION,
+        );
+        assert!(postgres.contains("20260721_avionics_catalog_curation.postgres.sql"));
+
+        let multi_type = avionics_multi_type_migration_required_message(DatabaseKind::Postgres);
+        assert!(multi_type.contains("20260721_avionics_multi_type.postgres.sql"));
+
+        let aircraft_reference =
+            aircraft_reference_catalog_migration_required_message(DatabaseKind::Sqlite);
+        assert!(aircraft_reference.contains("20260722_aircraft_reference_catalog.sqlite.sql"));
     }
 }

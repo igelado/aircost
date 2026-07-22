@@ -7,8 +7,54 @@ use serde::{Deserialize, Serialize};
 pub struct ComponentObservation {
     pub time_hours: Option<f64>,
     pub basis: ComponentTimeBasis,
+    #[serde(default)]
+    pub source_basis: Option<String>,
+    #[serde(default)]
+    pub evidence_text: Option<String>,
+    #[serde(default)]
+    pub source_confidence: Option<String>,
     #[serde(default = "one_component")]
     pub count: i64,
+}
+
+pub fn source_backed_component_observation(
+    time_hours: Option<f64>,
+    source_basis: &str,
+    evidence_text: Option<&str>,
+    source_confidence: Option<&str>,
+    count: i64,
+) -> ComponentObservation {
+    let parsed_basis = match source_basis {
+        "SNEW" => ComponentTimeBasis::SinceNew,
+        "SMOH" | "SFOH" | "SPOH" => ComponentTimeBasis::SinceOverhaul,
+        _ => ComponentTimeBasis::Unknown,
+    };
+    let is_source_backed = parsed_basis != ComponentTimeBasis::Unknown
+        && evidence_text.is_some_and(|value| !value.trim().is_empty())
+        && matches!(source_confidence, Some("high" | "medium"))
+        && time_hours.is_some_and(|hours| hours.is_finite() && hours >= 0.0);
+
+    ComponentObservation {
+        time_hours: is_source_backed.then_some(time_hours).flatten(),
+        basis: if is_source_backed {
+            parsed_basis
+        } else {
+            ComponentTimeBasis::Unknown
+        },
+        source_basis: Some(source_basis.to_string()),
+        evidence_text: evidence_text.map(str::to_string),
+        source_confidence: source_confidence.map(str::to_string),
+        count,
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SourceBackedValuationFact {
+    pub kind: String,
+    pub value: String,
+    pub evidence_text: String,
+    pub source_url: Option<String>,
+    pub confidence: String,
 }
 
 fn one_component() -> i64 {
@@ -24,6 +70,56 @@ pub enum ComponentTimeBasis {
     TimeRemaining,
     #[default]
     Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{source_backed_component_observation, ComponentTimeBasis};
+
+    #[test]
+    fn only_source_backed_known_component_times_reach_valuation() {
+        let trusted = source_backed_component_observation(
+            Some(420.0),
+            "SMOH",
+            Some("420 hours SMOH"),
+            Some("medium"),
+            1,
+        );
+        assert_eq!(trusted.time_hours, Some(420.0));
+        assert_eq!(trusted.basis, ComponentTimeBasis::SinceOverhaul);
+
+        for source_basis in ["SFOH", "SPOH"] {
+            let overhaul = source_backed_component_observation(
+                Some(420.0),
+                source_basis,
+                Some("420 hours since overhaul"),
+                Some("high"),
+                1,
+            );
+            assert_eq!(overhaul.basis, ComponentTimeBasis::SinceOverhaul);
+        }
+
+        for rejected in [
+            source_backed_component_observation(
+                Some(420.0),
+                "unknown",
+                Some("420 engine hours"),
+                Some("high"),
+                1,
+            ),
+            source_backed_component_observation(Some(420.0), "SMOH", None, Some("high"), 1),
+            source_backed_component_observation(
+                Some(420.0),
+                "SMOH",
+                Some("possibly 420 SMOH"),
+                Some("low"),
+                1,
+            ),
+        ] {
+            assert_eq!(rejected.time_hours, None);
+            assert_eq!(rejected.basis, ComponentTimeBasis::Unknown);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -156,6 +252,8 @@ pub struct TrainingListing {
     pub propeller_times: Vec<ComponentObservation>,
     #[serde(default)]
     pub equipment_tokens: Vec<String>,
+    #[serde(default)]
+    pub valuation_facts: Vec<SourceBackedValuationFact>,
     #[serde(default)]
     pub technical_field_count: u32,
 }
@@ -291,6 +389,13 @@ pub struct StructuralArtifactV1 {
 
 impl StructuralArtifactV1 {
     pub fn validate(&self) -> Result<(), ValuationError> {
+        if self.feature_schema_version != crate::valuation::FEATURE_SCHEMA_VERSION {
+            return Err(ValuationError::InvalidArtifact(format!(
+                "structural artifact feature schema {} does not match current schema {}",
+                self.feature_schema_version,
+                crate::valuation::FEATURE_SCHEMA_VERSION
+            )));
+        }
         if !(0.10..=0.70).contains(&self.age_floor)
             || !(0.01..=0.25).contains(&self.age_decay)
             || !self.global_log_anchor.is_finite()

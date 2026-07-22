@@ -1,0 +1,92 @@
+# Copy this file outside source control and set:
+# AIRCOST_GEMINI_CONFIG=/absolute/path/to/gemini.toml
+#
+# Precedence: compiled defaults < this file < legacy environment variables <
+# task-specific environment variables. All models must be pinned identifiers;
+# aliases ending in `-latest` are rejected so benchmark and accounting records
+# remain reproducible.
+version = 1
+
+[tasks.listing_extraction]
+model = "gemini-3.5-flash-lite"
+thinking_level = "low"
+max_output_tokens = 4096
+# service_tier = "flex"
+
+[tasks.grounded_metadata]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.avionics_identity]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.avionics_review]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 8192
+
+[tasks.aircraft_visual_identity]
+model = "gemini-3.1-flash-lite"
+thinking_level = "low"
+max_output_tokens = 4096
+
+[tasks.aircraft_search_grounding]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.aircraft_url_verification]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.aircraft_structure]
+model = "gemini-3.5-flash"
+thinking_level = "low"
+max_output_tokens = 12000
+
+[tasks.aircraft_catalog_adjudication]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.aircraft_hierarchy_verification]
+model = "gemini-3.5-flash"
+thinking_level = "medium"
+max_output_tokens = 12000
+
+[benchmark]
+sample_size = 10
+seed = 20260721
+# Set explicit IDs to bypass sampling:
+# listing_ids = [1, 2, 3]
+
+[[benchmark.matrices]]
+task = "listing_extraction"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]
+thinking_levels = ["minimal", "low"]
+max_output_tokens = [4096]
+
+[[benchmark.matrices]]
+task = "grounded_metadata"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
+# `unspecified` omits the wire field and therefore exercises standard service.
+service_tiers = ["unspecified", "flex"]
+thinking_levels = ["minimal", "low"]
+max_output_tokens = [4096]
+
+[[benchmark.matrices]]
+task = "avionics_identity"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+service_tiers = ["unspecified", "flex"]
+thinking_levels = ["minimal", "low"]
+max_output_tokens = [4096]
+
+[[benchmark.matrices]]
+task = "aircraft_visual_identity"
+models = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash"]
+thinking_levels = ["minimal", "low"]
+max_output_tokens = [4096]

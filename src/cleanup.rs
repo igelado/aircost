@@ -187,15 +187,23 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
         db,
         r#"
         DELETE FROM avionics_models
-        WHERE NOT EXISTS (
+        WHERE catalog_status <> 'approved'
+        AND NOT EXISTS (
           SELECT 1
           FROM aircraft_sale_listing_avionics listing_link
           WHERE listing_link.avionics_model_id = avionics_models.id
+             OR listing_link.replaces_avionics_model_id = avionics_models.id
         )
         AND NOT EXISTS (
           SELECT 1
           FROM aircraft_model_variant_default_avionics default_link
           WHERE default_link.avionics_model_id = avionics_models.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM avionics_suite_components membership
+          WHERE membership.suite_model_id = avionics_models.id
+             OR membership.component_model_id = avionics_models.id
         )
         "#
     )?;
@@ -218,8 +226,8 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
         DELETE FROM avionics_types
         WHERE NOT EXISTS (
           SELECT 1
-          FROM avionics_models model
-          WHERE model.avionics_type_id = avionics_types.id
+          FROM avionics_model_types membership
+          WHERE membership.avionics_type_id = avionics_types.id
         )
         "#
     )?;
@@ -312,7 +320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_removes_unreferenced_aircraft_and_component_rows() {
+    async fn cleanup_removes_unreferenced_aircraft_rows_but_keeps_approved_catalog_entries() {
         let (db, path) = test_db().await;
         seed_unreferenced_aircraft_graph(&db).await;
 
@@ -326,16 +334,16 @@ mod tests {
         assert_eq!(report.aircraft_model_spec_versions, 1);
         assert_eq!(report.aircraft_model_variant_price_points, 1);
         assert_eq!(report.aircraft_model_variant_default_avionics, 1);
-        assert_eq!(report.avionics_models, 1);
-        assert_eq!(report.avionics_manufacturers, 1);
-        assert_eq!(report.avionics_types, 1);
+        assert_eq!(report.avionics_models, 0);
+        assert_eq!(report.avionics_manufacturers, 0);
+        assert_eq!(report.avionics_types, 0);
         assert_eq!(report.engine_models, 1);
         assert_eq!(report.engine_manufacturers, 1);
         assert_eq!(report.propeller_models, 1);
         assert_eq!(report.propeller_manufacturers, 1);
 
         assert_eq!(table_count(&db, "aircraft_model_variants").await, 0);
-        assert_eq!(table_count(&db, "avionics_models").await, 0);
+        assert_eq!(table_count(&db, "avionics_models").await, 1);
         assert_eq!(table_count(&db, "engine_models").await, 0);
         assert_eq!(table_count(&db, "propeller_models").await, 0);
 
@@ -360,6 +368,58 @@ mod tests {
         assert_eq!(report.avionics_types, 0);
         assert_eq!(table_count(&db, "aircraft_model_variants").await, 1);
         assert_eq!(table_count(&db, "avionics_models").await, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_unreviewed_models_used_only_by_a_suite_membership() {
+        let (db, path) = test_db().await;
+        let manufacturer_id = insert_named(&db, "avionics_manufacturers", "Garmin").await;
+        let type_id = insert_named(&db, "avionics_types", "Flight Display").await;
+        let suite_id = insert_unreviewed_avionics_model(
+            &db,
+            manufacturer_id,
+            type_id,
+            "Test Integrated Suite",
+            "test integrated suite",
+        )
+        .await;
+        let component_id = insert_unreviewed_avionics_model(
+            &db,
+            manufacturer_id,
+            type_id,
+            "Test Display",
+            "test display",
+        )
+        .await;
+        // A migrated database may preserve suite links created before the
+        // approved-only trigger existed.
+        execute_query!(
+            &db,
+            "DROP TRIGGER avionics_suite_components_approved_insert"
+        )
+        .expect("legacy fixture should disable the fresh-schema insert guard");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO avionics_suite_components (
+              suite_model_id, component_model_id, quantity
+            ) VALUES (?, ?, 2)
+            "#,
+            suite_id,
+            component_id
+        )
+        .expect("suite membership should seed");
+
+        let report = cleanup_orphan_records(&db)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(report.avionics_models, 0);
+        assert_eq!(table_count(&db, "avionics_models").await, 2);
+        assert_eq!(table_count(&db, "avionics_suite_components").await, 1);
 
         drop(db);
         let _ = std::fs::remove_file(path);
@@ -497,7 +557,7 @@ mod tests {
     }
 
     async fn insert_aircraft_model(db: &AppDb, aircraft_manufacturer_id: i64) -> i64 {
-        query_scalar_one!(
+        let model_id = query_scalar_one!(
             db,
             i64,
             r#"
@@ -511,7 +571,8 @@ mod tests {
             "#,
             aircraft_manufacturer_id
         )
-        .expect("aircraft model should seed")
+        .expect("aircraft model should seed");
+        model_id
     }
 
     async fn insert_aircraft_variant(db: &AppDb, aircraft_model_id: i64) -> i64 {
@@ -535,23 +596,85 @@ mod tests {
     async fn insert_avionics_model(db: &AppDb) -> i64 {
         let manufacturer_id = insert_named(db, "avionics_manufacturers", "Garmin").await;
         let type_id = insert_named(db, "avionics_types", "Integrated Flight Deck").await;
-        query_scalar_one!(
+        let model_id = query_scalar_one!(
             db,
             i64,
             r#"
             INSERT INTO avionics_models (
               avionics_manufacturer_id,
-              avionics_type_id,
+              name,
+              normalized_name,
+              manufacturer_identifier_kind,
+              manufacturer_identifier,
+              normalized_manufacturer_identifier,
+              identity_source_url,
+              identity_source_title,
+              identity_evidence_text,
+              identity_evidence_kind,
+              identity_confidence,
+              catalog_reviewed_at
+            )
+            VALUES (
+              ?, 'G1000 NXi', 'g1000 nxi',
+              'manufacturer_model_number', 'G1000 NXi', 'g1000nxi',
+              'https://www.garmin.com/aviation/g1000-nxi/',
+              'Garmin G1000 NXi',
+              'Manufacturer reference identifies the G1000 NXi product.',
+              'authoritative_reference', 'very_high', CURRENT_TIMESTAMP
+            )
+            RETURNING id
+            "#,
+            manufacturer_id
+        )
+        .expect("avionics model should seed");
+        execute_query!(
+            db,
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+            model_id,
+            type_id
+        )
+        .expect("avionics capability should seed");
+        execute_query!(
+            db,
+            "UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?",
+            model_id
+        )
+        .expect("avionics model should be approved after capability assignment");
+        model_id
+    }
+
+    async fn insert_unreviewed_avionics_model(
+        db: &AppDb,
+        manufacturer_id: i64,
+        type_id: i64,
+        name: &str,
+        normalized_name: &str,
+    ) -> i64 {
+        let model_id = query_scalar_one!(
+            db,
+            i64,
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id,
               name,
               normalized_name
             )
-            VALUES (?, ?, 'G1000 NXi', 'g1000 nxi')
+            VALUES (?, ?, ?)
             RETURNING id
             "#,
             manufacturer_id,
+            name,
+            normalized_name
+        )
+        .expect("unreviewed avionics model should seed");
+        execute_query!(
+            db,
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+            model_id,
             type_id
         )
-        .expect("avionics model should seed")
+        .expect("unreviewed avionics capability should seed");
+        model_id
     }
 
     async fn insert_engine_model(db: &AppDb) -> i64 {

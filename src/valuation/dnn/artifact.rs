@@ -87,6 +87,14 @@ impl DnnArtifactV1 {
                 self.metadata.artifact_format_version
             )));
         }
+        if self.metadata.encoder.feature_schema_version != crate::valuation::FEATURE_SCHEMA_VERSION
+        {
+            return Err(ValuationError::InvalidArtifact(format!(
+                "DNN feature schema {} does not match current schema {}",
+                self.metadata.encoder.feature_schema_version,
+                crate::valuation::FEATURE_SCHEMA_VERSION
+            )));
+        }
         self.metadata.architecture.validate()?;
         if self.metadata.capacity != self.metadata.architecture.capacity {
             return Err(ValuationError::InvalidArtifact(

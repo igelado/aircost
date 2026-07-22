@@ -146,7 +146,11 @@ impl StructuralModel {
     }
 
     fn support(&self, query: &ValuationQuery) -> SupportGrade {
-        support_for_counts(&self.artifact.group_counts, query)
+        let expected_log_hours = self
+            .artifact
+            .expected_hours
+            .expected_log_hours(query.age(), query.category_key.as_deref());
+        support_for_counts_with_hours(&self.artifact.group_counts, query, Some(expected_log_hours))
     }
 
     fn q80(&self, query: &ValuationQuery, support: SupportGrade) -> f64 {
@@ -204,6 +208,10 @@ impl ValuationModel for StructuralModel {
 
     fn snapshot_id(&self) -> i64 {
         self.artifact.snapshot_id
+    }
+
+    fn market_year(&self) -> Result<i64, ValuationError> {
+        Ok(self.artifact.snapshot_year)
     }
 
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
@@ -679,10 +687,15 @@ fn weighted_line_fit(observations: &[(f64, f64)], weights: &[f64]) -> (f64, f64)
 
 fn count_groups(rows: &[TrainingListing]) -> GroupCounts {
     let mut counts = GroupCounts {
-        total: rows.len(),
+        total: 0,
         ..GroupCounts::default()
     };
+    let mut seen = BTreeSet::new();
     for row in rows {
+        if !seen.insert(row.duplicate_group_key.as_str()) {
+            continue;
+        }
+        counts.total += 1;
         if let Some(category) = &row.category_key {
             *counts.categories.entry(category.clone()).or_default() += 1;
         }
@@ -729,7 +742,16 @@ fn fit_utilization_rates(rows: &[TrainingListing]) -> UtilizationRates {
     }
 }
 
-pub(crate) fn support_for_counts(counts: &GroupCounts, query: &ValuationQuery) -> SupportGrade {
+pub(crate) fn support_for_counts_with_hours(
+    counts: &GroupCounts,
+    query: &ValuationQuery,
+    expected_log_hours: Option<f64>,
+) -> SupportGrade {
+    let variant_count = query
+        .variant_id
+        .and_then(|id| counts.variants.get(&id))
+        .copied()
+        .unwrap_or_default();
     let model_count = query
         .model_id
         .and_then(|id| counts.models.get(&id))
@@ -740,9 +762,19 @@ pub(crate) fn support_for_counts(counts: &GroupCounts, query: &ValuationQuery) -
         .and_then(|id| counts.manufacturers.get(&id))
         .copied()
         .unwrap_or_default();
-    if model_count >= 5 {
+    let hours_distance = query
+        .airframe_hours
+        .zip(expected_log_hours)
+        .map(|(hours, expected)| (hours.ln_1p() - expected).abs());
+    let close_hours = hours_distance.is_some_and(|distance| distance <= 2.5_f64.ln());
+    let broadly_close_hours = hours_distance.is_some_and(|distance| distance <= 4.0_f64.ln());
+    if variant_count >= 5 && close_hours {
         SupportGrade::High
-    } else if model_count >= 2 || manufacturer_count >= 5 {
+    } else if (variant_count >= 2 && broadly_close_hours)
+        || (model_count >= 5 && close_hours)
+        || (variant_count >= 5 && hours_distance.is_none())
+        || (model_count >= 2 && manufacturer_count >= 5 && broadly_close_hours)
+    {
         SupportGrade::Medium
     } else {
         SupportGrade::Low
@@ -810,6 +842,7 @@ mod tests {
                     engine_times: vec![],
                     propeller_times: vec![],
                     equipment_tokens: vec![],
+                    valuation_facts: vec![],
                     technical_field_count: 4,
                 }
             })
@@ -866,6 +899,25 @@ mod tests {
     }
 
     #[test]
+    fn broad_model_counts_and_distant_hours_do_not_claim_high_support() {
+        let artifact = fit_structural(&synthetic_rows(), &StructuralFitConfig::default()).unwrap();
+        let model = StructuralModel::new(8, artifact).unwrap();
+        let mut broad_model_only = synthetic_rows()[8].as_query();
+        broad_model_only.variant_id = Some(999);
+        assert_ne!(
+            model.estimate(&broad_model_only).unwrap().support,
+            SupportGrade::High
+        );
+
+        let mut distant_hours = synthetic_rows()[8].as_query();
+        distant_hours.airframe_hours = Some(1_000_000.0);
+        assert_ne!(
+            model.estimate(&distant_hours).unwrap().support,
+            SupportGrade::High
+        );
+    }
+
+    #[test]
     fn artifact_round_trip_does_not_change_prediction() {
         let artifact = fit_structural(&synthetic_rows(), &StructuralFitConfig::default()).unwrap();
         let encoded = serde_json::to_vec(&artifact).unwrap();
@@ -880,6 +932,14 @@ mod tests {
             .estimate(&query)
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn stale_feature_schema_artifact_is_rejected() {
+        let mut artifact =
+            fit_structural(&synthetic_rows(), &StructuralFitConfig::default()).unwrap();
+        artifact.feature_schema_version = FEATURE_SCHEMA_VERSION.saturating_sub(1);
+        assert!(StructuralModel::new(1, artifact).is_err());
     }
 
     #[test]

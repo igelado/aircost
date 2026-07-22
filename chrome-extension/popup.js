@@ -3,6 +3,33 @@ const START_UPLOAD_MESSAGE = "aircost:start-upload";
 const UPLOAD_PROGRESS_MESSAGE = "aircost:upload-progress";
 const BACKGROUND_UPLOADS_STATE_KEY = "aircostBackgroundUploads";
 const BACKGROUND_UPLOAD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const AVIONICS_TYPES = [
+  "GPS",
+  "NAV",
+  "COM",
+  "Transponder",
+  "Autopilot",
+  "Flight Director",
+  "Integrated Flight Deck",
+  "Audio Panel",
+  "Flight Display",
+  "Navigation Indicator",
+  "Traffic",
+  "Datalink",
+  "Weather Radar",
+  "Lightning Detection",
+  "Terrain Awareness",
+  "Engine Monitor",
+  "Standby Instrument",
+  "ELT",
+  "ADF",
+  "DME",
+  "AHRS",
+  "Air Data Computer",
+  "Radar Altimeter",
+  "Magnetometer",
+  "Clock/Timer",
+];
 
 const STAGE_LABELS = {
   capturing_page: "Capturing page",
@@ -814,7 +841,7 @@ function addAvionicsRow(item = {}) {
   row.append(
     avionicsInput("avionics_manufacturer", "Maker", item.manufacturer),
     avionicsInput("avionics_model", "Model", item.model),
-    avionicsTypeSelect(item.type || item.avionics_type),
+    avionicsTypeSelect(item.types || item.avionics_types),
     avionicsInput("avionics_quantity", "Qty", item.quantity || 1, "number"),
   );
   const remove = document.createElement("button");
@@ -859,17 +886,21 @@ function avionicsInput(name, placeholder, value = "", type = "text") {
   return input;
 }
 
-function avionicsTypeSelect(value = "Unknown") {
+function avionicsTypeSelect(values = []) {
   const select = document.createElement("select");
-  select.name = "avionics_type";
-  select.setAttribute("aria-label", "Avionics type");
-  for (const optionValue of ["PFD", "MFD", "NAV/COM", "GPS", "Autopilot", "Transponder", "Audio Panel", "Engine Monitor", "Unknown"]) {
+  select.name = "avionics_types";
+  select.multiple = true;
+  select.size = 3;
+  select.setAttribute("aria-label", "Avionics capabilities");
+  select.title = "Select one or more avionics capabilities";
+  const selectedTypes = new Set(Array.isArray(values) ? values : []);
+  for (const optionValue of AVIONICS_TYPES) {
     const option = document.createElement("option");
     option.value = optionValue;
     option.textContent = optionValue;
+    option.selected = selectedTypes.has(optionValue);
     select.append(option);
   }
-  select.value = value || "Unknown";
   return select;
 }
 
@@ -878,7 +909,10 @@ function readAvionicsRows() {
   for (const row of Array.from(avionicsList.querySelectorAll(".avionics-row"))) {
     const manufacturer = row.querySelector('[name="avionics_manufacturer"]').value.trim();
     const model = row.querySelector('[name="avionics_model"]').value.trim();
-    const type = row.querySelector('[name="avionics_type"]').value;
+    const types = Array.from(
+      row.querySelector('[name="avionics_types"]').selectedOptions,
+      (option) => option.value,
+    );
     const quantity = Number.parseInt(row.querySelector('[name="avionics_quantity"]').value, 10) || 1;
     if (!manufacturer && !model) {
       continue;
@@ -886,7 +920,10 @@ function readAvionicsRows() {
     if (!manufacturer || !model) {
       throw new Error("Avionics rows need maker and model.");
     }
-    avionics.push({ manufacturer, model, type, quantity: Math.max(quantity, 1) });
+    if (!types.length) {
+      throw new Error("Avionics rows need at least one capability.");
+    }
+    avionics.push({ manufacturer, model, types, quantity: Math.max(quantity, 1) });
   }
   return avionics;
 }

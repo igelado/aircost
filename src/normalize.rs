@@ -55,8 +55,62 @@ pub fn normalize_avionics_model_name(value: &str) -> String {
     normalized_tokens.join(" ")
 }
 
+/// Normalize an avionics manufacturer identity independently of typography.
+///
+/// Manufacturer names are short identity labels rather than prose. Removing
+/// whitespace after the general name normalization makes punctuation and word
+/// boundary variants such as `Bendix/King`, `Bendix King`, and `BendixKing`
+/// converge without maintaining a maker-specific alias table.
+pub fn normalize_avionics_manufacturer_name(value: &str) -> String {
+    normalize_name(value).split_whitespace().collect()
+}
+
+/// Normalize an authoritative manufacturer identifier for uniqueness checks.
+///
+/// Part numbers, model numbers, and SKUs are identifiers rather than display
+/// labels. Punctuation and spacing vary across manuals and distributor pages,
+/// so storage keeps the cited display value while this compact key is used for
+/// candidate lookup and duplicate prevention.
+pub fn normalize_avionics_identifier(value: &str) -> String {
+    decode_html_entities(value)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 pub fn is_generic_avionics_model_name(value: &str) -> bool {
-    normalize_avionics_model_name(value).is_empty()
+    matches!(
+        normalize_avionics_model_name(value).as_str(),
+        "" | "unknown"
+            | "generic"
+            | "standard"
+            | "factory"
+            | "oem"
+            | "various"
+            | "multiple"
+            | "avionics"
+            | "avionics suite"
+            | "integrated avionics"
+            | "integrated avionics suite"
+            | "glass panel"
+            | "flight instruments"
+            | "standard flight instruments"
+            | "standard vfr avionics"
+            | "standard ifr avionics"
+            | "radio"
+            | "radios"
+            | "nav com"
+            | "navigation system"
+            | "gps"
+            | "autopilot"
+            | "transponder"
+            | "ads b"
+            | "weather radar"
+            | "audio panel"
+            | "display"
+            | "equipment"
+    )
 }
 
 pub fn is_generic_avionics_manufacturer_name(value: &str) -> bool {
@@ -116,7 +170,8 @@ fn is_legal_suffix(value: &str) -> bool {
 mod tests {
     use super::{
         is_generic_avionics_manufacturer_name, is_generic_avionics_model_name,
-        is_usable_avionics_label, normalize_avionics_model_name, normalize_name,
+        is_usable_avionics_label, normalize_avionics_identifier,
+        normalize_avionics_manufacturer_name, normalize_avionics_model_name, normalize_name,
     };
 
     #[test]
@@ -140,9 +195,34 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_avionics_manufacturer_word_boundaries_without_aliases() {
+        assert_eq!(
+            normalize_avionics_manufacturer_name("Bendix/King"),
+            "bendixking"
+        );
+        assert_eq!(
+            normalize_avionics_manufacturer_name("Bendix King"),
+            normalize_avionics_manufacturer_name("BendixKing")
+        );
+        assert_eq!(
+            normalize_avionics_manufacturer_name("J. P. Instruments, Inc."),
+            normalize_avionics_manufacturer_name("JP Instruments")
+        );
+    }
+
+    #[test]
+    fn normalizes_authoritative_avionics_identifiers_for_duplicate_checks() {
+        assert_eq!(normalize_avionics_identifier("011-03520-00"), "0110352000");
+        assert_eq!(
+            normalize_avionics_identifier(" 011 03520 00 "),
+            normalize_avionics_identifier("011-03520-00")
+        );
+        assert_eq!(normalize_avionics_identifier("GTX&#x20;345R"), "gtx345r");
+    }
+
+    #[test]
     fn keeps_specific_avionics_labels() {
         for label in [
-            "ADS-B",
             "GTX 345R (ADS-B)",
             "GNS 430W",
             "GMA 350c (Bluetooth Audio)",
@@ -154,6 +234,23 @@ mod tests {
             assert!(
                 !is_generic_avionics_model_name(label),
                 "{label} should be specific"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_generic_equipment_classes_as_model_names() {
+        for label in [
+            "GPS",
+            "Autopilot",
+            "ADS-B",
+            "Standard Flight Instruments",
+            "Integrated Avionics Suite",
+            "Glass Panel",
+        ] {
+            assert!(
+                is_generic_avionics_model_name(label),
+                "{label} should be generic"
             );
         }
     }

@@ -85,6 +85,12 @@ impl From<ListingStoreError> for PluginStoreError {
             ListingStoreError::Validation(message) | ListingStoreError::State(message) => {
                 PluginStoreError::Validation(message)
             }
+            ListingStoreError::Ingestion {
+                listing_id,
+                message,
+            } => PluginStoreError::Validation(format!(
+                "listing {listing_id} was quarantined: {message}"
+            )),
             ListingStoreError::NotFound(message) => PluginStoreError::NotFound(message),
             ListingStoreError::Permission(message) => PluginStoreError::Permission(message),
             ListingStoreError::Database(message) => PluginStoreError::Database(message),
@@ -128,6 +134,7 @@ struct PluginSubmissionHtmlRow {
     id: i64,
     source_url: String,
     rendered_html: String,
+    canonical_listing_id: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -203,7 +210,7 @@ pub async fn submit_plugin_html_with_progress(
         );
         match parse_listing_html(&request.source_url, &request.rendered_html, extractor).await {
             Ok(parsed_preview) => {
-                extracted_listing_json = Some(json!(parsed_preview.parsed_listing));
+                extracted_listing_json = Some(extracted_listing_payload(&parsed_preview));
                 match create_listing_with_progress(
                     db,
                     user.id,
@@ -218,9 +225,15 @@ pub async fn submit_plugin_html_with_progress(
                         canonical_listing_id = Some(created_listing.id);
                         listing = Some(created_listing);
                     }
-                    Err(error) => {
-                        extraction_error = Some(error.to_string());
+                    Err(ListingStoreError::Ingestion {
+                        listing_id,
+                        message,
+                    }) => {
+                        canonical_listing_id = Some(listing_id);
+                        extraction_error =
+                            Some(format!("listing {listing_id} was quarantined: {message}"));
                     }
+                    Err(error) => extraction_error = Some(error.to_string()),
                 }
                 preview = Some(parsed_preview);
             }
@@ -314,12 +327,12 @@ pub async fn reprocess_plugin_submission(
     let mut listing = None;
     let mut extracted_listing_json = None;
     let mut extraction_error = None;
-    let mut canonical_listing_id = None;
+    let mut canonical_listing_id = stored.canonical_listing_id;
 
     if let Some(extractor) = extractor {
         match parse_listing_html(&stored.source_url, &stored.rendered_html, extractor).await {
             Ok(parsed_preview) => {
-                extracted_listing_json = Some(json!(parsed_preview.parsed_listing));
+                extracted_listing_json = Some(extracted_listing_payload(&parsed_preview));
                 match create_listing_with_progress(
                     db,
                     user.id,
@@ -334,9 +347,15 @@ pub async fn reprocess_plugin_submission(
                         canonical_listing_id = Some(created_listing.id);
                         listing = Some(created_listing);
                     }
-                    Err(error) => {
-                        extraction_error = Some(error.to_string());
+                    Err(ListingStoreError::Ingestion {
+                        listing_id,
+                        message,
+                    }) => {
+                        canonical_listing_id = Some(listing_id);
+                        extraction_error =
+                            Some(format!("listing {listing_id} was quarantined: {message}"));
                     }
+                    Err(error) => extraction_error = Some(error.to_string()),
                 }
                 preview = Some(parsed_preview);
             }
@@ -396,6 +415,19 @@ fn emit_plugin_progress(progress: Option<&PluginProgressSender>, stage: &str, me
             "message": message,
         }));
     }
+}
+
+fn extracted_listing_payload(preview: &ListingPreview) -> Value {
+    let mut payload = json!(preview.parsed_listing);
+    if let (Some(object), Some(identity_recovery)) =
+        (payload.as_object_mut(), preview.identity_recovery.as_ref())
+    {
+        object.insert(
+            "visual_identity_recovery".to_string(),
+            json!(identity_recovery),
+        );
+    }
+    payload
 }
 
 pub fn signature_message(
@@ -476,7 +508,8 @@ async fn plugin_submission_html_for_user(
         SELECT
           id,
           source_url,
-          rendered_html
+          rendered_html,
+          canonical_listing_id
         FROM plugin_submissions
         WHERE id = ? AND user_id = ?
         "#,
@@ -517,9 +550,9 @@ async fn update_plugin_submission_result(
         r#"
         UPDATE plugin_submissions
         SET
-          extracted_listing_json = ?,
+          extracted_listing_json = COALESCE(?, extracted_listing_json),
           extraction_error = ?,
-          canonical_listing_id = ?
+          canonical_listing_id = COALESCE(?, canonical_listing_id)
         WHERE id = ? AND user_id = ?
         RETURNING
           id,
@@ -640,8 +673,13 @@ mod tests {
     use base64::Engine as _;
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use serde_json::json;
 
-    use super::{sha256_hex, signature_message, verify_submission_signature};
+    use super::{
+        sha256_hex, signature_message, update_plugin_submission_result,
+        verify_submission_signature, ListingIdRow,
+    };
+    use crate::db::{AppDb, DatabaseBackend};
 
     #[test]
     fn verifies_fixed_p256_signature() {
@@ -665,5 +703,133 @@ mod tests {
             &signature_base64,
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_reprocess_update_preserves_prior_extraction_and_listing_link() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+
+        let manufacturer = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"
+            INSERT INTO aircraft_manufacturers (name, normalized_name)
+            VALUES ('Test Aircraft', 'test aircraft')
+            RETURNING id
+            "#
+        )
+        .expect("manufacturer should seed");
+        let model = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"
+            INSERT INTO aircraft_models (
+              aircraft_manufacturer_id,
+              name,
+              normalized_name
+            )
+            VALUES (?, 'Test Model', 'test model')
+            RETURNING id
+            "#,
+            manufacturer.id
+        )
+        .expect("model should seed");
+        let variant = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"
+            INSERT INTO aircraft_model_variants (
+              aircraft_model_id,
+              name,
+              normalized_name
+            )
+            VALUES (?, 'Test Variant', 'test variant')
+            RETURNING id
+            "#,
+            model.id
+        )
+        .expect("variant should seed");
+        let listing = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id,
+              created_by_user_id,
+              source_url,
+              model_year,
+              asking_price_usd,
+              airframe_hours
+            )
+            VALUES (?, ?, 'https://example.test/listing', 2020, 100000, 500)
+            RETURNING id
+            "#,
+            variant.id,
+            user.id
+        )
+        .expect("listing should seed");
+        let install = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"
+            INSERT INTO plugin_installs (user_id, public_key_base64)
+            VALUES (?, 'test-key')
+            RETURNING id
+            "#,
+            user.id
+        )
+        .expect("plugin install should seed");
+        let prior_extraction = json!({
+            "listing": {
+                "registration_number": "N12345"
+            }
+        });
+        let submission = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id,
+              plugin_install_id,
+              source_url,
+              rendered_html,
+              rendered_html_sha256,
+              signature_base64,
+              extracted_listing_json,
+              canonical_listing_id
+            )
+            VALUES (?, ?, 'https://example.test/listing', '<html></html>', 'hash', 'signature', ?, ?)
+            RETURNING id
+            "#,
+            user.id,
+            install.id,
+            prior_extraction.to_string(),
+            listing.id
+        )
+        .expect("plugin submission should seed");
+
+        let updated = update_plugin_submission_result(
+            &db,
+            user.id,
+            submission.id,
+            None,
+            Some("new extraction failed"),
+            None,
+        )
+        .await
+        .expect("failed reprocessing result should be recorded");
+
+        assert_eq!(updated.extracted_listing_json, Some(prior_extraction));
+        assert_eq!(
+            updated.extraction_error.as_deref(),
+            Some("new extraction failed")
+        );
+        assert_eq!(updated.canonical_listing_id, Some(listing.id));
     }
 }

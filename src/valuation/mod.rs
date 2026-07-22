@@ -16,11 +16,12 @@ pub use comparable::{ComparableConfig, ComparableModel};
 pub use structural::{fit_structural, StructuralFitConfig, StructuralModel};
 pub use types::*;
 
-pub const FEATURE_SCHEMA_VERSION: u32 = 1;
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
 
 pub trait ValuationModel: Send + Sync {
     fn model_version_id(&self) -> i64;
     fn model_kind(&self) -> &'static str;
     fn snapshot_id(&self) -> i64;
+    fn market_year(&self) -> Result<i64, ValuationError>;
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError>;
 }

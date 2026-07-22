@@ -29,11 +29,21 @@ The same header also accepts the dev auth subject:
 X-User-Email: developer
 ```
 
-At startup the server loads one hash-verified structural valuation artifact
-into shared application state. If no artifact is active, it builds the
-adjusted-comparable fallback from the newest frozen snapshot. A corrupt active
-artifact fails startup rather than creating or repairing weights during a
-request.
+At startup the server loads one approved, hash-verified valuation artifact into
+shared application state. If no artifact is active, an eligible newest frozen
+snapshot with at least five valid deduplicated aircraft can provide an explicitly
+uncalibrated adjusted-comparable fallback. A corrupt active structural artifact
+is rejected rather than creating or repairing weights during a request; the
+server then attempts the same eligible comparable fallback and otherwise marks
+valuation unavailable.
+
+`GET /api/valuation/status` reports `calibrated`, `comparable_fallback`, or
+`unavailable`, plus calibration state, model kind/version, snapshot ID, and
+warnings. `/health` includes the same object. The web header displays this
+state continuously. When neither an approved artifact nor an eligible snapshot
+exists, primary estimate fields remain null and `estimate_error` explains that
+listing-only valuation is unavailable; the legacy compatibility estimator does
+not silently fill those fields.
 
 ## Listing Preview
 
@@ -138,7 +148,7 @@ Manual JSON mode:
       {
         "manufacturer": "Garmin",
         "model": "Perspective+",
-        "type": "Integrated Flight Deck",
+        "types": ["Integrated Flight Deck", "Flight Display"],
         "quantity": 1
       }
     ]
@@ -218,6 +228,13 @@ URL and username. Use `http://127.0.0.1:8001` and `developer` for the current
 dev setup.
 
 ## Sale Listings
+
+The server currently admits only aircraft with U.S. N-numbers that match the
+newest imported FAA registry projection. Creation and update fail before any
+listing or catalog mutation when registration is missing, foreign, malformed,
+not covered, absent, ambiguous, or conflicts with the supplied serial number.
+Preview remains read-only and may still display extracted data that admission
+will reject.
 
 Create a listing from the same payload accepted by preview:
 
@@ -304,3 +321,12 @@ estimated error fraction, support grade, model kind/version, snapshot ID,
 listing-only factor breakdown, and a constant-today-dollar value curve for
 horizons zero through thirty. The listing-only path does not require aircraft
 spec metadata or a model-year new-price record.
+
+`valuation_calibrated` distinguishes approved structural/DNN artifacts from the
+adjusted-comparable fallback, and `valuation_warning` carries any serving caveat
+that should be shown with the estimate.
+
+The listing table also displays each row's ingestion state. Hovering an
+`incomplete` or `quarantined` badge shows its persisted completion error, so a
+stored row that is excluded from valuation is visible rather than silently
+treated as training data.
