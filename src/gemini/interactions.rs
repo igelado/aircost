@@ -1775,6 +1775,18 @@ fn interaction_usage_metrics(response: &InteractionResponse) -> UsageMetrics {
                 })
                 .filter_map(|entry| entry.get("count").and_then(Value::as_u64))
                 .sum()
+        })
+        .or_else(|| {
+            // Gemini omits grounding_tool_count entirely for requests that did
+            // not use Search. The trace lets us distinguish that known zero
+            // from an unknown/malformed counter on a Search response.
+            (!response.interaction.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    InteractionStep::GoogleSearchCall(_) | InteractionStep::GoogleSearchResult(_)
+                )
+            }))
+            .then_some(0)
         });
     UsageMetrics {
         input_tokens: counter("total_input_tokens")
@@ -2915,6 +2927,33 @@ mod tests {
             Some("interaction-1")
         );
         assert!(outcome.cost.is_some());
+    }
+
+    #[test]
+    fn accounts_non_search_interactions_with_zero_search_queries() {
+        let response = response_from(json!({
+            "id": "interaction-structure",
+            "model": "gemini-3.5-flash",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {"type": "model_output", "content": [{"type": "text", "text": "{}"}]}
+            ],
+            "usage": {
+                "total_input_tokens": 100,
+                "total_output_tokens": 25,
+                "total_thought_tokens": 0,
+                "total_cached_tokens": 0,
+                "total_tool_use_tokens": 0
+            }
+        }));
+        let metrics = interaction_usage_metrics(&response);
+        assert_eq!(metrics.search_query_count, Some(0));
+        assert!(
+            interaction_usage_outcome(&response, "gemini-3.5-flash", "standard")
+                .cost
+                .is_some()
+        );
     }
 
     #[test]

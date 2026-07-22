@@ -21,6 +21,16 @@ use crate::normalize::{
 const CANDIDATE_LIMIT: usize = 16;
 const COLLISION_CANDIDATE_LIMIT: usize = 32;
 const CANDIDATE_MINIMUM_SCORE: f64 = 0.28;
+const EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE: &str = "exact_catalog_product";
+const NO_IDENTIFIER_SCOPE: &str = "none";
+const MANUFACTURER_IDENTIFIER_SCOPES: &[&str] = &[
+    EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE,
+    "component_of_catalog_product",
+    "approval_or_article_scope",
+    "family_or_series",
+    "unknown",
+    NO_IDENTIFIER_SCOPE,
+];
 const CATALOG_SELECT_SQL: &str = r#"
     SELECT
       model.id,
@@ -123,6 +133,7 @@ struct VerifiedIdentity {
     canonical_types: Vec<String>,
     manufacturer_identifier_kind: String,
     manufacturer_identifier: String,
+    manufacturer_identifier_scope: String,
     identity_source_url: String,
     identity_source_title: String,
     identity_evidence: String,
@@ -358,14 +369,19 @@ async fn resolve_verified_identity(
             manufacturer_identifier: proposed.manufacturer_identifier.clone(),
         },
     };
-    let review_response = extractor
+    let review_response = match extractor
         .review_avionics_catalog_collisions(&review_context)
         .await
-        .map_err(|error| {
-            CatalogError::Gemini(format!(
-                "Gemini avionics collision review failed: {error:#}"
-            ))
-        })?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(AvionicsIdentityOutcome::Unresolved {
+                reason: format!(
+                    "independent grounded collision review could not establish a safe catalog decision: {error:#}"
+                ),
+            });
+        }
+    };
     let attestation = proposal_attestation(
         context,
         &proposed,
@@ -856,6 +872,14 @@ fn resolution_issues(
     }
     match status {
         "existing_match" => {
+            if string_field(response, "manufacturer_identifier_scope")
+                != EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE
+            {
+                issues.push(
+                    "existing_match requires manufacturer_identifier_scope=exact_catalog_product"
+                        .to_string(),
+                );
+            }
             if !google_search_used {
                 issues.push(
                     "existing_match requires Gemini Google Search grounding metadata".to_string(),
@@ -962,6 +986,14 @@ fn resolution_issues(
             );
         }
         "propose_new" => {
+            if string_field(response, "manufacturer_identifier_scope")
+                != EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE
+            {
+                issues.push(
+                    "propose_new requires manufacturer_identifier_scope=exact_catalog_product"
+                        .to_string(),
+                );
+            }
             if !google_search_used {
                 issues.push(
                     "propose_new requires Gemini Google Search grounding metadata".to_string(),
@@ -1013,6 +1045,11 @@ fn resolution_issues(
                     "{status} must use manufacturer_identifier_kind=none"
                 ));
             }
+            if string_field(response, "manufacturer_identifier_scope") != NO_IDENTIFIER_SCOPE {
+                issues.push(format!(
+                    "{status} must use manufacturer_identifier_scope=none"
+                ));
+            }
         }
         _ => issues
             .push("status must be existing_match, propose_new, reject, or unresolved".to_string()),
@@ -1027,6 +1064,7 @@ fn verified_identity_from_response(response: &Value) -> CatalogResult<VerifiedId
         canonical_types: canonical_types_from_response(response, "canonical_types")?,
         manufacturer_identifier_kind: required_field(response, "manufacturer_identifier_kind")?,
         manufacturer_identifier: required_field(response, "manufacturer_identifier")?,
+        manufacturer_identifier_scope: required_field(response, "manufacturer_identifier_scope")?,
         identity_source_url: required_field(response, "identity_source_url")?,
         identity_source_title: required_field(response, "identity_source_title")?,
         identity_evidence: required_field(response, "identity_evidence")?,
@@ -1038,6 +1076,12 @@ fn verified_identity_from_response(response: &Value) -> CatalogResult<VerifiedId
     ) {
         return Err(CatalogError::Validation(
             "verified identity requires manufacturer_part_number, manufacturer_model_number, or sku"
+                .to_string(),
+        ));
+    }
+    if identity.manufacturer_identifier_scope != EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE {
+        return Err(CatalogError::Validation(
+            "verified identity requires manufacturer_identifier_scope=exact_catalog_product; a component, approval/article, family/series, or unknown identifier cannot identify the catalog product"
                 .to_string(),
         ));
     }
@@ -1128,6 +1172,13 @@ fn proposal_attestation(
     }
     let decision = required_field(response, "proposal_decision")?;
     let reason = required_field(response, "proposal_reason")?;
+    let manufacturer_identifier_scope =
+        required_field(response, "proposal_manufacturer_identifier_scope")?;
+    if !MANUFACTURER_IDENTIFIER_SCOPES.contains(&manufacturer_identifier_scope.as_str()) {
+        return Err(CatalogError::Validation(format!(
+            "unexpected proposal_manufacturer_identifier_scope {manufacturer_identifier_scope}"
+        )));
+    }
     if decision == "not_confirmed" {
         return Ok(ProposalAttestation {
             confirmed: false,
@@ -1141,6 +1192,12 @@ fn proposal_attestation(
         return Err(CatalogError::Validation(format!(
             "unexpected proposal_decision {decision}"
         )));
+    }
+    if manufacturer_identifier_scope != EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE {
+        return Err(CatalogError::Validation(
+            "confirmed proposal review requires proposal_manufacturer_identifier_scope=exact_catalog_product; a component identifier cannot attest the complete proposed catalog product"
+                .to_string(),
+        ));
     }
     if string_field(response, "proposal_confidence") != "very_high" {
         return Err(CatalogError::Validation(
@@ -1952,6 +2009,7 @@ mod tests {
             canonical_types: vec!["Transponder".to_string()],
             manufacturer_identifier_kind: "manufacturer_part_number".to_string(),
             manufacturer_identifier: "011-03520-00".to_string(),
+            manufacturer_identifier_scope: "exact_catalog_product".to_string(),
             identity_source_url: "https://static.garmin.com/manuals/gtx345r.pdf".to_string(),
             identity_source_title: "GTX 345R installation manual".to_string(),
             identity_evidence:
@@ -2122,6 +2180,7 @@ mod tests {
             "canonical_types": ["Transponder", "GPS", "GPS"],
             "manufacturer_identifier_kind": "manufacturer_model_number",
             "manufacturer_identifier": "GNX 375",
+            "manufacturer_identifier_scope": "exact_catalog_product",
             "identity_source_url": "https://www.garmin.com/gnx-375",
             "identity_source_title": "Garmin GNX 375",
             "identity_evidence": "Garmin identifies GNX 375 as one GPS navigator with a transponder.",
@@ -2146,6 +2205,7 @@ mod tests {
             "canonical_types": ["Transponder"],
             "manufacturer_identifier_kind": "manufacturer_part_number",
             "manufacturer_identifier": "011-TEST-1",
+            "manufacturer_identifier_scope": "exact_catalog_product",
             "confidence": "very_high",
             "identity_source_url": "https://static.garmin.com/manuals/gtx345r.pdf",
             "identity_source_title": "GTX 345R installation manual",
@@ -2166,6 +2226,35 @@ mod tests {
     }
 
     #[test]
+    fn positive_resolution_rejects_component_of_catalog_product_identifier_scope() {
+        let context = context(vec![]);
+        let response = json!({
+            "status": "propose_new",
+            "catalog_id": 0,
+            "canonical_manufacturer": "3M",
+            "canonical_model": "WX-10A Stormscope",
+            "canonical_types": ["Lightning Detection"],
+            "manufacturer_identifier_kind": "manufacturer_part_number",
+            "manufacturer_identifier": "78-8060-5900-8",
+            "manufacturer_identifier_scope": "component_of_catalog_product",
+            "confidence": "very_high",
+            "identity_source_url": "https://manufacturer.example/wx-10a-manual.pdf",
+            "identity_source_title": "WX-10A service manual",
+            "identity_evidence": "The cited part number identifies one component in the WX-10A system.",
+            "reason": "The identifier does not scope the complete multi-box product."
+        });
+
+        let issues = resolution_issues(&context, &response, true, &[], &[]);
+        assert!(issues.iter().any(|issue| {
+            issue.contains("manufacturer_identifier_scope=exact_catalog_product")
+        }));
+        assert!(verified_identity_from_response(&response)
+            .unwrap_err()
+            .to_string()
+            .contains("component"));
+    }
+
+    #[test]
     fn approved_match_can_only_enrich_an_observed_capability_as_a_monotonic_union() {
         let mut approved = candidate(1, "GNX 375", "approved");
         approved.manufacturer_identifier_kind = "manufacturer_model_number".to_string();
@@ -2182,6 +2271,7 @@ mod tests {
             "canonical_types": ["GPS", "Transponder"],
             "manufacturer_identifier_kind": "manufacturer_model_number",
             "manufacturer_identifier": "GNX 375",
+            "manufacturer_identifier_scope": "exact_catalog_product",
             "confidence": "very_high",
             "identity_source_url": "https://static.garmin.com/manuals/gnx375.pdf",
             "identity_source_title": "Garmin GNX 375 pilot guide",
@@ -2213,6 +2303,7 @@ mod tests {
             "canonical_types": ["Transponder"],
             "manufacturer_identifier_kind": "manufacturer_part_number",
             "manufacturer_identifier": "011-03520-00",
+            "manufacturer_identifier_scope": "exact_catalog_product",
             "confidence": "high",
             "identity_source_url": "https://static.garmin.com/manuals/gtx345r.pdf",
             "identity_source_title": "GTX 345R installation manual",
@@ -2235,6 +2326,7 @@ mod tests {
             "canonical_types": ["NAV", "COM"],
             "manufacturer_identifier_kind": "manufacturer_part_number",
             "manufacturer_identifier": "011-00000-00",
+            "manufacturer_identifier_scope": "exact_catalog_product",
             "confidence": "very_high",
             "identity_source_url": "https://static.garmin.com/manuals/gns.pdf",
             "identity_source_title": "GNS manual",
@@ -2283,6 +2375,7 @@ mod tests {
             "canonical_types": ["Transponder"],
             "manufacturer_identifier_kind": "manufacturer_part_number",
             "manufacturer_identifier": "011-03520-00",
+            "proposal_manufacturer_identifier_scope": "exact_catalog_product",
             "proposal_confidence": "very_high",
             "input_evidence_text": "GTX345R",
             "proposal_source_url": "https://static.garmin.com/manuals/gtx345r.pdf",
@@ -2300,6 +2393,14 @@ mod tests {
             .expect("grounded attestation should validate");
         assert!(attestation.confirmed);
 
+        response["proposal_manufacturer_identifier_scope"] = json!("component_of_catalog_product");
+        let error =
+            proposal_attestation(&context, &proposed, &response, &sources, &supports).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("proposal_manufacturer_identifier_scope=exact_catalog_product"));
+
+        response["proposal_manufacturer_identifier_scope"] = json!("exact_catalog_product");
         response["input_evidence_text"] = json!("GTX 345R");
         let error =
             proposal_attestation(&context, &proposed, &response, &sources, &supports).unwrap_err();
@@ -2317,6 +2418,7 @@ mod tests {
             "canonical_types": ["Transponder"],
             "manufacturer_identifier_kind": "manufacturer_part_number",
             "manufacturer_identifier": "011-03520-00",
+            "proposal_manufacturer_identifier_scope": "unknown",
             "proposal_confidence": "medium",
             "input_evidence_text": "",
             "proposal_source_url": "",
@@ -2341,6 +2443,7 @@ mod tests {
             "canonical_types": ["Transponder"],
             "manufacturer_identifier_kind": "manufacturer_part_number",
             "manufacturer_identifier": "011-TEST-1",
+            "manufacturer_identifier_scope": "exact_catalog_product",
             "confidence": "very_high",
             "identity_source_url": "https://broker.example/listings/1",
             "identity_source_title": "Aircraft for sale",

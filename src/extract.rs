@@ -18,6 +18,9 @@ use crate::aircraft::curation::visual::{
 };
 use crate::db::AppDb;
 use crate::gemini::config::{GeminiRuntimeConfig, GeminiTask};
+use crate::gemini::curation::workflow::{
+    run_grounded_json_pass, GroundedJsonPassRequest, InteractionAudit,
+};
 use crate::gemini::interactions::{
     GeminiInteractionsClient, InteractionAccountingContext, RetryPolicy,
 };
@@ -35,6 +38,7 @@ use crate::normalize::{canonical_manufacturer_name, normalize_name};
 
 const DEFAULT_GEMINI_TIMEOUT_SECONDS: u64 = 60;
 const GEMINI_JSON_REPAIR_MAX_OUTPUT_TOKENS: u64 = 8192;
+const AVIONICS_GROUNDING_SCHEMA_VERSION: &str = "avionics-grounded-json-v3";
 
 pub const CURATED_AVIONICS_TYPES: &[&str] = &[
     "GPS",
@@ -64,6 +68,15 @@ pub const CURATED_AVIONICS_TYPES: &[&str] = &[
     "Clock/Timer",
 ];
 
+const AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES: &[&str] = &[
+    "exact_catalog_product",
+    "component_of_catalog_product",
+    "approval_or_article_scope",
+    "family_or_series",
+    "unknown",
+    "none",
+];
+
 const SYSTEM_PROMPT: &str = "You extract aircraft sale listing fields from plain text. Return only a single valid JSON object with the requested keys. Never infer missing component times or condition facts; preserve nulls and source evidence exactly as requested.";
 
 const AVIONICS_GROUNDING_SOURCE_POLICY: &str = r#"Authoritative-source policy:
@@ -72,6 +85,7 @@ const AVIONICS_GROUNDING_SOURCE_POLICY: &str = r#"Authoritative-source policy:
 - An FAA STC, AML, or PMA may establish approved applicability or configuration eligibility. It does not prove actual installation on a listing aircraft and does not by itself establish factory-standard equipment.
 - FCC equipment authorization is supplemental evidence only for RF-capable hardware. An FCC ID can identify a transmitter or internal radio module and need not map one-to-one to a marketed avionics product.
 - FAA ADS-B equipment lists are narrow corroborating sources, not a complete avionics catalog. Treat manufacturer-supplied or stale entries accordingly.
+- An authoritative part number can identify a component, module, sensor, display, or controller inside a marketed multi-box product. It identifies the catalog product only when the source explicitly scopes that identifier to the complete marketed unit, system, suite, or named package being curated.
 - Ordinary aircraft listings, retailer pages, forums, scraped catalogs, and model memory are discovery material, never authoritative product-identity, factory-default, or value evidence.
 - Preserve conflicts between sources. When the evidence does not distinguish a hardware suffix, generation, remote/panel form factor, suite composition, or part-number variant, return unresolved rather than collapsing products."#;
 
@@ -262,11 +276,13 @@ pub struct GeminiListingExtractor {
 #[derive(Clone, Debug)]
 pub struct GroundedJsonResponse {
     pub value: Value,
-    /// True only when Gemini returned grounding metadata showing that Google
-    /// Search ran (a search query or a cited grounding chunk was present).
+    /// True only when a successful Search call/result and the subsequent URL
+    /// Context verification both passed the shared curation gates.
     pub google_search_used: bool,
+    pub url_context_used: bool,
     pub grounding_sources: Vec<GeminiGroundingSource>,
     pub grounding_supports: Vec<GeminiGroundingSupport>,
+    pub interaction_audits: Vec<InteractionAudit>,
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +396,24 @@ impl GeminiListingExtractor {
         &self.runtime_config
     }
 
+    fn interaction_accounting_context(
+        &self,
+        task: GeminiTask,
+        purpose: impl Into<String>,
+    ) -> InteractionAccountingContext {
+        let mut accounting = InteractionAccountingContext::new(task, purpose);
+        if let Some(correlation_id) = self.usage_correlation_id.as_deref() {
+            accounting = accounting.with_correlation_id(correlation_id);
+        }
+        if let Some(listing_id) = self.usage_listing_id {
+            accounting = accounting.with_listing_id(listing_id);
+        }
+        if let Some(source) = self.usage_source.as_ref() {
+            accounting = accounting.with_source(&source.kind, &source.id);
+        }
+        accounting
+    }
+
     async fn fetch_url(&self, source_url: &str) -> Result<String> {
         let browser = self
             .browser
@@ -433,19 +467,10 @@ impl GeminiListingExtractor {
             })
             .collect::<Vec<_>>();
         let visual_config = VisualIdentifierConfig::from_runtime_config(&self.runtime_config)?;
-        let mut accounting = InteractionAccountingContext::new(
+        let accounting = self.interaction_accounting_context(
             GeminiTask::AircraftVisualIdentity,
             "visible_aircraft_identifier_resolution",
         );
-        if let Some(correlation_id) = self.usage_correlation_id.as_deref() {
-            accounting = accounting.with_correlation_id(correlation_id);
-        }
-        if let Some(listing_id) = self.usage_listing_id {
-            accounting = accounting.with_listing_id(listing_id);
-        }
-        if let Some(source) = self.usage_source.as_ref() {
-            accounting = accounting.with_source(&source.kind, &source.id);
-        }
         let resolution = resolve_visible_aircraft_identifiers_with_accounting(
             client,
             &photos,
@@ -562,16 +587,10 @@ impl GeminiListingExtractor {
         &self,
         context: &AvionicsMetadataContext<'_>,
     ) -> Result<GroundedJsonResponse> {
-        let max_output_tokens = self
-            .runtime_config
-            .route(GeminiTask::GroundedMetadata)
-            .max_output_tokens;
-        self.generate_grounded_json_with_metadata(
-            GeminiTask::GroundedMetadata,
+        self.generate_avionics_grounded_json(
             "avionics_metadata",
             build_avionics_metadata_prompt(context),
             gemini_avionics_metadata_response_schema(),
-            max_output_tokens,
         )
         .await
     }
@@ -580,12 +599,10 @@ impl GeminiListingExtractor {
         &self,
         context: &AvionicsUnitResolutionContext,
     ) -> Result<GroundedJsonResponse> {
-        self.generate_grounded_json_with_metadata(
-            GeminiTask::AvionicsIdentity,
+        self.generate_avionics_grounded_json(
             "avionics_identity",
             build_avionics_unit_resolution_prompt(context),
             gemini_avionics_unit_resolution_response_schema(context),
-            2048,
         )
         .await
     }
@@ -594,12 +611,10 @@ impl GeminiListingExtractor {
         &self,
         context: &AvionicsCatalogCollisionReviewContext,
     ) -> Result<GroundedJsonResponse> {
-        self.generate_grounded_json_with_metadata(
-            GeminiTask::AvionicsReview,
+        self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review",
             build_avionics_catalog_collision_review_prompt(context),
             gemini_avionics_catalog_collision_review_response_schema(context),
-            8192,
         )
         .await
     }
@@ -610,8 +625,7 @@ impl GeminiListingExtractor {
         previous_response: &Value,
         correction_context: &AvionicsUnitResolutionCorrectionContext,
     ) -> Result<GroundedJsonResponse> {
-        self.generate_grounded_json_with_metadata(
-            GeminiTask::AvionicsIdentity,
+        self.generate_avionics_grounded_json(
             "avionics_identity_correction",
             build_avionics_unit_resolution_correction_prompt(
                 context,
@@ -619,7 +633,6 @@ impl GeminiListingExtractor {
                 correction_context,
             ),
             gemini_avionics_unit_resolution_response_schema(context),
-            2048,
         )
         .await
     }
@@ -641,7 +654,7 @@ impl GeminiListingExtractor {
         &self,
         context: &AvionicsNormalizationContext,
     ) -> Result<Value> {
-        self.generate_grounded_json(
+        self.generate_content_grounded_json(
             GeminiTask::AvionicsIdentity,
             "avionics_model_normalization",
             build_avionics_normalization_prompt(context),
@@ -675,7 +688,7 @@ impl GeminiListingExtractor {
         &self,
         context: &DefaultAvionicsContext<'_>,
     ) -> Result<Value> {
-        self.generate_grounded_json(
+        self.generate_content_grounded_json(
             GeminiTask::GroundedMetadata,
             "default_aircraft_avionics",
             build_default_aircraft_avionics_prompt(context),
@@ -689,7 +702,7 @@ impl GeminiListingExtractor {
         &self,
         context: &AircraftSpecMetadataContext<'_>,
     ) -> Result<Value> {
-        self.generate_grounded_json(
+        self.generate_content_grounded_json(
             GeminiTask::GroundedMetadata,
             "aircraft_spec_metadata",
             build_aircraft_spec_metadata_prompt(context),
@@ -746,7 +759,57 @@ impl GeminiListingExtractor {
         }
     }
 
-    async fn generate_grounded_json(
+    async fn generate_avionics_grounded_json(
+        &self,
+        purpose: &str,
+        prompt: String,
+        response_schema: Value,
+    ) -> Result<GroundedJsonResponse> {
+        let client = self.interactions_client.as_ref().ok_or_else(|| {
+            anyhow!("Gemini Interactions client is unavailable for avionics grounding")
+        })?;
+        let pass = run_grounded_json_pass(
+            client,
+            &self.runtime_config,
+            GroundedJsonPassRequest::new(
+                prompt,
+                response_schema,
+                purpose,
+                AVIONICS_GROUNDING_SCHEMA_VERSION,
+                GeminiTask::AvionicsSearchGrounding,
+                GeminiTask::AvionicsUrlVerification,
+                GeminiTask::AvionicsStructure,
+            ),
+            |task, request_purpose| self.interaction_accounting_context(task, request_purpose),
+        )
+        .await?;
+        Ok(GroundedJsonResponse {
+            value: pass.value,
+            google_search_used: pass.grounding.google_search_call_count > 0
+                && pass.grounding.url_context_call_count > 0,
+            url_context_used: pass.grounding.url_context_call_count > 0,
+            grounding_sources: pass
+                .grounding_sources
+                .into_iter()
+                .map(|source| GeminiGroundingSource {
+                    chunk_index: source.chunk_index,
+                    url: source.url,
+                    title: source.title,
+                })
+                .collect(),
+            grounding_supports: pass
+                .grounding_supports
+                .into_iter()
+                .map(|support| GeminiGroundingSupport {
+                    text: support.text,
+                    source_indices: support.source_indices,
+                })
+                .collect(),
+            interaction_audits: pass.interactions,
+        })
+    }
+
+    async fn generate_content_grounded_json(
         &self,
         task: GeminiTask,
         purpose: &str,
@@ -755,7 +818,7 @@ impl GeminiListingExtractor {
         max_output_tokens: u64,
     ) -> Result<Value> {
         let response = self
-            .generate_grounded_json_with_metadata(
+            .generate_content_grounded_json_with_metadata(
                 task,
                 purpose,
                 prompt,
@@ -766,7 +829,7 @@ impl GeminiListingExtractor {
         Ok(response.value)
     }
 
-    async fn generate_grounded_json_with_metadata(
+    async fn generate_content_grounded_json_with_metadata(
         &self,
         task: GeminiTask,
         purpose: &str,
@@ -789,8 +852,10 @@ impl GeminiListingExtractor {
             Ok(value) => Ok(GroundedJsonResponse {
                 value,
                 google_search_used: gemini_google_search_was_used(&response_payload),
+                url_context_used: false,
                 grounding_sources: gemini_grounding_sources(&response_payload),
                 grounding_supports: gemini_grounding_supports(&response_payload),
+                interaction_audits: Vec::new(),
             }),
             Err(parse_error) => {
                 let repair_prompt =
@@ -815,8 +880,10 @@ impl GeminiListingExtractor {
                 Ok(GroundedJsonResponse {
                     value,
                     google_search_used: gemini_google_search_was_used(&repaired_payload),
+                    url_context_used: false,
                     grounding_sources: gemini_grounding_sources(&repaired_payload),
                     grounding_supports: gemini_grounding_supports(&repaired_payload),
+                    interaction_audits: Vec::new(),
                 })
             }
         }
@@ -1422,9 +1489,10 @@ Rules:\n\
 - manufacturer_identifier_kind must be manufacturer_part_number, manufacturer_model_number, sku, or none. Prefer an official manufacturer part/model number; use SKU only when an authoritative manufacturer source identifies it.\n\
 - manufacturer_identifier must be the corresponding stable official identifier, or empty only when kind is none. identity_source_url/title/evidence must cite authoritative product-identity evidence.\n\
 - identity_confidence must be very_high, high, medium, or low. Use very_high only when an authoritative source directly ties the exact manufacturer/model to the identifier. Identity confidence is independent of numeric-value confidence and does not itself approve a catalog row.\n\
-- introduced_year is the first public release, certification, or common market introduction year for this avionics model. Return the best integer estimate; do not use null.\n\
+- introduced_year is the first public release, certification, or common market introduction year for this avionics model. Return the best integer estimate; do not use null. introduced_year_source_url/title/evidence must identify and quote the verified source supporting that year.\n\
 - installed_value_contribution_usd is a conservative {} USD contribution to aircraft resale value for one installed working unit or suite. estimated_unit_value_usd must repeat this value for compatibility.\n\
-- replacement_cost_usd is the current equipment-plus-typical-installation replacement cost and must not be conflated with installed resale contribution.\n\
+- installed_value_source_url/title/evidence must identify and quote verified market evidence used for the installed contribution. Do not present an unsupported model estimate as sourced fact.\n\
+- replacement_cost_usd is the current equipment-plus-typical-installation replacement cost and must not be conflated with installed resale contribution. replacement_cost_source_url/title/evidence must identify and quote verified equipment and installation-cost evidence.\n\
 - valuation_scope is unit for individual hardware and integrated_suite for a named suite/package.\n\
 - included_components must be empty for unit scope. For integrated_suite, list only exact separately identifiable components and include the same manufacturer identifier plus authoritative identity source/evidence/confidence fields for each component; do not list uncertain or generic components.\n\
 - If the model name is a broad integrated suite or package, estimate the installed package/suite contribution represented by one parsed listing unit.\n\
@@ -1446,9 +1514,18 @@ value_reference_year: {}",
             "identity_evidence": "string",
             "identity_confidence": "very_high, high, medium, or low",
             "introduced_year": "integer",
+            "introduced_year_source_url": "string",
+            "introduced_year_source_title": "string",
+            "introduced_year_evidence": "exact cited source span",
             "estimated_unit_value_usd": "number",
             "installed_value_contribution_usd": "number",
+            "installed_value_source_url": "string",
+            "installed_value_source_title": "string",
+            "installed_value_evidence": "exact cited source span",
             "replacement_cost_usd": "number",
+            "replacement_cost_source_url": "string",
+            "replacement_cost_source_title": "string",
+            "replacement_cost_evidence": "exact cited source span",
             "valuation_scope": "unit or integrated_suite",
             "included_components": [{
                 "manufacturer": "string",
@@ -1490,6 +1567,8 @@ Rules:\n\
 - For an existing_match to catalog_status=unreviewed, confidence must be very_high. Authoritative evidence may supply a missing verified manufacturer identifier and may correct the legacy canonical manufacturer/model/capability set; keep the supplied catalog_id so the legacy identity is enriched/promoted instead of duplicated. Never overwrite a non-empty legacy identifier with a conflicting one.\n\
 - Use propose_new only when authoritative evidence verifies one concrete product identity and no supplied catalog candidate is that same product. catalog_id must be 0 and confidence must be very_high. A later independent collision review decides whether creation is safe.\n\
 - For propose_new, canonical manufacturer/model must identify one exact product or suite generation. Return a stable manufacturer_identifier: prefer an official manufacturer part number or manufacturer model number; use SKU only when an authoritative manufacturer source identifies it; never use a retailer or marketplace SKU.\n\
+- manufacturer_identifier_scope must be exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none. existing_match and propose_new require exact_catalog_product. If the best identifier belongs to a component, approval/article, or family rather than the complete catalog identity, return unresolved instead of promoting that identifier.\n\
+- A subcomponent part number cannot identify the complete multi-box system, integrated suite, or named package. A manufacturer model number may be used only when authoritative evidence shows that it names the exact marketed catalog product/package, not an internal box, replaceable component, approval article, or broad product family.\n\
 - canonical_types for a positive decision must contain every independently verified capability of the one physical product, using one or more exact server-owned values from: {curated_types}. Do not duplicate a capability. A multifunction product remains one identity with multiple capabilities; for example, a GNX 375 may be both GPS and Transponder. Use unresolved rather than inventing a type or approving Unknown.\n\
 - Capabilities are atomic. For combined navigation/communications hardware return both NAV and COM; never return or store a composite NAV/COM capability.\n\
 - manufacturer_identifier_kind must be manufacturer_part_number, manufacturer_model_number, sku, or none. propose_new requires a non-none kind and non-empty identifier.\n\
@@ -1499,7 +1578,7 @@ Rules:\n\
 - Do not treat generic features/classes as concrete units. Examples: ADS-B, WAAS GPS, Dual WAAS, Remote Transponder, Standard Audio Panel, Audio Controller, Autopilot, Synthetic Vision, Engine Monitor, radios, NAV/COM, GPS, Traffic, Datalink Weather, Backup Instruments.\n\
 - identity_source_url/title/evidence must cite authoritative identity evidence for existing_match or propose_new. Prefer manufacturer product pages, official manuals/service documents, FAA approval records, or equivalent primary references. An ordinary sale listing is installation context, not authoritative product-identity evidence.\n\
 - For propose_new, promotion of an unreviewed candidate, or capability enrichment of an approved candidate, identity_evidence must explicitly support the exact product identifier and every new returned canonical_types capability. Omit an unproven capability on new/unreviewed identities; for an approved identity with an unverified new observation, return unresolved instead of dropping the observation or changing the stored capability set.\n\
-- For reject or unresolved, use empty canonical identity/source/identifier strings, an empty canonical_types array, and manufacturer_identifier_kind=none.\n\
+- For reject or unresolved, use empty canonical identity/source/identifier strings, an empty canonical_types array, manufacturer_identifier_kind=none, and manufacturer_identifier_scope=none.\n\
 - reason must briefly explain the evidence-based identity decision.\n\
 - Never return prices, installed contributions, replacement costs, or other valuation metadata.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
@@ -1513,6 +1592,7 @@ Context:\n{}",
             "canonical_types": ["one or more exact server-owned capability strings for a positive decision; empty otherwise"],
             "manufacturer_identifier_kind": "manufacturer_part_number, manufacturer_model_number, sku, or none",
             "manufacturer_identifier": "string",
+            "manufacturer_identifier_scope": "exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none",
             "confidence": "very_high, high, medium, or low",
             "identity_source_url": "string",
             "identity_source_title": "string",
@@ -1569,10 +1649,12 @@ Correction rules:\n\
 - Never treat normalization or string similarity as proof of an existing match. existing_match requires high/very_high confidence and authoritative evidence for one supplied catalog id.\n\
 - An existing_match to catalog_status=approved must repeat its canonical identity and identifier exactly and must preserve every stored canonical_types member. If the candidate observes a capability absent from that approved identity, independently verify it with authoritative grounding and return the union of stored and newly verified capabilities; otherwise return unresolved. Never silently discard the observation, mechanically add it, or remove a stored capability. An existing_match to catalog_status=unreviewed requires very_high confidence and may supply its missing authoritative identifier or correct its legacy canonical label while retaining the supplied catalog_id; never propose a duplicate merely because the existing row is not yet approved.\n\
 - propose_new requires catalog_id=0, very_high confidence, authoritative product-identity evidence, an exact canonical identity, and an official manufacturer part/model number; use SKU only when an authoritative manufacturer source identifies it.\n\
+- manufacturer_identifier_scope must be exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none. Every positive decision requires exact_catalog_product; if the identifier scopes only a component, approval/article, family/series, or cannot be scoped confidently, return unresolved.\n\
+- A part number for one box or subcomponent cannot identify a complete multi-box system, integrated suite, or named package. A manufacturer model number is acceptable only when authoritative evidence establishes it as the name/identifier of the exact marketed catalog product/package rather than an internal component or broad family.\n\
 - A positive canonical_types array must contain one or more distinct exact server-owned capabilities from: {curated_types}. Include all verified functions of multifunction hardware while keeping one product identity. Never invent a type or approve Unknown.\n\
 - Capabilities are atomic. For combined navigation/communications hardware return both NAV and COM; never return or store a composite NAV/COM capability.\n\
 - identity_evidence must explicitly support the exact identifier and every returned canonical_types capability for a new or promoted identity, and every capability newly proposed for an approved identity. Remove unsupported capabilities from a new/unreviewed proposal; return unresolved when an approved identity's newly observed capability cannot be verified.\n\
-- reject and unresolved require catalog_id=0, an empty canonical_types array, blank identity/source/identifier fields, and identifier kind none. reject requires high or very_high confidence; use unresolved when rejection confidence is medium or low.\n\
+- reject and unresolved require catalog_id=0, an empty canonical_types array, blank identity/source/identifier fields, identifier kind none, and manufacturer_identifier_scope=none. reject requires high or very_high confidence; use unresolved when rejection confidence is medium or low.\n\
 - Never substitute factory/default equipment for an ambiguous listing candidate.\n\
 - Address every review issue using authoritative evidence. Do not guess and do not return any prices or value metadata.\n\
 - Do not include markdown, comments, nulls, or extra keys.\n\n\
@@ -1588,6 +1670,7 @@ Review context:\n{}",
             "canonical_types": ["one or more exact server-owned capability strings for a positive decision; empty otherwise"],
             "manufacturer_identifier_kind": "manufacturer_part_number, manufacturer_model_number, sku, or none",
             "manufacturer_identifier": "string",
+            "manufacturer_identifier_scope": "exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none",
             "confidence": "very_high, high, medium, or low",
             "identity_source_url": "string",
             "identity_source_title": "string",
@@ -1610,6 +1693,8 @@ Return JSON with exactly this shape:\n{}\n\n\
 Rules:\n\
 - First independently decide whether proposed_identity is the exact same physical product or exact named suite/package represented by classification_context.candidate. proposal_decision must be confirmed_same_as_input or not_confirmed. This attestation is required even when catalog_candidates is empty.\n\
 - For confirmed_same_as_input, repeat every proposed canonical identity and manufacturer identifier exactly, use proposal_confidence=very_high, and provide authoritative proposal source/evidence for the exact product identity. If the candidate-to-product mapping cannot be established at very high confidence, use not_confirmed.\n\
+- Independently classify proposal_manufacturer_identifier_scope as exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none. confirmed_same_as_input requires exact_catalog_product; do not merely copy or defer to the first-stage scope decision.\n\
+- A subcomponent part number cannot confirm the identity of a complete multi-box system, integrated suite, or named package. A manufacturer model number can support confirmation only when authoritative evidence shows that it names the exact proposed catalog product/package, not an internal component, approval article, or family/series.\n\
 - The proposal source/evidence must also support every proposed canonical_types capability; do not confirm a multifunction capability set from product-name similarity alone.\n\
 - Capabilities are atomic. Combined navigation/communications hardware must use both NAV and COM, never a composite NAV/COM capability.\n\
 - When a same-product approved catalog candidate already has a subset of proposed_identity.canonical_types, treat the difference as a capability-enrichment request. Confirm it only when authoritative product documentation directly supports every additional capability. The proposal must retain every capability already stored on that approved product; capability correction/removal is outside this workflow.\n\
@@ -1635,6 +1720,7 @@ Context:\n{}",
             "canonical_types": ["repeat every proposed capability exactly"],
             "manufacturer_identifier_kind": "repeat proposed value exactly",
             "manufacturer_identifier": "repeat proposed value exactly",
+            "proposal_manufacturer_identifier_scope": "exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none",
             "proposal_confidence": "very_high, high, medium, or low",
             "input_evidence_text": "exact listing substring when required; otherwise string",
             "proposal_source_url": "string",
@@ -2263,9 +2349,18 @@ fn gemini_avionics_metadata_response_schema() -> Value {
                 "enum": ["very_high", "high", "medium", "low"]
             },
             "introduced_year": {"type": "integer"},
+            "introduced_year_source_url": {"type": "string"},
+            "introduced_year_source_title": {"type": "string"},
+            "introduced_year_evidence": {"type": "string"},
             "estimated_unit_value_usd": {"type": "number"},
             "installed_value_contribution_usd": {"type": "number"},
+            "installed_value_source_url": {"type": "string"},
+            "installed_value_source_title": {"type": "string"},
+            "installed_value_evidence": {"type": "string"},
             "replacement_cost_usd": {"type": "number"},
+            "replacement_cost_source_url": {"type": "string"},
+            "replacement_cost_source_title": {"type": "string"},
+            "replacement_cost_evidence": {"type": "string"},
             "valuation_scope": {
                 "type": "string",
                 "enum": ["unit", "integrated_suite"]
@@ -2283,8 +2378,13 @@ fn gemini_avionics_metadata_response_schema() -> Value {
             "manufacturer_identifier_kind", "manufacturer_identifier",
             "identity_source_url", "identity_source_title", "identity_evidence",
             "identity_confidence",
-            "introduced_year", "estimated_unit_value_usd",
-            "installed_value_contribution_usd", "replacement_cost_usd",
+            "introduced_year", "introduced_year_source_url",
+            "introduced_year_source_title", "introduced_year_evidence",
+            "estimated_unit_value_usd", "installed_value_contribution_usd",
+            "installed_value_source_url", "installed_value_source_title",
+            "installed_value_evidence", "replacement_cost_usd",
+            "replacement_cost_source_url", "replacement_cost_source_title",
+            "replacement_cost_evidence",
             "valuation_scope", "included_components", "confidence"
         ],
         "propertyOrdering": [
@@ -2295,9 +2395,18 @@ fn gemini_avionics_metadata_response_schema() -> Value {
             "identity_evidence",
             "identity_confidence",
             "introduced_year",
+            "introduced_year_source_url",
+            "introduced_year_source_title",
+            "introduced_year_evidence",
             "estimated_unit_value_usd",
             "installed_value_contribution_usd",
+            "installed_value_source_url",
+            "installed_value_source_title",
+            "installed_value_evidence",
             "replacement_cost_usd",
+            "replacement_cost_source_url",
+            "replacement_cost_source_title",
+            "replacement_cost_evidence",
             "valuation_scope",
             "included_components",
             "confidence"
@@ -2328,10 +2437,11 @@ fn gemini_avionics_unit_resolution_response_schema(
             "canonical_types": {
                 "type": "array",
                 "maxItems": CURATED_AVIONICS_TYPES.len(),
-                "items": {
-                    "type": "string",
-                    "enum": CURATED_AVIONICS_TYPES
-                }
+                // Keep the provider schema below Gemini's structured-output
+                // complexity limit. The prompt supplies the server-owned
+                // allow-list and canonical_types_from_response enforces it
+                // locally before any catalog decision or write.
+                "items": {"type": "string"}
             },
             "manufacturer_identifier_kind": {
                 "type": "string",
@@ -2343,6 +2453,10 @@ fn gemini_avionics_unit_resolution_response_schema(
                 ]
             },
             "manufacturer_identifier": {"type": "string"},
+            "manufacturer_identifier_scope": {
+                "type": "string",
+                "enum": AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES
+            },
             "confidence": {
                 "type": "string",
                 "enum": ["very_high", "high", "medium", "low"]
@@ -2360,6 +2474,7 @@ fn gemini_avionics_unit_resolution_response_schema(
             "canonical_types",
             "manufacturer_identifier_kind",
             "manufacturer_identifier",
+            "manufacturer_identifier_scope",
             "confidence",
             "identity_source_url",
             "identity_source_title",
@@ -2374,6 +2489,7 @@ fn gemini_avionics_unit_resolution_response_schema(
             "canonical_types",
             "manufacturer_identifier_kind",
             "manufacturer_identifier",
+            "manufacturer_identifier_scope",
             "confidence",
             "identity_source_url",
             "identity_source_title",
@@ -2418,6 +2534,10 @@ fn gemini_avionics_catalog_collision_review_response_schema(
             "manufacturer_identifier": {
                 "type": "string",
                 "enum": [context.proposed_identity.manufacturer_identifier]
+            },
+            "proposal_manufacturer_identifier_scope": {
+                "type": "string",
+                "enum": AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES
             },
             "proposal_confidence": {
                 "type": "string",
@@ -2479,6 +2599,7 @@ fn gemini_avionics_catalog_collision_review_response_schema(
             "canonical_types",
             "manufacturer_identifier_kind",
             "manufacturer_identifier",
+            "proposal_manufacturer_identifier_scope",
             "proposal_confidence",
             "input_evidence_text",
             "proposal_source_url",
@@ -2494,6 +2615,7 @@ fn gemini_avionics_catalog_collision_review_response_schema(
             "canonical_types",
             "manufacturer_identifier_kind",
             "manufacturer_identifier",
+            "proposal_manufacturer_identifier_scope",
             "proposal_confidence",
             "input_evidence_text",
             "proposal_source_url",
@@ -3226,7 +3348,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_avionics_metadata_prompt, build_avionics_unit_resolution_prompt,
+        build_avionics_catalog_collision_review_prompt, build_avionics_metadata_prompt,
+        build_avionics_unit_resolution_correction_prompt, build_avionics_unit_resolution_prompt,
         gemini_aircraft_spec_metadata_response_schema,
         gemini_avionics_catalog_collision_review_response_schema,
         gemini_avionics_metadata_response_schema, gemini_avionics_unit_resolution_response_schema,
@@ -3235,6 +3358,8 @@ mod tests {
         parsed_listing_from_model_output, preview_manual_listing, AvionicsCatalogCandidate,
         AvionicsCatalogCollisionReviewContext, AvionicsMetadataContext, AvionicsProposedIdentity,
         AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
+        AvionicsUnitResolutionCorrectionContext, AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES,
+        CURATED_AVIONICS_TYPES,
     };
 
     #[test]
@@ -3303,17 +3428,22 @@ mod tests {
         assert_eq!(schema["properties"]["catalog_id"]["type"], "integer");
         assert!(schema["properties"]["catalog_id"].get("enum").is_none());
         assert_eq!(schema["properties"]["canonical_types"]["type"], "array");
-        assert!(schema["properties"]["canonical_types"]["items"]["enum"]
-            .as_array()
-            .expect("canonical capabilities")
-            .iter()
-            .any(|value| value == "AHRS"));
-        let canonical_types = schema["properties"]["canonical_types"]["items"]["enum"]
-            .as_array()
-            .expect("canonical capabilities");
-        assert!(canonical_types.iter().any(|value| value == "NAV"));
-        assert!(canonical_types.iter().any(|value| value == "COM"));
-        assert!(!canonical_types.iter().any(|value| value == "NAV/COM"));
+        assert_eq!(
+            schema["properties"]["canonical_types"]["maxItems"],
+            CURATED_AVIONICS_TYPES.len()
+        );
+        assert!(schema["properties"]["canonical_types"]["items"]
+            .get("enum")
+            .is_none());
+        let prompt = build_avionics_unit_resolution_prompt(&context);
+        for capability in ["AHRS", "NAV", "COM"] {
+            assert!(prompt.contains(capability));
+        }
+        assert!(!CURATED_AVIONICS_TYPES.contains(&"NAV/COM"));
+        assert_eq!(
+            schema["properties"]["manufacturer_identifier_scope"]["enum"],
+            json!(AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES)
+        );
         assert_eq!(
             schema["properties"]
                 .as_object()
@@ -3332,6 +3462,7 @@ mod tests {
                 "identity_source_url",
                 "manufacturer_identifier",
                 "manufacturer_identifier_kind",
+                "manufacturer_identifier_scope",
                 "reason",
                 "status"
             ]
@@ -3407,6 +3538,10 @@ mod tests {
             schema["properties"]["reviews"]["items"]["properties"]["decision"]["enum"],
             json!(["same_product", "different_product"])
         );
+        assert_eq!(
+            schema["properties"]["proposal_manufacturer_identifier_scope"]["enum"],
+            json!(AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES)
+        );
         let serialized = serde_json::to_string(&context).expect("review context should serialize");
         for forbidden in [
             "estimated_unit_value_usd",
@@ -3452,9 +3587,40 @@ mod tests {
             "not installation approval",
             "FCC equipment authorization is supplemental evidence only",
             "return unresolved rather than collapsing products",
+            "subcomponent part number cannot identify the complete multi-box system",
+            "existing_match and propose_new require exact_catalog_product",
         ] {
             assert!(identity_prompt.contains(required), "missing {required:?}");
         }
+
+        let correction_prompt = build_avionics_unit_resolution_correction_prompt(
+            &context,
+            &json!({"status": "propose_new"}),
+            &AvionicsUnitResolutionCorrectionContext {
+                issues: vec!["identifier does not scope the catalog product".to_string()],
+                secondary_check: None,
+            },
+        );
+        assert!(
+            correction_prompt.contains("Every positive decision requires exact_catalog_product")
+        );
+        assert!(correction_prompt.contains("part number for one box or subcomponent"));
+
+        let collision_prompt = build_avionics_catalog_collision_review_prompt(
+            &AvionicsCatalogCollisionReviewContext {
+                classification_context: context.clone(),
+                proposed_identity: AvionicsProposedIdentity {
+                    canonical_manufacturer: "Garmin".to_string(),
+                    canonical_model: "GTX 345R".to_string(),
+                    canonical_types: vec!["Transponder".to_string()],
+                    manufacturer_identifier_kind: "manufacturer_part_number".to_string(),
+                    manufacturer_identifier: "011-03378-40".to_string(),
+                },
+            },
+        );
+        assert!(collision_prompt
+            .contains("do not merely copy or defer to the first-stage scope decision"));
+        assert!(collision_prompt.contains("A subcomponent part number cannot confirm"));
 
         let observed_types = vec!["Transponder".to_string()];
         let metadata_prompt = build_avionics_metadata_prompt(&AvionicsMetadataContext {
@@ -3477,6 +3643,15 @@ mod tests {
             "identity_source_title",
             "identity_evidence",
             "identity_confidence",
+            "introduced_year_source_url",
+            "introduced_year_source_title",
+            "introduced_year_evidence",
+            "installed_value_source_url",
+            "installed_value_source_title",
+            "installed_value_evidence",
+            "replacement_cost_source_url",
+            "replacement_cost_source_title",
+            "replacement_cost_evidence",
         ] {
             assert!(metadata_schema["properties"].get(field).is_some());
             assert!(metadata_schema["required"]
@@ -3514,6 +3689,7 @@ mod tests {
         });
         assert!(metadata_prompt.contains("canonical_avionics_types"));
         assert!(metadata_prompt.contains("\"AHRS\""));
+        assert!(metadata_prompt.contains("Do not present an unsupported model estimate"));
 
         let default_schema = gemini_default_aircraft_avionics_response_schema();
         let item = &default_schema["properties"]["avionics"]["items"];

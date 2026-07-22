@@ -386,8 +386,11 @@ pub struct AvionicsEnrichmentItem {
     pub previous_replacement_cost_usd: Option<f64>,
     pub previous_valuation_scope: String,
     pub introduced_year: i64,
+    pub introduced_year_evidence: AvionicsFactEvidenceItem,
     pub installed_value_contribution_usd: f64,
+    pub installed_value_evidence: AvionicsFactEvidenceItem,
     pub replacement_cost_usd: f64,
+    pub replacement_cost_evidence: AvionicsFactEvidenceItem,
     pub valuation_scope: String,
     pub included_components: Vec<AvionicsIncludedComponentItem>,
     pub identity: AvionicsIdentityEvidenceItem,
@@ -412,6 +415,13 @@ pub struct AvionicsIdentityEvidenceItem {
     pub identity_source_title: String,
     pub identity_evidence: String,
     pub identity_confidence: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AvionicsFactEvidenceItem {
+    pub source_url: String,
+    pub source_title: String,
+    pub evidence: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2345,6 +2355,32 @@ fn enrichment_item_from_response(
         valuation_scope.as_str(),
     )?;
     let identity = identity_evidence_from_response(response)?;
+    let introduced_year_evidence = fact_evidence_from_response(response, "introduced_year")?;
+    let installed_value_evidence = fact_evidence_from_response(response, "installed_value")?;
+    let replacement_cost_evidence = fact_evidence_from_response(response, "replacement_cost")?;
+    for (field, value, evidence) in [
+        (
+            "introduced_year",
+            introduced_year as f64,
+            &introduced_year_evidence.evidence,
+        ),
+        (
+            "installed_value_contribution_usd",
+            installed_value_contribution_usd,
+            &installed_value_evidence.evidence,
+        ),
+        (
+            "replacement_cost_usd",
+            replacement_cost_usd,
+            &replacement_cost_evidence.evidence,
+        ),
+    ] {
+        if !evidence_mentions_number(evidence, value) {
+            return Err(AvionicsStoreError::Model(format!(
+                "Gemini avionics {field} evidence does not state the returned value {value}"
+            )));
+        }
+    }
     let confidence = required_confidence(response, "confidence")?;
     Ok(AvionicsEnrichmentItem {
         avionics_model_id: row.id,
@@ -2356,8 +2392,11 @@ fn enrichment_item_from_response(
         previous_replacement_cost_usd: row.replacement_cost_usd,
         previous_valuation_scope: row.valuation_scope.clone(),
         introduced_year,
+        introduced_year_evidence,
         installed_value_contribution_usd,
+        installed_value_evidence,
         replacement_cost_usd,
+        replacement_cost_evidence,
         valuation_scope,
         included_components,
         identity,
@@ -2642,7 +2681,7 @@ async fn update_avionics_metadata(
         return Ok(());
     }
     require_approved_catalog_model(db, item.avionics_model_id).await?;
-    let value_source = "gemini";
+    let value_source = item.installed_value_evidence.source_url.as_str();
     if overwrite_existing {
         execute_query!(
             db,
@@ -2898,6 +2937,51 @@ fn identity_evidence_from_response(value: &Value) -> StoreResult<AvionicsIdentit
         identity_evidence: required_present_string(value, "identity_evidence")?,
         identity_confidence: required_identity_confidence(value, "identity_confidence")?,
     })
+}
+
+fn fact_evidence_from_response(
+    value: &Value,
+    field_prefix: &str,
+) -> StoreResult<AvionicsFactEvidenceItem> {
+    let source_url = required_present_string(value, &format!("{field_prefix}_source_url"))?;
+    if !(source_url.starts_with("https://") || source_url.starts_with("http://")) {
+        return Err(AvionicsStoreError::Model(format!(
+            "Gemini avionics {field_prefix}_source_url must be http(s): {source_url}"
+        )));
+    }
+    let source_title = required_present_string(value, &format!("{field_prefix}_source_title"))?;
+    let evidence = required_present_string(value, &format!("{field_prefix}_evidence"))?;
+    if source_title.is_empty() || evidence.is_empty() {
+        return Err(AvionicsStoreError::Model(format!(
+            "Gemini avionics {field_prefix} evidence requires a source title and exact cited span"
+        )));
+    }
+    Ok(AvionicsFactEvidenceItem {
+        source_url,
+        source_title,
+        evidence,
+    })
+}
+
+fn evidence_mentions_number(evidence: &str, expected: f64) -> bool {
+    let expected = if expected.fract().abs() < f64::EPSILON {
+        format!("{expected:.0}")
+    } else {
+        expected.to_string()
+    };
+    evidence
+        .split(|character: char| !(character.is_ascii_digit() || matches!(character, ',' | '.')))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.replace(',', ""))
+        .map(|token| {
+            let token = token.trim_end_matches('.');
+            token
+                .strip_suffix(".00")
+                .or_else(|| token.strip_suffix(".0"))
+                .unwrap_or(token)
+                .to_string()
+        })
+        .any(|token| token == expected)
 }
 
 fn required_present_string(value: &Value, field: &str) -> StoreResult<String> {
@@ -3277,9 +3361,18 @@ mod tests {
             "identity_evidence": "The manual identifies GTX 345R part 011-03520-00.",
             "identity_confidence": "medium",
             "introduced_year": 2016,
+            "introduced_year_source_url": "https://static.garmin.com/manuals/gtx345r.pdf",
+            "introduced_year_source_title": "GTX 345R installation manual",
+            "introduced_year_evidence": "The manual was published in 2016.",
             "estimated_unit_value_usd": 5000.0,
             "installed_value_contribution_usd": 5000.0,
+            "installed_value_source_url": "https://avionics.example/gtx345r-market",
+            "installed_value_source_title": "GTX 345R market reference",
+            "installed_value_evidence": "Working GTX 345R units sell for $5,000.",
             "replacement_cost_usd": 9000.0,
+            "replacement_cost_source_url": "https://avionics.example/gtx345r-installed",
+            "replacement_cost_source_title": "GTX 345R installed pricing",
+            "replacement_cost_evidence": "Typical equipment and installation cost is $9,000.",
             "valuation_scope": "unit",
             "included_components": [],
             "confidence": "high"
@@ -3288,6 +3381,10 @@ mod tests {
         let item = enrichment_item_from_response(&row, &response).unwrap();
         assert_eq!(item.identity.identity_confidence, "medium");
         assert_eq!(item.confidence, "high");
+        assert_eq!(
+            item.installed_value_evidence.source_url,
+            "https://avionics.example/gtx345r-market"
+        );
 
         response
             .as_object_mut()
