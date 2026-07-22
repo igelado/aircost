@@ -1363,13 +1363,8 @@ fn validate_evidence_values(
     if evidence.trim().chars().count() < 20 {
         issues.push("identity evidence must contain a specific supporting fact".to_string());
     }
-    if !evidence_is_bound_to_grounding(
-        source_url,
-        source_title,
-        evidence,
-        grounding_sources,
-        grounding_supports,
-    ) {
+    if !evidence_is_bound_to_grounding(source_url, evidence, grounding_sources, grounding_supports)
+    {
         issues.push(
             "identity evidence must be linked by Gemini grounding support to the claimed web source"
                 .to_string(),
@@ -1379,7 +1374,6 @@ fn validate_evidence_values(
 
 fn evidence_is_bound_to_grounding(
     source_url: &str,
-    source_title: &str,
     evidence: &str,
     grounding_sources: &[GeminiGroundingSource],
     grounding_supports: &[GeminiGroundingSupport],
@@ -1390,38 +1384,20 @@ fn evidence_is_bound_to_grounding(
     }
     grounding_supports.iter().any(|support| {
         let support_key = normalize_name(&support.text);
-        let supports_claim = support_key.contains(&evidence_key)
-            || evidence_key.contains(&support_key)
-            || string_similarity(&support_key, &evidence_key) >= 0.4;
-        supports_claim
+        support_key.contains(&evidence_key)
             && support.source_indices.iter().any(|source_index| {
                 grounding_sources.iter().any(|source| {
                     source.chunk_index == *source_index
-                        && grounding_source_matches_claim(source, source_url, source_title)
+                        && grounding_source_matches_claim(source, source_url)
                 })
             })
     })
 }
 
-fn grounding_source_matches_claim(
-    source: &GeminiGroundingSource,
-    claimed_url: &str,
-    claimed_title: &str,
-) -> bool {
-    if normalized_evidence_url(&source.url)
+fn grounding_source_matches_claim(source: &GeminiGroundingSource, claimed_url: &str) -> bool {
+    normalized_evidence_url(&source.url)
         .zip(normalized_evidence_url(claimed_url))
         .is_some_and(|(source, claimed)| source == claimed)
-    {
-        return true;
-    }
-    let source_title = normalize_name(&source.title);
-    let claimed_title = normalize_name(claimed_title);
-    let shared_title_tokens = source_title
-        .split_whitespace()
-        .collect::<HashSet<_>>()
-        .intersection(&claimed_title.split_whitespace().collect::<HashSet<_>>())
-        .count();
-    shared_title_tokens >= 2 && string_similarity(&source_title, &claimed_title) >= 0.45
 }
 
 fn normalized_evidence_url(value: &str) -> Option<String> {
@@ -1929,7 +1905,8 @@ mod tests {
 
     use super::{
         canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
-        collision_reviews, expanded_collision_context, load_catalog_candidates,
+        collision_reviews, evidence_is_bound_to_grounding, expanded_collision_context,
+        grounding_source_matches_claim, load_catalog_candidates,
         persist_approved_capability_enrichment, persist_approved_identity, proposal_attestation,
         resolution_issues, shortlist_avionics_candidates, verified_identity_from_response,
         AvionicsCatalogCandidate, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
@@ -1999,6 +1976,62 @@ mod tests {
                 source_indices: vec![0],
             }],
         )
+    }
+
+    #[test]
+    fn grounding_evidence_requires_normalized_containment_in_cited_span() {
+        let (sources, exact_supports) = grounding(
+            "https://static.garmin.com/manuals/gtx345r.pdf",
+            "GTX 345R installation manual",
+            "The Garmin manual identifies the exact GTX-345R product and part number.",
+        );
+        assert!(evidence_is_bound_to_grounding(
+            "https://static.garmin.com/manuals/gtx345r.pdf",
+            "Garmin manual identifies the exact GTX 345R product",
+            &sources,
+            &exact_supports,
+        ));
+
+        let (_, paraphrased_supports) = grounding(
+            "https://static.garmin.com/manuals/gtx345r.pdf",
+            "GTX 345R installation manual",
+            "The part number for GTX 345R appears in the Garmin manual.",
+        );
+        assert!(!evidence_is_bound_to_grounding(
+            "https://static.garmin.com/manuals/gtx345r.pdf",
+            "Garmin manual identifies the GTX 345R part number",
+            &sources,
+            &paraphrased_supports,
+        ));
+
+        let (_, partial_supports) = grounding(
+            "https://static.garmin.com/manuals/gtx345r.pdf",
+            "GTX 345R installation manual",
+            "The manual identifies the GTX 345R.",
+        );
+        assert!(!evidence_is_bound_to_grounding(
+            "https://static.garmin.com/manuals/gtx345r.pdf",
+            "The manual identifies the GTX 345R and confirms part number 011-03520-00.",
+            &sources,
+            &partial_supports,
+        ));
+    }
+
+    #[test]
+    fn grounding_source_requires_exact_normalized_url_not_matching_title() {
+        let source = GeminiGroundingSource {
+            chunk_index: 0,
+            url: "https://static.garmin.com/manuals/gtx345r.pdf/?download=1#page=4".to_string(),
+            title: "GTX 345R installation manual".to_string(),
+        };
+        assert!(grounding_source_matches_claim(
+            &source,
+            "https://static.garmin.com/manuals/gtx345r.pdf"
+        ));
+        assert!(!grounding_source_matches_claim(
+            &source,
+            "https://unrelated.example/manuals/gtx345r.pdf"
+        ));
     }
 
     #[test]
