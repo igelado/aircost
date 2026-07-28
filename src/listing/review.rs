@@ -4051,6 +4051,36 @@ fn listing_evidence_has_ambiguous_semantic_qualifier(
     .any(|qualifier| evidence.contains(qualifier) && !canonical.contains(qualifier))
 }
 
+fn validate_review_product_identity_source_fields(
+    identity_source_title: &str,
+    identity_evidence_text: &str,
+) -> ReviewResult<()> {
+    let identity_source_title = identity_source_title.trim();
+    if identity_source_title.is_empty() {
+        return Err(ReviewError::Validation(
+            "identity_source_title is required".to_string(),
+        ));
+    }
+    if identity_source_title.chars().count() > MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS {
+        return Err(ReviewError::Validation(format!(
+            "identity_source_title must contain at most {MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS} characters"
+        )));
+    }
+
+    let identity_evidence_text = identity_evidence_text.trim();
+    if identity_evidence_text.is_empty() {
+        return Err(ReviewError::Validation(
+            "identity_evidence_text is required".to_string(),
+        ));
+    }
+    if identity_evidence_text.chars().count() > MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS {
+        return Err(ReviewError::Validation(format!(
+            "identity_evidence_text must be an exact publisher excerpt of at most {MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS} characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_existing_product_verification_evidence(
     aspect_id: &ReviewAspectId,
     target: &ReviewProduct,
@@ -4065,16 +4095,7 @@ fn validate_existing_product_verification_evidence(
         ))
     })?;
     authoritative_source_url(identity_source_url)?;
-    if identity_source_title.trim().is_empty()
-        || identity_source_title.trim().chars().count() > MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS
-        || identity_evidence_text.trim().is_empty()
-        || identity_evidence_text.trim().chars().count()
-            > MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS
-    {
-        return Err(ReviewError::Validation(format!(
-            "review aspect {aspect_id} requires a bounded nonblank authoritative source title and exact identity evidence"
-        )));
-    }
+    validate_review_product_identity_source_fields(identity_source_title, identity_evidence_text)?;
     if !exact_product_identity_signal_is_present(
         identity_evidence_text,
         &target.model,
@@ -4622,22 +4643,7 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
     }
     let identity_source_title = identity_source_title.trim();
     let identity_evidence_text = identity_evidence_text.trim();
-    if identity_source_title.is_empty() || identity_evidence_text.is_empty() {
-        return Err(ReviewError::Validation(
-            "verified product creation requires nonblank source title and identity evidence"
-                .to_string(),
-        ));
-    }
-    if identity_source_title.chars().count() > MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS {
-        return Err(ReviewError::Validation(format!(
-            "identity_source_title must contain at most {MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS} characters"
-        )));
-    }
-    if identity_evidence_text.chars().count() > MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS {
-        return Err(ReviewError::Validation(format!(
-            "identity_evidence_text must be an exact publisher excerpt of at most {MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS} characters"
-        )));
-    }
+    validate_review_product_identity_source_fields(identity_source_title, identity_evidence_text)?;
     if !exact_product_identity_signal_is_present(
         identity_evidence_text,
         model,
@@ -6969,6 +6975,34 @@ mod tests {
     }
 
     #[test]
+    fn product_identity_source_fields_report_precise_character_limits() {
+        assert!(validate_review_product_identity_source_fields(
+            &"é".repeat(MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS),
+            &"é".repeat(MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS),
+        )
+        .is_ok());
+
+        for (title, evidence, expected_message) in [
+            (" ", "identity", "identity_source_title is required"),
+            (
+                &"x".repeat(MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS + 1),
+                "identity",
+                "identity_source_title must contain at most 200 characters",
+            ),
+            ("identity", " ", "identity_evidence_text is required"),
+            (
+                "identity",
+                &"x".repeat(MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS + 1),
+                "identity_evidence_text must be an exact publisher excerpt of at most 128 characters",
+            ),
+        ] {
+            let error =
+                validate_review_product_identity_source_fields(title, evidence).unwrap_err();
+            assert_eq!(error.to_string(), expected_message);
+        }
+    }
+
+    #[test]
     fn verified_product_requires_one_bounded_exact_publisher_excerpt() {
         let mut missing = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
         let ReviewDecision::CreateVerifiedProduct {
@@ -6980,7 +7014,7 @@ mod tests {
         };
         identity_evidence_text.clear();
         let error = prepare_create_product(&missing).unwrap_err();
-        assert!(error.to_string().contains("nonblank"));
+        assert_eq!(error.to_string(), "identity_evidence_text is required");
 
         let mut oversized = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
         let ReviewDecision::CreateVerifiedProduct {
@@ -6992,7 +7026,10 @@ mod tests {
         };
         *identity_evidence_text = "x".repeat(MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS + 1);
         let error = prepare_create_product(&oversized).unwrap_err();
-        assert!(error.to_string().contains("exact publisher excerpt"));
+        assert_eq!(
+            error.to_string(),
+            "identity_evidence_text must be an exact publisher excerpt of at most 128 characters"
+        );
 
         let mut unrelated = create_candidate_decision("identity", "GIA 63W", "GIA 63W");
         let ReviewDecision::CreateVerifiedProduct {
@@ -7019,7 +7056,10 @@ mod tests {
         };
         *identity_source_title = "x".repeat(MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS + 1);
         let error = prepare_create_product(&oversized_title).unwrap_err();
-        assert!(error.to_string().contains("identity_source_title"));
+        assert_eq!(
+            error.to_string(),
+            "identity_source_title must contain at most 200 characters"
+        );
 
         let client_attempt: ReviewDecision = serde_json::from_value(serde_json::json!({
             "action": "create_verified_product",

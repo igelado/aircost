@@ -2111,6 +2111,88 @@ mod tests {
         assert_eq!(usage_after, usage_before);
     }
 
+    #[tokio::test]
+    async fn verify_existing_product_api_reports_the_exact_source_title_limit() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let preserved_id = insert_approved_garmin_product(&db).await;
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Garmin GNS 430W P/N 011-01064-40 shown in the listing',
+                      'high', 'installed')
+            "#,
+        )
+        .bind(listing_id)
+        .bind(preserved_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        stage_pending_review(
+            &db,
+            listing_id,
+            None,
+            &[PendingReviewAspect::avionics(
+                "primary-observation",
+                "avionics_identity",
+                "Garmin GTX 345",
+                "Garmin GTX 345 transponder",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some("GTX 345 shown in listing equipment".to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        restage_unattested_preserved_products(&db, owner_user_id, listing_id)
+            .await
+            .unwrap()
+            .expect("the preserved product must require review");
+        let review = get_listing_review(&db, owner_user_id, listing_id)
+            .await
+            .unwrap()
+            .review;
+        let synthetic = review
+            .aspects
+            .iter()
+            .find(|aspect| {
+                aspect
+                    .reuse_attestation_target
+                    .as_ref()
+                    .and_then(|product| product.id)
+                    == Some(preserved_id)
+            })
+            .expect("the preserved association must be staged");
+
+        let error = verify_existing_review_avionics_handler(
+            State(test_state(db)),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(VerifyExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: review.review_payload_sha256.clone(),
+                expected_catalog_revision_sha256: review.catalog_revision_sha256.clone(),
+                aspect_id: synthetic.id.clone(),
+                identity_source_url: "https://www.garmin.com/aviation/product".to_string(),
+                identity_source_title: "x".repeat(201),
+                identity_evidence_text:
+                    "Garmin identifies GNS 430W by manufacturer part number 011-01064-40."
+                        .to_string(),
+            }),
+        )
+        .await
+        .expect_err("the API must reject an oversized identity source title");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            error.message,
+            "identity_source_title must contain at most 200 characters"
+        );
+    }
+
     #[test]
     fn stale_review_revisions_are_rejected_before_grounding() {
         let review_revision = "a".repeat(64);
