@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
@@ -192,6 +192,51 @@ pub struct AvionicsIdentityRequest {
     pub model: String,
     pub avionics_types: Vec<String>,
     pub quantity: i64,
+}
+
+/// Immutable approved-product identity bound to one guarded OEM fetch.
+///
+/// This request deliberately contains no listing or aircraft context. Product
+/// attestation is global catalog work; listing occurrence is corroborated by a
+/// separate source-free local resolver.
+#[derive(Clone, Debug)]
+pub(crate) struct ApprovedAvionicsProductSourceRequest {
+    pub source_url: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub avionics_types: Vec<String>,
+    pub manufacturer_identifier_kind: String,
+    pub manufacturer_identifier: String,
+}
+
+/// Source-free occurrence claim for one listing and one immutable approved
+/// product. It contains only facts the local matcher consumes.
+#[derive(Clone, Debug)]
+pub(crate) struct ApprovedProductAssociationRequest {
+    pub manufacturer: String,
+    pub model: String,
+    pub avionics_types: Vec<String>,
+    pub listing_evidence_text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingProductAttestationCommitGuard {
+    pub owner_user_id: i64,
+    pub listing_id: i64,
+    pub review_payload_sha256: String,
+    pub aspect_id: Value,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ApprovedProductSourceVerification {
+    pub approved: ApprovedAvionicsIdentity,
+    pub manufacturer_collision_snapshot_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ApprovedProductSourceVerificationOutcome {
+    Verified(ApprovedProductSourceVerification),
+    Unresolved { reason: String },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -386,6 +431,49 @@ pub(crate) async fn attest_grounded_existing_avionics_identity(
     db: &AppDb,
     grounded: &ApprovedAvionicsIdentity,
 ) -> CatalogResult<bool> {
+    attest_grounded_existing_avionics_identity_with_guard(db, grounded, None).await
+}
+
+pub(crate) async fn attest_pending_review_product_identity(
+    db: &AppDb,
+    verification: &ApprovedProductSourceVerification,
+    guard: &PendingProductAttestationCommitGuard,
+) -> CatalogResult<bool> {
+    attest_grounded_existing_avionics_identity_with_guard(
+        db,
+        &verification.approved,
+        Some((
+            verification.manufacturer_collision_snapshot_sha256.as_str(),
+            guard,
+        )),
+    )
+    .await
+}
+
+fn pending_review_payload_contains_attestation_target(
+    payload_json: &str,
+    aspect_id: &Value,
+    product_id: i64,
+) -> bool {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()
+        .and_then(|payload| payload.get("aspects").and_then(Value::as_array).cloned())
+        .is_some_and(|aspects| {
+            aspects.iter().any(|aspect| {
+                aspect.get("id") == Some(aspect_id)
+                    && aspect
+                        .get("reuse_attestation_target_id")
+                        .and_then(Value::as_i64)
+                        == Some(product_id)
+            })
+        })
+}
+
+async fn attest_grounded_existing_avionics_identity_with_guard(
+    db: &AppDb,
+    grounded: &ApprovedAvionicsIdentity,
+    guarded_review: Option<(&str, &PendingProductAttestationCommitGuard)>,
+) -> CatalogResult<bool> {
     if grounded.id <= 0
         || grounded.evidence_url.trim().is_empty()
         || grounded.evidence_title.trim().is_empty()
@@ -406,7 +494,7 @@ pub(crate) async fn attest_grounded_existing_avionics_identity(
             "UPDATE avionics_models SET updated_at = updated_at WHERE id = (SELECT id FROM avionics_models ORDER BY id LIMIT 1)",
         ),
         DatabaseBackend::Postgres(_) => db.sql(
-            "LOCK TABLE avionics_models, avionics_model_types, avionics_types, avionics_manufacturers, avionics_approved_product_identities, avionics_product_reuse_attestations, avionics_authoritative_source_origins, avionics_authoritative_source_origin_revocations IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK TABLE avionics_models, avionics_model_types, avionics_types, avionics_manufacturers, avionics_approved_product_identities, avionics_product_reuse_attestations, avionics_authoritative_source_origins, avionics_authoritative_source_origin_revocations, aircraft_sale_listings, aircraft_sale_listing_pending_reviews IN SHARE ROW EXCLUSIVE MODE",
         ),
     };
     macro_rules! attest {
@@ -418,7 +506,11 @@ pub(crate) async fn attest_grounded_existing_avionics_identity(
             let rows = sqlx::query_as::<_, CatalogRow>(&select_sql)
                 .fetch_all(&mut *transaction)
                 .await?;
-            let catalog = catalog_candidates_from_rows(rows);
+            let review_catalog = review_catalog_candidates_from_rows(rows);
+            let catalog = review_catalog
+                .iter()
+                .map(|candidate| candidate.candidate.clone())
+                .collect::<Vec<_>>();
             let current = catalog
                 .iter()
                 .find(|candidate| candidate.id == grounded.id)
@@ -440,6 +532,53 @@ pub(crate) async fn attest_grounded_existing_avionics_identity(
                     "approved catalog id {} changed after grounded review; retry against the current product",
                     grounded.id
                 )));
+            }
+            if let Some((expected_collision_snapshot, guard)) = guarded_review {
+                let current_manufacturer_identity_id = review_catalog
+                    .iter()
+                    .find(|candidate| candidate.candidate.id == grounded.id)
+                    .and_then(|candidate| candidate.manufacturer_identity_id);
+                let current_collision_snapshot = manufacturer_collision_snapshot_sha256(
+                    &grounded.manufacturer,
+                    current_manufacturer_identity_id,
+                    &review_catalog,
+                );
+                if current_collision_snapshot != expected_collision_snapshot {
+                    return Err(CatalogError::Validation(format!(
+                        "manufacturer-scoped collision catalog changed after source verification for catalog id {}; retry against the current product family",
+                        grounded.id
+                    )));
+                }
+                let pending_sql = db.sql(
+                    r#"
+                    SELECT review.review_payload_json
+                    FROM aircraft_sale_listing_pending_reviews review
+                    JOIN aircraft_sale_listings listing
+                      ON listing.id = review.listing_id
+                    WHERE review.listing_id = ?
+                      AND listing.created_by_user_id = ?
+                      AND review.review_payload_sha256 = ?
+                    "#,
+                );
+                let pending_payload: Option<String> =
+                    sqlx::query_scalar(&pending_sql)
+                        .bind(guard.listing_id)
+                        .bind(guard.owner_user_id)
+                        .bind(guard.review_payload_sha256.as_str())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if !pending_payload.as_deref().is_some_and(|payload| {
+                    pending_review_payload_contains_attestation_target(
+                        payload,
+                        &guard.aspect_id,
+                        grounded.id,
+                    )
+                }) {
+                    return Err(CatalogError::Validation(format!(
+                        "the reviewer no longer owns the hash-bound pending association for catalog id {}; reload the product review queue",
+                        grounded.id
+                    )));
+                }
             }
             let attested = $refresh_grounded(
                 db,
@@ -484,26 +623,33 @@ pub(crate) async fn attest_grounded_existing_avionics_identity(
 /// through `attest_grounded_existing_avionics_identity`.
 pub(crate) async fn verify_approved_avionics_product_source_without_gemini(
     db: &AppDb,
-    request: &AvionicsIdentityRequest,
+    request: &ApprovedAvionicsProductSourceRequest,
     target_id: i64,
     source_title: &str,
     fetched: &FetchedSourceDocument,
-) -> CatalogResult<AvionicsIdentityOutcome> {
-    let direct_source_plan = authoritative_direct_source_plan(db, request).await?;
-    let (requested_source_url, admission) = match (
-        direct_source_plan.source_urls.as_slice(),
-        direct_source_plan.admission.as_ref(),
-    ) {
-        ([requested_source_url], Some(admission)) => (requested_source_url.as_str(), admission),
-        _ => {
-            return Ok(AvionicsIdentityOutcome::Unresolved {
-                reason: "deterministic existing-product verification requires exactly one currently admitted manufacturer source URL".to_string(),
-            });
-        }
-    };
+) -> CatalogResult<ApprovedProductSourceVerificationOutcome> {
+    canonical_exact_https_origin(&request.source_url).map_err(|error| {
+        CatalogError::Validation(format!(
+            "invalid authoritative avionics direct-source URL: {error}"
+        ))
+    })?;
+    let admission = authorize_manufacturer_source_urls(
+        db,
+        &request.manufacturer,
+        std::slice::from_ref(&request.source_url),
+    )
+    .await
+    .map_err(|error| match error {
+        ManufacturerIdentityError::Validation(message)
+        | ManufacturerIdentityError::Conflict(message) => CatalogError::Validation(format!(
+            "authoritative avionics direct-source admission failed: {message}"
+        )),
+        ManufacturerIdentityError::Database(message) => CatalogError::Database(message),
+    })?;
+    let requested_source_url = request.source_url.as_str();
     let final_url = fetched.final_url.as_str();
     if let Err(error) = admission.require_authorized_final_url(requested_source_url, final_url) {
-        return Ok(AvionicsIdentityOutcome::Unresolved {
+        return Ok(ApprovedProductSourceVerificationOutcome::Unresolved {
             reason: format!(
                 "the freshly fetched publisher document did not retain its admitted exact origin: {error}"
             ),
@@ -517,24 +663,31 @@ pub(crate) async fn verify_approved_avionics_product_source_without_gemini(
         target_id,
         source_title,
         fetched,
-        admission,
-        &direct_source_plan.identity_anchors,
+        &admission,
         &graph_candidates,
         &review_catalog,
     ) {
-        Ok(approved) => Ok(AvionicsIdentityOutcome::Approved(approved)),
-        Err(reason) => Ok(AvionicsIdentityOutcome::Unresolved { reason }),
+        Ok(approved) => Ok(ApprovedProductSourceVerificationOutcome::Verified(
+            ApprovedProductSourceVerification {
+                manufacturer_collision_snapshot_sha256: manufacturer_collision_snapshot_sha256(
+                    &request.manufacturer,
+                    Some(admission.effective_manufacturer_identity_id),
+                    &review_catalog,
+                ),
+                approved,
+            },
+        )),
+        Err(reason) => Ok(ApprovedProductSourceVerificationOutcome::Unresolved { reason }),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn deterministic_graph_approved_identity_from_source(
-    request: &AvionicsIdentityRequest,
+    request: &ApprovedAvionicsProductSourceRequest,
     target_id: i64,
     source_title: &str,
     fetched: &FetchedSourceDocument,
     admission: &ManufacturerSourceOriginAdmission,
-    identity_anchors: &[String],
     graph_candidates: &[KnownApprovedAvionicsCandidate],
     review_catalog: &[ReviewCatalogCandidate],
 ) -> Result<ApprovedAvionicsIdentity, String> {
@@ -575,9 +728,11 @@ fn deterministic_graph_approved_identity_from_source(
         || request.model != target.model
         || requested_types != target.avionics_types
         || requested_types.len() != request.avionics_types.len()
+        || request.manufacturer_identifier_kind != target.manufacturer_identifier_kind
+        || request.manufacturer_identifier != target.manufacturer_identifier
     {
         return Err(format!(
-            "catalog id {target_id} changed manufacturer, model, or capabilities after the hash-bound review was staged"
+            "catalog id {target_id} changed manufacturer, model, capabilities, or stable identifier after the hash-bound review was staged"
         ));
     }
     if !matches!(
@@ -609,21 +764,6 @@ fn deterministic_graph_approved_identity_from_source(
             "catalog id {target_id} has inconsistent graph identity keys"
         ));
     }
-    for expected_anchor in [
-        target.manufacturer.as_str(),
-        target.model.as_str(),
-        target.manufacturer_identifier.as_str(),
-    ] {
-        if !identity_anchors
-            .iter()
-            .any(|anchor| anchor.trim() == expected_anchor.trim())
-        {
-            return Err(format!(
-                "the admitted source request is not bound to every immutable identity field for catalog id {target_id}"
-            ));
-        }
-    }
-
     let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
         &target.manufacturer,
         Some(target.avionics_manufacturer_identity_id),
@@ -789,8 +929,42 @@ pub async fn resolve_verified_local_avionics_identity(
     };
     let catalog = load_catalog_candidates(db).await?;
     let approved_candidates = load_known_approved_candidates(db).await?;
-    Ok(known_approved_local_match(
-        request,
+    Ok(known_approved_local_match_core(
+        &request.model,
+        &request.listing_context,
+        &observed_types,
+        manufacturer_identity_id,
+        &approved_candidates,
+        &catalog,
+    ))
+}
+
+pub(crate) async fn resolve_approved_product_association(
+    db: &AppDb,
+    request: &ApprovedProductAssociationRequest,
+) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
+    if request.listing_evidence_text.trim().is_empty()
+        || request.manufacturer.trim().is_empty()
+        || request.model.trim().is_empty()
+        || request.avionics_types.is_empty()
+        || request.avionics_types.iter().any(|capability| {
+            let capability = capability.trim();
+            capability.is_empty() || !CURATED_AVIONICS_TYPES.contains(&capability)
+        })
+    {
+        return Ok(None);
+    }
+    let observed_types = canonicalize_avionics_types(&request.avionics_types);
+    let Some(manufacturer_identity_id) =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
+    else {
+        return Ok(None);
+    };
+    let catalog = load_catalog_candidates(db).await?;
+    let approved_candidates = load_known_approved_candidates(db).await?;
+    Ok(known_approved_local_match_core(
+        &request.model,
+        &request.listing_evidence_text,
         &observed_types,
         manufacturer_identity_id,
         &approved_candidates,
@@ -2090,6 +2264,7 @@ fn approved_candidate_adjudication_plan_is_unchanged(
             })
 }
 
+#[cfg(test)]
 fn known_approved_local_match(
     request: &AvionicsIdentityRequest,
     observed_types: &[String],
@@ -2097,7 +2272,25 @@ fn known_approved_local_match(
     candidates: &[KnownApprovedAvionicsCandidate],
     catalog: &[AvionicsCatalogCandidate],
 ) -> Option<ApprovedAvionicsIdentity> {
-    let observed_product_key = normalize_avionics_identifier(&request.model);
+    known_approved_local_match_core(
+        &request.model,
+        &request.listing_context,
+        observed_types,
+        manufacturer_identity_id,
+        candidates,
+        catalog,
+    )
+}
+
+fn known_approved_local_match_core(
+    observed_model: &str,
+    listing_evidence_text: &str,
+    observed_types: &[String],
+    manufacturer_identity_id: i64,
+    candidates: &[KnownApprovedAvionicsCandidate],
+    catalog: &[AvionicsCatalogCandidate],
+) -> Option<ApprovedAvionicsIdentity> {
+    let observed_product_key = normalize_avionics_identifier(observed_model);
     if observed_product_key.is_empty() {
         return None;
     }
@@ -2128,7 +2321,7 @@ fn known_approved_local_match(
                     &candidate.canonical_product_key,
                 )
                 && exact_stable_identifier_is_present(
-                    &request.listing_context,
+                    listing_evidence_text,
                     &candidate.manufacturer_identifier_kind,
                     &candidate.canonical_identifier_key,
                 );
@@ -2146,7 +2339,7 @@ fn known_approved_local_match(
                 .filter_map(|candidate| {
                     (observed_product_key == candidate.canonical_product_key
                         && exact_compact_identity_is_present(
-                            &request.listing_context,
+                            listing_evidence_text,
                             &candidate.canonical_product_key,
                         ))
                     .then_some(*candidate)
@@ -2155,7 +2348,7 @@ fn known_approved_local_match(
             let [selected] = exact_model_matches.as_slice() else {
                 return None;
             };
-            if listing_names_longer_catalog_variant(selected, catalog, &request.listing_context) {
+            if listing_names_longer_catalog_variant(selected, catalog, listing_evidence_text) {
                 return None;
             }
             (
@@ -2432,6 +2625,47 @@ fn manufacturer_scoped_catalog_candidates(
         )
         .map(|candidate| candidate.candidate.clone())
         .collect()
+}
+
+fn manufacturer_collision_snapshot_sha256(
+    manufacturer: &str,
+    manufacturer_identity_id: Option<i64>,
+    catalog: &[ReviewCatalogCandidate],
+) -> String {
+    let manufacturer_key = normalize_avionics_manufacturer_name(manufacturer);
+    let mut rows = catalog
+        .iter()
+        .filter(
+            |candidate| match (manufacturer_identity_id, candidate.manufacturer_identity_id) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => {
+                    !manufacturer_key.is_empty()
+                        && normalize_avionics_manufacturer_name(&candidate.candidate.manufacturer)
+                            == manufacturer_key
+                }
+            },
+        )
+        .map(|candidate| {
+            let product = &candidate.candidate;
+            json!({
+                "id": product.id,
+                "manufacturer": product.manufacturer,
+                "model": product.model,
+                "avionics_types": product.avionics_types,
+                "manufacturer_identifier_kind": product.manufacturer_identifier_kind,
+                "manufacturer_identifier": product.manufacturer_identifier,
+                "catalog_status": product.catalog_status,
+                "manufacturer_identity_id": candidate.manufacturer_identity_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row["id"].as_i64().unwrap_or_default());
+    let mut hasher = Sha256::new();
+    hasher.update(b"aircost:avionics-manufacturer-collision-snapshot:v1");
+    hasher.update(
+        serde_json::to_vec(&rows).expect("manufacturer collision snapshot is serializable"),
+    );
+    format!("{:x}", hasher.finalize())
 }
 
 fn review_catalog_candidates_from_rows(rows: Vec<CatalogRow>) -> Vec<ReviewCatalogCandidate> {
@@ -4608,27 +4842,31 @@ mod tests {
 
     use super::{
         approved_candidate_adjudication_plan, approved_candidate_adjudication_selection,
-        attest_grounded_existing_avionics_identity, authoritative_direct_source_plan,
-        canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
-        collision_correction_plan, collision_reviews, collision_reviews_with_direct_source_proofs,
+        attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
+        authoritative_direct_source_plan, canonical_avionics_types_for_label,
+        canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
+        collision_reviews, collision_reviews_with_direct_source_proofs,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, evidence_is_bound_to_grounding,
         exact_compact_identity_is_present, exact_product_identity_signal_is_present,
         expanded_collision_context, grounding_source_matches_claim, known_approved_local_match,
-        load_catalog_candidates, load_known_approved_candidates,
-        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
-        nonpositive_identity_outcome, persist_approved_capability_enrichment,
-        persist_approved_identity, persist_existing_reuse_attestation, proposal_attestation,
+        load_catalog_candidates, load_known_approved_candidates, load_review_catalog_candidates,
+        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
+        model_identity_relation_score, nonpositive_identity_outcome,
+        persist_approved_capability_enrichment, persist_approved_identity,
+        persist_existing_reuse_attestation, proposal_attestation,
         proposal_attestation_with_direct_source_proofs, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
         select_unique_exact_review_candidate, shortlist_avionics_candidates,
         should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
         validate_collision_decision_relation, validate_grounded_response_origin_state,
-        verified_identity_from_response, AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate,
-        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsUnitResolutionCandidate,
-        AvionicsUnitResolutionContext, CollisionCorrectionPlan, GeminiGroundingSource,
-        GeminiGroundingSupport, GroundedJsonResponse, KnownApprovedAvionicsCandidate,
+        verified_identity_from_response, ApprovedAvionicsIdentity,
+        ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
+        AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate, AvionicsIdentityOutcome,
+        AvionicsIdentityRequest, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
+        CollisionCorrectionPlan, GeminiGroundingSource, GeminiGroundingSupport,
+        GroundedJsonResponse, KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
         ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
         KNOWN_APPROVED_SELECT_SQL,
     };
@@ -4922,11 +5160,10 @@ mod tests {
     }
 
     fn deterministic_gtx33_fixture() -> (
-        AvionicsIdentityRequest,
+        ApprovedAvionicsProductSourceRequest,
         KnownApprovedAvionicsCandidate,
         KnownApprovedAvionicsCandidate,
         ManufacturerSourceOriginAdmission,
-        Vec<String>,
         FetchedSourceDocument,
     ) {
         let mut target = known_candidate(33, "GTX 33");
@@ -4938,15 +5175,14 @@ mod tests {
         longer_neighbor.canonical_identifier_key =
             normalize_avionics_identifier(&longer_neighbor.manufacturer_identifier);
 
-        let mut request = local_request("Garmin GTX 33 Transponder");
-        request.model = target.model.clone();
-        request.authoritative_direct_source_urls =
-            vec!["https://www.garmin.com/en-US/p/GTX33/".to_string()];
-        request.authoritative_identity_anchors = vec![
-            target.manufacturer.clone(),
-            target.model.clone(),
-            target.manufacturer_identifier.clone(),
-        ];
+        let request = ApprovedAvionicsProductSourceRequest {
+            source_url: "https://www.garmin.com/en-US/p/GTX33/".to_string(),
+            manufacturer: target.manufacturer.clone(),
+            model: target.model.clone(),
+            avionics_types: target.avionics_types.clone(),
+            manufacturer_identifier_kind: target.manufacturer_identifier_kind.clone(),
+            manufacturer_identifier: target.manufacturer_identifier.clone(),
+        };
         let admission = ManufacturerSourceOriginAdmission {
             avionics_manufacturer_id: 1,
             effective_manufacturer_identity_id: target.avionics_manufacturer_identity_id,
@@ -4966,21 +5202,12 @@ mod tests {
             }],
             source_text_rows_complete: true,
         };
-        let anchors = request.authoritative_identity_anchors.clone();
-        (
-            request,
-            target,
-            longer_neighbor,
-            admission,
-            anchors,
-            fetched,
-        )
+        (request, target, longer_neighbor, admission, fetched)
     }
 
     #[test]
     fn deterministic_oem_proof_allows_a_distinct_part_number_prefix_neighbor() {
-        let (request, target, neighbor, admission, anchors, fetched) =
-            deterministic_gtx33_fixture();
+        let (request, target, neighbor, admission, fetched) = deterministic_gtx33_fixture();
         let catalog = vec![
             deterministic_review_candidate(&target),
             deterministic_review_candidate(&neighbor),
@@ -4992,7 +5219,6 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &admission,
-            &anchors,
             &[target.clone(), neighbor],
             &catalog,
         )
@@ -5008,7 +5234,7 @@ mod tests {
 
     #[test]
     fn deterministic_oem_proof_rejects_a_longer_prefix_neighbor_in_the_same_row() {
-        let (mut request, mut target, mut neighbor, admission, _, mut fetched) =
+        let (mut request, mut target, mut neighbor, admission, mut fetched) =
             deterministic_gtx33_fixture();
         target.model = "G1000".to_string();
         target.canonical_product_key = normalize_avionics_identifier(&target.model);
@@ -5021,12 +5247,7 @@ mod tests {
         neighbor.canonical_identifier_key =
             normalize_avionics_identifier(&neighbor.manufacturer_identifier);
         request.model = target.model.clone();
-        request.authoritative_identity_anchors = vec![
-            target.manufacturer.clone(),
-            target.model.clone(),
-            target.manufacturer_identifier.clone(),
-        ];
-        let anchors = request.authoritative_identity_anchors.clone();
+        request.manufacturer_identifier = target.manufacturer_identifier.clone();
         fetched.publisher_text =
             "Garmin G1000 NXi Integrated Flight Deck; sku0 011-01000-00.".to_string();
         fetched.source_text_rows = vec![SourceTextRow {
@@ -5048,7 +5269,6 @@ mod tests {
             "Garmin G1000 product reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
@@ -5059,7 +5279,7 @@ mod tests {
 
     #[test]
     fn deterministic_oem_proof_rejects_exact_catalog_duplicates() {
-        let (request, target, _, admission, anchors, fetched) = deterministic_gtx33_fixture();
+        let (request, target, _, admission, fetched) = deterministic_gtx33_fixture();
 
         let mut exact_model_duplicate = known_candidate(34, "GTX-33");
         exact_model_duplicate.manufacturer_identifier = "011-99999-00".to_string();
@@ -5075,7 +5295,6 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &model_catalog,
         )
@@ -5096,7 +5315,6 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &identifier_catalog,
         )
@@ -5106,7 +5324,7 @@ mod tests {
 
     #[test]
     fn deterministic_oem_proof_rejects_identity_drift_and_ambiguous_short_prefixes() {
-        let (mut request, mut target, neighbor, admission, mut anchors, mut fetched) =
+        let (mut request, mut target, neighbor, admission, mut fetched) =
             deterministic_gtx33_fixture();
         let catalog = vec![
             deterministic_review_candidate(&target),
@@ -5120,12 +5338,11 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
         .expect_err("capability drift must invalidate the hash-bound decision");
-        assert!(error.contains("changed manufacturer, model, or capabilities"));
+        assert!(error.contains("changed manufacturer, model, capabilities, or stable identifier"));
 
         request.avionics_types = target.avionics_types.clone();
         let mut wrong_manufacturer_admission = admission.clone();
@@ -5136,7 +5353,6 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &wrong_manufacturer_admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
@@ -5146,12 +5362,7 @@ mod tests {
         target.manufacturer_identifier_kind = "manufacturer_part_number".to_string();
         target.manufacturer_identifier = "GTX 33".to_string();
         target.canonical_identifier_key = target.canonical_product_key.clone();
-        request.authoritative_identity_anchors = vec![
-            target.manufacturer.clone(),
-            target.model.clone(),
-            target.manufacturer_identifier.clone(),
-        ];
-        anchors = request.authoritative_identity_anchors.clone();
+        request.manufacturer_identifier = target.manufacturer_identifier.clone();
         fetched.publisher_text = "Garmin GTX 33 transponder; sku0 GTX 33.".to_string();
         fetched.source_text_rows = vec![SourceTextRow {
             kind: SourceTextRowKind::HtmlTableRow,
@@ -5168,7 +5379,6 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
@@ -5178,16 +5388,11 @@ mod tests {
 
     #[test]
     fn deterministic_oem_proof_rejects_placeholder_part_numbers_only() {
-        let (mut request, mut target, _, admission, _, mut fetched) = deterministic_gtx33_fixture();
+        let (mut request, mut target, _, admission, mut fetched) = deterministic_gtx33_fixture();
         target.manufacturer_identifier = "010-01217-xx".to_string();
         target.canonical_identifier_key =
             normalize_avionics_identifier(&target.manufacturer_identifier);
-        request.authoritative_identity_anchors = vec![
-            target.manufacturer.clone(),
-            target.model.clone(),
-            target.manufacturer_identifier.clone(),
-        ];
-        let anchors = request.authoritative_identity_anchors.clone();
+        request.manufacturer_identifier = target.manufacturer_identifier.clone();
         fetched.publisher_text =
             "Garmin GTX 33 family reference; manufacturer part number 010-01217-xx.".to_string();
         let catalog = vec![deterministic_review_candidate(&target)];
@@ -5198,7 +5403,6 @@ mod tests {
             "Garmin GTX 33 family reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
@@ -5212,7 +5416,7 @@ mod tests {
 
     #[test]
     fn deterministic_oem_proof_requires_one_visible_structural_row() {
-        let (request, target, _, admission, anchors, mut fetched) = deterministic_gtx33_fixture();
+        let (request, target, _, admission, mut fetched) = deterministic_gtx33_fixture();
         fetched.source_text_rows.clear();
         let catalog = vec![deterministic_review_candidate(&target)];
 
@@ -5222,7 +5426,6 @@ mod tests {
             "Garmin GTX 33 product reference",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
@@ -5232,7 +5435,7 @@ mod tests {
 
     #[test]
     fn deterministic_oem_proof_never_cross_pairs_adjacent_pdf_rows() {
-        let (request, target, _, admission, anchors, mut fetched) = deterministic_gtx33_fixture();
+        let (request, target, _, admission, mut fetched) = deterministic_gtx33_fixture();
         fetched.final_url =
             Url::parse("https://static.garmin.com/pumac/transponder-table.pdf").unwrap();
         fetched.publisher_text = format!(
@@ -5259,7 +5462,6 @@ mod tests {
             "Garmin transponder table",
             &fetched,
             &admission,
-            &anchors,
             std::slice::from_ref(&target),
             &catalog,
         )
@@ -7774,6 +7976,184 @@ mod tests {
                 .await
                 .expect("evidence should remain readable");
         assert_eq!(evidence_after_stale, freshly_grounded.evidence);
+    }
+
+    async fn pending_product_guard(
+        db: &AppDb,
+        product_id: i64,
+    ) -> PendingProductAttestationCommitGuard {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let owner_user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(crate::db::DEVELOPER_EMAIL)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let variant_id: i64 = sqlx::query_scalar(
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours, ingestion_state
+            ) VALUES (?, ?, 'https://broker.example/guarded-product',
+                      2020, 450000, 900, 'pending_review')
+            RETURNING id
+            "#,
+        )
+        .bind(variant_id)
+        .bind(owner_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let payload = json!({
+            "version": 1,
+            "aspects": [{
+                "id": "guarded-product",
+                "reuse_attestation_target_id": product_id
+            }]
+        });
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_pending_reviews (
+              listing_id, extraction_sha256, catalog_revision_sha256,
+              pending_aspect_count, review_payload_json, review_payload_sha256
+            ) VALUES (?, ?, ?, 1, ?, ?)
+            "#,
+        )
+        .bind(listing_id)
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind(&payload_json)
+        .bind(&payload_sha256)
+        .execute(pool)
+        .await
+        .unwrap();
+        PendingProductAttestationCommitGuard {
+            owner_user_id,
+            listing_id,
+            review_payload_sha256: payload_sha256,
+            aspect_id: json!("guarded-product"),
+        }
+    }
+
+    async fn guarded_source_verification(
+        db: &AppDb,
+        approved: ApprovedAvionicsIdentity,
+    ) -> ApprovedProductSourceVerification {
+        let catalog = load_review_catalog_candidates(db).await.unwrap();
+        let manufacturer_identity_id = catalog
+            .iter()
+            .find(|candidate| candidate.candidate.id == approved.id)
+            .and_then(|candidate| candidate.manufacturer_identity_id);
+        ApprovedProductSourceVerification {
+            manufacturer_collision_snapshot_sha256: manufacturer_collision_snapshot_sha256(
+                &approved.manufacturer,
+                manufacturer_identity_id,
+                &catalog,
+            ),
+            approved,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_product_attestation_rejects_association_removed_after_source_fetch() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_garmin_static_source_authority(&db).await;
+        let approved = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .unwrap();
+        let guard = pending_product_guard(&db, approved.id).await;
+        let verification = guarded_source_verification(&db, approved.clone()).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        sqlx::query("DELETE FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?")
+            .bind(guard.listing_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let error = attest_pending_review_product_identity(&db, &verification, &guard)
+            .await
+            .expect_err("removed pending ownership must invalidate the fetched dossier");
+        assert!(error.to_string().contains("no longer owns"));
+    }
+
+    #[tokio::test]
+    async fn pending_product_attestation_rejects_collision_inserted_after_source_fetch() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_garmin_static_source_authority(&db).await;
+        let approved = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .unwrap();
+        let guard = pending_product_guard(&db, approved.id).await;
+        let verification = guarded_source_verification(&db, approved.clone()).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let (manufacturer_id, capability_id): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT model.avionics_manufacturer_id, membership.avionics_type_id
+            FROM avionics_models model
+            JOIN avionics_model_types membership
+              ON membership.avionics_model_id = model.id
+            WHERE model.id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(approved.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let collision_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name, catalog_status,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier
+            ) VALUES (?, 'GTX 345R Plus', 'gtx 345r plus', 'unreviewed',
+                      'manufacturer_part_number', '011-NEW-COLLISION',
+                      '011newcollision')
+            RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(collision_id)
+        .bind(capability_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = attest_pending_review_product_identity(&db, &verification, &guard)
+            .await
+            .expect_err("a changed manufacturer scope must invalidate the fetched dossier");
+        assert!(error.to_string().contains("collision catalog changed"));
     }
 
     #[tokio::test]

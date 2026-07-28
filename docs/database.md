@@ -345,10 +345,10 @@ Listings are created through either the web API or plugin submission path:
    remains `pending_review` instead.
 15. Mark valuation snapshots stale and remove orphaned lookup rows.
 
-Review resolution is a separate lifecycle. Every avionics aspect offers all
-three actions, and the reviewer must submit exactly one: use an existing
-approved product, create a verified product, or discard the observation with a
-reason. Creation requires one or more canonical capabilities, a stable
+Review resolution is a separate lifecycle. Every ordinary extracted avionics
+aspect offers three actions, and the reviewer must submit exactly one: use an
+existing approved product, create a verified product, or discard the
+observation with a reason. Creation requires one or more canonical capabilities, a stable
 manufacturer identifier kind and value, and an authoritative source URL,
 title, and evidence text. An unlinked observation receives an explicit legacy
 promotion target only when its normalized identity selects exactly one catalog
@@ -359,6 +359,18 @@ it only after identity, status, normalized-identity uniqueness, identifier and
 model collisions, global references, and exact cross-listing coverage are
 rechecked under lock. A corrected manufacturer/model creates a separate
 approved identity and leaves the old candidate and unrelated links untouched.
+
+Preserved approved-product associations use a separate product-centric
+workflow. One current OEM attestation is shared by every pending occurrence of
+that product. The deterministic source proof is bound to the complete
+manufacturer-scoped collision snapshot, and the write transaction rechecks
+both that snapshot and ownership of the hash-bound pending association. The
+attestation preflight accepts one listing ID, review hash, and aspect ID and
+loads only that review; an unrelated malformed review cannot poison or
+authorize the operation.
+Occurrence corroboration then uses only retained listing text and the local
+catalog; it accepts no OEM dossier and never invokes Gemini. Successful
+corroboration removes only that synthetic association aspect.
 
 The server checks mandatory FAA admission before entering this catalog-writing
 transaction. The transaction rejects stale payload or catalog hashes, applies

@@ -7,12 +7,17 @@ import {
   aircraftIdentityIsVerified,
   characterLimitState,
   describeAircraftIdentity,
+  describeProductAssociationOutcome,
   describeReviewReasons,
+  groupProductAssociationsByListing,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
+  productActionContextIsCurrent,
+  productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
+  runProductAssociationWorkers,
 } from "./domain.mjs";
 
 const PRODUCTION_REASON_CODES = [
@@ -361,4 +366,92 @@ test("marks only the listing action graph reason as listing-level", () => {
 test("ignores blank and unsupported values", () => {
   assert.deepEqual(describeReviewReasons(""), []);
   assert.deepEqual(describeReviewReasons([" ", null, 42, {}]), []);
+});
+
+test("groups product associations by listing while preserving association order", () => {
+  const associations = [
+    { listing_id: 8, aspect_id: "a" },
+    { listing_id: 4, aspect_id: "b" },
+    { listing_id: 8, aspect_id: "c" },
+    { listing_id: 0, aspect_id: "ignored" },
+  ];
+  assert.deepEqual(groupProductAssociationsByListing(associations), [
+    { listingId: 8, items: [associations[0], associations[2]] },
+    { listingId: 4, items: [associations[1]] },
+  ]);
+});
+
+test("rapid product switches cannot commit over an active product action", () => {
+  const action = {
+    productId: 11,
+    detailSequence: 4,
+    actionSequence: 2,
+  };
+  const active = {
+    productBusy: true,
+    productBusyProductId: 11,
+    productActionSequence: 2,
+    productDetailRequestSequence: 4,
+    selectedProduct: { id: 11 },
+  };
+  assert.equal(productActionContextIsCurrent(action, active), true);
+  assert.equal(productDetailRequestMayCommit(11, 4, active), true);
+
+  const rapidSwitch = {
+    ...active,
+    productDetailRequestSequence: 5,
+  };
+  assert.equal(productActionContextIsCurrent(action, rapidSwitch), false);
+  assert.equal(
+    productDetailRequestMayCommit(22, 5, rapidSwitch),
+    false,
+    "a product B request that started before A became busy cannot replace A",
+  );
+  assert.equal(
+    productDetailRequestMayCommit(22, 5, {
+      ...rapidSwitch,
+      productBusy: false,
+      productBusyProductId: null,
+    }),
+    true,
+    "product B can commit after the active action is finished",
+  );
+});
+
+test("runs listing-owned association loops with bounded cross-listing concurrency", async () => {
+  const associations = Array.from({ length: 6 }, (_, index) => ({
+    listing_id: index + 1,
+    aspect_id: `aspect-${index}`,
+  }));
+  let active = 0;
+  let maximumActive = 0;
+  const results = await runProductAssociationWorkers(
+    associations,
+    async (listingId, items) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      return { listingId, count: items.length };
+    },
+    3,
+  );
+  assert.equal(maximumActive, 3);
+  assert.equal(results.length, 6);
+  assert.ok(results.every((result) => result.status === "fulfilled"));
+});
+
+test("gives precise product-association failure outcomes", () => {
+  assert.equal(describeProductAssociationOutcome({
+    status: 409,
+    payload: { error: { code: "review_stale" } },
+  }).kind, "stale");
+  assert.equal(describeProductAssociationOutcome({
+    payload: { error: { code: "avionics_association_unresolved" } },
+  }).kind, "manual");
+  assert.equal(describeProductAssociationOutcome({
+    payload: { error: { code: "avionics_identity_mismatch" } },
+  }).kind, "mismatch");
+  assert.equal(describeProductAssociationOutcome(new Error("network unavailable")).detail,
+    "network unavailable");
 });
