@@ -3,13 +3,16 @@ import test from "node:test";
 
 import {
   REVIEW_AREAS,
+  REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  characterLimitState,
   describeAircraftIdentity,
   describeReviewReasons,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
   reviewAreaForAspect,
+  reviewProductIdentitySourceValidation,
 } from "./domain.mjs";
 
 const PRODUCTION_REASON_CODES = [
@@ -56,6 +59,60 @@ const LIVE_REASON_CODES = [
   "raw_observation_ambiguous",
   "raw_observation_identity_unusable",
 ];
+
+test("publishes the review product identity character limits", () => {
+  assert.deepEqual(REVIEW_PRODUCT_IDENTITY_LIMITS, {
+    sourceTitle: 200,
+    evidenceText: 128,
+  });
+});
+
+test("counts review field characters and exposes prefilled over-limit state", () => {
+  assert.deepEqual(characterLimitState("é😀", 3), {
+    count: 2,
+    limit: 3,
+    remaining: 1,
+    overLimit: false,
+  });
+  assert.deepEqual(characterLimitState("x".repeat(129), 128), {
+    count: 129,
+    limit: 128,
+    remaining: -1,
+    overLimit: true,
+  });
+});
+
+test("validates review identity source fields at the exact server boundaries", () => {
+  assert.deepEqual(reviewProductIdentitySourceValidation(" ", "identity"), {
+    valid: false,
+    message: "An authoritative identity source title is required.",
+  });
+  assert.deepEqual(reviewProductIdentitySourceValidation("identity", " "), {
+    valid: false,
+    message: "Exact identity evidence is required.",
+  });
+  assert.deepEqual(
+    reviewProductIdentitySourceValidation("x".repeat(200), "é".repeat(128)),
+    {
+      valid: true,
+      message: "Identity source fields are within their character limits.",
+    },
+  );
+  assert.deepEqual(
+    reviewProductIdentitySourceValidation("x".repeat(201), "identity"),
+    {
+      valid: false,
+      message: "Authoritative identity source title must contain at most 200 characters.",
+    },
+  );
+  assert.deepEqual(
+    reviewProductIdentitySourceValidation("identity", "x".repeat(129)),
+    {
+      valid: false,
+      message: "Exact identity evidence must contain at most 128 characters.",
+    },
+  );
+});
 
 test("describes a consolidated catalog collision as pending identity verification", () => {
   assert.deepEqual(

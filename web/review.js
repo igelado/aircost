@@ -1,13 +1,16 @@
 import { displayLabel, renderAvionicsChips, safeDetailLink } from "/avionics.js";
 import {
   REVIEW_AREAS,
+  REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  characterLimitState,
   describeAircraftIdentity,
   describeReviewReasons,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
   reviewAreaForAspect,
+  reviewProductIdentitySourceValidation,
 } from "/review/domain.mjs";
 
 const REVIEW_LISTING_PARAM = "review_listing";
@@ -862,11 +865,11 @@ function verifyExistingProductControls(draft, key) {
     draftInput("Authoritative identity source title", draft.create.identitySourceTitle, (value) => {
       draft.create.identitySourceTitle = value;
       draftChanged(key);
-    }, "text", true),
+    }, "text", true, REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle),
     draftTextarea("Exact identity evidence", draft.create.identityEvidenceText, (value) => {
       draft.create.identityEvidenceText = value;
       draftChanged(key);
-    }),
+    }, REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText),
   );
   const button = document.createElement("button");
   button.type = "button";
@@ -952,11 +955,11 @@ function createProductControls(draft, key) {
     draftInput("Identity source title", draft.create.identitySourceTitle, (value) => {
       draft.create.identitySourceTitle = value;
       draftChanged(key);
-    }),
+    }, "text", false, REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle),
     draftTextarea("Identity evidence", draft.create.identityEvidenceText, (value) => {
       draft.create.identityEvidenceText = value;
       draftChanged(key);
-    }),
+    }, REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText),
   );
   const capabilityHint = document.createElement("p");
   capabilityHint.className = "review-catalog-message";
@@ -975,7 +978,14 @@ function discardControls(draft, key) {
   );
 }
 
-function draftInput(labelText, value, onInput, type = "text", fullWidth = false) {
+function draftInput(
+  labelText,
+  value,
+  onInput,
+  type = "text",
+  fullWidth = false,
+  characterLimit = null,
+) {
   const label = document.createElement("label");
   if (fullWidth) {
     label.className = "review-control-wide";
@@ -987,6 +997,7 @@ function draftInput(labelText, value, onInput, type = "text", fullWidth = false)
   input.value = value || "";
   input.addEventListener("input", () => onInput(input.value.trim()));
   label.append(caption, input);
+  appendCharacterCounter(label, input, characterLimit);
   return label;
 }
 
@@ -1007,7 +1018,7 @@ function draftSelect(labelText, value, options, onChange) {
   return label;
 }
 
-function draftTextarea(labelText, value, onInput) {
+function draftTextarea(labelText, value, onInput, characterLimit = null) {
   const label = document.createElement("label");
   label.className = "review-control-wide";
   const caption = document.createElement("span");
@@ -1017,7 +1028,25 @@ function draftTextarea(labelText, value, onInput) {
   input.value = value || "";
   input.addEventListener("input", () => onInput(input.value.trim()));
   label.append(caption, input);
+  appendCharacterCounter(label, input, characterLimit);
   return label;
+}
+
+function appendCharacterCounter(label, input, characterLimit) {
+  if (!Number.isSafeInteger(characterLimit) || characterLimit <= 0) {
+    return;
+  }
+  input.maxLength = characterLimit;
+  const counter = document.createElement("small");
+  counter.className = "review-character-counter";
+  const update = () => {
+    const limitState = characterLimitState(input.value, characterLimit);
+    counter.textContent = `${limitState.count} / ${limitState.limit} characters`;
+    counter.classList.toggle("over-limit", limitState.overLimit);
+  };
+  update();
+  input.addEventListener("input", update);
+  label.append(counter);
 }
 
 function draftChanged(key) {
@@ -1066,9 +1095,12 @@ function validateDraft(draft) {
       || !authoritativeIdentityUrl(draft.create.identitySourceUrl)) {
       return { valid: false, message: "Provide an authoritative HTTPS product source URL." };
     }
-    if (!nonBlank(draft.create.identitySourceTitle)
-      || !nonBlank(draft.create.identityEvidenceText)) {
-      return { valid: false, message: "Provide the source title and exact identity evidence." };
+    const identitySourceValidation = reviewProductIdentitySourceValidation(
+      draft.create.identitySourceTitle,
+      draft.create.identityEvidenceText,
+    );
+    if (!identitySourceValidation.valid) {
+      return identitySourceValidation;
     }
     return {
       valid: false,
@@ -1111,11 +1143,12 @@ function validateDraft(draft) {
         message: "Identity source must be an absolute authoritative HTTPS URL, not a sale listing.",
       };
     }
-    if (!nonBlank(draft.create.identitySourceTitle)) {
-      return { valid: false, message: "An authoritative identity source title is required." };
-    }
-    if (!nonBlank(draft.create.identityEvidenceText)) {
-      return { valid: false, message: "Quote the authoritative evidence for this identity." };
+    const identitySourceValidation = reviewProductIdentitySourceValidation(
+      draft.create.identitySourceTitle,
+      draft.create.identityEvidenceText,
+    );
+    if (!identitySourceValidation.valid) {
+      return identitySourceValidation;
     }
     return validDraftResult(draft, "New verified product details are complete.");
   }
@@ -1305,13 +1338,19 @@ async function verifyExistingProduct(key, button) {
     return;
   }
   if (!nonBlank(draft.create.identitySourceUrl)
-    || !authoritativeIdentityUrl(draft.create.identitySourceUrl)
-    || !nonBlank(draft.create.identitySourceTitle)
-    || !nonBlank(draft.create.identityEvidenceText)) {
+    || !authoritativeIdentityUrl(draft.create.identitySourceUrl)) {
     setWorkspaceMessage(
-      "Provide an authoritative source URL, title, and exact identity evidence before verification.",
+      "Provide an authoritative HTTPS product source URL before verification.",
       true,
     );
+    return;
+  }
+  const identitySourceValidation = reviewProductIdentitySourceValidation(
+    draft.create.identitySourceTitle,
+    draft.create.identityEvidenceText,
+  );
+  if (!identitySourceValidation.valid) {
+    setWorkspaceMessage(identitySourceValidation.message, true);
     return;
   }
   button.disabled = true;
