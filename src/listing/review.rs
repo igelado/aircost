@@ -38,6 +38,7 @@ use crate::avionics::reuse::{
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::CURATED_AVIONICS_TYPES;
 use crate::gemini::curation::workflow::MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS;
+use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
@@ -774,6 +775,21 @@ struct ReviewRow {
     manufacturer: String,
     model: String,
     variant: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ListingEvidenceProvenance {
+    plugin_submission_id: i64,
+    rendered_html_sha256: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ListingEvidenceCaptureRow {
+    plugin_submission_id: i64,
+    user_id: i64,
+    canonical_listing_id: Option<i64>,
+    rendered_html: String,
+    rendered_html_sha256: String,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -1598,6 +1614,7 @@ struct AssociationCorroborationCommit {
     observation_sha256: String,
     expected_catalog_revision_sha256: String,
     expected_collision_closure_sha256: String,
+    evidence_provenance: ListingEvidenceProvenance,
 }
 
 #[derive(Clone, Debug)]
@@ -1613,6 +1630,7 @@ enum OrdinaryAspectUseExistingAuthorization {
     ReviewerSelection,
     HashBoundReuseTarget {
         expected_collision_closure_sha256: String,
+        evidence_provenance: ListingEvidenceProvenance,
     },
 }
 
@@ -1635,6 +1653,8 @@ async fn restage_pending_review_if_current_with_commit(
                 !valid_sha256(&commit.observation_sha256)
                     || !valid_sha256(&commit.expected_catalog_revision_sha256)
                     || !valid_sha256(&commit.expected_collision_closure_sha256)
+                    || commit.evidence_provenance.plugin_submission_id <= 0
+                    || !valid_sha256(&commit.evidence_provenance.rendered_html_sha256)
             }
             ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(commit) => {
                 !valid_sha256(&commit.expected_catalog_revision_sha256)
@@ -1642,7 +1662,10 @@ async fn restage_pending_review_if_current_with_commit(
                         &commit.authorization,
                         OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
                             expected_collision_closure_sha256,
+                            evidence_provenance,
                         } if !valid_sha256(expected_collision_closure_sha256)
+                            || evidence_provenance.plugin_submission_id <= 0
+                            || !valid_sha256(&evidence_provenance.rendered_html_sha256)
                     )
             }
         })
@@ -1704,6 +1727,33 @@ async fn restage_pending_review_if_current_with_commit(
             WHERE id = ?
               AND canonical_listing_id = ?
               AND user_id = ?
+            FOR SHARE
+            "#,
+        ),
+    };
+    let verification_capture_select = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            r#"
+            SELECT
+              id AS plugin_submission_id,
+              user_id,
+              canonical_listing_id,
+              rendered_html,
+              rendered_html_sha256
+            FROM plugin_submissions
+            WHERE id = ?
+            "#,
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(
+            r#"
+            SELECT
+              id AS plugin_submission_id,
+              user_id,
+              canonical_listing_id,
+              rendered_html,
+              rendered_html_sha256
+            FROM plugin_submissions
+            WHERE id = ?
             FOR SHARE
             "#,
         ),
@@ -1911,6 +1961,58 @@ async fn restage_pending_review_if_current_with_commit(
                 Some(&row.review_payload_sha256),
                 row.pending_aspect_count,
             )?;
+            let local_evidence_guard = match maintenance_commit {
+                Some(ReviewMaintenanceCommit::CorroborateAssociation(commit)) => {
+                    Some((&commit.aspect_id, &commit.evidence_provenance))
+                }
+                Some(ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(commit)) => {
+                    match &commit.authorization {
+                        OrdinaryAspectUseExistingAuthorization::ReviewerSelection => None,
+                        OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
+                            evidence_provenance,
+                            ..
+                        } => Some((&commit.aspect_id, evidence_provenance)),
+                    }
+                }
+                None => None,
+            };
+            if let Some((aspect_id, expected_provenance)) = local_evidence_guard {
+                let evidence_text = payload
+                    .aspects
+                    .iter()
+                    .find(|aspect| &aspect.id == aspect_id)
+                    .and_then(|aspect| aspect.source_evidence_text.as_deref())
+                    .filter(|evidence| !evidence.is_empty())
+                    .ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "review aspect {aspect_id} no longer retains source_evidence_text"
+                        ))
+                    })?;
+                if row.plugin_submission_id != Some(expected_provenance.plugin_submission_id) {
+                    return Err(ReviewError::Stale(
+                        "pending review changed its exact listing source capture after evidence verification"
+                            .to_string(),
+                    ));
+                }
+                let capture =
+                    sqlx::query_as::<_, ListingEvidenceCaptureRow>(&verification_capture_select)
+                        .bind(expected_provenance.plugin_submission_id)
+                        .fetch_optional(&mut *transaction)
+                        .await?
+                        .ok_or_else(|| {
+                            ReviewError::Stale(
+                                "pending review lost its exact retained listing source capture"
+                                    .to_string(),
+                            )
+                        })?;
+                validate_listing_evidence_capture(
+                    &row,
+                    &capture,
+                    evidence_text,
+                    Some(expected_provenance),
+                )
+                .map_err(ReviewError::Stale)?;
+            }
             let mut assignments =
                 sqlx::query_as::<_, ExistingAssignmentRow>(&assignments_sql)
                     .bind(listing_id)
@@ -2080,6 +2182,7 @@ async fn restage_pending_review_if_current_with_commit(
                 }
                 if let OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
                     expected_collision_closure_sha256,
+                    ..
                 } = &commit.authorization
                 {
                     let current_collision_closure_sha256 =
@@ -2512,6 +2615,7 @@ pub(crate) async fn corroborate_existing_product_association_and_restage(
     expected_collision_closure_sha256: &str,
     avionics_model_id: i64,
     observation_sha256: &str,
+    evidence_provenance: &ListingEvidenceProvenance,
 ) -> ReviewResult<Option<StagedPendingReview>> {
     if avionics_model_id <= 0 {
         return Err(ReviewError::Validation(
@@ -2525,6 +2629,7 @@ pub(crate) async fn corroborate_existing_product_association_and_restage(
         observation_sha256: observation_sha256.to_string(),
         expected_catalog_revision_sha256: expected_catalog_revision_sha256.to_string(),
         expected_collision_closure_sha256: expected_collision_closure_sha256.to_string(),
+        evidence_provenance: evidence_provenance.clone(),
     });
     restage_pending_review_if_current_with_commit(
         db,
@@ -2589,6 +2694,7 @@ pub(crate) async fn approve_locally_verified_ordinary_aspect_and_restage(
     expected_catalog_revision_sha256: &str,
     expected_collision_closure_sha256: &str,
     avionics_model_id: i64,
+    evidence_provenance: &ListingEvidenceProvenance,
 ) -> ReviewResult<Option<StagedPendingReview>> {
     if avionics_model_id <= 0 {
         return Err(ReviewError::Validation(
@@ -2603,6 +2709,7 @@ pub(crate) async fn approve_locally_verified_ordinary_aspect_and_restage(
             expected_catalog_revision_sha256: expected_catalog_revision_sha256.to_string(),
             authorization: OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
                 expected_collision_closure_sha256: expected_collision_closure_sha256.to_string(),
+                evidence_provenance: evidence_provenance.clone(),
             },
         });
     restage_pending_review_if_current_with_commit(
@@ -3387,6 +3494,100 @@ async fn load_review_row(db: &AppDb, listing_id: i64) -> ReviewResult<ReviewRow>
             "pending review for listing {listing_id} was not found"
         ))
     })
+}
+
+fn validate_listing_evidence_capture(
+    review: &ReviewRow,
+    capture: &ListingEvidenceCaptureRow,
+    evidence_text: &str,
+    expected: Option<&ListingEvidenceProvenance>,
+) -> Result<ListingEvidenceProvenance, String> {
+    if review.plugin_submission_id != Some(capture.plugin_submission_id)
+        || capture.user_id != review.owner_user_id
+        || capture.canonical_listing_id != Some(review.listing_id)
+    {
+        return Err(
+            "pending review is not bound to the exact owner and canonical listing source capture"
+                .to_string(),
+        );
+    }
+    if capture.plugin_submission_id <= 0
+        || !valid_sha256(&capture.rendered_html_sha256)
+        || sha256_hex(capture.rendered_html.as_bytes()) != capture.rendered_html_sha256
+    {
+        return Err("retained listing source capture failed its content hash".to_string());
+    }
+    if let Some(expected) = expected {
+        if expected.plugin_submission_id != capture.plugin_submission_id
+            || expected.rendered_html_sha256 != capture.rendered_html_sha256
+        {
+            return Err(
+                "retained listing source capture changed after evidence verification".to_string(),
+            );
+        }
+    }
+    if evidence_text.is_empty()
+        || evidence_text.len() > MAX_LISTING_EVIDENCE_CONTEXT_BYTES
+        || !listing_body_contains_exact_structurally_visible_text_span(
+            &capture.rendered_html,
+            evidence_text,
+        )
+    {
+        return Err(
+            "source_evidence_text is not one bounded exact structurally visible-body span from the retained listing capture"
+                .to_string(),
+        );
+    }
+    Ok(ListingEvidenceProvenance {
+        plugin_submission_id: capture.plugin_submission_id,
+        rendered_html_sha256: capture.rendered_html_sha256.clone(),
+    })
+}
+
+async fn load_listing_evidence_provenance(
+    db: &AppDb,
+    review: &ReviewRow,
+    evidence_text: &str,
+) -> ReviewResult<ListingEvidenceProvenance> {
+    let plugin_submission_id = review.plugin_submission_id.ok_or_else(|| {
+        ReviewError::Validation(
+            "automated existing-product verification requires the exact plugin submission attached to the pending review"
+                .to_string(),
+        )
+    })?;
+    let sql = db.sql(
+        r#"
+        SELECT
+          id AS plugin_submission_id,
+          user_id,
+          canonical_listing_id,
+          rendered_html,
+          rendered_html_sha256
+        FROM plugin_submissions
+        WHERE id = ?
+        "#,
+    );
+    let capture = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, ListingEvidenceCaptureRow>(&sql)
+                .bind(plugin_submission_id)
+                .fetch_optional(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, ListingEvidenceCaptureRow>(&sql)
+                .bind(plugin_submission_id)
+                .fetch_optional(pool)
+                .await?
+        }
+    }
+    .ok_or_else(|| {
+        ReviewError::Validation(
+            "pending review no longer has its exact retained listing source capture".to_string(),
+        )
+    })?;
+    validate_listing_evidence_capture(review, &capture, evidence_text, None)
+        .map_err(ReviewError::Validation)
 }
 
 async fn load_aircraft_identity_status(
@@ -4456,6 +4657,7 @@ pub(crate) struct PendingProductAttestationTarget {
 pub(crate) struct ExistingProductAssociationTarget {
     pub product: ReviewProduct,
     pub listing_evidence_text: String,
+    pub listing_evidence_provenance: ListingEvidenceProvenance,
     pub commit: ExistingProductAssociationCommit,
 }
 
@@ -4746,7 +4948,7 @@ pub(crate) async fn preflight_pending_product_attestation(
     })
 }
 
-/// Read-only gate for one source-free, association-only local verification.
+/// Read-only gate for one retained-source, association-only local verification.
 ///
 /// Product identity is a global prerequisite and must already have a current
 /// reuse attestation. This function validates only the hash-bound listing
@@ -4859,6 +5061,8 @@ pub(crate) async fn preflight_existing_product_association(
             "review aspect {aspect_id} contains an unresolved identity or capability qualifier and cannot use the exact local/one-by-one fast path"
         )));
     }
+    let listing_evidence_provenance =
+        load_listing_evidence_provenance(db, &row, &listing_evidence_text).await?;
     let commit = if is_synthetic_preserved_attestation_aspect(aspect) {
         let association = aspect
             .covered_associations
@@ -4906,6 +5110,7 @@ pub(crate) async fn preflight_existing_product_association(
     Ok(ExistingProductAssociationTarget {
         product,
         listing_evidence_text,
+        listing_evidence_provenance,
         commit,
     })
 }
@@ -10334,6 +10539,13 @@ mod tests {
     async fn exact_association_corroboration_retires_only_link_572_not_real_aspect_9() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<html><body>Garmin GDL 69A shown in the listing. Weather Radar.</body></html>",
+        )
+        .await;
         let preserved_id = insert_approved_product(&db, "GDL 69A", "GDL69A", "Connectivity").await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -10361,9 +10573,14 @@ mod tests {
             Some("Weather Radar".to_string()),
             Some("medium".to_string()),
         );
-        stage_pending_review(&db, listing_id, None, &[real_weather_radar_aspect])
-            .await
-            .unwrap();
+        stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[real_weather_radar_aspect],
+        )
+        .await
+        .unwrap();
 
         let initially_restaged = restage_unattested_preserved_products(&db, user_id, listing_id)
             .await
@@ -10445,6 +10662,10 @@ mod tests {
         let active_collision_revision = active_collision_closure_revision_sha256(&db, preserved_id)
             .await
             .unwrap();
+        let review_row = load_review_row(&db, listing_id).await.unwrap();
+        let evidence_provenance = load_listing_evidence_provenance(&db, &review_row, evidence_text)
+            .await
+            .unwrap();
         let restaged = corroborate_existing_product_association_and_restage(
             &db,
             user_id,
@@ -10455,6 +10676,7 @@ mod tests {
             &active_collision_revision,
             preserved_id,
             &observation_sha256,
+            &evidence_provenance,
         )
         .await
         .unwrap()
@@ -10559,6 +10781,13 @@ mod tests {
     async fn final_association_corroboration_clears_empty_review_and_marks_listing_incomplete() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<html><body>Garmin GMA 1347 audio panel</body></html>",
+        )
+        .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -10588,9 +10817,10 @@ mod tests {
             .unwrap();
         let synthetic =
             preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
-        let staged = stage_pending_review(&db, listing_id, None, &[synthetic.clone()])
-            .await
-            .unwrap();
+        let staged =
+            stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
+                .await
+                .unwrap();
         attest_approved_product_for_current_policy_reuse(&db, product_id).await;
         let evidence_text = assignment.source_notes.as_deref().unwrap();
         let observation_sha256 = association_observation_sha256(
@@ -10600,6 +10830,10 @@ mod tests {
             evidence_text,
         );
         let active_collision_revision = active_collision_closure_revision_sha256(&db, product_id)
+            .await
+            .unwrap();
+        let review_row = load_review_row(&db, listing_id).await.unwrap();
+        let evidence_provenance = load_listing_evidence_provenance(&db, &review_row, evidence_text)
             .await
             .unwrap();
 
@@ -10613,6 +10847,7 @@ mod tests {
             &active_collision_revision,
             product_id,
             &observation_sha256,
+            &evidence_provenance,
         )
         .await
         .unwrap();
@@ -10647,6 +10882,13 @@ mod tests {
     async fn association_corroboration_rejects_a_new_unreviewed_collision_under_lock() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<html><body>GMA 1347 audio panel</body></html>",
+        )
+        .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
         let link_id: i64 = sqlx::query_scalar(
             r#"
@@ -10676,9 +10918,10 @@ mod tests {
             .unwrap();
         let synthetic =
             preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
-        let staged = stage_pending_review(&db, listing_id, None, &[synthetic.clone()])
-            .await
-            .unwrap();
+        let staged =
+            stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
+                .await
+                .unwrap();
         attest_approved_product_for_current_policy_reuse(&db, product_id).await;
         let expected_active_collision_revision =
             active_collision_closure_revision_sha256(&db, product_id)
@@ -10690,6 +10933,14 @@ mod tests {
             ListingAssociationRole::Installed,
             assignment.source_notes.as_deref().unwrap(),
         );
+        let review_row = load_review_row(&db, listing_id).await.unwrap();
+        let evidence_provenance = load_listing_evidence_provenance(
+            &db,
+            &review_row,
+            assignment.source_notes.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
 
         // Unreviewed rows do not alter the review's approved-only catalog
         // revision, but they can invalidate an exact local identity match.
@@ -10704,6 +10955,7 @@ mod tests {
             &expected_active_collision_revision,
             product_id,
             &observation_sha256,
+            &evidence_provenance,
         )
         .await
         .expect_err("the locked commit must reject a stale local collision snapshot");
@@ -10734,6 +10986,13 @@ mod tests {
     async fn local_ordinary_approval_rejects_a_new_unreviewed_collision_under_lock() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<html><body>Garmin GMA 1347 audio panel</body></html>",
+        )
+        .await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
         attest_approved_product_for_current_policy_reuse(&db, product_id).await;
         let aspect = PendingReviewAspect::avionics(
@@ -10748,11 +11007,16 @@ mod tests {
             Some("high".to_string()),
         )
         .with_reuse_attestation_target(product_id);
-        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+        let staged = stage_pending_review(&db, listing_id, Some(submission_id), &[aspect])
             .await
             .unwrap();
         let expected_active_collision_revision =
             active_collision_closure_revision_sha256(&db, product_id)
+                .await
+                .unwrap();
+        let review_row = load_review_row(&db, listing_id).await.unwrap();
+        let evidence_provenance =
+            load_listing_evidence_provenance(&db, &review_row, "Garmin GMA 1347 audio panel")
                 .await
                 .unwrap();
 
@@ -10768,6 +11032,7 @@ mod tests {
             &staged.catalog_revision_sha256,
             &expected_active_collision_revision,
             product_id,
+            &evidence_provenance,
         )
         .await
         .expect_err("the locked commit must reject a stale local collision snapshot");
@@ -10786,6 +11051,380 @@ mod tests {
         assert_eq!(link_count, 0);
         let row = load_review_row(&db, listing_id).await.unwrap();
         assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
+    }
+
+    #[tokio::test]
+    async fn local_ordinary_approval_rechecks_source_capture_under_lock() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<html><body>Garmin GMA 1347 audio panel</body></html>",
+        )
+        .await;
+        let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "observation-17",
+            "avionics_identity",
+            "Garmin GMA 1347",
+            "Garmin GMA 1347 audio panel",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GMA 1347 audio panel".to_string()),
+            Some("high".to_string()),
+        )
+        .with_reuse_attestation_target(product_id);
+        let staged = stage_pending_review(&db, listing_id, Some(submission_id), &[aspect])
+            .await
+            .unwrap();
+        let expected_active_collision_revision =
+            active_collision_closure_revision_sha256(&db, product_id)
+                .await
+                .unwrap();
+        let review_row = load_review_row(&db, listing_id).await.unwrap();
+        let evidence_provenance =
+            load_listing_evidence_provenance(&db, &review_row, "Garmin GMA 1347 audio panel")
+                .await
+                .unwrap();
+
+        let changed_capture =
+            "<html><body>Garmin GMA 1347 audio panel in a changed capture</body></html>";
+        sqlx::query(
+            "UPDATE plugin_submissions SET rendered_html = ?, rendered_html_sha256 = ? WHERE id = ?",
+        )
+        .bind(changed_capture)
+        .bind(sha256_hex(changed_capture.as_bytes()))
+        .bind(submission_id)
+        .execute(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let error = approve_locally_verified_ordinary_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &ReviewAspectId::from("observation-17"),
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+            &expected_active_collision_revision,
+            product_id,
+            &evidence_provenance,
+        )
+        .await
+        .expect_err("a changed source capture must invalidate the preflight authorization");
+        assert!(matches!(error, ReviewError::Stale(_)));
+        assert!(error.to_string().contains("source capture changed"));
+
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(link_count, 0);
+        let row = load_review_row(&db, listing_id).await.unwrap();
+        assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
+    }
+
+    #[tokio::test]
+    async fn local_verification_never_falls_back_to_observed_text() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<html><body>Garmin GMA 1347 audio panel</body></html>",
+        )
+        .await;
+        let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "observation-17",
+            "avionics_identity",
+            "Garmin GMA 1347",
+            "Garmin GMA 1347 audio panel",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            None,
+            Some("high".to_string()),
+        )
+        .with_reuse_attestation_target(product_id);
+        let staged = stage_pending_review(&db, listing_id, Some(submission_id), &[aspect])
+            .await
+            .unwrap();
+
+        let error = preflight_existing_product_association(
+            &db,
+            user_id,
+            listing_id,
+            &ReviewAspectId::from("observation-17"),
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+        )
+        .await
+        .expect_err("observed_text must never substitute for missing source_evidence_text");
+        assert!(matches!(
+            error,
+            ReviewError::Validation(message)
+                if message.contains("no retained raw listing evidence")
+        ));
+    }
+
+    #[tokio::test]
+    async fn listing_evidence_capture_requires_exact_owner_listing_and_content_hash() {
+        let evidence = "Garmin GMA 1347 audio panel";
+        let rendered_html = format!("<html><body>{evidence}</body></html>");
+
+        let owner_mismatch_db = test_db().await;
+        let (owner_user_id, listing_id) = insert_listing(&owner_mismatch_db).await;
+        let submission_id = insert_review_bound_submission(
+            &owner_mismatch_db,
+            owner_user_id,
+            listing_id,
+            &rendered_html,
+        )
+        .await;
+        stage_pending_review(
+            &owner_mismatch_db,
+            listing_id,
+            Some(submission_id),
+            &[PendingReviewAspect::avionics(
+                "owner-mismatch",
+                "avionics_identity",
+                evidence,
+                evidence,
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some(evidence.to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let other_user_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO users (email, display_name, auth_provider, auth_subject)
+            VALUES ('other@example.test', 'Other', 'test', 'other-owner')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(sqlite_pool(&owner_mismatch_db))
+        .await
+        .unwrap();
+        sqlx::query("UPDATE plugin_submissions SET user_id = ? WHERE id = ?")
+            .bind(other_user_id)
+            .bind(submission_id)
+            .execute(sqlite_pool(&owner_mismatch_db))
+            .await
+            .unwrap();
+        let review = load_review_row(&owner_mismatch_db, listing_id)
+            .await
+            .unwrap();
+        let error = load_listing_evidence_provenance(&owner_mismatch_db, &review, evidence)
+            .await
+            .expect_err("a different capture owner must fail provenance");
+        assert!(matches!(
+            error,
+            ReviewError::Validation(message)
+                if message.contains("exact owner and canonical listing")
+        ));
+
+        let listing_mismatch_db = test_db().await;
+        let (owner_user_id, listing_id) = insert_listing(&listing_mismatch_db).await;
+        let submission_id = insert_review_bound_submission(
+            &listing_mismatch_db,
+            owner_user_id,
+            listing_id,
+            &rendered_html,
+        )
+        .await;
+        stage_pending_review(
+            &listing_mismatch_db,
+            listing_id,
+            Some(submission_id),
+            &[PendingReviewAspect::avionics(
+                "listing-mismatch",
+                "avionics_identity",
+                evidence,
+                evidence,
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some(evidence.to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE plugin_submissions SET canonical_listing_id = NULL WHERE id = ?")
+            .bind(submission_id)
+            .execute(sqlite_pool(&listing_mismatch_db))
+            .await
+            .unwrap();
+        let review = load_review_row(&listing_mismatch_db, listing_id)
+            .await
+            .unwrap();
+        let error = load_listing_evidence_provenance(&listing_mismatch_db, &review, evidence)
+            .await
+            .expect_err("a missing exact canonical listing ID must fail provenance");
+        assert!(matches!(
+            error,
+            ReviewError::Validation(message)
+                if message.contains("exact owner and canonical listing")
+        ));
+
+        let hash_mismatch_db = test_db().await;
+        let (owner_user_id, listing_id) = insert_listing(&hash_mismatch_db).await;
+        let submission_id = insert_review_bound_submission(
+            &hash_mismatch_db,
+            owner_user_id,
+            listing_id,
+            &rendered_html,
+        )
+        .await;
+        stage_pending_review(
+            &hash_mismatch_db,
+            listing_id,
+            Some(submission_id),
+            &[PendingReviewAspect::avionics(
+                "hash-mismatch",
+                "avionics_identity",
+                evidence,
+                evidence,
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some(evidence.to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE plugin_submissions SET rendered_html_sha256 = ? WHERE id = ?")
+            .bind("a".repeat(64))
+            .bind(submission_id)
+            .execute(sqlite_pool(&hash_mismatch_db))
+            .await
+            .unwrap();
+        let review = load_review_row(&hash_mismatch_db, listing_id)
+            .await
+            .unwrap();
+        let error = load_listing_evidence_provenance(&hash_mismatch_db, &review, evidence)
+            .await
+            .expect_err("a stored hash that does not match rendered HTML must fail provenance");
+        assert!(matches!(
+            error,
+            ReviewError::Validation(message)
+                if message.contains("failed its content hash")
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserved_corroboration_rechecks_source_capture_under_lock() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let evidence = "Garmin GMA 1347 audio panel";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            &format!("<html><body>{evidence}</body></html>"),
+        )
+        .await;
+        let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(evidence)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let assignment = load_existing_assignments(&db, listing_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let product = load_all_approved_product_map(&db)
+            .await
+            .unwrap()
+            .remove(&product_id)
+            .unwrap();
+        let synthetic =
+            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let staged =
+            stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
+                .await
+                .unwrap();
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+        let observation_sha256 = association_observation_sha256(
+            listing_id,
+            &assignment,
+            ListingAssociationRole::Installed,
+            evidence,
+        );
+        let active_collision_revision = active_collision_closure_revision_sha256(&db, product_id)
+            .await
+            .unwrap();
+        let review = load_review_row(&db, listing_id).await.unwrap();
+        let evidence_provenance = load_listing_evidence_provenance(&db, &review, evidence)
+            .await
+            .unwrap();
+
+        let changed_capture = format!("<html><body>{evidence} in a changed capture</body></html>");
+        sqlx::query(
+            "UPDATE plugin_submissions SET rendered_html = ?, rendered_html_sha256 = ? WHERE id = ?",
+        )
+        .bind(&changed_capture)
+        .bind(sha256_hex(changed_capture.as_bytes()))
+        .bind(submission_id)
+        .execute(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let error = corroborate_existing_product_association_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &synthetic.id,
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+            &active_collision_revision,
+            product_id,
+            &observation_sha256,
+            &evidence_provenance,
+        )
+        .await
+        .expect_err("a changed capture must invalidate preserved-link corroboration");
+        assert!(matches!(error, ReviewError::Stale(_)));
+        assert!(error.to_string().contains("source capture changed"));
+
+        let corroboration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(corroboration_count, 0);
+        let review = load_review_row(&db, listing_id).await.unwrap();
+        assert_eq!(review.review_payload_sha256, staged.review_payload_sha256);
     }
 
     #[tokio::test]

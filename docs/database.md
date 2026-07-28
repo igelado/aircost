@@ -368,15 +368,26 @@ ownership of the hash-bound pending aspect. The attestation preflight accepts
 one listing ID, review hash, and aspect ID and loads only that review; an
 unrelated malformed review cannot poison or authorize the operation.
 Existing-product verification then uses only retained listing text and the
-live local catalog; it accepts no OEM dossier and never invokes Gemini. A
-synthetic preserved-link aspect records occurrence corroboration without
-rewriting the link. An ordinary installed, non-replacement aspect may cover
-zero or one installed link and is committed through the normal aspect-scoped
-`use-existing` transaction with its exact quantity. The transaction rechecks
-the hash-bound target, current reuse attestation, approved-catalog revision,
-active identity-collision closure, exact covered-link ownership, and listing
-action graph. Coupled replacement aspects, ambiguous identities, implicit
-merges, and stale collision decisions remain pending.
+live local catalog; it accepts no OEM dossier and never invokes Gemini. The
+aspect's `source_evidence_text` must be one exact, bounded structurally visible
+body span from the immutable `plugin_submissions.rendered_html` capture
+attached to the review. Only HTML entity and whitespace normalization is
+allowed. Structural visibility excludes head and executable content, hidden
+attributes, inline or embedded stylesheet hiding, and closed details/dialog
+containers. It does not claim browser-computed visibility from external CSS,
+which is absent from the retained outer HTML. The capture must have its stored
+content hash, owner, and exact `canonical_listing_id`; missing captures,
+generated explanations, hidden metadata, and corrected text remain pending. A
+synthetic preserved-link aspect records occurrence
+corroboration without rewriting the link. An ordinary installed,
+non-replacement aspect may cover zero or one installed link and is committed
+through the normal aspect-scoped `use-existing` transaction with its exact
+quantity. The transaction re-reads the capture and rechecks its hash and
+visible evidence under the mutation lock, together with the hash-bound target,
+current reuse attestation, approved-catalog revision, active
+identity-collision closure, exact covered-link ownership, and listing action
+graph. Coupled replacement aspects, ambiguous identities, implicit merges,
+and stale collision decisions remain pending.
 
 The server checks mandatory FAA admission before entering this catalog-writing
 transaction. The transaction rejects stale payload or catalog hashes, applies

@@ -1,5 +1,6 @@
 use html_escape::decode_html_entities;
 use scraper::{Html, Selector};
+use std::collections::HashSet;
 
 const DEFAULT_MAX_LISTING_TEXT_CHARACTERS: usize = 24_000;
 
@@ -71,6 +72,91 @@ pub fn clean_publisher_source_html(html: &str) -> String {
     normalize_page_text(&text)
 }
 
+/// Return whether one evidence value is an exact structurally visible-body
+/// text span in retained HTML.
+///
+/// Only HTML whitespace and entities are normalized. Case, punctuation, and
+/// every alphanumeric character remain exact: this gate must never turn a
+/// model-produced correction into listing evidence. Head metadata and hidden
+/// or executable body content are excluded. Embedded stylesheet selectors are
+/// applied, but external browser-computed CSS is not present in retained HTML.
+pub fn listing_body_contains_exact_structurally_visible_text_span(
+    html: &str,
+    evidence: &str,
+) -> bool {
+    let evidence = normalize_page_text(evidence);
+    if evidence.is_empty() {
+        return false;
+    }
+    let document = Html::parse_document(html);
+    let mut stylesheet_hidden_nodes = HashSet::new();
+    let style_selector = Selector::parse("style").expect("static style selector is valid");
+    for stylesheet in document.select(&style_selector) {
+        let stylesheet_text = stylesheet.text().collect::<String>();
+        for rule in stylesheet_text.split('}') {
+            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
+                continue;
+            };
+            if !inline_style_hides_element(declarations) {
+                continue;
+            }
+            for selector_text in selectors.split(',') {
+                let Ok(selector) = Selector::parse(selector_text.trim()) else {
+                    continue;
+                };
+                stylesheet_hidden_nodes
+                    .extend(document.select(&selector).map(|element| element.id()));
+            }
+        }
+    }
+    let mut text = String::new();
+    for node in document.tree.root().descendants() {
+        let Some(node_text) = node.value().as_text() else {
+            continue;
+        };
+        let mut inside_body = false;
+        let mut excluded = false;
+        for ancestor in node.ancestors() {
+            let Some(element) = ancestor.value().as_element() else {
+                continue;
+            };
+            inside_body |= element.name() == "body";
+            excluded |= matches!(
+                element.name(),
+                "head" | "script" | "style" | "noscript" | "template" | "svg" | "canvas" | "iframe"
+            ) || element.attr("hidden").is_some()
+                || (element.name() == "dialog" && element.attr("open").is_none())
+                || (element.name() == "details" && element.attr("open").is_none())
+                || element
+                    .attr("aria-hidden")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+                || element
+                    .attr("style")
+                    .is_some_and(inline_style_hides_element)
+                || stylesheet_hidden_nodes.contains(&ancestor.id());
+        }
+        if !inside_body || excluded {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(node_text);
+    }
+    let visible = normalize_page_text(&text);
+    visible.match_indices(&evidence).any(|(start, matched)| {
+        let end = start + matched.len();
+        visible[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_alphanumeric())
+            && visible[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_alphanumeric())
+    })
+}
+
 fn inline_style_hides_element(style: &str) -> bool {
     style.split(';').any(|declaration| {
         let Some((property, value)) = declaration.split_once(':') else {
@@ -79,6 +165,10 @@ fn inline_style_hides_element(style: &str) -> bool {
         let property = property.trim();
         (property.eq_ignore_ascii_case("display") && css_value_is(value, "none"))
             || (property.eq_ignore_ascii_case("visibility") && css_value_is(value, "hidden"))
+            || (property.eq_ignore_ascii_case("visibility") && css_value_is(value, "collapse"))
+            || (property.eq_ignore_ascii_case("content-visibility")
+                && css_value_is(value, "hidden"))
+            || (property.eq_ignore_ascii_case("opacity") && css_value_is(value, "0"))
     })
 }
 
@@ -205,7 +295,8 @@ fn nearest_char_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_listing_html, clean_publisher_source_html, normalize_source_evidence_span,
+        clean_listing_html, clean_publisher_source_html,
+        listing_body_contains_exact_structurally_visible_text_span, normalize_source_evidence_span,
         publisher_text_contains_evidence_span,
     };
 
@@ -324,6 +415,97 @@ mod tests {
         assert!(!publisher_text_contains_evidence_span(
             &text,
             "fabricated family identity"
+        ));
+    }
+
+    #[test]
+    fn listing_evidence_requires_one_exact_visible_body_span() {
+        let html = r#"
+        <html>
+          <head>
+            <title>Title-only Garmin GDL 69A</title>
+            <meta name="description" content="Meta-only Garmin GDL 69A">
+            <script type="application/ld+json">{"name":"JSON-LD Garmin GDL 69A"}</script>
+          </head>
+          <body>
+            <p>Installed Garmin GDL <strong>69A</strong>&nbsp;receiver</p>
+            <script>Script-only Garmin GTX 345</script>
+            <template>Template-only Garmin GTX 345</template>
+            <div hidden>Hidden Garmin GTX 345</div>
+            <div aria-hidden="true">ARIA-hidden Garmin GTX 345</div>
+            <div style="display:none">CSS-hidden Garmin GTX 345</div>
+          </body>
+        </html>
+        "#;
+
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            html,
+            "Installed Garmin GDL 69A receiver"
+        ));
+        assert!(!listing_body_contains_exact_structurally_visible_text_span(
+            html,
+            "installed Garmin GDL 69A receiver"
+        ));
+        assert!(!listing_body_contains_exact_structurally_visible_text_span(
+            "<html><body>Garmin GNS 430W navigator</body></html>",
+            "Garmin GNS 430"
+        ));
+        for rejected in [
+            "Title-only Garmin GDL 69A",
+            "Meta-only Garmin GDL 69A",
+            "JSON-LD Garmin GDL 69A",
+            "Script-only Garmin GTX 345",
+            "Template-only Garmin GTX 345",
+            "Hidden Garmin GTX 345",
+            "ARIA-hidden Garmin GTX 345",
+            "CSS-hidden Garmin GTX 345",
+        ] {
+            assert!(
+                !listing_body_contains_exact_structurally_visible_text_span(html, rejected),
+                "{rejected:?} must not become listing evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn listing_evidence_excludes_embedded_stylesheet_and_closed_container_text() {
+        let html = r#"
+        <html>
+          <head>
+            <style>
+              .gone { display: none !important; }
+              #collapsed { visibility: collapse; }
+            </style>
+          </head>
+          <body>
+            <div class="gone">Stylesheet-hidden Garmin GNS 430W</div>
+            <div id="collapsed">Collapsed Garmin GTX 345</div>
+            <details>Closed details Garmin GDL 69A</details>
+            <dialog>Closed dialog Garmin GMA 1347</dialog>
+            <details open>Open details Garmin GTN 750Xi</details>
+            <dialog open>Open dialog Garmin GI 275</dialog>
+          </body>
+        </html>
+        "#;
+
+        for rejected in [
+            "Stylesheet-hidden Garmin GNS 430W",
+            "Collapsed Garmin GTX 345",
+            "Closed details Garmin GDL 69A",
+            "Closed dialog Garmin GMA 1347",
+        ] {
+            assert!(
+                !listing_body_contains_exact_structurally_visible_text_span(html, rejected),
+                "{rejected:?} must not become listing evidence"
+            );
+        }
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            html,
+            "Open details Garmin GTN 750Xi"
+        ));
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            html,
+            "Open dialog Garmin GI 275"
         ));
     }
 }
