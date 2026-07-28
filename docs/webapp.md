@@ -397,10 +397,13 @@ A hash-bound approved-product target is not a fourth decision type. Product
 attestation and retained-source occurrence verification are separate
 operations.
 For a preserved link, successful local verification corroborates the existing
-occurrence without rewriting it. For an ordinary installed, non-replacement
-aspect, the same operation may create an exact-quantity association or update
-its one covered installed link through the normal aspect-scoped
-`use-existing` transaction. Until local verification succeeds, the aspect
+occurrence without rewriting it, including an unchanged positive quantity
+greater than one. The staged aspect quantity must exactly equal the current
+listing-link quantity at preflight and again under the mutation lock. For an
+ordinary installed, non-replacement aspect, the same operation may create an
+exact-quantity association or update its one covered installed link through
+the normal aspect-scoped `use-existing` transaction. Until local verification
+succeeds, the aspect
 remains pending and may only be explicitly discarded from the listing
 workflow. Automated verification requires `source_evidence_text` to be one
 exact, bounded structurally visible body span in the immutable plugin
