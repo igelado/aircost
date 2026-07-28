@@ -4,6 +4,7 @@ pub mod inspection;
 pub mod manufacturer;
 pub mod repopulate;
 pub(crate) mod reuse;
+pub(crate) mod source;
 
 use std::collections::BTreeMap;
 

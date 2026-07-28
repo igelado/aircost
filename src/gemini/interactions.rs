@@ -19,7 +19,7 @@ use reqwest::header::{
 };
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode};
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
@@ -50,6 +50,8 @@ const MAX_SOURCE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_PDF_PAGES: usize = 128;
 const MAX_SOURCE_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_PDF_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_TEXT_ROWS: usize = 16_384;
+const MAX_SOURCE_TEXT_ROW_CHARACTERS: usize = 512;
 const MAX_ROBOTS_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_INDEX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_INDEXES: usize = 8;
@@ -58,11 +60,6 @@ const MAX_SOURCE_INDEX_URLS: usize = 4_096;
 const MAX_SOURCE_INDEX_URL_BYTES: usize = 4_096;
 const MAX_SOURCE_INDEX_XML_DEPTH: usize = 16;
 const MAX_SOURCE_INDEX_XML_EVENTS: usize = 100_000;
-const GARMIN_PRODUCT_ORIGIN: &str = "https://www.garmin.com";
-const MAX_GARMIN_PRODUCT_DISPLAY_NAME_BYTES: usize = 256;
-const MAX_GARMIN_PRODUCT_SKU_BYTES: usize = 96;
-const MAX_GARMIN_PRODUCT_METADATA_SENTENCE_BYTES: usize = 512;
-
 pub type GeminiInteractionsResult<T> = Result<T, GeminiInteractionsError>;
 
 #[derive(Debug)]
@@ -1601,28 +1598,27 @@ pub(crate) struct FetchedSourceDocument {
     pub(crate) final_url: Url,
     pub(crate) content_sha256: String,
     pub(crate) publisher_text: String,
-    /// Present only when the strict exact-origin Garmin HTML adapter found one
-    /// unique literal `product_display_name`/`sku0` pair.
-    ///
-    /// Generic HTML, text, and PDFs never populate this field. Keeping the
-    /// publisher-specific record typed prevents adjacent table rows or hidden
-    /// generic metadata from becoming deterministic product identity proof.
-    pub(crate) garmin_product_page_identity: Option<GarminProductPageIdentityRecord>,
+    /// Bounded visible structural rows retained only for exact deterministic
+    /// source proof. Rows never cross an HTML table-row, PDF physical-line, or
+    /// page boundary and are never persisted.
+    pub(crate) source_text_rows: Vec<SourceTextRow>,
+    /// False when any otherwise-visible structural row exceeded its row or
+    /// document-count bound. Deterministic proof must reject an incomplete
+    /// structural projection rather than ignore unseen ambiguity.
+    pub(crate) source_text_rows_complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GarminProductPageIdentityRecord {
-    pub(crate) product_display_name: String,
-    pub(crate) sku0: String,
+pub(crate) struct SourceTextRow {
+    pub(crate) kind: SourceTextRowKind,
+    pub(crate) ordinal: usize,
+    pub(crate) text: String,
 }
 
-impl GarminProductPageIdentityRecord {
-    pub(crate) fn literal_evidence_text(&self) -> String {
-        format!(
-            "Garmin product page metadata: product_display_name {}; sku0 {}.",
-            self.product_display_name, self.sku0
-        )
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceTextRowKind {
+    HtmlTableRow,
+    PdfPhysicalLine,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2088,92 +2084,107 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Preserve the two literal first-party fields that identify a Garmin product
-/// as one typed record.
-///
-/// This is deliberately not part of generic HTML cleanup: the field names are
-/// publisher-specific, and accepting arbitrary metadata or JSON-LD would let
-/// unrelated pages inject hidden text into source evidence. Duplicate fields,
-/// missing content, and oversized/control-bearing values all fail closed.
-fn garmin_product_page_identity_record(
-    final_url: &Url,
-    html: &str,
-) -> Option<GarminProductPageIdentityRecord> {
-    if final_url.scheme() != "https"
-        || final_url.origin().ascii_serialization() != GARMIN_PRODUCT_ORIGIN
-    {
-        return None;
-    }
-
-    let document = Html::parse_document(html);
-    let meta_selector = Selector::parse("meta").expect("static meta selector is valid");
-    let product_display_name = unique_bounded_literal_meta_content(
-        &document,
-        &meta_selector,
-        "product_display_name",
-        MAX_GARMIN_PRODUCT_DISPLAY_NAME_BYTES,
-    )?;
-    let sku = unique_bounded_literal_meta_content(
-        &document,
-        &meta_selector,
-        "sku0",
-        MAX_GARMIN_PRODUCT_SKU_BYTES,
-    )?;
-    let record = GarminProductPageIdentityRecord {
-        product_display_name,
-        sku0: sku,
-    };
-    (record.literal_evidence_text().len() <= MAX_GARMIN_PRODUCT_METADATA_SENTENCE_BYTES)
-        .then_some(record)
-}
-
-#[cfg(test)]
-fn garmin_product_page_metadata_sentence(final_url: &Url, html: &str) -> Option<String> {
-    garmin_product_page_identity_record(final_url, html)
-        .map(|record| record.literal_evidence_text())
-}
-
-fn unique_bounded_literal_meta_content(
-    document: &Html,
-    meta_selector: &Selector,
-    field_name: &str,
-    max_bytes: usize,
-) -> Option<String> {
-    let mut matching = document
-        .select(meta_selector)
-        .filter(|element| element.value().attr("name") == Some(field_name));
-    let element = matching.next()?;
-    if matching.next().is_some() {
-        return None;
-    }
-    let value = element.value().attr("content")?.trim();
-    (!value.is_empty()
-        && value.len() <= max_bytes
-        && value.chars().count() <= max_bytes
-        && value.chars().all(|character| !character.is_control()))
-    .then(|| value.to_string())
-}
-
 struct CleanedPublicSourceHtml {
     publisher_text: String,
-    garmin_product_page_identity: Option<GarminProductPageIdentityRecord>,
+    source_text_rows: Vec<SourceTextRow>,
+    source_text_rows_complete: bool,
 }
 
-fn clean_public_source_html(final_url: &Url, html: &str) -> CleanedPublicSourceHtml {
+fn clean_public_source_html(html: &str) -> CleanedPublicSourceHtml {
     let publisher_text = crate::html::clean::clean_publisher_source_html(html);
-    let garmin_product_page_identity = garmin_product_page_identity_record(final_url, html);
-    let publisher_text = match garmin_product_page_identity
-        .as_ref()
-        .map(GarminProductPageIdentityRecord::literal_evidence_text)
-    {
-        Some(metadata) if publisher_text.is_empty() => metadata,
-        Some(metadata) => format!("{metadata} {publisher_text}"),
-        None => publisher_text,
-    };
+    let (source_text_rows, source_text_rows_complete) = source_html_table_rows(html);
     CleanedPublicSourceHtml {
         publisher_text,
-        garmin_product_page_identity,
+        source_text_rows,
+        source_text_rows_complete,
     }
+}
+
+fn source_html_table_rows(html: &str) -> (Vec<SourceTextRow>, bool) {
+    let document = Html::parse_document(html);
+    let row_selector = Selector::parse("tr").expect("static table-row selector is valid");
+    let mut rows = Vec::new();
+    let mut complete = true;
+    for (ordinal, row) in document.select(&row_selector).enumerate() {
+        let text = visible_html_element_text(row);
+        if text.is_empty() {
+            continue;
+        }
+        if rows.len() >= MAX_SOURCE_TEXT_ROWS
+            || text.chars().count() > MAX_SOURCE_TEXT_ROW_CHARACTERS
+        {
+            complete = false;
+            continue;
+        }
+        rows.push(SourceTextRow {
+            kind: SourceTextRowKind::HtmlTableRow,
+            ordinal,
+            text,
+        });
+    }
+    (rows, complete)
+}
+
+fn visible_html_element_text(element: ElementRef<'_>) -> String {
+    let mut text = String::new();
+    for node in element.descendants() {
+        let Some(node_text) = node.value().as_text() else {
+            continue;
+        };
+        if node.ancestors().any(|ancestor| {
+            ancestor.value().as_element().is_some_and(|element| {
+                matches!(
+                    element.name(),
+                    "script" | "style" | "noscript" | "template" | "svg" | "canvas" | "iframe"
+                ) || element.attr("hidden").is_some()
+                    || element
+                        .attr("aria-hidden")
+                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+                    || element
+                        .attr("style")
+                        .is_some_and(inline_style_hides_source_element)
+            })
+        }) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(node_text);
+    }
+    normalize_source_text_row(&text)
+}
+
+fn inline_style_hides_source_element(style: &str) -> bool {
+    style.split(';').any(|declaration| {
+        let Some((property, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let normalized_value = value.trim().to_ascii_lowercase();
+        let normalized_value = normalized_value
+            .strip_suffix("!important")
+            .unwrap_or(&normalized_value)
+            .trim();
+        (property.trim().eq_ignore_ascii_case("display")
+            && normalized_value.eq_ignore_ascii_case("none"))
+            || (property.trim().eq_ignore_ascii_case("visibility")
+                && normalized_value.eq_ignore_ascii_case("hidden"))
+    })
+}
+
+fn normalize_source_text_row(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() && !character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn fetch_public_source_document_inner(
@@ -2244,7 +2255,7 @@ async fn fetch_public_source_document_inner(
             )));
         }
         let content_sha256 = format!("{:x}", Sha256::digest(&body));
-        let (publisher_text, garmin_product_page_identity) = match document_kind {
+        let (publisher_text, source_text_rows, source_text_rows_complete) = match document_kind {
             SourceDocumentKind::Html | SourceDocumentKind::PlainText => {
                 let body = String::from_utf8(body).map_err(|_| {
                     GeminiInteractionsError::InvalidResponse(format!(
@@ -2253,25 +2264,36 @@ async fn fetch_public_source_document_inner(
                 })?;
                 match document_kind {
                     SourceDocumentKind::Html => {
-                        let cleaned = clean_public_source_html(&current_url, &body);
-                        (cleaned.publisher_text, cleaned.garmin_product_page_identity)
+                        let cleaned = clean_public_source_html(&body);
+                        (
+                            cleaned.publisher_text,
+                            cleaned.source_text_rows,
+                            cleaned.source_text_rows_complete,
+                        )
                     }
-                    SourceDocumentKind::PlainText => {
-                        (body.split_whitespace().collect::<Vec<_>>().join(" "), None)
-                    }
+                    SourceDocumentKind::PlainText => (
+                        body.split_whitespace().collect::<Vec<_>>().join(" "),
+                        Vec::new(),
+                        true,
+                    ),
                     SourceDocumentKind::Pdf => unreachable!("PDF handled by the outer match"),
                 }
             }
-            SourceDocumentKind::Pdf => (
-                tokio::task::spawn_blocking(move || extract_source_pdf_publisher_text(&body))
-                    .await
-                    .map_err(|_| {
-                        GeminiInteractionsError::InvalidResponse(
-                            "public source PDF extraction worker failed".to_string(),
-                        )
-                    })??,
-                None,
-            ),
+            SourceDocumentKind::Pdf => {
+                let extracted =
+                    tokio::task::spawn_blocking(move || extract_source_pdf_document(&body))
+                        .await
+                        .map_err(|_| {
+                            GeminiInteractionsError::InvalidResponse(
+                                "public source PDF extraction worker failed".to_string(),
+                            )
+                        })??;
+                (
+                    extracted.publisher_text,
+                    extracted.source_text_rows,
+                    extracted.source_text_rows_complete,
+                )
+            }
         };
         if publisher_text.is_empty() {
             return Err(GeminiInteractionsError::InvalidResponse(format!(
@@ -2283,7 +2305,8 @@ async fn fetch_public_source_document_inner(
             final_url: current_url,
             content_sha256,
             publisher_text,
-            garmin_product_page_identity,
+            source_text_rows,
+            source_text_rows_complete,
         });
     }
     Err(GeminiInteractionsError::InvalidUrl(
@@ -2322,14 +2345,20 @@ const SOURCE_PDF_LIMITS: SourcePdfLimits = SourcePdfLimits {
     max_total_text_bytes: MAX_SOURCE_PDF_TEXT_BYTES,
 };
 
-fn extract_source_pdf_publisher_text(pdf: &[u8]) -> GeminiInteractionsResult<String> {
-    extract_source_pdf_publisher_text_with_limits(pdf, SOURCE_PDF_LIMITS)
+struct ExtractedSourcePdf {
+    publisher_text: String,
+    source_text_rows: Vec<SourceTextRow>,
+    source_text_rows_complete: bool,
 }
 
-fn extract_source_pdf_publisher_text_with_limits(
+fn extract_source_pdf_document(pdf: &[u8]) -> GeminiInteractionsResult<ExtractedSourcePdf> {
+    extract_source_pdf_document_with_limits(pdf, SOURCE_PDF_LIMITS)
+}
+
+fn extract_source_pdf_document_with_limits(
     pdf: &[u8],
     limits: SourcePdfLimits,
-) -> GeminiInteractionsResult<String> {
+) -> GeminiInteractionsResult<ExtractedSourcePdf> {
     if limits.max_pages == 0
         || limits.max_page_decompressed_bytes == 0
         || limits.max_total_text_bytes == 0
@@ -2371,6 +2400,9 @@ fn extract_source_pdf_publisher_text_with_limits(
     }
 
     let mut extracted = String::new();
+    let mut source_text_rows = Vec::new();
+    let mut source_text_rows_complete = true;
+    let mut next_row_ordinal = 0usize;
     let mut total_text_bytes = 0usize;
     for page_number in pages.keys().copied() {
         let text = document
@@ -2395,27 +2427,38 @@ fn extract_source_pdf_publisher_text_with_limits(
             extracted.push('\n');
         }
         extracted.push_str(&text);
+        for line in text.lines() {
+            let ordinal = next_row_ordinal;
+            next_row_ordinal = next_row_ordinal.saturating_add(1);
+            let text = normalize_source_text_row(line);
+            if text.is_empty() {
+                continue;
+            }
+            if source_text_rows.len() >= MAX_SOURCE_TEXT_ROWS
+                || text.chars().count() > MAX_SOURCE_TEXT_ROW_CHARACTERS
+            {
+                source_text_rows_complete = false;
+                continue;
+            }
+            source_text_rows.push(SourceTextRow {
+                kind: SourceTextRowKind::PdfPhysicalLine,
+                ordinal,
+                text,
+            });
+        }
     }
 
-    let publisher_text = extracted
-        .chars()
-        .map(|character| {
-            if character.is_control() && !character.is_whitespace() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let publisher_text = normalize_source_text_row(&extracted);
     if publisher_text.is_empty() {
         return Err(GeminiInteractionsError::InvalidResponse(
             "public source PDF has no extractable publisher text".to_string(),
         ));
     }
-    Ok(publisher_text)
+    Ok(ExtractedSourcePdf {
+        publisher_text,
+        source_text_rows,
+        source_text_rows_complete,
+    })
 }
 
 fn source_document_kind(headers: &HeaderMap) -> GeminiInteractionsResult<SourceDocumentKind> {
@@ -4496,111 +4539,75 @@ mod tests {
     }
 
     #[test]
-    fn garmin_product_page_metadata_is_prepended_as_one_literal_bounded_pair() {
-        let url = Url::parse("https://www.garmin.com/en-US/p/14664/").unwrap();
+    fn source_html_keeps_only_visible_table_row_boundaries() {
         let html = r#"
             <html>
               <head>
-                <meta name="product_display_name" content="GTS™ 800 TAS">
-                <meta name="sku0" content="010-00519-00">
+                <meta name="product_display_name" content="HIDDEN META PRODUCT">
                 <script type="application/ld+json">
                   {"name":"DO_NOT_INGEST_SCRIPT_PRODUCT","sku":"DO-NOT-INGEST"}
                 </script>
               </head>
-              <body>Visible Garmin product description.</body>
+              <body>
+                <table>
+                  <tr><th>Product</th><th>Part number</th></tr>
+                  <tr><td>GEA 71</td><td>011-00831-00</td></tr>
+                </table>
+              </body>
             </html>
         "#;
 
-        let cleaned = clean_public_source_html(&url, html);
-        let record = cleaned
-            .garmin_product_page_identity
-            .expect("the unique exact-origin pair should become a typed record");
+        let cleaned = clean_public_source_html(html);
 
-        assert!(cleaned.publisher_text.starts_with(
-            "Garmin product page metadata: product_display_name GTS™ 800 TAS; sku0 010-00519-00."
-        ));
-        assert!(cleaned
-            .publisher_text
-            .contains("Visible Garmin product description."));
+        assert_eq!(cleaned.source_text_rows.len(), 2);
+        assert!(cleaned.source_text_rows_complete);
+        assert_eq!(cleaned.source_text_rows[0].ordinal, 0);
+        assert_eq!(
+            cleaned.source_text_rows[0].kind,
+            SourceTextRowKind::HtmlTableRow
+        );
+        assert_eq!(cleaned.source_text_rows[0].text, "Product Part number");
+        assert_eq!(cleaned.source_text_rows[1].text, "GEA 71 011-00831-00");
+        assert!(cleaned.publisher_text.contains("GEA 71 011-00831-00"));
+        assert!(!cleaned.publisher_text.contains("HIDDEN META PRODUCT"));
         assert!(!cleaned.publisher_text.contains("DO_NOT_INGEST"));
-        assert_eq!(record.product_display_name, "GTS™ 800 TAS");
-        assert_eq!(record.sku0, "010-00519-00");
-        assert!(
-            garmin_product_page_metadata_sentence(&url, html)
-                .unwrap()
-                .len()
-                <= MAX_GARMIN_PRODUCT_METADATA_SENTENCE_BYTES
-        );
     }
 
     #[test]
-    fn garmin_product_page_metadata_rejects_duplicate_or_conflicting_fields() {
-        let url = Url::parse("https://www.garmin.com/en-US/p/14664/").unwrap();
-        let duplicate = r#"
-            <meta name="product_display_name" content="GTS™ 800 TAS">
-            <meta name="product_display_name" content="GTS™ 800 TAS">
-            <meta name="sku0" content="010-00519-00">
-        "#;
-        let conflicting = r#"
-            <meta name="product_display_name" content="GTS™ 800 TAS">
-            <meta name="sku0" content="010-00519-00">
-            <meta name="sku0" content="010-99999-99">
-        "#;
-
-        assert!(garmin_product_page_metadata_sentence(&url, duplicate).is_none());
-        assert!(garmin_product_page_metadata_sentence(&url, conflicting).is_none());
-    }
-
-    #[test]
-    fn garmin_product_page_metadata_requires_both_nonempty_bounded_fields() {
-        let url = Url::parse("https://www.garmin.com/en-US/p/14664/").unwrap();
-        for html in [
-            r#"<meta name="product_display_name" content="GTS™ 800 TAS">"#,
-            r#"<meta name="sku0" content="010-00519-00">"#,
-            r#"
-                <meta name="product_display_name" content="">
-                <meta name="sku0" content="010-00519-00">
-            "#,
-            r#"
-                <meta name="product_display_name" content="GTS™ 800 TAS">
-                <meta name="sku0">
-            "#,
-        ] {
-            assert!(
-                garmin_product_page_metadata_sentence(&url, html).is_none(),
-                "{html}"
-            );
-        }
-        let oversized_name = format!(
-            r#"<meta name="product_display_name" content="{}"><meta name="sku0" content="010-00519-00">"#,
-            "X".repeat(MAX_GARMIN_PRODUCT_DISPLAY_NAME_BYTES + 1)
-        );
-        assert!(garmin_product_page_metadata_sentence(&url, &oversized_name).is_none());
-    }
-
-    #[test]
-    fn garmin_product_page_metadata_never_applies_outside_the_exact_https_origin() {
+    fn source_html_excludes_hidden_rows_and_hidden_row_descendants() {
         let html = r#"
-            <meta name="product_display_name" content="GTS™ 800 TAS">
-            <meta name="sku0" content="010-00519-00">
-            <body>Visible publisher text.</body>
+            <table hidden>
+              <tr><td>HIDDEN OUTER MODEL 011-OUTER-00</td></tr>
+            </table>
+            <table>
+              <tr style="display: none"><td>HIDDEN ROW 011-ROW-00</td></tr>
+              <tr>
+                <td>ME406</td>
+                <td>453-6603</td>
+                <td hidden>HIDDEN CELL 453-HIDDEN</td>
+                <script>HIDDEN SCRIPT 453-SCRIPT</script>
+              </tr>
+            </table>
         "#;
-        for url in [
-            "http://www.garmin.com/en-US/p/14664/",
-            "https://garmin.com/en-US/p/14664/",
-            "https://aviation.garmin.com/en-US/p/14664/",
-            "https://www.garmin.com.evil.example/en-US/p/14664/",
-            "https://www.garmin.com:444/en-US/p/14664/",
-        ] {
-            let url = Url::parse(url).unwrap();
-            assert!(
-                garmin_product_page_metadata_sentence(&url, html).is_none(),
-                "{url}"
-            );
-            let cleaned = clean_public_source_html(&url, html);
-            assert_eq!(cleaned.publisher_text, "Visible publisher text.");
-            assert!(cleaned.garmin_product_page_identity.is_none());
-        }
+
+        let cleaned = clean_public_source_html(html);
+
+        assert_eq!(cleaned.source_text_rows.len(), 1);
+        assert!(cleaned.source_text_rows_complete);
+        assert_eq!(cleaned.source_text_rows[0].ordinal, 2);
+        assert_eq!(cleaned.source_text_rows[0].text, "ME406 453-6603");
+    }
+
+    #[test]
+    fn source_html_drops_oversized_rows_instead_of_truncating_them() {
+        let oversized = "X".repeat(MAX_SOURCE_TEXT_ROW_CHARACTERS + 1);
+        let html = format!("<table><tr><td>{oversized}</td></tr></table>");
+
+        let cleaned = clean_public_source_html(&html);
+
+        assert!(cleaned.source_text_rows.is_empty());
+        assert!(!cleaned.source_text_rows_complete);
+        assert_eq!(cleaned.publisher_text, oversized);
     }
 
     fn source_pdf(pages: &[&[&str]]) -> Vec<u8> {
@@ -4657,29 +4664,54 @@ mod tests {
     }
 
     #[test]
-    fn source_pdf_extracts_bounded_normalized_publisher_text() {
+    fn source_pdf_extracts_bounded_text_and_preserves_physical_lines() {
         let pdf = source_pdf(&[
-            &["GARMIN GIA 63W", "PART NUMBER 011-00870-00"],
-            &["GIA 63W Installation Manual"],
+            &[
+                "GEA 71 Unit (011-00831-00) 010-00283-00",
+                "GEA 71 Unit Rack 115-00411-00",
+            ],
+            &["GEA 71 Installation Manual"],
         ]);
 
-        let text = extract_source_pdf_publisher_text(&pdf).unwrap();
+        let extracted = extract_source_pdf_document(&pdf).unwrap();
 
-        assert!(text.contains("GARMIN GIA 63W"));
-        assert!(text.contains("PART NUMBER 011-00870-00"));
-        assert!(text.contains("GIA 63W Installation Manual"));
-        assert!(!text.contains('\n'));
+        assert!(extracted
+            .publisher_text
+            .contains("GEA 71 Unit (011-00831-00) 010-00283-00"));
+        assert!(extracted
+            .publisher_text
+            .contains("GEA 71 Installation Manual"));
+        assert!(!extracted.publisher_text.contains('\n'));
+        assert_eq!(extracted.source_text_rows.len(), 3);
+        assert!(extracted.source_text_rows_complete);
+        assert!(extracted
+            .source_text_rows
+            .iter()
+            .all(|row| row.kind == SourceTextRowKind::PdfPhysicalLine));
+        assert_eq!(
+            extracted.source_text_rows[0].text,
+            "GEA 71 Unit (011-00831-00) 010-00283-00"
+        );
+        assert_eq!(
+            extracted.source_text_rows[1].text,
+            "GEA 71 Unit Rack 115-00411-00"
+        );
+        assert_eq!(extracted.source_text_rows[2].ordinal, 2);
+        assert_eq!(
+            extracted.source_text_rows[2].text,
+            "GEA 71 Installation Manual"
+        );
     }
 
     #[test]
     fn source_pdf_fails_closed_on_malformed_empty_page_and_resource_limits() {
-        assert!(extract_source_pdf_publisher_text(b"%PDF-not-a-document").is_err());
+        assert!(extract_source_pdf_document(b"%PDF-not-a-document").is_err());
 
         let empty = source_pdf(&[&[]]);
-        assert!(extract_source_pdf_publisher_text(&empty).is_err());
+        assert!(extract_source_pdf_document(&empty).is_err());
 
         let two_pages = source_pdf(&[&["Garmin GIA 63"], &["Garmin GIA 63W"]]);
-        assert!(extract_source_pdf_publisher_text_with_limits(
+        assert!(extract_source_pdf_document_with_limits(
             &two_pages,
             SourcePdfLimits {
                 max_pages: 1,
@@ -4687,7 +4719,7 @@ mod tests {
             },
         )
         .is_err());
-        assert!(extract_source_pdf_publisher_text_with_limits(
+        assert!(extract_source_pdf_document_with_limits(
             &two_pages,
             SourcePdfLimits {
                 max_total_text_bytes: 4,
@@ -4695,6 +4727,12 @@ mod tests {
             },
         )
         .is_err());
+
+        let oversized_line = "X".repeat(MAX_SOURCE_TEXT_ROW_CHARACTERS + 1);
+        let oversized_pdf = source_pdf(&[&[oversized_line.as_str()]]);
+        let oversized = extract_source_pdf_document(&oversized_pdf).unwrap();
+        assert!(oversized.source_text_rows.is_empty());
+        assert!(!oversized.source_text_rows_complete);
     }
 
     #[test]
@@ -4714,7 +4752,7 @@ mod tests {
         let mut encrypted = Vec::new();
         document.save_to(&mut encrypted).unwrap();
 
-        assert!(extract_source_pdf_publisher_text(&encrypted).is_err());
+        assert!(extract_source_pdf_document(&encrypted).is_err());
     }
 
     #[test]
