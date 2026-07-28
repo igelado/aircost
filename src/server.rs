@@ -1011,6 +1011,7 @@ async fn verify_existing_review_avionics_handler(
                 &expected_collision_closure_sha256,
                 target_id,
                 &observation_sha256,
+                &target.listing_evidence_provenance,
             )
             .await?
         }
@@ -1024,6 +1025,7 @@ async fn verify_existing_review_avionics_handler(
                 &payload.catalog_revision_sha256,
                 &expected_collision_closure_sha256,
                 target_id,
+                &target.listing_evidence_provenance,
             )
             .await?
         }
@@ -1841,6 +1843,41 @@ mod tests {
         (owner_user_id, listing_id)
     }
 
+    async fn insert_review_bound_submission(
+        db: &AppDb,
+        owner_user_id: i64,
+        listing_id: i64,
+        rendered_html: &str,
+    ) -> i64 {
+        let pool = sqlite_pool(db);
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'test-key') RETURNING id",
+        )
+        .bind(owner_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, canonical_listing_id
+            ) VALUES (?, ?, 'https://broker.example/aircraft/server-review', ?, ?,
+                      'test-signature', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(install_id)
+        .bind(rendered_html)
+        .bind(rendered_html_sha256)
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     async fn insert_approved_garmin_product(db: &AppDb) -> i64 {
         insert_approved_garmin_product_named(db, "GNS 430W", "011-01064-40").await
     }
@@ -2003,6 +2040,13 @@ mod tests {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let pool = sqlite_pool(&db);
         let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            owner_user_id,
+            listing_id,
+            "<html><body>Garmin GNS 430W P/N 011-01064-40 shown in the listing</body></html>",
+        )
+        .await;
         let preserved_id = insert_approved_garmin_product(&db).await;
         sqlx::query(
             r#"
@@ -2029,7 +2073,7 @@ mod tests {
             Some("GTX 345 shown in listing equipment".to_string()),
             Some("high".to_string()),
         );
-        stage_pending_review(&db, listing_id, None, &[primary])
+        stage_pending_review(&db, listing_id, Some(submission_id), &[primary])
             .await
             .unwrap();
         let before_attestation =
@@ -2100,7 +2144,14 @@ mod tests {
     async fn ordinary_hash_bound_aspect_uses_existing_product_without_gemini_usage() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let pool = sqlite_pool(&db);
-        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            owner_user_id,
+            listing_id,
+            "<html><body><p>Two Garmin GNS <strong>430W</strong>\n navigators</p></body></html>",
+        )
+        .await;
         let product_id = insert_approved_garmin_product(&db).await;
         attest_approved_garmin_product(&db, product_id).await;
         let ordinary = PendingReviewAspect::avionics(
@@ -2126,9 +2177,10 @@ mod tests {
             Some("Unknown radio".to_string()),
             Some("low".to_string()),
         );
-        let staged = stage_pending_review(&db, listing_id, None, &[ordinary, remaining])
-            .await
-            .unwrap();
+        let staged =
+            stage_pending_review(&db, listing_id, Some(submission_id), &[ordinary, remaining])
+                .await
+                .unwrap();
         let usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
             .fetch_one(pool)
             .await
@@ -2175,6 +2227,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(usage_after, usage_before);
+    }
+
+    #[tokio::test]
+    async fn generated_avionics_explanation_is_not_listing_evidence() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            owner_user_id,
+            listing_id,
+            "<html><body><p>Installed Garmin GDL 690A receiver</p></body></html>",
+        )
+        .await;
+        let product_id = insert_approved_garmin_product_named(&db, "GDL 69A", "011-00987-00").await;
+        attest_approved_garmin_product(&db, product_id).await;
+        let generated_explanation =
+            "The candidate 'GDL690A' was identified as a typo for Garmin GDL 69A.";
+        let aspect = PendingReviewAspect::avionics(
+            "observation-25",
+            "avionics_identity",
+            "Garmin GDL 69A",
+            "Garmin GDL 690A",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some(generated_explanation.to_string()),
+            Some("high".to_string()),
+        )
+        .with_reuse_attestation_target(product_id);
+        let staged = stage_pending_review(&db, listing_id, Some(submission_id), &[aspect])
+            .await
+            .unwrap();
+        let usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let error = verify_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(VerifyExistingReviewAvionicsRequest {
+                review_payload_sha256: staged.review_payload_sha256.clone(),
+                catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: ReviewAspectId::from("observation-25"),
+            }),
+        )
+        .await
+        .expect_err("generated reasoning must not authorize an automatic listing link");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error
+            .message
+            .contains("exact structurally visible-body span"));
+
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(link_count, 0);
+        let retained_hash: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_hash, staged.review_payload_sha256);
+        let usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_after, usage_before);
+    }
+
+    #[tokio::test]
+    async fn ordinary_local_verification_without_source_capture_stays_pending() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let product_id = insert_approved_garmin_product(&db).await;
+        attest_approved_garmin_product(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "observation-manual",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Garmin GNS 430W",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GNS 430W".to_string()),
+            Some("high".to_string()),
+        )
+        .with_reuse_attestation_target(product_id);
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+
+        let error = verify_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(VerifyExistingReviewAvionicsRequest {
+                review_payload_sha256: staged.review_payload_sha256.clone(),
+                catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: ReviewAspectId::from("observation-manual"),
+            }),
+        )
+        .await
+        .expect_err("manual reviews without immutable capture must remain pending");
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(error.message.contains("exact plugin submission"));
+
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(link_count, 0);
     }
 
     #[tokio::test]

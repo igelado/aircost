@@ -394,14 +394,24 @@ exactly one before the Verify Listing button is enabled:
   nor a listing association.
 
 A hash-bound approved-product target is not a fourth decision type. Product
-attestation and source-free occurrence verification are separate operations.
+attestation and retained-source occurrence verification are separate
+operations.
 For a preserved link, successful local verification corroborates the existing
 occurrence without rewriting it. For an ordinary installed, non-replacement
 aspect, the same operation may create an exact-quantity association or update
 its one covered installed link through the normal aspect-scoped
 `use-existing` transaction. Until local verification succeeds, the aspect
 remains pending and may only be explicitly discarded from the listing
-workflow.
+workflow. Automated verification requires `source_evidence_text` to be one
+exact, bounded structurally visible body span in the immutable plugin
+submission attached to that review, after HTML entity and whitespace
+normalization only. Structural visibility excludes head and executable
+content, hidden attributes, inline or embedded stylesheet hiding, and closed
+details/dialog containers. It cannot reconstruct browser-computed visibility
+from external CSS absent from the retained outer HTML. The submission must
+belong to the listing owner, name that exact canonical listing, and retain its
+stored content hash. Missing captures, generated explanations, hidden
+metadata, corrected text, and substring-only model matches remain pending.
 
 For an unlinked observation, an explicit legacy candidate means normalized
 manufacturer/model selected one and only one `unreviewed` catalog row. An
@@ -436,11 +446,12 @@ The existing-product verification request carries only the canonical review
 hash, catalog revision, and aspect ID; source fields and revision aliases are
 rejected. It requires retained evidence to identify the hash-bound, currently
 attested product uniquely in the live local catalog. The mutation lock
-rechecks the review and catalog hashes, the complete active collision closure,
-the target's current reuse eligibility, exact covered-link ownership, and the
-listing action graph. Ordinary aspects must be installed, positive-quantity,
-and independent of every replacement edge; they may cover zero or one
-installed link. Attestation separately rechecks both the
+re-reads the exact review-bound source capture and rechecks its content hash
+and visible evidence, as well as the review and catalog hashes, the complete
+active collision closure, the target's current reuse eligibility, exact
+covered-link ownership, and the listing action graph. Ordinary aspects must be
+installed, positive-quantity, and independent of every replacement edge; they
+may cover zero or one installed link. Attestation separately rechecks both the
 manufacturer-scoped collision snapshot and ownership of the exact pending
 aspect under the mutation lock.
 
