@@ -127,12 +127,22 @@ entirely.
 Existing-product re-attestation can also avoid Gemini after a fresh guarded
 fetch from an origin approved for the effective manufacturer identity. The
 fetched HTML or PDF must contain the complete graph-approved model and stable
-identifier in one bounded visible HTML table row or PDF physical line. Adjacent
-rows, hidden metadata, scripts, generic page text, and cross-line matches never
-authorize an identity. Documents without one unambiguous exact structural row
-remain unresolved. Guarded source downloads are capped at 8 MiB; PDFs are
-additionally capped at 256 pages, 2 MiB of extracted text, and 2 MiB of
-decompressed data per page.
+identifier in one bounded visible HTML table row or reconstructed PDF visual
+row. For PDFs, the server-owned product identity selects relevant fragments;
+reconstruction joins fragments only on the same page and displayed horizontal
+baseline after composing inherited right-angle page rotation with graphics and
+text transforms. It never joins adjacent baselines or pages. An ambiguous row
+that contains sibling products cannot authorize an identity, although a
+separate clean exact row in the same document can. Hidden metadata, scripts,
+generic page text, and cross-row matches never authorize.
+
+Unrelated oversized or excess rows do not invalidate a targeted projection.
+Target-relevant overflow, missing or undecodable invoked fonts, unhandled
+invoked Form XObjects, malformed transforms, and incomplete page or resource
+structures fail closed. Guarded source downloads are capped at 8 MiB; PDFs are
+additionally capped at 256 pages, 2 MiB of extracted publisher text, and 2 MiB of
+page content plus inspected invoked resources per page. Invoked font and Form
+counts, graphics-state depth, and page-tree depth are independently bounded.
 
 Durable evidence is limited to source records and atomic claims that active
 catalog approval, FAA provenance, aircraft assignments, applicability, or

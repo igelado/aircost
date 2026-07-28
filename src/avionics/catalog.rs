@@ -4878,7 +4878,8 @@ mod tests {
     use crate::gemini::curation::workflow::{
         SourceEvidenceProof, SourceEvidenceSpanProof, MAX_EXACT_PRODUCT_SIGNAL_TOKEN_SPAN,
     };
-    use crate::gemini::interactions::{FetchedSourceDocument, SourceTextRow, SourceTextRowKind};
+    use crate::gemini::interactions::FetchedSourceDocument;
+    use crate::gemini::source::{TextRow, TextRowKind};
     use crate::html::clean::normalize_source_evidence_span;
     use crate::normalize::{
         normalize_avionics_identifier, normalize_avionics_manufacturer_name,
@@ -5195,8 +5196,8 @@ mod tests {
             publisher_text:
                 "Garmin GTX 33 Mode S transponder; manufacturer part number 011-00455-00."
                     .to_string(),
-            source_text_rows: vec![SourceTextRow {
-                kind: SourceTextRowKind::HtmlTableRow,
+            source_text_rows: vec![TextRow {
+                kind: TextRowKind::HtmlTableRow,
                 ordinal: 0,
                 text: "GTX 33 Mode S Transponder | 011-00455-00".to_string(),
             }],
@@ -5250,8 +5251,8 @@ mod tests {
         request.manufacturer_identifier = target.manufacturer_identifier.clone();
         fetched.publisher_text =
             "Garmin G1000 NXi Integrated Flight Deck; sku0 011-01000-00.".to_string();
-        fetched.source_text_rows = vec![SourceTextRow {
-            kind: SourceTextRowKind::HtmlTableRow,
+        fetched.source_text_rows = vec![TextRow {
+            kind: TextRowKind::HtmlTableRow,
             ordinal: 0,
             text: format!(
                 "G1000 NXi Integrated Flight Deck | {}",
@@ -5364,8 +5365,8 @@ mod tests {
         target.canonical_identifier_key = target.canonical_product_key.clone();
         request.manufacturer_identifier = target.manufacturer_identifier.clone();
         fetched.publisher_text = "Garmin GTX 33 transponder; sku0 GTX 33.".to_string();
-        fetched.source_text_rows = vec![SourceTextRow {
-            kind: SourceTextRowKind::HtmlTableRow,
+        fetched.source_text_rows = vec![TextRow {
+            kind: TextRowKind::HtmlTableRow,
             ordinal: 0,
             text: "GTX 33 Transponder | GTX 33".to_string(),
         }];
@@ -5430,7 +5431,7 @@ mod tests {
             &catalog,
         )
         .expect_err("flat publisher text cannot replace one visible structural row");
-        assert!(error.contains("no bounded visible HTML table row or PDF physical line"));
+        assert!(error.contains("no bounded visible HTML table row or PDF visual row"));
     }
 
     #[test]
@@ -5443,13 +5444,13 @@ mod tests {
             target.manufacturer_identifier
         );
         fetched.source_text_rows = vec![
-            SourceTextRow {
-                kind: SourceTextRowKind::PdfPhysicalLine,
+            TextRow {
+                kind: TextRowKind::PdfVisualRow,
                 ordinal: 0,
                 text: "GTX 33 transponder 011-UNRELATED-00".to_string(),
             },
-            SourceTextRow {
-                kind: SourceTextRowKind::PdfPhysicalLine,
+            TextRow {
+                kind: TextRowKind::PdfVisualRow,
                 ordinal: 1,
                 text: format!("GTX 330 transponder {}", target.manufacturer_identifier),
             },
@@ -5466,7 +5467,7 @@ mod tests {
             &catalog,
         )
         .expect_err("adjacent PDF rows must never become one deterministic identity record");
-        assert!(error.contains("no bounded visible HTML table row or PDF physical line"));
+        assert!(error.contains("no bounded visible HTML table row or PDF visual row"));
     }
 
     async fn seed_unreviewed_legacy_identity(

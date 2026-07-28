@@ -2,13 +2,13 @@
 //!
 //! Product identity may be established only by one bounded visible structural
 //! row that contains the complete catalog model and stable identifier. HTML
-//! table rows and PDF physical lines remain separate so adjacent products can
-//! never be cross-paired.
+//! table rows and reconstructed PDF visual rows remain separate so adjacent
+//! products can never be cross-paired.
 
 use crate::gemini::curation::workflow::{
     direct_source_product_identity_signal_is_present, MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS,
 };
-use crate::gemini::interactions::{SourceTextRow, SourceTextRowKind};
+use crate::gemini::source::{TextRow, TextRowKind};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OemProductIdentity<'a> {
@@ -19,12 +19,13 @@ pub(crate) struct OemProductIdentity<'a> {
 
 /// Select the first source-order row that proves exactly the target product.
 ///
-/// Repeated unambiguous rows are harmless, but a row that also proves a
-/// different manufacturer-scoped catalog identity is not evidence for either
-/// product. The caller remains responsible for source-origin admission,
-/// immutable catalog checks, and duplicate catalog rejection.
+/// Repeated unambiguous rows are harmless. A row that also proves a different
+/// manufacturer-scoped catalog identity is never evidence for either product,
+/// but it does not poison a separate clean structural row: identity proof is
+/// deliberately row-local. The caller remains responsible for source-origin
+/// admission, immutable catalog checks, and duplicate catalog rejection.
 pub(crate) fn exact_oem_product_identity_row(
-    rows: &[SourceTextRow],
+    rows: &[TextRow],
     rows_complete: bool,
     target: OemProductIdentity<'_>,
     manufacturer_catalog: &[OemProductIdentity<'_>],
@@ -41,7 +42,7 @@ pub(crate) fn exact_oem_product_identity_row(
     for row in rows {
         if !matches!(
             row.kind,
-            SourceTextRowKind::HtmlTableRow | SourceTextRowKind::PdfPhysicalLine
+            TextRowKind::HtmlTableRow | TextRowKind::PdfVisualRow
         ) || !direct_source_product_identity_signal_is_present(
             &row.text,
             target.model,
@@ -68,13 +69,13 @@ pub(crate) fn exact_oem_product_identity_row(
         first_clean_row.get_or_insert_with(|| row.text.clone());
     }
 
+    if let Some(row) = first_clean_row {
+        return Ok(row);
+    }
     if let Some(ordinal) = first_ambiguous_ordinal {
         return Err(format!(
             "source row {ordinal} pairs the target with another manufacturer-scoped catalog identity"
         ));
-    }
-    if let Some(row) = first_clean_row {
-        return Ok(row);
     }
     if matched_target {
         return Err(format!(
@@ -82,7 +83,7 @@ pub(crate) fn exact_oem_product_identity_row(
         ));
     }
     Err(
-        "the freshly fetched source has no bounded visible HTML table row or PDF physical line containing the complete target model and stable identifier"
+        "the freshly fetched source has no bounded visible HTML table row or PDF visual row containing the complete target model and stable identifier"
             .to_string(),
     )
 }
@@ -90,10 +91,10 @@ pub(crate) fn exact_oem_product_identity_row(
 #[cfg(test)]
 mod tests {
     use super::{exact_oem_product_identity_row, OemProductIdentity};
-    use crate::gemini::interactions::{SourceTextRow, SourceTextRowKind};
+    use crate::gemini::source::{TextRow, TextRowKind};
 
-    fn row(kind: SourceTextRowKind, ordinal: usize, text: &str) -> SourceTextRow {
-        SourceTextRow {
+    fn row(kind: TextRowKind, ordinal: usize, text: &str) -> TextRow {
+        TextRow {
             kind,
             ordinal,
             text: text.to_string(),
@@ -116,10 +117,7 @@ mod tests {
     fn accepts_one_exact_visible_html_or_pdf_row() {
         let target = identity(30, "GEA 71", "011-00831-00");
         let catalog = [target];
-        for kind in [
-            SourceTextRowKind::HtmlTableRow,
-            SourceTextRowKind::PdfPhysicalLine,
-        ] {
+        for kind in [TextRowKind::HtmlTableRow, TextRowKind::PdfVisualRow] {
             let rows = [row(kind, 4, "GEA 71 Unit (011-00831-00) | 010-00283-00")];
             assert_eq!(
                 exact_oem_product_identity_row(&rows, true, target, &catalog).unwrap(),
@@ -133,8 +131,8 @@ mod tests {
         let target = identity(33, "GTX 33", "011-00455-00");
         let catalog = [target];
         let rows = [
-            row(SourceTextRowKind::PdfPhysicalLine, 0, "GTX 33"),
-            row(SourceTextRowKind::PdfPhysicalLine, 1, "011-00455-00"),
+            row(TextRowKind::PdfVisualRow, 0, "GTX 33"),
+            row(TextRowKind::PdfVisualRow, 1, "011-00455-00"),
         ];
 
         assert!(
@@ -145,12 +143,24 @@ mod tests {
     }
 
     #[test]
+    fn generic_pdf_physical_lines_cannot_authorize_oem_proof() {
+        let target = identity(30, "GEA 71", "011-00831-00");
+        let rows = [row(
+            TextRowKind::PdfPhysicalLine,
+            0,
+            "GEA 71 | 011-00831-00",
+        )];
+
+        assert!(exact_oem_product_identity_row(&rows, true, target, &[target]).is_err());
+    }
+
+    #[test]
     fn rejects_a_row_that_proves_two_scoped_products() {
         let target = identity(125, "ME406", "453-6603");
         let neighbor = identity(126, "ME406HM", "453-6604");
         let catalog = [target, neighbor];
         let rows = [row(
-            SourceTextRowKind::PdfPhysicalLine,
+            TextRowKind::PdfVisualRow,
             11,
             "ME406 (453-6603), ME406HM (453-6604)",
         )];
@@ -165,16 +175,8 @@ mod tests {
         let target = identity(244, "GEA 71B", "011-03682-00");
         let catalog = [target];
         let rows = [
-            row(
-                SourceTextRowKind::PdfPhysicalLine,
-                8,
-                "GEA 71B | 011-03682-00 | 497",
-            ),
-            row(
-                SourceTextRowKind::PdfPhysicalLine,
-                90,
-                "GEA 71B (011-03682-00)",
-            ),
+            row(TextRowKind::PdfVisualRow, 8, "GEA 71B | 011-03682-00 | 497"),
+            row(TextRowKind::PdfVisualRow, 90, "GEA 71B (011-03682-00)"),
         ];
 
         assert_eq!(
@@ -184,26 +186,27 @@ mod tests {
     }
 
     #[test]
-    fn later_ambiguous_target_row_invalidates_an_earlier_clean_row() {
+    fn ambiguous_multi_product_row_never_authorizes_but_does_not_poison_a_clean_row() {
         let target = identity(125, "ME406", "453-6603");
         let neighbor = identity(126, "ME406HM", "453-6604");
         let catalog = [target, neighbor];
         let rows = [
             row(
-                SourceTextRowKind::PdfPhysicalLine,
+                TextRowKind::PdfVisualRow,
                 4,
                 "Emergency Locator Transmitter | 453-6603 | ME406",
             ),
             row(
-                SourceTextRowKind::PdfPhysicalLine,
+                TextRowKind::PdfVisualRow,
                 27,
                 "ME406 (453-6603), ME406HM (453-6604)",
             ),
         ];
 
-        let error = exact_oem_product_identity_row(&rows, true, target, &catalog).unwrap_err();
-        assert!(error.contains("row 27"));
-        assert!(error.contains("another manufacturer-scoped"));
+        assert_eq!(
+            exact_oem_product_identity_row(&rows, true, target, &catalog).unwrap(),
+            "Emergency Locator Transmitter | 453-6603 | ME406"
+        );
     }
 
     #[test]
@@ -211,7 +214,7 @@ mod tests {
         let target = identity(734, "GSU 75", "011-03094-00");
         let catalog = [target];
         let rows = [row(
-            SourceTextRowKind::PdfPhysicalLine,
+            TextRowKind::PdfVisualRow,
             0,
             &format!("GSU 75 (011-03094-00) {}", "bounded filler ".repeat(16)),
         )];
@@ -227,11 +230,7 @@ mod tests {
     fn incomplete_structural_projection_fails_before_row_selection() {
         let target = identity(30, "GEA 71", "011-00831-00");
         let catalog = [target];
-        let rows = [row(
-            SourceTextRowKind::HtmlTableRow,
-            0,
-            "GEA 71 | 011-00831-00",
-        )];
+        let rows = [row(TextRowKind::HtmlTableRow, 0, "GEA 71 | 011-00831-00")];
 
         assert!(
             exact_oem_product_identity_row(&rows, false, target, &catalog)
