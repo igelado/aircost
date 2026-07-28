@@ -403,8 +403,21 @@ The corresponding API is:
 ```http
 GET /api/review/listings?limit=25&offset=0
 GET /api/review/listings/{listing_id}
+POST /api/review/listings/{listing_id}/avionics/use-existing-replacement
 POST /api/review/listings/{listing_id}/resolve
 ```
+
+The replacement endpoint is the only aspect-scoped path that accepts a
+replacement relationship. Its strict request names the staged parent and child
+aspect, selected approved catalog ID, and exact staged quantity for each. The
+parent must explicitly target the child; the child quantity is one. Both
+products must already have current global reuse attestations. The server
+changes one listing link atomically, preserves that link's ID when the bundle
+covers an existing relationship, and performs no Gemini or OEM fetch. It
+rejects half relationships, stale or cross-listing link coverage, implicit
+association merges, quantity changes, and invalid action graphs. The ordinary
+single-aspect `use-existing` route continues to reject both sides of a
+replacement relationship.
 
 The resolve request includes `review_payload_sha256`,
 `catalog_revision_sha256`, one decision for every returned aspect, and an

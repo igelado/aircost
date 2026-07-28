@@ -36,6 +36,9 @@ use crate::avionics::inspection::{
 };
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
+use crate::listing::review::replacement::{
+    use_existing_replacement_relationship_and_restage, UseExistingReplacementRelationshipRequest,
+};
 use crate::listing::review::{
     active_collision_closure_revision_sha256, corroborate_existing_product_association_and_restage,
     get_listing_review, list_listing_reviews, preflight_existing_product_verification,
@@ -217,6 +220,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/avionics/use-existing",
             post(use_existing_review_avionics_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/avionics/use-existing-replacement",
+            post(use_existing_replacement_relationship_handler),
         )
         .route(
             "/api/review/listings/{id}/resolve",
@@ -731,6 +738,24 @@ async fn use_existing_review_avionics_handler(
         payload.avionics_model_id,
     )
     .await?;
+    review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+/// Apply both identities of one staged replacement relationship atomically.
+///
+/// This association-only path requires both products to be current reusable
+/// catalog entries and never invokes Gemini or an OEM fetch.
+async fn use_existing_replacement_relationship_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<UseExistingReplacementRelationshipRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let staged =
+        use_existing_replacement_relationship_and_restage(&state.db, user.id, listing_id, &payload)
+            .await?;
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
 }
 
@@ -1687,8 +1712,9 @@ mod tests {
     use super::{
         avionics_options_handler, get_listing_review, list_avionics_handler,
         require_current_review_revisions, start_plugin_submission_job,
-        use_existing_review_avionics_handler, verify_existing_review_avionics_handler, AppState,
-        UseExistingReviewAvionicsRequest, VerifyExistingReviewAvionicsRequest,
+        use_existing_replacement_relationship_handler, use_existing_review_avionics_handler,
+        verify_existing_review_avionics_handler, AppState, UseExistingReviewAvionicsRequest,
+        VerifyExistingReviewAvionicsRequest,
     };
     use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::avionics::manufacturer::{
@@ -1696,6 +1722,9 @@ mod tests {
     };
     use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
     use crate::db::{AppDb, DatabaseBackend};
+    use crate::listing::review::replacement::{
+        ExistingProductAspectSelection, UseExistingReplacementRelationshipRequest,
+    };
     use crate::listing::review::{
         restage_unattested_preserved_products, stage_pending_review, ListingReview,
         PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
@@ -1766,6 +1795,14 @@ mod tests {
     }
 
     async fn insert_approved_garmin_product(db: &AppDb) -> i64 {
+        insert_approved_garmin_product_named(db, "GNS 430W", "011-01064-40").await
+    }
+
+    async fn insert_approved_garmin_product_named(
+        db: &AppDb,
+        model: &str,
+        identifier: &str,
+    ) -> i64 {
         let pool = sqlite_pool(db);
         let manufacturer_key = normalize_avionics_manufacturer_name("Garmin");
         sqlx::query(
@@ -1795,8 +1832,6 @@ mod tests {
         .await
         .unwrap();
 
-        let model = "GNS 430W";
-        let identifier = "011-01064-40";
         let model_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO avionics_models (
@@ -1807,8 +1842,8 @@ mod tests {
               identity_evidence_kind, identity_confidence, catalog_reviewed_at
             ) VALUES (?, ?, ?, 'manufacturer_part_number', ?, ?,
                       'https://www.garmin.com/aviation/product',
-                      'Garmin GNS 430W product manual',
-                      'Garmin identifies GNS 430W by manufacturer part number 011-01064-40.',
+                      'Garmin avionics product manual',
+                      'Garmin identifies this avionics product by its manufacturer part number.',
                       'authoritative_reference', 'very_high', CURRENT_TIMESTAMP)
             RETURNING id
             "#,
@@ -2104,6 +2139,247 @@ mod tests {
                 Some("high".to_string()),
             )
         );
+        let usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_after, usage_before);
+    }
+
+    #[tokio::test]
+    async fn replacement_api_updates_one_link_in_place_without_gemini_usage() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let old_parent =
+            insert_approved_garmin_product_named(&db, "GNS 430W", "011-01064-40").await;
+        let old_child = insert_approved_garmin_product_named(&db, "KX 155", "069-1024-01").await;
+        let selected_parent =
+            insert_approved_garmin_product_named(&db, "GTN 650Xi", "010-02351-01").await;
+        let selected_child =
+            insert_approved_garmin_product_named(&db, "KX 155A", "069-1055-00").await;
+        let unrelated_product =
+            insert_approved_garmin_product_named(&db, "GTX 327", "011-00490-01").await;
+        attest_approved_garmin_product(&db, selected_parent).await;
+
+        let listing_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action,
+              replaces_avionics_model_id
+            ) VALUES (?, ?, 2, 'listing', 'Two new navigators replace the old unit',
+                      'medium', 'replaces', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(old_parent)
+        .bind(old_child)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let unrelated_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Garmin GTX 327 transponder shown in listing',
+                      'medium', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(unrelated_product)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let parent = PendingReviewAspect::avionics(
+            "replacement-parent",
+            "avionics_identity",
+            "two replacement navigators",
+            "Two new navigators replace the old unit",
+            "catalog_match_requires_review",
+            2,
+            "replaces",
+            Some("Two new navigators replace the old unit".to_string()),
+            Some("medium".to_string()),
+        )
+        .with_replacement_aspect("replacement-child")
+        .with_covered_association(
+            listing_link_id,
+            crate::listing::review::ListingAssociationRole::Installed,
+            old_parent,
+        );
+        let child = PendingReviewAspect::avionics(
+            "replacement-child",
+            "avionics_identity",
+            "old navigator",
+            "old unit",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("old unit".to_string()),
+            Some("medium".to_string()),
+        )
+        .with_covered_association(
+            listing_link_id,
+            crate::listing::review::ListingAssociationRole::Replacement,
+            old_child,
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[parent, child])
+            .await
+            .unwrap();
+        let usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let unattested_error = use_existing_replacement_relationship_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReplacementRelationshipRequest {
+                review_payload_sha256: staged.review_payload_sha256.clone(),
+                catalog_revision_sha256: staged.catalog_revision_sha256.clone(),
+                parent: ExistingProductAspectSelection {
+                    aspect_id: "replacement-parent".into(),
+                    avionics_model_id: selected_parent,
+                    quantity: 2,
+                },
+                child: ExistingProductAspectSelection {
+                    aspect_id: "replacement-child".into(),
+                    avionics_model_id: selected_child,
+                    quantity: 1,
+                },
+            }),
+        )
+        .await
+        .expect_err("both products require current global attestations");
+        assert_eq!(unattested_error.status, StatusCode::CONFLICT);
+        let unchanged: (i64, i64, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT id, avionics_model_id, replaces_avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, (listing_link_id, old_parent, Some(old_child)));
+
+        attest_approved_garmin_product(&db, selected_child).await;
+        let single_child_error = use_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256.clone(),
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256.clone(),
+                aspect_id: "replacement-child".into(),
+                avionics_model_id: selected_child,
+            }),
+        )
+        .await
+        .expect_err("a replacement child must not be approved independently");
+        assert_eq!(single_child_error.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let accepted_request = UseExistingReplacementRelationshipRequest {
+            review_payload_sha256: staged.review_payload_sha256.clone(),
+            catalog_revision_sha256: staged.catalog_revision_sha256.clone(),
+            parent: ExistingProductAspectSelection {
+                aspect_id: "replacement-parent".into(),
+                avionics_model_id: selected_parent,
+                quantity: 2,
+            },
+            child: ExistingProductAspectSelection {
+                aspect_id: "replacement-child".into(),
+                avionics_model_id: selected_child,
+                quantity: 1,
+            },
+        };
+        let response = use_existing_replacement_relationship_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(accepted_request.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response["review_complete"], false);
+        assert_eq!(response["review"]["aspects"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response["review"]["aspects"][0]["reuse_attestation_target"]["id"],
+            unrelated_product
+        );
+        let link: (i64, i64, i64, String, Option<i64>, String, Option<String>) = sqlx::query_as(
+            r#"
+                SELECT id, avionics_model_id, quantity, configuration_action,
+                       replaces_avionics_model_id, source, source_confidence
+                FROM aircraft_sale_listing_avionics
+                WHERE aircraft_sale_listing_id = ? AND id = ?
+                "#,
+        )
+        .bind(listing_id)
+        .bind(listing_link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            link,
+            (
+                listing_link_id,
+                selected_parent,
+                2,
+                "replaces".to_string(),
+                Some(selected_child),
+                "listing_review".to_string(),
+                Some("high".to_string()),
+            )
+        );
+        let unrelated: (i64, i64, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT id, avionics_model_id, source, source_confidence
+            FROM aircraft_sale_listing_avionics
+            WHERE id = ?
+            "#,
+        )
+        .bind(unrelated_link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unrelated,
+            (
+                unrelated_link_id,
+                unrelated_product,
+                "listing".to_string(),
+                Some("medium".to_string()),
+            )
+        );
+
+        let stale_retry = use_existing_replacement_relationship_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(accepted_request),
+        )
+        .await
+        .expect_err("a stale retry must not insert or merge another link");
+        assert_eq!(stale_retry.status, StatusCode::PRECONDITION_FAILED);
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(link_count, 2);
         let usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
             .fetch_one(pool)
             .await
