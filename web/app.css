@@ -1951,6 +1951,19 @@ label span,
   grid-column: 1 / -1;
 }
 
+.review-character-counter {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: right;
+}
+
+.review-character-counter.over-limit {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 .review-decision-validation {
   min-height: 17px;
   margin: 8px 0 0;
