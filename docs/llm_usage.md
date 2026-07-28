@@ -124,6 +124,14 @@ and excerpts are not model input. Aircraft reuse is similarly strict: an exact
 current FAA record and one applicable approved hierarchy may bypass Gemini
 entirely.
 
+Existing-product re-attestation can also avoid Gemini after a fresh guarded
+fetch from an origin approved for the effective manufacturer identity. The
+fetched HTML or PDF must contain the complete graph-approved model and stable
+identifier in one bounded visible HTML table row or PDF physical line. Adjacent
+rows, hidden metadata, scripts, generic page text, and cross-line matches never
+authorize an identity. Documents without one unambiguous exact structural row
+remain unresolved.
+
 Durable evidence is limited to source records and atomic claims that active
 catalog approval, FAA provenance, aircraft assignments, applicability, or
 reference facts actually cite. Those rows are not complete Gemini prompts,

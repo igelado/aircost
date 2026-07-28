@@ -18,6 +18,7 @@ use super::reuse::{
     refresh_grounded_evidence_and_reuse_attestation_sqlite, refresh_reuse_attestation_postgres,
     refresh_reuse_attestation_sqlite,
 };
+use super::source::{exact_oem_product_identity_row, OemProductIdentity};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
     AvionicsApprovedCandidateAdjudicationContext, AvionicsApprovedCatalogCandidate,
@@ -668,27 +669,36 @@ fn deterministic_graph_approved_identity_from_source(
         }
     }
 
-    let record = fetched
-        .garmin_product_page_identity
-        .as_ref()
-        .ok_or_else(|| {
-            format!(
-                "the freshly fetched source has no typed exact-origin Garmin product_display_name/sku0 identity record for catalog id {target_id}"
-            )
-        })?;
-    if target.manufacturer_identifier_kind != "manufacturer_part_number" {
-        return Err(format!(
-            "catalog id {target_id} cannot map Garmin sku0 to identifier kind {:?}; deterministic Garmin product-page proof supports only the canonical manufacturer_part_number kind",
-            target.manufacturer_identifier_kind
-        ));
-    }
-    if !exact_compact_identity_is_present(&record.product_display_name, &product_key)
-        || normalize_avionics_identifier(&record.sku0) != identifier_key
-    {
-        return Err(format!(
-            "the typed Garmin product-page record does not carry the complete target model and exact paired orderable part number for catalog id {target_id}"
-        ));
-    }
+    let target_identity = OemProductIdentity {
+        catalog_id: target.id,
+        model: &target.model,
+        manufacturer_identifier: &target.manufacturer_identifier,
+    };
+    let scoped_identities = manufacturer_catalog
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.manufacturer_identifier_kind.as_str(),
+                "manufacturer_part_number" | "manufacturer_model_number" | "sku"
+            ) && !candidate.manufacturer_identifier.trim().is_empty()
+                && !stable_oem_identifier_has_placeholder(
+                    &candidate.manufacturer_identifier_kind,
+                    &candidate.manufacturer_identifier,
+                )
+        })
+        .map(|candidate| OemProductIdentity {
+            catalog_id: candidate.id,
+            model: &candidate.model,
+            manufacturer_identifier: &candidate.manufacturer_identifier,
+        })
+        .collect::<Vec<_>>();
+    let evidence = exact_oem_product_identity_row(
+        &fetched.source_text_rows,
+        fetched.source_text_rows_complete,
+        target_identity,
+        &scoped_identities,
+    )
+    .map_err(|reason| format!("{reason} for catalog id {target_id}"))?;
     if manufacturer_catalog
         .iter()
         .filter(|candidate| candidate.id != target_id)
@@ -697,22 +707,13 @@ fn deterministic_graph_approved_identity_from_source(
             !other_product_key.is_empty()
                 && other_product_key != product_key
                 && other_product_key.starts_with(&product_key)
-                && exact_compact_identity_is_present(
-                    &record.product_display_name,
-                    &other_product_key,
-                )
+                && exact_compact_identity_is_present(&evidence, &other_product_key)
         })
     {
         return Err(format!(
-            "the typed Garmin product-page record names a longer manufacturer-scoped prefix-neighbor instead of catalog id {target_id}"
+            "the exact OEM source row names a longer manufacturer-scoped prefix-neighbor instead of catalog id {target_id}"
         ));
     }
-    // Garmin's exact-origin product page exposes `sku0` as the orderable
-    // product number paired with `product_display_name`. This publisher-
-    // specific adapter maps that field to our canonical
-    // `manufacturer_part_number`; no generic SKU/identifier equivalence is
-    // inferred for any other publisher or source format.
-    let evidence = record.literal_evidence_text();
 
     let has_longer_product_neighbor = manufacturer_catalog
         .iter()
@@ -745,7 +746,7 @@ fn deterministic_graph_approved_identity_from_source(
         evidence_url: fetched.final_url.to_string(),
         evidence_title: source_title.trim().to_string(),
         evidence,
-        reason: "A fresh guarded fetch from the currently admitted OEM origin carries the complete graph-approved model and stable identifier; the manufacturer-scoped catalog has no exact identity duplicate.".to_string(),
+        reason: "A fresh guarded fetch from the currently admitted OEM origin carries the complete graph-approved model and stable identifier in one bounded visible structural row; the manufacturer-scoped catalog has no exact identity duplicate.".to_string(),
         grounded_claim_source_urls: vec![fetched.final_url.to_string()],
     })
 }
@@ -4639,7 +4640,7 @@ mod tests {
     use crate::gemini::curation::workflow::{
         SourceEvidenceProof, SourceEvidenceSpanProof, MAX_EXACT_PRODUCT_SIGNAL_TOKEN_SPAN,
     };
-    use crate::gemini::interactions::{FetchedSourceDocument, GarminProductPageIdentityRecord};
+    use crate::gemini::interactions::{FetchedSourceDocument, SourceTextRow, SourceTextRowKind};
     use crate::html::clean::normalize_source_evidence_span;
     use crate::normalize::{
         normalize_avionics_identifier, normalize_avionics_manufacturer_name,
@@ -4958,10 +4959,12 @@ mod tests {
             publisher_text:
                 "Garmin GTX 33 Mode S transponder; manufacturer part number 011-00455-00."
                     .to_string(),
-            garmin_product_page_identity: Some(GarminProductPageIdentityRecord {
-                product_display_name: "GTX 33 Mode S Transponder".to_string(),
-                sku0: "011-00455-00".to_string(),
-            }),
+            source_text_rows: vec![SourceTextRow {
+                kind: SourceTextRowKind::HtmlTableRow,
+                ordinal: 0,
+                text: "GTX 33 Mode S Transponder | 011-00455-00".to_string(),
+            }],
+            source_text_rows_complete: true,
         };
         let anchors = request.authoritative_identity_anchors.clone();
         (
@@ -4998,13 +5001,13 @@ mod tests {
         assert_eq!(approved.id, target.id);
         assert_eq!(
             approved.evidence,
-            "Garmin product page metadata: product_display_name GTX 33 Mode S Transponder; sku0 011-00455-00."
+            "GTX 33 Mode S Transponder | 011-00455-00"
         );
         assert_eq!(approved.grounded_claim_source_urls.len(), 1);
     }
 
     #[test]
-    fn deterministic_oem_proof_rejects_a_typed_longer_prefix_neighbor() {
+    fn deterministic_oem_proof_rejects_a_longer_prefix_neighbor_in_the_same_row() {
         let (mut request, mut target, mut neighbor, admission, _, mut fetched) =
             deterministic_gtx33_fixture();
         target.model = "G1000".to_string();
@@ -5026,10 +5029,14 @@ mod tests {
         let anchors = request.authoritative_identity_anchors.clone();
         fetched.publisher_text =
             "Garmin G1000 NXi Integrated Flight Deck; sku0 011-01000-00.".to_string();
-        fetched.garmin_product_page_identity = Some(GarminProductPageIdentityRecord {
-            product_display_name: "G1000 NXi Integrated Flight Deck".to_string(),
-            sku0: target.manufacturer_identifier.clone(),
-        });
+        fetched.source_text_rows = vec![SourceTextRow {
+            kind: SourceTextRowKind::HtmlTableRow,
+            ordinal: 0,
+            text: format!(
+                "G1000 NXi Integrated Flight Deck | {}",
+                target.manufacturer_identifier
+            ),
+        }];
         let catalog = vec![
             deterministic_review_candidate(&target),
             deterministic_review_candidate(&neighbor),
@@ -5045,7 +5052,7 @@ mod tests {
             std::slice::from_ref(&target),
             &catalog,
         )
-        .expect_err("typed G1000 NXi metadata cannot attest the shorter G1000 target");
+        .expect_err("a G1000 NXi row cannot attest the shorter G1000 target");
 
         assert!(error.contains("longer manufacturer-scoped prefix-neighbor"));
     }
@@ -5146,10 +5153,11 @@ mod tests {
         ];
         anchors = request.authoritative_identity_anchors.clone();
         fetched.publisher_text = "Garmin GTX 33 transponder; sku0 GTX 33.".to_string();
-        fetched.garmin_product_page_identity = Some(GarminProductPageIdentityRecord {
-            product_display_name: "GTX 33 Transponder".to_string(),
-            sku0: "GTX 33".to_string(),
-        });
+        fetched.source_text_rows = vec![SourceTextRow {
+            kind: SourceTextRowKind::HtmlTableRow,
+            ordinal: 0,
+            text: "GTX 33 Transponder | GTX 33".to_string(),
+        }];
         let catalog = vec![
             deterministic_review_candidate(&target),
             deterministic_review_candidate(&neighbor),
@@ -5203,9 +5211,9 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_oem_proof_requires_the_typed_garmin_metadata_pair() {
+    fn deterministic_oem_proof_requires_one_visible_structural_row() {
         let (request, target, _, admission, anchors, mut fetched) = deterministic_gtx33_fixture();
-        fetched.garmin_product_page_identity = None;
+        fetched.source_text_rows.clear();
         let catalog = vec![deterministic_review_candidate(&target)];
 
         let error = deterministic_graph_approved_identity_from_source(
@@ -5218,8 +5226,8 @@ mod tests {
             std::slice::from_ref(&target),
             &catalog,
         )
-        .expect_err("ordinary visible HTML cannot replace the typed metadata pair");
-        assert!(error.contains("no typed exact-origin Garmin"));
+        .expect_err("flat publisher text cannot replace one visible structural row");
+        assert!(error.contains("no bounded visible HTML table row or PDF physical line"));
     }
 
     #[test]
@@ -5231,7 +5239,18 @@ mod tests {
             "GTX 33 transponder 011-UNRELATED-00\nGTX 330 transponder {}",
             target.manufacturer_identifier
         );
-        fetched.garmin_product_page_identity = None;
+        fetched.source_text_rows = vec![
+            SourceTextRow {
+                kind: SourceTextRowKind::PdfPhysicalLine,
+                ordinal: 0,
+                text: "GTX 33 transponder 011-UNRELATED-00".to_string(),
+            },
+            SourceTextRow {
+                kind: SourceTextRowKind::PdfPhysicalLine,
+                ordinal: 1,
+                text: format!("GTX 330 transponder {}", target.manufacturer_identifier),
+            },
+        ];
         let catalog = vec![deterministic_review_candidate(&target)];
 
         let error = deterministic_graph_approved_identity_from_source(
@@ -5245,7 +5264,7 @@ mod tests {
             &catalog,
         )
         .expect_err("adjacent PDF rows must never become one deterministic identity record");
-        assert!(error.contains("no typed exact-origin Garmin"));
+        assert!(error.contains("no bounded visible HTML table row or PDF physical line"));
     }
 
     async fn seed_unreviewed_legacy_identity(
