@@ -355,13 +355,15 @@ treated as ready data.
 ## Listing Review Workspace
 
 The Review tab has **By product** and **By listing** queues. By product
-collapses every pending preserved association onto one approved avionics
+collapses every hash-bound existing-product aspect onto one approved avionics
 identity. A product is attested once from a guarded OEM fetch, without Gemini,
-then its listing associations are checked locally with bounded concurrency
-across listings and serial optimistic-lock updates within each listing. By
-listing shows the aircraft, tail, year, aspect count, reason groups, and last
-update. Opening a listing shows every unresolved observation, its source
-context, and any suggested or proposed product.
+then its listing aspects are checked locally with bounded concurrency across
+listings and serial optimistic-lock updates within each listing. These aspects
+may represent a preserved link or an ordinary unlinked extraction observation;
+the browser uses the same verification workflow for both. By listing shows the
+aircraft, tail, year, aspect count, reason groups, and last update. Opening a
+listing shows every unresolved observation, its source context, and any
+suggested or proposed product.
 
 Review access has a server-side allowlist until durable application roles are
 available. Production deployments must provide a comma-separated list of exact
@@ -391,10 +393,15 @@ exactly one before the Verify Listing button is enabled:
 - **Discard observation** requires a reason and creates neither a catalog row
   nor a listing association.
 
-A preserved approved-product association is not a fourth decision type.
-Product attestation and source-free occurrence corroboration are separate
-operations. Until local corroboration succeeds, the synthetic aspect remains
-pending and may only be explicitly discarded from the listing workflow.
+A hash-bound approved-product target is not a fourth decision type. Product
+attestation and source-free occurrence verification are separate operations.
+For a preserved link, successful local verification corroborates the existing
+occurrence without rewriting it. For an ordinary installed, non-replacement
+aspect, the same operation may create an exact-quantity association or update
+its one covered installed link through the normal aspect-scoped
+`use-existing` transaction. Until local verification succeeds, the aspect
+remains pending and may only be explicitly discarded from the listing
+workflow.
 
 For an unlinked observation, an explicit legacy candidate means normalized
 manufacturer/model selected one and only one `unreviewed` catalog row. An
@@ -425,10 +432,17 @@ and exactly one direct association authorization tuple:
 `listing_id`, `review_payload_sha256`, and `aspect_id`. The server loads only
 that listing review and requires the exact hash-bound aspect to target the
 requested product; it does not scan other pending reviews for authorization.
-The association request carries only the canonical review hash, catalog
-revision, and aspect ID; source fields and legacy revision aliases are rejected.
-Attestation rechecks both the manufacturer-scoped collision snapshot and
-ownership of the exact pending association under the mutation lock.
+The existing-product verification request carries only the canonical review
+hash, catalog revision, and aspect ID; source fields and revision aliases are
+rejected. It requires retained evidence to identify the hash-bound, currently
+attested product uniquely in the live local catalog. The mutation lock
+rechecks the review and catalog hashes, the complete active collision closure,
+the target's current reuse eligibility, exact covered-link ownership, and the
+listing action graph. Ordinary aspects must be installed, positive-quantity,
+and independent of every replacement edge; they may cover zero or one
+installed link. Attestation separately rechecks both the
+manufacturer-scoped collision snapshot and ownership of the exact pending
+aspect under the mutation lock.
 
 The replacement endpoint is the only aspect-scoped path that accepts a
 replacement relationship. Its strict source-free request names the staged

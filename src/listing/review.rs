@@ -343,8 +343,8 @@ pub struct PendingReviewAspect {
     /// including associations to the same product on a different link.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub covered_associations: Vec<CoveredListingAssociation>,
-    /// Approved catalog product whose existing listing association must be
-    /// freshly grounded before it is eligible for current-policy reuse.
+    /// Approved catalog product whose hash-bound listing aspect must be
+    /// freshly verified before its occurrence is eligible for reuse.
     ///
     /// This is deliberately separate from `proposed_product.id`: that field
     /// identifies only a legacy *unreviewed* promotion candidate. Treating an
@@ -1318,11 +1318,24 @@ fn validated_aspects(aspects: &[PendingReviewAspect]) -> ReviewResult<Vec<Pendin
             let target_id = aspect
                 .reuse_attestation_target_id
                 .expect("checked as present");
-            if aspect.covered_associations.len() != 1
-                || aspect.covered_associations[0].avionics_model_id != target_id
+            if aspect.covered_associations.len() > 1
+                || aspect
+                    .covered_associations
+                    .first()
+                    .is_some_and(|association| association.avionics_model_id != target_id)
             {
                 return Err(ReviewError::Validation(format!(
-                    "review aspect {} must cover exactly its reuse-attestation target catalog id {target_id}",
+                    "review aspect {} may cover at most one association and it must identify its reuse-attestation target catalog id {target_id}",
+                    aspect.id
+                )));
+            }
+            if aspect.covered_associations.is_empty()
+                && (!aspect.kind.starts_with("avionics")
+                    || aspect.configuration_action != "installed"
+                    || has_replacement)
+            {
+                return Err(ReviewError::Validation(format!(
+                    "unlinked reuse-target aspect {} must be an ordinary installed avionics observation",
                     aspect.id
                 )));
             }
@@ -1592,6 +1605,15 @@ struct OrdinaryAspectUseExistingCommit {
     aspect_id: ReviewAspectId,
     avionics_model_id: i64,
     expected_catalog_revision_sha256: String,
+    authorization: OrdinaryAspectUseExistingAuthorization,
+}
+
+#[derive(Clone, Debug)]
+enum OrdinaryAspectUseExistingAuthorization {
+    ReviewerSelection,
+    HashBoundReuseTarget {
+        expected_collision_closure_sha256: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1616,6 +1638,12 @@ async fn restage_pending_review_if_current_with_commit(
             }
             ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(commit) => {
                 !valid_sha256(&commit.expected_catalog_revision_sha256)
+                    || matches!(
+                        &commit.authorization,
+                        OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
+                            expected_collision_closure_sha256,
+                        } if !valid_sha256(expected_collision_closure_sha256)
+                    )
             }
         })
     {
@@ -2019,50 +2047,29 @@ async fn restage_pending_review_if_current_with_commit(
                         ))
                     })?;
                 let aspect = payload.aspects[aspect_index].clone();
-                if !aspect.kind.starts_with("avionics")
-                    || is_synthetic_preserved_attestation_aspect(&aspect)
-                    || aspect.reuse_attestation_target_id.is_some()
-                    || !aspect
-                        .allowed_actions
-                        .contains(&ReviewAction::UseVerifiedProduct)
-                {
-                    return Err(ReviewError::Validation(format!(
-                        "review aspect {} is not an ordinary avionics identity aspect",
-                        commit.aspect_id
-                    )));
+                match &commit.authorization {
+                    OrdinaryAspectUseExistingAuthorization::ReviewerSelection => {
+                        if aspect.reuse_attestation_target_id.is_some()
+                            || !aspect
+                                .allowed_actions
+                                .contains(&ReviewAction::UseVerifiedProduct)
+                        {
+                            return Err(ReviewError::Validation(format!(
+                                "review aspect {} is not an ordinary avionics identity aspect",
+                                aspect.id
+                            )));
+                        }
+                    }
+                    OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget { .. } => {
+                        if aspect.reuse_attestation_target_id != Some(commit.avionics_model_id) {
+                            return Err(ReviewError::Validation(format!(
+                                "review aspect {} is not authorized to select catalog id {}",
+                                aspect.id, commit.avionics_model_id
+                            )));
+                        }
+                    }
                 }
-                let referenced_as_replacement = payload.aspects.iter().any(|candidate| {
-                    candidate.replacement_aspect_id.as_ref() == Some(&aspect.id)
-                });
-                if aspect.configuration_action != "installed"
-                    || aspect.replaces_product_id.is_some()
-                    || aspect.replacement_aspect_id.is_some()
-                    || referenced_as_replacement
-                {
-                    return Err(ReviewError::Validation(format!(
-                        "review aspect {} is coupled to a replacement action and requires complete review",
-                        commit.aspect_id
-                    )));
-                }
-                if aspect.quantity <= 0 {
-                    return Err(ReviewError::Validation(format!(
-                        "review aspect {} has an invalid quantity",
-                        commit.aspect_id
-                    )));
-                }
-                if aspect.covered_associations.len() > 1
-                    || aspect
-                        .covered_associations
-                        .first()
-                        .is_some_and(|association| {
-                            association.role != ListingAssociationRole::Installed
-                        })
-                {
-                    return Err(ReviewError::Validation(format!(
-                        "review aspect {} does not identify one independent installed association",
-                        commit.aspect_id
-                    )));
-                }
+                validate_independent_ordinary_aspect(&aspect, &payload.aspects)?;
                 if !approved.contains_key(&commit.avionics_model_id)
                     || !reuse_attested_ids.contains(&commit.avionics_model_id)
                 {
@@ -2070,6 +2077,29 @@ async fn restage_pending_review_if_current_with_commit(
                         "avionics catalog id {} is not an approved current-policy reusable product",
                         commit.avionics_model_id
                     )));
+                }
+                if let OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
+                    expected_collision_closure_sha256,
+                } = &commit.authorization
+                {
+                    let current_collision_closure_sha256 =
+                        fingerprint_active_collision_closure(
+                            &active_collision_catalog_rows,
+                            &reuse_attested_ids,
+                            commit.avionics_model_id,
+                        )
+                        .ok_or_else(|| {
+                            ReviewError::Stale(format!(
+                                "catalog id {} lost its unique active collision closure",
+                                commit.avionics_model_id
+                            ))
+                        })?;
+                    if expected_collision_closure_sha256 != &current_collision_closure_sha256 {
+                        return Err(ReviewError::Stale(
+                            "active avionics collision catalog changed after local association matching; reload and re-evaluate"
+                                .to_string(),
+                        ));
+                    }
                 }
 
                 let existing_action_graph_issues: i64 =
@@ -2532,6 +2562,48 @@ pub(crate) async fn use_existing_product_for_aspect_and_restage(
             aspect_id: aspect_id.clone(),
             avionics_model_id,
             expected_catalog_revision_sha256: expected_catalog_revision_sha256.to_string(),
+            authorization: OrdinaryAspectUseExistingAuthorization::ReviewerSelection,
+        });
+    restage_pending_review_if_current_with_commit(
+        db,
+        owner_user_id,
+        listing_id,
+        expected_review_payload_sha256,
+        Some(&commit),
+    )
+    .await
+}
+
+/// Atomically accepts one locally verified, hash-bound reuse target on an
+/// independent ordinary extraction aspect.
+///
+/// This authorization is intentionally distinct from reviewer product
+/// selection: only the source-free verification workflow can supply the
+/// collision-closure token produced by the preceding exact local match.
+pub(crate) async fn approve_locally_verified_ordinary_aspect_and_restage(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    aspect_id: &ReviewAspectId,
+    expected_review_payload_sha256: &str,
+    expected_catalog_revision_sha256: &str,
+    expected_collision_closure_sha256: &str,
+    avionics_model_id: i64,
+) -> ReviewResult<Option<StagedPendingReview>> {
+    if avionics_model_id <= 0 {
+        return Err(ReviewError::Validation(
+            "avionics_model_id must be positive".to_string(),
+        ));
+    }
+    aspect_id.validate()?;
+    let commit =
+        ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(OrdinaryAspectUseExistingCommit {
+            aspect_id: aspect_id.clone(),
+            avionics_model_id,
+            expected_catalog_revision_sha256: expected_catalog_revision_sha256.to_string(),
+            authorization: OrdinaryAspectUseExistingAuthorization::HashBoundReuseTarget {
+                expected_collision_closure_sha256: expected_collision_closure_sha256.to_string(),
+            },
         });
     restage_pending_review_if_current_with_commit(
         db,
@@ -3800,6 +3872,49 @@ fn is_synthetic_preserved_attestation_aspect(aspect: &PendingReviewAspect) -> bo
         && aspect.id == preserved_review_aspect_id(association.listing_link_id, association.role)
 }
 
+fn validate_independent_ordinary_aspect(
+    aspect: &PendingReviewAspect,
+    aspects: &[PendingReviewAspect],
+) -> ReviewResult<()> {
+    if !aspect.kind.starts_with("avionics") || is_synthetic_preserved_attestation_aspect(aspect) {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} is not an ordinary avionics identity aspect",
+            aspect.id
+        )));
+    }
+    let referenced_as_replacement = aspects
+        .iter()
+        .any(|candidate| candidate.replacement_aspect_id.as_ref() == Some(&aspect.id));
+    if aspect.configuration_action != "installed"
+        || aspect.replaces_product_id.is_some()
+        || aspect.replacement_aspect_id.is_some()
+        || referenced_as_replacement
+    {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} is coupled to a replacement action and requires complete review",
+            aspect.id
+        )));
+    }
+    if aspect.quantity <= 0 {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} has an invalid quantity",
+            aspect.id
+        )));
+    }
+    if aspect.covered_associations.len() > 1
+        || aspect
+            .covered_associations
+            .first()
+            .is_some_and(|association| association.role != ListingAssociationRole::Installed)
+    {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} does not identify an independent installed association",
+            aspect.id
+        )));
+    }
+    Ok(())
+}
+
 fn association_role_label(role: ListingAssociationRole) -> &'static str {
     match role {
         ListingAssociationRole::Installed => "installed",
@@ -4341,7 +4456,13 @@ pub(crate) struct PendingProductAttestationTarget {
 pub(crate) struct ExistingProductAssociationTarget {
     pub product: ReviewProduct,
     pub listing_evidence_text: String,
-    pub observation_sha256: String,
+    pub commit: ExistingProductAssociationCommit,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ExistingProductAssociationCommit {
+    CorroboratePreserved { observation_sha256: String },
+    ApproveOrdinary,
 }
 
 fn compact_listing_identity_spans(source: &str, model: &str) -> Vec<(usize, usize)> {
@@ -4673,6 +4794,7 @@ pub(crate) async fn preflight_existing_product_association(
         ));
     }
     let assignments = load_existing_assignments(db, listing_id).await?;
+    validate_current_covered_associations(&payload.aspects, &assignments)?;
     let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
     let corroboration_rows = load_association_corroborations(db, listing_id).await?;
     let active_collision_catalog_rows = load_active_collision_catalog_rows(db).await?;
@@ -4700,55 +4822,11 @@ pub(crate) async fn preflight_existing_product_association(
         .iter()
         .find(|aspect| &aspect.id == aspect_id)
         .ok_or_else(|| ReviewError::Validation(format!("unknown review aspect {aspect_id}")))?;
-    if !is_synthetic_preserved_attestation_aspect(aspect) {
-        return Err(ReviewError::Validation(format!(
-            "review aspect {aspect_id} is not an isolated preserved-product association; resolve its extraction or capability decision separately"
-        )));
-    }
     let target_id = aspect.reuse_attestation_target_id.ok_or_else(|| {
         ReviewError::Validation(format!(
             "review aspect {aspect_id} is not an existing-product verification aspect"
         ))
     })?;
-    let association = aspect
-        .covered_associations
-        .first()
-        .expect("validated reuse target has exactly one association")
-        .clone();
-    let assignment = assignments
-        .iter()
-        .find(|assignment| assignment.listing_link_id == association.listing_link_id)
-        .ok_or_else(|| {
-            ReviewError::Stale(format!(
-                "listing link {} covered by review aspect {aspect_id} no longer exists",
-                association.listing_link_id
-            ))
-        })?;
-    if association.role != ListingAssociationRole::Installed
-        || assignment.configuration_action != "installed"
-        || assignment.replaces_avionics_model_id.is_some()
-        || assignment.quantity != 1
-        || aspect.quantity != 1
-    {
-        return Err(ReviewError::Validation(format!(
-            "review aspect {aspect_id} requires complete manual review: one-by-one verification currently supports only a single ordinary installed unit with no replacement relationship"
-        )));
-    }
-    let (current_target_id, current_status) = match association.role {
-        ListingAssociationRole::Installed => (
-            assignment.avionics_model_id,
-            assignment.installed_catalog_status.as_deref(),
-        ),
-        ListingAssociationRole::Replacement => (
-            assignment.replaces_avionics_model_id.unwrap_or_default(),
-            assignment.replacement_catalog_status.as_deref(),
-        ),
-    };
-    if current_target_id != target_id || current_status != Some("approved") {
-        return Err(ReviewError::Stale(format!(
-            "existing product association for review aspect {aspect_id} changed; restage the listing"
-        )));
-    }
     let product = load_all_approved_product_map(db)
         .await?
         .remove(&target_id)
@@ -4768,7 +4846,6 @@ pub(crate) async fn preflight_existing_product_association(
         })?
         .clone();
     if listing_evidence_text.len() > MAX_LISTING_EVIDENCE_CONTEXT_BYTES
-        || assignment.source_notes.as_deref() != Some(listing_evidence_text.as_str())
         || !exact_compact_listing_identity_is_present(&listing_evidence_text, &product.model)
     {
         return Err(ReviewError::Validation(format!(
@@ -4782,12 +4859,45 @@ pub(crate) async fn preflight_existing_product_association(
             "review aspect {aspect_id} contains an unresolved identity or capability qualifier and cannot use the exact local/one-by-one fast path"
         )));
     }
-    let observation_sha256 = association_observation_sha256(
-        listing_id,
-        assignment,
-        association.role,
-        &listing_evidence_text,
-    );
+    let commit = if is_synthetic_preserved_attestation_aspect(aspect) {
+        let association = aspect
+            .covered_associations
+            .first()
+            .expect("validated synthetic aspect has exactly one association");
+        let assignment = assignments
+            .iter()
+            .find(|assignment| assignment.listing_link_id == association.listing_link_id)
+            .ok_or_else(|| {
+                ReviewError::Stale(format!(
+                    "listing link {} covered by review aspect {aspect_id} no longer exists",
+                    association.listing_link_id
+                ))
+            })?;
+        if association.role != ListingAssociationRole::Installed
+            || assignment.configuration_action != "installed"
+            || assignment.replaces_avionics_model_id.is_some()
+            || assignment.quantity != 1
+            || aspect.quantity != 1
+            || assignment.avionics_model_id != target_id
+            || assignment.installed_catalog_status.as_deref() != Some("approved")
+            || assignment.source_notes.as_deref() != Some(listing_evidence_text.as_str())
+        {
+            return Err(ReviewError::Validation(format!(
+                "review aspect {aspect_id} requires complete manual review: preserved-product corroboration supports only one unchanged ordinary installed unit"
+            )));
+        }
+        ExistingProductAssociationCommit::CorroboratePreserved {
+            observation_sha256: association_observation_sha256(
+                listing_id,
+                assignment,
+                association.role,
+                &listing_evidence_text,
+            ),
+        }
+    } else {
+        validate_independent_ordinary_aspect(aspect, &payload.aspects)?;
+        ExistingProductAssociationCommit::ApproveOrdinary
+    };
     if !reuse_attested_ids.contains(&target_id) {
         return Err(ReviewError::Conflict(format!(
             "approved catalog id {target_id} requires global product attestation before listing associations can be verified"
@@ -4796,7 +4906,7 @@ pub(crate) async fn preflight_existing_product_association(
     Ok(ExistingProductAssociationTarget {
         product,
         listing_evidence_text,
-        observation_sha256,
+        commit,
     })
 }
 
@@ -10172,6 +10282,31 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_local_verification_rejects_coupled_replacements_without_id_conventions() {
+        let mut coupled = PendingReviewAspect::avionics(
+            "observation-17",
+            "avionics_identity",
+            "Garmin GTN 750Xi",
+            "Garmin GTN 750Xi replaces GNS 530W",
+            "catalog_match_requires_review",
+            1,
+            "replaces",
+            Some("Garmin GTN 750Xi replaces GNS 530W".to_string()),
+            Some("high".to_string()),
+        )
+        .with_replacement_product(44)
+        .with_reuse_attestation_target(43);
+        coupled.allowed_actions = vec![ReviewAction::Discard];
+
+        let error = validate_independent_ordinary_aspect(&coupled, &[coupled.clone()])
+            .expect_err("replacement graphs require complete review");
+        assert!(matches!(
+            error,
+            ReviewError::Validation(message) if message.contains("coupled")
+        ));
+    }
+
+    #[test]
     fn collision_closure_includes_other_model_equal_to_target_identifier() {
         let mut target = collision_fingerprint_row(1, "GTX 345R", "011-03520-00");
         target.catalog_status = "approved".to_string();
@@ -10593,6 +10728,64 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending_count, 1);
+    }
+
+    #[tokio::test]
+    async fn local_ordinary_approval_rejects_a_new_unreviewed_collision_under_lock() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "observation-17",
+            "avionics_identity",
+            "Garmin GMA 1347",
+            "Garmin GMA 1347 audio panel",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GMA 1347 audio panel".to_string()),
+            Some("high".to_string()),
+        )
+        .with_reuse_attestation_target(product_id);
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+        let expected_active_collision_revision =
+            active_collision_closure_revision_sha256(&db, product_id)
+                .await
+                .unwrap();
+
+        // This active row is outside the approved-only review revision but
+        // invalidates the exact local product decision made before commit.
+        insert_unreviewed_product(&db, "GMA-1347", "DIFFERENT-1347", "Audio Panel").await;
+        let error = approve_locally_verified_ordinary_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &ReviewAspectId::from("observation-17"),
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+            &expected_active_collision_revision,
+            product_id,
+        )
+        .await
+        .expect_err("the locked commit must reject a stale local collision snapshot");
+        assert!(matches!(error, ReviewError::Stale(_)));
+        assert!(error
+            .to_string()
+            .contains("active avionics collision catalog"));
+
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(link_count, 0);
+        let row = load_review_row(&db, listing_id).await.unwrap();
+        assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
     }
 
     #[tokio::test]
