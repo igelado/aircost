@@ -1,14 +1,14 @@
 //! Fail-closed admission for listing-backed aircraft work.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-use crate::db::{AppDb, DatabaseBackend};
-
 use super::{lookup_current, require_eligible, AircraftGrounding, BlockReason, Eligibility};
+use crate::aircraft::identity::{require_listing_identity_assignment, IdentityAssignmentError};
+use crate::db::{AppDb, DatabaseBackend};
 
 /// A listing or raw aircraft observation that cannot be admitted through the
 /// current FAA projection. Rejections preserve the source listing; callers
@@ -188,14 +188,22 @@ pub async fn require_aircraft_admission(
     }
 }
 
-/// Load the current canonical registration and serial for an existing listing,
-/// then apply the same fail-closed admission policy as new listing ingestion.
-pub async fn require_listing_admission(
+/// Load registration and serial for an existing listing and require only the
+/// raw current FAA match. This is the pre-curation boundary: it intentionally
+/// does not treat legacy product labels as authoritative.
+pub async fn require_listing_faa_admission(
     db: &AppDb,
     listing_id: i64,
 ) -> Result<AircraftGrounding, AircraftAdmissionError> {
-    let sql = db
-        .sql("SELECT registration_number, serial_number FROM aircraft_sale_listings WHERE id = ?");
+    let sql = db.sql(
+        r#"
+        SELECT
+          listing.registration_number,
+          listing.serial_number
+        FROM aircraft_sale_listings listing
+        WHERE listing.id = ?
+        "#,
+    );
     let row = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
             sqlx::query_as::<_, ListingIdentityRow>(&sql)
@@ -225,6 +233,47 @@ pub async fn require_listing_admission(
     .map_err(|error| error.with_listing_id(listing_id))
 }
 
+/// Published/valuation admission requires both the raw FAA match and the
+/// current immutable curated identity assignment bound to that exact release.
+pub async fn require_listing_admission(
+    db: &AppDb,
+    listing_id: i64,
+) -> Result<AircraftGrounding, AircraftAdmissionError> {
+    let grounding = require_listing_faa_admission(db, listing_id).await?;
+    require_listing_identity_assignment(db, listing_id, &grounding)
+        .await
+        .map_err(|error| identity_assignment_admission_error(listing_id, &grounding, error))?;
+    Ok(grounding)
+}
+
+fn identity_assignment_admission_error(
+    listing_id: i64,
+    grounding: &AircraftGrounding,
+    error: IdentityAssignmentError,
+) -> AircraftAdmissionError {
+    match error {
+        IdentityAssignmentError::Missing(_) => AircraftAdmissionError::Rejected {
+            listing_id: Some(listing_id),
+            reason: BlockReason::CanonicalIdentityAssignmentMissing,
+            n_number: Some(grounding.n_number.clone()),
+            snapshot_id: Some(grounding.snapshot.id),
+        },
+        IdentityAssignmentError::Mismatch { .. } => AircraftAdmissionError::Rejected {
+            listing_id: Some(listing_id),
+            reason: BlockReason::CanonicalIdentityAssignmentMismatch,
+            n_number: Some(grounding.n_number.clone()),
+            snapshot_id: Some(grounding.snapshot.id),
+        },
+        IdentityAssignmentError::ListingNotFound(_) => {
+            AircraftAdmissionError::ListingNotFound { listing_id }
+        }
+        IdentityAssignmentError::Database(message) => AircraftAdmissionError::LookupFailed {
+            listing_id: Some(listing_id),
+            message,
+        },
+    }
+}
+
 /// Audit every stored listing, or an exact requested subset, through the same
 /// strict policy used for mutation admission. A requested listing that no
 /// longer exists is excluded rather than silently disappearing. Database
@@ -233,9 +282,7 @@ pub async fn audit_listing_admission(
     db: &AppDb,
     listing_ids: Option<&BTreeSet<i64>>,
 ) -> Result<ListingAdmissionReport, AircraftAdmissionError> {
-    let sql = db.sql(
-        "SELECT id, registration_number, serial_number FROM aircraft_sale_listings ORDER BY id",
-    );
+    let sql = db.sql("SELECT id, serial_number FROM aircraft_sale_listings ORDER BY id");
     let rows = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
             sqlx::query_as::<_, ListingAdmissionRow>(&sql)
@@ -255,29 +302,13 @@ pub async fn audit_listing_admission(
 
     let mut report = ListingAdmissionReport::default();
     let mut found_ids = BTreeSet::new();
-    let mut cache = HashMap::<
-        (Option<String>, Option<String>),
-        Result<AircraftGrounding, AircraftAdmissionError>,
-    >::new();
     for row in rows {
         if listing_ids.is_some_and(|ids| !ids.contains(&row.id)) {
             continue;
         }
         found_ids.insert(row.id);
         report.evaluated_count += 1;
-        let key = (row.registration_number.clone(), row.serial_number.clone());
-        let admission = if let Some(cached) = cache.get(&key) {
-            cached.clone()
-        } else {
-            let result = require_aircraft_admission(
-                db,
-                row.registration_number.as_deref(),
-                row.serial_number.as_deref(),
-            )
-            .await;
-            cache.insert(key, result.clone());
-            result
-        };
+        let admission = require_listing_admission(db, row.id).await;
         match admission {
             Ok(grounding) => {
                 report.admitted_count += 1;
@@ -350,6 +381,15 @@ pub fn block_reason_code(reason: &BlockReason) -> &'static str {
         BlockReason::RegistrationNotCovered => "registration_not_covered",
         BlockReason::AmbiguousRegistration => "ambiguous_registration",
         BlockReason::SerialConflict => "serial_conflict",
+        BlockReason::RegistryAircraftIdentityUnavailable => {
+            "registry_aircraft_identity_unavailable"
+        }
+        BlockReason::AircraftManufacturerMismatch => "aircraft_manufacturer_mismatch",
+        BlockReason::AircraftModelMismatch => "aircraft_model_mismatch",
+        BlockReason::CanonicalIdentityAssignmentMissing => "canonical_identity_assignment_missing",
+        BlockReason::CanonicalIdentityAssignmentMismatch => {
+            "canonical_identity_assignment_mismatch"
+        }
     }
 }
 
@@ -362,7 +402,6 @@ struct ListingIdentityRow {
 #[derive(Debug, FromRow)]
 struct ListingAdmissionRow {
     id: i64,
-    registration_number: Option<String>,
     serial_number: Option<String>,
 }
 

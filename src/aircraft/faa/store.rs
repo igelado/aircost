@@ -85,6 +85,7 @@ async fn store_sqlite(pool: &SqlitePool, release: &Release) -> Result<StoredSnap
     insert_aircraft_references_sqlite(&mut transaction, snapshot_id, release).await?;
     insert_engine_references_sqlite(&mut transaction, snapshot_id, release).await?;
     insert_coverage_sqlite(&mut transaction, snapshot_id, release).await?;
+    quarantine_stale_ready_listings_sqlite(&mut transaction, snapshot_id).await?;
     transaction.commit().await?;
     Ok(stored_snapshot(
         snapshot_id,
@@ -149,6 +150,7 @@ async fn store_postgres(pool: &PgPool, release: &Release) -> Result<StoredSnapsh
     insert_aircraft_references_postgres(&mut transaction, snapshot_id, release).await?;
     insert_engine_references_postgres(&mut transaction, snapshot_id, release).await?;
     insert_coverage_postgres(&mut transaction, snapshot_id, release).await?;
+    quarantine_stale_ready_listings_postgres(&mut transaction, snapshot_id).await?;
     transaction.commit().await?;
     Ok(stored_snapshot(
         snapshot_id,
@@ -156,6 +158,104 @@ async fn store_postgres(pool: &PgPool, release: &Release) -> Result<StoredSnapsh
         release,
         true,
     ))
+}
+
+async fn quarantine_stale_ready_listings_sqlite(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE aircraft_sale_listings
+        SET ingestion_state = 'quarantined',
+            ingestion_error = 'FAA snapshot rollover: current canonical aircraft assignment does not cite snapshot '
+              || ?,
+            ingestion_completed_at = NULL,
+            is_verified = 0,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE ingestion_state = 'ready'
+          AND EXISTS (
+            SELECT 1
+            FROM faa_registry_snapshots imported_release
+            JOIN faa_registry_snapshots latest_release
+              ON latest_release.id = (
+                SELECT id FROM faa_registry_snapshots
+                ORDER BY snapshot_date DESC, id DESC LIMIT 1
+              )
+             AND latest_release.snapshot_date = imported_release.snapshot_date
+             AND latest_release.archive_sha256 = imported_release.archive_sha256
+            WHERE imported_release.id = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_current_identity_assignments current_assignment
+            JOIN aircraft_sale_listing_identity_assignments assignment
+              ON assignment.id = current_assignment.identity_assignment_id
+             AND assignment.aircraft_sale_listing_id = current_assignment.aircraft_sale_listing_id
+            JOIN faa_registry_snapshots assignment_snapshot
+              ON assignment_snapshot.id = assignment.faa_registry_snapshot_id
+            JOIN faa_registry_snapshots imported_release
+              ON imported_release.id = ?
+             AND imported_release.snapshot_date = assignment_snapshot.snapshot_date
+             AND imported_release.archive_sha256 = assignment_snapshot.archive_sha256
+            WHERE current_assignment.aircraft_sale_listing_id = aircraft_sale_listings.id
+          )
+        "#,
+    )
+    .bind(snapshot_id)
+    .bind(snapshot_id)
+    .bind(snapshot_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn quarantine_stale_ready_listings_postgres(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE aircraft_sale_listings
+        SET ingestion_state = 'quarantined',
+            ingestion_error = 'FAA snapshot rollover: current canonical aircraft assignment does not cite snapshot '
+              || $1::text,
+            ingestion_completed_at = NULL,
+            is_verified = FALSE,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE ingestion_state = 'ready'
+          AND EXISTS (
+            SELECT 1
+            FROM faa_registry_snapshots imported_release
+            JOIN faa_registry_snapshots latest_release
+              ON latest_release.id = (
+                SELECT id FROM faa_registry_snapshots
+                ORDER BY snapshot_date DESC, id DESC LIMIT 1
+              )
+             AND latest_release.snapshot_date = imported_release.snapshot_date
+             AND latest_release.archive_sha256 = imported_release.archive_sha256
+            WHERE imported_release.id = $1
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_current_identity_assignments current_assignment
+            JOIN aircraft_sale_listing_identity_assignments assignment
+              ON assignment.id = current_assignment.identity_assignment_id
+             AND assignment.aircraft_sale_listing_id = current_assignment.aircraft_sale_listing_id
+            JOIN faa_registry_snapshots assignment_snapshot
+              ON assignment_snapshot.id = assignment.faa_registry_snapshot_id
+            JOIN faa_registry_snapshots imported_release
+              ON imported_release.id = $1
+             AND imported_release.snapshot_date = assignment_snapshot.snapshot_date
+             AND imported_release.archive_sha256 = assignment_snapshot.archive_sha256
+            WHERE current_assignment.aircraft_sale_listing_id = aircraft_sale_listings.id
+          )
+        "#,
+    )
+    .bind(snapshot_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn insert_aircraft_references_sqlite(

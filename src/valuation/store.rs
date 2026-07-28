@@ -643,12 +643,12 @@ mod tests {
               feature_schema_version, included_count, excluded_count
             ) VALUES (
               '2026-07-20', lower(hex(randomblob(32))),
-              '{"faa_admission":{"schema_version":1,"included_listings":{}}}',
-              ?, 3, 0
+              ?, ?, 3, 0
             )
             RETURNING id
             "#,
         )
+        .bind(crate::valuation::dataset::empty_test_snapshot_selection_policy_json())
         .bind(crate::valuation::FEATURE_SCHEMA_VERSION as i64)
         .fetch_one(pool)
         .await

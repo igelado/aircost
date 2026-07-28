@@ -7,6 +7,7 @@ pub mod extract;
 pub mod fit;
 pub mod gemini;
 pub mod html;
+pub mod listing;
 pub mod listings;
 pub mod models;
 pub mod normalize;

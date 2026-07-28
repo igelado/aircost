@@ -28,6 +28,17 @@ proof. Generation and factory package remain distinct because a designation
 such as `SR22` does not by itself establish a generation such as `G6` or a
 package such as `GTS`.
 
+An aircraft hierarchy decision may use `no_supported_selection` only for
+generation or package. This is an approved operational `NULL` for one exact,
+grounded catalog result: every retained model/variant token is accounted for
+by the exact FAA designation or a positively typed hierarchy selection,
+targeted primary-source research found no positive candidate for the NULL
+dimension, and the catalog has no applicable relationship. Relationship
+absence is rechecked transactionally on every apply and replay. It is not a
+claim that the real-world dimension does not exist, carries no evidence or
+selected entity, and cannot be used for required make/family/designation
+decisions.
+
 `aircraft_reference_configurations`,
 `aircraft_reference_configuration_versions`, and reference applicability,
 price, avionics, engine, propeller, and feature tables
@@ -50,15 +61,37 @@ addresses, other names, Mode-S values, unrelated registrations, and all other
 archive members are excluded. These tables provide registration-identity
 evidence only; they do not populate the canonical aircraft catalog.
 
+`curation_evidence_sources`, `curation_evidence_claims`
+
+Store only durable source identity and atomic cited claims used by active
+approval, provenance, assignment, applicability, and reference-fact
+constraints. They do not store a Gemini prompt, response, Search result set, or
+complete URL-context dossier. Same-case Gemini corrections may reuse verified
+working evidence in memory; cross-run matching uses approved catalog facts and
+IDs instead of replaying source material.
+
+There is deliberately no generic `faa_source_records`, `faa_source_snapshots`,
+or `faa_source_checks` cache for avionics. The current FAA registry import has a
+documented, versioned bulk source and is used as controlling evidence for
+aircraft registration identity. The avionics sources investigated so far do
+not expose an equivalent stable, unauthenticated product-identity feed: DRS API
+access is credentialed and its document records are not a product catalog, and
+ADS-B equipment data does not establish the exact marketed unit installed in a
+listing. If a future FAA source is integrated, it should receive a typed,
+source-specific snapshot schema with an explicit provenance and refresh
+contract rather than being hidden behind an unused generic cache.
+
 `aircraft_sale_listings`
 
 Stores canonical sale listing facts: model variant, source URL, model year,
 asking price, currency, status, registration, serial number, and airframe,
-engine, and propeller hours. `ingestion_state` keeps incomplete or quarantined
-rows out of serving and training. Component times are nullable and carry an
-explicit basis, evidence text, and confidence; a missing time is not converted
-to zero or copied from the airframe. High-confidence installed engine and
-propeller identities are linked separately from the factory configuration.
+engine, and propeller hours. `ingestion_state` keeps `incomplete`,
+`pending_review`, and `quarantined` rows out of serving and training. A pending
+review is an expected curation state, while quarantine records a failed
+completion. Component times are nullable and carry an explicit basis, evidence
+text, and confidence; a missing time is not converted to zero or copied from
+the airframe. High-confidence installed engine and propeller identities are
+linked separately from the factory configuration.
 
 `aircraft_sale_listing_facts`
 
@@ -126,7 +159,12 @@ stored as durable avionics models. `catalog_status` separates the curated
 `approved` catalog from preserved legacy `unreviewed` rows. Approval requires a
 stable manufacturer part/model number or authoritative SKU, its normalized
 uniqueness key, `very_high` identity confidence, authoritative non-listing
-evidence, and a review timestamp.
+evidence, and a review timestamp. A documented legacy manufacturer model
+number may equal the canonical model label; a separate OEM LRU part number is
+not required. Listing association is a separate claim: one current attested
+product may be selected locally from a unique, complete, exact
+manufacturer/model occurrence, while non-exact prefix/suffix similarity remains
+review-only candidate retrieval.
 One physical product can expose multiple capabilities through
 `avionics_model_types`; for example, one GNX 375 identity can be both GPS and
 transponder equipment without duplicating the product. Types are not part of
@@ -143,6 +181,39 @@ only with a non-empty recorded value source. Identity approval does not approve
 numeric metadata; legacy values and suite memberships are cleared when a row is
 promoted and must be grounded separately.
 
+`avionics_manufacturer_canonical_keys` is only a deterministic lookup key.
+`avionics_manufacturer_identities` is the curated, authoritative manufacturer
+namespace, and immutable memberships retain every raw manufacturer spelling.
+Only punctuation/spacing variants with the exact same deterministic key attach
+automatically to an existing evidence-backed identity. Semantic aliases are
+stored in `avionics_manufacturer_alias_candidates` until a human reviewer
+corroborates official evidence. A reviewed redirect is append-only; raw maker
+rows and their original memberships are never rewritten or deleted.
+
+`avionics_approved_product_identities` is the uniqueness registry for approved
+products. Its product-name and stable-identifier constraints are scoped by the
+effective manufacturer identity, not a raw spelling row. Identifier kind
+remains part of identity: a SKU value is not automatically equal to the same
+text used as a part or model number. An approved manufacturer redirect is
+blocked while the two namespaces contain an exact product collision. The
+human decision remains recorded, the explicit product-consolidation workflow
+adjudicates those rows, and only then can the redirect be finalized.
+
+`avionics_legacy_manufacturer_alias_signals` is a read-only review aid for
+cross-maker exact product-name or exact stable-identifier matches. It does not
+create curated identities from unreviewed legacy names. Once one side gains
+authoritative evidence, matching unassigned makers are staged as pending alias
+candidates without approval.
+
+`avionics_catalog_consolidation_guard` is a transient transaction guard, not a
+review queue or durable merge log. A row authorizes one exact unreviewed
+duplicate-to-survivor pair only. Its insert and every association remap
+revalidate equal canonical manufacturer plus equal product or non-empty stable
+identifier kind and normalized value. A matching identifier value with a
+different kind is not an identity edge. While a pair exists, both endpoint
+identities and statuses are immutable. Consolidation must delete and verify all
+guard rows before changing or deleting either endpoint and before committing.
+
 `aircraft_sale_listing_avionics`
 
 Links concrete avionics units to a specific sale listing. The link stores
@@ -151,7 +222,23 @@ quantity, provenance, evidence confidence, and an explicit `installed`,
 target. Valuation starts from factory defaults and applies these links as
 deltas. New primary and replacement links require approved catalog identities;
 the installation-evidence confidence on the link is independent from catalog
-identity confidence.
+identity confidence. A listing cannot contain the same canonical product twice
+or install and replace the same product. Ready or verified listing associations
+are immutable. A transition to `ready` additionally requires positive quantity,
+approved endpoints, high confidence, and `listing` or `listing_review`
+provenance for every avionics link.
+
+`aircraft_sale_listing_pending_reviews`
+
+Stores the durable handoff for listing avionics that cannot be resolved with
+the confidence required for a canonical association. There is exactly one
+bundle per listing, containing all pending aspects, an optional retained plugin
+submission reference, the extraction fingerprint, the serialized payload and
+its hash, and the approved-catalog revision against which it was prepared. The
+row moves the listing to `pending_review`; unresolved text is not inserted into
+`avionics_models` or `aircraft_sale_listing_avionics` merely so it can be
+reviewed. Replacing the bundle is an upsert, and deleting the listing cascades
+to its bundle.
 
 `aircraft_model_variant_default_avionics`
 
@@ -229,17 +316,64 @@ Listings are created through either the web API or plugin submission path:
    are retrieval aids only. Every positive identity—including an already
    approved match—undergoes an independent proposal attestation and
    candidate-by-candidate collision review before it can be associated.
-9. Upsert manufacturer, model, and variant lookup rows.
-10. Insert the listing, or update an equivalent existing listing, in the
-   `incomplete` ingestion state.
-11. Replace source-backed listing avionics, installed-component identities, and
-   valuation facts.
-12. Enrich and validate missing authoritative factory specs, exact-model-year
-   price evidence, factory avionics, and listing avionics metadata.
-13. Mark the listing `ready` only after every readiness query passes. A failed
-   completion remains stored as `quarantined` with the error for inspection or
-   reprocessing.
-14. Mark valuation snapshots stale and remove orphaned lookup rows.
+9. Keep only verified canonical outcomes. An approved identity can become a
+   listing association. A primary candidate is automatically discarded as
+   generic or garbage only when Gemini returns high confidence, selects a
+   structured `rejection_basis`, and states a candidate-specific negative
+   `reason` consistent with that basis. The whole normalized reason must occur
+   in one Google Search grounding support span linked to a cited source, and
+   must explicitly name the observed model and its usable manufacturer.
+   Identity-only, unrelated, fragmented, or contradictory citation support is
+   not rejection evidence. An unsafe rejection is corrected once and otherwise
+   becomes unresolved. An unresolved identity is converted into a review
+   aspect; its raw label is not inserted into the catalog. Replacement and
+   removal targets are resolved independently so uncertain configuration
+   semantics remain explicit.
+10. Upsert manufacturer, model, and variant lookup rows.
+11. Insert the listing, or update an equivalent existing listing, in the
+   `incomplete` ingestion state, and replace source-backed approved avionics,
+   installed-component identities, and valuation facts.
+12. If any avionics aspects remain unresolved, atomically upsert the complete
+   one-row review bundle and set the listing to `pending_review`. Enrichment is
+   skipped while that row exists.
+13. Otherwise, enrich and validate missing authoritative factory specs,
+   exact-model-year price evidence, factory avionics, and listing avionics
+   metadata.
+14. Mark the listing `ready` only after every readiness query passes. A failed
+   persistence or enrichment completion remains stored as `quarantined` with
+   the error for inspection or reprocessing; expected identity uncertainty
+   remains `pending_review` instead.
+15. Mark valuation snapshots stale and remove orphaned lookup rows.
+
+Review resolution is a separate lifecycle. Every avionics aspect offers all
+three actions, and the reviewer must submit exactly one: use an existing
+approved product, create a verified product, or discard the observation with a
+reason. Creation requires one or more canonical capabilities, a stable
+manufacturer identifier kind and value, and an authoritative source URL,
+title, and evidence text. An unlinked observation receives an explicit legacy
+promotion target only when its normalized identity selects exactly one catalog
+row and that row is `unreviewed`. An aspect covering an existing legacy listing
+association can instead expose that exact row by its covered catalog ID. In
+either case the ID is only a candidate: a matching create decision may promote
+it only after identity, status, normalized-identity uniqueness, identifier and
+model collisions, global references, and exact cross-listing coverage are
+rechecked under lock. A corrected manufacturer/model creates a separate
+approved identity and leaves the old candidate and unrelated links untouched.
+
+The server checks mandatory FAA admission before entering this catalog-writing
+transaction. The transaction rejects stale payload or catalog hashes, applies
+all catalog decisions and only the exact covered listing-link ID/role pairs,
+removes the bundle, and returns the listing to `incomplete`. After commit, the
+server rechecks FAA admission before ordinary grounded enrichment and final
+publication. Successful source-backed completion becomes `ready` and verified
+only after all readiness checks pass; an admission or enrichment failure
+becomes `quarantined`. If a new pending bundle appears while post-review
+enrichment is running, that bundle wins: the listing remains `pending_review`
+instead of becoming a stranded quarantined review. Reviewer-accepted listing
+associations are stored with
+high installation confidence and a `listing_review` source, which is eligible
+where valuation reads otherwise accept high-confidence `listing` evidence.
+Network enrichment is intentionally not held inside the review transaction.
 
 The listing insert path deliberately keeps code generic. If a Cessna, Cirrus, or
 another maker needs better results, the preferred fix is better prompts, better
@@ -250,11 +384,24 @@ validation, or better data in reusable tables.
 `PATCH /api/listings/{id}` merges provided fields into the current listing,
 then applies the same mandatory FAA admission check before variant correction,
 avionics resolution, or any database mutation. An update cannot retain or
-introduce a non-N, unresolved, or serial-conflicting identity. Admitted updates
-replace evidence links, return the row to `incomplete`, and run the same
-completion path as inserts. If the update moves a listing to a different
-aircraft model, both the old and new model scopes make the frozen valuation
-snapshot stale. No listing write implicitly refits or activates a model.
+introduce a non-N, unresolved, or serial-conflicting aircraft identity.
+Avionics are an explicit replacement boundary. A patch without an `avionics`
+member does not invoke avionics identity resolution and does not rewrite
+listing-avionics links or the pending bundle; ordinary price, status, hours,
+and similar edits preserve its hashes and exact covered link IDs. Supplying any
+avionics-resolution context field—`manufacturer`, `model`, `variant`,
+`model_year`, `source_url`, `registration_number`, or `serial_number`—requires
+an explicit valid `avionics` array in the same patch. Null, non-array, or
+malformed avionics fail before mutation. An explicit empty array is a
+deliberate complete replacement that clears the old links and pending evidence;
+a non-empty array is resolved and restaged as needed. Admitted updates return
+the row to `incomplete` and run the same completion or pending-review path as
+inserts. If explicit restaging fails after links were replaced, the server
+removes the now-stale prior bundle before quarantining the listing, so exact
+coverage cannot point at obsolete link IDs. If the update moves a listing to a
+different aircraft model, both the
+old and new model scopes make the frozen valuation snapshot stale. No listing
+write implicitly refits or activates a model.
 
 ## Removal Path
 
@@ -273,11 +420,14 @@ removes unreferenced lookup rows:
   avionics references
 - aircraft models with no variants or specs
 - aircraft manufacturers with no models
-- unapproved avionics models with no listing/default/replacement/suite links;
-  approved catalog identities are retained independently of current installs
-- avionics manufacturers and types with no models
 - engine and propeller models with no aircraft spec references
 - engine and propeller manufacturers with no models
+
+Avionics catalog candidates, raw manufacturer spellings, and capability rows
+are deliberately excluded from generic orphan cleanup. Pending-review payloads
+can cite them without a foreign key, so only an explicit global catalog audit
+may delete them after proving that no relational role or review bundle refers
+to them.
 
 The admin command is:
 
@@ -285,15 +435,17 @@ The admin command is:
 cargo run --bin aircost-admin -- cleanup-orphans
 ```
 
-## Healing And Enrichment Commands
+## Curation And Enrichment Commands
 
-Dry-run commands are available for review before applying broad DB changes:
+Aircraft labels from listings are no longer mechanically healed or normalized
+into catalog rows. They remain review input until FAA-backed identity curation
+selects an existing canonical hierarchy or admits a new one. Dry-run commands
+are available for the remaining evidence-backed workflows:
 
 ```bash
-cargo run --bin aircost-admin -- heal-aircraft-models --dry-run
-cargo run --bin aircost-admin -- normalize-variants --manufacturer Cessna --model "182 SKYLANE" --dry-run
 cargo run --bin aircost-admin -- curate-avionics --dry-run
 cargo run --bin aircost-admin -- repopulate-avionics --limit 10 --dry-run
+cargo run --bin aircost-admin -- stage-listing-reviews --limit 100 --dry-run
 cargo run --bin aircost-admin -- enrich-avionics --dry-run
 cargo run --bin aircost-admin -- enrich-model-year-avionics --dry-run
 cargo run --bin aircost-admin -- enrich-aircraft-specs --dry-run
@@ -529,9 +681,9 @@ sqlite3 -bail data/aircost.sqlite3 \
 
 Run the migration only when the preflight query returns `0`. Then use
 the temporary `repopulate-avionics` workflow below to classify stored listing
-equipment and replace associations safely. Mechanical `normalize-avionics` is
-legacy unreviewed-row hygiene, not catalog approval, and is never run
-automatically during listing ingestion.
+equipment and replace associations safely. The former mechanical
+`normalize-avionics` command was removed: typography-only maker/model matches
+are review signals and can never authorize catalog rewrites or deletion.
 
 ## Avionics Multiple-Type Migration
 
@@ -561,20 +713,180 @@ sqlite3 -bail data/aircost.sqlite3 \
   ".read migrations/20260721_avionics_multi_type.sqlite.sql"
 ```
 
-### Temporary stored-listing avionics rebuild
+## Listing Pending-Review Migration
 
-`repopulate-avionics` uses retained `plugin_submissions` rather than asking
-users to add listings again. It prefers the latest submission linked through
-`canonical_listing_id` and uses an exact source-URL fallback for an unlinked
-submission. A retained extraction is replayed only when it has at least one
-equipment item and every item uses the current non-empty `types` capability
-array. Empty or scalar `type` payloads are not normalized or mechanically
-converted. Instead, the tool re-runs the current Gemini listing extractor
-against the retained `rendered_html`, then passes that transient current-schema
-result to grounded identity resolution. The signed plugin payload is never
-overwritten.
+The durable listing review state is installed by the matching backend
+migration:
 
-Start with one listing or the default ten-listing dry run:
+```text
+migrations/20260724_listing_pending_reviews.sqlite.sql
+migrations/20260724_listing_pending_reviews.postgres.sql
+```
+
+It extends the listing ingestion-state constraint with `pending_review` and
+creates `aircraft_sale_listing_pending_reviews`. It does not populate the
+table, classify legacy equipment, change listing-avionics links, or create FAA
+cache tables. Apply it after the aircraft-reference and avionics catalog
+migrations and before deploying code that can stage review bundles.
+
+Back up SQLite and apply in fail-fast mode:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260724_listing_pending_reviews.sqlite.sql"
+sqlite3 -readonly data/aircost.sqlite3 \
+  "PRAGMA foreign_key_check; SELECT ingestion_state, COUNT(*) FROM aircraft_sale_listings GROUP BY ingestion_state;"
+```
+
+Both backend migrations are idempotent. The SQLite version rebuilds
+`aircraft_sale_listings` to extend its check constraint, preserves IDs and
+listing data, recreates its indexes, and runs `PRAGMA foreign_key_check` before
+returning.
+
+## Identity Deduplication Postconditions Migration
+
+Canonical approved-product uniqueness, guarded legacy remaps, and listing-link
+postconditions are installed together by the matching backend migration:
+
+```text
+migrations/20260725_identity_deduplication_postconditions.sqlite.sql
+migrations/20260725_identity_deduplication_postconditions.postgres.sql
+```
+
+Apply it after the catalog, aircraft-reference, and pending-review migrations
+and before running legacy catalog consolidation. It intentionally leaves
+unreviewed collisions on non-ready listings in place. Existing invalid ready
+rows are preserved but quarantined and unverified with a repair reason. The
+migration never merges products or approves an identity.
+
+For SQLite, back up the database, rehearse on a copy, and use fail-fast mode:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260725_identity_deduplication_postconditions.sqlite.sql"
+sqlite3 -readonly data/aircost.sqlite3 \
+  "PRAGMA foreign_key_check; PRAGMA integrity_check; SELECT COUNT(*) FROM avionics_catalog_consolidation_guard;"
+```
+
+The final guard count must be zero outside an active consolidation transaction.
+Startup preflight requires the canonical-key, approved-identity, guard, and
+validated-authorization objects so an old database reports the exact migration
+command rather than failing later with a missing-table error.
+
+`aircost-admin audit-avionics-duplicates` is read-only and reports collisions
+by stored keys, current canonical maker/product keys, and exact maker-scoped
+stable-identifier kind/normalized-value pairs. Run
+`aircost-admin consolidate-legacy-avionics` without `--apply` first. Automatic
+application is limited to unreviewed rows where every pair in a component has
+the same non-empty manufacturer identifier kind and normalized value. A
+mechanically equal maker/model label remains an audit candidate, not destructive
+merge evidence. Transitive-only graphs, conflicting or differently namespaced
+identifiers, fuzzy-similarity candidates, and same-listing quantity ambiguity
+remain blocked for grounded review. Raw manufacturer rows are historical input
+and are never reparented or deleted by legacy consolidation; semantic maker
+resolution uses only the evidence-backed alias decision and redirect workflow.
+
+## Legacy Listing Review Staging
+
+`stage-listing-reviews` prepares the new review bundles from existing listing
+data without rerunning Gemini. It reads the latest retained plugin extraction,
+including old scalar `type` fields, together with current listing links and
+catalog state. It deterministically identifies unlinked observations,
+unapproved legacy products, low-confidence or mismatched links, unsupported
+capabilities, and unresolved replacement targets. Approved, high-confidence
+legacy links that do not match any usable retained observation are also staged,
+including their exact installed and replacement roles, so stale imported links
+cannot bypass review. If no usable retained observations exist, those
+approved/high links are preserved rather than rejected without evidence.
+Associations with `listing_review` provenance are never reopened by this
+backfill.
+
+Dry run is the default and is strictly read-only:
+
+```sh
+cargo run --bin aircost-admin -- stage-listing-reviews \
+  --database /absolute/path/to/aircost.sqlite3 \
+  --limit 100
+
+cargo run --bin aircost-admin -- stage-listing-reviews \
+  --database /absolute/path/to/aircost.sqlite3 \
+  --listing-id 51
+```
+
+The JSON report includes per-listing status, reason counts, source issues,
+pending aspect counts, and the approved-catalog revision. It also reports zero
+Gemini calls, catalog writes, and listing-link writes. After inspecting that
+report, opt in to staging:
+
+```sh
+cargo run --bin aircost-admin -- stage-listing-reviews \
+  --database /absolute/path/to/aircost.sqlite3 \
+  --limit 100 \
+  --apply
+```
+
+Apply mode creates or replaces at most one complete bundle per selected
+listing and moves that listing to `pending_review`. It does not delete or
+rewrite the legacy catalog or listing links; those records remain available as
+explicit context until a reviewer submits a complete decision set. Coverage is
+recorded by exact listing-link ID and installed/replacement role; sharing a
+catalog product with another link therefore cannot cause that other association
+to be removed. A live review not produced by this backfill is never overwritten
+or cleared. Re-running apply clears an obsolete backfill-owned bundle only when
+that listing no longer has any pending aspects.
+
+For an unlinked retained observation, staging exposes an in-place catalog
+candidate only when normalized manufacturer/model selects exactly one catalog
+row and that row is `unreviewed`. Duplicate identities, approved rows, and
+rejected rows are not implicit promotion targets. A staged aspect that covers
+an existing legacy association can expose that exact catalog row by ID without
+pretending the row was selected by an unlinked uniqueness search. Neither form
+is preapproved: promotion still rechecks normalized-identity uniqueness and
+identifier/model collisions under the write lock, in addition to status and
+reference coverage. The reviewer receives all three actions. A create decision
+with the same identity may promote the surviving explicit candidate; a
+corrected identity creates a new row instead of rewriting it.
+
+The stored catalog hash is staging provenance. Review reads return the current
+approved-only catalog fingerprint, and resolution recomputes that fingerprint
+under the write lock. Edits to legacy `unreviewed` or `rejected` rows therefore
+do not create false stale-review conflicts, while a real change to an approved
+product's fingerprinted manufacturer, model, capabilities, stable identifier,
+or approval membership requires the reviewer to reload. Promoting a covered
+legacy product is rejected if it participates in aircraft defaults, reference
+configurations, or avionics suites; those global relationships require separate
+catalog curation and cannot be adjudicated from one sale listing.
+
+## Temporary Stored-Listing Avionics Rebuild
+
+`repopulate-avionics` automates only listings that already have a pending
+review. It uses exactly the `plugin_submission_id` attached to that review; it
+does not select a newer submission or silently substitute another same-URL
+payload. The listing and submission must have the same owner and the
+submission must either be canonically linked to the listing or have the exact
+listing source URL without being linked elsewhere. Before any Gemini call, the
+workflow verifies the stored review-payload SHA-256 and the retained rendered
+HTML against its signed SHA-256.
+
+A retained extraction is replayed only when it has at least one equipment item
+and every item uses the current non-empty `types` capability array. Empty or
+scalar `type` payloads are not normalized or mechanically converted. Instead,
+the tool re-runs the current Gemini listing extractor against the verified
+`rendered_html`, then passes that transient current-schema result to grounded
+identity resolution. The generated extraction is not written back to the
+signed plugin submission. Each listing's Gemini usage is attributed to that
+listing and exact plugin submission.
+
+Identity resolution does not resend the whole retained listing for every
+candidate. It builds an exact source-only context capped at 4,096 bytes from a
+header slice, the candidate neighborhood, and the nearest manufacturer
+neighborhood. A model anchor with alphanumeric boundaries is mandatory, source
+ranges are merged, and a fixed word-bearing separator prevents synthetic
+manufacturer/model adjacency across slices. A missing or prefix-only match
+such as `G5` inside `G500` returns no context and therefore fails closed.
+
+The default mode is a zero-Gemini preflight. Start with one listing or inspect
+the first ten pending listings:
 
 ```sh
 cargo run --bin aircost-admin -- repopulate-avionics \
@@ -586,29 +898,81 @@ cargo run --bin aircost-admin -- repopulate-avionics \
   --limit 10
 ```
 
-Dry run is the default. It still makes one listing-extraction call for each
-legacy or otherwise incompatible payload, in addition to the approximately two
-grounded Gemini calls per attempted identity and any correction retries. Apply
-mode has the same re-extraction behavior but persists approved catalog
-identities and the final listing links. Set `GEMINI_API_KEY` and review the
-per-listing source, re-extraction, error, and call-count fields before adding
-`--apply`.
+Preflight does not construct a Gemini client, require `GEMINI_API_KEY`, make
+provider requests, or write usage/domain data. Its checkpoint contains
+`resume_after_listing_id` and `has_more`; pass the checkpoint back as
+`--after-listing-id` to advance even when low-ID listings remain pending:
 
-Apply mode resolves catalog identities through the same two-stage service and
-replaces a listing's links only when every non-rejected primary/replacement
-identity resolves to an approved ID. The replacement is one transaction; an
-unresolved candidate, conflicting duplicate, or insert failure leaves all old
-links intact. Multiple capability rows such as GPS and transponder labels for
-one GNX 375 are coalesced only after both independently resolve to the same
-approved ID. Quantities use the maximum rather than a sum.
+```sh
+cargo run --bin aircost-admin -- repopulate-avionics \
+  --database /absolute/path/to/copy.sqlite3 \
+  --limit 10 \
+  --after-listing-id 51
+```
 
-The rebuild fails closed when an incompatible payload has no retained HTML or
-source URL, the retained HTML cleans to no usable text, Gemini is unavailable,
-or Gemini returns anything outside the current capability-array schema. An
-empty extracted equipment array cannot erase existing links. These cases are
-reported and leave all old associations intact. The workflow never invents
-replacement semantics, never changes listing readiness, and never writes
-dollar metadata; identity rebuilding alone does not make a listing
+`--after-listing-id` and `--listing-id` are mutually exclusive. An exact
+listing ID remains available to retry or inspect a residual item separately.
+
+The request plan counts logical provider requests rather than describing a
+grounded workflow as one "call." One fresh grounded pass has three baseline
+requests: Search, URL Context, and structure. Per-stage model-validation
+fallback raises the identity pass to at most six requests; one reused-evidence
+identity correction makes that pass envelope eight. A positive identity also
+requires an independent collision pass. Its review and optional domain
+correction share a two-structure-call budget, for six baseline requests and a
+fourteen-request complete validation envelope. The report separates its
+known minimum baseline (conditional relationship targets skipped after primary
+rejection), all-positive baseline, and maximum validation envelope. A legacy
+listing re-extraction is one baseline request and up to two with JSON repair.
+Transport retry attempts are reported separately and are not multiplied into
+these logical counts. Identity counts produced by legacy re-extraction, later
+verified-local reuse, fallback, and correction outcomes remain explicitly
+unknown; the tool does not infer a dollar estimate.
+
+Use `--dry-run` (or `--preview`) to explicitly enable a paid preview. Preview
+writes no catalog, listing, review, or plugin domain data; normal Gemini usage
+accounting still applies. Set `GEMINI_API_KEY` and review the per-listing
+source, re-extraction, error, accepted, safely-discarded, and remaining-review
+counts before using `--apply`. Apply mode persists independently grounded
+catalog identities through the ordinary catalog resolver; listing links and
+review state are handled separately by the atomic apply boundary below.
+
+Candidate outcomes are partial rather than all-or-nothing:
+
+- A grounded approved product becomes a listing link only when the occurrence
+  itself has exact `high` source confidence.
+- An approved product with weaker occurrence evidence remains a review aspect
+  with the verified catalog product as its suggestion.
+- An unresolved identity, provider error, or input error remains a review
+  aspect.
+- A safely grounded rejection of an installed or subject observation is
+  discarded and does not enter either the catalog links or the residual
+  review.
+
+A `replaces` or `removes` subject and target are one dependency. Both must
+resolve with high listing evidence before the relationship is accepted. A
+rejected subject safely discards the complete unit; an unresolved or rejected
+target leaves both subject and target for review. Multiple capability rows such
+as GPS and transponder labels for one GNX 375 are coalesced only after they
+resolve to the same stable product identity. Quantities use the maximum rather
+than a sum, and the complete accepted action graph is validated before apply.
+
+Apply writes the accepted listing links and residual review bundle through one
+transaction. That transaction revalidates the review and HTML hashes,
+submission ownership/binding, current FAA snapshot and source record, and
+approved catalog graph identities. Unrelated existing verified,
+high-confidence links are preserved. A stale source, FAA change, invalid
+accepted graph, conflicting duplicate, or database failure leaves the prior
+links and pending review intact. If residual aspects remain, the listing stays
+`pending_review`; an all-pass result returns it to `incomplete` for the
+ordinary finalizer and never publishes it directly.
+
+The workflow also fails closed before apply when retained HTML or its source
+URL is missing, the HTML hash is invalid, the HTML cleans to no usable text,
+the listing lacks current FAA admission, or a re-extraction returns no usable
+equipment observations. An empty equipment array is never treated as evidence
+that all prior observations are garbage. The workflow never writes dollar
+metadata; automated avionics review alone does not make a listing
 valuation-grade.
 
 ## Aircraft Reference Catalog And FAA Projection Migration
@@ -651,6 +1015,293 @@ digest match the recorded archive, require reference rows to be reachable from
 a retained target, require coverage to agree with the retained MASTER row, and
 reject updates or deletes. Corrections arrive as a new release/projection, not
 as mutations to prior evidence.
+
+An earlier draft of this migration also created
+`aircraft_curation_interaction_runs` and nullable references from decisions and
+profile proposals. No runtime path reads or writes those fields: request
+accounting belongs in `gemini_api_usage`, while approved source facts belong in
+`curation_evidence_sources` and `curation_evidence_claims`. Databases that
+received that draft should apply the matching idempotent cleanup migration:
+
+```text
+migrations/20260727_remove_unused_aircraft_curation_runs.sqlite.sql
+migrations/20260727_remove_unused_aircraft_curation_runs.postgres.sql
+```
+
+For SQLite, back up the database and run:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260727_remove_unused_aircraft_curation_runs.sqlite.sql" \
+  "PRAGMA foreign_key_check;"
+```
+
+The cleanup preserves decisions, proposals, validated evidence, and usage
+accounting. It removes only the unused request/response dossier table and its
+two unused foreign-key columns, and is safe to run more than once.
+
+The optional-dimension decision semantics are upgraded independently by:
+
+```text
+migrations/20260728_aircraft_identity_no_supported_selection.sqlite.sql
+migrations/20260728_aircraft_identity_no_supported_selection.postgres.sql
+```
+
+This migration removes the overloaded `not_an_entity` action and admits the
+approved, evidence-free `no_supported_selection` outcome for newly validated
+generation and package decisions only. Canonical historical `not_an_entity`
+rows remain generic `reject`/`rejected` decisions because they were not
+validated under the new token, grounding, and catalog-relationship predicates;
+they are never retroactively approved. The migration fails closed on malformed
+legacy combinations and is safe to rerun. Rehearse it on a backup before
+applying it to a stopped writer:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260728_aircraft_identity_no_supported_selection.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+```
+
+For PostgreSQL, use:
+
+```sh
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
+  -f migrations/20260728_aircraft_identity_no_supported_selection.postgres.sql
+```
+
+## Aircraft Catalog Retrieval-Key Repair
+
+Canonical make, family, generation, and factory-package rows use a mechanical
+retrieval key: preserve ASCII letters and digits, lowercase ASCII letters,
+replace every other code point with a separator, then collapse and trim the
+separators. These keys deliberately do not apply manufacturer aliases or remove
+legal suffixes. For example, `TEXTRON AVIATION INC` is stored as
+`textron aviation inc`; `Cessna` remains a separately approved alias.
+
+Older catalog rows may have been written with the manufacturer-aware legacy
+normalizer, which could store `cessna` as the key for the canonical display
+name `TEXTRON AVIATION INC`. Repair those rows with:
+
+```text
+migrations/20260729_aircraft_catalog_retrieval_keys.sqlite.sql
+migrations/20260729_aircraft_catalog_retrieval_keys.postgres.sql
+```
+
+The migration derives keys for all existing makes, families, generations, and
+factory packages. It fails before changing data if a derived key is empty,
+collides within its catalog scope, or would overlap another make's approved
+alias. It does not merge or delete rows and preserves catalog IDs, approval
+decisions, assignments, projections, and aliases. Only the update side of the
+assigned/projected immutability barrier is suspended inside the repair
+transaction; delete protection remains active and the full barriers are
+restored before commit. The migration is safe to rerun.
+
+Stop writers, make a backup, and apply the SQLite repair with:
+
+```sh
+backup_path="data/aircost.pre-aircraft-catalog-retrieval-keys-$(date +%Y%m%d%H%M%S).sqlite3"
+cp --reflink=auto data/aircost.sqlite3 "$backup_path"
+sqlite3 -bail data/aircost.sqlite3 \
+  "PRAGMA foreign_keys=ON;" \
+  ".read migrations/20260729_aircraft_catalog_retrieval_keys.sqlite.sql" \
+  "SELECT id, name, normalized_name FROM aircraft_makes ORDER BY id;" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+```
+
+For PostgreSQL, use:
+
+```sh
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
+  -f migrations/20260729_aircraft_catalog_retrieval_keys.postgres.sql
+```
+
+## Listing Aircraft Identity Assignment Migration
+
+Listings cross the publication and valuation boundary through a durable
+curated identity assignment installed by:
+
+```text
+migrations/20260725_listing_aircraft_identity.sqlite.sql
+migrations/20260725_listing_aircraft_identity.postgres.sql
+```
+
+The SQLite migration uses one `BEGIN IMMEDIATE` transaction; the Postgres
+migration is transactional as well. It creates a release-scoped FAA aircraft
+code-to-designation binding, append-only listing assignment versions, and a
+single current pointer. Assignment insertion requires an approved curated
+make/family/designation, validated regulator evidence, the exact cited FAA
+projection/record/code, and compatible generation and trim-tier dimensions.
+Changing identity appends a successor and advances the pointer; assigned
+hierarchy rows, applicability links, evidence bindings, and assignment history
+cannot be edited in place.
+
+The designation binding also proves that the designation's owning make matches
+the FAA manufacturer. A typographically exact make label is sufficient;
+otherwise the catalog must contain one approved, deterministic make alias that
+is applicable to the United States and to the aircraft/listing model year.
+Aliases for another market or year are ignored. Overlapping market/year aliases
+cannot map the same normalized FAA label to different makes, and approved make
+aliases are immutable. Both runtime admission and the database `ready` gate
+repeat this check. The ready-update trigger includes `model_year`, so changing a
+year cannot retain a stale make alias, generation, or factory-package scope.
+
+Apply the matching file after backing up and rehearsing on a copy. Existing
+listings are retained. A pre-migration `ready` row without a valid current
+assignment is unverified and quarantined with a precise migration reason; it
+is never grandfathered or deleted. Direct SQL also cannot insert or restore a
+`ready` row without the current assignment. Because the live curated hierarchy
+may be empty, the migration deliberately does not fabricate assignments from
+legacy labels. Such rows remain pending curation until an exact existing
+family/designation can be selected and evidence-backed.
+
+FAA snapshots are target-scoped projections. Currentness therefore compares
+the release identity—snapshot date plus archive SHA-256—not one projection ID.
+An assignment continues to admit when another projection of the same release
+covers its N-number and yields the same aircraft code and source-record hash.
+Importing a genuinely newer/different release atomically quarantines and
+unverifies ready listings whose assignment still cites the prior release.
+After re-grounding, a successor assignment can restore readiness. The legacy
+`aircraft_model_variant_id` remains only a valuation compatibility projection;
+its display labels are not FAA or publication identity evidence.
+
+## Listing Aircraft Compatibility Projection Migration
+
+The compatibility bridge from curated aircraft identity to the valuation
+schema is installed by:
+
+```text
+migrations/20260726_listing_aircraft_compatibility_projection.sqlite.sql
+migrations/20260726_listing_aircraft_compatibility_projection.postgres.sql
+```
+
+Apply the matching file only after the `20260725_listing_aircraft_identity`
+identity v2 migration. Unresolved new listings use one immutable, schema-owned
+placeholder hierarchy (`-1/-1/-1`). Parsed or manually entered labels are
+instead retained append-only in
+`aircraft_listing_identity_input_observations`. Those observations are
+non-authoritative retrieval history, survive parent-listing deletion with a
+null listing reference, and cannot satisfy an evidence or identity gate.
+
+`aircraft_valuation_compatibility_projections` is the only canonical bridge.
+Each immutable row maps one deterministic valuation variant to one positive
+make/family/designation/generation/package tuple and copies the controlling
+decision, evidence claim, FAA snapshot, N-number, and FAA source-record digest
+from the assignment that created it. Generation and package may be null, but
+the tuple is still null-safely unique. A later listing with the same exact
+tuple reuses the existing projection; labels from a listing never select or
+create one.
+
+An insert into `aircraft_valuation_projection_transitions` is an ephemeral
+command with kind `initial`, `current_repair`, or `successor`. In one atomic
+operation it validates the current FAA-backed assignment, creates or reuses
+the collision-free reserved valuation hierarchy, repoints the listing,
+advances the current assignment when required, and deletes itself. A failed
+sub-step rolls back the whole command. PostgreSQL also locks the relevant
+catalog and listing rows while checking reserved-key collisions. Committed
+databases must therefore contain no transition rows.
+
+The exact join is exposed as
+`aircraft_sale_listing_exact_compatibility_projections`. Both insertion as
+`ready` and transition to `ready` require that exact projection, and the
+placeholder can never become ready. Migration of an older database quarantines
+and unverifies formerly ready listings that lack it; it does not delete them.
+Valuation snapshot creation applies the same gate and freezes the projected
+variant and five-part tuple alongside the FAA admission evidence. A successor
+assignment or projection mismatch invalidates that snapshot instead of
+silently changing its aircraft identity.
+
+The migration deliberately performs no mechanical legacy adoption, merge, or
+label-based backfill. Existing unreviewed duplicate manufacturer, model, or
+variant rows can therefore remain as historical rows outside the projected
+path unless a later evidence-backed operation explicitly consolidates or
+deletes them. They remain pending or quarantined and cannot become ready
+listings or valuation inputs merely because their text looks similar.
+
+Stop writers and back up the target before applying either backend migration.
+For SQLite, rehearse the exact order on a disposable copy:
+
+```sh
+rehearsal_db="$(mktemp /tmp/aircost-compatibility.XXXXXX.sqlite3)"
+cp data/aircost.sqlite3 "$rehearsal_db"
+sqlite3 -bail "$rehearsal_db" \
+  ".read migrations/20260725_listing_aircraft_identity.sqlite.sql" \
+  ".read migrations/20260726_listing_aircraft_compatibility_projection.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+rm -f "$rehearsal_db"
+```
+
+After a successful rehearsal, apply the same two files to the backed-up live
+database:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260725_listing_aircraft_identity.sqlite.sql" \
+  ".read migrations/20260726_listing_aircraft_compatibility_projection.sqlite.sql"
+```
+
+For PostgreSQL, restore a production backup into a disposable rehearsal
+database and run:
+
+```sh
+psql -v ON_ERROR_STOP=1 "$REHEARSAL_DATABASE_URL" \
+  -f migrations/20260725_listing_aircraft_identity.postgres.sql \
+  -f migrations/20260726_listing_aircraft_compatibility_projection.postgres.sql
+```
+
+Run the same fail-fast command against the stopped, backed-up live PostgreSQL
+database only after the rehearsal passes:
+
+```sh
+psql -v ON_ERROR_STOP=1 "$DATABASE_URL" \
+  -f migrations/20260725_listing_aircraft_identity.postgres.sql \
+  -f migrations/20260726_listing_aircraft_compatibility_projection.postgres.sql
+```
+
+Verify either backend with:
+
+```sql
+SELECT migration_name, contract_version, contract_fingerprint
+FROM schema_migration_contracts
+WHERE migration_name IN (
+  '20260725_listing_aircraft_identity',
+  '20260726_listing_aircraft_compatibility_projection'
+)
+ORDER BY migration_name;
+
+SELECT singleton_id, aircraft_manufacturer_id, aircraft_model_id,
+       aircraft_model_variant_id
+FROM aircraft_sale_listing_pending_compatibility_placeholder;
+
+SELECT count(*) AS unfinished_projection_commands
+FROM aircraft_valuation_projection_transitions;
+
+SELECT count(*) AS ready_without_exact_projection
+FROM aircraft_sale_listings listing
+WHERE listing.ingestion_state = 'ready'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM aircraft_sale_listing_exact_compatibility_projections exact_projection
+    WHERE exact_projection.listing_id = listing.id
+  );
+
+SELECT aircraft_make_id, aircraft_model_family_id, aircraft_designation_id,
+       coalesce(aircraft_generation_id, 0) AS generation_id,
+       coalesce(aircraft_factory_package_id, 0) AS package_id,
+       count(*) AS duplicate_count
+FROM aircraft_valuation_compatibility_projections
+GROUP BY aircraft_make_id, aircraft_model_family_id, aircraft_designation_id,
+         coalesce(aircraft_generation_id, 0),
+         coalesce(aircraft_factory_package_id, 0)
+HAVING count(*) > 1;
+```
+
+The contract query must return both migrations at version 2. The placeholder
+query must return exactly `1/-1/-1/-1`; both count queries must return zero;
+the duplicate query must return no rows. SQLite must additionally return no
+rows from `PRAGMA foreign_key_check` and `ok` from `PRAGMA integrity_check`.
 
 ## Gemini Usage Accounting Migration
 

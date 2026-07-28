@@ -361,7 +361,7 @@ function avionicsCatalogRow(item) {
   return row;
 }
 
-function renderAvionicsChips(values, limit = Number.POSITIVE_INFINITY) {
+export function renderAvionicsChips(values, limit = Number.POSITIVE_INFINITY) {
   const container = document.createElement("div");
   container.className = "catalog-chip-list";
   const normalized = normalizedTextValues(values);
@@ -784,7 +784,7 @@ function detailMetadata(values) {
   return values.filter(Boolean).map(String).join(" · ");
 }
 
-function safeDetailLink(value, label) {
+export function safeDetailLink(value, label) {
   if (!value) {
     return null;
   }
@@ -804,7 +804,7 @@ function safeDetailLink(value, label) {
   }
 }
 
-function displayLabel(value) {
+export function displayLabel(value) {
   if (value === null || value === undefined || value === "") {
     return "-";
   }

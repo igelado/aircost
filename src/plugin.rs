@@ -10,6 +10,7 @@ use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{parse_listing_html, validate_source_url, GeminiListingExtractor};
+use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{create_listing_with_progress, ListingStoreError};
 use crate::models::{
     ListingPreview, PluginInstall, PluginSubmission, PluginSubmissionRequest, SaleListing, User,
@@ -264,6 +265,7 @@ pub async fn submit_plugin_html_with_progress(
         canonical_listing_id,
     )
     .await?;
+    attach_submission_to_pending_review_if_needed(db, user, listing.as_ref(), &submission).await?;
 
     Ok(PluginSubmissionOutcome {
         submission,
@@ -377,12 +379,32 @@ pub async fn reprocess_plugin_submission(
         canonical_listing_id,
     )
     .await?;
+    attach_submission_to_pending_review_if_needed(db, user, listing.as_ref(), &submission).await?;
 
     Ok(PluginSubmissionOutcome {
         submission,
         preview,
         listing,
     })
+}
+
+async fn attach_submission_to_pending_review_if_needed(
+    db: &AppDb,
+    user: &User,
+    listing: Option<&SaleListing>,
+    submission: &PluginSubmission,
+) -> StoreResult<()> {
+    let Some(listing) = listing.filter(|listing| listing.ingestion_state == "pending_review")
+    else {
+        return Ok(());
+    };
+    attach_pending_review_submission(db, listing.id, submission.id, user.id)
+        .await
+        .map_err(|error| {
+            PluginStoreError::Database(format!(
+                "listing review was staged but its plugin submission could not be attached: {error}"
+            ))
+        })
 }
 
 async fn latest_listing_id_for_source_url(
@@ -715,46 +737,16 @@ mod tests {
             .await
             .expect("developer user should exist");
 
-        let manufacturer = query_as_one!(
-            &db,
-            ListingIdRow,
-            r#"
-            INSERT INTO aircraft_manufacturers (name, normalized_name)
-            VALUES ('Test Aircraft', 'test aircraft')
-            RETURNING id
-            "#
-        )
-        .expect("manufacturer should seed");
-        let model = query_as_one!(
-            &db,
-            ListingIdRow,
-            r#"
-            INSERT INTO aircraft_models (
-              aircraft_manufacturer_id,
-              name,
-              normalized_name
-            )
-            VALUES (?, 'Test Model', 'test model')
-            RETURNING id
-            "#,
-            manufacturer.id
-        )
-        .expect("model should seed");
         let variant = query_as_one!(
             &db,
             ListingIdRow,
             r#"
-            INSERT INTO aircraft_model_variants (
-              aircraft_model_id,
-              name,
-              normalized_name
-            )
-            VALUES (?, 'Test Variant', 'test variant')
-            RETURNING id
-            "#,
-            model.id
+            SELECT aircraft_model_variant_id AS id
+            FROM aircraft_sale_listing_pending_compatibility_placeholder
+            WHERE singleton_id = 1
+            "#
         )
-        .expect("variant should seed");
+        .expect("pending aircraft placeholder should exist");
         let listing = query_as_one!(
             &db,
             ListingIdRow,

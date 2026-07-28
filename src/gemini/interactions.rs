@@ -5,7 +5,7 @@
 //! steps and citations, and fail closed on incomplete responses.  This module
 //! deliberately does not contain catalog or database writes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -13,19 +13,25 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE, LOCATION, RANGE, RETRY_AFTER};
+use lopdf::{Document, LoadOptions};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE, RETRY_AFTER,
+};
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode};
+use scraper::{Html, Selector};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
+use xml::reader::{ParserConfig as XmlParserConfig, XmlEvent};
 
 use crate::gemini::config::GeminiTask;
 use crate::gemini::usage::{
     estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, Outcome as UsageOutcome,
     SourceCorrelation, Start as UsageStart, Status as UsageStatus, Store as UsageStore,
+    ToolUseBilling,
 };
 
 /// Versioned endpoint and wire revision used by the current multimodal
@@ -40,6 +46,22 @@ const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 20_000_000;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_REDIRECTS: usize = 10;
+const MAX_SOURCE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SOURCE_PDF_PAGES: usize = 128;
+const MAX_SOURCE_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_PDF_TEXT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ROBOTS_BYTES: usize = 256 * 1024;
+const MAX_SOURCE_INDEX_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SOURCE_INDEXES: usize = 8;
+const MAX_ROBOTS_SITEMAPS: usize = 4;
+const MAX_SOURCE_INDEX_URLS: usize = 4_096;
+const MAX_SOURCE_INDEX_URL_BYTES: usize = 4_096;
+const MAX_SOURCE_INDEX_XML_DEPTH: usize = 16;
+const MAX_SOURCE_INDEX_XML_EVENTS: usize = 100_000;
+const GARMIN_PRODUCT_ORIGIN: &str = "https://www.garmin.com";
+const MAX_GARMIN_PRODUCT_DISPLAY_NAME_BYTES: usize = 256;
+const MAX_GARMIN_PRODUCT_SKU_BYTES: usize = 96;
+const MAX_GARMIN_PRODUCT_METADATA_SENTENCE_BYTES: usize = 512;
 
 pub type GeminiInteractionsResult<T> = Result<T, GeminiInteractionsError>;
 
@@ -1184,7 +1206,7 @@ impl GeminiInteractionsClient {
             api_key,
             endpoint,
             retry_policy,
-            resolver_timeout: timeout,
+            resolver_timeout: timeout.min(Duration::from_secs(60)),
             usage_store: None,
         })
     }
@@ -1198,7 +1220,7 @@ impl GeminiInteractionsClient {
     }
 
     #[cfg(test)]
-    fn with_test_endpoint(
+    pub(crate) fn with_test_endpoint(
         api_key: &str,
         endpoint: Url,
         retry_policy: RetryPolicy,
@@ -1263,6 +1285,7 @@ impl GeminiInteractionsClient {
                         &response,
                         &request.model,
                         request.service_tier.as_deref().unwrap_or("standard"),
+                        &request.tools,
                     );
                     store
                         .finish(attempt, &outcome)
@@ -1473,6 +1496,97 @@ impl GeminiInteractionsClient {
             "source URL resolution ended unexpectedly".to_string(),
         ))
     }
+
+    /// Fetch a public publisher document without attaching the Gemini API key.
+    ///
+    /// This is intentionally crate-private: the normalized body is transient
+    /// verification material and must never become an API or persistence
+    /// payload. Every DNS answer and connected peer is public, redirects are
+    /// followed manually, and the decoded response body is streamed under a
+    /// hard cap.
+    pub(crate) async fn fetch_public_source_document(
+        &self,
+        source_url: &str,
+    ) -> GeminiInteractionsResult<FetchedSourceDocument> {
+        let requested_url = Url::parse(source_url).map_err(|error| {
+            GeminiInteractionsError::InvalidUrl(format!("{source_url:?}: {error}"))
+        })?;
+        validate_public_http_url(&requested_url)?;
+        tokio::time::timeout(
+            self.resolver_timeout,
+            fetch_public_source_document_inner(
+                requested_url,
+                self.resolver_timeout,
+                MAX_SOURCE_DOCUMENT_BYTES,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            GeminiInteractionsError::InvalidUrl(
+                "public source document fetch exceeded its total timeout".to_string(),
+            )
+        })?
+    }
+
+    /// Fetch one index-discovered publisher document while refusing to follow
+    /// any redirect away from the requested URL's exact HTTPS origin.
+    ///
+    /// The redirect target is validated before another request is made. The
+    /// ordinary Search-citation fetch above intentionally retains its existing
+    /// public cross-origin redirect behavior.
+    pub(crate) async fn fetch_public_same_origin_source_document(
+        &self,
+        source_url: &str,
+    ) -> GeminiInteractionsResult<FetchedSourceDocument> {
+        let requested_url = Url::parse(source_url).map_err(|error| {
+            GeminiInteractionsError::InvalidUrl(format!("{source_url:?}: {error}"))
+        })?;
+        validate_public_same_origin_source_document_url(&requested_url, &requested_url)?;
+        tokio::time::timeout(
+            self.resolver_timeout,
+            fetch_public_source_document_inner(
+                requested_url.clone(),
+                self.resolver_timeout,
+                MAX_SOURCE_DOCUMENT_BYTES,
+                Some(requested_url),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            GeminiInteractionsError::InvalidUrl(
+                "same-origin public source document fetch exceeded its total timeout".to_string(),
+            )
+        })?
+    }
+
+    /// Discover publisher-owned URLs from the seed publisher's robots and
+    /// sitemap indexes without attaching the Gemini API key.
+    ///
+    /// The returned URLs are discovery hints only. Callers must independently
+    /// fetch and verify any candidate before using it as evidence. This helper
+    /// accepts only HTTPS URLs on the seed's exact origin, bounds all fetched
+    /// bytes and extracted locations, and never returns robots or sitemap
+    /// bodies.
+    pub(crate) async fn discover_public_source_index_candidates(
+        &self,
+        seed_url: &str,
+    ) -> GeminiInteractionsResult<Vec<Url>> {
+        let seed_url = Url::parse(seed_url).map_err(|error| {
+            GeminiInteractionsError::InvalidUrl(format!("{seed_url:?}: {error}"))
+        })?;
+        validate_public_source_index_url(&seed_url, &seed_url)?;
+        tokio::time::timeout(
+            self.resolver_timeout,
+            discover_public_source_index_candidates_inner(seed_url, self.resolver_timeout),
+        )
+        .await
+        .map_err(|_| {
+            GeminiInteractionsError::InvalidUrl(
+                "public source index discovery exceeded its total timeout".to_string(),
+            )
+        })?
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1480,6 +1594,910 @@ pub struct ResolvedUrl {
     pub requested_url: Url,
     pub final_url: Url,
     pub status: StatusCode,
+}
+
+#[derive(Clone)]
+pub(crate) struct FetchedSourceDocument {
+    pub(crate) final_url: Url,
+    pub(crate) content_sha256: String,
+    pub(crate) publisher_text: String,
+    /// Present only when the strict exact-origin Garmin HTML adapter found one
+    /// unique literal `product_display_name`/`sku0` pair.
+    ///
+    /// Generic HTML, text, and PDFs never populate this field. Keeping the
+    /// publisher-specific record typed prevents adjacent table rows or hidden
+    /// generic metadata from becoming deterministic product identity proof.
+    pub(crate) garmin_product_page_identity: Option<GarminProductPageIdentityRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GarminProductPageIdentityRecord {
+    pub(crate) product_display_name: String,
+    pub(crate) sku0: String,
+}
+
+impl GarminProductPageIdentityRecord {
+    pub(crate) fn literal_evidence_text(&self) -> String {
+        format!(
+            "Garmin product page metadata: product_display_name {}; sku0 {}.",
+            self.product_display_name, self.sku0
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceDocumentKind {
+    Html,
+    PlainText,
+    Pdf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceIndexDocumentKind {
+    Robots,
+    Sitemap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SitemapDocumentKind {
+    UrlSet,
+    SitemapIndex,
+}
+
+#[derive(Debug)]
+struct ParsedSitemap {
+    kind: SitemapDocumentKind,
+    locations: Vec<String>,
+}
+
+async fn discover_public_source_index_candidates_inner(
+    seed_url: Url,
+    timeout: Duration,
+) -> GeminiInteractionsResult<Vec<Url>> {
+    let mut robots_url = seed_url.clone();
+    robots_url.set_path("/robots.txt");
+    robots_url.set_query(None);
+    robots_url.set_fragment(None);
+
+    let mut sitemap_queue = VecDeque::new();
+    match fetch_public_source_index_document(
+        robots_url,
+        &seed_url,
+        timeout,
+        MAX_ROBOTS_BYTES,
+        SourceIndexDocumentKind::Robots,
+    )
+    .await
+    {
+        Ok(body) => {
+            sitemap_queue.extend(parse_robots_sitemap_urls(&body, &seed_url));
+        }
+        Err(GeminiInteractionsError::InvalidResponse(_)) => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut conventional_sitemap_url = seed_url.clone();
+    conventional_sitemap_url.set_path("/sitemap.xml");
+    conventional_sitemap_url.set_query(None);
+    conventional_sitemap_url.set_fragment(None);
+    sitemap_queue.push_back(conventional_sitemap_url);
+
+    let mut visited_indexes = HashSet::new();
+    let mut candidate_keys = HashSet::new();
+    let mut candidates = Vec::new();
+    while let Some(sitemap_url) = sitemap_queue.pop_front() {
+        if visited_indexes.len() >= MAX_SOURCE_INDEXES {
+            break;
+        }
+        if !visited_indexes.insert(sitemap_url.as_str().to_string()) {
+            continue;
+        }
+
+        let body = match fetch_public_source_index_document(
+            sitemap_url,
+            &seed_url,
+            timeout,
+            MAX_SOURCE_INDEX_BYTES,
+            SourceIndexDocumentKind::Sitemap,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(GeminiInteractionsError::InvalidResponse(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        let parsed = match parse_sitemap(&body) {
+            Ok(parsed) => parsed,
+            Err(GeminiInteractionsError::InvalidResponse(_)) => continue,
+            Err(error) => return Err(error),
+        };
+
+        match parsed.kind {
+            SitemapDocumentKind::SitemapIndex => {
+                for location in parsed.locations {
+                    if visited_indexes.len() + sitemap_queue.len() >= MAX_SOURCE_INDEXES {
+                        break;
+                    }
+                    if let Some(url) = parse_same_origin_source_index_url(&location, &seed_url) {
+                        let key = url.as_str();
+                        if !visited_indexes.contains(key)
+                            && !sitemap_queue.iter().any(|queued| queued.as_str() == key)
+                        {
+                            sitemap_queue.push_back(url);
+                        }
+                    }
+                }
+            }
+            SitemapDocumentKind::UrlSet => {
+                for location in parsed.locations {
+                    if candidates.len() >= MAX_SOURCE_INDEX_URLS {
+                        break;
+                    }
+                    if let Some(url) = parse_same_origin_source_index_url(&location, &seed_url) {
+                        if candidate_keys.insert(url.as_str().to_string()) {
+                            candidates.push(url);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+async fn fetch_public_source_index_document(
+    requested_url: Url,
+    seed_url: &Url,
+    timeout: Duration,
+    max_bytes: usize,
+    expected_kind: SourceIndexDocumentKind,
+) -> GeminiInteractionsResult<String> {
+    validate_public_source_index_url(&requested_url, seed_url)?;
+    let mut current_url = requested_url;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let resolver = pinned_public_client(&current_url, timeout).await?;
+        let accept = match expected_kind {
+            SourceIndexDocumentKind::Robots => "text/plain",
+            SourceIndexDocumentKind::Sitemap => "application/xml, text/xml;q=0.9",
+        };
+        let mut response = resolver
+            .get(current_url.clone())
+            .header(ACCEPT, accept)
+            .send()
+            .await
+            .map_err(GeminiInteractionsError::Transport)?;
+        ensure_public_peer(&response)?;
+
+        if redirect_status(response.status()) {
+            if redirect_count == MAX_REDIRECTS {
+                return Err(GeminiInteractionsError::InvalidUrl(format!(
+                    "source index redirect count exceeds {MAX_REDIRECTS}"
+                )));
+            }
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .ok_or_else(|| {
+                    GeminiInteractionsError::InvalidUrl(format!(
+                        "redirect from {current_url} has no Location header"
+                    ))
+                })?
+                .to_str()
+                .map_err(|_| {
+                    GeminiInteractionsError::InvalidUrl(format!(
+                        "redirect from {current_url} has a non-UTF-8 Location header"
+                    ))
+                })?;
+            current_url = current_url.join(location).map_err(|error| {
+                GeminiInteractionsError::InvalidUrl(format!(
+                    "invalid redirect target {location:?}: {error}"
+                ))
+            })?;
+            validate_public_source_index_url(&current_url, seed_url)?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source index {current_url} returned HTTP {}",
+                response.status()
+            )));
+        }
+        validate_source_index_content_type(response.headers(), expected_kind)?;
+        validate_source_content_length(response.headers(), response.content_length(), max_bytes)?;
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(GeminiInteractionsError::Transport)?
+        {
+            append_source_body_chunk(&mut body, &chunk, max_bytes)?;
+        }
+        if body.is_empty() {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source index {current_url} returned an empty body"
+            )));
+        }
+        return String::from_utf8(body).map_err(|_| {
+            GeminiInteractionsError::InvalidResponse(format!(
+                "public source index {current_url} is not valid UTF-8 text"
+            ))
+        });
+    }
+    Err(GeminiInteractionsError::InvalidUrl(
+        "public source index fetch ended unexpectedly".to_string(),
+    ))
+}
+
+fn validate_source_index_content_type(
+    headers: &HeaderMap,
+    expected_kind: SourceIndexDocumentKind,
+) -> GeminiInteractionsResult<()> {
+    let values = headers.get_all(CONTENT_TYPE).iter().collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source index must have exactly one Content-Type header".to_string(),
+        ));
+    }
+    let content_type = values[0].to_str().map_err(|_| {
+        GeminiInteractionsError::InvalidResponse(
+            "public source index has a non-UTF-8 Content-Type header".to_string(),
+        )
+    })?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let allowed = match expected_kind {
+        SourceIndexDocumentKind::Robots => media_type == "text/plain",
+        SourceIndexDocumentKind::Sitemap => {
+            matches!(media_type.as_str(), "application/xml" | "text/xml")
+        }
+    };
+    if !allowed {
+        return Err(GeminiInteractionsError::InvalidResponse(format!(
+            "public source index Content-Type {media_type:?} is not allowed for {expected_kind:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_robots_sitemap_urls(body: &str, seed_url: &Url) -> Vec<Url> {
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for line in body.lines() {
+        if urls.len() >= MAX_ROBOTS_SITEMAPS {
+            break;
+        }
+        let line = strip_robots_comment(line);
+        let Some((directive, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !directive.trim().eq_ignore_ascii_case("sitemap") {
+            continue;
+        }
+        if let Some(url) = parse_same_origin_source_index_url(value, seed_url) {
+            if seen.insert(url.as_str().to_string()) {
+                urls.push(url);
+            }
+        }
+    }
+    urls
+}
+
+fn parse_sitemap(body: &str) -> GeminiInteractionsResult<ParsedSitemap> {
+    if contains_ascii_case_insensitive(body.as_bytes(), b"<!DOCTYPE")
+        || contains_ascii_case_insensitive(body.as_bytes(), b"<!ENTITY")
+    {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source sitemap must not contain document type or entity declarations"
+                .to_string(),
+        ));
+    }
+
+    let parser = XmlParserConfig::new()
+        .trim_whitespace(false)
+        .whitespace_to_characters(true)
+        .cdata_to_characters(true)
+        .ignore_comments(true)
+        .coalesce_characters(true)
+        .create_reader(body.as_bytes());
+    let mut kind = None;
+    let mut element_stack = Vec::new();
+    let mut current_location: Option<String> = None;
+    let mut locations = Vec::new();
+    let mut event_count = 0_usize;
+
+    for event in parser {
+        event_count = event_count.checked_add(1).ok_or_else(|| {
+            GeminiInteractionsError::InvalidResponse(
+                "public source sitemap XML event count overflowed".to_string(),
+            )
+        })?;
+        if event_count > MAX_SOURCE_INDEX_XML_EVENTS {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source sitemap XML event count exceeds {MAX_SOURCE_INDEX_XML_EVENTS}"
+            )));
+        }
+        let event = event.map_err(|error| {
+            GeminiInteractionsError::InvalidResponse(format!(
+                "public source sitemap is not valid XML: {error}"
+            ))
+        })?;
+        match event {
+            XmlEvent::StartElement { name, .. } => {
+                if current_location.is_some() {
+                    return Err(GeminiInteractionsError::InvalidResponse(
+                        "public source sitemap loc elements must contain text only".to_string(),
+                    ));
+                }
+                if element_stack.len() >= MAX_SOURCE_INDEX_XML_DEPTH {
+                    return Err(GeminiInteractionsError::InvalidResponse(format!(
+                        "public source sitemap XML depth exceeds {MAX_SOURCE_INDEX_XML_DEPTH}"
+                    )));
+                }
+                if element_stack.is_empty() {
+                    kind = Some(match name.local_name.as_str() {
+                        "urlset" => SitemapDocumentKind::UrlSet,
+                        "sitemapindex" => SitemapDocumentKind::SitemapIndex,
+                        root => {
+                            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                                "public source sitemap has unsupported root element {root:?}"
+                            )));
+                        }
+                    });
+                }
+                element_stack.push(name.local_name);
+                let expected_entry = match kind {
+                    Some(SitemapDocumentKind::UrlSet) => "url",
+                    Some(SitemapDocumentKind::SitemapIndex) => "sitemap",
+                    None => continue,
+                };
+                if element_stack.len() == 3
+                    && element_stack[1] == expected_entry
+                    && element_stack[2] == "loc"
+                {
+                    current_location = Some(String::new());
+                }
+            }
+            XmlEvent::Characters(text) => {
+                if let Some(location) = current_location.as_mut() {
+                    let next_length = location.len().checked_add(text.len()).ok_or_else(|| {
+                        GeminiInteractionsError::InvalidResponse(
+                            "public source sitemap loc length overflowed".to_string(),
+                        )
+                    })?;
+                    if next_length > MAX_SOURCE_INDEX_URL_BYTES {
+                        return Err(GeminiInteractionsError::InvalidResponse(format!(
+                            "public source sitemap loc exceeds {MAX_SOURCE_INDEX_URL_BYTES} bytes"
+                        )));
+                    }
+                    location.push_str(&text);
+                }
+            }
+            XmlEvent::EndElement { .. } => {
+                if current_location.is_some()
+                    && element_stack.last().is_some_and(|element| element == "loc")
+                {
+                    let location = current_location.take().unwrap_or_default();
+                    let location = location.trim();
+                    if !location.is_empty() && locations.len() < MAX_SOURCE_INDEX_URLS {
+                        locations.push(location.to_string());
+                    }
+                }
+                element_stack.pop();
+            }
+            XmlEvent::ProcessingInstruction { .. } => {
+                return Err(GeminiInteractionsError::InvalidResponse(
+                    "public source sitemap must not contain processing instructions".to_string(),
+                ));
+            }
+            XmlEvent::StartDocument { .. }
+            | XmlEvent::EndDocument
+            | XmlEvent::Whitespace(_)
+            | XmlEvent::CData(_)
+            | XmlEvent::Comment(_) => {}
+        }
+    }
+
+    let kind = kind.ok_or_else(|| {
+        GeminiInteractionsError::InvalidResponse(
+            "public source sitemap has no root element".to_string(),
+        )
+    })?;
+    Ok(ParsedSitemap { kind, locations })
+}
+
+fn parse_same_origin_source_index_url(value: &str, seed_url: &Url) -> Option<Url> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_SOURCE_INDEX_URL_BYTES {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    validate_public_source_index_url(&url, seed_url)
+        .ok()
+        .map(|_| url)
+}
+
+fn strip_robots_comment(line: &str) -> &str {
+    let Some(comment_start) = line.find('#') else {
+        return line;
+    };
+    if comment_start == 0
+        || line[..comment_start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
+    {
+        &line[..comment_start]
+    } else {
+        line
+    }
+}
+
+fn validate_public_source_index_url(url: &Url, seed_url: &Url) -> GeminiInteractionsResult<()> {
+    validate_public_https_same_origin_url(url, seed_url)?;
+    if url.fragment().is_some() {
+        return Err(GeminiInteractionsError::InvalidUrl(
+            "public source index URLs must not contain fragments".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_same_origin_source_document_url(
+    url: &Url,
+    seed_url: &Url,
+) -> GeminiInteractionsResult<()> {
+    validate_public_https_same_origin_url(url, seed_url)?;
+    if url.fragment().is_some() {
+        return Err(GeminiInteractionsError::InvalidUrl(
+            "same-origin public source document URLs must not contain fragments".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_https_same_origin_url(
+    url: &Url,
+    seed_url: &Url,
+) -> GeminiInteractionsResult<()> {
+    validate_public_http_url(seed_url)?;
+    validate_public_http_url(url)?;
+    if seed_url.scheme() != "https" || url.scheme() != "https" {
+        return Err(GeminiInteractionsError::InvalidUrl(
+            "same-origin public source discovery requires HTTPS".to_string(),
+        ));
+    }
+    if url.origin() != seed_url.origin() {
+        return Err(GeminiInteractionsError::InvalidUrl(format!(
+            "public source URL {url} is not on seed origin {}",
+            seed_url.origin().ascii_serialization()
+        )));
+    }
+    Ok(())
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Preserve the two literal first-party fields that identify a Garmin product
+/// as one typed record.
+///
+/// This is deliberately not part of generic HTML cleanup: the field names are
+/// publisher-specific, and accepting arbitrary metadata or JSON-LD would let
+/// unrelated pages inject hidden text into source evidence. Duplicate fields,
+/// missing content, and oversized/control-bearing values all fail closed.
+fn garmin_product_page_identity_record(
+    final_url: &Url,
+    html: &str,
+) -> Option<GarminProductPageIdentityRecord> {
+    if final_url.scheme() != "https"
+        || final_url.origin().ascii_serialization() != GARMIN_PRODUCT_ORIGIN
+    {
+        return None;
+    }
+
+    let document = Html::parse_document(html);
+    let meta_selector = Selector::parse("meta").expect("static meta selector is valid");
+    let product_display_name = unique_bounded_literal_meta_content(
+        &document,
+        &meta_selector,
+        "product_display_name",
+        MAX_GARMIN_PRODUCT_DISPLAY_NAME_BYTES,
+    )?;
+    let sku = unique_bounded_literal_meta_content(
+        &document,
+        &meta_selector,
+        "sku0",
+        MAX_GARMIN_PRODUCT_SKU_BYTES,
+    )?;
+    let record = GarminProductPageIdentityRecord {
+        product_display_name,
+        sku0: sku,
+    };
+    (record.literal_evidence_text().len() <= MAX_GARMIN_PRODUCT_METADATA_SENTENCE_BYTES)
+        .then_some(record)
+}
+
+#[cfg(test)]
+fn garmin_product_page_metadata_sentence(final_url: &Url, html: &str) -> Option<String> {
+    garmin_product_page_identity_record(final_url, html)
+        .map(|record| record.literal_evidence_text())
+}
+
+fn unique_bounded_literal_meta_content(
+    document: &Html,
+    meta_selector: &Selector,
+    field_name: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    let mut matching = document
+        .select(meta_selector)
+        .filter(|element| element.value().attr("name") == Some(field_name));
+    let element = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    let value = element.value().attr("content")?.trim();
+    (!value.is_empty()
+        && value.len() <= max_bytes
+        && value.chars().count() <= max_bytes
+        && value.chars().all(|character| !character.is_control()))
+    .then(|| value.to_string())
+}
+
+struct CleanedPublicSourceHtml {
+    publisher_text: String,
+    garmin_product_page_identity: Option<GarminProductPageIdentityRecord>,
+}
+
+fn clean_public_source_html(final_url: &Url, html: &str) -> CleanedPublicSourceHtml {
+    let publisher_text = crate::html::clean::clean_publisher_source_html(html);
+    let garmin_product_page_identity = garmin_product_page_identity_record(final_url, html);
+    let publisher_text = match garmin_product_page_identity
+        .as_ref()
+        .map(GarminProductPageIdentityRecord::literal_evidence_text)
+    {
+        Some(metadata) if publisher_text.is_empty() => metadata,
+        Some(metadata) => format!("{metadata} {publisher_text}"),
+        None => publisher_text,
+    };
+    CleanedPublicSourceHtml {
+        publisher_text,
+        garmin_product_page_identity,
+    }
+}
+
+async fn fetch_public_source_document_inner(
+    requested_url: Url,
+    timeout: Duration,
+    max_bytes: usize,
+    required_origin: Option<Url>,
+) -> GeminiInteractionsResult<FetchedSourceDocument> {
+    let mut current_url = requested_url;
+    for redirect_count in 0..=MAX_REDIRECTS {
+        let resolver = pinned_public_client(&current_url, timeout).await?;
+        let mut response = resolver
+            .get(current_url.clone())
+            .header(
+                ACCEPT,
+                "text/html, application/xhtml+xml, application/pdf;q=0.9, text/plain;q=0.8",
+            )
+            .send()
+            .await
+            .map_err(GeminiInteractionsError::Transport)?;
+        ensure_public_peer(&response)?;
+
+        if redirect_status(response.status()) {
+            if redirect_count == MAX_REDIRECTS {
+                return Err(GeminiInteractionsError::InvalidUrl(format!(
+                    "source redirect count exceeds {MAX_REDIRECTS}"
+                )));
+            }
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .ok_or_else(|| {
+                    GeminiInteractionsError::InvalidUrl(format!(
+                        "redirect from {current_url} has no Location header"
+                    ))
+                })?
+                .to_str()
+                .map_err(|_| {
+                    GeminiInteractionsError::InvalidUrl(format!(
+                        "redirect from {current_url} has a non-UTF-8 Location header"
+                    ))
+                })?;
+            current_url =
+                source_document_redirect_target(&current_url, location, required_origin.as_ref())?;
+            continue;
+        }
+
+        if !response.status().is_success() {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source document {current_url} returned HTTP {}",
+                response.status()
+            )));
+        }
+        let document_kind = source_document_kind(response.headers())?;
+        validate_source_content_length(response.headers(), response.content_length(), max_bytes)?;
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(GeminiInteractionsError::Transport)?
+        {
+            append_source_body_chunk(&mut body, &chunk, max_bytes)?;
+        }
+        if body.is_empty() {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source document {current_url} returned an empty body"
+            )));
+        }
+        let content_sha256 = format!("{:x}", Sha256::digest(&body));
+        let (publisher_text, garmin_product_page_identity) = match document_kind {
+            SourceDocumentKind::Html | SourceDocumentKind::PlainText => {
+                let body = String::from_utf8(body).map_err(|_| {
+                    GeminiInteractionsError::InvalidResponse(format!(
+                        "public source document {current_url} is not valid UTF-8 text"
+                    ))
+                })?;
+                match document_kind {
+                    SourceDocumentKind::Html => {
+                        let cleaned = clean_public_source_html(&current_url, &body);
+                        (cleaned.publisher_text, cleaned.garmin_product_page_identity)
+                    }
+                    SourceDocumentKind::PlainText => {
+                        (body.split_whitespace().collect::<Vec<_>>().join(" "), None)
+                    }
+                    SourceDocumentKind::Pdf => unreachable!("PDF handled by the outer match"),
+                }
+            }
+            SourceDocumentKind::Pdf => (
+                tokio::task::spawn_blocking(move || extract_source_pdf_publisher_text(&body))
+                    .await
+                    .map_err(|_| {
+                        GeminiInteractionsError::InvalidResponse(
+                            "public source PDF extraction worker failed".to_string(),
+                        )
+                    })??,
+                None,
+            ),
+        };
+        if publisher_text.is_empty() {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source document {current_url} has no publisher text"
+            )));
+        }
+        current_url.set_fragment(None);
+        return Ok(FetchedSourceDocument {
+            final_url: current_url,
+            content_sha256,
+            publisher_text,
+            garmin_product_page_identity,
+        });
+    }
+    Err(GeminiInteractionsError::InvalidUrl(
+        "public source document fetch ended unexpectedly".to_string(),
+    ))
+}
+
+fn source_document_redirect_target(
+    current_url: &Url,
+    location: &str,
+    required_origin: Option<&Url>,
+) -> GeminiInteractionsResult<Url> {
+    let mut target = current_url.join(location).map_err(|error| {
+        GeminiInteractionsError::InvalidUrl(format!(
+            "invalid redirect target {location:?}: {error}"
+        ))
+    })?;
+    target.set_fragment(None);
+    match required_origin {
+        Some(seed_url) => validate_public_same_origin_source_document_url(&target, seed_url)?,
+        None => validate_public_http_url(&target)?,
+    }
+    Ok(target)
+}
+
+#[derive(Clone, Copy)]
+struct SourcePdfLimits {
+    max_pages: usize,
+    max_page_decompressed_bytes: usize,
+    max_total_text_bytes: usize,
+}
+
+const SOURCE_PDF_LIMITS: SourcePdfLimits = SourcePdfLimits {
+    max_pages: MAX_SOURCE_PDF_PAGES,
+    max_page_decompressed_bytes: MAX_SOURCE_PDF_PAGE_DECOMPRESSED_BYTES,
+    max_total_text_bytes: MAX_SOURCE_PDF_TEXT_BYTES,
+};
+
+fn extract_source_pdf_publisher_text(pdf: &[u8]) -> GeminiInteractionsResult<String> {
+    extract_source_pdf_publisher_text_with_limits(pdf, SOURCE_PDF_LIMITS)
+}
+
+fn extract_source_pdf_publisher_text_with_limits(
+    pdf: &[u8],
+    limits: SourcePdfLimits,
+) -> GeminiInteractionsResult<String> {
+    if limits.max_pages == 0
+        || limits.max_page_decompressed_bytes == 0
+        || limits.max_total_text_bytes == 0
+    {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source PDF extraction limits must be positive".to_string(),
+        ));
+    }
+    if !pdf.starts_with(b"%PDF-") {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source PDF is missing the PDF signature".to_string(),
+        ));
+    }
+    let document = Document::load_mem_with_options(
+        pdf,
+        LoadOptions {
+            strict: true,
+            max_decompressed_size: Some(limits.max_page_decompressed_bytes),
+            ..LoadOptions::default()
+        },
+    )
+    .map_err(|_| {
+        GeminiInteractionsError::InvalidResponse(
+            "public source PDF failed strict parsing".to_string(),
+        )
+    })?;
+    if document.is_encrypted() || document.was_encrypted() {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "encrypted public source PDFs are not allowed".to_string(),
+        ));
+    }
+    let pages = document.get_pages();
+    if pages.is_empty() || pages.len() > limits.max_pages {
+        return Err(GeminiInteractionsError::InvalidResponse(format!(
+            "public source PDF has {} pages; expected 1..={}",
+            pages.len(),
+            limits.max_pages
+        )));
+    }
+
+    let mut extracted = String::new();
+    let mut total_text_bytes = 0usize;
+    for page_number in pages.keys().copied() {
+        let text = document
+            .extract_text_with_limit(&[page_number], limits.max_page_decompressed_bytes)
+            .map_err(|_| {
+                GeminiInteractionsError::InvalidResponse(format!(
+                    "public source PDF page {page_number} text extraction failed"
+                ))
+            })?;
+        total_text_bytes = total_text_bytes.checked_add(text.len()).ok_or_else(|| {
+            GeminiInteractionsError::InvalidResponse(
+                "public source PDF extracted text exceeded its byte cap".to_string(),
+            )
+        })?;
+        if total_text_bytes > limits.max_total_text_bytes {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source PDF extracted text exceeds {} bytes",
+                limits.max_total_text_bytes
+            )));
+        }
+        if !extracted.is_empty() {
+            extracted.push('\n');
+        }
+        extracted.push_str(&text);
+    }
+
+    let publisher_text = extracted
+        .chars()
+        .map(|character| {
+            if character.is_control() && !character.is_whitespace() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if publisher_text.is_empty() {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source PDF has no extractable publisher text".to_string(),
+        ));
+    }
+    Ok(publisher_text)
+}
+
+fn source_document_kind(headers: &HeaderMap) -> GeminiInteractionsResult<SourceDocumentKind> {
+    let values = headers.get_all(CONTENT_TYPE).iter().collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source document must have exactly one Content-Type header".to_string(),
+        ));
+    }
+    let content_type = values[0].to_str().map_err(|_| {
+        GeminiInteractionsError::InvalidResponse(
+            "public source document has a non-UTF-8 Content-Type header".to_string(),
+        )
+    })?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "text/html" | "application/xhtml+xml" => Ok(SourceDocumentKind::Html),
+        "text/plain" => Ok(SourceDocumentKind::PlainText),
+        "application/pdf" => Ok(SourceDocumentKind::Pdf),
+        _ => Err(GeminiInteractionsError::InvalidResponse(format!(
+            "public source document Content-Type {media_type:?} is not allowed"
+        ))),
+    }
+}
+
+fn validate_source_content_length(
+    headers: &HeaderMap,
+    decoded_length: Option<u64>,
+    max_bytes: usize,
+) -> GeminiInteractionsResult<()> {
+    let lengths = headers.get_all(CONTENT_LENGTH).iter().collect::<Vec<_>>();
+    if lengths.len() > 1 {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source document has multiple Content-Length headers".to_string(),
+        ));
+    }
+    if let Some(value) = lengths.first() {
+        let declared = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                GeminiInteractionsError::InvalidResponse(
+                    "public source document has an invalid Content-Length header".to_string(),
+                )
+            })?;
+        if declared > max_bytes as u64 {
+            return Err(GeminiInteractionsError::InvalidResponse(format!(
+                "public source document Content-Length exceeds {max_bytes} bytes"
+            )));
+        }
+    }
+    if decoded_length.is_some_and(|length| length > max_bytes as u64) {
+        return Err(GeminiInteractionsError::InvalidResponse(format!(
+            "public source document decoded length exceeds {max_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn append_source_body_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> GeminiInteractionsResult<()> {
+    let next_length = body.len().checked_add(chunk.len()).ok_or_else(|| {
+        GeminiInteractionsError::InvalidResponse(
+            "public source document body length overflowed".to_string(),
+        )
+    })?;
+    if next_length > max_bytes {
+        return Err(GeminiInteractionsError::InvalidResponse(format!(
+            "public source document streamed body exceeds {max_bytes} bytes"
+        )));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn redirect_status(status: StatusCode) -> bool {
@@ -1609,16 +2627,25 @@ fn public_ipv4(address: Ipv4Addr) -> bool {
         || octets[0] == 0
         || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-        || (octets[0] == 198 && (18..=19).contains(&octets[1])))
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        || octets[0] >= 240)
 }
 
 fn public_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
+    let is_ipv4_compatible = segments[..6].iter().all(|segment| *segment == 0);
+    let is_nat64_well_known = segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2..6].iter().all(|segment| *segment == 0);
     if address.is_loopback()
         || address.is_unspecified()
         || address.is_multicast()
         || (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || segments[0] == 0x2002
+        || is_nat64_well_known
+        || is_ipv4_compatible
     {
         return false;
     }
@@ -1695,6 +2722,7 @@ fn interaction_usage_outcome(
     response: &InteractionResponse,
     requested_model: &str,
     service_tier: &str,
+    tools: &[InteractionTool],
 ) -> UsageOutcome {
     let metrics = response
         .interaction
@@ -1702,11 +2730,15 @@ fn interaction_usage_outcome(
         .as_ref()
         .map(|_| interaction_usage_metrics(response))
         .unwrap_or_default();
-    let cost = response
-        .interaction
-        .usage
-        .as_ref()
-        .and_then(|_| estimate_paid_list_cost(requested_model, service_tier, &metrics).ok());
+    let cost = response.interaction.usage.as_ref().and_then(|_| {
+        estimate_paid_list_cost(
+            requested_model,
+            service_tier,
+            interaction_tool_use_billing(tools),
+            &metrics,
+        )
+        .ok()
+    });
     let status = match &response.interaction.status {
         InteractionStatus::Completed => UsageStatus::Completed,
         InteractionStatus::RequiresAction => UsageStatus::RequiresAction,
@@ -1741,6 +2773,24 @@ fn interaction_usage_outcome(
     };
     outcome.cost = cost;
     outcome
+}
+
+fn interaction_tool_use_billing(tools: &[InteractionTool]) -> ToolUseBilling {
+    let has_google_search = tools
+        .iter()
+        .any(|tool| matches!(tool, InteractionTool::GoogleSearch));
+    let has_chargeable_tool = tools.iter().any(|tool| {
+        matches!(
+            tool,
+            InteractionTool::UrlContext | InteractionTool::Function { .. }
+        )
+    });
+    match (has_google_search, has_chargeable_tool) {
+        (false, false) => ToolUseBilling::NoTools,
+        (false, true) => ToolUseBilling::ChargeAsUncachedInput,
+        (true, false) => ToolUseBilling::GoogleSearchContextExcluded,
+        (true, true) => ToolUseBilling::AmbiguousMixed,
+    }
 }
 
 fn interaction_usage_metrics(response: &InteractionResponse) -> UsageMetrics {
@@ -2795,6 +3845,8 @@ impl UrlCitationRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Object, Stream};
     use serde_json::json;
 
     fn response_from(raw: Value) -> InteractionResponse {
@@ -2910,7 +3962,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_full_interaction_usage_and_search_count_for_accounting() {
+    fn maps_full_interaction_usage_and_withholds_ambiguous_mixed_tool_cost() {
         let response = response_from(grounded_fixture());
         let metrics = interaction_usage_metrics(&response);
         assert_eq!(metrics.input_tokens, Some(100));
@@ -2920,13 +3972,77 @@ mod tests {
         assert_eq!(metrics.tool_tokens, Some(15));
         assert_eq!(metrics.search_query_count, Some(1));
 
-        let outcome = interaction_usage_outcome(&response, "gemini-3.5-flash", "standard");
+        let outcome = interaction_usage_outcome(
+            &response,
+            "gemini-3.5-flash",
+            "standard",
+            &[InteractionTool::GoogleSearch, InteractionTool::UrlContext],
+        );
         assert_eq!(outcome.status, UsageStatus::Completed);
         assert_eq!(
             outcome.provider_request_id.as_deref(),
             Some("interaction-1")
         );
-        assert!(outcome.cost.is_some());
+        assert!(outcome.cost.is_none());
+    }
+
+    #[test]
+    fn distinguishes_search_url_and_custom_function_tool_billing() {
+        let response = response_from(grounded_fixture());
+
+        let search_only = interaction_usage_outcome(
+            &response,
+            "gemini-3.5-flash",
+            "standard",
+            &[InteractionTool::GoogleSearch],
+        )
+        .cost
+        .unwrap();
+        assert_eq!(
+            search_only.pricing_snapshot["tool_use_billing"],
+            "google_search_context_excluded"
+        );
+        assert_eq!(
+            search_only.pricing_snapshot["billable_usage"]["billed_tool_use_input_tokens"],
+            0
+        );
+        assert_eq!(
+            search_only.pricing_snapshot["billable_usage"]["excluded_google_search_context_tokens"],
+            15
+        );
+
+        let url_context = interaction_usage_outcome(
+            &response,
+            "gemini-3.5-flash",
+            "standard",
+            &[InteractionTool::UrlContext],
+        )
+        .cost
+        .unwrap();
+        assert_eq!(
+            url_context.pricing_snapshot["tool_use_billing"],
+            "charge_as_uncached_input"
+        );
+        assert_eq!(
+            url_context.pricing_snapshot["billable_usage"]["uncached_input_tokens"],
+            110
+        );
+        assert_eq!(
+            url_context.pricing_snapshot["billable_usage"]["billed_tool_use_input_tokens"],
+            15
+        );
+        assert!(url_context.total_microusd > search_only.total_microusd);
+
+        let function = InteractionTool::function(
+            "lookup_product",
+            "Look up one product",
+            json!({"type": "object", "properties": {}}),
+        )
+        .unwrap();
+        assert_eq!(
+            interaction_tool_use_billing(&[function]),
+            ToolUseBilling::ChargeAsUncachedInput
+        );
     }
 
     #[test]
@@ -2950,7 +4066,7 @@ mod tests {
         let metrics = interaction_usage_metrics(&response);
         assert_eq!(metrics.search_query_count, Some(0));
         assert!(
-            interaction_usage_outcome(&response, "gemini-3.5-flash", "standard")
+            interaction_usage_outcome(&response, "gemini-3.5-flash", "standard", &[])
                 .cost
                 .is_some()
         );
@@ -3319,13 +4435,524 @@ mod tests {
             "http://localhost/admin",
             "http://127.0.0.1/admin",
             "http://10.0.0.1/admin",
+            "http://240.0.0.1/admin",
+            "http://255.0.0.1/admin",
             "http://[::1]/admin",
+            "http://[::c0a8:1]/admin",
+            "http://[64:ff9b::7f00:1]/admin",
+            "http://[2002:7f00:1::]/admin",
+            "http://[fec0::1]/admin",
+            "http://[::ffff:127.0.0.1]/admin",
             "https://user:password@example.com/",
         ] {
             let url = Url::parse(source).unwrap();
             assert!(validate_public_http_url(&url).is_err(), "{source}");
         }
         assert!(validate_public_http_url(&Url::parse("https://www.faa.gov/").unwrap()).is_ok());
+        assert!(
+            validate_public_http_url(&Url::parse("https://[::ffff:8.8.8.8]/").unwrap()).is_ok()
+        );
+    }
+
+    #[test]
+    fn source_document_content_types_accept_bounded_pdf_and_reject_unknown_media() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert_eq!(
+            source_document_kind(&headers).unwrap(),
+            SourceDocumentKind::Html
+        );
+
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/xhtml+xml"),
+        );
+        assert_eq!(
+            source_document_kind(&headers).unwrap(),
+            SourceDocumentKind::Html
+        );
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        assert_eq!(
+            source_document_kind(&headers).unwrap(),
+            SourceDocumentKind::PlainText
+        );
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+        assert_eq!(
+            source_document_kind(&headers).unwrap(),
+            SourceDocumentKind::Pdf
+        );
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        assert!(source_document_kind(&headers).is_err());
+        headers.remove(CONTENT_TYPE);
+        assert!(source_document_kind(&headers).is_err());
+    }
+
+    #[test]
+    fn garmin_product_page_metadata_is_prepended_as_one_literal_bounded_pair() {
+        let url = Url::parse("https://www.garmin.com/en-US/p/14664/").unwrap();
+        let html = r#"
+            <html>
+              <head>
+                <meta name="product_display_name" content="GTS™ 800 TAS">
+                <meta name="sku0" content="010-00519-00">
+                <script type="application/ld+json">
+                  {"name":"DO_NOT_INGEST_SCRIPT_PRODUCT","sku":"DO-NOT-INGEST"}
+                </script>
+              </head>
+              <body>Visible Garmin product description.</body>
+            </html>
+        "#;
+
+        let cleaned = clean_public_source_html(&url, html);
+        let record = cleaned
+            .garmin_product_page_identity
+            .expect("the unique exact-origin pair should become a typed record");
+
+        assert!(cleaned.publisher_text.starts_with(
+            "Garmin product page metadata: product_display_name GTS™ 800 TAS; sku0 010-00519-00."
+        ));
+        assert!(cleaned
+            .publisher_text
+            .contains("Visible Garmin product description."));
+        assert!(!cleaned.publisher_text.contains("DO_NOT_INGEST"));
+        assert_eq!(record.product_display_name, "GTS™ 800 TAS");
+        assert_eq!(record.sku0, "010-00519-00");
+        assert!(
+            garmin_product_page_metadata_sentence(&url, html)
+                .unwrap()
+                .len()
+                <= MAX_GARMIN_PRODUCT_METADATA_SENTENCE_BYTES
+        );
+    }
+
+    #[test]
+    fn garmin_product_page_metadata_rejects_duplicate_or_conflicting_fields() {
+        let url = Url::parse("https://www.garmin.com/en-US/p/14664/").unwrap();
+        let duplicate = r#"
+            <meta name="product_display_name" content="GTS™ 800 TAS">
+            <meta name="product_display_name" content="GTS™ 800 TAS">
+            <meta name="sku0" content="010-00519-00">
+        "#;
+        let conflicting = r#"
+            <meta name="product_display_name" content="GTS™ 800 TAS">
+            <meta name="sku0" content="010-00519-00">
+            <meta name="sku0" content="010-99999-99">
+        "#;
+
+        assert!(garmin_product_page_metadata_sentence(&url, duplicate).is_none());
+        assert!(garmin_product_page_metadata_sentence(&url, conflicting).is_none());
+    }
+
+    #[test]
+    fn garmin_product_page_metadata_requires_both_nonempty_bounded_fields() {
+        let url = Url::parse("https://www.garmin.com/en-US/p/14664/").unwrap();
+        for html in [
+            r#"<meta name="product_display_name" content="GTS™ 800 TAS">"#,
+            r#"<meta name="sku0" content="010-00519-00">"#,
+            r#"
+                <meta name="product_display_name" content="">
+                <meta name="sku0" content="010-00519-00">
+            "#,
+            r#"
+                <meta name="product_display_name" content="GTS™ 800 TAS">
+                <meta name="sku0">
+            "#,
+        ] {
+            assert!(
+                garmin_product_page_metadata_sentence(&url, html).is_none(),
+                "{html}"
+            );
+        }
+        let oversized_name = format!(
+            r#"<meta name="product_display_name" content="{}"><meta name="sku0" content="010-00519-00">"#,
+            "X".repeat(MAX_GARMIN_PRODUCT_DISPLAY_NAME_BYTES + 1)
+        );
+        assert!(garmin_product_page_metadata_sentence(&url, &oversized_name).is_none());
+    }
+
+    #[test]
+    fn garmin_product_page_metadata_never_applies_outside_the_exact_https_origin() {
+        let html = r#"
+            <meta name="product_display_name" content="GTS™ 800 TAS">
+            <meta name="sku0" content="010-00519-00">
+            <body>Visible publisher text.</body>
+        "#;
+        for url in [
+            "http://www.garmin.com/en-US/p/14664/",
+            "https://garmin.com/en-US/p/14664/",
+            "https://aviation.garmin.com/en-US/p/14664/",
+            "https://www.garmin.com.evil.example/en-US/p/14664/",
+            "https://www.garmin.com:444/en-US/p/14664/",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert!(
+                garmin_product_page_metadata_sentence(&url, html).is_none(),
+                "{url}"
+            );
+            let cleaned = clean_public_source_html(&url, html);
+            assert_eq!(cleaned.publisher_text, "Visible publisher text.");
+            assert!(cleaned.garmin_product_page_identity.is_none());
+        }
+    }
+
+    fn source_pdf(pages: &[&[&str]]) -> Vec<u8> {
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Courier",
+        });
+        let resources_id = document.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let mut page_ids = Vec::new();
+        for lines in pages {
+            let mut operations = vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 10.into()]),
+                Operation::new("Td", vec![50.into(), 740.into()]),
+            ];
+            for line in *lines {
+                operations.push(Operation::new("Tj", vec![Object::string_literal(*line)]));
+                operations.push(Operation::new("T*", vec![]));
+            }
+            operations.push(Operation::new("ET", vec![]));
+            let content_id = document.add_object(Stream::new(
+                dictionary! {},
+                Content { operations }.encode().unwrap(),
+            ));
+            page_ids.push(document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+            }));
+        }
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
+                "Count" => page_ids.len() as i64,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn source_pdf_extracts_bounded_normalized_publisher_text() {
+        let pdf = source_pdf(&[
+            &["GARMIN GIA 63W", "PART NUMBER 011-00870-00"],
+            &["GIA 63W Installation Manual"],
+        ]);
+
+        let text = extract_source_pdf_publisher_text(&pdf).unwrap();
+
+        assert!(text.contains("GARMIN GIA 63W"));
+        assert!(text.contains("PART NUMBER 011-00870-00"));
+        assert!(text.contains("GIA 63W Installation Manual"));
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn source_pdf_fails_closed_on_malformed_empty_page_and_resource_limits() {
+        assert!(extract_source_pdf_publisher_text(b"%PDF-not-a-document").is_err());
+
+        let empty = source_pdf(&[&[]]);
+        assert!(extract_source_pdf_publisher_text(&empty).is_err());
+
+        let two_pages = source_pdf(&[&["Garmin GIA 63"], &["Garmin GIA 63W"]]);
+        assert!(extract_source_pdf_publisher_text_with_limits(
+            &two_pages,
+            SourcePdfLimits {
+                max_pages: 1,
+                ..SOURCE_PDF_LIMITS
+            },
+        )
+        .is_err());
+        assert!(extract_source_pdf_publisher_text_with_limits(
+            &two_pages,
+            SourcePdfLimits {
+                max_total_text_bytes: 4,
+                ..SOURCE_PDF_LIMITS
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_pdf_fails_closed_when_an_encrypt_dictionary_is_present() {
+        let pdf = source_pdf(&[&["Garmin GIA 63W"]]);
+        let mut document = Document::load_mem(&pdf).unwrap();
+        let encrypt_id = document.add_object(dictionary! {
+            "Filter" => "Standard",
+            "V" => 1,
+            "R" => 2,
+            "Length" => 40,
+            "O" => Object::string_literal("owner"),
+            "U" => Object::string_literal("user"),
+            "P" => -4,
+        });
+        document.trailer.set("Encrypt", encrypt_id);
+        let mut encrypted = Vec::new();
+        document.save_to(&mut encrypted).unwrap();
+
+        assert!(extract_source_pdf_publisher_text(&encrypted).is_err());
+    }
+
+    #[test]
+    fn source_document_length_and_stream_caps_are_both_enforced() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("9"));
+        validate_source_content_length(&headers, Some(9), 10).unwrap();
+        assert!(validate_source_content_length(&headers, Some(11), 10).is_err());
+
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("11"));
+        assert!(validate_source_content_length(&headers, None, 10).is_err());
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("invalid"));
+        assert!(validate_source_content_length(&headers, None, 10).is_err());
+
+        let mut body = vec![1, 2, 3];
+        append_source_body_chunk(&mut body, &[4, 5], 5).unwrap();
+        assert_eq!(body, vec![1, 2, 3, 4, 5]);
+        assert!(append_source_body_chunk(&mut body, &[6], 5).is_err());
+    }
+
+    #[test]
+    fn source_index_content_types_are_strict_and_role_specific() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        validate_source_index_content_type(&headers, SourceIndexDocumentKind::Robots).unwrap();
+        assert!(
+            validate_source_index_content_type(&headers, SourceIndexDocumentKind::Sitemap).is_err()
+        );
+
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/xml; charset=utf-8"),
+        );
+        validate_source_index_content_type(&headers, SourceIndexDocumentKind::Sitemap).unwrap();
+        assert!(
+            validate_source_index_content_type(&headers, SourceIndexDocumentKind::Robots).is_err()
+        );
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/xml"));
+        validate_source_index_content_type(&headers, SourceIndexDocumentKind::Sitemap).unwrap();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        assert!(
+            validate_source_index_content_type(&headers, SourceIndexDocumentKind::Sitemap).is_err()
+        );
+        headers.remove(CONTENT_TYPE);
+        assert!(
+            validate_source_index_content_type(&headers, SourceIndexDocumentKind::Sitemap).is_err()
+        );
+    }
+
+    #[test]
+    fn source_index_urls_require_exact_https_origin_without_fragments() {
+        let seed = Url::parse("https://media.example.com/releases/182").unwrap();
+        for accepted in [
+            "https://media.example.com/sitemap.xml",
+            "https://media.example.com:443/releases/182",
+        ] {
+            validate_public_source_index_url(&Url::parse(accepted).unwrap(), &seed).unwrap();
+        }
+        for rejected in [
+            "http://media.example.com/sitemap.xml",
+            "https://www.media.example.com/sitemap.xml",
+            "https://media.example.com:444/sitemap.xml",
+            "https://media.example.com/sitemap.xml#section",
+            "https://user:password@media.example.com/sitemap.xml",
+            "https://127.0.0.1/sitemap.xml",
+        ] {
+            assert!(
+                validate_public_source_index_url(&Url::parse(rejected).unwrap(), &seed).is_err(),
+                "{rejected}"
+            );
+        }
+        let insecure_seed = Url::parse("http://media.example.com/releases/182").unwrap();
+        assert!(validate_public_source_index_url(&insecure_seed, &insecure_seed).is_err());
+        let private_seed = Url::parse("https://10.0.0.1/releases/182").unwrap();
+        assert!(validate_public_source_index_url(&private_seed, &private_seed).is_err());
+    }
+
+    #[test]
+    fn index_discovered_source_redirects_are_rejected_before_leaving_the_seed_origin() {
+        let seed = Url::parse("https://media.example.com/releases/182").unwrap();
+        let same_origin =
+            source_document_redirect_target(&seed, "/history/skylane#section", Some(&seed))
+                .unwrap();
+        assert_eq!(
+            same_origin.as_str(),
+            "https://media.example.com/history/skylane"
+        );
+
+        for location in [
+            "https://other.example.com/history/skylane",
+            "//other.example.com/history/skylane",
+            "http://media.example.com/history/skylane",
+            "https://media.example.com:444/history/skylane",
+            "https://user:password@media.example.com/history/skylane",
+        ] {
+            assert!(
+                source_document_redirect_target(&seed, location, Some(&seed)).is_err(),
+                "{location}"
+            );
+        }
+
+        assert!(
+            source_document_redirect_target(
+                &seed,
+                "https://other.example.com/history/skylane",
+                None,
+            )
+            .is_ok(),
+            "ordinary Search citations preserve public cross-origin redirects"
+        );
+        assert!(validate_public_same_origin_source_document_url(
+            &Url::parse("https://media.example.com/history/skylane#section").unwrap(),
+            &seed,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn robots_sitemap_discovery_is_bounded_deduplicated_and_same_origin() {
+        let seed = Url::parse("https://media.example.com/releases/182").unwrap();
+        let robots = r#"
+            # publisher index
+            sItEmAp: https://media.example.com/sitemap.xml # canonical
+            Sitemap: https://media.example.com/sitemap.xml
+            Sitemap: http://media.example.com/insecure.xml
+            Sitemap: https://other.example.com/foreign.xml
+            Sitemap: https://user:password@media.example.com/credential.xml
+            Sitemap: https://media.example.com/fragment.xml#unsafe
+            Sitemap: https://media.example.com/second.xml
+            Sitemap: https://media.example.com/third.xml
+            Sitemap: https://media.example.com/fourth.xml
+            Sitemap: https://media.example.com/fifth.xml
+        "#;
+        let urls = parse_robots_sitemap_urls(robots, &seed);
+        assert_eq!(urls.len(), MAX_ROBOTS_SITEMAPS);
+        assert_eq!(urls[0].as_str(), "https://media.example.com/sitemap.xml");
+        assert_eq!(urls[1].as_str(), "https://media.example.com/second.xml");
+        assert_eq!(urls[3].as_str(), "https://media.example.com/fourth.xml");
+    }
+
+    #[test]
+    fn sitemap_parser_extracts_only_structural_locs_and_decodes_xml() {
+        let seed = Url::parse("https://media.example.com/releases/182").unwrap();
+        let parsed = parse_sitemap(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+            <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+              <url>
+                <loc>https://media.example.com/releases/182?view=full&amp;lang=en</loc>
+                <lastmod>2026-07-24</lastmod>
+              </url>
+              <url><loc><![CDATA[https://other.example.com/foreign]]></loc></url>
+              <metadata><loc>https://media.example.com/not-an-entry</loc></metadata>
+            </urlset>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, SitemapDocumentKind::UrlSet);
+        assert_eq!(parsed.locations.len(), 2);
+        assert_eq!(
+            parse_same_origin_source_index_url(&parsed.locations[0], &seed)
+                .unwrap()
+                .as_str(),
+            "https://media.example.com/releases/182?view=full&lang=en"
+        );
+        assert!(parse_same_origin_source_index_url(&parsed.locations[1], &seed).is_none());
+    }
+
+    #[test]
+    fn sitemap_index_parser_is_bounded_and_rejects_active_xml_constructs() {
+        let parsed = parse_sitemap(
+            r#"<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <sitemap><loc>https://media.example.com/one.xml</loc></sitemap>
+                <sitemap><loc>https://media.example.com/two.xml</loc></sitemap>
+            </sitemapindex>"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.kind, SitemapDocumentKind::SitemapIndex);
+        assert_eq!(
+            parsed.locations,
+            [
+                "https://media.example.com/one.xml",
+                "https://media.example.com/two.xml"
+            ]
+        );
+
+        let entity_expansion = r#"<?xml version="1.0"?>
+            <!DOCTYPE urlset [
+              <!ENTITY a "aaaaaaaaaa">
+              <!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">
+            ]>
+            <urlset><url><loc>https://media.example.com/&b;</loc></url></urlset>"#;
+        assert!(parse_sitemap(entity_expansion).is_err());
+        assert!(parse_sitemap(
+            r#"<urlset><?publisher command="fetch"?>
+                <url><loc>https://media.example.com/one</loc></url>
+            </urlset>"#
+        )
+        .is_err());
+        assert!(parse_sitemap(
+            r#"<urlset><url><loc>https://media.example.com/<nested/></loc></url></urlset>"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sitemap_location_count_is_capped() {
+        let mut sitemap = String::from("<urlset>");
+        for index in 0..=MAX_SOURCE_INDEX_URLS {
+            sitemap.push_str(&format!(
+                "<url><loc>https://media.example.com/{index}</loc></url>"
+            ));
+        }
+        sitemap.push_str("</urlset>");
+        let parsed = parse_sitemap(&sitemap).unwrap();
+        assert_eq!(parsed.locations.len(), MAX_SOURCE_INDEX_URLS);
+    }
+
+    #[test]
+    fn sitemap_xml_depth_and_event_count_are_capped() {
+        let mut deep = String::from("<urlset>");
+        for _ in 0..MAX_SOURCE_INDEX_XML_DEPTH {
+            deep.push_str("<metadata>");
+        }
+        for _ in 0..MAX_SOURCE_INDEX_XML_DEPTH {
+            deep.push_str("</metadata>");
+        }
+        deep.push_str("</urlset>");
+        assert!(parse_sitemap(&deep).is_err());
+
+        let mut busy = String::from("<urlset>");
+        for _ in 0..=(MAX_SOURCE_INDEX_XML_EVENTS / 2) {
+            busy.push_str("<metadata/>");
+        }
+        busy.push_str("</urlset>");
+        assert!(parse_sitemap(&busy).is_err());
     }
 
     #[test]

@@ -6,7 +6,8 @@ test_database="$(mktemp /tmp/aircost-reference-schema.XXXXXX.sqlite3)"
 approval_database="$(mktemp /tmp/aircost-reference-approval.XXXXXX.sqlite3)"
 component_database="$(mktemp /tmp/aircost-reference-component.XXXXXX.sqlite3)"
 overlap_database="$(mktemp /tmp/aircost-reference-overlap.XXXXXX.sqlite3)"
-trap 'rm -f "$test_database" "$approval_database" "$component_database" "$overlap_database"' EXIT
+cleanup_database="$(mktemp /tmp/aircost-reference-cleanup.XXXXXX.sqlite3)"
+trap 'rm -f "$test_database" "$approval_database" "$component_database" "$overlap_database" "$cleanup_database"' EXIT
 
 sqlite3 -bail "$test_database" \
   ".read $repository_root/schema/sqlite.sql" \
@@ -22,6 +23,12 @@ propeller_catalog_target="$(sqlite3 "$test_database" \
   "SELECT \"table\" FROM pragma_foreign_key_list('aircraft_reference_propellers') WHERE \"from\" = 'aircraft_propeller_catalog_model_id'")"
 test "$engine_catalog_target" = "aircraft_engine_catalog_models"
 test "$propeller_catalog_target" = "aircraft_propeller_catalog_models"
+test "$(sqlite3 "$test_database" \
+  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='aircraft_curation_interaction_runs'")" = "0"
+test "$(sqlite3 "$test_database" \
+  "SELECT count(*) FROM pragma_table_info('aircraft_identity_decisions') WHERE name='interaction_run_id'")" = "0"
+test "$(sqlite3 "$test_database" \
+  "SELECT count(*) FROM pragma_table_info('aircraft_reference_profile_proposals') WHERE name='interaction_run_id'")" = "0"
 
 expect_failure() {
   local database="$1"
@@ -111,6 +118,45 @@ expect_failure "$overlap_database" "
   SET publication_state = 'published', published_at = '2026-07-21'
   WHERE id = 2;
 " "published reference profile applicability overlaps an existing version"
+
+cp "$test_database" "$cleanup_database"
+sqlite3 -bail "$cleanup_database" "
+  CREATE TABLE aircraft_curation_interaction_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_json TEXT NOT NULL,
+    response_json TEXT
+  );
+  ALTER TABLE aircraft_identity_decisions
+    ADD COLUMN interaction_run_id INTEGER
+      REFERENCES aircraft_curation_interaction_runs(id) ON DELETE RESTRICT;
+  ALTER TABLE aircraft_reference_profile_proposals
+    ADD COLUMN interaction_run_id INTEGER
+      REFERENCES aircraft_curation_interaction_runs(id) ON DELETE RESTRICT;
+  INSERT INTO aircraft_curation_interaction_runs (request_json, response_json)
+  VALUES ('{\"prompt\":\"unused\"}', '{\"response\":\"unused\"}');
+  UPDATE aircraft_identity_decisions SET interaction_run_id = 1 WHERE id = 1;
+  INSERT INTO aircraft_reference_profile_proposals (
+    resolution_case_id, interaction_run_id, proposed_identity_json,
+    proposed_profile_json, deterministic_validation_json, validation_status,
+    catalog_revision
+  ) VALUES (1, 1, '{}', '{}', '{}', 'valid', 'catalog-1');
+" \
+  ".read $repository_root/migrations/20260727_remove_unused_aircraft_curation_runs.sqlite.sql" \
+  ".read $repository_root/migrations/20260727_remove_unused_aircraft_curation_runs.sqlite.sql"
+
+test "$(sqlite3 "$cleanup_database" \
+  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='aircraft_curation_interaction_runs'")" = "0"
+test "$(sqlite3 "$cleanup_database" \
+  "SELECT count(*) FROM pragma_table_info('aircraft_identity_decisions') WHERE name='interaction_run_id'")" = "0"
+test "$(sqlite3 "$cleanup_database" \
+  "SELECT count(*) FROM pragma_table_info('aircraft_reference_profile_proposals') WHERE name='interaction_run_id'")" = "0"
+test "$(sqlite3 "$cleanup_database" \
+  "SELECT count(*) FROM aircraft_identity_decisions")" = "11"
+test "$(sqlite3 "$cleanup_database" \
+  "SELECT count(*) FROM aircraft_reference_profile_proposals")" = "1"
+test "$(sqlite3 "$cleanup_database" \
+  "SELECT count(*) FROM aircraft_identity_decision_claims")" = "11"
+test -z "$(sqlite3 "$cleanup_database" "PRAGMA foreign_key_check")"
 
 sqlite3 -bail "$test_database" "PRAGMA foreign_key_check"
 echo "aircraft reference catalog SQLite schema contract passed"

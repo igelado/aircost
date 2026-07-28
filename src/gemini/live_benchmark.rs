@@ -164,7 +164,7 @@ impl LiveBenchmarkRunner {
         value_reference_year: i64,
         correlation_id: &str,
     ) -> Result<TaskExecution> {
-        let config = self.config_for_model(model, AVIONICS_GROUNDING_TASKS)?;
+        let config = self.config_for_model(model, AVIONICS_PIPELINE_TASKS)?;
         let extractor = self.scoped_extractor(config, case, correlation_id)?;
         let response = extractor
             .estimate_avionics_metadata(&AvionicsMetadataContext {
@@ -191,7 +191,7 @@ impl LiveBenchmarkRunner {
         catalog_candidates: &[super::benchmark::BenchmarkCatalogCandidate],
         correlation_id: &str,
     ) -> Result<TaskExecution> {
-        let config = self.config_for_model(model, AVIONICS_GROUNDING_TASKS)?;
+        let config = self.config_for_model(model, AVIONICS_PIPELINE_TASKS)?;
         let extractor = self.scoped_extractor(config, case, correlation_id)?;
         let context = AvionicsUnitResolutionContext {
             aircraft_manufacturer: aircraft.manufacturer.clone().unwrap_or_default(),
@@ -201,6 +201,8 @@ impl LiveBenchmarkRunner {
             source_url: case.source_url.clone(),
             listing_context: listing_evidence.to_string(),
             requires_listing_evidence: true,
+            authoritative_direct_source_urls: Vec::new(),
+            authoritative_identity_anchors: Vec::new(),
             candidate: AvionicsUnitResolutionCandidate {
                 manufacturer: candidate.manufacturer.clone(),
                 model: candidate.model.clone(),
@@ -453,10 +455,12 @@ impl LiveBenchmarkRunner {
     }
 }
 
-const AVIONICS_GROUNDING_TASKS: &[GeminiTask] = &[
+const AVIONICS_PIPELINE_TASKS: &[GeminiTask] = &[
+    GeminiTask::AvionicsApprovedCandidateAdjudication,
     GeminiTask::AvionicsSearchGrounding,
     GeminiTask::AvionicsUrlVerification,
     GeminiTask::AvionicsStructure,
+    GeminiTask::AvionicsCollisionStructure,
 ];
 
 impl BenchmarkRunner for LiveBenchmarkRunner {
@@ -737,11 +741,18 @@ mod tests {
     use super::*;
     use crate::gemini::benchmark::BenchmarkPricing;
     use crate::gemini::usage::{
-        estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, ValidationStatus,
+        estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, ToolUseBilling,
+        ValidationStatus,
     };
 
     fn usage_record(id: i64, metrics: UsageMetrics) -> UsageRecord {
-        let cost = estimate_paid_list_cost("gemini-3.5-flash", "standard", &metrics).ok();
+        let cost = estimate_paid_list_cost(
+            "gemini-3.5-flash",
+            "standard",
+            ToolUseBilling::GoogleSearchContextExcluded,
+            &metrics,
+        )
+        .ok();
         UsageRecord {
             id,
             task: "listing_extraction".to_string(),
@@ -918,12 +929,15 @@ mod tests {
             value: json!({}),
             google_search_used: true,
             url_context_used: true,
+            authoritative_direct_source_verified: false,
+            authoritative_direct_source_final_urls: Vec::new(),
             grounding_sources: vec![crate::extract::GeminiGroundingSource {
                 chunk_index: 0,
                 url: "https://www.garmin.com/example".to_string(),
                 title: "Garmin".to_string(),
             }],
             grounding_supports: Vec::new(),
+            source_evidence_proofs: Vec::new(),
             interaction_audits: vec![crate::gemini::curation::workflow::InteractionAudit {
                 purpose: "benchmark_avionics_url_verification".to_string(),
                 request_json: json!({}),
@@ -938,6 +952,7 @@ mod tests {
                 total_output_tokens: Some(20),
                 raw_response: json!({}),
             }],
+            verified_evidence: None,
         };
         let mut evidence = TaskEvidence::default();
         evidence.observe_grounded_response(&response);
@@ -960,9 +975,13 @@ mod tests {
             value: json!({}),
             google_search_used: true,
             url_context_used: true,
+            authoritative_direct_source_verified: false,
+            authoritative_direct_source_final_urls: Vec::new(),
             grounding_sources: Vec::new(),
             grounding_supports: Vec::new(),
+            source_evidence_proofs: Vec::new(),
             interaction_audits: Vec::new(),
+            verified_evidence: None,
         };
         let mut evidence = TaskEvidence::default();
         evidence.observe_grounded_response(&response);

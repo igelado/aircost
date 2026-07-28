@@ -34,6 +34,98 @@ pub fn clean_listing_html_with_limit(html: &str, max_characters: usize) -> Strin
     trim_listing_text(&lines.join("\n"), max_characters)
 }
 
+/// Extract publisher-authored page text for source-proof verification.
+///
+/// Unlike listing cleanup, this preserves the complete document and never
+/// moves or truncates the result around an aircraft-listing anchor. Script,
+/// style, template, and other non-visible text is excluded so it cannot be
+/// mistaken for publisher evidence.
+pub fn clean_publisher_source_html(html: &str) -> String {
+    let document = Html::parse_document(html);
+    let mut text = String::new();
+    for node in document.tree.root().descendants() {
+        let Some(node_text) = node.value().as_text() else {
+            continue;
+        };
+        if node.ancestors().any(|ancestor| {
+            ancestor.value().as_element().is_some_and(|element| {
+                matches!(
+                    element.name(),
+                    "script" | "style" | "noscript" | "template" | "svg" | "canvas" | "iframe"
+                ) || element.attr("hidden").is_some()
+                    || element
+                        .attr("aria-hidden")
+                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+                    || element
+                        .attr("style")
+                        .is_some_and(inline_style_hides_element)
+            })
+        }) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(node_text);
+    }
+    normalize_page_text(&text)
+}
+
+fn inline_style_hides_element(style: &str) -> bool {
+    style.split(';').any(|declaration| {
+        let Some((property, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let property = property.trim();
+        (property.eq_ignore_ascii_case("display") && css_value_is(value, "none"))
+            || (property.eq_ignore_ascii_case("visibility") && css_value_is(value, "hidden"))
+    })
+}
+
+fn css_value_is(value: &str, expected: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized
+        .strip_suffix("!important")
+        .unwrap_or(&normalized)
+        .trim()
+        .eq_ignore_ascii_case(expected)
+}
+
+/// Canonicalize evidence for exact, token-bounded source-page comparison.
+///
+/// Punctuation and markup boundaries are not identity-bearing. Alphanumeric
+/// token contents are: in particular, `182` remains different from `182T`.
+pub fn normalize_source_evidence_span(value: &str) -> String {
+    decode_html_entities(value)
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Return whether `evidence` occurs as one contiguous, token-bounded span in
+/// already-extracted publisher text.
+pub fn publisher_text_contains_evidence_span(publisher_text: &str, evidence: &str) -> bool {
+    let document = normalize_source_evidence_span(publisher_text);
+    let evidence = normalize_source_evidence_span(evidence);
+    if evidence.is_empty() {
+        return false;
+    }
+    document.match_indices(&evidence).any(|(start, matched)| {
+        let end = start + matched.len();
+        (start == 0 || document.as_bytes()[start - 1] == b' ')
+            && (end == document.len() || document.as_bytes()[end] == b' ')
+    })
+}
+
 fn selector_text(document: &Html, selector: &str) -> Vec<String> {
     let selector = Selector::parse(selector).unwrap();
     document
@@ -112,7 +204,10 @@ fn nearest_char_boundary(text: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_listing_html;
+    use super::{
+        clean_listing_html, clean_publisher_source_html, normalize_source_evidence_span,
+        publisher_text_contains_evidence_span,
+    };
 
     #[test]
     fn cleans_listing_html_to_text() {
@@ -140,5 +235,95 @@ mod tests {
         assert!(text.contains("Garmin GFC-700 Digital Autopilot"));
         assert!(!text.contains("window.analytics"));
         assert!(!text.contains("<h1>"));
+    }
+
+    #[test]
+    fn publisher_source_text_is_complete_and_accepts_conames_across_markup_and_entities() {
+        let long_prefix = "unrelated ".repeat(30_000);
+        let html = format!(
+            r#"<html><body>{long_prefix}<p>Cessna <strong>Skylane</strong>&nbsp;(182)</p>
+            <script>Cessna 209740 fabricated evidence</script></body></html>"#
+        );
+
+        let text = clean_publisher_source_html(&html);
+
+        assert!(text.starts_with("unrelated unrelated"));
+        assert!(text.contains("Cessna Skylane (182)"));
+        assert!(!text.contains("209740"));
+        assert!(publisher_text_contains_evidence_span(
+            &text,
+            "Cessna Skylane 182"
+        ));
+    }
+
+    #[test]
+    fn source_span_comparison_is_token_bounded() {
+        assert_eq!(
+            normalize_source_evidence_span("Cessna\u{a0}Skylane (182)"),
+            "cessna skylane 182"
+        );
+        assert!(publisher_text_contains_evidence_span(
+            "The Cessna Skylane 182 is listed.",
+            "Skylane 182"
+        ));
+        assert!(!publisher_text_contains_evidence_span(
+            "The FAA designation is 182T.",
+            "182"
+        ));
+        assert!(!publisher_text_contains_evidence_span(
+            "A different 209741 designation.",
+            "209740"
+        ));
+    }
+
+    #[test]
+    fn publisher_source_text_separates_dom_text_nodes_without_fabricating_tokens() {
+        let text = clean_publisher_source_html(
+            "<html><body><span>Cessna</span><span>182</span>\
+             <p>designation <i>18</i><b>2</b></p></body></html>",
+        );
+
+        assert!(publisher_text_contains_evidence_span(&text, "Cessna 182"));
+        assert!(!publisher_text_contains_evidence_span(
+            &text,
+            "designation 182"
+        ));
+    }
+
+    #[test]
+    fn publisher_source_text_excludes_hidden_subtrees_without_style_substring_false_positives() {
+        let text = clean_publisher_source_html(
+            r#"
+            <html><body>
+              <p>Visible Cessna Skylane 182 evidence</p>
+              <div hidden>Hidden fabricated family identity</div>
+              <div aria-hidden=" TRUE ">ARIA-hidden fabricated family identity</div>
+              <div style=" DISPLAY : NONE!important ">Display-hidden fabricated family identity</div>
+              <div style=" visibility : HIDDEN ">Visibility-hidden fabricated family identity</div>
+              <div style="content: 'display:none'; display: block">
+                Visible content-property text
+              </div>
+              <div style="--display:none; display: none-block">
+                Visible substring-collision text
+              </div>
+            </body></html>
+            "#,
+        );
+
+        assert!(text.contains("Visible Cessna Skylane 182 evidence"));
+        assert!(text.contains("Visible content-property text"));
+        assert!(text.contains("Visible substring-collision text"));
+        assert!(!text.contains("Hidden fabricated"));
+        assert!(!text.contains("ARIA-hidden fabricated"));
+        assert!(!text.contains("Display-hidden fabricated"));
+        assert!(!text.contains("Visibility-hidden fabricated"));
+        assert!(publisher_text_contains_evidence_span(
+            &text,
+            "Cessna Skylane 182"
+        ));
+        assert!(!publisher_text_contains_evidence_span(
+            &text,
+            "fabricated family identity"
+        ));
     }
 }

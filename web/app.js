@@ -1,8 +1,10 @@
 import { initializeAvionicsInspector } from "/avionics.js";
+import { initializeReviewWorkspace } from "/review.js";
 
 const USER_HEADER = "developer";
 const VIEW_TITLES = {
   "listings-panel": ["Listings", "Sale listings and aircraft details"],
+  "review-panel": ["Review", "Resolve listing evidence before verification"],
   "aircraft-panel": ["Aircraft", "Model parameters and depreciation curves"],
   "avionics-panel": ["Avionics", "Catalog identities, capabilities, values, and usage"],
   "comparisons-panel": ["Comparisons", "Purchase, rental, and investment runs"],
@@ -55,6 +57,7 @@ const state = {
 
 const elements = {};
 let avionicsInspector;
+let reviewWorkspace;
 
 document.addEventListener("DOMContentLoaded", () => {
   collectElements();
@@ -68,12 +71,22 @@ document.addEventListener("DOMContentLoaded", () => {
     selectOption,
     setButtonBusy,
   });
+  reviewWorkspace = initializeReviewWorkspace({
+    activatePanel,
+    api,
+    formatDate,
+    formatNumber,
+    refreshAvionics: () => avionicsInspector.refresh(),
+    refreshListings: loadListings,
+    setButtonBusy,
+  });
   bindEvents();
   addAvionicsRow();
   loadValuationStatus();
   loadCurrentUser();
   loadListings();
   loadAircraftOptions();
+  reviewWorkspace.restoreFromLocation();
 });
 
 function collectElements() {
@@ -251,6 +264,8 @@ function activatePanel(panelId) {
   elements.viewSubtitle.textContent = subtitle;
   if (panelId === "avionics-panel") {
     avionicsInspector.activate();
+  } else if (panelId === "review-panel") {
+    reviewWorkspace.activate();
   }
 }
 
@@ -753,7 +768,7 @@ function statusCell(status, verified, ingestionState, ingestionError) {
   const ingestionPill = document.createElement("span");
   const normalizedState = ingestionState || "unknown";
   ingestionPill.className = `ingestion-pill ${normalizedState}`;
-  ingestionPill.textContent = normalizedState;
+  ingestionPill.textContent = normalizedState.replaceAll("_", " ");
   ingestionPill.title = ingestionError
     ? `Ingestion ${normalizedState}: ${ingestionError}`
     : `Ingestion ${normalizedState}`;
@@ -1385,7 +1400,10 @@ async function api(path, options = {}) {
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const message = payload?.error?.message || `HTTP ${response.status}`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }

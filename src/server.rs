@@ -19,18 +19,43 @@ use crate::aircraft::{
     aircraft_listing_value_with_model, aircraft_options, aircraft_variant_detail_with_model,
     AircraftStoreError,
 };
+use crate::avionics::catalog::{
+    attest_grounded_existing_avionics_identity, preview_avionics_identity,
+    resolve_verified_local_avionics_identity,
+    verify_approved_avionics_product_source_without_gemini, AvionicsIdentityOutcome,
+    AvionicsIdentityRequest, CatalogError,
+};
+use crate::avionics::consolidation::{
+    consolidate_avionics_models_with_human_review,
+    preview_human_reviewed_avionics_model_consolidation, ConsolidationError,
+    HumanReviewedAvionicsConsolidationRequest, HumanReviewedConsolidationProvenance,
+};
 use crate::avionics::inspection::{
     avionics_catalog_options, get_avionics_catalog_detail, list_avionics_catalog,
     AvionicsCatalogQuery, AvionicsInspectionError,
 };
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
+use crate::listing::review::{
+    active_collision_closure_revision_sha256, corroborate_existing_product_association_and_restage,
+    get_listing_review, list_listing_reviews, preflight_existing_product_verification,
+    preflight_listing_review_resolution, resolve_listing_review, resolved_review_response,
+    restage_unattested_preserved_products, ListingReview, ListingReviewDetail, ListingReviewQueue,
+    ResolveReviewRequest, ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError,
+    ReviewQueueQuery, StagedPendingReview,
+};
 use crate::listings::{
-    create_listing, delete_listing, get_listing, list_listings, update_listing, ListingStoreError,
+    create_listing, delete_listing, ensure_listing_canonical_aircraft_identity,
+    finalize_reviewed_listing_ingestion, get_listing, list_listings, update_listing,
+    ListingStoreError,
 };
 use crate::models::{
     ListingPreview, ListingUpdateRequest, PluginRegisterRequest, PluginSubmissionRequest,
     PreviewRequest, User,
+};
+use crate::normalize::{
+    normalize_avionics_identifier, normalize_avionics_manufacturer_name,
+    normalize_avionics_model_name,
 };
 use crate::plugin::{
     plugin_url_status, register_plugin_install, reprocess_plugin_submission, submit_plugin_html,
@@ -61,6 +86,46 @@ struct AircraftVariantQuery {
 #[derive(Debug, Deserialize)]
 struct PluginSubmissionStatusQuery {
     source_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HumanAvionicsConsolidationApiRequest {
+    #[serde(
+        rename = "review_payload_sha256",
+        alias = "expected_review_payload_sha256"
+    )]
+    expected_review_payload_sha256: String,
+    #[serde(
+        rename = "catalog_revision_sha256",
+        alias = "expected_catalog_revision_sha256"
+    )]
+    expected_catalog_revision_sha256: String,
+    aspect_id: crate::listing::review::ReviewAspectId,
+    survivor_id: i64,
+    duplicate_ids: Vec<i64>,
+    authoritative_source_url: String,
+    authoritative_source_title: String,
+    exact_evidence_text: String,
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyExistingReviewAvionicsRequest {
+    #[serde(
+        rename = "review_payload_sha256",
+        alias = "expected_review_payload_sha256"
+    )]
+    expected_review_payload_sha256: String,
+    #[serde(
+        rename = "catalog_revision_sha256",
+        alias = "expected_catalog_revision_sha256"
+    )]
+    expected_catalog_revision_sha256: String,
+    aspect_id: ReviewAspectId,
+    identity_source_url: String,
+    identity_source_title: String,
+    identity_evidence_text: String,
 }
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
@@ -94,6 +159,8 @@ fn router(state: AppState) -> Router {
         .route("/app.css", get(stylesheet))
         .route("/app.js", get(javascript))
         .route("/avionics.js", get(avionics_javascript))
+        .route("/review.js", get(review_javascript))
+        .route("/review/domain.mjs", get(review_domain_javascript))
         .route("/health", get(health))
         .route("/api/valuation/status", get(valuation_status_handler))
         .route("/api/users/current", get(current_user_handler))
@@ -120,6 +187,24 @@ fn router(state: AppState) -> Router {
         .route("/api/avionics", get(list_avionics_handler))
         .route("/api/avionics/options", get(avionics_options_handler))
         .route("/api/avionics/{id}", get(avionics_detail_handler))
+        .route("/api/review/listings", get(list_listing_reviews_handler))
+        .route("/api/review/listings/{id}", get(get_listing_review_handler))
+        .route(
+            "/api/review/listings/{id}/restage",
+            post(restage_listing_review_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/avionics/verify-existing",
+            post(verify_existing_review_avionics_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/resolve",
+            post(resolve_listing_review_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/avionics/consolidate",
+            post(consolidate_review_avionics_handler),
+        )
         .route(
             "/api/aircraft/variants/{id}",
             get(aircraft_variant_detail_handler),
@@ -159,6 +244,26 @@ async fn avionics_javascript() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         AVIONICS_JS,
+    )
+}
+
+async fn review_javascript() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        REVIEW_JS,
+    )
+}
+
+async fn review_domain_javascript() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        REVIEW_DOMAIN_JS,
     )
 }
 
@@ -517,6 +622,703 @@ async fn avionics_detail_handler(
     Ok(Json(json!({"current_user": user, "avionics": avionics})))
 }
 
+async fn list_listing_reviews_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ReviewQueueQuery>,
+) -> Result<Json<ListingReviewQueue>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let queue = list_listing_reviews(&state.db, user.id, query).await?;
+    Ok(Json(queue))
+}
+
+async fn get_listing_review_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+) -> Result<Json<ListingReviewDetail>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let review = get_listing_review(&state.db, user.id, listing_id).await?;
+    Ok(Json(review))
+}
+
+async fn restage_listing_review_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let staged = restage_unattested_preserved_products(&state.db, user.id, listing_id).await?;
+    review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+async fn review_maintenance_response(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    staged: Option<StagedPendingReview>,
+) -> Result<Json<Value>, ApiError> {
+    match staged {
+        Some(_) => {
+            let detail = get_listing_review(db, owner_user_id, listing_id).await?;
+            Ok(Json(json!({
+                "review": detail.review,
+                "review_complete": false
+            })))
+        }
+        None => Ok(Json(json!({
+            "review": Value::Null,
+            "review_complete": true
+        }))),
+    }
+}
+
+/// Ground exactly one hash-bound approved product association.
+///
+/// This endpoint never resolves the listing or grounds another aspect. After a
+/// Product re-attestation uses only a guarded publisher fetch and deterministic
+/// catalog checks; it never makes a Gemini provider call. After a new positive
+/// attestation, the endpoint performs only the zero-Gemini review maintenance
+/// needed to retire satisfied synthetic aspects. The attestation remains
+/// durable if the reviewer later discards another aspect or the final listing
+/// transaction becomes stale.
+async fn verify_existing_review_avionics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<VerifyExistingReviewAvionicsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let target = preflight_existing_product_verification(
+        &state.db,
+        user.id,
+        listing_id,
+        &payload.aspect_id,
+        &payload.expected_review_payload_sha256,
+        &payload.expected_catalog_revision_sha256,
+        &payload.identity_source_url,
+        &payload.identity_source_title,
+        &payload.identity_evidence_text,
+    )
+    .await?;
+    let target_id = target
+        .product
+        .id
+        .expect("verification target always comes from an approved catalog row");
+    let listing = get_listing(&state.db, user.id, listing_id).await?;
+    let target = if !target.already_reuse_attested {
+        // Re-read both review hashes, the exact covered association, and the
+        // immutable approved identity immediately before the guarded OEM
+        // fetch. The attestation writer performs its own locked identity
+        // comparison after deterministic verification returns.
+        preflight_existing_product_verification(
+            &state.db,
+            user.id,
+            listing_id,
+            &payload.aspect_id,
+            &payload.expected_review_payload_sha256,
+            &payload.expected_catalog_revision_sha256,
+            &payload.identity_source_url,
+            &payload.identity_source_title,
+            &payload.identity_evidence_text,
+        )
+        .await?
+    } else {
+        target
+    };
+    let stable_identifier = target
+        .product
+        .stable_identifier
+        .as_ref()
+        .expect("verification preflight requires a stable identifier");
+    let request = AvionicsIdentityRequest {
+        aircraft_manufacturer: listing.aircraft.manufacturer.clone(),
+        aircraft_model: listing.aircraft.model.clone(),
+        aircraft_variant: listing.aircraft.variant.clone(),
+        model_year: listing.model_year,
+        source_url: listing.source_url.clone().unwrap_or_default(),
+        // This is the immutable listing observation being corroborated. The
+        // authoritative product dossier below proves the global product
+        // identity, but it must never stand in for occurrence-level evidence.
+        listing_context: target.listing_evidence_text.clone(),
+        requires_listing_evidence: true,
+        authoritative_direct_source_urls: vec![payload.identity_source_url.clone()],
+        authoritative_identity_anchors: vec![
+            target.product.manufacturer.clone(),
+            target.product.model.clone(),
+            stable_identifier.value.clone(),
+        ],
+        manufacturer: target.product.manufacturer.clone(),
+        model: target.product.model.clone(),
+        avionics_types: target.product.capabilities.clone(),
+        quantity: target.quantity,
+    };
+
+    if !target.already_reuse_attested {
+        let extractor = state.extractor.as_ref().ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "guarded publisher-source fetching is unavailable",
+            )
+            .with_code("avionics_grounding_unavailable")
+        })?;
+        let fetched = extractor
+            .fetch_public_same_origin_source_document(&payload.identity_source_url)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("could not fetch authoritative avionics source: {error}"),
+                )
+                .with_code("avionics_source_fetch_failed")
+            })?;
+        let outcome = verify_approved_avionics_product_source_without_gemini(
+            &state.db,
+            &request,
+            target_id,
+            &payload.identity_source_title,
+            &fetched,
+        )
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                CatalogError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                CatalogError::Validation(_) | CatalogError::Gemini(_) => StatusCode::CONFLICT,
+            };
+            ApiError::new(
+                status,
+                format!("could not deterministically verify existing avionics identity: {error}"),
+            )
+            .with_code("avionics_identity_verification_failed")
+        })?;
+        let approved = match outcome {
+            AvionicsIdentityOutcome::Approved(approved) if approved.id == target_id => approved,
+            AvionicsIdentityOutcome::Approved(approved) => {
+                return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "source verification matched catalog id {} instead of hash-bound existing catalog id {target_id}",
+                            approved.id
+                        ),
+                    )
+                    .with_code("avionics_identity_mismatch"));
+            }
+            AvionicsIdentityOutcome::Rejected { reason } => {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("existing avionics product source was rejected: {reason}"),
+                )
+                .with_code("avionics_identity_rejected"));
+            }
+            AvionicsIdentityOutcome::Unresolved { reason } => {
+                return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "existing avionics identity could not be deterministically re-attested: {reason}"
+                        ),
+                    )
+                    .with_code("avionics_identity_unresolved"));
+            }
+        };
+        let attested = attest_grounded_existing_avionics_identity(&state.db, &approved)
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "grounded catalog id {target_id} could not receive a current-policy reuse attestation: {error}"
+                        ),
+                    )
+                    .with_code("avionics_reuse_attestation_failed")
+                })?;
+        if !attested {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "grounded catalog id {target_id} has no active exact manufacturer source origin"
+                ),
+            )
+            .with_code("avionics_reuse_attestation_failed"));
+        }
+    }
+
+    // Capture the complete local-resolver collision state after a possible
+    // product attestation (which intentionally changes reuse eligibility)
+    // and immediately before the association decision that consumes it.
+    let expected_collision_closure_sha256 =
+        active_collision_closure_revision_sha256(&state.db, target_id).await?;
+
+    // Product identity and listing occurrence are independent claims. Run the
+    // identifier-only local resolver even when preflight found an apparently
+    // current marker: catalog state may have changed since that read, and a
+    // stale marker must never be rebound to a new closure without fresh proof.
+    let local = resolve_verified_local_avionics_identity(&state.db, &request)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not evaluate the local avionics fast path: {error}"),
+            )
+            .with_code("avionics_local_match_failed")
+        })?;
+    match local {
+        Some(approved) if approved.id == target_id => {}
+        Some(approved) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "local matching selected catalog id {} instead of hash-bound catalog id {target_id}",
+                    approved.id
+                ),
+            )
+            .with_code("avionics_identity_mismatch"));
+        }
+        None => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "retained listing evidence does not unambiguously identify current catalog id {target_id}; product re-attestation, if newly completed, remains durable while this association stays pending for manual/full-listing review"
+                ),
+            )
+            .with_code("avionics_association_unresolved"));
+        }
+    }
+
+    let staged = corroborate_existing_product_association_and_restage(
+        &state.db,
+        user.id,
+        listing_id,
+        &payload.aspect_id,
+        &payload.expected_review_payload_sha256,
+        &payload.expected_catalog_revision_sha256,
+        &expected_collision_closure_sha256,
+        target_id,
+        &target.observation_sha256,
+    )
+    .await?;
+    review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+/// Preview or apply an explicit, evidence-backed consolidation of the exact
+/// unreviewed catalog collision blocking one listing-review aspect.
+///
+/// This endpoint never calls Gemini. The core function re-snapshots the
+/// pending-review digest and every selected catalog row under its write lock
+/// before an apply, so the preview is informative rather than authorization.
+async fn consolidate_review_avionics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<HumanAvionicsConsolidationApiRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let detail = get_listing_review(&state.db, user.id, listing_id).await?;
+    if payload.expected_review_payload_sha256 != detail.review.review_payload_sha256 {
+        return Err(ApiError::from(ReviewError::Stale(
+            "review payload is stale; reload the review".to_string(),
+        )));
+    }
+    if payload.expected_catalog_revision_sha256 != detail.review.catalog_revision_sha256 {
+        return Err(ApiError::from(ReviewError::Stale(
+            "approved avionics catalog changed during review; reload and re-evaluate".to_string(),
+        )));
+    }
+
+    let aspect = detail
+        .review
+        .aspects
+        .iter()
+        .find(|aspect| aspect.id == payload.aspect_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown review aspect {}", payload.aspect_id),
+            )
+            .with_code("review_consolidation_invalid")
+        })?;
+    if aspect.kind != "avionics" {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "review aspect {} is not an avionics identity aspect",
+                payload.aspect_id
+            ),
+        )
+        .with_code("review_consolidation_invalid"));
+    }
+    let proposed = aspect.proposed_product.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "review aspect {} has no proposed avionics identity to consolidate",
+                payload.aspect_id
+            ),
+        )
+        .with_code("review_consolidation_invalid")
+    })?;
+    if proposed
+        .id
+        .is_some_and(|id| id != payload.survivor_id && !payload.duplicate_ids.contains(&id))
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "review aspect {} points to catalog id {:?}, outside the requested consolidation set",
+                payload.aspect_id, proposed.id
+            ),
+        )
+        .with_code("review_consolidation_mismatch"));
+    }
+
+    let request = HumanReviewedAvionicsConsolidationRequest {
+        survivor_id: payload.survivor_id,
+        duplicate_ids: payload.duplicate_ids,
+        reviewer_user_id: user.id,
+        authoritative_source_url: payload.authoritative_source_url,
+        authoritative_source_title: payload.authoritative_source_title,
+        exact_evidence_text: payload.exact_evidence_text,
+        provenance: Some(HumanReviewedConsolidationProvenance {
+            listing_id,
+            review_aspect_id: payload.aspect_id.to_string(),
+            expected_review_payload_sha256: payload.expected_review_payload_sha256,
+        }),
+        expected_authorization_sha256: None,
+        expected_catalog_revision_sha256: Some(payload.expected_catalog_revision_sha256.clone()),
+    };
+    let preview = preview_human_reviewed_avionics_model_consolidation(&state.db, &request).await?;
+    let proposed_manufacturer_key = normalize_avionics_manufacturer_name(&proposed.manufacturer);
+    let proposed_model_key = normalize_avionics_model_name(&proposed.model);
+    if proposed_model_key != preview.authorization.canonical_model_key
+        || preview.authorization.members.iter().all(|member| {
+            normalize_avionics_manufacturer_name(&member.manufacturer) != proposed_manufacturer_key
+        })
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "requested catalog rows do not match the proposed identity {} {} for review aspect {}",
+                proposed.manufacturer, proposed.model, payload.aspect_id
+            ),
+        )
+        .with_code("review_consolidation_mismatch"));
+    }
+    if let Some(staged_identifier) = &proposed.stable_identifier {
+        let staged_kind = staged_identifier.kind.trim();
+        let staged_value = normalize_avionics_identifier(&staged_identifier.value);
+        let has_conflicting_member_identifier =
+            preview.authorization.members.iter().any(|member| {
+                member
+                    .manufacturer_identifier_kind
+                    .as_deref()
+                    .zip(member.normalized_manufacturer_identifier.as_deref())
+                    .is_some_and(|(kind, value)| {
+                        kind.trim() != staged_kind
+                            || normalize_avionics_identifier(value) != staged_value
+                    })
+            });
+        if has_conflicting_member_identifier {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "requested catalog rows conflict with the staged stable identifier for review aspect {}",
+                    payload.aspect_id
+                ),
+            )
+            .with_code("review_consolidation_mismatch"));
+        }
+    }
+
+    if !payload.apply {
+        return Ok(Json(json!({
+            "applied": false,
+            "report": preview,
+            "review": detail.review,
+        })));
+    }
+
+    let mut apply_request = request;
+    apply_request.expected_authorization_sha256 =
+        Some(preview.authorization.authorization_sha256.clone());
+    let report = consolidate_avionics_models_with_human_review(&state.db, &apply_request).await?;
+    let refreshed = get_listing_review(&state.db, user.id, listing_id).await?;
+    Ok(Json(json!({
+        "applied": true,
+        "report": report,
+        "review": refreshed.review,
+    })))
+}
+
+async fn resolve_listing_review_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(mut payload): Json<ResolveReviewRequest>,
+) -> Result<Json<ResolveReviewResponse>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    // Enforce ownership before preparing FAA identity, then establish and
+    // strictly revalidate the immutable canonical assignment before any
+    // Gemini or avionics-catalog writes. This also repairs legacy pending
+    // reviews that predate aircraft identity assignment. When explicitly
+    // requested below, post-commit finalization repeats the check to close the
+    // publication race around network enrichment.
+    let review = get_listing_review(&state.db, user.id, listing_id).await?;
+    require_current_review_revisions(&review.review, &payload)?;
+    preflight_listing_review_resolution(&state.db, &review.review, &payload).await?;
+    ensure_listing_canonical_aircraft_identity(&state.db, listing_id)
+        .await
+        .map_err(|error| {
+            ApiError::from(error).with_code("listing_aircraft_identity_preparation_failed")
+        })?;
+    ground_review_product_creations(&state, user.id, listing_id, &review.review, &mut payload)
+        .await?;
+    let resolved = resolve_listing_review(&state.db, user.id, listing_id, &payload).await?;
+    if payload.finalize_listing {
+        finalize_reviewed_listing_ingestion(&state.db, listing_id, state.extractor.as_ref(), None)
+            .await
+            .map_err(|error| ApiError::from(error).with_code("listing_finalization_failed"))?;
+    }
+    Ok(Json(
+        resolved_review_response(&state.db, user.id, resolved).await?,
+    ))
+}
+
+/// Reject stale browser state before any FAA preparation or paid Gemini work.
+///
+/// The transaction repeats these checks under its database locks; this early
+/// gate is only a cost and latency optimization, never the concurrency
+/// boundary.
+fn require_current_review_revisions(
+    review: &ListingReview,
+    payload: &ResolveReviewRequest,
+) -> Result<(), ApiError> {
+    if payload.expected_review_payload_sha256 != review.review_payload_sha256 {
+        return Err(ApiError::from(ReviewError::Stale(
+            "review payload is stale; reload the review".to_string(),
+        )));
+    }
+    if payload.expected_catalog_revision_sha256 != review.catalog_revision_sha256 {
+        return Err(ApiError::from(ReviewError::Stale(
+            "approved avionics catalog changed during review; reload and re-evaluate".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+/// A human corroboration can authorize a catalog write, but it cannot bypass
+/// the same grounded identity and collision checks used by automatic
+/// ingestion. The preflight is deliberately outside the write transaction:
+/// the review transaction repeats exact catalog-revision and uniqueness checks
+/// before persisting the Gemini-attested canonical fields below.
+async fn ground_review_product_creations(
+    state: &AppState,
+    user_id: i64,
+    listing_id: i64,
+    review: &ListingReview,
+    payload: &mut ResolveReviewRequest,
+) -> Result<(), ApiError> {
+    if !payload
+        .decisions
+        .iter()
+        .any(|decision| matches!(decision, ReviewDecision::CreateVerifiedProduct { .. }))
+    {
+        return Ok(());
+    }
+    let extractor = state.extractor.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Gemini is required to ground a new verified avionics product",
+        )
+        .with_code("avionics_grounding_unavailable")
+    })?;
+    let listing = get_listing(&state.db, user_id, listing_id).await?;
+
+    for decision in &mut payload.decisions {
+        let ReviewDecision::CreateVerifiedProduct {
+            aspect_id,
+            unreviewed_avionics_model_id,
+            manufacturer,
+            model,
+            capabilities,
+            manufacturer_identifier_kind,
+            manufacturer_identifier,
+            identity_source_url,
+            identity_source_title,
+            identity_evidence_text,
+            grounded_claim_source_urls,
+        } = decision
+        else {
+            continue;
+        };
+        let aspect = review
+            .aspects
+            .iter()
+            .find(|aspect| &aspect.id == aspect_id)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown review aspect {aspect_id}"),
+                )
+                .with_code("review_decision_invalid")
+            })?;
+        let staged_candidate_id = aspect
+            .proposed_product
+            .as_ref()
+            .and_then(|product| product.id);
+        if let (Some(staged_id), Some(selected_id)) =
+            (staged_candidate_id, *unreviewed_avionics_model_id)
+        {
+            if staged_id != selected_id {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "review aspect {aspect_id} was staged with unreviewed catalog candidate id {staged_id}, but the decision selected id {selected_id}"
+                    ),
+                )
+                .with_code("avionics_candidate_mismatch"));
+            }
+        }
+        let promotion_candidate_id = (*unreviewed_avionics_model_id).or(staged_candidate_id);
+        let submitted_identifier_kind = manufacturer_identifier_kind.trim().to_string();
+        let submitted_identifier = normalize_avionics_identifier(manufacturer_identifier);
+        let request = AvionicsIdentityRequest {
+            aircraft_manufacturer: listing.aircraft.manufacturer.clone(),
+            aircraft_model: listing.aircraft.model.clone(),
+            aircraft_variant: listing.aircraft.variant.clone(),
+            model_year: listing.model_year,
+            source_url: listing.source_url.clone().unwrap_or_default(),
+            listing_context: json!({
+                "context_kind": "human listing review product creation",
+                "listing_id": listing_id,
+                    "review_aspect_id": aspect_id.to_string(),
+                    "unreviewed_avionics_model_id": promotion_candidate_id,
+                "reviewer_proposed_identity": {
+                    "manufacturer": manufacturer,
+                    "model": model,
+                    "capabilities": capabilities,
+                    "manufacturer_identifier_kind": manufacturer_identifier_kind,
+                    "manufacturer_identifier": manufacturer_identifier,
+                    "identity_source_title": identity_source_title,
+                    "identity_evidence_text": identity_evidence_text,
+                },
+            })
+            .to_string(),
+            // The authoritative product source supplied by the reviewer, not
+            // the sale listing, is the identity evidence for this pass.
+            requires_listing_evidence: false,
+            authoritative_direct_source_urls: vec![identity_source_url.clone()],
+            authoritative_identity_anchors: vec![
+                manufacturer.clone(),
+                model.clone(),
+                manufacturer_identifier.clone(),
+                identity_evidence_text.clone(),
+            ],
+            manufacturer: manufacturer.clone(),
+            model: model.clone(),
+            avionics_types: capabilities.clone(),
+            quantity: aspect.quantity.max(1),
+        };
+        let outcome = preview_avionics_identity(&state.db, extractor, &request)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("could not ground proposed avionics identity: {error}"),
+                )
+                .with_code("avionics_grounding_failed")
+            })?;
+        let approved = match outcome {
+            AvionicsIdentityOutcome::Approved(approved) => approved,
+            AvionicsIdentityOutcome::Rejected { reason } => {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("proposed avionics product was rejected: {reason}"),
+                )
+                .with_code("avionics_identity_rejected"));
+            }
+            AvionicsIdentityOutcome::Unresolved { reason } => {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!("proposed avionics identity remains unresolved: {reason}"),
+                )
+                .with_code("avionics_identity_unresolved"));
+            }
+        };
+
+        if approved.manufacturer_identifier_kind != submitted_identifier_kind
+            || normalize_avionics_identifier(&approved.manufacturer_identifier)
+                != submitted_identifier
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "Gemini did not confirm the submitted manufacturer identifier for {} {}",
+                    manufacturer, model
+                ),
+            )
+            .with_code("avionics_identifier_mismatch"));
+        }
+
+        if approved.id > 0 && Some(approved.id) != promotion_candidate_id {
+            let reuse_attested =
+                attest_grounded_existing_avionics_identity(&state.db, &approved)
+                    .await
+                    .map_err(|error| {
+                        ApiError::new(
+                            StatusCode::CONFLICT,
+                            format!(
+                                "Gemini matched catalog id {}, but its current-policy reuse attestation could not be persisted: {error}",
+                                approved.id
+                            ),
+                        )
+                        .with_code("avionics_reuse_attestation_failed")
+                    })?;
+            let existing_is_verified_suggestion = aspect
+                .suggested_product
+                .as_ref()
+                .and_then(|product| product.id)
+                == Some(approved.id);
+            let guidance = if reuse_attested {
+                "the current grounded review was saved as a reuse attestation; reload the review and use that verified product"
+            } else if existing_is_verified_suggestion {
+                "reload the review and use that verified product instead"
+            } else {
+                "consolidate or adjudicate that existing catalog candidate before creating a product"
+            };
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "Gemini matched the proposed product to existing catalog id {}; {guidance}",
+                    approved.id,
+                ),
+            )
+            .with_code(if reuse_attested {
+                "avionics_identity_reuse_attested"
+            } else {
+                "avionics_identity_exists"
+            }));
+        }
+
+        // Persist exactly the independently grounded canonical identity and
+        // evidence, never unchecked reviewer-entered catalog fields.
+        *manufacturer = approved.manufacturer;
+        *model = approved.model;
+        *capabilities = approved.avionics_types;
+        *manufacturer_identifier_kind = approved.manufacturer_identifier_kind;
+        *manufacturer_identifier = approved.manufacturer_identifier;
+        *identity_source_url = approved.evidence_url;
+        *identity_source_title = approved.evidence_title;
+        *identity_evidence_text = approved.evidence;
+        *grounded_claim_source_urls = approved.grounded_claim_source_urls;
+    }
+    Ok(())
+}
+
 async fn aircraft_variant_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -604,6 +1406,39 @@ fn user_email(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Minimal reviewer authorization until the application has durable roles.
+/// The existing header identity mechanism is unchanged; production deployments
+/// must configure the exact reviewer email allowlist server-side.
+fn require_listing_reviewer(user: &User) -> Result<(), ApiError> {
+    let allow_local_reviewer = cfg!(debug_assertions)
+        || std::env::var("AIRCOST_ALLOW_LOCAL_REVIEWER")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"));
+    let local_developer = allow_local_reviewer
+        && user.auth_provider == "local"
+        && user.email.eq_ignore_ascii_case(crate::db::DEVELOPER_EMAIL);
+    let configured = std::env::var("AIRCOST_REVIEWER_EMAILS")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|email| !email.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|email| email.eq_ignore_ascii_case(&user.email));
+    if local_developer || configured {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "current user is not configured as a listing reviewer",
+        ))
+    }
+}
+
 async fn plugin_submission_response(
     db: &AppDb,
     valuation_model: Option<&Arc<dyn ValuationModel>>,
@@ -631,6 +1466,7 @@ async fn plugin_submission_response(
 struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -638,7 +1474,13 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            code: None,
         }
+    }
+
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
@@ -649,6 +1491,7 @@ impl IntoResponse for ApiError {
             "error": {
                 "message": self.message,
                 "status": status.as_u16(),
+                "code": self.code,
             }
         }));
         (status, body).into_response()
@@ -721,6 +1564,44 @@ impl From<AvionicsInspectionError> for ApiError {
     }
 }
 
+impl From<ConsolidationError> for ApiError {
+    fn from(error: ConsolidationError) -> Self {
+        match error {
+            ConsolidationError::Validation(message) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+                    .with_code("avionics_consolidation_invalid")
+            }
+            ConsolidationError::Conflict(message) => ApiError::new(StatusCode::CONFLICT, message)
+                .with_code("avionics_consolidation_conflict"),
+            ConsolidationError::Database(message) => {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+                    .with_code("avionics_consolidation_failed")
+            }
+        }
+    }
+}
+
+impl From<ReviewError> for ApiError {
+    fn from(error: ReviewError) -> Self {
+        match error {
+            ReviewError::Validation(message) => {
+                ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+            }
+            ReviewError::Stale(message) => {
+                ApiError::new(StatusCode::PRECONDITION_FAILED, message).with_code("review_stale")
+            }
+            ReviewError::Conflict(message) => {
+                ApiError::new(StatusCode::CONFLICT, message).with_code("review_conflict")
+            }
+            ReviewError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
+            ReviewError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
+            ReviewError::Database(message) => {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}"))
@@ -731,22 +1612,41 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 const AVIONICS_JS: &str = include_str!("../web/avionics.js");
+const REVIEW_JS: &str = include_str!("../web/review.js");
+const REVIEW_DOMAIN_JS: &str = include_str!("../web/review/domain.mjs");
 
 #[cfg(test)]
 mod tests {
-    use axum::extract::{Query, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::Json;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+    use sqlx::SqlitePool;
 
     use super::{
-        avionics_options_handler, list_avionics_handler, start_plugin_submission_job, AppState,
+        avionics_options_handler, get_listing_review, list_avionics_handler,
+        require_current_review_revisions, start_plugin_submission_job,
+        verify_existing_review_avionics_handler, AppState, VerifyExistingReviewAvionicsRequest,
     };
     use crate::avionics::inspection::AvionicsCatalogQuery;
-    use crate::db::AppDb;
+    use crate::avionics::manufacturer::{
+        ensure_manufacturer_identity, ManufacturerIdentityEvidence,
+    };
+    use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
+    use crate::db::{AppDb, DatabaseBackend};
+    use crate::listing::review::{
+        restage_unattested_preserved_products, stage_pending_review, ListingReview,
+        PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
+        ReviewAircraftIdentityStatus, ReviewAircraftSummary,
+    };
     use crate::models::PluginSubmissionRequest;
+    use crate::normalize::{
+        normalize_avionics_identifier, normalize_avionics_manufacturer_name,
+        normalize_avionics_model_name, normalize_name,
+    };
     use crate::plugin::{
         plugin_url_status, register_plugin_install, sha256_hex, signature_message,
     };
@@ -767,6 +1667,334 @@ mod tests {
                 warnings: vec![],
             },
         }
+    }
+
+    fn sqlite_pool(db: &AppDb) -> &SqlitePool {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("server test database is not SQLite");
+        };
+        pool
+    }
+
+    async fn insert_review_listing(db: &AppDb) -> (i64, i64) {
+        let pool = sqlite_pool(db);
+        let owner_user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(crate::db::DEVELOPER_EMAIL)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let variant_id: i64 = sqlx::query_scalar(
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            ) VALUES (?, ?, 'https://broker.example/aircraft/server-review', 2020, 450000, 900)
+            RETURNING id
+            "#,
+        )
+        .bind(variant_id)
+        .bind(owner_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (owner_user_id, listing_id)
+    }
+
+    async fn insert_approved_garmin_product(db: &AppDb) -> i64 {
+        let pool = sqlite_pool(db);
+        let manufacturer_key = normalize_avionics_manufacturer_name("Garmin");
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(&manufacturer_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        let manufacturer_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?")
+                .bind(&manufacturer_key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        ensure_manufacturer_identity(
+            db,
+            manufacturer_id,
+            &ManufacturerIdentityEvidence {
+                source_url: "https://www.garmin.com/en-US/aviation/".to_string(),
+                source_title: "Garmin Aviation".to_string(),
+                evidence_text:
+                    "Garmin's authoritative aviation site identifies Garmin as the manufacturer."
+                        .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let model = "GNS 430W";
+        let identifier = "011-01064-40";
+        let model_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier, identity_source_url,
+              identity_source_title, identity_evidence_text,
+              identity_evidence_kind, identity_confidence, catalog_reviewed_at
+            ) VALUES (?, ?, ?, 'manufacturer_part_number', ?, ?,
+                      'https://www.garmin.com/aviation/product',
+                      'Garmin GNS 430W product manual',
+                      'Garmin identifies GNS 430W by manufacturer part number 011-01064-40.',
+                      'authoritative_reference', 'very_high', CURRENT_TIMESTAMP)
+            RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .bind(model)
+        .bind(normalize_avionics_model_name(model))
+        .bind(identifier)
+        .bind(normalize_avionics_identifier(identifier))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let capability = "GPS";
+        sqlx::query(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(capability)
+        .bind(normalize_name(capability))
+        .execute(pool)
+        .await
+        .unwrap();
+        let capability_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_types WHERE normalized_name = ?")
+                .bind(normalize_name(capability))
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(capability_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        model_id
+    }
+
+    async fn attest_approved_garmin_product(db: &AppDb, avionics_model_id: i64) {
+        let pool = sqlite_pool(db);
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origins (
+              authority_kind, avionics_manufacturer_identity_id, https_origin,
+              evidence_source_url, evidence_source_title, evidence_text,
+              approval_basis, approval_reason
+            )
+            SELECT
+              'manufacturer_primary',
+              product_identity.avionics_manufacturer_identity_id,
+              'https://www.garmin.com',
+              'https://www.garmin.com/aviation/product',
+              'Garmin aviation product catalog',
+              'Garmin publishes this exact product on its first-party aviation catalog.',
+              'curated_bootstrap',
+              'Server verification cleanup test'
+            FROM avionics_approved_product_identities product_identity
+            WHERE product_identity.avionics_model_id = ?
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(avionics_model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(refresh_reuse_attestation_sqlite(
+            db,
+            &mut transaction,
+            avionics_model_id,
+            "https://www.garmin.com/aviation/product",
+        )
+        .await
+        .unwrap());
+        transaction.commit().await.unwrap();
+    }
+
+    fn review_with_revisions(review_revision: &str, catalog_revision: &str) -> ListingReview {
+        ListingReview {
+            listing_id: 1,
+            source_url: None,
+            label: "test listing".to_string(),
+            aircraft: ReviewAircraftSummary {
+                manufacturer: "Test".to_string(),
+                model: "Model".to_string(),
+                variant: "Variant".to_string(),
+            },
+            aircraft_identity: ReviewAircraftIdentityStatus {
+                status: ReviewAircraftIdentityState::Verified,
+                reason_code: None,
+                faa_n_number: Some("N1".to_string()),
+                faa_snapshot_id: Some(1),
+            },
+            registration_number: Some("N1".to_string()),
+            model_year: 2000,
+            review_payload_sha256: review_revision.to_string(),
+            catalog_revision_sha256: catalog_revision.to_string(),
+            allowed_capabilities: vec![],
+            aspects: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn corroborated_existing_product_returns_only_remaining_review_without_gemini_usage() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let preserved_id = insert_approved_garmin_product(&db).await;
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Garmin GNS 430W P/N 011-01064-40 shown in the listing',
+                      'high', 'installed')
+            "#,
+        )
+        .bind(listing_id)
+        .bind(preserved_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let primary = PendingReviewAspect::avionics(
+            "genuine-primary-observation",
+            "avionics_identity",
+            "Garmin GTX 345",
+            "Garmin GTX 345 transponder",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("GTX 345 shown in listing equipment".to_string()),
+            Some("high".to_string()),
+        );
+        stage_pending_review(&db, listing_id, None, &[primary])
+            .await
+            .unwrap();
+        let before_attestation =
+            restage_unattested_preserved_products(&db, owner_user_id, listing_id)
+                .await
+                .unwrap()
+                .expect("the genuine aspect must keep the review pending");
+        assert_eq!(before_attestation.pending_aspect_count, 2);
+
+        // This is the exact durable boundary reached by the handler only after
+        // its guarded OEM fetch and deterministic product checks succeed.
+        attest_approved_garmin_product(&db, preserved_id).await;
+        let usage_before_cleanup: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let detail = get_listing_review(&db, owner_user_id, listing_id)
+            .await
+            .unwrap()
+            .review;
+        let synthetic = detail
+            .aspects
+            .iter()
+            .find(|aspect| {
+                aspect
+                    .reuse_attestation_target
+                    .as_ref()
+                    .and_then(|product| product.id)
+                    == Some(preserved_id)
+            })
+            .expect("the preserved association must be staged");
+        let response = verify_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(VerifyExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: before_attestation.review_payload_sha256.clone(),
+                expected_catalog_revision_sha256: before_attestation
+                    .catalog_revision_sha256
+                    .clone(),
+                aspect_id: synthetic.id.clone(),
+                // Product identity is already covered by the current reuse
+                // attestation. Association-only local reuse must not require
+                // the browser to resubmit or re-bound that product dossier.
+                identity_source_url: String::new(),
+                identity_source_title: String::new(),
+                identity_evidence_text: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_ne!(
+            response["review"]["review_payload_sha256"],
+            before_attestation.review_payload_sha256
+        );
+        assert_eq!(response["review"]["aspects"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response["review"]["aspects"][0]["id"],
+            "genuine-primary-observation"
+        );
+        assert!(response["review"]["aspects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|aspect| aspect["reuse_attestation_target"]["id"] != preserved_id));
+        let usage_after_cleanup: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_after_cleanup, usage_before_cleanup);
+    }
+
+    #[test]
+    fn stale_review_revisions_are_rejected_before_grounding() {
+        let review_revision = "a".repeat(64);
+        let catalog_revision = "b".repeat(64);
+        let review = review_with_revisions(&review_revision, &catalog_revision);
+        let current = ResolveReviewRequest {
+            expected_review_payload_sha256: review_revision.clone(),
+            expected_catalog_revision_sha256: catalog_revision.clone(),
+            finalize_listing: false,
+            decisions: vec![],
+        };
+        require_current_review_revisions(&review, &current).unwrap();
+
+        let stale_review = ResolveReviewRequest {
+            expected_review_payload_sha256: "c".repeat(64),
+            ..current
+        };
+        let error = require_current_review_revisions(&review, &stale_review).unwrap_err();
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.code, Some("review_stale"));
+        assert!(error.message.contains("review payload is stale"));
+
+        let stale_catalog = ResolveReviewRequest {
+            expected_review_payload_sha256: review_revision,
+            expected_catalog_revision_sha256: "d".repeat(64),
+            finalize_listing: false,
+            decisions: vec![],
+        };
+        let error = require_current_review_revisions(&review, &stale_catalog).unwrap_err();
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.code, Some("review_stale"));
+        assert!(error.message.contains("catalog changed"));
     }
 
     #[tokio::test]

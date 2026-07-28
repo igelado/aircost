@@ -87,42 +87,6 @@ CREATE TRIGGER curation_evidence_claims_immutable_delete
 BEFORE DELETE ON curation_evidence_claims
 BEGIN SELECT RAISE(ABORT, 'curation evidence claims are immutable'); END;
 
-CREATE TABLE aircraft_curation_interaction_runs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  provider TEXT NOT NULL DEFAULT 'gemini',
-  api_family TEXT NOT NULL CHECK (api_family IN ('interactions', 'generate_content')),
-  api_version TEXT NOT NULL,
-  model TEXT NOT NULL,
-  purpose TEXT NOT NULL CHECK (purpose IN (
-    'identity_evidence', 'identity_adjudication', 'profile_evidence',
-    'profile_adjudication', 'collision_review', 'correction'
-  )),
-  provider_interaction_id TEXT,
-  previous_interaction_id TEXT,
-  prompt_version TEXT NOT NULL,
-  schema_version TEXT NOT NULL,
-  candidate_catalog_revision TEXT,
-  store_requested INTEGER NOT NULL DEFAULT 0 CHECK (store_requested IN (0, 1)),
-  request_json TEXT NOT NULL,
-  response_json TEXT,
-  run_status TEXT NOT NULL CHECK (run_status IN (
-    'pending', 'completed', 'failed', 'cancelled', 'incomplete',
-    'requires_action', 'budget_exceeded'
-  )),
-  input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
-  output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
-  search_query_count INTEGER NOT NULL DEFAULT 0 CHECK (search_query_count >= 0),
-  latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
-  error_text TEXT,
-  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  completed_at TEXT,
-  UNIQUE (provider, provider_interaction_id),
-  CHECK (run_status <> 'completed' OR completed_at IS NOT NULL)
-);
-
-CREATE INDEX idx_aircraft_curation_runs_status
-  ON aircraft_curation_interaction_runs (purpose, run_status, started_at);
-
 CREATE TABLE aircraft_identity_observations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   aircraft_sale_listing_id INTEGER
@@ -193,8 +157,6 @@ CREATE TABLE aircraft_identity_decisions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   resolution_case_id INTEGER NOT NULL
     REFERENCES aircraft_identity_resolution_cases(id) ON DELETE RESTRICT,
-  interaction_run_id INTEGER
-    REFERENCES aircraft_curation_interaction_runs(id) ON DELETE RESTRICT,
   entity_kind TEXT NOT NULL CHECK (entity_kind IN (
     'make', 'family', 'designation', 'alias', 'identifier', 'generation',
     'generation_designation', 'package', 'package_applicability',
@@ -250,8 +212,6 @@ CREATE TABLE aircraft_reference_profile_proposals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   resolution_case_id INTEGER NOT NULL
     REFERENCES aircraft_identity_resolution_cases(id) ON DELETE CASCADE,
-  interaction_run_id INTEGER
-    REFERENCES aircraft_curation_interaction_runs(id) ON DELETE RESTRICT,
   proposed_identity_json TEXT NOT NULL,
   proposed_profile_json TEXT NOT NULL,
   deterministic_validation_json TEXT NOT NULL,

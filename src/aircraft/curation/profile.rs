@@ -769,6 +769,7 @@ mod tests {
             unresolved_questions: vec![],
         };
         let grounding = GroundingAudit {
+            mode: crate::aircraft::curation::GroundingMode::FreshWeb,
             google_search_call_count: 1,
             url_context_call_count: 1,
             citation_urls: [
@@ -777,6 +778,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            reused_verified_dossier: false,
         };
         let mut issues = Vec::new();
         validate_research(&research, &grounding, &mut issues);

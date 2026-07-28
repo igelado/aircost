@@ -11,9 +11,35 @@ benchmarking, and accounting are in `src/gemini/`.
 
 Gemini routing is centralized in the versioned, credential-free
 `config/gemini.toml`. Each `[tasks.<task>]` route can select a pinned model,
-service tier, thinking level, and maximum output tokens. Aliases ending in
-`-latest` are rejected so request accounting and comparisons remain
-reproducible.
+an optional pinned fallback model and fallback thinking level, service tier,
+primary thinking level, and maximum output tokens. Aliases ending in `-latest`
+are rejected so request accounting and comparisons remain reproducible.
+
+The avionics and aircraft Search, URL Context, and ordinary structure routes
+use `gemini-3.5-flash-lite` with low thinking first. A valid primary response
+ends the stage without a fallback call. Only a returned response that fails the
+stage's deterministic grounding, citation, JSON, or provenance gates is retried
+with `gemini-3.6-flash`; Search and URL Context fallback calls use medium
+thinking, while ordinary structure fallback calls stay low. Transport failures
+do not escalate the model. The larger avionics collision schema uses its own
+`tasks.avionics_collision_structure` route with `gemini-3.5-flash-lite` first
+and `gemini-3.6-flash` only after deterministic validation failure. Direct
+publisher dossiers rank up to four bounded windows per source using separate
+optional capability and shortlist hints; those hints never participate in the
+required identity-anchor or exact-origin admission gates. Search prompts
+request no more than four focused queries as a soft cost bound; the application
+does not reject an otherwise valid response after the provider has already
+exceeded that request.
+
+Grounded avionics requests use separate stage inputs. Search and URL Context
+receive a compact research brief containing the observed product and the full
+maker/model/capability/identifier shortlist, but not listing HTML, catalog IDs,
+catalog status, response schemas, or decision rules. Only the tools-disabled
+structure stage receives the complete decision contract. Initial avionics
+identity passes allow at most eight cited URLs; the independent collision pass
+keeps the shared maximum of twenty because it may need to distinguish a larger
+expanded shortlist. Both limits are enforced locally at citation resolution,
+the URL Context call trace, and the verified citation allow-list.
 
 Normal application startup resolves configuration in this order, with each
 later source taking precedence:
@@ -24,10 +50,15 @@ later source taking precedence:
 3. Legacy environment variables, retained for deployment compatibility.
 4. Task-specific environment variables.
 
-Task-specific names use the task prefix plus `_MODEL`, `_SERVICE_TIER`,
-`_THINKING_LEVEL`, or `_MAX_OUTPUT_TOKENS`. For example,
+Task-specific names use the task prefix plus `_MODEL`, `_FALLBACK_MODEL`,
+`_SERVICE_TIER`, `_THINKING_LEVEL`, `_FALLBACK_THINKING_LEVEL`, or
+`_MAX_OUTPUT_TOKENS`. An empty/`none` fallback model disables escalation, and
+an empty/`inherit` fallback thinking level inherits the primary thinking level.
+For example,
 `AIRCOST_GEMINI_LISTING_EXTRACTION_MODEL` overrides only
 `tasks.listing_extraction`, while
+`AIRCOST_GEMINI_AVIONICS_COLLISION_STRUCTURE_MODEL` overrides only collision
+structure conversion and
 `AIRCOST_GEMINI_AIRCRAFT_VISUAL_IDENTITY_THINKING_LEVEL` overrides only the
 visual-identity route. The legacy `AIRCOST_GEMINI_MODEL`,
 `AIRCOST_GEMINI_GROUNDING_MODEL`, `AIRCOST_GEMINI_AVIONICS_REVIEW_MODEL`,
@@ -56,9 +87,49 @@ model/tier has a dated pricing snapshot. Otherwise cost remains unknown: both
 `estimated_cost_microusd` and `pricing_snapshot_json` stay null rather than
 silently treating missing counters as zero.
 
+Interactions reports tool-use input separately from ordinary prompt input.
+URL Context and custom-function tool tokens are charged at the model's uncached
+input rate; Google Search retrieved context is excluded while its search-query
+fee is accounted separately. If one request mixes Search with a chargeable tool
+and reports only an aggregate positive tool-token count, the estimate remains
+unknown rather than guessing how to split it.
+
 The accounting table stores no prompt text, response body, downloaded image
 bytes, or API key. Prompts and images exist only in memory for the request, and
 `GEMINI_API_KEY` remains process configuration.
+
+## Evidence Retention And Reuse
+
+Search and URL Context output is request-scoped working data, not a durable
+cache. A grounded curation case may retain its verified URL set and citation
+spans in memory long enough to run a correction or independent structure pass
+for that exact subject and candidate set. Reuse still performs a fresh,
+tools-disabled structure call and revalidates the URL and citation-span
+bindings. The dossier is discarded when the case ends; it is not serialized to
+the database, and Gemini requests set `store=false`.
+
+Across runs, the application reuses the approved conclusion rather than
+replaying its research. Avionics first uses a deterministic, tools-free local
+resolver over graph-approved catalog identities. It accepts only one exact
+canonical product or stable-identifier match under the effective manufacturer
+identity, requires the retained listing text to contain that identity, and
+requires every observed capability to be approved for the product. When that
+strict check cannot decide but the same evidence-backed manufacturer identity
+has a small capability-compatible approved shortlist, one tools-disabled Lite
+call may select only an unchanged supplied catalog ID at `very_high`
+confidence. The caller re-reads the catalog and revalidates exact listing
+evidence, membership, capabilities, and ambiguity before accepting it.
+Anything else falls through to grounded curation. Stored source URLs, titles,
+and excerpts are not model input. Aircraft reuse is similarly strict: an exact
+current FAA record and one applicable approved hierarchy may bypass Gemini
+entirely.
+
+Durable evidence is limited to source records and atomic claims that active
+catalog approval, FAA provenance, aircraft assignments, applicability, or
+reference facts actually cite. Those rows are not complete Gemini prompts,
+responses, or URL-context dossiers. The obsolete
+`aircraft_curation_interaction_runs` request/response table was removed because
+no runtime logic used it.
 
 ## Gemini Benchmark
 
@@ -167,9 +238,10 @@ autocompleted identifiers fail closed.
 One complete, conflict-free N-number visible in one image is sufficient to
 produce a visual candidate. More images add corroborating evidence but are not
 required. Distinct visible registrations or serials are conflicts. Visual
-acceptance is never listing admission: the candidate must still match the
-current target-scoped FAA projection exactly, and an observed serial must not
-conflict. The plugin submission retains the visual decision, model, evidence,
+acceptance is never listing admission: the candidate must still match an exact
+target-scoped projection of the current FAA release, and an observed serial
+must not conflict. Sibling target projections with the same snapshot date and
+archive hash are one release identity. The plugin submission retains the visual decision, model, evidence,
 image hashes, byte counts, and token usage for audit. An FAA-confirmed identity
 repair is independent of later aircraft/avionics enrichment, so an unrelated
 enrichment review cannot erase the recovered identity or its evidence.
@@ -205,12 +277,29 @@ duplicated rows back to the model.
 
 ## Aircraft Hierarchy Curation And Mandatory FAA Grounding
 
-`curate-aircraft-hierarchy` is a read-only, evidence-producing workflow. It
-loads literal aircraft labels from retained listing source, groups compatible
-observations, applies a mandatory local FAA admission gate, researches primary
-sources, queries the live approved aircraft catalog, and performs independent
-adjudication and verification. It returns reviewable proposals and interaction
-audits; it cannot create or approve canonical aircraft rows.
+`curate-aircraft-hierarchy` is read-only by default. It loads literal aircraft
+labels from retained listing source, groups compatible observations, applies a
+mandatory local FAA admission gate, researches primary sources, queries the
+live approved aircraft catalog, and performs independent adjudication and
+verification. The default run returns reviewable proposals and interaction
+audits without creating or approving canonical aircraft rows.
+
+An explicit `--apply` persists only a case that passed every reviewability gate.
+Immediately before writing, the command reloads the literal observation and
+requires an exact listing-id/fingerprint match to the observation and FAA
+grounding retained in that case. Persistence rechecks the FAA projection and
+catalog revision and atomically creates the evidence-backed catalog decisions,
+FAA binding, immutable listing assignment, and valuation compatibility
+projection. Missing, ambiguous, stale, or merely suggested cases are reported
+as blocked; they are never mechanically normalized into the catalog.
+
+If the read-only pass instead finds one exact already-approved hierarchy,
+`--apply` creates or reuses only the listing's FAA-backed immutable assignment
+and reports `catalog_reused_assigned` or `catalog_reused_current`, with zero
+catalog writes. For a newly approved cluster spanning several listings, one
+deterministic representative persists the shared approval; each remaining
+listing then receives the same exact approved hierarchy through that
+assignment-only path.
 
 The FAA gate applies to every observation before Gemini sees it. An observation
 is admitted only when all of these conditions hold:
@@ -236,7 +325,8 @@ before making a Gemini call.
 Valuation snapshots freeze the exact FAA admission evidence for every included
 listing and include it in their hashes. Training, structural/DNN activation,
 comparable fallback, and request-time serving reject legacy snapshots or any
-subsequent N-number, serial, FAA projection, release archive, or source-record
+subsequent N-number, serial, FAA release archive, or source-record change.
+Adding another target projection of the same release is not an identity
 change. They never repair an immutable snapshot by silently dropping rows.
 
 The local `lookup_faa_aircraft_registry` function does not accept a registration
@@ -283,8 +373,9 @@ function result are audited independently. A generally authoritative source is
 not authoritative for every claim. Each evidence pass runs as three explicit
 Interactions API requests: cited Google Search discovery, URL Context
 verification of those exact resolved URLs, then tool-free schema-constrained
-JSON conversion. Search is limited to the 20 URLs accepted by the URL Context
-stage. The JSON pass may copy only URLs verified by URL Context.
+JSON conversion. The shared URL Context ceiling is twenty; callers may impose
+a smaller request-scoped ceiling such as eight for initial avionics identity.
+The JSON pass may copy only URLs verified by URL Context.
 
 After the forced FAA and catalog function calls, deterministic validation runs
 before the independent verifier. Fabricated catalog IDs, missing FAA identity
@@ -300,39 +391,63 @@ Avionics parsing is intentionally strict. A durable avionics row should be a
 concrete unit, integrated suite, or named package. Generic labels are not useful
 for valuation and are not inserted into the catalog.
 
-Every extracted candidate, including an exact-looking string, goes through a
-two-stage grounded Gemini workflow:
+Every extracted candidate first goes through a local catalog pass:
 
-1. Local normalization and similarity scoring build a shortlist from current
-   `approved` and legacy-`unreviewed` catalog rows. This is retrieval only; an
-   exact normalized string is never identity proof.
-2. Gemini returns `existing_match`, `propose_new`, `reject`, or `unresolved`
+1. A distinct exact OEM part number or SKU in the listing takes precedence.
+2. Otherwise, an exact manufacturer-scoped canonical model label or
+   typography-only normalized spelling may select one `approved` product with
+   a current reuse attestation. The complete label must occur in retained
+   listing text, observed capabilities may not exceed the curated product, and
+   exact model/identifier collisions block selection. A possible but unwritten
+   suffix does not defeat literal evidence; if the retained text explicitly
+   names a longer known family member, the shorter base product is not
+   selected.
+3. Non-exact model similarity is retrieval only. Numeric-run-aware
+   prefix/suffix candidates are retained for variant comparison and never
+   assigned mechanically.
+
+Candidates unresolved by that local pass enter the grounded workflow:
+
+1. Gemini returns `existing_match`, `propose_new`, `reject`, or `unresolved`
    with authoritative identity evidence. Existing IDs are schema-constrained
    to the supplied shortlist.
-3. Every positive identity decision, including a match to an already-approved
+2. Every positive identity decision, including a match to an already-approved
    row, is sent through a second independent grounded review. The reviewer must
    first attest that the exact proposed product is the same product represented
    by the raw input. For listing assignment it must also quote an exact stored
    listing substring containing the discriminating model label; a real product
    manual cannot prove that a particular listing names or installs that unit.
-4. The same review compares the proposal with every shortlisted collision and
+3. The same review compares the proposal with every shortlisted collision and
    returns `same_product` or `different_product` with `very_high` confidence
    and evidence for each ID. This proposal attestation is required even when
    the collision shortlist is empty, so an empty array is not a vacuous pass.
    The call uses the separately configurable
    `AIRCOST_GEMINI_AVIONICS_REVIEW_MODEL`.
-5. Only after all checks pass does one transaction promote the
+4. Only after all checks pass does one transaction promote the
    confirmed legacy row or create a new `approved` row.
 
-Approved identities require an official manufacturer part number, manufacturer
-model number, or authoritative manufacturer SKU. The display identifier is
-retained and a compact normalized identifier is used only as a uniqueness key
-within the manufacturer. Manufacturer/model normalization and canonical
-capability keys are used for candidate lookup and storage, never to assign raw
-listing text mechanically. Positive identities must return a non-empty array
-containing only server-owned avionics capabilities. Multifunction products
-retain every verified capability on one identity; Gemini cannot introduce a
-typo, `Unknown`, or a new free-form capability as part of approval.
+Approved identities require an official manufacturer part number,
+manufacturer model number, or authoritative manufacturer SKU. A documented
+legacy model number may be identical to the canonical display label; a
+separate LRU part number is not required. The display identifier is retained
+and a compact normalized identifier is used only as a uniqueness key within
+the evidence-backed manufacturer identity. Manufacturer/model normalization
+may authorize only typography-equivalent exact labels for already-attested
+products. Prefix, suffix, semantic, and fuzzy similarity remain retrieval
+signals. Plausible semantic aliases and cross-maker product collisions stop
+approval and create pending human review candidates. Positive identities must
+return a non-empty array containing only server-owned avionics capabilities.
+Multifunction products retain every verified capability on one identity;
+Gemini cannot introduce a typo, `Unknown`, or a new free-form capability as
+part of approval.
+
+Legacy-product research prioritizes historical OEM manuals and catalogs, FAA
+records, aircraft equipment lists, and installation or service documents.
+Wikipedia, Wikidata, forums, and reseller catalogs may generate search terms or
+lead to cited documents, but they are not sufficient as the sole source for
+catalog approval. The resolver follows those references to durable primary or
+regulatory evidence instead of requiring an unavailable modern orderable
+part-number page.
 
 For positive decisions the server requires Gemini's returned
 `groundingChunks` and `groundingSupports`, and verifies that the evidence claim
@@ -344,21 +459,101 @@ approval.
 The identity classifier never returns prices. Product-identity confidence and
 listing-installation confidence remain separate: proving that a GTX 345R exists
 does not upgrade a weak claim that one is installed on a particular aircraft.
-Replacement and removal targets resolve independently. If Gemini is absent,
-evidence is incomplete, candidates conflict, or the catalog changes during
-review, ingestion fails closed and the listing remains quarantined.
+Replacement and removal targets resolve independently. A primary observation
+that Gemini rejects as generic or garbage is discarded only at `high` or
+`very_high` confidence and with one allowed structured `rejection_basis`. Its
+`reason` must be a candidate-specific negative claim consistent with that
+basis, explicitly name the observed model and its usable manufacturer, and
+have its whole normalized text contained in one Google Search grounding
+support span linked to a cited source. Support that merely proves the product's
+identity, contradicts the negative basis, is unrelated, or splits the reason
+across spans is insufficient. The server requests one correction for an unsafe
+reject; if it remains unsafe or correction fails, the outcome becomes
+`unresolved` rather than an automatic discard. An ordinary `unresolved`
+result—including unavailable classification, incomplete evidence, or an
+uncertain candidate—is a durable `pending_review` outcome rather than a
+quarantine. Provider, persistence, and enrichment failures remain real
+ingestion errors and can still quarantine a stored listing.
 
 Catalog approvals take an optimistic fingerprint of the active catalog before
 the model calls, serialize the final write, and compare the fingerprint again
-inside the transaction. A concurrent catalog edit forces a retry instead of
-allowing the model to approve against a stale shortlist. A non-empty legacy
-manufacturer identifier likewise cannot be silently overwritten with a
-different identifier.
+inside the transaction. The same transaction creates or loads the authoritative
+manufacturer identity and immutable membership before approving the product.
+A concurrent catalog edit forces a retry instead of allowing the model to
+approve against a stale shortlist. A non-empty legacy manufacturer identifier
+likewise cannot be silently overwritten with a different identifier.
+
+Stable-identifier equality always includes both the non-null identifier kind
+and its normalized value inside the canonical manufacturer namespace. The same
+text labeled as a SKU and as a manufacturer part/model number is not an
+automatic match; it remains separate evidence for review.
 
 `approved` rows are the curated catalog. Legacy rows remain `unreviewed` until
 grounded review; rejected listing text is not stored as a catalog row. Promoting
 a legacy identity clears its old value and suite metadata, because identity
 evidence cannot validate previously imported dollar assumptions.
+
+### Pending Human Review
+
+The listing pipeline persists all unresolved avionics aspects together in one
+hash-addressed bundle per listing. The listing becomes `pending_review`, stays
+unverified, and skips metadata enrichment while that bundle exists. Observed
+text, installation action, source evidence, and replacement relationships are
+review context only; they do not become catalog products or canonical listing
+links before a decision.
+
+All three actions remain available for every avionics aspect, including an
+aspect with a suggested match or legacy candidate. The reviewer must make
+exactly one decision for every aspect in the bundle:
+
+- `use_verified_product` selects an existing `approved` catalog ID.
+- `create_verified_product` supplies a concrete manufacturer and model,
+  canonical capabilities, a stable manufacturer identifier kind and value,
+  plus authoritative source URL, title, and evidence text.
+- `discard` records a reason and creates no product or association.
+
+The bundle stores both its own payload hash and an approved-only catalog
+fingerprint of product IDs, manufacturer/model labels, capabilities, stable
+identifiers, and approval membership. Its stored catalog hash records staging
+provenance; each read exposes the current catalog hash, and a resolve request
+must echo that current value. Resolution recomputes it under the write lock.
+Changes to approved identity fields therefore force a reload, while unrelated
+edits to preserved `unreviewed` or `rejected` rows do not invalidate work. The
+resolution transaction validates a complete decision set, creates or promotes
+verified identities, replaces only exact covered listing-link ID/role pairs,
+deletes the bundle, and returns the listing to `incomplete` atomically. An
+unlinked observation gets an explicit promotion target only when normalized
+manufacturer/model uniquely identifies one `unreviewed` row. An aspect already
+covering an exact legacy listing association may expose that known catalog row
+by ID, but this does not bypass the same locked normalized-identity uniqueness
+and identifier/model collision checks. A create decision that still matches
+may promote a surviving candidate; a corrected identity creates a separate
+product and leaves the legacy row untouched. A legacy product referenced by
+aircraft defaults, reference configurations, or suite membership cannot be
+promoted through listing review. It never admits an undecided or unverified
+candidate into canonical state.
+
+Avionics are also an explicit `PATCH` boundary. Omitting `avionics` skips
+avionics identity resolution and preserves the pending bundle, its hashes, and
+the exact listing-link IDs; ordinary price, status, hours, and similar changes
+can therefore proceed without silently restaging review work. A patch that
+includes `manufacturer`, `model`, `variant`, `model_year`, `source_url`,
+`registration_number`, or `serial_number` must include a valid avionics array
+because those fields change the resolution context. Null, non-array, or
+malformed avionics fail before mutation. `"avionics": []` is an intentional
+complete clear, while a non-empty array runs identity resolution and replaces
+or restages the bundle and links.
+
+Mandatory FAA admission is checked before any review-driven catalog write. It
+is checked again after that transaction and before grounded metadata enrichment
+and final publication, closing the race around network calls. A source-backed
+listing becomes `ready` and verified only if FAA admission, full enrichment,
+and the readiness pass all succeed. A failure at that stage is persisted as
+`quarantined`; it does not roll back or hold a network request inside the
+catalog/link transaction. Associations explicitly corroborated by a reviewer
+use `listing_review` provenance with high installation confidence and are
+valuation-eligible wherever equivalent high-confidence `listing` associations
+are accepted.
 
 ## Grounded Metadata
 
@@ -398,9 +593,11 @@ classify provenance and purpose:
   catalog identities so the suite and its components are not counted twice.
 
 LLM completion does not make a listing ready by itself. The database row starts
-`incomplete`; deterministic readiness queries recheck all evidence. Any failed
-enrichment or incomplete result is persisted as `quarantined` with an error and
-is excluded from snapshots and serving until reprocessed.
+`incomplete`; deterministic readiness queries recheck all evidence. Expected
+avionics uncertainty is persisted as `pending_review` and skips enrichment.
+Failed enrichment or another actual completion error is persisted as
+`quarantined`. Both states are excluded from snapshots and serving until the
+review is resolved or the failure is reprocessed.
 
 ## Normalization Philosophy
 

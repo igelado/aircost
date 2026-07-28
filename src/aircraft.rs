@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod curation;
 pub mod faa;
+pub mod identity;
 pub mod observations;
 pub mod reference;
 
@@ -570,6 +571,8 @@ pub async fn aircraft_options(db: &AppDb, user_id: i64) -> StoreResult<Vec<Aircr
           variant.name AS variant,
           COUNT(l.id) AS listing_count
         FROM aircraft_model_variants variant
+        JOIN aircraft_valuation_compatibility_projections projection
+          ON projection.aircraft_model_variant_id = variant.id
         JOIN aircraft_models model
           ON model.id = variant.aircraft_model_id
         JOIN aircraft_manufacturers mfr
@@ -597,6 +600,9 @@ pub async fn aircraft_options(db: &AppDb, user_id: i64) -> StoreResult<Vec<Aircr
           l.aircraft_model_variant_id AS variant_id,
           l.id AS listing_id
         FROM aircraft_sale_listings l
+        JOIN aircraft_valuation_compatibility_projections projection
+          ON projection.aircraft_model_variant_id =
+             l.aircraft_model_variant_id
         WHERE l.ingestion_state = 'ready'
           AND (l.is_verified = TRUE OR l.created_by_user_id = ?)
         ORDER BY l.aircraft_model_variant_id, l.id
@@ -929,6 +935,8 @@ async fn aircraft_option_for_variant(
           variant.name AS variant,
           COUNT(l.id) AS listing_count
         FROM aircraft_model_variants variant
+        JOIN aircraft_valuation_compatibility_projections projection
+          ON projection.aircraft_model_variant_id = variant.id
         JOIN aircraft_models model
           ON model.id = variant.aircraft_model_id
         JOIN aircraft_manufacturers mfr
@@ -1600,7 +1608,7 @@ async fn listing_avionics_estimates(
         JOIN avionics_manufacturers mfr
           ON mfr.id = model.avionics_manufacturer_id
         WHERE link.aircraft_sale_listing_id = ?
-          AND link.source = 'listing'
+          AND link.source IN ('listing', 'listing_review')
           AND model.catalog_status = 'approved'
           AND (
             link.replaces_avionics_model_id IS NULL
@@ -1632,7 +1640,7 @@ async fn listing_equipment_tokens(db: &AppDb, listing_id: i64) -> StoreResult<Ve
         JOIN avionics_manufacturers manufacturer
           ON manufacturer.id = model.avionics_manufacturer_id
         WHERE link.aircraft_sale_listing_id = ?
-          AND link.source = 'listing'
+          AND link.source IN ('listing', 'listing_review')
           AND link.configuration_action IN ('installed', 'replaces')
           AND link.source_confidence = 'high'
           AND model.catalog_status = 'approved'
@@ -1901,33 +1909,29 @@ pub(crate) fn resolve_avionics_configuration(
             .or_insert_with(|| link.quantity.max(1));
     }
 
-    for link in listing_deltas
+    let high_confidence_deltas = listing_deltas
         .iter()
         .filter(|link| is_high_confidence(link.source_confidence.as_deref()))
-    {
-        match link.configuration_action.as_str() {
-            "removes" => {
-                if let Some(replaced_id) = link.replaces_avionics_model_id {
-                    quantities.remove(&replaced_id);
-                }
-            }
-            "replaces" => {
-                let Some(replaced_id) = link.replaces_avionics_model_id else {
-                    continue;
-                };
+        .collect::<Vec<_>>();
+
+    // Resolve deltas as a set, not in row-id order. Readiness validation
+    // rejects ambiguous graphs (an installed identity may not also be a
+    // replacement target, and a target may be displaced only once), while
+    // this two-pass evaluation remains deterministic even for retained legacy
+    // rows that have not reached that gate.
+    for link in &high_confidence_deltas {
+        if matches!(link.configuration_action.as_str(), "replaces" | "removes") {
+            if let Some(replaced_id) = link.replaces_avionics_model_id {
                 quantities.remove(&replaced_id);
-                quantities
-                    .entry(link.avionics_model_id)
-                    .and_modify(|quantity| *quantity = (*quantity).max(link.quantity.max(1)))
-                    .or_insert_with(|| link.quantity.max(1));
             }
-            "installed" => {
-                quantities
-                    .entry(link.avionics_model_id)
-                    .and_modify(|quantity| *quantity = (*quantity).max(link.quantity.max(1)))
-                    .or_insert_with(|| link.quantity.max(1));
-            }
-            _ => {}
+        }
+    }
+    for link in high_confidence_deltas {
+        if matches!(link.configuration_action.as_str(), "installed" | "replaces") {
+            quantities
+                .entry(link.avionics_model_id)
+                .and_modify(|quantity| *quantity = (*quantity).max(link.quantity.max(1)))
+                .or_insert_with(|| link.quantity.max(1));
         }
     }
 
@@ -2105,6 +2109,8 @@ async fn aircraft_variants_missing_specs(
           variant.name AS variant,
           COUNT(DISTINCT l.id) AS listing_count
         FROM aircraft_model_variants variant
+        JOIN aircraft_valuation_compatibility_projections projection
+          ON projection.aircraft_model_variant_id = variant.id
         JOIN aircraft_models model
           ON model.id = variant.aircraft_model_id
         JOIN aircraft_manufacturers mfr
@@ -2156,6 +2162,8 @@ async fn aircraft_variants_with_plugin_evidence(
           variant.name AS variant,
           COUNT(DISTINCT l.id) AS listing_count
         FROM aircraft_model_variants variant
+        JOIN aircraft_valuation_compatibility_projections projection
+          ON projection.aircraft_model_variant_id = variant.id
         JOIN aircraft_models model
           ON model.id = variant.aircraft_model_id
         JOIN aircraft_manufacturers mfr
@@ -3046,15 +3054,18 @@ fn year_from_date_prefix(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        aircraft_listing_value_with_model, aircraft_options, avionics_suite_memberships,
-        enrich_aircraft_spec_for_listing_if_missing, listing_avionics_estimates,
-        listing_value_point, model_year_default_avionics_estimates,
-        require_valuation_model_faa_admission, resolve_avionics_configuration,
-        spec_enrichment_item_from_response, AircraftListingPointRow, AircraftVariantOption,
-        AvionicsConfigurationLink, AvionicsSuiteMembership,
+        aircraft_listing_value_with_model, aircraft_option_for_variant, aircraft_options,
+        avionics_suite_memberships, enrich_aircraft_spec_for_listing_if_missing,
+        listing_avionics_estimates, listing_equipment_tokens, listing_value_point,
+        model_year_default_avionics_estimates, require_valuation_model_faa_admission,
+        resolve_avionics_configuration, spec_enrichment_item_from_response,
+        AircraftListingPointRow, AircraftVariantOption, AvionicsConfigurationLink,
+        AvionicsSuiteMembership,
     };
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
     use crate::db::{AppDb, DatabaseBackend};
     use crate::extract::GeminiListingExtractor;
+    use crate::valuation::dataset::equipment_feature_token;
     use crate::valuation::{
         ComparableConfig, ComparableModel, TrainingListing, ValuationError, ValuationEstimate,
         ValuationModel, ValuationQuery,
@@ -3135,27 +3146,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_variant_lookup_rejects_an_unprojected_legacy_variant() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_manufacturers (name, normalized_name)
+            VALUES ('Legacy Manufacturer', 'legacy manufacturer')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let model_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_models (
+              aircraft_manufacturer_id, name, normalized_name
+            ) VALUES (?, 'Legacy Model', 'legacy model')
+            RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let variant_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_model_variants (
+              aircraft_model_id, name, normalized_name
+            ) VALUES (?, 'Legacy Variant', 'legacy variant')
+            RETURNING id
+            "#,
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let error = aircraft_option_for_variant(&db, 1, variant_id)
+            .await
+            .expect_err("an arbitrary legacy variant must not be publicly addressable");
+
+        assert!(error.to_string().contains("aircraft variant not found"));
+    }
+
+    #[tokio::test]
     async fn direct_valuation_rejects_a_retained_non_n_listing() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
-        sqlx::query(
-            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Gate Test', 'gate test')",
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_manufacturers (name, normalized_name)
+            VALUES ('Gate Test', 'gate test')
+            RETURNING id
+            "#,
         )
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, 'Model', 'model')",
+        let model_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_models (
+              aircraft_manufacturer_id, name, normalized_name
+            ) VALUES (?, 'Model', 'model')
+            RETURNING id
+            "#,
         )
-        .execute(pool)
+        .bind(manufacturer_id)
+        .fetch_one(pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'variant')",
+        let _variant_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_model_variants (
+              aircraft_model_id, name, normalized_name
+            ) VALUES (?, 'Variant', 'variant')
+            RETURNING id
+            "#,
         )
-        .execute(pool)
+        .bind(model_id)
+        .fetch_one(pool)
         .await
         .unwrap();
         let listing_id: i64 = sqlx::query_scalar(
@@ -3164,14 +3238,20 @@ mod tests {
               aircraft_model_variant_id, created_by_user_id, model_year,
               asking_price_usd, airframe_hours, registration_number,
               ingestion_state, ingestion_completed_at
-            ) VALUES (1, 1, 2020, 200000, 1000, 'C-GABC', 'ready', CURRENT_TIMESTAMP)
+            ) VALUES (
+              (
+                SELECT aircraft_model_variant_id
+                FROM aircraft_sale_listing_pending_compatibility_placeholder
+                WHERE singleton_id = 1
+              ),
+              1, 2020, 200000, 1000, 'C-GABC', 'incomplete', NULL
+            )
             RETURNING id
             "#,
         )
         .fetch_one(pool)
         .await
         .unwrap();
-
         let error = aircraft_listing_value_with_model(&db, 1, listing_id, None)
             .await
             .expect_err("a retained foreign aircraft must never receive a valuation");
@@ -3213,7 +3293,14 @@ mod tests {
               aircraft_model_variant_id, created_by_user_id, model_year,
               asking_price_usd, airframe_hours, ingestion_state,
               ingestion_completed_at
-            ) VALUES (1, 1, 2020, 200000, 1000, 'ready', CURRENT_TIMESTAMP)
+            ) VALUES (
+              (
+                SELECT aircraft_model_variant_id
+                FROM aircraft_sale_listing_pending_compatibility_placeholder
+                WHERE singleton_id = 1
+              ),
+              1, 2020, 200000, 1000, 'incomplete', NULL
+            )
             RETURNING id
             "#,
         )
@@ -3320,6 +3407,9 @@ mod tests {
         .await
         .unwrap();
         if catalog_status == "approved" {
+            ensure_test_manufacturer_identity(db, manufacturer_id)
+                .await
+                .unwrap();
             sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
                 .bind(model_id)
                 .execute(pool)
@@ -3357,6 +3447,22 @@ mod tests {
 
         assert_eq!(resolved.get(&1), Some(&1));
         assert_eq!(resolved.get(&2), None);
+    }
+
+    #[test]
+    fn retained_ambiguous_avionics_deltas_are_evaluated_independently_of_row_order() {
+        let defaults = vec![link(1, 1, "installed", None, "high")];
+        let first_order = vec![
+            link(1, 1, "installed", None, "high"),
+            link(2, 1, "replaces", Some(1), "high"),
+        ];
+        let mut reverse_order = first_order.clone();
+        reverse_order.reverse();
+
+        assert_eq!(
+            resolve_avionics_configuration(&defaults, &first_order, &[]),
+            resolve_avionics_configuration(&defaults, &reverse_order, &[])
+        );
     }
 
     #[test]
@@ -3409,7 +3515,14 @@ mod tests {
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, model_year,
               asking_price_usd, airframe_hours
-            ) VALUES (1, 1, 2020, 100000, 1000)
+            ) VALUES (
+              (
+                SELECT aircraft_model_variant_id
+                FROM aircraft_sale_listing_pending_compatibility_placeholder
+                WHERE singleton_id = 1
+              ),
+              1, 2020, 100000, 1000
+            )
             RETURNING id
             "#,
         )
@@ -3489,16 +3602,20 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        for model_id in [approved_suite_id, unreviewed_id] {
+        for (model_id, source) in [
+            (approved_suite_id, "listing_review"),
+            (unreviewed_id, "listing"),
+        ] {
             sqlx::query(
                 r#"
                 INSERT INTO aircraft_sale_listing_avionics (
-                  aircraft_sale_listing_id, avionics_model_id, source_confidence
-                ) VALUES (?, ?, 'high')
+                  aircraft_sale_listing_id, avionics_model_id, source, source_confidence
+                ) VALUES (?, ?, ?, 'high')
                 "#,
             )
             .bind(listing_id)
             .bind(model_id)
+            .bind(source)
             .execute(pool)
             .await
             .unwrap();
@@ -3547,6 +3664,14 @@ mod tests {
                 .map(|row| row.avionics_model_id)
                 .collect::<Vec<_>>(),
             vec![approved_suite_id]
+        );
+        assert_eq!(
+            listing_equipment_tokens(&db, listing_id).await.unwrap(),
+            vec![equipment_feature_token(
+                "avionics",
+                "Garmin",
+                "Approved Suite"
+            )]
         );
         let default_rows = model_year_default_avionics_estimates(&db, 1, 2020)
             .await

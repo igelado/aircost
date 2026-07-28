@@ -35,12 +35,30 @@ impl Default for SnapshotPolicy {
     }
 }
 
-const FAA_ADMISSION_MANIFEST_VERSION: u32 = 1;
+const FAA_ADMISSION_MANIFEST_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+struct AircraftCompatibilityProjectionEvidence {
+    aircraft_model_variant_id: i64,
+    aircraft_make_id: i64,
+    aircraft_model_family_id: i64,
+    aircraft_designation_id: i64,
+    aircraft_generation_id: Option<i64>,
+    aircraft_factory_package_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+struct SnapshotListingAdmissionEvidence {
+    #[serde(flatten)]
+    faa: ListingAdmissionEvidence,
+    #[serde(default)]
+    compatibility_projection: Option<AircraftCompatibilityProjectionEvidence>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 struct SnapshotFaaAdmissionManifest {
     schema_version: u32,
-    included_listings: BTreeMap<i64, ListingAdmissionEvidence>,
+    included_listings: BTreeMap<i64, SnapshotListingAdmissionEvidence>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +156,30 @@ struct FrozenDbRow {
     feature_json: String,
 }
 
+#[derive(Debug, FromRow)]
+struct ExactCompatibilityProjectionRow {
+    listing_id: i64,
+    aircraft_model_variant_id: i64,
+    aircraft_make_id: i64,
+    aircraft_model_family_id: i64,
+    aircraft_designation_id: i64,
+    aircraft_generation_id: Option<i64>,
+    aircraft_factory_package_id: Option<i64>,
+}
+
+impl ExactCompatibilityProjectionRow {
+    fn into_evidence(self) -> AircraftCompatibilityProjectionEvidence {
+        AircraftCompatibilityProjectionEvidence {
+            aircraft_model_variant_id: self.aircraft_model_variant_id,
+            aircraft_make_id: self.aircraft_make_id,
+            aircraft_model_family_id: self.aircraft_model_family_id,
+            aircraft_designation_id: self.aircraft_designation_id,
+            aircraft_generation_id: self.aircraft_generation_id,
+            aircraft_factory_package_id: self.aircraft_factory_package_id,
+        }
+    }
+}
+
 pub async fn create_snapshot(
     db: &AppDb,
     policy: &SnapshotPolicy,
@@ -162,10 +204,14 @@ pub async fn create_snapshot(
     let faa_admission = audit_listing_admission(db, Some(&listing_ids))
         .await
         .map_err(|error| ValuationError::Database(error.to_string()))?;
+    let compatibility_projections = load_exact_compatibility_projections(db).await?;
     let equipment = load_equipment(db).await?;
     let facts = load_facts(db).await?;
     let mut prepared = Vec::with_capacity(listings.len());
     for listing in listings {
+        let compatibility_projection = compatibility_projections
+            .get(&listing.id)
+            .filter(|projection| projection.aircraft_model_variant_id == listing.variant_id);
         let mut tokens = equipment.get(&listing.id).cloned().unwrap_or_default();
         let valuation_facts = facts.get(&listing.id).cloned().unwrap_or_default();
         tokens.extend(
@@ -179,6 +225,11 @@ pub async fn create_snapshot(
         let reason = faa_admission
             .exclusion_reason(listing.id)
             .map(|reason| format!("faa_{reason}"))
+            .or_else(|| {
+                compatibility_projection.is_none().then_some(
+                    "aircraft_compatibility_projection_missing_or_mismatched".to_string(),
+                )
+            })
             .or_else(|| exclusion_reason(&listing, policy, capture_day, snapshot_year));
         let technical_field_count = technical_field_count(
             listing.engine_hours.is_some(),
@@ -219,6 +270,16 @@ pub async fn create_snapshot(
         let feature_json = serde_json::to_string(&training)?;
         let target = is_plausible_asking_price_usd(listing.asking_price_usd)
             .then_some(listing.asking_price_usd);
+        let frozen_identity = match (
+            faa_admission.admission_evidence(listing.id),
+            compatibility_projection,
+        ) {
+            (Some(faa), Some(compatibility_projection)) => Some(SnapshotListingAdmissionEvidence {
+                faa: faa.clone(),
+                compatibility_projection: Some(compatibility_projection.clone()),
+            }),
+            _ => None,
+        };
         let row_sha256 = sha256_hex(
             format!(
                 "{}\n{}\n{}\n{}\n{}",
@@ -226,8 +287,8 @@ pub async fn create_snapshot(
                 duplicate_group_key,
                 feature_json,
                 target.map(|value| value.to_string()).unwrap_or_default(),
-                faa_admission
-                    .admission_evidence(listing.id)
+                frozen_identity
+                    .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?
                     .unwrap_or_default()
@@ -252,16 +313,27 @@ pub async fn create_snapshot(
         .iter()
         .filter(|row| row.included)
         .map(|row| {
-            faa_admission
-                .admission_evidence(row.listing_id)
-                .cloned()
-                .map(|evidence| (row.listing_id, evidence))
-                .ok_or_else(|| {
-                    ValuationError::ValidationGate(format!(
-                        "listing {} was selected without frozen FAA admission evidence",
-                        row.listing_id
-                    ))
-                })
+            let faa = faa_admission.admission_evidence(row.listing_id).cloned();
+            let compatibility_projection =
+                compatibility_projections
+                    .get(&row.listing_id)
+                    .filter(|projection| {
+                        projection.aircraft_model_variant_id == row.training.variant_id
+                    })
+                    .cloned();
+            match (faa, compatibility_projection) {
+                (Some(faa), Some(compatibility_projection)) => Ok((
+                    row.listing_id,
+                    SnapshotListingAdmissionEvidence {
+                        faa,
+                        compatibility_projection: Some(compatibility_projection),
+                    },
+                )),
+                _ => Err(ValuationError::ValidationGate(format!(
+                    "listing {} was selected without frozen FAA admission and exact aircraft compatibility projection evidence",
+                    row.listing_id
+                ))),
+            }
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let policy_json = serde_json::to_string(&PersistedSnapshotPolicy {
@@ -300,11 +372,16 @@ pub async fn create_snapshot(
         let final_admission = audit_listing_admission(db, Some(&included_ids))
             .await
             .map_err(|error| ValuationError::Database(error.to_string()))?;
+        let final_compatibility_projections = load_exact_compatibility_projections(db).await?;
         if final_admission.excluded_count != 0
-            || !admission_evidence_matches(&final_admission, &frozen_included_listings)
+            || !admission_evidence_matches(
+                &final_admission,
+                &final_compatibility_projections,
+                &frozen_included_listings,
+            )
         {
             return Err(ValuationError::ValidationGate(
-                "FAA admission identity or release changed while building the valuation snapshot; retry the operation"
+                "FAA admission or exact aircraft compatibility projection changed while building the valuation snapshot; retry the operation"
                     .to_string(),
             ));
         }
@@ -421,9 +498,10 @@ pub async fn snapshot_faa_admission_report(
 }
 
 /// Reject a legacy or externally modified snapshot when even one frozen
-/// included row is not currently FAA-admitted. Filtering a frozen snapshot at
-/// load time would change its training material without changing its hash, so
-/// callers must build a fresh snapshot instead.
+/// included row is not currently FAA-admitted with the exact canonical
+/// compatibility projection that was frozen into the snapshot. Filtering a
+/// frozen snapshot at load time would change its training material without
+/// changing its hash, so callers must build a fresh snapshot instead.
 pub async fn require_snapshot_faa_admission(
     db: &AppDb,
     snapshot_id: i64,
@@ -437,9 +515,14 @@ pub async fn require_snapshot_faa_admission(
                 manifest.schema_version
             )));
         }
-        if !admission_evidence_matches(&report, &manifest.included_listings) {
+        let compatibility_projections = load_exact_compatibility_projections(db).await?;
+        if !admission_evidence_matches(
+            &report,
+            &compatibility_projections,
+            &manifest.included_listings,
+        ) {
             return Err(ValuationError::ValidationGate(format!(
-                "valuation snapshot {snapshot_id} FAA admission identity or provenance changed; create a fresh valuation snapshot"
+                "valuation snapshot {snapshot_id} FAA admission or exact aircraft compatibility identity changed; create a fresh valuation snapshot"
             )));
         }
         return Ok(report);
@@ -458,12 +541,50 @@ pub async fn require_snapshot_faa_admission(
 
 fn admission_evidence_matches(
     report: &ListingAdmissionReport,
-    frozen: &BTreeMap<i64, ListingAdmissionEvidence>,
+    current_compatibility_projections: &BTreeMap<i64, AircraftCompatibilityProjectionEvidence>,
+    frozen: &BTreeMap<i64, SnapshotListingAdmissionEvidence>,
 ) -> bool {
     frozen.len() == report.admitted_count
-        && frozen
-            .iter()
-            .all(|(listing_id, evidence)| report.admission_evidence(*listing_id) == Some(evidence))
+        && frozen.iter().all(|(listing_id, frozen_evidence)| {
+            let current_faa = report.admission_evidence(*listing_id);
+            let current_compatibility_projection =
+                current_compatibility_projections.get(listing_id);
+            match (current_faa, current_compatibility_projection) {
+                (Some(current_faa), Some(current_compatibility_projection)) => {
+                    same_listing_admission_evidence(
+                        current_faa,
+                        current_compatibility_projection,
+                        frozen_evidence,
+                    )
+                }
+                _ => false,
+            }
+        })
+}
+
+fn same_listing_admission_evidence(
+    current: &ListingAdmissionEvidence,
+    current_compatibility_projection: &AircraftCompatibilityProjectionEvidence,
+    frozen: &SnapshotListingAdmissionEvidence,
+) -> bool {
+    same_faa_admission_evidence(current, &frozen.faa)
+        && frozen.compatibility_projection.as_ref() == Some(current_compatibility_projection)
+}
+
+fn same_faa_admission_evidence(
+    current: &ListingAdmissionEvidence,
+    frozen: &ListingAdmissionEvidence,
+) -> bool {
+    // One FAA release may be stored as several target-scoped projections. A
+    // later projection that covers the same N-number must not invalidate a
+    // frozen dataset when the authoritative release and exact source record
+    // are unchanged. Keep the projection id in the manifest for auditability,
+    // but do not treat that storage detail as aircraft identity.
+    current.n_number == frozen.n_number
+        && current.observed_serial_key == frozen.observed_serial_key
+        && current.faa_snapshot_date == frozen.faa_snapshot_date
+        && current.faa_archive_sha256 == frozen.faa_archive_sha256
+        && current.faa_source_record_sha256 == frozen.faa_source_record_sha256
 }
 
 async fn load_snapshot_faa_manifest(
@@ -497,6 +618,17 @@ async fn load_snapshot_faa_manifest(
             "valuation snapshot {snapshot_id} has an invalid FAA admission manifest: {error}"
         ))
     })
+}
+
+#[cfg(test)]
+pub(crate) fn empty_test_snapshot_selection_policy_json() -> String {
+    serde_json::json!({
+        "faa_admission": SnapshotFaaAdmissionManifest {
+            schema_version: FAA_ADMISSION_MANIFEST_VERSION,
+            included_listings: BTreeMap::new(),
+        }
+    })
+    .to_string()
 }
 
 pub async fn newest_snapshot(
@@ -572,6 +704,48 @@ async fn load_listing_rows(db: &AppDb) -> Result<Vec<ListingRow>, ValuationError
     })
 }
 
+async fn load_exact_compatibility_projections(
+    db: &AppDb,
+) -> Result<BTreeMap<i64, AircraftCompatibilityProjectionEvidence>, ValuationError> {
+    let sql = r#"
+        SELECT
+          listing_id,
+          aircraft_model_variant_id,
+          aircraft_make_id,
+          aircraft_model_family_id,
+          aircraft_designation_id,
+          aircraft_generation_id,
+          aircraft_factory_package_id
+        FROM aircraft_sale_listing_exact_compatibility_projections
+        ORDER BY listing_id
+    "#;
+    let rows = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, ExactCompatibilityProjectionRow>(sql)
+                .fetch_all(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, ExactCompatibilityProjectionRow>(sql)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    let mut projections = BTreeMap::new();
+    for row in rows {
+        let listing_id = row.listing_id;
+        if projections
+            .insert(listing_id, row.into_evidence())
+            .is_some()
+        {
+            return Err(ValuationError::ValidationGate(format!(
+                "listing {listing_id} has more than one exact aircraft compatibility projection"
+            )));
+        }
+    }
+    Ok(projections)
+}
+
 async fn load_facts(
     db: &AppDb,
 ) -> Result<BTreeMap<i64, Vec<SourceBackedValuationFact>>, ValuationError> {
@@ -620,7 +794,7 @@ async fn load_equipment(db: &AppDb) -> Result<BTreeMap<i64, Vec<String>>, Valuat
         JOIN avionics_models model ON model.id = link.avionics_model_id
         JOIN avionics_manufacturers manufacturer
           ON manufacturer.id = model.avionics_manufacturer_id
-        WHERE link.source = 'listing'
+        WHERE link.source IN ('listing', 'listing_review')
           AND link.configuration_action IN ('installed', 'replaces')
           AND link.source_confidence = 'high'
           AND model.catalog_status = 'approved'
@@ -1047,7 +1221,12 @@ pub fn current_capture_time() -> String {
 mod tests {
     use std::io::Cursor;
 
-    use crate::aircraft::faa::{parse_release, store_release, ReleaseMetadata, ReleaseReaders};
+    use crate::aircraft::faa::{
+        parse_release, require_listing_faa_admission, store_release, ReleaseMetadata,
+        ReleaseReaders,
+    };
+    use crate::aircraft::identity::seed_test_curated_identity_assignment;
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
 
     use super::*;
 
@@ -1070,12 +1249,12 @@ mod tests {
         store_release(db, &release).await.unwrap();
     }
 
-    async fn insert_listing(db: &AppDb) {
+    async fn insert_listing(db: &AppDb) -> i64 {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
         sqlx::query(
-            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Test', 'TEST')",
+            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('CESSNA AIRCRAFT CO', 'cessna aircraft co')",
         )
         .execute(pool)
         .await
@@ -1087,24 +1266,74 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'VARIANT')",
+            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, '182T', '182t')",
         )
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(
+        let listing_id = sqlx::query_scalar(
             r#"
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, is_verified, source_url,
               model_year, asking_price_usd, currency, added_at, status,
-              ingestion_state, ingestion_completed_at,
               registration_number, serial_number, airframe_hours, engine_hours,
               propeller_hours
-            ) VALUES (1, 1, FALSE, 'https://example.test/listing', 2010, 175000,
-              'USD', '2026-07-01T00:00:00Z', 'active', 'ready',
-              '2026-07-01T00:00:00Z', 'N123', 'S123', 1000, 500, 300)
+            ) VALUES (
+              (
+                SELECT aircraft_model_variant_id
+                FROM aircraft_sale_listing_pending_compatibility_placeholder
+                WHERE singleton_id = 1
+              ),
+              1, FALSE, 'https://example.test/listing', 2010, 175000,
+              'USD', '2026-07-01T00:00:00Z', 'active',
+              'N123', 'S123', 1000, 500, 300
+            )
+            RETURNING id
             "#,
         )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_listing_identity_input_observations (
+              aircraft_sale_listing_id, source_url,
+              observed_make, observed_family, observed_designation,
+              model_year, serial_number, registration_number,
+              input_json, observation_sha256
+            ) VALUES (
+              ?, 'https://example.test/listing',
+              'CESSNA AIRCRAFT CO', 'Model', '182T',
+              2010, 'S123', 'N123',
+              '{"observation_kind":"valuation_dataset_test_fixture"}', ?
+            )
+            "#,
+        )
+        .bind(listing_id)
+        .bind(format!("{listing_id:064x}"))
+        .execute(pool)
+        .await
+        .unwrap();
+        listing_id
+    }
+
+    async fn make_listing_ready(db: &AppDb, listing_id: i64) {
+        let grounding = require_listing_faa_admission(db, listing_id).await.unwrap();
+        seed_test_curated_identity_assignment(db, listing_id, &grounding)
+            .await
+            .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            r#"
+            UPDATE aircraft_sale_listings
+            SET ingestion_state = 'ready', ingestion_error = NULL,
+                ingestion_completed_at = '2026-07-01T00:00:00Z'
+            WHERE id = ?
+            "#,
+        )
+        .bind(listing_id)
         .execute(pool)
         .await
         .unwrap();
@@ -1137,11 +1366,103 @@ mod tests {
         assert_eq!(technical_field_count(true, false, true, false, true), 4);
     }
 
+    #[test]
+    fn frozen_admission_compares_faa_release_and_source_record_not_projection_id() {
+        let frozen_evidence = ListingAdmissionEvidence {
+            n_number: "N123".to_string(),
+            observed_serial_key: Some("S123".to_string()),
+            faa_snapshot_id: 10,
+            faa_snapshot_date: "2026-07-20".to_string(),
+            faa_archive_sha256: "a".repeat(64),
+            faa_source_record_sha256: "b".repeat(64),
+        };
+        let mut current_evidence = frozen_evidence.clone();
+        current_evidence.faa_snapshot_id = 11;
+
+        assert!(same_faa_admission_evidence(
+            &current_evidence,
+            &frozen_evidence
+        ));
+
+        current_evidence.faa_source_record_sha256 = "c".repeat(64);
+        assert!(!same_faa_admission_evidence(
+            &current_evidence,
+            &frozen_evidence
+        ));
+    }
+
+    #[test]
+    fn frozen_admission_requires_the_same_exact_compatibility_projection() {
+        let faa = ListingAdmissionEvidence {
+            n_number: "N123".to_string(),
+            observed_serial_key: Some("S123".to_string()),
+            faa_snapshot_id: 10,
+            faa_snapshot_date: "2026-07-20".to_string(),
+            faa_archive_sha256: "a".repeat(64),
+            faa_source_record_sha256: "b".repeat(64),
+        };
+        let compatibility_projection = AircraftCompatibilityProjectionEvidence {
+            aircraft_model_variant_id: 101,
+            aircraft_make_id: 102,
+            aircraft_model_family_id: 103,
+            aircraft_designation_id: 104,
+            aircraft_generation_id: Some(105),
+            aircraft_factory_package_id: Some(106),
+        };
+        let frozen = SnapshotListingAdmissionEvidence {
+            faa: faa.clone(),
+            compatibility_projection: Some(compatibility_projection.clone()),
+        };
+
+        assert!(same_listing_admission_evidence(
+            &faa,
+            &compatibility_projection,
+            &frozen
+        ));
+
+        let mut successor = compatibility_projection;
+        successor.aircraft_designation_id += 1;
+        assert!(!same_listing_admission_evidence(&faa, &successor, &frozen));
+
+        let frozen_manifest = SnapshotFaaAdmissionManifest {
+            schema_version: FAA_ADMISSION_MANIFEST_VERSION,
+            included_listings: BTreeMap::from([(1, frozen.clone())]),
+        };
+        let mut successor_manifest = frozen_manifest.clone();
+        successor_manifest
+            .included_listings
+            .get_mut(&1)
+            .unwrap()
+            .compatibility_projection = Some(successor.clone());
+        assert_ne!(
+            sha256_hex(&serde_json::to_vec(&frozen_manifest).unwrap()),
+            sha256_hex(&serde_json::to_vec(&successor_manifest).unwrap())
+        );
+
+        let legacy = SnapshotListingAdmissionEvidence {
+            faa: faa.clone(),
+            compatibility_projection: None,
+        };
+        assert!(!same_listing_admission_evidence(&faa, &successor, &legacy));
+    }
+
+    #[test]
+    fn empty_test_snapshot_policy_tracks_the_current_admission_manifest() {
+        let policy: serde_json::Value =
+            serde_json::from_str(&empty_test_snapshot_selection_policy_json()).unwrap();
+        let manifest: SnapshotFaaAdmissionManifest =
+            serde_json::from_value(policy["faa_admission"].clone()).unwrap();
+
+        assert_eq!(manifest.schema_version, FAA_ADMISSION_MANIFEST_VERSION);
+        assert!(manifest.included_listings.is_empty());
+    }
+
     #[tokio::test]
     async fn sqlite_snapshot_is_listing_only_and_round_trips() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        insert_listing(&db).await;
+        let listing_id = insert_listing(&db).await;
         seed_faa_aircraft(&db).await;
+        make_listing_ready(&db, listing_id).await;
         let policy = SnapshotPolicy {
             capture_time: "2026-07-20T00:00:00Z".to_string(),
             max_listing_age_days: 60,
@@ -1158,10 +1479,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_snapshot_survives_same_faa_release_projection_expansion() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = insert_listing(&db).await;
+        let master = "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n123,S123,2072738,41528,2010\n124,S124,2072738,41528,2011\n";
+        let metadata = ReleaseMetadata::official("2026-07-20", "a".repeat(64));
+        let initial_projection = parse_release(
+            metadata.clone(),
+            ReleaseReaders::new(
+                Cursor::new(master),
+                Cursor::new(FAA_AIRCRAFT_REFERENCE),
+                Cursor::new(FAA_ENGINE_REFERENCE),
+            ),
+            ["N123"],
+        )
+        .unwrap();
+        let initial = store_release(&db, &initial_projection).await.unwrap();
+        make_listing_ready(&db, listing_id).await;
+
+        let policy = SnapshotPolicy {
+            capture_time: "2026-07-20T00:00:00Z".to_string(),
+            max_listing_age_days: 60,
+            ..SnapshotPolicy::default()
+        };
+        let snapshot_id = create_snapshot(&db, &policy, true)
+            .await
+            .unwrap()
+            .snapshot_id
+            .unwrap();
+
+        let expanded_projection = parse_release(
+            metadata,
+            ReleaseReaders::new(
+                Cursor::new(master),
+                Cursor::new(FAA_AIRCRAFT_REFERENCE),
+                Cursor::new(FAA_ENGINE_REFERENCE),
+            ),
+            ["N123", "N124"],
+        )
+        .unwrap();
+        let expanded = store_release(&db, &expanded_projection).await.unwrap();
+        assert_ne!(expanded.snapshot.id, initial.snapshot.id);
+
+        let rows = load_snapshot(&db, snapshot_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].listing_id, listing_id);
+    }
+
+    #[tokio::test]
     async fn snapshot_reports_faa_exclusions_and_rejects_contaminated_legacy_rows() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        insert_listing(&db).await;
+        let listing_id = insert_listing(&db).await;
         seed_faa_aircraft(&db).await;
+        make_listing_ready(&db, listing_id).await;
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
@@ -1175,12 +1545,15 @@ mod tests {
                 INSERT INTO aircraft_sale_listings (
                   aircraft_model_variant_id, created_by_user_id, source_url,
                   model_year, asking_price_usd, currency, added_at, status,
-                  ingestion_state, ingestion_completed_at, registration_number,
-                  serial_number, airframe_hours
+                  registration_number, serial_number, airframe_hours
                 ) VALUES (
-                  1, 1, 'https://example.test/other', 2010, 175000, 'USD',
-                  '2026-07-01T00:00:00Z', 'active', 'ready',
-                  '2026-07-01T00:00:00Z', ?, ?, 1000
+                  (
+                    SELECT aircraft_model_variant_id
+                    FROM aircraft_sale_listing_pending_compatibility_placeholder
+                    WHERE singleton_id = 1
+                  ),
+                  1, 'https://example.test/other', 2010, 175000, 'USD',
+                  '2026-07-01T00:00:00Z', 'active', ?, ?, 1000
                 )
                 "#,
             )
@@ -1236,8 +1609,9 @@ mod tests {
     #[tokio::test]
     async fn frozen_snapshot_rejects_an_eligible_to_eligible_identity_swap() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        insert_listing(&db).await;
+        let listing_id = insert_listing(&db).await;
         seed_faa_aircraft(&db).await;
+        make_listing_ready(&db, listing_id).await;
         let policy = SnapshotPolicy {
             capture_time: "2026-07-20T00:00:00Z".to_string(),
             max_listing_age_days: 60,
@@ -1249,16 +1623,23 @@ mod tests {
             panic!("test expects SQLite")
         };
         sqlx::query(
-            "UPDATE aircraft_sale_listings SET registration_number = 'N124', serial_number = 'S124' WHERE id = 1",
+            "UPDATE aircraft_sale_listings SET ingestion_state = 'quarantined', ingestion_error = 'test identity correction', ingestion_completed_at = NULL, registration_number = 'N124', serial_number = 'S124' WHERE id = 1",
         )
         .execute(pool)
         .await
         .unwrap();
+        let replacement_grounding = require_listing_faa_admission(&db, listing_id)
+            .await
+            .unwrap();
+        seed_test_curated_identity_assignment(&db, listing_id, &replacement_grounding)
+            .await
+            .unwrap();
+        make_listing_ready(&db, listing_id).await;
 
         let error = load_snapshot(&db, snapshot_id).await.unwrap_err();
         assert!(error
             .to_string()
-            .contains("FAA admission identity or provenance changed"));
+            .contains("FAA admission or exact aircraft compatibility identity changed"));
     }
 
     #[tokio::test]
@@ -1338,6 +1719,9 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        ensure_test_manufacturer_identity(&db, manufacturer_id)
+            .await
+            .unwrap();
         sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
             .bind(approved_id)
             .execute(pool)
@@ -1350,15 +1734,16 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        for model_id in [approved_id, unreviewed_id] {
+        for (model_id, source) in [(approved_id, "listing_review"), (unreviewed_id, "listing")] {
             sqlx::query(
                 r#"
                 INSERT INTO aircraft_sale_listing_avionics (
-                  aircraft_sale_listing_id, avionics_model_id, source_confidence
-                ) VALUES (1, ?, 'high')
+                  aircraft_sale_listing_id, avionics_model_id, source, source_confidence
+                ) VALUES (1, ?, ?, 'high')
                 "#,
             )
             .bind(model_id)
+            .bind(source)
             .execute(pool)
             .await
             .unwrap();

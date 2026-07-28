@@ -1131,7 +1131,7 @@ async fn fit_avionics_rows(db: &AppDb) -> FitResult<Vec<FitAvionicsRow>> {
           ON model.id = link.avionics_model_id
         JOIN avionics_manufacturers mfr
           ON mfr.id = model.avionics_manufacturer_id
-        WHERE link.source = 'listing'
+        WHERE link.source IN ('listing', 'listing_review')
           AND model.catalog_status = 'approved'
           AND (
             link.replaces_avionics_model_id IS NULL
@@ -1450,6 +1450,7 @@ mod tests {
         grouped_out_of_fold_score, known_component_time, select_best_candidate, FitSample,
     };
     use crate::aircraft::AvionicsSuiteMembership;
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
     use crate::db::{AppDb, DatabaseBackend};
 
     async fn insert_fit_test_avionics_model(
@@ -1528,6 +1529,9 @@ mod tests {
         .await
         .unwrap();
         if approved {
+            ensure_test_manufacturer_identity(db, manufacturer_id)
+                .await
+                .unwrap();
             sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
                 .bind(model_id)
                 .execute(pool)
@@ -1609,30 +1613,17 @@ mod tests {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
-        sqlx::query(
-            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Test', 'test')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, 'Model', 'model')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'variant')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
         let listing_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, model_year,
               asking_price_usd, airframe_hours
-            ) VALUES (1, 1, 2020, 100000, 1000)
+            ) VALUES (
+              (SELECT aircraft_model_variant_id
+               FROM aircraft_sale_listing_pending_compatibility_placeholder
+               WHERE singleton_id = 1),
+              1, 2020, 100000, 1000
+            )
             RETURNING id
             "#,
         )
@@ -1692,16 +1683,17 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for model_id in [approved_id, unreviewed_id] {
+        for (model_id, source) in [(approved_id, "listing_review"), (unreviewed_id, "listing")] {
             sqlx::query(
                 r#"
                 INSERT INTO aircraft_sale_listing_avionics (
-                  aircraft_sale_listing_id, avionics_model_id, source_confidence
-                ) VALUES (?, ?, 'high')
+                  aircraft_sale_listing_id, avionics_model_id, source, source_confidence
+                ) VALUES (?, ?, ?, 'high')
                 "#,
             )
             .bind(listing_id)
             .bind(model_id)
+            .bind(source)
             .execute(pool)
             .await
             .unwrap();
@@ -1711,7 +1703,10 @@ mod tests {
                   aircraft_model_variant_id, model_year, avionics_model_id,
                   quantity, source_url, source_title, source_notes, source_confidence
                 ) VALUES (
-                  1, 2020, ?, 1, 'https://example.test/factory-reference',
+                  (SELECT aircraft_model_variant_id
+                   FROM aircraft_sale_listing_pending_compatibility_placeholder
+                   WHERE singleton_id = 1),
+                  2020, ?, 1, 'https://example.test/factory-reference',
                   'Factory reference', 'Fixture', 'high'
                 )
                 "#,

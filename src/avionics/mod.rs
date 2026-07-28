@@ -1,6 +1,9 @@
 pub mod catalog;
+pub mod consolidation;
 pub mod inspection;
+pub mod manufacturer;
 pub mod repopulate;
+pub(crate) mod reuse;
 
 use std::collections::BTreeMap;
 
@@ -13,7 +16,6 @@ use crate::avionics::catalog::{
     preview_avionics_identity, resolve_avionics_identity, ApprovedAvionicsIdentity,
     AvionicsIdentityOutcome, AvionicsIdentityRequest,
 };
-use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
     AircraftPricePointContext, AvionicsMetadataContext, DefaultAvionicsContext,
@@ -66,20 +68,6 @@ macro_rules! query_scalar_optional {
     }};
 }
 
-macro_rules! query_scalar_one {
-    ($db:expr, $ty:ty, $sql:expr $(, $bind:expr)* $(,)?) => {{
-        let sql = $db.sql($sql);
-        match $db.backend() {
-            DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_scalar::<_, $ty>(&sql)$(.bind($bind))*.fetch_one(pool).await
-            }
-            DatabaseBackend::Postgres(pool) => {
-                sqlx::query_scalar::<_, $ty>(&sql)$(.bind($bind))*.fetch_one(pool).await
-            }
-        }
-    }};
-}
-
 #[derive(Debug)]
 pub enum AvionicsStoreError {
     Database(String),
@@ -107,12 +95,6 @@ impl From<sqlx::Error> for AvionicsStoreError {
 impl From<anyhow::Error> for AvionicsStoreError {
     fn from(error: anyhow::Error) -> Self {
         AvionicsStoreError::Model(error.to_string())
-    }
-}
-
-impl From<CleanupError> for AvionicsStoreError {
-    fn from(error: CleanupError) -> Self {
-        AvionicsStoreError::Database(error.to_string())
     }
 }
 
@@ -148,68 +130,6 @@ struct AvionicsModelReferenceDbRow {
     estimated_unit_value_usd: Option<f64>,
     replacement_cost_usd: Option<f64>,
     valuation_scope: String,
-}
-
-#[derive(Clone, Debug)]
-struct AvionicsModelNormalizeRow {
-    id: i64,
-    avionics_manufacturer_id: i64,
-    manufacturer: String,
-    avionics_types: Vec<String>,
-    name: String,
-    normalized_name: String,
-    introduced_year: Option<i64>,
-    estimated_unit_value_usd: Option<f64>,
-    value_basis: String,
-    replacement_cost_usd: Option<f64>,
-    value_reference_year: Option<i64>,
-    value_source: Option<String>,
-    valuation_scope: String,
-}
-
-#[derive(Clone, Debug, FromRow)]
-struct AvionicsModelNormalizeDbRow {
-    id: i64,
-    avionics_manufacturer_id: i64,
-    manufacturer: String,
-    name: String,
-    normalized_name: String,
-    introduced_year: Option<i64>,
-    estimated_unit_value_usd: Option<f64>,
-    value_basis: String,
-    replacement_cost_usd: Option<f64>,
-    value_reference_year: Option<i64>,
-    value_source: Option<String>,
-    valuation_scope: String,
-}
-
-#[derive(Debug, FromRow)]
-struct AvionicsListingLinkRow {
-    aircraft_sale_listing_id: i64,
-    quantity: i64,
-    source: String,
-    source_notes: Option<String>,
-    configuration_action: String,
-    replaces_avionics_model_id: Option<i64>,
-    source_confidence: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct AvionicsSuiteLinkRow {
-    suite_model_id: i64,
-    component_model_id: i64,
-    quantity: i64,
-}
-
-#[derive(Debug, FromRow)]
-struct AvionicsDefaultProfileLinkRow {
-    aircraft_model_variant_id: i64,
-    model_year: i64,
-    quantity: i64,
-    source_url: String,
-    source_title: String,
-    source_notes: String,
-    source_confidence: String,
 }
 
 #[derive(Debug)]
@@ -493,90 +413,6 @@ pub struct AvionicsModelYearProfileAvionicsItem {
     pub notes: String,
 }
 
-pub async fn normalize_avionics_models(
-    db: &AppDb,
-    apply: bool,
-) -> StoreResult<AvionicsNormalizationReport> {
-    let rows = avionics_models_for_normalization(db).await?;
-    let canonical_manufacturer_ids =
-        rows.iter()
-            .fold(BTreeMap::<String, i64>::new(), |mut ids, row| {
-                ids.entry(normalize_avionics_manufacturer_name(&row.manufacturer))
-                    .and_modify(|id| *id = (*id).min(row.avionics_manufacturer_id))
-                    .or_insert(row.avionics_manufacturer_id);
-                ids
-            });
-    let mut groups: BTreeMap<(String, String), Vec<AvionicsModelNormalizeRow>> = BTreeMap::new();
-    for row in rows {
-        let manufacturer_key = normalize_avionics_manufacturer_name(&row.manufacturer);
-        let model_key = normalize_avionics_model_name(&row.name);
-        groups
-            .entry((manufacturer_key, model_key))
-            .or_default()
-            .push(row);
-    }
-
-    let mut items = Vec::new();
-    for ((manufacturer_key, canonical_normalized_name), rows) in groups {
-        let canonical_manufacturer_id = canonical_manufacturer_ids[&manufacturer_key];
-        let needs_normalization = rows.len() > 1
-            || rows.iter().any(|row| {
-                row.avionics_manufacturer_id != canonical_manufacturer_id
-                    || row.normalized_name != canonical_normalized_name
-            });
-        if !needs_normalization {
-            continue;
-        }
-        let canonical = rows
-            .iter()
-            .min_by_key(|row| {
-                (
-                    row.introduced_year.is_none() || row.estimated_unit_value_usd.is_none(),
-                    row.id,
-                )
-            })
-            .expect("normalization group is not empty")
-            .clone();
-        let canonical_manufacturer = rows
-            .iter()
-            .find(|row| row.avionics_manufacturer_id == canonical_manufacturer_id)
-            .map(|row| row.manufacturer.clone())
-            .unwrap_or_else(|| canonical.manufacturer.clone());
-        let item = AvionicsNormalizationItem {
-            canonical_model_id: canonical.id,
-            canonical_manufacturer,
-            canonical_avionics_types: canonical.avionics_types.clone(),
-            canonical_name: canonical.name.clone(),
-            canonical_normalized_name: canonical_normalized_name.clone(),
-            source_model_ids: rows.iter().map(|row| row.id).collect(),
-            source_names: rows.iter().map(|row| row.name.clone()).collect(),
-            resolution_status: "legacy_unreviewed_merge".to_string(),
-            resolution_reason: "mechanical normalization is restricted to legacy unreviewed catalog rows and does not approve product identity".to_string(),
-        };
-        if apply {
-            apply_avionics_normalization_group(
-                db,
-                &canonical,
-                canonical_manufacturer_id,
-                &canonical.name,
-                &canonical_normalized_name,
-                &rows,
-            )
-            .await?;
-        }
-        items.push(item);
-    }
-
-    if apply {
-        cleanup_orphan_records(db).await?;
-    }
-
-    Ok(AvionicsNormalizationReport {
-        applied: apply,
-        items,
-    })
-}
-
 pub async fn enrich_missing_avionics_metadata(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
@@ -736,6 +572,8 @@ pub async fn curate_avionics_models_with_gemini(
             })
             .to_string(),
             requires_listing_evidence: false,
+            authoritative_direct_source_urls: Vec::new(),
+            authoritative_identity_anchors: Vec::new(),
             manufacturer: row.manufacturer.clone(),
             model: row.model.clone(),
             avionics_types: row.avionics_types.clone(),
@@ -759,13 +597,12 @@ pub async fn curate_avionics_models_with_gemini(
                     if approved.id == row.id {
                         "approved_promoted"
                     } else {
-                        delete_unreferenced_legacy_catalog_row(
-                            db,
-                            row.id,
-                            "approved catalog mapping",
-                        )
-                        .await?;
-                        "approved_mapped"
+                        // The listing-review payload is an evidence record but
+                        // its product references are JSON, not foreign keys.
+                        // Keep the legacy candidate until the explicit catalog
+                        // cleanup workflow can prove that no pending review or
+                        // relational role still names it.
+                        "approved_mapped_cleanup_pending"
                     }
                 } else if approved.id == 0 {
                     "would_create_approved"
@@ -778,8 +615,7 @@ pub async fn curate_avionics_models_with_gemini(
             }
             AvionicsIdentityOutcome::Rejected { reason } => {
                 let status = if apply {
-                    delete_unreferenced_legacy_catalog_row(db, row.id, "rejected identity").await?;
-                    "rejected_deleted"
+                    "rejected_cleanup_pending"
                 } else {
                     "would_reject"
                 };
@@ -833,66 +669,6 @@ fn normalization_item_from_identity(
         resolution_status: status.to_string(),
         resolution_reason: reason,
     }
-}
-
-async fn delete_unreferenced_legacy_catalog_row(
-    db: &AppDb,
-    avionics_model_id: i64,
-    outcome: &str,
-) -> StoreResult<()> {
-    let status = query_scalar_optional!(
-        db,
-        String,
-        "SELECT catalog_status FROM avionics_models WHERE id = ?",
-        avionics_model_id
-    )?;
-    if status.as_deref() != Some("unreviewed") {
-        return Err(AvionicsStoreError::Model(format!(
-            "legacy avionics catalog row {avionics_model_id} changed from unreviewed to {} during curation; retry instead of deleting it",
-            status.as_deref().unwrap_or("missing")
-        )));
-    }
-    let reference_count = query_scalar_one!(
-        db,
-        i64,
-        r#"
-        SELECT
-          (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
-           WHERE avionics_model_id = ? OR replaces_avionics_model_id = ?)
-          + (SELECT COUNT(*) FROM aircraft_model_variant_default_avionics
-             WHERE avionics_model_id = ?)
-          + (SELECT COUNT(*) FROM avionics_suite_components
-             WHERE suite_model_id = ? OR component_model_id = ?)
-        "#,
-        avionics_model_id,
-        avionics_model_id,
-        avionics_model_id,
-        avionics_model_id,
-        avionics_model_id,
-    )?;
-    if reference_count > 0 {
-        return Err(AvionicsStoreError::Model(format!(
-            "legacy avionics catalog row {avionics_model_id} resolved as {outcome} but still has {reference_count} association(s); explicit association remediation is required before it can be deleted"
-        )));
-    }
-    execute_query!(
-        db,
-        "DELETE FROM avionics_models WHERE id = ? AND catalog_status = 'unreviewed'",
-        avionics_model_id
-    )?;
-    if query_scalar_optional!(
-        db,
-        i64,
-        "SELECT id FROM avionics_models WHERE id = ?",
-        avionics_model_id
-    )?
-    .is_some()
-    {
-        return Err(AvionicsStoreError::Model(format!(
-            "legacy avionics catalog row {avionics_model_id} changed during deletion; retry curation"
-        )));
-    }
-    Ok(())
 }
 
 pub async fn enrich_model_year_avionics_and_price_points(
@@ -1040,55 +816,6 @@ pub async fn enrich_model_year_avionics_and_price_point_for_listing(
         }
     }
     Ok(Some(item))
-}
-
-async fn avionics_models_for_normalization(
-    db: &AppDb,
-) -> StoreResult<Vec<AvionicsModelNormalizeRow>> {
-    let capabilities = avionics_capability_map(db).await?;
-    let rows = query_as_all!(
-        db,
-        AvionicsModelNormalizeDbRow,
-        r#"
-        SELECT
-          model.id,
-          model.avionics_manufacturer_id,
-          mfr.name AS manufacturer,
-          model.name,
-          model.normalized_name,
-          model.introduced_year,
-          model.estimated_unit_value_usd,
-          model.value_basis,
-          model.replacement_cost_usd,
-          model.value_reference_year,
-          model.value_source,
-          model.valuation_scope
-        FROM avionics_models model
-        JOIN avionics_manufacturers mfr
-          ON mfr.id = model.avionics_manufacturer_id
-        WHERE model.catalog_status = 'unreviewed'
-        ORDER BY model.id
-        "#
-    )?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(AvionicsModelNormalizeRow {
-                id: row.id,
-                avionics_manufacturer_id: row.avionics_manufacturer_id,
-                manufacturer: row.manufacturer,
-                avionics_types: required_model_capabilities(&capabilities, row.id)?,
-                name: row.name,
-                normalized_name: row.normalized_name,
-                introduced_year: row.introduced_year,
-                estimated_unit_value_usd: row.estimated_unit_value_usd,
-                value_basis: row.value_basis,
-                replacement_cost_usd: row.replacement_cost_usd,
-                value_reference_year: row.value_reference_year,
-                value_source: row.value_source,
-                valuation_scope: row.valuation_scope,
-            })
-        })
-        .collect()
 }
 
 async fn avionics_models_for_gemini_normalization(
@@ -1740,443 +1467,6 @@ async fn upsert_default_avionics_profile_item(
     Ok(())
 }
 
-async fn apply_avionics_normalization_group(
-    db: &AppDb,
-    canonical: &AvionicsModelNormalizeRow,
-    canonical_manufacturer_id: i64,
-    canonical_name: &str,
-    canonical_normalized_name: &str,
-    rows: &[AvionicsModelNormalizeRow],
-) -> StoreResult<()> {
-    for row in rows {
-        let status = query_scalar_optional!(
-            db,
-            String,
-            "SELECT catalog_status FROM avionics_models WHERE id = ?",
-            row.id
-        )?;
-        if status.as_deref() != Some("unreviewed") {
-            return Err(AvionicsStoreError::Model(format!(
-                "legacy mechanical normalization refuses catalog row {} because it is not unreviewed",
-                row.id
-            )));
-        }
-    }
-    for row in rows.iter().filter(|row| row.id != canonical.id) {
-        execute_query!(
-            db,
-            r#"
-            INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
-            SELECT ?, membership.avionics_type_id
-            FROM avionics_model_types membership
-            WHERE membership.avionics_model_id = ?
-            ON CONFLICT (avionics_model_id, avionics_type_id) DO NOTHING
-            "#,
-            canonical.id,
-            row.id
-        )?;
-        let links = avionics_listing_links_for_model(db, row.id).await?;
-        for link in links {
-            upsert_listing_avionics_link(db, canonical.id, &link).await?;
-        }
-        execute_query!(
-            db,
-            "DELETE FROM aircraft_sale_listing_avionics WHERE avionics_model_id = ?",
-            row.id
-        )?;
-
-        let default_links = avionics_default_profile_links_for_model(db, row.id).await?;
-        for link in default_links {
-            upsert_default_avionics_profile_link(db, canonical.id, &link).await?;
-        }
-        execute_query!(
-            db,
-            "DELETE FROM aircraft_model_variant_default_avionics WHERE avionics_model_id = ?",
-            row.id
-        )?;
-
-        rewire_suite_memberships(db, row.id, canonical.id).await?;
-        execute_query!(
-            db,
-            "UPDATE aircraft_sale_listing_avionics SET replaces_avionics_model_id = ? WHERE replaces_avionics_model_id = ?",
-            canonical.id,
-            row.id
-        )?;
-
-        execute_query!(
-            db,
-            "DELETE FROM avionics_models WHERE id = ? AND catalog_status = 'unreviewed'",
-            row.id
-        )?;
-    }
-
-    let introduced_year = consensus_year(rows.iter().filter_map(|row| row.introduced_year));
-    let installed_value_contribution_usd = consensus_money(rows.iter().filter_map(|row| {
-        (row.value_basis == "installed_contribution")
-            .then_some(row.estimated_unit_value_usd)
-            .flatten()
-    }));
-    let replacement_cost_usd = consensus_money(rows.iter().filter_map(|row| {
-        row.replacement_cost_usd.or_else(|| {
-            (row.value_basis == "replacement_cost")
-                .then_some(row.estimated_unit_value_usd)
-                .flatten()
-        })
-    }));
-    let value_reference_year = consensus_year(
-        rows.iter()
-            .filter(|row| row.value_basis != "unreviewed" || row.replacement_cost_usd.is_some())
-            .filter_map(|row| row.value_reference_year),
-    );
-    let value_source = (installed_value_contribution_usd.is_some()
-        || replacement_cost_usd.is_some())
-    .then(|| {
-        canonical
-            .value_source
-            .clone()
-            .or_else(|| rows.iter().find_map(|row| row.value_source.clone()))
-    })
-    .flatten();
-    let value_basis = if installed_value_contribution_usd.is_some() {
-        "installed_contribution"
-    } else if replacement_cost_usd.is_some() {
-        "replacement_cost"
-    } else {
-        "unreviewed"
-    };
-    let valuation_scope = if rows
-        .iter()
-        .any(|row| row.valuation_scope == "integrated_suite")
-    {
-        "integrated_suite"
-    } else {
-        "unit"
-    };
-
-    execute_query!(
-        db,
-        r#"
-        UPDATE avionics_models
-        SET
-          avionics_manufacturer_id = ?,
-          name = ?,
-          normalized_name = ?,
-          introduced_year = ?,
-          estimated_unit_value_usd = ?,
-          value_basis = ?,
-          replacement_cost_usd = ?,
-          value_reference_year = ?,
-          value_source = ?,
-          valuation_scope = ?,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND catalog_status = 'unreviewed'
-        "#,
-        canonical_manufacturer_id,
-        canonical_name.trim(),
-        canonical_normalized_name,
-        introduced_year,
-        installed_value_contribution_usd,
-        value_basis,
-        replacement_cost_usd,
-        value_reference_year,
-        value_source.as_deref(),
-        valuation_scope,
-        canonical.id
-    )?;
-    Ok(())
-}
-
-fn consensus_year(values: impl Iterator<Item = i64>) -> Option<i64> {
-    let mut values = values.collect::<Vec<_>>();
-    values.sort_unstable();
-    let first = *values.first()?;
-    let last = *values.last()?;
-    (last - first <= 2).then_some(values[values.len() / 2])
-}
-
-fn consensus_money(values: impl Iterator<Item = f64>) -> Option<f64> {
-    let mut values = values
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .collect::<Vec<_>>();
-    values.sort_by(|left, right| left.total_cmp(right));
-    let first = *values.first()?;
-    let last = *values.last()?;
-    let median = values[values.len() / 2];
-    let tolerance = (median * 0.25).max(250.0);
-    (last - first <= tolerance).then_some(median)
-}
-
-async fn rewire_suite_memberships(
-    db: &AppDb,
-    source_model_id: i64,
-    canonical_model_id: i64,
-) -> StoreResult<()> {
-    let links = query_as_all!(
-        db,
-        AvionicsSuiteLinkRow,
-        r#"
-        SELECT suite_model_id, component_model_id, quantity
-        FROM avionics_suite_components
-        WHERE suite_model_id = ? OR component_model_id = ?
-        "#,
-        source_model_id,
-        source_model_id
-    )?;
-    execute_query!(
-        db,
-        "DELETE FROM avionics_suite_components WHERE suite_model_id = ? OR component_model_id = ?",
-        source_model_id,
-        source_model_id
-    )?;
-    for link in links {
-        let suite_model_id = if link.suite_model_id == source_model_id {
-            canonical_model_id
-        } else {
-            link.suite_model_id
-        };
-        let component_model_id = if link.component_model_id == source_model_id {
-            canonical_model_id
-        } else {
-            link.component_model_id
-        };
-        if suite_model_id == component_model_id {
-            continue;
-        }
-        execute_query!(
-            db,
-            r#"
-            INSERT INTO avionics_suite_components (
-              suite_model_id, component_model_id, quantity
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT (suite_model_id, component_model_id) DO UPDATE SET
-              quantity = CASE
-                WHEN excluded.quantity > avionics_suite_components.quantity
-                THEN excluded.quantity
-                ELSE avionics_suite_components.quantity
-              END
-            "#,
-            suite_model_id,
-            component_model_id,
-            link.quantity.max(1)
-        )?;
-    }
-    Ok(())
-}
-
-async fn avionics_listing_links_for_model(
-    db: &AppDb,
-    avionics_model_id: i64,
-) -> StoreResult<Vec<AvionicsListingLinkRow>> {
-    Ok(query_as_all!(
-        db,
-        AvionicsListingLinkRow,
-        r#"
-        SELECT
-          aircraft_sale_listing_id,
-          quantity,
-          source,
-          source_notes,
-          configuration_action,
-          replaces_avionics_model_id,
-          source_confidence
-        FROM aircraft_sale_listing_avionics
-        WHERE avionics_model_id = ?
-        "#,
-        avionics_model_id
-    )?)
-}
-
-async fn avionics_default_profile_links_for_model(
-    db: &AppDb,
-    avionics_model_id: i64,
-) -> StoreResult<Vec<AvionicsDefaultProfileLinkRow>> {
-    Ok(query_as_all!(
-        db,
-        AvionicsDefaultProfileLinkRow,
-        r#"
-        SELECT
-          aircraft_model_variant_id,
-          model_year,
-          quantity,
-          source_url,
-          source_title,
-          source_notes,
-          source_confidence
-        FROM aircraft_model_variant_default_avionics
-        WHERE avionics_model_id = ?
-        "#,
-        avionics_model_id
-    )?)
-}
-
-async fn upsert_listing_avionics_link(
-    db: &AppDb,
-    avionics_model_id: i64,
-    link: &AvionicsListingLinkRow,
-) -> StoreResult<()> {
-    let existing_quantity = query_scalar_optional!(
-        db,
-        i64,
-        r#"
-        SELECT quantity
-        FROM aircraft_sale_listing_avionics
-        WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?
-        "#,
-        link.aircraft_sale_listing_id,
-        avionics_model_id
-    )?;
-    match existing_quantity {
-        Some(existing_quantity) => {
-            execute_query!(
-                db,
-                r#"
-                UPDATE aircraft_sale_listing_avionics
-                SET
-                  quantity = ?,
-                  source = CASE
-                    WHEN configuration_action = 'installed' AND ? <> 'installed' THEN ?
-                    ELSE source
-                  END,
-                  source_notes = CASE
-                    WHEN configuration_action = 'installed' AND ? <> 'installed' THEN ?
-                    ELSE source_notes
-                  END,
-                  configuration_action = CASE
-                    WHEN configuration_action = 'installed' AND ? <> 'installed' THEN ?
-                    ELSE configuration_action
-                  END,
-                  replaces_avionics_model_id = CASE
-                    WHEN configuration_action = 'installed' AND ? <> 'installed' THEN ?
-                    ELSE replaces_avionics_model_id
-                  END,
-                  source_confidence = CASE
-                    WHEN source_confidence IS NULL OR source_confidence <> 'high' THEN ?
-                    ELSE source_confidence
-                  END,
-                  updated_at = CURRENT_TIMESTAMP
-                WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?
-                "#,
-                existing_quantity.max(link.quantity),
-                link.configuration_action.as_str(),
-                link.source.as_str(),
-                link.configuration_action.as_str(),
-                link.source_notes.as_deref(),
-                link.configuration_action.as_str(),
-                link.configuration_action.as_str(),
-                link.configuration_action.as_str(),
-                link.replaces_avionics_model_id,
-                link.source_confidence.as_deref(),
-                link.aircraft_sale_listing_id,
-                avionics_model_id
-            )?;
-        }
-        None => {
-            execute_query!(
-                db,
-                r#"
-                INSERT INTO aircraft_sale_listing_avionics (
-                  aircraft_sale_listing_id,
-                  avionics_model_id,
-                  quantity,
-                  source,
-                  source_notes,
-                  configuration_action,
-                  replaces_avionics_model_id,
-                  source_confidence
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                link.aircraft_sale_listing_id,
-                avionics_model_id,
-                link.quantity.max(1),
-                link.source.as_str(),
-                link.source_notes.as_deref(),
-                link.configuration_action.as_str(),
-                link.replaces_avionics_model_id,
-                link.source_confidence.as_deref()
-            )?;
-        }
-    }
-    Ok(())
-}
-
-async fn upsert_default_avionics_profile_link(
-    db: &AppDb,
-    avionics_model_id: i64,
-    link: &AvionicsDefaultProfileLinkRow,
-) -> StoreResult<()> {
-    let existing_quantity = query_scalar_optional!(
-        db,
-        i64,
-        r#"
-        SELECT quantity
-        FROM aircraft_model_variant_default_avionics
-        WHERE aircraft_model_variant_id = ?
-          AND model_year = ?
-          AND avionics_model_id = ?
-        "#,
-        link.aircraft_model_variant_id,
-        link.model_year,
-        avionics_model_id
-    )?;
-    match existing_quantity {
-        Some(existing_quantity) => {
-            execute_query!(
-                db,
-                r#"
-                UPDATE aircraft_model_variant_default_avionics
-                SET
-                  quantity = ?,
-                  source_url = ?,
-                  source_title = ?,
-                  source_notes = ?,
-                  source_confidence = ?,
-                  updated_at = CURRENT_TIMESTAMP
-                WHERE aircraft_model_variant_id = ?
-                  AND model_year = ?
-                  AND avionics_model_id = ?
-                "#,
-                existing_quantity.max(link.quantity).max(1),
-                link.source_url.as_str(),
-                link.source_title.as_str(),
-                link.source_notes.as_str(),
-                link.source_confidence.as_str(),
-                link.aircraft_model_variant_id,
-                link.model_year,
-                avionics_model_id
-            )?;
-        }
-        None => {
-            execute_query!(
-                db,
-                r#"
-                INSERT INTO aircraft_model_variant_default_avionics (
-                  aircraft_model_variant_id,
-                  model_year,
-                  avionics_model_id,
-                  quantity,
-                  source_url,
-                  source_title,
-                  source_notes,
-                  source_confidence
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-                link.aircraft_model_variant_id,
-                link.model_year,
-                avionics_model_id,
-                link.quantity.max(1),
-                link.source_url.as_str(),
-                link.source_title.as_str(),
-                link.source_notes.as_str(),
-                link.source_confidence.as_str()
-            )?;
-        }
-    }
-    Ok(())
-}
-
 async fn avionics_models_to_enrich(
     db: &AppDb,
     limit: i64,
@@ -2593,6 +1883,8 @@ fn identity_request(
         })
         .to_string(),
         requires_listing_evidence: false,
+        authoritative_direct_source_urls: Vec::new(),
+        authoritative_identity_anchors: Vec::new(),
         manufacturer: manufacturer.to_string(),
         model: model.to_string(),
         avionics_types: avionics_types.to_vec(),
@@ -3231,7 +2523,7 @@ fn required_min_f64(value: &Value, field: &str, minimum: f64) -> StoreResult<f64
 #[cfg(test)]
 mod tests {
     use super::{
-        consensus_money, default_avionics_item_from_response, enrich_listing_avionics_metadata,
+        default_avionics_item_from_response, enrich_listing_avionics_metadata,
         enrich_model_year_avionics_and_price_point_for_listing, enrichment_item_from_response,
         has_material_price_discontinuity, included_components_from_response,
         model_year_profile_item_from_response, price_evidence_is_stronger,
@@ -3247,31 +2539,21 @@ mod tests {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
-        sqlx::query(
-            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Gate Test', 'gate test')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (1, 'Model', 'model')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (1, 'Variant', 'variant')",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
         let listing_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, model_year,
               asking_price_usd, airframe_hours, ingestion_state,
-              ingestion_completed_at
-            ) VALUES (1, 1, 2020, 200000, 1000, 'ready', CURRENT_TIMESTAMP)
+              ingestion_error
+            ) VALUES (
+              (
+                SELECT aircraft_model_variant_id
+                FROM aircraft_sale_listing_pending_compatibility_placeholder
+                WHERE singleton_id = 1
+              ),
+              1, 2020, 200000, 1000, 'quarantined',
+              'test fixture retained for mandatory FAA admission rejection'
+            )
             RETURNING id
             "#,
         )
@@ -3323,15 +2605,6 @@ mod tests {
         assert!(!has_material_price_discontinuity(
             "Model B", 2001, 150_000.0, &nearby
         ));
-    }
-
-    #[test]
-    fn conflicting_duplicate_values_are_not_silently_selected() {
-        assert_eq!(
-            consensus_money([4_000.0, 4_500.0].into_iter()),
-            Some(4_500.0)
-        );
-        assert_eq!(consensus_money([4_000.0, 15_000.0].into_iter()), None);
     }
 
     #[test]

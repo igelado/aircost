@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
+use crate::normalize::{
+    normalize_avionics_identifier, normalize_avionics_manufacturer_name,
+    normalize_avionics_model_name, normalize_name,
+};
 
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
@@ -22,7 +26,7 @@ const MAX_CATALOG_YEAR: i64 = 2200;
 // The named aliases are established by both queries below.
 const VALUATION_ELIGIBLE_LISTING_LINK_PREDICATE: &str = r#"
     listing.ingestion_state = 'ready'
-    AND link.source = 'listing'
+    AND link.source IN ('listing', 'listing_review')
     AND link.source_confidence = 'high'
     AND link.configuration_action IN ('installed', 'replaces', 'removes')
     AND installed_model.catalog_status = 'approved'
@@ -252,12 +256,99 @@ type InspectionResult<T> = Result<T, AvionicsInspectionError>;
 
 #[derive(Debug)]
 struct ValidatedQuery {
-    search: Option<String>,
+    search: Option<CatalogSearch>,
     status: Option<String>,
     capability: Option<String>,
     completeness: Option<bool>,
     limit: u32,
     offset: u64,
+}
+
+#[derive(Debug)]
+struct CatalogSearch {
+    literal: String,
+    normalized_phrase: String,
+    normalized_identifier: String,
+    normalized_tokens: Vec<String>,
+}
+
+impl CatalogSearch {
+    // This is an inspector retrieval key, not a product-identity decision.
+    // Admission and review continue to use the catalog's evidence-backed
+    // manufacturer and product identities after a user selects a result.
+    fn new(value: String) -> Self {
+        let normalized_phrase = normalize_name(&value);
+        let normalized_tokens = normalized_phrase
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        Self {
+            literal: value.to_ascii_lowercase(),
+            normalized_identifier: normalize_avionics_identifier(&value),
+            normalized_phrase,
+            normalized_tokens,
+        }
+    }
+
+    fn matches(&self, row: &RawSummary) -> bool {
+        if self.normalized_tokens.is_empty() {
+            return [
+                row.manufacturer_name.as_str(),
+                row.name.as_str(),
+                row.manufacturer_identifier.as_deref().unwrap_or_default(),
+            ]
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(&self.literal));
+        }
+
+        let normalized_fields = [
+            normalize_avionics_manufacturer_name(&row.manufacturer_name),
+            normalize_avionics_model_name(&row.name),
+            normalize_avionics_identifier(
+                row.manufacturer_identifier.as_deref().unwrap_or_default(),
+            ),
+        ];
+        self.normalized_tokens
+            .iter()
+            .all(|token| normalized_fields.iter().any(|field| field.contains(token)))
+    }
+
+    fn rank(&self, row: &RawSummary) -> (u8, u8, String, String, i64) {
+        let manufacturer = normalize_avionics_manufacturer_name(&row.manufacturer_name);
+        let model = normalize_avionics_model_name(&row.name);
+        let identifier = normalize_avionics_identifier(
+            row.manufacturer_identifier.as_deref().unwrap_or_default(),
+        );
+        let combined = format!("{manufacturer} {model}");
+        let specificity =
+            if !self.normalized_phrase.is_empty() && self.normalized_phrase == combined {
+                0
+            } else if !identifier.is_empty() && self.normalized_identifier == identifier {
+                1
+            } else if !self.normalized_phrase.is_empty() && self.normalized_phrase == model {
+                2
+            } else if contains_token_sequence(&self.normalized_phrase, &model) {
+                3
+            } else {
+                4
+            };
+        let status = match row.catalog_status.as_str() {
+            "approved" => 0,
+            "unreviewed" => 1,
+            _ => 2,
+        };
+        (specificity, status, manufacturer, model, row.id)
+    }
+}
+
+fn contains_token_sequence(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.split_whitespace().collect::<Vec<_>>();
+    let needle = needle.split_whitespace().collect::<Vec<_>>();
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_slice())
 }
 
 impl AvionicsCatalogQuery {
@@ -298,7 +389,7 @@ impl AvionicsCatalogQuery {
             )));
         }
         Ok(ValidatedQuery {
-            search,
+            search: search.map(CatalogSearch::new),
             status,
             capability,
             completeness,
@@ -312,20 +403,6 @@ fn nonempty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' | '%' | '_' => {
-                escaped.push('\\');
-                escaped.push(character);
-            }
-            _ => escaped.push(character),
-        }
-    }
-    escaped
 }
 
 fn is_blank(value: Option<&str>) -> bool {
@@ -455,12 +532,6 @@ fn summary_sql() -> String {
     JOIN avionics_manufacturers manufacturer
       ON manufacturer.id = model.avionics_manufacturer_id
     WHERE (? IS NULL OR model.id = ?)
-      AND (
-        ? IS NULL
-        OR lower(manufacturer.name) LIKE ? ESCAPE '\'
-        OR lower(model.name) LIKE ? ESCAPE '\'
-        OR lower(COALESCE(model.manufacturer_identifier, '')) LIKE ? ESCAPE '\'
-      )
       AND (? IS NULL OR model.catalog_status = ?)
       AND (
         ? IS NULL OR EXISTS (
@@ -486,10 +557,6 @@ async fn load_raw_summaries(
 ) -> InspectionResult<Vec<RawSummary>> {
     let summary_sql = summary_sql();
     let sql = db.sql(&summary_sql);
-    let search_pattern = query
-        .search
-        .as_ref()
-        .map(|value| format!("%{}%", escape_like_literal(&value.to_ascii_lowercase())));
     macro_rules! bind_summary_query {
         ($query_builder:expr) => {
             $query_builder
@@ -497,10 +564,6 @@ async fn load_raw_summaries(
                 .bind(user_id)
                 .bind(model_id)
                 .bind(model_id)
-                .bind(search_pattern.as_deref())
-                .bind(search_pattern.as_deref())
-                .bind(search_pattern.as_deref())
-                .bind(search_pattern.as_deref())
                 .bind(query.status.as_deref())
                 .bind(query.status.as_deref())
                 .bind(query.capability.as_deref())
@@ -705,7 +768,16 @@ pub async fn list_avionics_catalog(
     query: AvionicsCatalogQuery,
 ) -> InspectionResult<AvionicsCatalogPage> {
     let query = query.validate()?;
-    let raw = load_raw_summaries(db, user_id, None, &query).await?;
+    let mut raw = load_raw_summaries(db, user_id, None, &query).await?;
+    raw.retain(|row| {
+        query
+            .search
+            .as_ref()
+            .is_none_or(|search| search.matches(row))
+    });
+    if let Some(search) = query.search.as_ref() {
+        raw.sort_by_key(|row| search.rank(row));
+    }
     let mut capabilities = load_capabilities(db, None).await?;
     let mut items = raw
         .into_iter()
@@ -928,7 +1000,7 @@ fn listing_valuation_blockers(row: &ListingOccurrenceRow) -> Vec<String> {
     if row.ingestion_state != "ready" {
         blockers.push("listing_not_ready".to_string());
     }
-    if row.source != "listing" {
+    if !matches!(row.source.as_str(), "listing" | "listing_review") {
         blockers.push("source_not_listing".to_string());
     }
     if row.source_confidence.as_deref() != Some("high") {
@@ -1258,6 +1330,7 @@ mod tests {
         avionics_catalog_options, completeness_blockers, get_avionics_catalog_detail,
         list_avionics_catalog, AvionicsCatalogQuery, RawSummary,
     };
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity_for_model;
     use crate::db::{AppDb, DatabaseBackend};
 
     fn incomplete_row() -> RawSummary {
@@ -1405,6 +1478,242 @@ mod tests {
         }
     }
 
+    async fn seed_current_faa_aircraft_assignment(db: &AppDb, registration_number: &str) {
+        const FAA_ARCHIVE_SHA256: &str =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const FAA_RECORD_SHA256: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO curation_evidence_sources (
+                     source_url, source_title, publisher, source_domain,
+                     source_tier, content_sha256, retrieved_at
+                   ) VALUES (
+                     'https://faa.gov/aircraft-registry/test-release.zip',
+                     'FAA test registry release', 'FAA', 'faa.gov',
+                     'regulator_primary', '{FAA_ARCHIVE_SHA256}', CURRENT_TIMESTAMP
+                   )"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            r#"INSERT INTO curation_evidence_claims (
+                 evidence_source_id, claim_kind, subject_text, predicate_text,
+                 object_text, quoted_evidence, validation_status, validated_at
+               ) SELECT id, 'identity', 'Inspector Aircraft Model', 'is FAA designation',
+                        'Model', 'FAA identifies Inspector Aircraft model Model.',
+                        'validated', CURRENT_TIMESTAMP
+                 FROM curation_evidence_sources
+                 WHERE source_url = 'https://faa.gov/aircraft-registry/test-release.zip'"#,
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO aircraft_identity_observations (
+                     aircraft_sale_listing_id, source_url, observed_make,
+                     observed_family, observed_designation, model_year,
+                     registration_number, exact_source_evidence, observation_sha256
+                   ) SELECT id, source_url, 'Inspector Aircraft', 'Model', 'Model',
+                            model_year, registration_number,
+                            'Fixture observation grounded by the FAA test release.',
+                            '2222222222222222222222222222222222222222222222222222222222222222'
+                     FROM aircraft_sale_listings
+                     WHERE registration_number = '{registration_number}'"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            r#"INSERT INTO aircraft_identity_resolution_cases (
+                 observation_id, resolution_scope, job_fingerprint,
+                 catalog_revision, case_status
+               ) SELECT id, 'designation',
+                        '3333333333333333333333333333333333333333333333333333333333333333',
+                        'inspection-fixture-v1', 'resolved'
+                 FROM aircraft_identity_observations
+                 WHERE observation_sha256 = '2222222222222222222222222222222222222222222222222222222222222222'"#,
+        )
+        .await;
+        for entity_kind in ["make", "family", "designation"] {
+            execute(
+                db,
+                &format!(
+                    r#"INSERT INTO aircraft_identity_decisions (
+                         resolution_case_id, entity_kind, decision_action,
+                         decision_status, decision_payload_json,
+                         deterministic_validation_json,
+                         deterministic_validation_passed, rationale, decided_at
+                       ) SELECT id, '{entity_kind}', 'approve_new', 'approved',
+                                '{{}}', '{{}}', 1, 'FAA-backed inspection fixture',
+                                CURRENT_TIMESTAMP
+                         FROM aircraft_identity_resolution_cases
+                         WHERE job_fingerprint = '3333333333333333333333333333333333333333333333333333333333333333'"#,
+                ),
+            )
+            .await;
+        }
+        execute(
+            db,
+            r#"INSERT INTO aircraft_identity_decision_claims (
+                 decision_id, evidence_claim_id, evidence_role
+               ) SELECT decision.id, claim.id, 'identity'
+                 FROM aircraft_identity_decisions decision
+                 CROSS JOIN curation_evidence_claims claim
+                 WHERE decision.rationale = 'FAA-backed inspection fixture'
+                   AND claim.subject_text = 'Inspector Aircraft Model'"#,
+        )
+        .await;
+        execute(
+            db,
+            r#"INSERT INTO aircraft_makes (name, normalized_name, approval_decision_id)
+               SELECT 'Inspector Aircraft', 'inspector aircraft', id
+               FROM aircraft_identity_decisions
+               WHERE rationale = 'FAA-backed inspection fixture' AND entity_kind = 'make'"#,
+        )
+        .await;
+        execute(
+            db,
+            r#"INSERT INTO aircraft_model_families (
+                 aircraft_make_id, name, normalized_name, approval_decision_id
+               ) SELECT make.id, 'Model', 'model', decision.id
+                 FROM aircraft_makes make
+                 CROSS JOIN aircraft_identity_decisions decision
+                 WHERE make.normalized_name = 'inspector aircraft'
+                   AND decision.rationale = 'FAA-backed inspection fixture'
+                   AND decision.entity_kind = 'family'"#,
+        )
+        .await;
+        execute(
+            db,
+            r#"INSERT INTO aircraft_designations (
+                 aircraft_model_family_id, official_designation,
+                 normalized_official_designation, display_name,
+                 approval_decision_id
+               ) SELECT family.id, 'Model', 'model', 'Inspector Aircraft Model', decision.id
+                 FROM aircraft_model_families family
+                 CROSS JOIN aircraft_identity_decisions decision
+                 WHERE family.normalized_name = 'model'
+                   AND decision.rationale = 'FAA-backed inspection fixture'
+                   AND decision.entity_kind = 'designation'"#,
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO faa_registry_snapshots (
+                     evidence_source_id, snapshot_date, source_url,
+                     archive_sha256, source_manifest_sha256, target_set_sha256,
+                     master_member_name, master_member_sha256,
+                     aircraft_member_name, aircraft_member_sha256,
+                     engine_member_name, engine_member_sha256
+                   ) SELECT id, '2026-07-22', source_url,
+                            '{FAA_ARCHIVE_SHA256}',
+                            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                            'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+                            'MASTER.txt',
+                            'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                            'ACFTREF.txt',
+                            'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                            'ENGINE.txt',
+                            'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+                     FROM curation_evidence_sources
+                     WHERE source_url = 'https://faa.gov/aircraft-registry/test-release.zip'"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO faa_registry_aircraft (
+                     snapshot_id, n_number, aircraft_code, year_manufactured,
+                     source_record_sha256
+                   ) SELECT id, '{registration_number}', 'INSPECT-1', 2020,
+                            '{FAA_RECORD_SHA256}'
+                     FROM faa_registry_snapshots
+                     WHERE archive_sha256 = '{FAA_ARCHIVE_SHA256}'"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO faa_registry_aircraft_references (
+                     snapshot_id, aircraft_code, manufacturer_name, model_name
+                   ) SELECT id, 'INSPECT-1', 'Inspector Aircraft', 'Model'
+                     FROM faa_registry_snapshots
+                     WHERE archive_sha256 = '{FAA_ARCHIVE_SHA256}'"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO aircraft_designation_faa_bindings (
+                     faa_snapshot_date, faa_archive_sha256, faa_aircraft_code,
+                     aircraft_designation_id, representative_faa_registry_snapshot_id,
+                     identity_evidence_claim_id
+                   ) SELECT snapshot.snapshot_date, snapshot.archive_sha256,
+                            'INSPECT-1', designation.id, snapshot.id, claim.id
+                     FROM faa_registry_snapshots snapshot
+                     CROSS JOIN aircraft_designations designation
+                     CROSS JOIN curation_evidence_claims claim
+                     WHERE snapshot.archive_sha256 = '{FAA_ARCHIVE_SHA256}'
+                       AND designation.normalized_official_designation = 'model'
+                       AND claim.subject_text = 'Inspector Aircraft Model'"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO aircraft_sale_listing_identity_assignments (
+                     aircraft_sale_listing_id, aircraft_make_id,
+                     aircraft_model_family_id, aircraft_designation_id,
+                     identity_decision_id, identity_evidence_claim_id,
+                     faa_registry_snapshot_id, faa_n_number,
+                     faa_source_record_sha256
+                   ) SELECT listing.id, make.id, family.id, designation.id,
+                            decision.id, claim.id, snapshot.id,
+                            '{registration_number}', '{FAA_RECORD_SHA256}'
+                     FROM aircraft_sale_listings listing
+                     CROSS JOIN aircraft_makes make
+                     CROSS JOIN aircraft_model_families family
+                     CROSS JOIN aircraft_designations designation
+                     CROSS JOIN aircraft_identity_decisions decision
+                     CROSS JOIN curation_evidence_claims claim
+                     CROSS JOIN faa_registry_snapshots snapshot
+                     WHERE listing.registration_number = '{registration_number}'
+                       AND make.normalized_name = 'inspector aircraft'
+                       AND family.aircraft_make_id = make.id
+                       AND family.normalized_name = 'model'
+                       AND designation.aircraft_model_family_id = family.id
+                       AND designation.normalized_official_designation = 'model'
+                       AND decision.id = designation.approval_decision_id
+                       AND claim.subject_text = 'Inspector Aircraft Model'
+                       AND snapshot.archive_sha256 = '{FAA_ARCHIVE_SHA256}'"#,
+            ),
+        )
+        .await;
+        execute(
+            db,
+            &format!(
+                r#"INSERT INTO aircraft_valuation_projection_transitions (
+                     aircraft_sale_listing_id, identity_assignment_id,
+                     transition_kind, selected_at
+                   ) SELECT assignment.aircraft_sale_listing_id, assignment.id,
+                            'initial', CURRENT_TIMESTAMP
+                     FROM aircraft_sale_listing_identity_assignments assignment
+                     JOIN aircraft_sale_listings listing
+                       ON listing.id = assignment.aircraft_sale_listing_id
+                     WHERE listing.registration_number = '{registration_number}'"#,
+            ),
+        )
+        .await;
+    }
+
     async fn fixture() -> (AppDb, i64, i64, i64) {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let current_user = db.current_user(None).await.unwrap();
@@ -1457,38 +1766,21 @@ mod tests {
             "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) SELECT (SELECT id FROM avionics_models WHERE normalized_name = 'visible unit'), (SELECT id FROM avionics_types WHERE normalized_name = 'inspector capability')",
         )
         .await;
+        ensure_test_manufacturer_identity_for_model(&db, avionics_id)
+            .await
+            .unwrap();
         execute(
             &db,
             "UPDATE avionics_models SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE id = (SELECT id FROM avionics_models WHERE normalized_name = 'visible unit')",
         )
         .await;
-        execute(
-            &db,
-            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Inspector Aircraft', 'inspector aircraft')",
-        )
-        .await;
-        execute(
-            &db,
-            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) SELECT id, 'Model', 'model' FROM aircraft_manufacturers WHERE normalized_name = 'inspector aircraft'",
-        )
-        .await;
-        execute(
-            &db,
-            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) SELECT id, 'Variant', 'variant' FROM aircraft_models WHERE normalized_name = 'model' AND aircraft_manufacturer_id = (SELECT id FROM aircraft_manufacturers WHERE normalized_name = 'inspector aircraft')",
-        )
-        .await;
-        let variant_id = scalar(
-            &db,
-            "SELECT variant.id FROM aircraft_model_variants variant JOIN aircraft_models model ON model.id = variant.aircraft_model_id JOIN aircraft_manufacturers manufacturer ON manufacturer.id = model.aircraft_manufacturer_id WHERE manufacturer.normalized_name = 'inspector aircraft'",
-        )
-        .await;
-        for (email, verified, registration) in [
-            ("developer@localhost", 1, "N100IT"),
-            ("developer@localhost", 0, "N101IT"),
-            ("other@example.test", 0, "N102IT"),
+        for (email, registration) in [
+            ("developer@localhost", "N100IT"),
+            ("developer@localhost", "N101IT"),
+            ("other@example.test", "N102IT"),
         ] {
             let sql = format!(
-                "INSERT INTO aircraft_sale_listings (aircraft_model_variant_id, created_by_user_id, is_verified, source_url, model_year, asking_price_usd, airframe_hours, registration_number) VALUES ({variant_id}, (SELECT id FROM users WHERE email = '{email}'), {verified}, 'https://listing.example/{registration}', 2020, 100000, 1000, '{registration}')"
+                "INSERT INTO aircraft_sale_listings (aircraft_model_variant_id, created_by_user_id, is_verified, source_url, model_year, asking_price_usd, airframe_hours, registration_number) VALUES ((SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1), (SELECT id FROM users WHERE email = '{email}'), 0, 'https://listing.example/{registration}', 2020, 100000, 1000, '{registration}')"
             );
             execute(&db, &sql).await;
         }
@@ -1501,12 +1793,13 @@ mod tests {
         .await;
         execute(
             &db,
-            "UPDATE aircraft_sale_listings SET ingestion_state = 'ready', ingestion_completed_at = CURRENT_TIMESTAMP WHERE registration_number = 'N100IT'",
+            "UPDATE aircraft_sale_listing_avionics SET source = 'listing_review', source_confidence = 'high' WHERE aircraft_sale_listing_id = (SELECT id FROM aircraft_sale_listings WHERE registration_number = 'N100IT')",
         )
         .await;
+        seed_current_faa_aircraft_assignment(&db, "N100IT").await;
         execute(
             &db,
-            "UPDATE aircraft_sale_listing_avionics SET source_confidence = 'high' WHERE aircraft_sale_listing_id = (SELECT id FROM aircraft_sale_listings WHERE registration_number = 'N100IT')",
+            "UPDATE aircraft_sale_listings SET ingestion_state = 'ready', ingestion_completed_at = CURRENT_TIMESTAMP, is_verified = 1 WHERE registration_number = 'N100IT'",
         )
         .await;
         (db, current_user.id, other_user, avionics_id)
@@ -1604,6 +1897,122 @@ mod tests {
             .completeness
             .iter()
             .any(|option| option.value == "complete" && option.count >= 1));
+    }
+
+    #[tokio::test]
+    async fn combined_normalized_search_retrieves_approved_catalog_product() {
+        let (db, current_user_id, _, _) = fixture().await;
+        execute(
+            &db,
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('BendixKing', 'bendixking')",
+        )
+        .await;
+        execute(
+            &db,
+            r#"INSERT INTO avionics_models (
+                avionics_manufacturer_id, name, normalized_name,
+                manufacturer_identifier_kind, manufacturer_identifier,
+                normalized_manufacturer_identifier, identity_source_url,
+                identity_source_title, identity_evidence_text, identity_evidence_kind,
+                identity_confidence, introduced_year, estimated_unit_value_usd,
+                value_basis, replacement_cost_usd, value_reference_year, value_source
+              ) VALUES (
+                (SELECT id FROM avionics_manufacturers WHERE normalized_name = 'bendixking'),
+                'KX-170B', 'kx170b', 'manufacturer_part_number', '069-1020-00',
+                '069102000', 'https://manufacturer.example/kx-170b',
+                'KX-170B maintenance manual',
+                'Manufacturer identifies the KX-170B and part number 069-1020-00.',
+                'authoritative_reference', 'very_high', 1970, 900,
+                'installed_contribution', 2500, 2026, 'Avionics price guide'
+              )"#,
+        )
+        .await;
+        let kx_170b_id = scalar(
+            &db,
+            "SELECT id FROM avionics_models WHERE normalized_name = 'kx170b'",
+        )
+        .await;
+        execute(
+            &db,
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) SELECT model.id, capability.id FROM avionics_models model CROSS JOIN avionics_types capability WHERE model.normalized_name = 'kx170b' AND capability.normalized_name = 'inspector capability'",
+        )
+        .await;
+        ensure_test_manufacturer_identity_for_model(&db, kx_170b_id)
+            .await
+            .unwrap();
+        execute(
+            &db,
+            "UPDATE avionics_models SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP WHERE id = (SELECT id FROM avionics_models WHERE normalized_name = 'kx170b')",
+        )
+        .await;
+
+        for search in [
+            "King KX-170B",
+            "BendixKing KX-170B",
+            "Bendix King KX 170B",
+            "King 069-1020-00",
+        ] {
+            let page = list_avionics_catalog(
+                &db,
+                current_user_id,
+                AvionicsCatalogQuery {
+                    search: Some(search.to_string()),
+                    status: Some("approved".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.total, 1, "combined search for {search:?}");
+            assert_eq!(page.items[0].id, kx_170b_id);
+            assert_eq!(page.items[0].display_name, "BendixKing KX-170B");
+        }
+
+        let unrelated_manufacturer = list_avionics_catalog(
+            &db,
+            current_user_id,
+            AvionicsCatalogQuery {
+                search: Some("Garmin KX-170B".to_string()),
+                status: Some("approved".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unrelated_manufacturer.total, 0);
+    }
+
+    #[tokio::test]
+    async fn search_ranks_an_exact_model_phrase_before_loose_token_matches() {
+        let (db, current_user_id, _, _) = fixture().await;
+        for (name, normalized_name) in [("Exact I", "exact i"), ("Exact 2000", "exact 2000")] {
+            execute(
+                &db,
+                &format!(
+                    "INSERT INTO avionics_models (avionics_manufacturer_id, name, normalized_name) \
+                     SELECT id, '{name}', '{normalized_name}' \
+                     FROM avionics_manufacturers WHERE normalized_name = 'inspector test'"
+                ),
+            )
+            .await;
+        }
+
+        let page = list_avionics_catalog(
+            &db,
+            current_user_id,
+            AvionicsCatalogQuery {
+                // The short "i" token also occurs in "Inspector", so both
+                // rows remain legitimate loose retrieval results.
+                search: Some("Inspector Exact I".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items[0].name, "Exact I");
+        assert_eq!(page.items[1].name, "Exact 2000");
     }
 
     #[tokio::test]

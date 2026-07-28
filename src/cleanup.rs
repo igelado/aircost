@@ -76,6 +76,21 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
             FROM rental_aircraft_offerings offering
             WHERE offering.aircraft_model_variant_id = variant.id
           )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_valuation_compatibility_projections projection
+            WHERE projection.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+            WHERE placeholder.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_model_variant_default_avionics_candidates candidate
+            WHERE candidate.aircraft_model_variant_id = variant.id
+          )
         )
         "#
     )?;
@@ -96,6 +111,21 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
             SELECT 1
             FROM rental_aircraft_offerings offering
             WHERE offering.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_valuation_compatibility_projections projection
+            WHERE projection.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+            WHERE placeholder.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_model_variant_default_avionics_candidates candidate
+            WHERE candidate.aircraft_model_variant_id = variant.id
           )
         )
         "#
@@ -118,6 +148,21 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
             FROM rental_aircraft_offerings offering
             WHERE offering.aircraft_model_variant_id = variant.id
           )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_valuation_compatibility_projections projection
+            WHERE projection.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+            WHERE placeholder.aircraft_model_variant_id = variant.id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM aircraft_model_variant_default_avionics_candidates candidate
+            WHERE candidate.aircraft_model_variant_id = variant.id
+          )
         )
         "#
     )?;
@@ -138,6 +183,18 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
         )
         AND NOT EXISTS (
           SELECT 1
+          FROM aircraft_valuation_compatibility_projections projection
+          WHERE projection.aircraft_model_variant_id =
+            aircraft_model_variants.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+          WHERE placeholder.aircraft_model_variant_id =
+            aircraft_model_variants.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
           FROM aircraft_model_spec_versions spec
           WHERE spec.aircraft_model_variant_id = aircraft_model_variants.id
         )
@@ -150,6 +207,11 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
           SELECT 1
           FROM aircraft_model_variant_default_avionics default_avionics
           WHERE default_avionics.aircraft_model_variant_id = aircraft_model_variants.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM aircraft_model_variant_default_avionics_candidates candidate
+          WHERE candidate.aircraft_model_variant_id = aircraft_model_variants.id
         )
         "#
     )?;
@@ -168,6 +230,18 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
           FROM aircraft_model_spec_versions spec
           WHERE spec.aircraft_model_id = aircraft_models.id
         )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM aircraft_valuation_compatibility_projections projection
+          JOIN aircraft_model_variants variant
+            ON variant.id = projection.aircraft_model_variant_id
+          WHERE variant.aircraft_model_id = aircraft_models.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+          WHERE placeholder.aircraft_model_id = aircraft_models.id
+        )
         "#
     )?;
 
@@ -180,57 +254,29 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
           FROM aircraft_models model
           WHERE model.aircraft_manufacturer_id = aircraft_manufacturers.id
         )
-        "#
-    )?;
-
-    report.avionics_models = execute_query_count!(
-        db,
-        r#"
-        DELETE FROM avionics_models
-        WHERE catalog_status <> 'approved'
         AND NOT EXISTS (
           SELECT 1
-          FROM aircraft_sale_listing_avionics listing_link
-          WHERE listing_link.avionics_model_id = avionics_models.id
-             OR listing_link.replaces_avionics_model_id = avionics_models.id
+          FROM aircraft_valuation_compatibility_projections projection
+          JOIN aircraft_model_variants variant
+            ON variant.id = projection.aircraft_model_variant_id
+          JOIN aircraft_models model
+            ON model.id = variant.aircraft_model_id
+          WHERE model.aircraft_manufacturer_id = aircraft_manufacturers.id
         )
         AND NOT EXISTS (
           SELECT 1
-          FROM aircraft_model_variant_default_avionics default_link
-          WHERE default_link.avionics_model_id = avionics_models.id
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM avionics_suite_components membership
-          WHERE membership.suite_model_id = avionics_models.id
-             OR membership.component_model_id = avionics_models.id
+          FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+          WHERE placeholder.aircraft_manufacturer_id =
+            aircraft_manufacturers.id
         )
         "#
     )?;
 
-    report.avionics_manufacturers = execute_query_count!(
-        db,
-        r#"
-        DELETE FROM avionics_manufacturers
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM avionics_models model
-          WHERE model.avionics_manufacturer_id = avionics_manufacturers.id
-        )
-        "#
-    )?;
-
-    report.avionics_types = execute_query_count!(
-        db,
-        r#"
-        DELETE FROM avionics_types
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM avionics_model_types membership
-          WHERE membership.avionics_type_id = avionics_types.id
-        )
-        "#
-    )?;
+    // Catalog candidates, manufacturer spellings, and capability rows can be
+    // referenced by pending-review payloads and evidence-backed identity
+    // decisions that are not represented by a simple foreign key. Their
+    // lifecycle belongs to listing review or explicit catalog consolidation,
+    // never this generic relational-orphan sweep.
 
     report.engine_models = execute_query_count!(
         db,
@@ -287,6 +333,7 @@ pub async fn cleanup_orphan_records(db: &AppDb) -> CleanupResult<OrphanCleanupRe
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
     use crate::db::AppDb;
 
     use super::*;
@@ -322,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_removes_unreferenced_aircraft_rows_but_keeps_approved_catalog_entries() {
         let (db, path) = test_db().await;
-        seed_unreferenced_aircraft_graph(&db).await;
+        let graph = seed_unreferenced_aircraft_graph(&db).await;
 
         let report = cleanup_orphan_records(&db)
             .await
@@ -342,7 +389,23 @@ mod tests {
         assert_eq!(report.propeller_models, 1);
         assert_eq!(report.propeller_manufacturers, 1);
 
-        assert_eq!(table_count(&db, "aircraft_model_variants").await, 0);
+        assert!(
+            !row_exists(
+                &db,
+                "aircraft_model_variants",
+                graph.aircraft_model_variant_id
+            )
+            .await
+        );
+        assert!(!row_exists(&db, "aircraft_models", graph.aircraft_model_id).await);
+        assert!(
+            !row_exists(
+                &db,
+                "aircraft_manufacturers",
+                graph.aircraft_manufacturer_id
+            )
+            .await
+        );
         assert_eq!(table_count(&db, "avionics_models").await, 1);
         assert_eq!(table_count(&db, "engine_models").await, 0);
         assert_eq!(table_count(&db, "propeller_models").await, 0);
@@ -354,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_keeps_rows_referenced_by_listing_roots() {
         let (db, path) = test_db().await;
-        seed_referenced_aircraft_graph(&db).await;
+        let graph = seed_referenced_aircraft_graph(&db).await;
 
         let report = cleanup_orphan_records(&db)
             .await
@@ -366,8 +429,221 @@ mod tests {
         assert_eq!(report.avionics_models, 0);
         assert_eq!(report.avionics_manufacturers, 0);
         assert_eq!(report.avionics_types, 0);
-        assert_eq!(table_count(&db, "aircraft_model_variants").await, 1);
+        assert!(
+            row_exists(
+                &db,
+                "aircraft_model_variants",
+                graph.aircraft_model_variant_id
+            )
+            .await
+        );
         assert_eq!(table_count(&db, "avionics_models").await, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_hierarchy_and_product_referenced_only_by_pending_default_claim() {
+        let (db, path) = test_db().await;
+        let aircraft_manufacturer_id =
+            insert_named(&db, "aircraft_manufacturers", "Pending Cessna").await;
+        let aircraft_model_id = insert_aircraft_model(&db, aircraft_manufacturer_id).await;
+        let aircraft_model_variant_id = insert_aircraft_variant(&db, aircraft_model_id).await;
+        let avionics_manufacturer_id =
+            insert_named(&db, "avionics_manufacturers", "Pending Garmin").await;
+        let avionics_type_id = insert_named(&db, "avionics_types", "Pending Navigation").await;
+        let avionics_model_id = insert_unreviewed_avionics_model(
+            &db,
+            avionics_manufacturer_id,
+            avionics_type_id,
+            "Pending GIA",
+            "pending gia",
+        )
+        .await;
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_model_variant_default_avionics_candidates (
+              aircraft_model_variant_id,
+              model_year,
+              avionics_model_id,
+              quantity,
+              source_url,
+              source_title,
+              source_notes,
+              source_confidence,
+              pending_reason
+            ) VALUES (
+              ?, 2010, ?, 2,
+              'https://example.test/pending-default',
+              'Pending factory equipment claim',
+              'Exact imported pending claim',
+              'high',
+              'factory_default_claim_unverified'
+            )
+            "#,
+            aircraft_model_variant_id,
+            avionics_model_id
+        )
+        .expect("pending default claim should seed");
+
+        let report = cleanup_orphan_records(&db)
+            .await
+            .expect("cleanup should preserve pending default ownership");
+
+        assert_eq!(report.aircraft_model_variants, 0);
+        assert_eq!(report.aircraft_models, 0);
+        assert_eq!(report.aircraft_manufacturers, 0);
+        assert_eq!(report.avionics_models, 0);
+        assert!(row_exists(&db, "aircraft_model_variants", aircraft_model_variant_id).await);
+        assert!(row_exists(&db, "aircraft_models", aircraft_model_id).await);
+        assert!(row_exists(&db, "aircraft_manufacturers", aircraft_manufacturer_id).await);
+        assert!(row_exists(&db, "avionics_models", avionics_model_id).await);
+        assert_eq!(
+            table_count(&db, "aircraft_model_variant_default_avionics_candidates").await,
+            1
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_the_schema_owned_pending_compatibility_placeholder() {
+        let (db, path) = test_db().await;
+        let aircraft_manufacturer_id = query_scalar_one!(
+            &db,
+            i64,
+            "SELECT aircraft_manufacturer_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1"
+        )
+        .expect("pending placeholder manufacturer should exist");
+        let aircraft_model_id = query_scalar_one!(
+            &db,
+            i64,
+            "SELECT aircraft_model_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1"
+        )
+        .expect("pending placeholder model should exist");
+        let aircraft_model_variant_id = query_scalar_one!(
+            &db,
+            i64,
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1"
+        )
+        .expect("pending placeholder variant should exist");
+        let avionics_model_id = insert_avionics_model(&db).await;
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_model_spec_versions (
+              aircraft_model_id, aircraft_model_variant_id, effective_from
+            ) VALUES (?, ?, '2026-01-01')
+            "#,
+            aircraft_model_id,
+            aircraft_model_variant_id
+        )
+        .expect("placeholder spec version should seed");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_model_variant_price_points (
+              aircraft_model_variant_id, model_year,
+              purchase_price_new_usd, purchase_price_reference_year,
+              source_url, source_title, source_notes, source_confidence
+            ) VALUES (?, 2026, 1, 2026, 'https://example.test',
+                      'placeholder fixture', 'placeholder fixture', 'high')
+            "#,
+            aircraft_model_variant_id
+        )
+        .expect("placeholder price point should seed");
+        execute_query!(
+            &db,
+            r#"
+            INSERT INTO aircraft_model_variant_default_avionics (
+              aircraft_model_variant_id, model_year, avionics_model_id,
+              quantity, source_url, source_title, source_notes,
+              source_confidence
+            ) VALUES (?, 2026, ?, 1, 'https://example.test',
+                      'placeholder fixture', 'placeholder fixture', 'high')
+            "#,
+            aircraft_model_variant_id,
+            avionics_model_id
+        )
+        .expect("placeholder default avionics should seed");
+
+        let report = cleanup_orphan_records(&db)
+            .await
+            .expect("cleanup should preserve schema-owned compatibility rows");
+
+        assert_eq!(report.aircraft_model_variant_default_avionics, 0);
+        assert_eq!(report.aircraft_model_variant_price_points, 0);
+        assert_eq!(report.aircraft_model_spec_versions, 0);
+        assert_eq!(report.aircraft_model_variants, 0);
+        assert_eq!(report.aircraft_models, 0);
+        assert_eq!(report.aircraft_manufacturers, 0);
+        assert!(row_exists(&db, "aircraft_model_variants", aircraft_model_variant_id).await);
+        assert!(row_exists(&db, "aircraft_models", aircraft_model_id).await);
+        assert!(row_exists(&db, "aircraft_manufacturers", aircraft_manufacturer_id).await);
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_every_row_owned_by_a_valuation_compatibility_projection() {
+        let (db, path) = test_db().await;
+        let graph = seed_unreferenced_aircraft_graph(&db).await;
+
+        // Projection admission is covered by the aircraft-identity schema.
+        // This unit test isolates orphan ownership by replacing the guarded
+        // table with its one cleanup-relevant key.
+        execute_query!(
+            &db,
+            "DROP TABLE aircraft_valuation_compatibility_projections"
+        )
+        .expect("projection fixture should replace the guarded table");
+        execute_query!(
+            &db,
+            r#"
+            CREATE TABLE aircraft_valuation_compatibility_projections (
+              aircraft_model_variant_id INTEGER PRIMARY KEY
+            )
+            "#
+        )
+        .expect("projection fixture table should seed");
+        execute_query!(
+            &db,
+            "INSERT INTO aircraft_valuation_compatibility_projections (aircraft_model_variant_id) VALUES (?)",
+            graph.aircraft_model_variant_id
+        )
+        .expect("projection ownership should seed");
+
+        let report = cleanup_orphan_records(&db)
+            .await
+            .expect("cleanup should preserve projection-owned compatibility rows");
+
+        assert_eq!(report.aircraft_model_variant_default_avionics, 0);
+        assert_eq!(report.aircraft_model_variant_price_points, 0);
+        assert_eq!(report.aircraft_model_spec_versions, 0);
+        assert_eq!(report.aircraft_model_variants, 0);
+        assert_eq!(report.aircraft_models, 0);
+        assert_eq!(report.aircraft_manufacturers, 0);
+        assert!(
+            row_exists(
+                &db,
+                "aircraft_model_variants",
+                graph.aircraft_model_variant_id
+            )
+            .await
+        );
+        assert!(row_exists(&db, "aircraft_models", graph.aircraft_model_id).await);
+        assert!(
+            row_exists(
+                &db,
+                "aircraft_manufacturers",
+                graph.aircraft_manufacturer_id
+            )
+            .await
+        );
 
         drop(db);
         let _ = std::fs::remove_file(path);
@@ -441,7 +717,14 @@ mod tests {
         (db, path)
     }
 
-    async fn seed_unreferenced_aircraft_graph(db: &AppDb) {
+    #[derive(Clone, Copy, Debug)]
+    struct SeededAircraftGraph {
+        aircraft_manufacturer_id: i64,
+        aircraft_model_id: i64,
+        aircraft_model_variant_id: i64,
+    }
+
+    async fn seed_unreferenced_aircraft_graph(db: &AppDb) -> SeededAircraftGraph {
         let aircraft_manufacturer_id = insert_named(db, "aircraft_manufacturers", "Cessna").await;
         let aircraft_model_id = insert_aircraft_model(db, aircraft_manufacturer_id).await;
         let variant_id = insert_aircraft_variant(db, aircraft_model_id).await;
@@ -504,9 +787,14 @@ mod tests {
             avionics_model_id
         )
         .expect("default avionics should seed");
+        SeededAircraftGraph {
+            aircraft_manufacturer_id,
+            aircraft_model_id,
+            aircraft_model_variant_id: variant_id,
+        }
     }
 
-    async fn seed_referenced_aircraft_graph(db: &AppDb) {
+    async fn seed_referenced_aircraft_graph(db: &AppDb) -> SeededAircraftGraph {
         let aircraft_manufacturer_id = insert_named(db, "aircraft_manufacturers", "Cessna").await;
         let aircraft_model_id = insert_aircraft_model(db, aircraft_manufacturer_id).await;
         let variant_id = insert_aircraft_variant(db, aircraft_model_id).await;
@@ -515,6 +803,15 @@ mod tests {
             .current_user(None)
             .await
             .expect("developer user should exist");
+        // Reproduce a retained listing row from before the compatibility
+        // projection contract was installed. New application writes cannot
+        // create this shape, but cleanup must never delete hierarchy rows
+        // still referenced by a migrated legacy listing.
+        execute_query!(
+            db,
+            "DROP TRIGGER listing_insert_requires_aircraft_projection_or_placeholder"
+        )
+        .expect("legacy listing fixture should bypass only the new-write guard");
         let listing_id = query_scalar_one!(
             db,
             i64,
@@ -548,6 +845,11 @@ mod tests {
             avionics_model_id
         )
         .expect("listing avionics should seed");
+        SeededAircraftGraph {
+            aircraft_manufacturer_id,
+            aircraft_model_id,
+            aircraft_model_variant_id: variant_id,
+        }
     }
 
     async fn insert_named(db: &AppDb, table: &str, name: &str) -> i64 {
@@ -634,6 +936,9 @@ mod tests {
             type_id
         )
         .expect("avionics capability should seed");
+        ensure_test_manufacturer_identity(db, manufacturer_id)
+            .await
+            .expect("avionics manufacturer identity should seed");
         execute_query!(
             db,
             "UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?",
@@ -718,5 +1023,10 @@ mod tests {
     async fn table_count(db: &AppDb, table: &str) -> i64 {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         query_scalar_one!(db, i64, &sql).expect("table count should succeed")
+    }
+
+    async fn row_exists(db: &AppDb, table: &str, id: i64) -> bool {
+        let sql = format!("SELECT EXISTS (SELECT 1 FROM {table} WHERE id = ?)");
+        query_scalar_one!(db, i64, &sql, id).expect("row existence should load") != 0
     }
 }
