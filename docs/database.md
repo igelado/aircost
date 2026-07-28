@@ -379,10 +379,12 @@ which is absent from the retained outer HTML. The capture must have its stored
 content hash, owner, and exact `canonical_listing_id`; missing captures,
 generated explanations, hidden metadata, and corrected text remain pending. A
 synthetic preserved-link aspect records occurrence
-corroboration without rewriting the link. An ordinary installed,
-non-replacement aspect may cover zero or one installed link and is committed
-through the normal aspect-scoped `use-existing` transaction with its exact
-quantity. The transaction re-reads the capture and rechecks its hash and
+corroboration without rewriting the link. It accepts any unchanged positive
+quantity, including quantities greater than one, only when the staged aspect
+and current listing link still agree under the mutation lock. An ordinary
+installed, non-replacement aspect may cover zero or one installed link and is
+committed through the normal aspect-scoped `use-existing` transaction with its
+exact quantity. The transaction re-reads the capture and rechecks its hash and
 visible evidence under the mutation lock, together with the hash-bound target,
 current reuse attestation, approved-catalog revision, active
 identity-collision closure, exact covered-link ownership, and listing action

@@ -2048,7 +2048,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corroborated_existing_product_returns_only_remaining_review_without_gemini_usage() {
+    async fn multi_quantity_preserved_product_corroboration_keeps_link_unchanged_and_uses_no_gemini(
+    ) {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let pool = sqlite_pool(&db);
         let (owner_user_id, listing_id) = insert_review_listing(&db).await;
@@ -2060,18 +2061,19 @@ mod tests {
         )
         .await;
         let preserved_id = insert_approved_garmin_product(&db).await;
-        sqlx::query(
+        let link_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO aircraft_sale_listing_avionics (
               aircraft_sale_listing_id, avionics_model_id, quantity, source,
               source_notes, source_confidence, configuration_action
-            ) VALUES (?, ?, 1, 'listing', 'Garmin GNS 430W P/N 011-01064-40 shown in the listing',
+            ) VALUES (?, ?, 2, 'listing', 'Garmin GNS 430W P/N 011-01064-40 shown in the listing',
                       'high', 'installed')
+            RETURNING id
             "#,
         )
         .bind(listing_id)
         .bind(preserved_id)
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .unwrap();
         let primary = PendingReviewAspect::avionics(
@@ -2118,6 +2120,7 @@ mod tests {
                     == Some(preserved_id)
             })
             .expect("the preserved association must be staged");
+        assert_eq!(synthetic.quantity, 2);
         let response = verify_existing_review_avionics_handler(
             State(test_state(db.clone())),
             HeaderMap::new(),
@@ -2150,6 +2153,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(usage_after_cleanup, usage_before_cleanup);
+        let unchanged_link: (i64, i64, String, Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, quantity, configuration_action,
+                   replaces_avionics_model_id, source
+            FROM aircraft_sale_listing_avionics
+            WHERE id = ?
+            "#,
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged_link,
+            (
+                preserved_id,
+                2,
+                "installed".to_string(),
+                None,
+                "listing".to_string()
+            ),
+            "corroboration must not rewrite the preserved association"
+        );
     }
 
     #[tokio::test]

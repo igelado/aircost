@@ -2411,8 +2411,8 @@ async fn restage_pending_review_if_current_with_commit(
                     || assignment.installed_catalog_status.as_deref() != Some("approved")
                     || assignment.configuration_action != "installed"
                     || assignment.replaces_avionics_model_id.is_some()
-                    || assignment.quantity != 1
-                    || aspect.quantity != 1
+                    || assignment.quantity <= 0
+                    || aspect.quantity != assignment.quantity
                     || assignment.source_notes.as_deref() != Some(evidence_text)
                 {
                     return Err(ReviewError::Stale(format!(
@@ -3910,7 +3910,7 @@ fn preserved_product_aspect(
         label,
         observed_text,
         PRESERVED_ASSOCIATION_REVIEW_REASON,
-        quantity.max(1),
+        quantity,
         configuration_action,
         assignment.source_notes.clone(),
         assignment.source_confidence.clone(),
@@ -5080,14 +5080,14 @@ pub(crate) async fn preflight_existing_product_association(
         if association.role != ListingAssociationRole::Installed
             || assignment.configuration_action != "installed"
             || assignment.replaces_avionics_model_id.is_some()
-            || assignment.quantity != 1
-            || aspect.quantity != 1
+            || assignment.quantity <= 0
+            || aspect.quantity != assignment.quantity
             || assignment.avionics_model_id != target_id
             || assignment.installed_catalog_status.as_deref() != Some("approved")
             || assignment.source_notes.as_deref() != Some(listing_evidence_text.as_str())
         {
             return Err(ReviewError::Validation(format!(
-                "review aspect {aspect_id} requires complete manual review: preserved-product corroboration supports only one unchanged ordinary installed unit"
+                "review aspect {aspect_id} requires complete manual review: preserved-product corroboration supports only one unchanged ordinary installed association with an exact positive quantity"
             )));
         }
         ExistingProductAssociationCommit::CorroboratePreserved {
@@ -8376,6 +8376,14 @@ mod tests {
             .filter_map(|aspect| aspect.reuse_attestation_target_id)
             .collect::<BTreeSet<_>>();
         assert_eq!(targets, BTreeSet::from([11, 12, 13]));
+        assert_eq!(
+            aspects
+                .iter()
+                .find(|aspect| aspect.reuse_attestation_target_id == Some(11))
+                .map(|aspect| aspect.quantity),
+            Some(2),
+            "a preserved aspect must carry the exact installed association quantity"
+        );
         assert!(
             hidden_preserved_blockers(&aspects, &assignments, &HashSet::new(), &HashSet::new(),)
                 .is_empty(),
@@ -10536,7 +10544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_association_corroboration_retires_only_link_572_not_real_aspect_9() {
+    async fn multi_quantity_association_corroboration_retires_only_link_572_not_real_aspect_9() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let submission_id = insert_review_bound_submission(
@@ -10552,7 +10560,7 @@ mod tests {
             INSERT INTO aircraft_sale_listing_avionics (
               id, aircraft_sale_listing_id, avionics_model_id, quantity, source,
               source_notes, source_confidence, configuration_action
-            ) VALUES (572, ?, ?, 1, 'listing', 'Garmin GDL 69A shown in the listing',
+            ) VALUES (572, ?, ?, 2, 'listing', 'Garmin GDL 69A shown in the listing',
                       'high', 'installed')
             RETURNING id
             "#,
@@ -10876,6 +10884,116 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(corroboration_count, 1);
+    }
+
+    #[tokio::test]
+    async fn preserved_quantity_change_after_preflight_is_rejected_under_lock() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let evidence = "Two Garmin GMA 1347 audio panels";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            &format!("<html><body>{evidence}</body></html>"),
+        )
+        .await;
+        let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 2, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(evidence)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let assignment = load_existing_assignments(&db, listing_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let product = load_all_approved_product_map(&db)
+            .await
+            .unwrap()
+            .remove(&product_id)
+            .unwrap();
+        let synthetic =
+            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let staged =
+            stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
+                .await
+                .unwrap();
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+
+        let target = preflight_existing_product_association(
+            &db,
+            user_id,
+            listing_id,
+            &synthetic.id,
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+        )
+        .await
+        .expect("an exact preserved quantity of two must pass preflight");
+        let observation_sha256 = match &target.commit {
+            ExistingProductAssociationCommit::CorroboratePreserved { observation_sha256 } => {
+                observation_sha256.clone()
+            }
+            ExistingProductAssociationCommit::ApproveOrdinary => {
+                panic!("a preserved association must use the corroboration commit")
+            }
+        };
+        let active_collision_revision = active_collision_closure_revision_sha256(&db, product_id)
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE aircraft_sale_listing_avionics SET quantity = 3 WHERE id = ?")
+            .bind(link_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+
+        let error = corroborate_existing_product_association_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &synthetic.id,
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+            &active_collision_revision,
+            product_id,
+            &observation_sha256,
+            &target.listing_evidence_provenance,
+        )
+        .await
+        .expect_err("a quantity change after preflight must fail under the mutation lock");
+        assert!(matches!(error, ReviewError::Stale(_)));
+        assert!(error.to_string().contains("changed"));
+
+        let corroboration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(corroboration_count, 0);
+        let retained_review_hash: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(retained_review_hash, staged.review_payload_sha256);
     }
 
     #[tokio::test]
