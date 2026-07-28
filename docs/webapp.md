@@ -236,6 +236,14 @@ not covered, absent, ambiguous, or conflicts with the supplied serial number.
 Preview remains read-only and may still display extracted data that admission
 will reject.
 
+During creation or an explicit avionics replacement, the server automatically
+discards an observation as garbage only for a high-confidence structured
+`rejection_basis` and a basis-consistent, candidate-specific negative reason.
+The entire normalized reason must appear in one linked Google Search citation
+support span. A citation that only establishes product identity, contradicts
+the negative claim, or is otherwise unrelated leaves the observation pending
+for review instead of discarding it.
+
 Create a listing from the same payload accepted by preview:
 
 ```http
@@ -295,16 +303,28 @@ Content-Type: application/json
 }
 ```
 
+Avionics are replaced only when the PATCH body explicitly contains a valid
+`avionics` array. Without that member, the server skips avionics identity
+resolution and preserves the pending-review hashes and exact listing-link IDs;
+price, status, hours, and similar edits do not silently restage the review.
+Including `manufacturer`, `model`, `variant`, `model_year`, `source_url`,
+`registration_number`, or `serial_number` requires an explicit avionics array
+in the same request. Null, object-valued, or malformed avionics fail before any
+mutation. `"avionics": []` deliberately clears the prior avionics set and its
+pending evidence; a non-empty array replaces and restages it as necessary.
+
 Delete an unverified listing:
 
 ```http
 DELETE /api/listings/{id}
 ```
 
-Listings have `is_verified` and `added_at`. New user-created listings start
-with `is_verified: false`. Verified listings are globally visible and cannot be
-updated or deleted through these user APIs. Unverified listings are visible only
-to the user who created them.
+Listings have `is_verified` and `added_at`. A row is inserted unverified; a
+source-backed listing becomes verified only after mandatory FAA admission,
+avionics resolution, enrichment, and readiness checks all pass. Source-less
+manual drafts remain unverified. Verified listings are globally visible and
+cannot be updated or deleted through these user APIs. Unverified and
+`pending_review` listings are visible only to the user who created them.
 
 When adding a listing with the same tail number:
 
@@ -327,6 +347,92 @@ adjusted-comparable fallback, and `valuation_warning` carries any serving caveat
 that should be shown with the estimate.
 
 The listing table also displays each row's ingestion state. Hovering an
-`incomplete` or `quarantined` badge shows its persisted completion error, so a
-stored row that is excluded from valuation is visible rather than silently
-treated as training data.
+`incomplete` or `quarantined` badge shows its persisted completion error.
+`pending_review` identifies expected curation work and has no ingestion error.
+All three states are excluded from valuation and training rather than silently
+treated as ready data.
+
+## Listing Review Workspace
+
+The Review tab lists the current user's listings that have one durable pending
+review bundle. The queue shows the aircraft, tail, year, aspect count, reason
+groups, and last update. Opening a listing shows every unresolved observation,
+its source context, and any suggested or proposed product. Catalog search in
+the workspace returns approved products only.
+
+Review access has a server-side allowlist until durable application roles are
+available. Production deployments must provide a comma-separated list of exact
+reviewer emails:
+
+```text
+AIRCOST_REVIEWER_EMAILS=reviewer@example.com,second-reviewer@example.com
+```
+
+Debug builds also admit the seeded local `developer@localhost` user. A local
+release build can opt in to that developer with
+`AIRCOST_ALLOW_LOCAL_REVIEWER=true`; do not use that override as production
+authorization. The store layer additionally scopes queue, detail, and resolve
+operations to listings owned by the authenticated reviewer. The current web
+authentication adapter trusts `X-User-Email`; production must expose these
+routes only behind a trusted proxy that strips any client-supplied value and
+injects the authenticated identity itself.
+
+Every avionics aspect offers all three actions, even when the server presents a
+suggested approved match or an explicit legacy candidate. The reviewer chooses
+exactly one before the Verify Listing button is enabled:
+
+- **Use verified product** searches and selects one existing approved catalog
+  identity.
+- **Create verified product** requires manufacturer, model, one or more
+  canonical capabilities, a stable manufacturer identifier kind and value,
+  and authoritative identity source URL, title, and evidence text.
+- **Discard observation** requires a reason and creates neither a catalog row
+  nor a listing association.
+
+For an unlinked observation, an explicit legacy candidate means normalized
+manufacturer/model selected one and only one `unreviewed` catalog row. An
+aspect already tied to a legacy listing association may instead show that exact
+covered catalog row by ID. Neither is preapproved: creating the same identity
+can promote the row only after the server rechecks normalized-identity
+uniqueness and identifier/model collisions under lock. Entering a corrected
+manufacturer/model creates a separate verified product and leaves the old
+candidate unchanged.
+
+The corresponding API is:
+
+```http
+GET /api/review/listings?limit=25&offset=0
+GET /api/review/listings/{listing_id}
+POST /api/review/listings/{listing_id}/resolve
+```
+
+The resolve request includes `review_payload_sha256`,
+`catalog_revision_sha256`, one decision for every returned aspect, and an
+optional `finalize_listing` boolean. Both hashes are optimistic concurrency
+controls. `finalize_listing` defaults to `false`, so API and batch reviewers
+can save a local review without unexpectedly starting Gemini enrichment. When
+it is `true`, the same already authorized request runs final enrichment only
+after the all-or-nothing review transaction commits. The browser sends `true`
+for its one-click Verify Listing action. The detail response supplies the
+current approved-catalog hash; resolution recomputes it while holding the write
+lock. The hash covers approved product IDs, manufacturer/model labels,
+capabilities, stable identifiers, and approval membership only, so unrelated
+changes to preserved unreviewed or rejected legacy rows do not invalidate the
+form. If the bundle or those approved identity fields change, the API rejects
+the stale submission and the workspace offers Reload Review.
+
+Resolution is all-or-nothing. The server first checks mandatory FAA admission,
+before any catalog write. The database transaction then validates the full
+decision set, creates or selects verified catalog identities, replaces only
+the exact covered listing-link ID/role pairs, and removes the pending bundle
+together. Without the explicit finalization flag it leaves the listing
+incomplete and private. With the flag set, the server rechecks FAA admission
+and runs grounded enrichment outside the transaction. Only successful
+admission, enrichment, and readiness checks publish it as `ready` and
+verified. Accepted associations receive `listing_review`
+provenance and high installation confidence and participate in valuation under
+the same evidence rule as high-confidence `listing` associations. A completion
+failure is stored as `quarantined`; an unresolved bundle remains
+`pending_review` and is not treated as an ingestion failure. A bundle staged
+concurrently with post-review enrichment takes precedence over quarantine and
+stays visible in the review queue.

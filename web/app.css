@@ -564,6 +564,11 @@ tbody tr:hover {
   color: var(--warning);
 }
 
+.ingestion-pill.pending_review {
+  background: #e8e2ff;
+  color: #4d3f91;
+}
+
 .ingestion-pill.quarantined {
   background: #fde8e7;
   color: var(--danger);
@@ -935,6 +940,1065 @@ label span,
   color: #854d0e;
 }
 
+.avionics-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.8fr) repeat(3, minmax(150px, 1fr)) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.avionics-message {
+  min-height: 22px;
+  padding: 4px 12px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.avionics-message.error,
+.detail-state.error {
+  color: var(--danger);
+}
+
+.avionics-table-shell {
+  min-height: 360px;
+}
+
+.avionics-table {
+  min-width: 1080px;
+}
+
+.avionics-table th:nth-child(1) {
+  width: 22%;
+}
+
+.avionics-table th:nth-child(2) {
+  width: 13%;
+}
+
+.avionics-table th:nth-child(3) {
+  width: 20%;
+}
+
+.avionics-table th:nth-child(4) {
+  width: 15%;
+}
+
+.avionics-table th:nth-child(5) {
+  width: 12%;
+}
+
+.avionics-table th:nth-child(6) {
+  width: 12%;
+}
+
+.avionics-table th:nth-child(7) {
+  width: 84px;
+}
+
+.avionics-identity-cell strong,
+.avionics-identity-cell small,
+.avionics-identifier-cell strong,
+.avionics-identifier-cell small,
+.avionics-status-cell small,
+.avionics-value-cell strong,
+.avionics-value-cell small,
+.avionics-usage-cell strong,
+.avionics-usage-cell small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.avionics-identity-cell small,
+.avionics-identifier-cell small,
+.avionics-status-cell small,
+.avionics-value-cell small,
+.avionics-usage-cell small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.avionics-status-cell {
+  overflow: visible;
+  white-space: normal;
+}
+
+.avionics-status-cell .status-pill {
+  text-transform: none;
+}
+
+.avionics-status-cell .catalog-incomplete {
+  color: var(--warning);
+  font-weight: 700;
+}
+
+.catalog-status-curated,
+.catalog-status-approved,
+.catalog-status-active,
+.catalog-status-verified {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.catalog-status-candidate,
+.catalog-status-review-required,
+.catalog-status-pending {
+  background: #fff3d6;
+  color: var(--warning);
+}
+
+.catalog-status-rejected,
+.catalog-status-invalid {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.catalog-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  color: var(--muted);
+}
+
+.catalog-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 21px;
+  max-width: 100%;
+  padding: 2px 7px;
+  overflow: hidden;
+  border: 1px solid #b8d8d4;
+  border-radius: 999px;
+  background: #f0faf8;
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-chip-overflow {
+  border-color: var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+.catalog-inspect-button {
+  min-height: 32px;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.catalog-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 54px;
+  padding: 9px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.catalog-pagination > div {
+  display: flex;
+  gap: 8px;
+}
+
+.avionics-detail-dialog {
+  width: min(960px, calc(100vw - 32px));
+  max-height: min(900px, calc(100vh - 32px));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 24px 80px rgba(25, 32, 36, 0.24);
+}
+
+.avionics-detail-dialog::backdrop {
+  background: rgba(25, 32, 36, 0.42);
+}
+
+.avionics-detail-dialog[open] {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.avionics-detail-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-height: 180px;
+  overflow: auto;
+  padding: 14px;
+  outline: none;
+}
+
+.avionics-detail-section {
+  min-width: 0;
+  align-self: start;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.avionics-detail-section h3 {
+  margin: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.avionics-detail-section > .catalog-chip-list,
+.avionics-detail-section > .detail-state,
+.avionics-detail-section > .detail-evidence,
+.avionics-detail-section > .detail-list {
+  margin: 0;
+  padding: 12px;
+}
+
+.detail-definition-list {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(0, 1.2fr);
+  margin: 0;
+}
+
+.detail-definition-list dt,
+.detail-definition-list dd {
+  min-width: 0;
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.detail-definition-list dt {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.detail-definition-list dd {
+  text-align: right;
+}
+
+.detail-definition-list dt:nth-last-of-type(1),
+.detail-definition-list dd:last-child {
+  border-bottom: 0;
+}
+
+.detail-evidence {
+  color: var(--text);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.detail-list {
+  padding-left: 30px !important;
+  color: var(--warning);
+}
+
+.detail-list li + li {
+  margin-top: 5px;
+}
+
+.detail-record-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.detail-record-list li {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.detail-record-list li:last-child {
+  border-bottom: 0;
+}
+
+.detail-record-list strong,
+.detail-record-list span,
+.detail-record-list a {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.detail-record-list span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.detail-record-list a {
+  margin-top: 5px;
+  color: var(--accent-strong);
+  font-size: 11px;
+}
+
+.review-toolbar,
+.review-workspace-header,
+.review-source,
+.review-workspace-footer,
+.review-stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.review-toolbar {
+  min-height: 66px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-toolbar h2,
+.review-toolbar p,
+.review-workspace-header h2,
+.review-workspace-header p {
+  margin: 0;
+}
+
+.review-toolbar h2,
+.review-workspace-header h2 {
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.review-toolbar p,
+.review-workspace-header p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-message {
+  min-height: 24px;
+  padding: 5px 12px 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.review-message.error,
+.review-catalog-message.error,
+.review-workspace-state.error,
+.review-decision-validation.error {
+  color: var(--danger);
+}
+
+.review-table {
+  min-width: 980px;
+}
+
+.review-table th:nth-child(1) {
+  width: 22%;
+}
+
+.review-table th:nth-child(2),
+.review-table th:nth-child(3),
+.review-table th:nth-child(4) {
+  width: 9%;
+}
+
+.review-table th:nth-child(5) {
+  width: 28%;
+}
+
+.review-table th:nth-child(6) {
+  width: 14%;
+}
+
+.review-table th:nth-child(7) {
+  width: 82px;
+}
+
+.review-count-pill,
+.review-reason-chip,
+.review-decision-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 750;
+  line-height: 1.2;
+}
+
+.review-count-pill {
+  background: #fff3d6;
+  color: var(--warning);
+  white-space: nowrap;
+}
+
+.review-reason-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-reason-chip {
+  max-width: 190px;
+  overflow: hidden;
+  border: 1px solid #efd79e;
+  background: #fffaf0;
+  color: #76510b;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-reason-chip.overflow {
+  border-color: var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+.review-open-button {
+  min-height: 32px;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.review-workspace {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  box-shadow: var(--shadow);
+}
+
+.review-workspace-header {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.review-workspace-heading {
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: center;
+}
+
+.review-workspace-heading h2,
+.review-workspace-heading p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-stale {
+  margin: 0 14px 12px;
+  padding: 11px 12px;
+  border: 1px solid #efb4ab;
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.review-stale strong,
+.review-stale span {
+  display: block;
+}
+
+.review-stale span {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+.review-source {
+  margin: 0 14px 12px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.review-source > div {
+  min-width: 0;
+}
+
+.review-source strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-source .button {
+  flex: 0 0 auto;
+  text-decoration: none;
+}
+
+.review-tabs-shell {
+  padding: 0 14px 12px;
+}
+
+.review-tabs {
+  display: inline-flex;
+  min-width: min(100%, 420px);
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #e9edef;
+}
+
+.review-tab {
+  display: inline-flex;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 750;
+}
+
+.review-tab:hover {
+  color: var(--text);
+}
+
+.review-tab[aria-selected="true"] {
+  background: var(--panel);
+  color: var(--accent-strong);
+  box-shadow: 0 1px 4px rgba(25, 32, 36, 0.13);
+}
+
+.review-tab:focus-visible {
+  outline: 3px solid rgba(15, 118, 110, 0.24);
+  outline-offset: 2px;
+}
+
+.review-tab-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(102, 113, 120, 0.14);
+  color: inherit;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.review-tab[aria-selected="true"] .review-tab-count {
+  background: var(--accent-soft);
+}
+
+.review-tab-panel[hidden] {
+  display: none;
+}
+
+.review-aircraft-summary {
+  min-height: 220px;
+  padding: 0 14px 14px;
+}
+
+.review-aircraft-card {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.review-aircraft-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-aircraft-card h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.review-aircraft-metadata {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: var(--line);
+}
+
+.review-aircraft-metadata > div {
+  min-width: 0;
+  padding: 11px 12px;
+  background: #fbfcfc;
+}
+
+.review-aircraft-metadata dt,
+.review-aircraft-metadata dd {
+  margin: 0;
+}
+
+.review-aircraft-metadata dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.review-aircraft-metadata dd {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  font-weight: 650;
+}
+
+.review-aircraft-notice {
+  margin: 0;
+  padding: 12px 14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.review-listing-reasons {
+  padding: 0 14px 12px;
+}
+
+.review-listing-reason {
+  padding: 10px 12px;
+  border: 1px solid #efd79e;
+  border-left: 4px solid #e8bf5d;
+  border-radius: 8px;
+  background: #fffaf0;
+  color: #76510b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.review-listing-reason ul {
+  margin: 5px 0 0;
+  padding-left: 18px;
+}
+
+.review-eyebrow {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.review-aspects {
+  display: grid;
+  gap: 12px;
+  min-height: 220px;
+  padding: 0 14px 14px;
+}
+
+.review-aspect-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.review-aspect-card.is-decided {
+  border-color: #98d3ca;
+  box-shadow: 0 0 0 1px rgba(15, 118, 110, 0.08);
+}
+
+.review-aspect-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-aspect-header h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.review-decision-status.pending {
+  background: #fff3d6;
+  color: var(--warning);
+}
+
+.review-decision-status.decided {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.review-decision-status.informational {
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+
+.review-aspect-context {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfcfc;
+}
+
+.review-aspect-reason {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 9px 10px;
+  border-left: 3px solid #e8bf5d;
+  background: #fffaf0;
+  color: #76510b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.review-aspect-reason > strong {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.review-aspect-reason ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.review-aspect-reason li strong,
+.review-aspect-reason li span {
+  display: block;
+}
+
+.review-aspect-reason li span {
+  margin-top: 1px;
+}
+
+.review-observation,
+.review-product-summary,
+.review-selected-product {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.review-observation p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.review-observation-metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 9px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.review-observation-metadata > div {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+}
+
+.review-observation-metadata dt,
+.review-observation-metadata dd {
+  margin: 0;
+  font-size: 10px;
+}
+
+.review-observation-metadata dt {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.review-observation-metadata dd {
+  color: var(--text);
+}
+
+.review-observation .review-source-evidence,
+.review-product-summary .review-product-evidence,
+.review-selected-product .review-product-evidence,
+.review-product-summary .review-related-observation {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.review-observation .review-source-evidence.empty,
+.review-product-evidence.empty,
+.review-product-evidence-missing {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.review-product-summary strong,
+.review-product-summary > span:not(.review-eyebrow),
+.review-selected-product strong,
+.review-selected-product > span:not(.review-eyebrow) {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.review-product-summary > span:not(.review-eyebrow),
+.review-selected-product > span:not(.review-eyebrow) {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-product-summary .catalog-chip-list,
+.review-selected-product .catalog-chip-list {
+  margin-top: 8px;
+}
+
+.review-product-source,
+.review-product-summary > .review-product-evidence-missing,
+.review-selected-product > .review-product-evidence-missing {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+
+.review-product-source {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.review-product-summary .review-product-evidence,
+.review-selected-product .review-product-evidence {
+  margin-bottom: 0;
+}
+
+.review-decision-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 14px;
+  border: 0;
+}
+
+.review-decision-fieldset > legend {
+  padding: 0;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.review-action-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.review-action-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.review-action-option:has(input:checked) {
+  border-color: var(--accent);
+  background: #f0faf8;
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.08);
+}
+
+.review-action-option input {
+  width: 16px;
+  min-height: 16px;
+  flex: 0 0 16px;
+  margin: 2px 0 0;
+  padding: 0;
+}
+
+.review-action-option > span {
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: inherit;
+}
+
+.review-action-option strong,
+.review-action-option small {
+  display: block;
+}
+
+.review-action-option strong {
+  font-size: 12px;
+}
+
+.review-action-option small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.review-action-panel {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.75fr) minmax(260px, 1.25fr);
+  gap: 10px;
+  margin-top: 10px;
+  padding: 11px;
+  border: 1px solid #b8d8d4;
+  border-radius: 8px;
+  background: #f7fbfa;
+}
+
+.review-action-panel > label > span,
+.review-create-product-grid label > span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.review-catalog-message {
+  grid-column: 2;
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-catalog-results {
+  grid-column: 2;
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.review-catalog-result {
+  display: block;
+  width: 100%;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+  text-align: left;
+}
+
+.review-catalog-result:hover {
+  border-color: var(--accent);
+  background: #f0faf8;
+}
+
+.review-catalog-result strong,
+.review-catalog-result span {
+  display: block;
+}
+
+.review-catalog-result span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-selection-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.review-create-product-grid {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.review-control-wide {
+  grid-column: 1 / -1;
+}
+
+.review-decision-validation {
+  min-height: 17px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-workspace-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 -8px 24px rgba(25, 32, 36, 0.06);
+  backdrop-filter: blur(8px);
+}
+
+.review-progress {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 320px) auto;
+  gap: 9px;
+  align-items: center;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.review-progress progress {
+  width: 100%;
+  height: 9px;
+  accent-color: var(--accent);
+}
+
+.review-workspace-state {
+  align-self: center;
+  justify-self: center;
+  max-width: 520px;
+  padding: 28px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.review-workspace-state p {
+  margin: 0 0 12px;
+}
+
 .placeholder-panel p {
   margin: 0;
 }
@@ -958,7 +2022,8 @@ label span,
   }
 
   .table-toolbar,
-  .aircraft-toolbar {
+  .aircraft-toolbar,
+  .avionics-toolbar {
     grid-template-columns: repeat(5, minmax(0, 1fr));
   }
 
@@ -982,7 +2047,7 @@ label span,
   }
 
   .nav-tabs {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
   }
 
   .nav-tab {
@@ -997,7 +2062,10 @@ label span,
   .metrics-row,
   .form-grid,
   .table-toolbar,
-  .aircraft-toolbar {
+  .aircraft-toolbar,
+  .avionics-toolbar,
+  .review-action-list,
+  .review-create-product-grid {
     grid-template-columns: 1fr;
   }
 
@@ -1029,5 +2097,190 @@ label span,
 
   .form-actions {
     flex-direction: column-reverse;
+  }
+
+  .avionics-table-shell {
+    min-height: 280px;
+    overflow: visible;
+    padding: 10px;
+  }
+
+  .avionics-table,
+  .avionics-table tbody,
+  .avionics-table tr,
+  .avionics-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .avionics-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .avionics-table tr {
+    margin-bottom: 10px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .avionics-table tr:last-child {
+    margin-bottom: 0;
+  }
+
+  .avionics-table td {
+    display: grid;
+    grid-template-columns: minmax(112px, 0.7fr) minmax(0, 1.3fr);
+    gap: 10px;
+    min-height: 38px;
+    border-bottom: 1px solid var(--line);
+    overflow: visible;
+    text-align: left;
+    text-overflow: initial;
+    white-space: normal;
+  }
+
+  .avionics-table td::before {
+    align-self: start;
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .avionics-table td:last-child {
+    border-bottom: 0;
+  }
+
+  .catalog-inspect-button {
+    width: 100%;
+  }
+
+  .catalog-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .catalog-pagination > div,
+  .catalog-pagination .button {
+    width: 100%;
+  }
+
+  .avionics-detail-dialog {
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
+  }
+
+  .avionics-detail-body {
+    grid-template-columns: 1fr;
+  }
+
+  .review-toolbar,
+  .review-workspace-header,
+  .review-source,
+  .review-workspace-footer,
+  .review-stale {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .review-workspace-header .button,
+  .review-source .button,
+  .review-stale .button,
+  .review-workspace-footer .button {
+    width: 100%;
+  }
+
+  .review-workspace-heading {
+    order: -1;
+    text-align: left;
+  }
+
+  .review-tabs {
+    display: flex;
+    width: 100%;
+  }
+
+  .review-aircraft-metadata {
+    grid-template-columns: 1fr;
+  }
+
+  .review-aspect-context,
+  .review-action-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .review-catalog-message,
+  .review-catalog-results,
+  .review-create-product-grid,
+  .review-control-wide {
+    grid-column: 1;
+  }
+
+  .review-progress {
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .review-table-shell {
+    overflow: visible;
+    padding: 10px;
+  }
+
+  .review-table,
+  .review-table tbody,
+  .review-table tr,
+  .review-table td {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .review-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .review-table tr {
+    margin-bottom: 10px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .review-table td {
+    display: grid;
+    grid-template-columns: minmax(100px, 0.65fr) minmax(0, 1.35fr);
+    gap: 10px;
+    min-height: 38px;
+    border-bottom: 1px solid var(--line);
+    overflow: visible;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .review-table td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .review-table td:last-child {
+    border-bottom: 0;
+  }
+
+  .review-open-button {
+    width: 100%;
   }
 }

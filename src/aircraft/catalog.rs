@@ -22,9 +22,9 @@ pub const MAX_AIRCRAFT_MODEL_YEAR: i32 = 2200;
 /// no maker aliases and no aircraft-specific rewrites.
 pub fn normalize_aircraft_retrieval_text(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len());
-    for character in value.chars().flat_map(char::to_lowercase) {
+    for character in value.chars() {
         if character.is_ascii_alphanumeric() {
-            normalized.push(character);
+            normalized.push(character.to_ascii_lowercase());
         } else {
             normalized.push(' ');
         }
@@ -145,11 +145,12 @@ impl EvidenceSourceKind {
         use EvidenceClaimKind::{
             ComponentIdentity, FactoryConfiguration, HierarchyIdentity,
             InstalledMarketContribution, MarketApplicability, MaterialFeature,
-            ProductionApplicability, ReferencePrice,
+            ProductionApplicability, ReferencePrice, SerialApplicability,
         };
         match (self, claim) {
             (Self::Regulator | Self::TypeCertificate, HierarchyIdentity)
-            | (Self::Regulator | Self::TypeCertificate, ProductionApplicability) => Controlling,
+            | (Self::Regulator | Self::TypeCertificate, ProductionApplicability)
+            | (Self::Regulator | Self::TypeCertificate, SerialApplicability) => Controlling,
             (Self::Manufacturer, FactoryConfiguration)
             | (Self::Manufacturer, ReferencePrice)
             | (Self::Manufacturer, MarketApplicability)
@@ -167,6 +168,7 @@ impl EvidenceSourceKind {
             | (Self::Manufacturer, ProductionApplicability)
             | (Self::ManufacturerServicePublication, HierarchyIdentity)
             | (Self::ManufacturerServicePublication, ProductionApplicability)
+            | (Self::ApprovedFlightManual, SerialApplicability)
             | (Self::TypeCertificate, MarketApplicability)
             | (Self::Regulator | Self::TypeCertificate, ComponentIdentity)
             | (Self::Regulator | Self::TypeCertificate, MaterialFeature) => Primary,
@@ -174,6 +176,8 @@ impl EvidenceSourceKind {
             (Self::MarketplaceListing, _) => ContextOnly,
             (Self::Regulator | Self::TypeCertificate, FactoryConfiguration)
             | (Self::Regulator | Self::TypeCertificate, ReferencePrice)
+            | (Self::Manufacturer, SerialApplicability)
+            | (Self::ManufacturerServicePublication, SerialApplicability)
             | (Self::ApprovedFlightManual, ReferencePrice)
             | (Self::ManufacturerServicePublication, ReferencePrice)
             | (Self::ApprovedFlightManual, MarketApplicability)
@@ -206,6 +210,10 @@ pub enum EvidenceAuthority {
 pub enum EvidenceClaimKind {
     HierarchyIdentity,
     ProductionApplicability,
+    /// Exact manufacturer-serial eligibility or attribution. This is
+    /// deliberately distinct from model-year production applicability so a
+    /// serial boundary can never be consumed as a calendar-year boundary.
+    SerialApplicability,
     MarketApplicability,
     FactoryConfiguration,
     ReferencePrice,
@@ -1107,6 +1115,21 @@ mod tests {
             serial_number: None,
             market: None,
         }
+    }
+
+    #[test]
+    fn retrieval_normalization_preserves_legal_manufacturer_identity() {
+        let textron = normalize_aircraft_retrieval_text("TEXTRON AVIATION INC");
+        assert_eq!(textron, "textron aviation inc");
+        assert_eq!(
+            textron,
+            normalize_aircraft_retrieval_text("Textron-Aviation, Inc.")
+        );
+        assert_ne!(textron, normalize_aircraft_retrieval_text("Cessna"));
+        assert_eq!(
+            normalize_aircraft_retrieval_text("TEXTRON\u{212a}AVIATION \u{0130}NC"),
+            "textron aviation nc"
+        );
     }
 
     #[test]

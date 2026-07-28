@@ -9,10 +9,19 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
-use crate::html::clean::clean_listing_html_with_limit;
+use crate::html::clean::{clean_publisher_source_html, normalize_source_evidence_span};
 
-const MAX_LOCAL_HTML_TEXT: usize = 4_000_000;
 const MAX_SOURCE_EXCERPT: usize = 2_000;
+const MAX_IDENTITY_EVIDENCE_TOKENS: usize = 32;
+const MAX_COMPONENT_MATCHES: usize = 128;
+const MAX_IDENTITY_EVIDENCE_SEARCH_STEPS: usize = 4_096;
+const OBSERVATION_SCHEMA_VERSION: u8 = 2;
+const IDENTITY_EVIDENCE_RESOLVER_VERSION: &str = "publisher_identity_evidence_v2";
+const LITERAL_IDENTITY_SPAN_RESOLVER: &str = "literal_identity_token_span_v2";
+const BASE_MODEL_VARIANT_SPAN_RESOLVER: &str = "base_model_variant_token_span_v2";
+const COMPOSITE_FAMILY_SPAN_RESOLVER: &str = "composite_family_token_span_v2";
+const MISSING_IDENTITY_SPAN_RESOLVER: &str = "missing_identity_token_span_v2";
+const WORK_LIMITED_IDENTITY_SPAN_RESOLVER: &str = "work_limited_identity_token_span_v2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AircraftIdentityObservation {
@@ -104,6 +113,46 @@ struct LiteralAircraftFields {
     registration_number: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityEvidenceStatus {
+    Exact,
+    Missing,
+    WorkLimitExceeded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IdentityEvidenceResolution {
+    excerpt: Option<String>,
+    status: IdentityEvidenceStatus,
+    resolver: &'static str,
+}
+
+impl IdentityEvidenceResolution {
+    fn is_exact(&self) -> bool {
+        self.status == IdentityEvidenceStatus::Exact
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceToken {
+    normalized: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TokenRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UniqueIdentitySpan {
+    Unique(String),
+    Missing,
+    WorkLimitExceeded,
+}
+
 /// Load literal aircraft identity observations from retained submissions.
 ///
 /// Previously generated catalog labels are fallback hints only. When a retained
@@ -162,8 +211,9 @@ pub async fn load_aircraft_identity_observations(
     })
 }
 
-/// Persist only observations whose literal labels can be located in retained
-/// source text. This is a staging write, not a catalog approval or merge.
+/// Persist only observations whose immutable extracted identity can be bound
+/// to one exact retained publisher span by the versioned evidence resolver.
+/// This is a staging write, not a catalog approval or merge.
 pub async fn stage_aircraft_identity_observations(
     db: &AppDb,
     observations: &[AircraftIdentityObservation],
@@ -281,17 +331,14 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
         .clone()
         .or_else(|| row.listing_source_url.clone());
 
-    let cleaned = row
+    let publisher_text = row
         .rendered_html
         .as_deref()
-        .map(|html| clean_listing_html_with_limit(html, MAX_LOCAL_HTML_TEXT))
+        .map(clean_publisher_source_html)
         .unwrap_or_default();
-    let (source_excerpt, source_excerpt_is_exact) = identity_excerpt(
-        &cleaned,
-        [&manufacturer, &model, &variant]
-            .into_iter()
-            .filter(|value| !value.trim().is_empty()),
-    );
+    let evidence = resolve_identity_evidence(&publisher_text, &manufacturer, &model, &variant);
+    let source_excerpt = evidence.excerpt.clone();
+    let source_excerpt_is_exact = evidence.is_exact();
 
     let mut review_reasons = Vec::new();
     if row.rendered_html.is_none() {
@@ -312,9 +359,16 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
                 .to_string(),
         );
     }
-    if !source_excerpt_is_exact {
-        review_reasons
-            .push("identity labels were not found verbatim in retained source text".to_string());
+    match evidence.status {
+        IdentityEvidenceStatus::Exact => {}
+        IdentityEvidenceStatus::Missing => review_reasons.push(
+            "identity labels were not found in one bounded publisher-authored source span"
+                .to_string(),
+        ),
+        IdentityEvidenceStatus::WorkLimitExceeded => review_reasons.push(
+            "publisher source repeated identity labels beyond the bounded evidence-search work limit"
+                .to_string(),
+        ),
     }
     if manufacturer.trim().is_empty() || model.trim().is_empty() || variant.trim().is_empty() {
         review_reasons.push("one or more literal hierarchy fields are empty".to_string());
@@ -331,6 +385,10 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
         model_year,
         serial_number.as_deref(),
         registration_number.as_deref(),
+        source_excerpt
+            .as_deref()
+            .filter(|_| source_excerpt_is_exact),
+        evidence.resolver,
     );
 
     AircraftIdentityObservation {
@@ -356,6 +414,50 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
         requires_human_review: !review_reasons.is_empty(),
         review_reasons,
     }
+}
+
+/// Recompute the retained publisher proof and its versioned observation
+/// fingerprint before an approved hierarchy is written.
+///
+/// The caller remains responsible for checking the selected submission,
+/// source URL, rendered-HTML digest, literal extraction, and FAA admission.
+/// This helper binds only the source-evidence decision to the exact resolver
+/// used when the observation was loaded.
+pub(crate) fn retained_source_identity_evidence_matches(
+    rendered_html: &str,
+    expected: &AircraftIdentityObservation,
+) -> bool {
+    let publisher_text = clean_publisher_source_html(rendered_html);
+    let evidence = resolve_identity_evidence(
+        &publisher_text,
+        &expected.manufacturer,
+        &expected.model,
+        &expected.variant,
+    );
+    let Some(exact_source_evidence) = evidence
+        .excerpt
+        .as_deref()
+        .filter(|_| evidence.is_exact() && expected.source_excerpt_is_exact)
+    else {
+        return false;
+    };
+    if expected.source_excerpt.as_deref() != Some(exact_source_evidence) {
+        return false;
+    }
+
+    observation_fingerprint(
+        expected.listing_id,
+        expected.submission_id,
+        expected.rendered_html_sha256.as_deref(),
+        &expected.manufacturer,
+        &expected.model,
+        &expected.variant,
+        expected.model_year,
+        expected.serial_number.as_deref(),
+        expected.registration_number.as_deref(),
+        Some(exact_source_evidence),
+        evidence.resolver,
+    ) == expected.observation_sha256
 }
 
 async fn load_rows(
@@ -488,6 +590,8 @@ fn observation_fingerprint(
     model_year: i64,
     serial_number: Option<&str>,
     registration_number: Option<&str>,
+    exact_source_evidence: Option<&str>,
+    evidence_resolver: &str,
 ) -> String {
     let material = serde_json::json!({
         "listing_id": listing_id,
@@ -499,48 +603,392 @@ fn observation_fingerprint(
         "model_year": model_year,
         "serial_number": serial_number,
         "registration_number": registration_number,
-        "observation_schema_version": 1,
+        "exact_source_evidence": exact_source_evidence,
+        "identity_evidence_resolver": evidence_resolver,
+        "identity_evidence_resolver_version": IDENTITY_EVIDENCE_RESOLVER_VERSION,
+        "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
     });
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&material).expect("observation material serializes"));
     format!("{:x}", hasher.finalize())
 }
 
+fn resolve_identity_evidence(
+    publisher_text: &str,
+    manufacturer: &str,
+    model: &str,
+    variant: &str,
+) -> IdentityEvidenceResolution {
+    if publisher_text.trim().is_empty() {
+        return IdentityEvidenceResolution {
+            excerpt: None,
+            status: IdentityEvidenceStatus::Missing,
+            resolver: MISSING_IDENTITY_SPAN_RESOLVER,
+        };
+    }
+
+    match unique_identity_span(publisher_text, &[manufacturer, model, variant]) {
+        UniqueIdentitySpan::Unique(excerpt) => {
+            return IdentityEvidenceResolution {
+                excerpt: Some(excerpt),
+                status: IdentityEvidenceStatus::Exact,
+                resolver: LITERAL_IDENTITY_SPAN_RESOLVER,
+            };
+        }
+        UniqueIdentitySpan::Missing => {}
+        UniqueIdentitySpan::WorkLimitExceeded => {
+            return work_limited_identity_evidence(publisher_text);
+        }
+    }
+
+    if base_model_variant_phrase_is_compatible(model, variant) {
+        match unique_identity_span(publisher_text, &[manufacturer, variant]) {
+            UniqueIdentitySpan::Unique(excerpt) => {
+                return IdentityEvidenceResolution {
+                    excerpt: Some(excerpt),
+                    status: IdentityEvidenceStatus::Exact,
+                    resolver: BASE_MODEL_VARIANT_SPAN_RESOLVER,
+                };
+            }
+            UniqueIdentitySpan::Missing => {}
+            UniqueIdentitySpan::WorkLimitExceeded => {
+                return work_limited_identity_evidence(publisher_text);
+            }
+        }
+    }
+
+    let Some(family_name) = composite_family_name_component(manufacturer, model, variant) else {
+        return unresolved_identity_evidence(publisher_text);
+    };
+    match unique_identity_span(
+        publisher_text,
+        &[manufacturer, variant, family_name.as_str()],
+    ) {
+        UniqueIdentitySpan::Unique(excerpt) => IdentityEvidenceResolution {
+            excerpt: Some(excerpt),
+            status: IdentityEvidenceStatus::Exact,
+            resolver: COMPOSITE_FAMILY_SPAN_RESOLVER,
+        },
+        UniqueIdentitySpan::Missing => unresolved_identity_evidence(publisher_text),
+        UniqueIdentitySpan::WorkLimitExceeded => work_limited_identity_evidence(publisher_text),
+    }
+}
+
+fn unresolved_identity_evidence(publisher_text: &str) -> IdentityEvidenceResolution {
+    IdentityEvidenceResolution {
+        excerpt: (!publisher_text.trim().is_empty())
+            .then(|| prefix_at_boundary(publisher_text, MAX_SOURCE_EXCERPT).to_string()),
+        status: IdentityEvidenceStatus::Missing,
+        resolver: MISSING_IDENTITY_SPAN_RESOLVER,
+    }
+}
+
+fn work_limited_identity_evidence(publisher_text: &str) -> IdentityEvidenceResolution {
+    IdentityEvidenceResolution {
+        excerpt: (!publisher_text.trim().is_empty())
+            .then(|| prefix_at_boundary(publisher_text, MAX_SOURCE_EXCERPT).to_string()),
+        status: IdentityEvidenceStatus::WorkLimitExceeded,
+        resolver: WORK_LIMITED_IDENTITY_SPAN_RESOLVER,
+    }
+}
+
+/// Extract the safest bounded source span that contains every identity
+/// component as complete alphanumeric tokens.
+///
+/// Repeated title, breadcrumb, heading, and detail copies corroborate the same
+/// fixed extracted components; they are not an identity ambiguity. The
+/// shortest valid token span is the strongest local proof, with publisher
+/// occurrence order as a deterministic tie-breaker.
+fn unique_identity_span(source: &str, components: &[&str]) -> UniqueIdentitySpan {
+    let tokens = source_tokens(source);
+    if tokens.is_empty() || components.is_empty() {
+        return UniqueIdentitySpan::Missing;
+    }
+
+    let mut component_matches = Vec::with_capacity(components.len());
+    for component in components {
+        let phrase = normalized_tokens(component);
+        if phrase.is_empty() {
+            return UniqueIdentitySpan::Missing;
+        }
+        let matches = phrase_matches(&tokens, &phrase);
+        if matches.is_empty() {
+            return UniqueIdentitySpan::Missing;
+        }
+        if matches.len() > MAX_COMPONENT_MATCHES {
+            return UniqueIdentitySpan::WorkLimitExceeded;
+        }
+        component_matches.push(matches);
+    }
+
+    component_matches.sort_by_key(Vec::len);
+    let mut best = None;
+    let mut search_steps = 0;
+    let mut work_limit_exceeded = false;
+    for anchor in &component_matches[0] {
+        select_best_candidate_range(
+            source,
+            &tokens,
+            &component_matches,
+            1,
+            *anchor,
+            &mut best,
+            &mut search_steps,
+            &mut work_limit_exceeded,
+        );
+        if work_limit_exceeded {
+            return UniqueIdentitySpan::WorkLimitExceeded;
+        }
+    }
+
+    best.map(|range| {
+        let start = tokens[range.start].start;
+        let end = tokens[range.end - 1].end;
+        UniqueIdentitySpan::Unique(source[start..end].to_string())
+    })
+    .unwrap_or(UniqueIdentitySpan::Missing)
+}
+
+fn select_best_candidate_range(
+    source: &str,
+    tokens: &[SourceToken],
+    component_matches: &[Vec<TokenRange>],
+    component_index: usize,
+    current: TokenRange,
+    best: &mut Option<TokenRange>,
+    search_steps: &mut usize,
+    work_limit_exceeded: &mut bool,
+) {
+    if *work_limit_exceeded {
+        return;
+    }
+    if *search_steps >= MAX_IDENTITY_EVIDENCE_SEARCH_STEPS {
+        *work_limit_exceeded = true;
+        return;
+    }
+    *search_steps += 1;
+
+    let current_width = current.end.saturating_sub(current.start);
+    if current_width > MAX_IDENTITY_EVIDENCE_TOKENS
+        || best.is_some_and(|best| current_width > best.end.saturating_sub(best.start))
+    {
+        return;
+    }
+    if component_index == component_matches.len() {
+        let start = tokens[current.start].start;
+        let end = tokens[current.end - 1].end;
+        let excerpt = &source[start..end];
+        if excerpt.is_empty() || crosses_hard_span_boundary(excerpt) {
+            return;
+        }
+        let candidate_key = (current_width, start, end);
+        let should_replace = best.is_none_or(|best| {
+            let best_start = tokens[best.start].start;
+            let best_end = tokens[best.end - 1].end;
+            candidate_key < (best.end.saturating_sub(best.start), best_start, best_end)
+        });
+        if should_replace {
+            *best = Some(current);
+        }
+        return;
+    }
+
+    for matched in &component_matches[component_index] {
+        let combined = TokenRange {
+            start: current.start.min(matched.start),
+            end: current.end.max(matched.end),
+        };
+        select_best_candidate_range(
+            source,
+            tokens,
+            component_matches,
+            component_index + 1,
+            combined,
+            best,
+            search_steps,
+            work_limit_exceeded,
+        );
+        if *work_limit_exceeded {
+            return;
+        }
+    }
+}
+
+fn source_tokens(source: &str) -> Vec<SourceToken> {
+    let mut tokens = Vec::new();
+    let mut token_start = None;
+    for (index, character) in source.char_indices() {
+        if character.is_alphanumeric() {
+            token_start.get_or_insert(index);
+        } else if let Some(start) = token_start.take() {
+            tokens.push(SourceToken {
+                normalized: normalize_source_evidence_span(&source[start..index]),
+                start,
+                end: index,
+            });
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push(SourceToken {
+            normalized: normalize_source_evidence_span(&source[start..]),
+            start,
+            end: source.len(),
+        });
+    }
+    tokens
+}
+
+fn normalized_tokens(value: &str) -> Vec<String> {
+    normalize_source_evidence_span(value)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn phrase_matches(tokens: &[SourceToken], phrase: &[String]) -> Vec<TokenRange> {
+    if phrase.len() > tokens.len() {
+        return Vec::new();
+    }
+    tokens
+        .windows(phrase.len())
+        .enumerate()
+        .filter_map(|(start, candidate)| {
+            candidate
+                .iter()
+                .map(|token| token.normalized.as_str())
+                .eq(phrase.iter().map(String::as_str))
+                .then_some(TokenRange {
+                    start,
+                    end: start + phrase.len(),
+                })
+        })
+        .collect()
+}
+
+fn base_model_variant_phrase_is_compatible(model: &str, variant: &str) -> bool {
+    let model_tokens = normalized_tokens(model);
+    let variant_tokens = normalized_tokens(variant);
+    if model_tokens.len() != 1 || variant_tokens.is_empty() || model_tokens == variant_tokens {
+        return false;
+    }
+    let digit_bearing_variant_tokens = variant_tokens
+        .iter()
+        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
+        .collect::<Vec<_>>();
+    digit_bearing_variant_tokens.len() == 1
+        && designator_suffix_is_compatible(&model_tokens[0], digit_bearing_variant_tokens[0])
+}
+
+fn composite_family_name_component(
+    manufacturer: &str,
+    model: &str,
+    variant: &str,
+) -> Option<String> {
+    let model_tokens = normalized_tokens(model);
+    let variant_tokens = normalized_tokens(variant);
+    if model_tokens.is_empty()
+        || variant_tokens.is_empty()
+        || model_tokens == variant_tokens
+        || !composite_designator_is_compatible(&model_tokens, &variant_tokens)
+    {
+        return None;
+    }
+
+    let mut alphabetic_runs = Vec::<Vec<&str>>::new();
+    let mut current = Vec::new();
+    for token in &model_tokens {
+        if token.chars().all(char::is_alphabetic) {
+            current.push(token.as_str());
+        } else if !current.is_empty() {
+            alphabetic_runs.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        alphabetic_runs.push(current);
+    }
+    alphabetic_runs.retain(|run| run.iter().map(|token| token.len()).sum::<usize>() >= 3);
+    if alphabetic_runs.len() != 1 {
+        return None;
+    }
+
+    let family_tokens = &alphabetic_runs[0];
+    let manufacturer_tokens = normalized_tokens(manufacturer);
+    if words_contain_phrase(&manufacturer_tokens, family_tokens)
+        || words_contain_phrase(&variant_tokens, family_tokens)
+    {
+        return None;
+    }
+    Some(family_tokens.join(" "))
+}
+
+/// Require one unambiguous digit-bearing model token to be either the exact
+/// variant or its complete leading designator. A variant may add only a short
+/// alphabetic suffix. This proves `182` -> `182T` without treating `182` as a
+/// substring of `T182T`, accepting `172` -> `182T`, or guessing how multiple
+/// numeric components relate.
+fn composite_designator_is_compatible(model_tokens: &[String], variant_tokens: &[String]) -> bool {
+    let digit_bearing_model_tokens = model_tokens
+        .iter()
+        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
+        .collect::<Vec<_>>();
+    if digit_bearing_model_tokens.len() != 1 || variant_tokens.len() != 1 {
+        return false;
+    }
+    designator_suffix_is_compatible(digit_bearing_model_tokens[0], &variant_tokens[0])
+}
+
+fn designator_suffix_is_compatible(model_designator: &str, exact_variant: &str) -> bool {
+    if !model_designator
+        .chars()
+        .any(|character| character.is_ascii_digit())
+        || !exact_variant
+            .chars()
+            .any(|character| character.is_ascii_digit())
+    {
+        return false;
+    }
+    let Some(suffix) = exact_variant.strip_prefix(model_designator) else {
+        return false;
+    };
+    suffix.len() <= 3
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+}
+
+fn words_contain_phrase(words: &[String], phrase: &[&str]) -> bool {
+    phrase.len() <= words.len()
+        && words.windows(phrase.len()).any(|candidate| {
+            candidate
+                .iter()
+                .map(String::as_str)
+                .eq(phrase.iter().copied())
+        })
+}
+
+fn crosses_hard_span_boundary(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '.' | '!' | '?' | ';'))
+}
+
+#[cfg(test)]
 fn identity_excerpt<'a>(
     source: &str,
     labels: impl Iterator<Item = &'a String>,
 ) -> (Option<String>, bool) {
-    if source.trim().is_empty() {
-        return (None, false);
-    }
-    let lowercase = source.to_lowercase();
     let labels = labels
-        .map(|label| label.trim())
-        .filter(|label| !label.is_empty())
+        .map(String::as_str)
+        .filter(|label| !label.trim().is_empty())
         .collect::<Vec<_>>();
-    let anchors = labels
-        .iter()
-        .filter_map(|label| lowercase.find(&label.to_lowercase()))
-        .collect::<Vec<_>>();
-    if anchors.is_empty() {
-        return (
-            Some(prefix_at_boundary(source, MAX_SOURCE_EXCERPT).to_string()),
+    match unique_identity_span(source, &labels) {
+        UniqueIdentitySpan::Unique(excerpt) => (Some(excerpt), true),
+        UniqueIdentitySpan::Missing | UniqueIdentitySpan::WorkLimitExceeded => (
+            (!source.trim().is_empty())
+                .then(|| prefix_at_boundary(source, MAX_SOURCE_EXCERPT).to_string()),
             false,
-        );
+        ),
     }
-    let anchor = *anchors.iter().min().unwrap_or(&0);
-    let mut start = anchor.saturating_sub(MAX_SOURCE_EXCERPT / 4);
-    while start > 0 && !source.is_char_boundary(start) {
-        start -= 1;
-    }
-    let mut end = (start + MAX_SOURCE_EXCERPT).min(source.len());
-    while end > start && !source.is_char_boundary(end) {
-        end -= 1;
-    }
-    (
-        Some(source[start..end].to_string()),
-        anchors.len() == labels.len(),
-    )
 }
 
 fn prefix_at_boundary(value: &str, limit: usize) -> &str {
@@ -571,8 +1019,11 @@ pub fn group_observations_by_cluster(
 mod tests {
     use super::{
         group_observations_by_cluster, identity_excerpt, observation_cluster_key,
-        observation_from_row, parse_literal_fields, AircraftIdentityObservation,
-        ObservationSourceRow,
+        observation_fingerprint, observation_from_row, parse_literal_fields,
+        resolve_identity_evidence, retained_source_identity_evidence_matches,
+        AircraftIdentityObservation, IdentityEvidenceStatus, ObservationSourceRow,
+        BASE_MODEL_VARIANT_SPAN_RESOLVER, COMPOSITE_FAMILY_SPAN_RESOLVER,
+        LITERAL_IDENTITY_SPAN_RESOLVER,
     };
 
     #[test]
@@ -604,7 +1055,7 @@ mod tests {
 
     #[test]
     fn excerpt_requires_every_literal_label_for_exactness() {
-        let source = "2006 Cessna T182T Turbo Skylane with Garmin equipment";
+        let source = "2006 Cessna 182 T182T Turbo Skylane with Garmin equipment";
         let manufacturer = "Cessna".to_string();
         let model = "182".to_string();
         let variant = "T182T".to_string();
@@ -616,6 +1067,366 @@ mod tests {
         let wrong = "182I".to_string();
         let (_, exact) = identity_excerpt(source, [&manufacturer, &model, &wrong].into_iter());
         assert!(!exact);
+    }
+
+    #[test]
+    fn exact_literal_evidence_is_token_bounded() {
+        let manufacturer = "Cessna".to_string();
+        let model = "182".to_string();
+        let variant = "182T".to_string();
+
+        let (_, exact) = identity_excerpt(
+            "2022 Cessna 182T Skylane",
+            [&manufacturer, &model, &variant].into_iter(),
+        );
+        assert!(
+            !exact,
+            "the model token 182 must not be fabricated from 182T"
+        );
+
+        let (_, exact) = identity_excerpt(
+            "2006 Cessna T182T Turbo Skylane",
+            [&manufacturer, &variant].into_iter(),
+        );
+        assert!(!exact, "the exact variant 182T must not match inside T182T");
+    }
+
+    #[test]
+    fn composite_model_uses_unique_make_variant_and_family_name_span() {
+        for variant in ["182T", "182S", "182R", "182Q", "182P"] {
+            let source = format!("2022 CESSNA {variant} SKYLANE • Available now");
+            let resolved = resolve_identity_evidence(&source, "Cessna", "182 Skylane", variant);
+
+            assert_eq!(resolved.status, IdentityEvidenceStatus::Exact);
+            assert_eq!(resolved.resolver, COMPOSITE_FAMILY_SPAN_RESOLVER);
+            assert_eq!(
+                resolved.excerpt.as_deref(),
+                Some(format!("CESSNA {variant} SKYLANE").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn composite_model_requires_the_exact_variant_token() {
+        let turbo = resolve_identity_evidence(
+            "2006 Cessna T182T Turbo Skylane",
+            "Cessna",
+            "182 Skylane",
+            "182T",
+        );
+        assert_eq!(turbo.status, IdentityEvidenceStatus::Missing);
+
+        let suffixed =
+            resolve_identity_evidence("2022 Cessna 182T Skylane", "Cessna", "182 Skylane", "182");
+        assert_eq!(suffixed.status, IdentityEvidenceStatus::Missing);
+    }
+
+    #[test]
+    fn composite_model_requires_unambiguous_designator_compatibility() {
+        let wrong_base =
+            resolve_identity_evidence("2022 Cessna 182T Skylane", "Cessna", "172 Skylane", "182T");
+        assert_eq!(wrong_base.status, IdentityEvidenceStatus::Missing);
+
+        let prefixed_variant = resolve_identity_evidence(
+            "2006 Cessna T182T Skylane",
+            "Cessna",
+            "182 Skylane",
+            "T182T",
+        );
+        assert_eq!(
+            prefixed_variant.status,
+            IdentityEvidenceStatus::Missing,
+            "182 must not be treated as a component inside T182T"
+        );
+
+        let numeric_prefix =
+            resolve_identity_evidence("2022 Cessna 182T Skylane", "Cessna", "18 Skylane", "182T");
+        assert_eq!(numeric_prefix.status, IdentityEvidenceStatus::Missing);
+
+        let multiple_numeric_components = resolve_identity_evidence(
+            "2022 Cessna 182T Skylane",
+            "Cessna",
+            "182 182T Skylane",
+            "182T",
+        );
+        assert_eq!(
+            multiple_numeric_components.status,
+            IdentityEvidenceStatus::Missing
+        );
+
+        let valid_alphanumeric_base =
+            resolve_identity_evidence("2022 Cirrus SR22T Vision", "Cirrus", "SR22 Vision", "SR22T");
+        assert_eq!(
+            valid_alphanumeric_base.status,
+            IdentityEvidenceStatus::Exact
+        );
+    }
+
+    #[test]
+    fn base_model_uses_the_exact_full_variant_phrase_from_real_listing_shapes() {
+        for (variant, source, excerpt) in [
+            ("182P", "1974 CESSNA 182P For Sale", "CESSNA 182P"),
+            (
+                "182Q Skylane",
+                "1979 CESSNA 182Q SKYLANE - Low Time",
+                "CESSNA 182Q SKYLANE",
+            ),
+            (
+                "Turbo 182T Skylane",
+                "2006 CESSNA TURBO 182T SKYLANE For Sale",
+                "CESSNA TURBO 182T SKYLANE",
+            ),
+        ] {
+            let resolved = resolve_identity_evidence(source, "Cessna", "182", variant);
+
+            assert_eq!(resolved.status, IdentityEvidenceStatus::Exact);
+            assert_eq!(resolved.resolver, BASE_MODEL_VARIANT_SPAN_RESOLVER);
+            assert_eq!(resolved.excerpt.as_deref(), Some(excerpt));
+        }
+    }
+
+    #[test]
+    fn base_model_variant_phrase_rejects_prefixed_mismatched_and_ambiguous_designators() {
+        for (model, variant, source) in [
+            ("182", "T182T", "2006 Cessna T182T"),
+            ("172", "182T", "2006 Cessna 182T"),
+            ("18", "182T Skylane", "2006 Cessna 182T Skylane"),
+            (
+                "182",
+                "Turbo 182T 206 Skylane",
+                "2006 Cessna Turbo 182T 206 Skylane",
+            ),
+        ] {
+            let resolved = resolve_identity_evidence(source, "Cessna", model, variant);
+            assert_eq!(
+                resolved.status,
+                IdentityEvidenceStatus::Missing,
+                "{model:?} must not be related mechanically to {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_identical_publisher_titles_are_not_ambiguous() {
+        let resolved = resolve_identity_evidence(
+            "2022 Cessna 182T Skylane 2022 Cessna 182T Skylane",
+            "Cessna",
+            "182 Skylane",
+            "182T",
+        );
+
+        assert_eq!(resolved.status, IdentityEvidenceStatus::Exact);
+        assert_eq!(resolved.excerpt.as_deref(), Some("Cessna 182T Skylane"));
+    }
+
+    #[test]
+    fn distinct_matching_publisher_spans_choose_shortest_then_earliest() {
+        let shortest = resolve_identity_evidence(
+            "Cessna 182T Skylane. Skylane edition Cessna 182T",
+            "Cessna",
+            "182 Skylane",
+            "182T",
+        );
+
+        assert_eq!(shortest.status, IdentityEvidenceStatus::Exact);
+        assert_eq!(shortest.excerpt.as_deref(), Some("Cessna 182T Skylane"));
+
+        let earliest = resolve_identity_evidence(
+            "Skylane Cessna 182T. Cessna 182T Skylane",
+            "Cessna",
+            "182 Skylane",
+            "182T",
+        );
+
+        assert_eq!(earliest.status, IdentityEvidenceStatus::Exact);
+        assert_eq!(earliest.excerpt.as_deref(), Some("Skylane Cessna 182T"));
+    }
+
+    #[test]
+    fn repeated_real_page_identity_sections_choose_one_safe_source_proof() {
+        let publisher_text = crate::html::clean::clean_publisher_source_html(
+            r#"
+            <html>
+              <head><title>2022 CESSNA 182T SKYLANE For Sale</title></head>
+              <body>
+                <nav>Aircraft / Cessna / 182T Skylane</nav>
+                <h1>2022 Cessna 182T Skylane</h1>
+                <section>
+                  <h2>General</h2>
+                  <p>This Cessna aircraft is a low-time 182T in the Skylane family.</p>
+                </section>
+              </body>
+            </html>
+            "#,
+        );
+
+        let resolved = resolve_identity_evidence(&publisher_text, "Cessna", "182 Skylane", "182T");
+
+        assert_eq!(resolved.status, IdentityEvidenceStatus::Exact);
+        assert_eq!(resolved.resolver, COMPOSITE_FAMILY_SPAN_RESOLVER);
+        assert_eq!(resolved.excerpt.as_deref(), Some("CESSNA 182T SKYLANE"));
+    }
+
+    #[test]
+    fn repeated_token_page_exceeding_search_work_limit_fails_closed() {
+        let source = format!(
+            "{}{}{}",
+            "Cessna. ".repeat(65),
+            "182T. ".repeat(65),
+            "Skylane. ".repeat(65)
+        );
+
+        let resolved = resolve_identity_evidence(&source, "Cessna", "182 Skylane", "182T");
+
+        assert_eq!(resolved.status, IdentityEvidenceStatus::WorkLimitExceeded);
+        assert!(!resolved.is_exact());
+    }
+
+    #[test]
+    fn existing_literal_identity_path_remains_exact() {
+        let resolved = resolve_identity_evidence(
+            "2005 Cessna Skylane 182T for sale",
+            "Cessna",
+            "Skylane",
+            "182T",
+        );
+
+        assert_eq!(resolved.status, IdentityEvidenceStatus::Exact);
+        assert_eq!(resolved.resolver, LITERAL_IDENTITY_SPAN_RESOLVER);
+        assert_eq!(resolved.excerpt.as_deref(), Some("Cessna Skylane 182T"));
+    }
+
+    #[test]
+    fn retained_publisher_title_resolves_composite_model_without_rewriting_fields() {
+        let row = ObservationSourceRow {
+            listing_id: 8,
+            listing_source_url: Some("https://example.test/listing/8".to_string()),
+            stored_manufacturer: "Legacy Make".to_string(),
+            stored_model: "Legacy Model".to_string(),
+            stored_variant: "Legacy Variant".to_string(),
+            stored_model_year: 2022,
+            stored_serial_number: Some("18200001".to_string()),
+            stored_registration_number: Some("N182AA".to_string()),
+            submission_id: Some(10),
+            submission_source_url: None,
+            rendered_html_sha256: Some("b".repeat(64)),
+            rendered_html: Some(
+                r#"
+                <html>
+                  <head><title>2022 CESSNA 182T SKYLANE For Sale</title></head>
+                  <body><p>Well-equipped aircraft.</p></body>
+                </html>
+                "#
+                .to_string(),
+            ),
+            extracted_listing_json: Some(
+                serde_json::json!({
+                    "manufacturer": "Cessna",
+                    "model": "182 Skylane",
+                    "variant": "182T",
+                    "model_year": 2022,
+                    "registration_number": "N182AA",
+                    "serial_number": "18200001"
+                })
+                .to_string(),
+            ),
+        };
+
+        let observation = observation_from_row(&row);
+
+        assert_eq!(observation.manufacturer, "Cessna");
+        assert_eq!(observation.model, "182 Skylane");
+        assert_eq!(observation.variant, "182T");
+        assert_eq!(
+            observation.source_excerpt.as_deref(),
+            Some("CESSNA 182T SKYLANE")
+        );
+        assert!(observation.source_excerpt_is_exact);
+        assert!(!observation.requires_human_review);
+        assert!(retained_source_identity_evidence_matches(
+            row.rendered_html.as_deref().expect("retained HTML"),
+            &observation
+        ));
+
+        let mut wrong_fingerprint = observation.clone();
+        wrong_fingerprint.observation_sha256 = "0".repeat(64);
+        assert!(!retained_source_identity_evidence_matches(
+            row.rendered_html.as_deref().expect("retained HTML"),
+            &wrong_fingerprint
+        ));
+    }
+
+    #[test]
+    fn observation_rejects_identity_present_only_in_hidden_or_script_text() {
+        let row = ObservationSourceRow {
+            listing_id: 8,
+            listing_source_url: Some("https://example.test/listing/8".to_string()),
+            stored_manufacturer: "Cessna".to_string(),
+            stored_model: "182 Skylane".to_string(),
+            stored_variant: "182T".to_string(),
+            stored_model_year: 2022,
+            stored_serial_number: Some("18200001".to_string()),
+            stored_registration_number: Some("N182AA".to_string()),
+            submission_id: Some(10),
+            submission_source_url: None,
+            rendered_html_sha256: Some("b".repeat(64)),
+            rendered_html: Some(
+                r#"
+                <html><body>
+                  <p>Aircraft listing</p>
+                  <div hidden>2022 Cessna 182T Skylane</div>
+                  <script>const identity = "2022 Cessna 182T Skylane";</script>
+                </body></html>
+                "#
+                .to_string(),
+            ),
+            extracted_listing_json: Some(
+                serde_json::json!({
+                    "manufacturer": "Cessna",
+                    "model": "182 Skylane",
+                    "variant": "182T",
+                    "model_year": 2022,
+                    "registration_number": "N182AA",
+                    "serial_number": "18200001"
+                })
+                .to_string(),
+            ),
+        };
+
+        let observation = observation_from_row(&row);
+
+        assert_eq!(observation.model, "182 Skylane");
+        assert_eq!(observation.variant, "182T");
+        assert!(!observation.source_excerpt_is_exact);
+        assert!(observation.requires_human_review);
+    }
+
+    #[test]
+    fn observation_fingerprint_binds_exact_evidence_and_resolver() {
+        let fingerprint = |evidence, resolver| {
+            observation_fingerprint(
+                1,
+                Some(2),
+                Some("rendered-digest"),
+                "Cessna",
+                "182 Skylane",
+                "182T",
+                2022,
+                Some("18200001"),
+                Some("N182AA"),
+                evidence,
+                resolver,
+            )
+        };
+
+        assert_ne!(
+            fingerprint(Some("Cessna 182T Skylane"), COMPOSITE_FAMILY_SPAN_RESOLVER),
+            fingerprint(Some("Cessna Skylane 182T"), COMPOSITE_FAMILY_SPAN_RESOLVER)
+        );
+        assert_ne!(
+            fingerprint(Some("Cessna 182T Skylane"), COMPOSITE_FAMILY_SPAN_RESOLVER),
+            fingerprint(Some("Cessna 182T Skylane"), LITERAL_IDENTITY_SPAN_RESOLVER)
+        );
     }
 
     #[test]

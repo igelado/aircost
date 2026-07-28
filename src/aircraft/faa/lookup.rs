@@ -68,6 +68,11 @@ pub enum BlockReason {
     RegistrationNotCovered,
     AmbiguousRegistration,
     SerialConflict,
+    RegistryAircraftIdentityUnavailable,
+    AircraftManufacturerMismatch,
+    AircraftModelMismatch,
+    CanonicalIdentityAssignmentMissing,
+    CanonicalIdentityAssignmentMismatch,
 }
 
 /// Shared strict admission result. Only an exact current FAA N-number match

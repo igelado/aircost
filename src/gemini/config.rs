@@ -20,6 +20,8 @@ pub const DEFAULT_GEMINI_CONFIG_PATH: &str = "config/gemini.toml";
 
 const DEFAULT_LISTING_MODEL: &str = "gemini-3.5-flash-lite";
 const DEFAULT_GROUNDED_MODEL: &str = "gemini-3.5-flash";
+const DEFAULT_CURATION_MODEL: &str = "gemini-3.5-flash-lite";
+const DEFAULT_AVIONICS_COLLISION_FALLBACK_MODEL: &str = "gemini-3.6-flash";
 const DEFAULT_VISUAL_MODEL: &str = "gemini-3.1-flash-lite";
 const DEFAULT_GENERATE_CONTENT_MAX_OUTPUT_TOKENS: u64 = 4_096;
 const DEFAULT_CURATION_MAX_OUTPUT_TOKENS: u64 = 12_000;
@@ -38,6 +40,11 @@ pub enum GeminiTask {
     GroundedMetadata,
     AvionicsIdentity,
     AvionicsReview,
+    AvionicsSearchGrounding,
+    AvionicsUrlVerification,
+    AvionicsStructure,
+    AvionicsCollisionStructure,
+    AvionicsApprovedCandidateAdjudication,
     AircraftVisualIdentity,
     AircraftSearchGrounding,
     AircraftUrlVerification,
@@ -47,11 +54,16 @@ pub enum GeminiTask {
 }
 
 impl GeminiTask {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 15] = [
         Self::ListingExtraction,
         Self::GroundedMetadata,
         Self::AvionicsIdentity,
         Self::AvionicsReview,
+        Self::AvionicsSearchGrounding,
+        Self::AvionicsUrlVerification,
+        Self::AvionicsStructure,
+        Self::AvionicsCollisionStructure,
+        Self::AvionicsApprovedCandidateAdjudication,
         Self::AircraftVisualIdentity,
         Self::AircraftSearchGrounding,
         Self::AircraftUrlVerification,
@@ -66,6 +78,13 @@ impl GeminiTask {
             Self::GroundedMetadata => "AIRCOST_GEMINI_GROUNDED_METADATA",
             Self::AvionicsIdentity => "AIRCOST_GEMINI_AVIONICS_IDENTITY",
             Self::AvionicsReview => "AIRCOST_GEMINI_AVIONICS_REVIEW",
+            Self::AvionicsSearchGrounding => "AIRCOST_GEMINI_AVIONICS_SEARCH_GROUNDING",
+            Self::AvionicsUrlVerification => "AIRCOST_GEMINI_AVIONICS_URL_VERIFICATION",
+            Self::AvionicsStructure => "AIRCOST_GEMINI_AVIONICS_STRUCTURE",
+            Self::AvionicsCollisionStructure => "AIRCOST_GEMINI_AVIONICS_COLLISION_STRUCTURE",
+            Self::AvionicsApprovedCandidateAdjudication => {
+                "AIRCOST_GEMINI_AVIONICS_APPROVED_CANDIDATE_ADJUDICATION"
+            }
             Self::AircraftVisualIdentity => "AIRCOST_GEMINI_AIRCRAFT_VISUAL_IDENTITY",
             Self::AircraftSearchGrounding => "AIRCOST_GEMINI_AIRCRAFT_SEARCH_GROUNDING",
             Self::AircraftUrlVerification => "AIRCOST_GEMINI_AIRCRAFT_URL_VERIFICATION",
@@ -81,6 +100,13 @@ impl GeminiTask {
             Self::GroundedMetadata => "grounded_metadata",
             Self::AvionicsIdentity => "avionics_identity",
             Self::AvionicsReview => "avionics_review",
+            Self::AvionicsSearchGrounding => "avionics_search_grounding",
+            Self::AvionicsUrlVerification => "avionics_url_verification",
+            Self::AvionicsStructure => "avionics_structure",
+            Self::AvionicsCollisionStructure => "avionics_collision_structure",
+            Self::AvionicsApprovedCandidateAdjudication => {
+                "avionics_approved_candidate_adjudication"
+            }
             Self::AircraftVisualIdentity => "aircraft_visual_identity",
             Self::AircraftSearchGrounding => "aircraft_search_grounding",
             Self::AircraftUrlVerification => "aircraft_url_verification",
@@ -119,6 +145,12 @@ impl ThinkingLevel {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TaskRoute {
     pub model: String,
+    /// Optional escalation model used only by workflows after a primary
+    /// response deterministically fails that stage's validation gates.
+    pub fallback_model: Option<String>,
+    /// Thinking level for the fallback model. `None` inherits the primary
+    /// route's thinking level.
+    pub fallback_thinking_level: Option<ThinkingLevel>,
     /// `None` preserves the APIs' current behavior of omitting service tier.
     pub service_tier: Option<String>,
     pub thinking_level: ThinkingLevel,
@@ -129,6 +161,8 @@ impl TaskRoute {
     fn new(model: &str, thinking_level: ThinkingLevel, max_output_tokens: u64) -> Self {
         Self {
             model: model.to_string(),
+            fallback_model: None,
+            fallback_thinking_level: None,
             service_tier: None,
             thinking_level,
             max_output_tokens,
@@ -138,6 +172,12 @@ impl TaskRoute {
     fn apply(&mut self, overlay: TaskRouteOverlay) {
         if let Some(model) = overlay.model {
             self.model = model;
+        }
+        if let Some(fallback_model) = overlay.fallback_model {
+            self.fallback_model = optional_model(fallback_model);
+        }
+        if let Some(fallback_thinking_level) = overlay.fallback_thinking_level {
+            self.fallback_thinking_level = Some(fallback_thinking_level);
         }
         if let Some(service_tier) = overlay.service_tier {
             self.service_tier = service_tier_option(service_tier);
@@ -153,6 +193,10 @@ impl TaskRoute {
     fn validate(&self, task: GeminiTask) -> Result<()> {
         validate_model(&self.model)
             .with_context(|| format!("invalid primary model for {task:?}"))?;
+        if let Some(fallback_model) = self.fallback_model.as_deref() {
+            validate_model(fallback_model)
+                .with_context(|| format!("invalid fallback model for {task:?}"))?;
+        }
         if self.max_output_tokens == 0 {
             bail!("max_output_tokens for {task:?} must be positive");
         }
@@ -168,6 +212,8 @@ impl TaskRoute {
 #[serde(deny_unknown_fields)]
 struct TaskRouteOverlay {
     model: Option<String>,
+    fallback_model: Option<String>,
+    fallback_thinking_level: Option<ThinkingLevel>,
     service_tier: Option<String>,
     thinking_level: Option<ThinkingLevel>,
     max_output_tokens: Option<u64>,
@@ -274,25 +320,72 @@ impl Default for GeminiRuntimeConfig {
             ),
         );
         for task in [
+            GeminiTask::AvionicsSearchGrounding,
+            GeminiTask::AvionicsUrlVerification,
             GeminiTask::AircraftSearchGrounding,
             GeminiTask::AircraftUrlVerification,
-            GeminiTask::AircraftCatalogAdjudication,
-            GeminiTask::AircraftHierarchyVerification,
         ] {
-            tasks.insert(
-                task,
-                TaskRoute::new(
-                    DEFAULT_GROUNDED_MODEL,
-                    ThinkingLevel::Medium,
-                    DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
-                ),
+            let mut route = TaskRoute::new(
+                DEFAULT_CURATION_MODEL,
+                ThinkingLevel::Low,
+                DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
             );
+            route.fallback_model = Some(DEFAULT_GROUNDED_MODEL.to_string());
+            route.fallback_thinking_level = Some(ThinkingLevel::Medium);
+            tasks.insert(task, route);
         }
+        for task in [GeminiTask::AvionicsStructure, GeminiTask::AircraftStructure] {
+            let mut route = TaskRoute::new(
+                DEFAULT_CURATION_MODEL,
+                ThinkingLevel::Low,
+                DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
+            );
+            route.fallback_model = Some(DEFAULT_GROUNDED_MODEL.to_string());
+            tasks.insert(task, route);
+        }
+        // Collision structure receives the same bounded publisher dossier,
+        // enriched with capability and shortlist window-ranking hints. Use
+        // Lite first and reserve the stronger model for deterministic
+        // validation failure rather than paying for it on every comparison.
+        let mut avionics_collision_structure = TaskRoute::new(
+            DEFAULT_CURATION_MODEL,
+            ThinkingLevel::Low,
+            DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
+        );
+        avionics_collision_structure.fallback_model =
+            Some(DEFAULT_AVIONICS_COLLISION_FALLBACK_MODEL.to_string());
         tasks.insert(
-            GeminiTask::AircraftStructure,
+            GeminiTask::AvionicsCollisionStructure,
+            avionics_collision_structure,
+        );
+        // This bounded adjudication compares listing evidence only with
+        // graph-approved catalog identities. It deliberately uses no Search,
+        // URL Context, or function tools.
+        tasks.insert(
+            GeminiTask::AvionicsApprovedCandidateAdjudication,
+            TaskRoute::new(DEFAULT_CURATION_MODEL, ThinkingLevel::Low, 2_048),
+        );
+        let mut aircraft_catalog_adjudication = TaskRoute::new(
+            DEFAULT_GROUNDED_MODEL,
+            ThinkingLevel::Medium,
+            DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
+        );
+        // The primary adjudication can exhaust its combined thinking/output
+        // budget after both required function results are already present.
+        // Retry the immutable tools-disabled final history on the configured
+        // fallback route with lower thinking rather than repeating either
+        // function stage.
+        aircraft_catalog_adjudication.fallback_model = Some(DEFAULT_GROUNDED_MODEL.to_string());
+        aircraft_catalog_adjudication.fallback_thinking_level = Some(ThinkingLevel::Low);
+        tasks.insert(
+            GeminiTask::AircraftCatalogAdjudication,
+            aircraft_catalog_adjudication,
+        );
+        tasks.insert(
+            GeminiTask::AircraftHierarchyVerification,
             TaskRoute::new(
                 DEFAULT_GROUNDED_MODEL,
-                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
                 DEFAULT_CURATION_MAX_OUTPUT_TOKENS,
             ),
         );
@@ -552,6 +645,13 @@ impl GeminiRuntimeConfig {
         if let Some(value) = read(&format!("{prefix}_MODEL"))? {
             route.model = value;
         }
+        if let Some(value) = read(&format!("{prefix}_FALLBACK_MODEL"))? {
+            route.fallback_model = optional_model(value);
+        }
+        if let Some(value) = read(&format!("{prefix}_FALLBACK_THINKING_LEVEL"))? {
+            route.fallback_thinking_level = parse_optional_thinking_level(&value)
+                .with_context(|| format!("invalid {prefix}_FALLBACK_THINKING_LEVEL"))?;
+        }
         if let Some(value) = read(&format!("{prefix}_SERVICE_TIER"))? {
             route.service_tier = service_tier_option(value);
         }
@@ -613,6 +713,14 @@ fn parse_thinking_level(value: &str) -> Result<ThinkingLevel> {
     }
 }
 
+fn parse_optional_thinking_level(value: &str) -> Result<Option<ThinkingLevel>> {
+    if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("inherit") {
+        Ok(None)
+    } else {
+        parse_thinking_level(value).map(Some)
+    }
+}
+
 fn parse_positive_u64(name: &str, value: &str) -> Result<u64> {
     let parsed = value
         .trim()
@@ -667,6 +775,11 @@ fn service_tier_option(value: String) -> Option<String> {
     (!value.is_empty() && value != "unspecified").then(|| value.to_string())
 }
 
+fn optional_model(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && !value.eq_ignore_ascii_case("none")).then(|| value.to_string())
+}
+
 const fn default_benchmark_sample_size() -> usize {
     DEFAULT_BENCHMARK_SAMPLE_SIZE
 }
@@ -702,12 +815,175 @@ mod tests {
         );
         assert_eq!(
             config
+                .route(GeminiTask::AvionicsSearchGrounding)
+                .thinking_level,
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            config
+                .route(GeminiTask::AvionicsSearchGrounding)
+                .fallback_model
+                .as_deref(),
+            Some("gemini-3.5-flash")
+        );
+        assert_eq!(
+            config
+                .route(GeminiTask::AvionicsSearchGrounding)
+                .fallback_thinking_level,
+            Some(ThinkingLevel::Medium)
+        );
+        assert_eq!(
+            config
+                .route(GeminiTask::AvionicsUrlVerification)
+                .max_output_tokens,
+            12_000
+        );
+        assert_eq!(
+            config.route(GeminiTask::AvionicsStructure).thinking_level,
+            ThinkingLevel::Low
+        );
+        let collision_structure = config.route(GeminiTask::AvionicsCollisionStructure);
+        assert_eq!(collision_structure.model, "gemini-3.5-flash-lite");
+        assert_eq!(collision_structure.thinking_level, ThinkingLevel::Low);
+        assert_eq!(
+            collision_structure.fallback_model.as_deref(),
+            Some("gemini-3.6-flash")
+        );
+        assert_eq!(collision_structure.max_output_tokens, 12_000);
+        let approved_adjudication = config.route(GeminiTask::AvionicsApprovedCandidateAdjudication);
+        assert_eq!(approved_adjudication.model, "gemini-3.5-flash-lite");
+        assert_eq!(approved_adjudication.thinking_level, ThinkingLevel::Low);
+        assert_eq!(approved_adjudication.fallback_model, None);
+        assert_eq!(approved_adjudication.max_output_tokens, 2_048);
+        assert_eq!(
+            config.route(GeminiTask::AircraftSearchGrounding).model,
+            "gemini-3.5-flash-lite"
+        );
+        assert_eq!(
+            config
                 .route(GeminiTask::AircraftSearchGrounding)
                 .max_output_tokens,
             12_000
         );
+        let aircraft_adjudication = config.route(GeminiTask::AircraftCatalogAdjudication);
+        assert_eq!(aircraft_adjudication.model, "gemini-3.5-flash");
+        assert_eq!(aircraft_adjudication.thinking_level, ThinkingLevel::Medium);
+        assert_eq!(
+            aircraft_adjudication.fallback_model.as_deref(),
+            Some("gemini-3.5-flash")
+        );
+        assert_eq!(
+            aircraft_adjudication.fallback_thinking_level,
+            Some(ThinkingLevel::Low)
+        );
         assert_eq!(config.tasks.len(), GeminiTask::ALL.len());
         config.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn checked_in_config_uses_lite_then_current_flash_for_avionics_curation() {
+        let config = GeminiRuntimeConfig::from_toml_str(include_str!("../../config/gemini.toml"))
+            .expect("checked-in Gemini config must load");
+        let identity_structure = config.route(GeminiTask::AvionicsStructure);
+        assert_eq!(identity_structure.model, "gemini-3.5-flash-lite");
+        assert_eq!(
+            identity_structure.fallback_model.as_deref(),
+            Some("gemini-3.6-flash")
+        );
+
+        let collision_structure = config.route(GeminiTask::AvionicsCollisionStructure);
+        assert_eq!(collision_structure.model, "gemini-3.5-flash-lite");
+        assert_eq!(collision_structure.thinking_level, ThinkingLevel::Low);
+        assert_eq!(
+            collision_structure.fallback_model.as_deref(),
+            Some("gemini-3.6-flash")
+        );
+
+        let approved_adjudication = config.route(GeminiTask::AvionicsApprovedCandidateAdjudication);
+        assert_eq!(approved_adjudication.model, "gemini-3.5-flash-lite");
+        assert_eq!(approved_adjudication.thinking_level, ThinkingLevel::Low);
+        assert_eq!(approved_adjudication.fallback_model, None);
+        assert_eq!(approved_adjudication.max_output_tokens, 2_048);
+
+        let aircraft_adjudication = config.route(GeminiTask::AircraftCatalogAdjudication);
+        assert_eq!(aircraft_adjudication.model, "gemini-3.5-flash");
+        assert_eq!(aircraft_adjudication.thinking_level, ThinkingLevel::Medium);
+        assert_eq!(
+            aircraft_adjudication.fallback_model.as_deref(),
+            Some("gemini-3.5-flash")
+        );
+        assert_eq!(
+            aircraft_adjudication.fallback_thinking_level,
+            Some(ThinkingLevel::Low)
+        );
+
+        let example =
+            GeminiRuntimeConfig::from_toml_str(include_str!("../../config/gemini.example.toml"))
+                .expect("example Gemini config must load");
+        let example_collision = example.route(GeminiTask::AvionicsCollisionStructure);
+        assert_eq!(example_collision.model, "gemini-3.5-flash-lite");
+        assert_eq!(
+            example_collision.fallback_model.as_deref(),
+            Some("gemini-3.6-flash")
+        );
+    }
+
+    #[test]
+    fn avionics_pipeline_tasks_have_stable_names_and_environment_routes() {
+        let cases = [
+            (
+                GeminiTask::AvionicsSearchGrounding,
+                "avionics_search_grounding",
+                "AIRCOST_GEMINI_AVIONICS_SEARCH_GROUNDING",
+            ),
+            (
+                GeminiTask::AvionicsUrlVerification,
+                "avionics_url_verification",
+                "AIRCOST_GEMINI_AVIONICS_URL_VERIFICATION",
+            ),
+            (
+                GeminiTask::AvionicsStructure,
+                "avionics_structure",
+                "AIRCOST_GEMINI_AVIONICS_STRUCTURE",
+            ),
+            (
+                GeminiTask::AvionicsCollisionStructure,
+                "avionics_collision_structure",
+                "AIRCOST_GEMINI_AVIONICS_COLLISION_STRUCTURE",
+            ),
+            (
+                GeminiTask::AvionicsApprovedCandidateAdjudication,
+                "avionics_approved_candidate_adjudication",
+                "AIRCOST_GEMINI_AVIONICS_APPROVED_CANDIDATE_ADJUDICATION",
+            ),
+        ];
+        let mut environment = BTreeMap::new();
+        for (task, name, prefix) in cases {
+            assert_eq!(task.as_str(), name);
+            assert_eq!(task.environment_prefix(), prefix);
+            assert_eq!(
+                serde_json::from_str::<GeminiTask>(&format!("\"{name}\""))
+                    .expect("task name should deserialize"),
+                task
+            );
+            environment.insert(format!("{prefix}_MODEL"), "gemini-3.5-flash-lite".into());
+            environment.insert(
+                format!("{prefix}_FALLBACK_MODEL"),
+                "gemini-3.5-flash".into(),
+            );
+            environment.insert(format!("{prefix}_FALLBACK_THINKING_LEVEL"), "high".into());
+            environment.insert(format!("{prefix}_MAX_OUTPUT_TOKENS"), "6144".into());
+        }
+
+        let config = GeminiRuntimeConfig::from_environment_reader(map_environment(environment))
+            .expect("avionics task environment routes should load");
+        for (task, _, _) in cases {
+            let route = config.route(task);
+            assert_eq!(route.model, "gemini-3.5-flash-lite");
+            assert_eq!(route.fallback_model.as_deref(), Some("gemini-3.5-flash"));
+            assert_eq!(route.fallback_thinking_level, Some(ThinkingLevel::High));
+            assert_eq!(route.max_output_tokens, 6_144);
+        }
     }
 
     #[test]
@@ -718,6 +994,8 @@ version = 1
 
 [tasks.avionics_identity]
 model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.5-flash"
+fallback_thinking_level = "medium"
 service_tier = "flex"
 thinking_level = "minimal"
 max_output_tokens = 3072
@@ -738,6 +1016,8 @@ max_output_tokens = [2048, 4096]
 
         let route = config.route(GeminiTask::AvionicsIdentity);
         assert_eq!(route.model, "gemini-3.5-flash-lite");
+        assert_eq!(route.fallback_model.as_deref(), Some("gemini-3.5-flash"));
+        assert_eq!(route.fallback_thinking_level, Some(ThinkingLevel::Medium));
         assert_eq!(route.service_tier.as_deref(), Some("flex"));
         assert_eq!(route.thinking_level, ThinkingLevel::Minimal);
         assert_eq!(route.max_output_tokens, 3_072);
@@ -859,6 +1139,16 @@ model = "gemini-flash-latest"
         )
         .expect_err("latest alias must fail");
         assert!(format!("{latest:#}").contains("pinned"));
+
+        let latest_fallback = GeminiRuntimeConfig::from_toml_str(
+            r#"
+version = 1
+[tasks.avionics_search_grounding]
+fallback_model = "gemini-flash-latest"
+"#,
+        )
+        .expect_err("latest fallback alias must fail");
+        assert!(format!("{latest_fallback:#}").contains("fallback model"));
 
         let empty_matrix = GeminiRuntimeConfig::from_toml_str(
             r#"

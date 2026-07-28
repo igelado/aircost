@@ -21,7 +21,7 @@ use crate::db::{AppDb, DatabaseBackend};
 ///
 /// This must change whenever a rate or accounting assumption changes. Historical
 /// rows retain the full snapshot used for their estimate.
-pub const PRICING_VERSION: &str = "google-ai-developer-2026-07-21";
+pub const PRICING_VERSION: &str = "google-ai-developer-2026-07-27";
 pub const PRICING_SOURCE_URL: &str = "https://ai.google.dev/gemini-api/docs/pricing";
 const SEARCH_MICROUSD_PER_QUERY: u64 = 14_000;
 
@@ -147,17 +147,72 @@ pub struct CostEstimate {
     pub pricing_snapshot: Value,
 }
 
+/// How the request's aggregate provider-reported tool-use token counter is
+/// billed.
+///
+/// Gemini reports one aggregate tool-use counter, so a request that combines
+/// Google Search with a chargeable tool cannot be estimated when that counter
+/// is positive: Search-retrieved context is excluded from input-token charges,
+/// while URL Context and custom-function tool input are not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolUseBilling {
+    NoTools,
+    ChargeAsUncachedInput,
+    GoogleSearchContextExcluded,
+    AmbiguousMixed,
+}
+
+impl ToolUseBilling {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTools => "no_tools",
+            Self::ChargeAsUncachedInput => "charge_as_uncached_input",
+            Self::GoogleSearchContextExcluded => "google_search_context_excluded",
+            Self::AmbiguousMixed => "ambiguous_mixed",
+        }
+    }
+
+    fn classify(self, reported_tokens: Option<u64>) -> Result<(u64, Option<u64>)> {
+        match self {
+            Self::NoTools => {
+                if reported_tokens.is_some_and(|tokens| tokens != 0) {
+                    bail!(
+                        "cannot estimate cost because the provider reported tool-use tokens for a request with no declared tools"
+                    );
+                }
+                Ok((0, None))
+            }
+            Self::ChargeAsUncachedInput => Ok((
+                required_metric(reported_tokens, "tool_tokens")?,
+                None,
+            )),
+            Self::GoogleSearchContextExcluded => Ok((0, reported_tokens)),
+            Self::AmbiguousMixed => match reported_tokens {
+                Some(0) => Ok((0, Some(0))),
+                Some(_) => bail!(
+                    "cannot estimate cost because aggregate tool-use tokens cannot be split between chargeable tools and Google Search"
+                ),
+                None => bail!(
+                    "cannot estimate cost because mixed chargeable and Google Search tool usage was not reported"
+                ),
+            },
+        }
+    }
+}
+
 /// Estimate marginal paid-tier list cost from provider-reported usage.
 ///
 /// The calculation deliberately ignores the shared free Search quota, account
 /// credits, negotiated discounts, and explicit-cache storage fees. Cached input
 /// is a subset of total input, while thinking tokens are additional billed
-/// output. Tool tokens are retained in the snapshot but not added a second time
-/// because they are a breakdown of tokens already represented by provider input
-/// and output counters.
+/// output. URL Context and custom-function tool-use input tokens are separate
+/// from total input and are added at the model's uncached input rate. Google
+/// Search-retrieved context is excluded because its query fee is charged
+/// separately.
 pub fn estimate_paid_list_cost(
     model: &str,
     service_tier: &str,
+    tool_use_billing: ToolUseBilling,
     metrics: &Metrics,
 ) -> Result<CostEstimate> {
     let model = model.trim().strip_prefix("models/").unwrap_or(model.trim());
@@ -176,9 +231,15 @@ pub fn estimate_paid_list_cost(
     let thought_tokens = required_metric(metrics.thought_tokens, "thought_tokens")?;
     let cached_tokens = required_metric(metrics.cached_tokens, "cached_tokens")?;
     let search_query_count = required_metric(metrics.search_query_count, "search_query_count")?;
-    let uncached_input_tokens = input_tokens.checked_sub(cached_tokens).with_context(|| {
-        format!("cached_tokens ({cached_tokens}) exceeds input_tokens ({input_tokens})")
-    })?;
+    let (billed_tool_use_input_tokens, excluded_search_context_tokens) =
+        tool_use_billing.classify(metrics.tool_tokens)?;
+    let uncached_prompt_input_tokens =
+        input_tokens.checked_sub(cached_tokens).with_context(|| {
+            format!("cached_tokens ({cached_tokens}) exceeds input_tokens ({input_tokens})")
+        })?;
+    let uncached_input_tokens = uncached_prompt_input_tokens
+        .checked_add(billed_tool_use_input_tokens)
+        .context("prompt and tool-use input token total overflowed")?;
     let billed_output_tokens = output_tokens
         .checked_add(thought_tokens)
         .context("output and thought token total overflowed")?;
@@ -208,6 +269,7 @@ pub fn estimate_paid_list_cost(
             "estimate_basis": "marginal_paid_list_price",
             "model": model,
             "service_tier": service_tier,
+            "tool_use_billing": tool_use_billing.as_str(),
             "rates": {
                 "input_microusd_per_million_tokens": rates.input,
                 "cached_input_microusd_per_million_tokens": rates.cached_input,
@@ -216,11 +278,14 @@ pub fn estimate_paid_list_cost(
             },
             "billable_usage": {
                 "uncached_input_tokens": uncached_input_tokens,
+                "uncached_prompt_input_tokens": uncached_prompt_input_tokens,
+                "reported_tool_use_tokens": metrics.tool_tokens,
+                "billed_tool_use_input_tokens": billed_tool_use_input_tokens,
+                "excluded_google_search_context_tokens": excluded_search_context_tokens,
                 "cached_input_tokens": cached_tokens,
                 "output_tokens": output_tokens,
                 "thought_tokens": thought_tokens,
                 "search_query_count": search_query_count,
-                "tool_tokens_informational": metrics.tool_tokens,
             },
             "components_microusd": {
                 "input": input_microusd,
@@ -232,7 +297,6 @@ pub fn estimate_paid_list_cost(
                 "shared_free_search_quota",
                 "account_credits_and_negotiated_discounts",
                 "explicit_cache_storage",
-                "tool_tokens_already_represented_in_provider_totals",
             ],
         }),
     })
@@ -864,7 +928,7 @@ mod tests {
 
     use super::{
         estimate_paid_list_cost, ApiFamily, CostEstimate, Metrics, Outcome, SourceCorrelation,
-        Start, Status, Store, ValidationStatus, PRICING_VERSION,
+        Start, Status, Store, ToolUseBilling, ValidationStatus, PRICING_VERSION,
     };
     use crate::db::AppDb;
 
@@ -949,6 +1013,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_historical_pricing_snapshots_without_reestimating_them() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let store = Store::new(&db);
+        let start = Start::new(
+            "avionics_curation",
+            "historical_cost_snapshot",
+            ApiFamily::Interactions,
+            "gemini-3.5-flash-lite",
+        );
+        let attempt = store.start(&start).await.unwrap();
+        let historical_snapshot = json!({
+            "version": "google-ai-developer-2026-07-21",
+            "billable_usage": {
+                "uncached_input_tokens": 8000,
+                "tool_tokens_informational": 12,
+            },
+            "components_microusd": {
+                "input": 2400,
+            },
+            "excluded": [
+                "tool_tokens_already_represented_in_provider_totals",
+            ],
+        });
+        let mut outcome = Outcome::completed(Metrics {
+            input_tokens: Some(10_000),
+            output_tokens: Some(1_000),
+            thought_tokens: Some(500),
+            cached_tokens: Some(2_000),
+            tool_tokens: Some(12),
+            search_query_count: Some(2),
+        });
+        outcome.cost = Some(CostEstimate {
+            total_microusd: 34_210,
+            pricing_snapshot: historical_snapshot.clone(),
+        });
+
+        let record = store.finish(attempt, &outcome).await.unwrap();
+        let cost = record.cost.as_ref().unwrap();
+        assert_eq!(cost.total_microusd, 34_210);
+        assert_eq!(cost.pricing_snapshot, historical_snapshot);
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_lifecycle_values_before_writing_them() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let store = Store::new(&db);
@@ -984,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn estimates_versioned_token_cache_thinking_and_search_costs() {
+    fn estimates_versioned_chargeable_tool_cache_thinking_and_search_costs() {
         let metrics = Metrics {
             input_tokens: Some(10_000),
             output_tokens: Some(1_000),
@@ -993,27 +1100,126 @@ mod tests {
             tool_tokens: Some(12),
             search_query_count: Some(2),
         };
-        let standard =
-            estimate_paid_list_cost("gemini-3.5-flash-lite", "standard", &metrics).unwrap();
-        assert_eq!(standard.total_microusd, 34_210);
+        let standard = estimate_paid_list_cost(
+            "gemini-3.5-flash-lite",
+            "standard",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(standard.total_microusd, 34_214);
         assert_eq!(standard.pricing_snapshot["version"], PRICING_VERSION);
+        assert_eq!(
+            standard.pricing_snapshot["tool_use_billing"],
+            "charge_as_uncached_input"
+        );
         assert_eq!(
             standard.pricing_snapshot["components_microusd"],
             json!({
-                "input": 2_400,
+                "input": 2_404,
                 "cached_input": 60,
                 "output_and_thinking": 3_750,
                 "search": 28_000,
             })
         );
         assert_eq!(
-            standard.pricing_snapshot["billable_usage"]["tool_tokens_informational"],
+            standard.pricing_snapshot["billable_usage"],
+            json!({
+                "uncached_input_tokens": 8_012,
+                "uncached_prompt_input_tokens": 8_000,
+                "reported_tool_use_tokens": 12,
+                "billed_tool_use_input_tokens": 12,
+                "excluded_google_search_context_tokens": null,
+                "cached_input_tokens": 2_000,
+                "output_tokens": 1_000,
+                "thought_tokens": 500,
+                "search_query_count": 2,
+            })
+        );
+
+        let flex = estimate_paid_list_cost(
+            "models/gemini-3.5-flash-lite",
+            "flex",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(flex.total_microusd, 31_117);
+    }
+
+    #[test]
+    fn excludes_google_search_context_and_fails_closed_for_mixed_tools() {
+        let metrics = Metrics {
+            input_tokens: Some(10_000),
+            output_tokens: Some(1_000),
+            thought_tokens: Some(500),
+            cached_tokens: Some(2_000),
+            tool_tokens: Some(12),
+            search_query_count: Some(2),
+        };
+        let search_only = estimate_paid_list_cost(
+            "gemini-3.5-flash-lite",
+            "standard",
+            ToolUseBilling::GoogleSearchContextExcluded,
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(search_only.total_microusd, 34_210);
+        assert_eq!(
+            search_only.pricing_snapshot["billable_usage"]["uncached_input_tokens"],
+            8_000
+        );
+        assert_eq!(
+            search_only.pricing_snapshot["billable_usage"]["billed_tool_use_input_tokens"],
+            0
+        );
+        assert_eq!(
+            search_only.pricing_snapshot["billable_usage"]["excluded_google_search_context_tokens"],
             12
         );
 
-        let flex =
-            estimate_paid_list_cost("models/gemini-3.5-flash-lite", "flex", &metrics).unwrap();
-        assert_eq!(flex.total_microusd, 31_115);
+        assert!(estimate_paid_list_cost(
+            "gemini-3.5-flash-lite",
+            "standard",
+            ToolUseBilling::AmbiguousMixed,
+            &metrics,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be split"));
+    }
+
+    #[test]
+    fn no_tool_request_accepts_an_omitted_or_zero_tool_counter_only() {
+        let metrics = Metrics {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            thought_tokens: Some(0),
+            cached_tokens: Some(0),
+            tool_tokens: None,
+            search_query_count: Some(0),
+        };
+        assert!(estimate_paid_list_cost(
+            "gemini-3.1-flash-lite",
+            "standard",
+            ToolUseBilling::NoTools,
+            &metrics,
+        )
+        .is_ok());
+
+        let inconsistent = Metrics {
+            tool_tokens: Some(1),
+            ..metrics
+        };
+        assert!(estimate_paid_list_cost(
+            "gemini-3.1-flash-lite",
+            "standard",
+            ToolUseBilling::NoTools,
+            &inconsistent,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no declared tools"));
     }
 
     #[test]
@@ -1026,34 +1232,73 @@ mod tests {
             tool_tokens: None,
             search_query_count: Some(0),
         };
-        assert!(
-            estimate_paid_list_cost("gemini-3.1-flash-lite", "standard", &incomplete)
-                .unwrap_err()
-                .to_string()
-                .contains("thought_tokens")
-        );
+        assert!(estimate_paid_list_cost(
+            "gemini-3.1-flash-lite",
+            "standard",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &incomplete,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("thought_tokens"));
 
-        let complete = Metrics {
+        let complete_except_tool_use = Metrics {
             thought_tokens: Some(0),
             ..incomplete
         };
-        assert!(
-            estimate_paid_list_cost("gemini-future", "standard", &complete)
-                .unwrap_err()
-                .to_string()
-                .contains("no Gemini pricing")
-        );
+        assert!(estimate_paid_list_cost(
+            "gemini-3.1-flash-lite",
+            "standard",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &complete_except_tool_use
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("tool_tokens"));
+
+        let complete = Metrics {
+            tool_tokens: Some(0),
+            ..complete_except_tool_use
+        };
+        assert!(estimate_paid_list_cost(
+            "gemini-future",
+            "standard",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &complete,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no Gemini pricing"));
 
         let invalid_cache = Metrics {
             input_tokens: Some(1),
             cached_tokens: Some(2),
             ..complete
         };
-        assert!(
-            estimate_paid_list_cost("gemini-3.1-flash-lite", "standard", &invalid_cache)
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds input_tokens")
-        );
+        assert!(estimate_paid_list_cost(
+            "gemini-3.1-flash-lite",
+            "standard",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &invalid_cache,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds input_tokens"));
+
+        let input_overflow = Metrics {
+            input_tokens: Some(u64::MAX),
+            cached_tokens: Some(0),
+            tool_tokens: Some(1),
+            ..complete
+        };
+        assert!(estimate_paid_list_cost(
+            "gemini-3.1-flash-lite",
+            "standard",
+            ToolUseBilling::ChargeAsUncachedInput,
+            &input_overflow,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("prompt and tool-use input token total overflowed"));
     }
 }

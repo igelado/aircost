@@ -901,6 +901,8 @@ pub struct BenchmarkSummary {
     pub tool_use_tokens: u64,
     pub grounded_requests: u64,
     pub successful_google_search_calls: u64,
+    #[serde(default)]
+    pub successful_url_context_calls: u64,
     pub search_queries: u64,
     pub citation_url_count: u64,
     pub mean_latency_ms: u64,
@@ -1279,11 +1281,12 @@ fn validate_grounded_metadata_output(
     let grounding_success = Some(
         usage.grounded_requests >= 1
             && usage.successful_google_search_calls >= 1
+            && usage.successful_url_context_calls >= 1
             && usage.citation_url_count >= 1,
     );
     if grounding_success == Some(false) {
         errors.push(
-            "grounded metadata requires an observed Google Search call and cited grounding source"
+            "grounded metadata requires observed Google Search and URL Context calls with a cited grounding source"
                 .to_string(),
         );
     }
@@ -1385,6 +1388,9 @@ fn validate_avionics_output(
         errors.push("confidence must be very_high, high, medium, or low".to_string());
     }
     let positive = matches!(status, Some("existing_match" | "propose_new"));
+    let manufacturer_identifier_scope = classification
+        .and_then(|object| object.get("manufacturer_identifier_scope"))
+        .and_then(Value::as_str);
     if positive {
         for field in [
             "canonical_manufacturer",
@@ -1410,6 +1416,16 @@ fn validate_avionics_output(
         {
             errors.push("positive identity requires canonical_types".to_string());
         }
+        if manufacturer_identifier_scope != Some("exact_catalog_product") {
+            errors.push(
+                "positive identity requires manufacturer_identifier_scope=exact_catalog_product"
+                    .to_string(),
+            );
+        }
+    } else if matches!(status, Some("reject" | "unresolved"))
+        && manufacturer_identifier_scope != Some("none")
+    {
+        errors.push("reject and unresolved require manufacturer_identifier_scope=none".to_string());
     }
 
     let catalog_candidates: &[BenchmarkCatalogCandidate] = match &case.input {
@@ -1446,6 +1462,10 @@ fn validate_avionics_output(
             .and_then(|object| object.get("proposal_decision"))
             .and_then(Value::as_str)
             == Some("confirmed_same_as_input");
+        let proposal_scope_is_exact = review
+            .and_then(|object| object.get("proposal_manufacturer_identifier_scope"))
+            .and_then(Value::as_str)
+            == Some("exact_catalog_product");
         let reviewed = review
             .and_then(|object| object.get("reviews"))
             .and_then(Value::as_array)
@@ -1471,11 +1491,17 @@ fn validate_avionics_output(
             || catalog_id
                 .and_then(|id| reviewed.get(&id))
                 .is_some_and(|decision| *decision == "same_product");
-        review_shape_success = proposal_confirmed && exact_coverage && selected_confirmed;
+        review_shape_success =
+            proposal_confirmed && proposal_scope_is_exact && exact_coverage && selected_confirmed;
         if review.is_none() {
             errors.push("positive identity is missing independent review output".to_string());
         } else if !proposal_confirmed {
             errors.push("independent review did not confirm the input identity".to_string());
+        } else if !proposal_scope_is_exact {
+            errors.push(
+                "confirmed independent review requires proposal_manufacturer_identifier_scope=exact_catalog_product"
+                    .to_string(),
+            );
         } else if !exact_coverage {
             errors.push(
                 "independent review must cover every supplied catalog candidate exactly once"
@@ -1492,19 +1518,24 @@ fn validate_avionics_output(
     let grounding_success = Some(
         usage.grounded_requests >= required_grounded_requests
             && usage.successful_google_search_calls >= required_grounded_requests
+            && usage.successful_url_context_calls >= required_grounded_requests
             && usage.citation_url_count > 0,
     );
     if grounding_success == Some(false) {
         errors.push(if positive {
-            "positive identity requires grounded classification and review calls with cited Search results"
+            "positive identity requires grounded classification and review calls with successful Search and URL Context results plus citations"
                 .to_string()
         } else {
-            "negative identity requires a grounded classification call with cited Search results"
+            "negative identity requires a grounded classification call with successful Search and URL Context results plus citations"
                 .to_string()
         });
     }
-    let independent_review_success =
-        positive.then(|| review_shape_success && usage.grounded_requests >= 2);
+    let independent_review_success = positive.then(|| {
+        review_shape_success
+            && usage.grounded_requests >= 2
+            && usage.successful_google_search_calls >= 2
+            && usage.successful_url_context_calls >= 2
+    });
     if independent_review_success == Some(false) {
         errors.push(
             "positive avionics identity requires a complete independent grounded review"
@@ -1688,6 +1719,7 @@ fn summarize_group(
         successful_google_search_calls: usage_sum(runs, |usage| {
             usage.successful_google_search_calls
         }),
+        successful_url_context_calls: usage_sum(runs, |usage| usage.successful_url_context_calls),
         search_queries: usage_sum(runs, |usage| usage.search_queries),
         citation_url_count: usage_sum(runs, |usage| usage.citation_url_count),
         mean_latency_ms: if runs.is_empty() {
@@ -1983,6 +2015,7 @@ mod tests {
                     "canonical_types": ["Flight Display", "Navigation"],
                     "manufacturer_identifier_kind": "manufacturer_model_number",
                     "manufacturer_identifier": "G1000NXI",
+                    "manufacturer_identifier_scope": "exact_catalog_product",
                     "confidence": "very_high",
                     "identity_source_url": "https://www.garmin.com/example",
                     "identity_source_title": "G1000 NXi",
@@ -1991,6 +2024,7 @@ mod tests {
                 },
                 "review": {
                     "proposal_decision": "confirmed_same_as_input",
+                    "proposal_manufacturer_identifier_scope": "exact_catalog_product",
                     "reviews": []
                 }
             })),
@@ -2024,6 +2058,7 @@ mod tests {
         let grounded_usage = BenchmarkUsage {
             grounded_requests: 1,
             successful_google_search_calls: 1,
+            successful_url_context_calls: 1,
             citation_url_count: 1,
             ..BenchmarkUsage::default()
         };
@@ -2041,11 +2076,129 @@ mod tests {
         assert!(ungrounded.structured_output_success);
         assert_eq!(ungrounded.grounding_success, Some(false));
 
+        let mut search_only_usage = grounded_usage.clone();
+        search_only_usage.successful_url_context_calls = 0;
+        let search_only = validate_output(
+            metadata,
+            Some(&grounded_metadata_value()),
+            &search_only_usage,
+        );
+        assert!(search_only.structured_output_success);
+        assert_eq!(search_only.grounding_success, Some(false));
+
         let mut malformed = grounded_metadata_value();
         malformed.as_object_mut().unwrap().remove("introduced_year");
         let invalid = validate_output(metadata, Some(&malformed), &grounded_usage);
         assert!(!invalid.structured_output_success);
         assert_eq!(invalid.grounding_success, Some(true));
+    }
+
+    #[test]
+    fn avionics_validator_requires_staged_grounding_and_product_scoped_identifiers() {
+        let suite = build_suite(
+            vec![source_row(
+                13,
+                &gallery_html(),
+                Some(parsed_listing_value()),
+            )],
+            Vec::new(),
+            &BenchmarkSelection {
+                listing_limit: 1,
+                ..BenchmarkSelection::default()
+            },
+        )
+        .unwrap();
+        let avionics = suite
+            .cases
+            .iter()
+            .find(|case| case.task == BenchmarkTaskKind::AvionicsGroundingReview)
+            .unwrap();
+        let positive = json!({
+            "classification": {
+                "status": "propose_new",
+                "catalog_id": 0,
+                "canonical_manufacturer": "Garmin",
+                "canonical_model": "G1000 NXi",
+                "canonical_types": ["Flight Display", "Navigation"],
+                "manufacturer_identifier_kind": "manufacturer_model_number",
+                "manufacturer_identifier": "G1000NXI",
+                "manufacturer_identifier_scope": "exact_catalog_product",
+                "confidence": "very_high",
+                "identity_source_url": "https://www.garmin.com/example",
+                "identity_source_title": "G1000 NXi",
+                "identity_evidence": "Official product documentation",
+                "reason": "manufacturer documentation distinguishes it"
+            },
+            "review": {
+                "proposal_decision": "confirmed_same_as_input",
+                "proposal_manufacturer_identifier_scope": "exact_catalog_product",
+                "reviews": []
+            }
+        });
+        let staged_usage = BenchmarkUsage {
+            grounded_requests: 2,
+            successful_google_search_calls: 2,
+            successful_url_context_calls: 2,
+            citation_url_count: 1,
+            ..BenchmarkUsage::default()
+        };
+        assert!(validate_output(avionics, Some(&positive), &staged_usage).overall_success());
+
+        let mut missing_url_context = staged_usage.clone();
+        missing_url_context.successful_url_context_calls = 1;
+        let invalid_grounding = validate_output(avionics, Some(&positive), &missing_url_context);
+        assert_eq!(invalid_grounding.grounding_success, Some(false));
+        assert_eq!(invalid_grounding.independent_review_success, Some(false));
+
+        let mut component_scoped = positive.clone();
+        component_scoped["classification"]["manufacturer_identifier_scope"] =
+            json!("component_of_catalog_product");
+        let invalid_identity = validate_output(avionics, Some(&component_scoped), &staged_usage);
+        assert!(!invalid_identity.structured_output_success);
+        assert!(invalid_identity
+            .errors
+            .iter()
+            .any(|error| error.contains("manufacturer_identifier_scope=exact_catalog_product")));
+
+        let mut component_scoped_review = positive.clone();
+        component_scoped_review["review"]["proposal_manufacturer_identifier_scope"] =
+            json!("component_of_catalog_product");
+        let invalid_review =
+            validate_output(avionics, Some(&component_scoped_review), &staged_usage);
+        assert_eq!(invalid_review.independent_review_success, Some(false));
+        assert!(invalid_review.errors.iter().any(|error| {
+            error.contains("proposal_manufacturer_identifier_scope=exact_catalog_product")
+        }));
+
+        let negative = json!({
+            "status": "reject",
+            "catalog_id": 0,
+            "manufacturer_identifier_scope": "none",
+            "confidence": "high",
+            "reason": "generic capability, not a product identity"
+        });
+        let negative_usage = BenchmarkUsage {
+            grounded_requests: 1,
+            successful_google_search_calls: 1,
+            successful_url_context_calls: 1,
+            citation_url_count: 1,
+            ..BenchmarkUsage::default()
+        };
+        assert!(validate_output(avionics, Some(&negative), &negative_usage).overall_success());
+
+        let mut incorrectly_scoped_negative = negative;
+        incorrectly_scoped_negative["manufacturer_identifier_scope"] =
+            json!("exact_catalog_product");
+        let invalid_negative = validate_output(
+            avionics,
+            Some(&incorrectly_scoped_negative),
+            &negative_usage,
+        );
+        assert!(!invalid_negative.structured_output_success);
+        assert!(invalid_negative
+            .errors
+            .iter()
+            .any(|error| error.contains("manufacturer_identifier_scope=none")));
     }
 
     #[test]
@@ -2147,6 +2300,7 @@ mod tests {
                     BenchmarkTaskKind::AvionicsGroundingReview => Some(json!({
                         "status": "reject",
                         "catalog_id": 0,
+                        "manufacturer_identifier_scope": "none",
                         "confidence": "high",
                         "reason": "generic capability, not a product identity"
                     })),
@@ -2162,17 +2316,22 @@ mod tests {
                         total_output_tokens: 20,
                         grounded_requests: match case.task {
                             BenchmarkTaskKind::GroundedMetadata => 1,
-                            BenchmarkTaskKind::AvionicsGroundingReview => 2,
+                            BenchmarkTaskKind::AvionicsGroundingReview => 1,
                             _ => 0,
                         },
                         successful_google_search_calls: match case.task {
                             BenchmarkTaskKind::GroundedMetadata => 1,
-                            BenchmarkTaskKind::AvionicsGroundingReview => 2,
+                            BenchmarkTaskKind::AvionicsGroundingReview => 1,
+                            _ => 0,
+                        },
+                        successful_url_context_calls: match case.task {
+                            BenchmarkTaskKind::GroundedMetadata => 1,
+                            BenchmarkTaskKind::AvionicsGroundingReview => 1,
                             _ => 0,
                         },
                         search_queries: match case.task {
                             BenchmarkTaskKind::GroundedMetadata => 1,
-                            BenchmarkTaskKind::AvionicsGroundingReview => 2,
+                            BenchmarkTaskKind::AvionicsGroundingReview => 1,
                             _ => 0,
                         },
                         citation_url_count: if matches!(
@@ -2215,6 +2374,23 @@ mod tests {
         .unwrap();
         assert_eq!(report.runs.len(), suite.cases.len());
         assert_eq!(report.summaries.len(), 4);
+        assert_eq!(
+            report
+                .summaries
+                .iter()
+                .filter(|summary| matches!(
+                    summary.task,
+                    BenchmarkTaskKind::GroundedMetadata
+                        | BenchmarkTaskKind::AvionicsGroundingReview
+                ))
+                .map(|summary| summary.successful_url_context_calls)
+                .sum::<u64>(),
+            2
+        );
+        assert!(report
+            .runs
+            .iter()
+            .all(|run| run.validation.overall_success()));
         assert!(report
             .runs
             .iter()

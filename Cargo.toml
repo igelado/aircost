@@ -22,6 +22,7 @@ base64 = "0.22"
 csv = "1"
 eoka = "0.4"
 html-escape = "0.2"
+lopdf = { version = "0.44", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["charset", "gzip", "json", "rustls"] }
 ring = "0.17"
 scraper = "0.27"
@@ -34,6 +35,7 @@ tokio-stream = "0.1"
 toml = "1"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
+xml-rs = "0.8"
 
 [dependencies.burn]
 version = "0.21"

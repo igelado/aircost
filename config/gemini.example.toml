@@ -28,29 +28,72 @@ model = "gemini-3.5-flash"
 thinking_level = "low"
 max_output_tokens = 8192
 
+[tasks.avionics_search_grounding]
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.6-flash"
+thinking_level = "low"
+fallback_thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.avionics_url_verification]
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.6-flash"
+thinking_level = "low"
+fallback_thinking_level = "medium"
+max_output_tokens = 12000
+
+[tasks.avionics_structure]
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.6-flash"
+thinking_level = "low"
+max_output_tokens = 12000
+
+# Collision responses reuse a bounded publisher dossier enriched with
+# identity, capability, and shortlist relevance hints. Start on Lite now that
+# the packet carries the comparison spans needed by the stricter schema, and
+# escalate only after a deterministic validation failure.
+[tasks.avionics_collision_structure]
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.6-flash"
+thinking_level = "low"
+max_output_tokens = 12000
+
+# This bounded approved-catalog comparison is intentionally tools-disabled.
+[tasks.avionics_approved_candidate_adjudication]
+model = "gemini-3.5-flash-lite"
+thinking_level = "low"
+max_output_tokens = 2048
+
 [tasks.aircraft_visual_identity]
 model = "gemini-3.1-flash-lite"
 thinking_level = "low"
 max_output_tokens = 4096
 
 [tasks.aircraft_search_grounding]
-model = "gemini-3.5-flash"
-thinking_level = "medium"
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.5-flash"
+thinking_level = "low"
+fallback_thinking_level = "medium"
 max_output_tokens = 12000
 
 [tasks.aircraft_url_verification]
-model = "gemini-3.5-flash"
-thinking_level = "medium"
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.5-flash"
+thinking_level = "low"
+fallback_thinking_level = "medium"
 max_output_tokens = 12000
 
 [tasks.aircraft_structure]
-model = "gemini-3.5-flash"
+model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.5-flash"
 thinking_level = "low"
 max_output_tokens = 12000
 
 [tasks.aircraft_catalog_adjudication]
 model = "gemini-3.5-flash"
+fallback_model = "gemini-3.5-flash"
 thinking_level = "medium"
+fallback_thinking_level = "low"
 max_output_tokens = 12000
 
 [tasks.aircraft_hierarchy_verification]

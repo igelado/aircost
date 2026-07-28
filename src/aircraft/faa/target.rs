@@ -360,23 +360,13 @@ mod tests {
             unreachable!("test database is SQLite")
         };
 
-        let manufacturer_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO aircraft_manufacturers (name, normalized_name) VALUES ('Target Test Aircraft', 'target-test-aircraft') RETURNING id",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        let model_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO aircraft_models (aircraft_manufacturer_id, name, normalized_name) VALUES (?, '182', '182') RETURNING id",
-        )
-        .bind(manufacturer_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
         let variant_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO aircraft_model_variants (aircraft_model_id, name, normalized_name) VALUES (?, '182H', '182h') RETURNING id",
+            r#"
+            SELECT aircraft_model_variant_id
+            FROM aircraft_sale_listing_pending_compatibility_placeholder
+            WHERE singleton_id = 1
+            "#,
         )
-        .bind(model_id)
         .fetch_one(pool)
         .await
         .unwrap();

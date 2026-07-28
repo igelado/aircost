@@ -6,6 +6,7 @@
 //! This module does not promote FAA rows into the curated aircraft catalog.
 
 mod admission;
+pub mod drs;
 mod import;
 mod lookup;
 mod store;
@@ -13,8 +14,8 @@ mod target;
 
 pub use admission::{
     audit_listing_admission, block_reason_code, require_aircraft_admission,
-    require_listing_admission, AircraftAdmissionError, ListingAdmissionEvidence,
-    ListingAdmissionReport,
+    require_listing_admission, require_listing_faa_admission, AircraftAdmissionError,
+    ListingAdmissionEvidence, ListingAdmissionReport,
 };
 pub use import::{parse_release, ReleaseReaders};
 pub use lookup::{

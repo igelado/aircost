@@ -28,6 +28,14 @@ jobs:
           node --check chrome-extension/popup.js
           node --test chrome-extension/*.test.mjs
 
+      - name: Check web frontend
+        run: |
+          node --check web/app.js
+          node --check web/avionics.js
+          node --check web/review.js
+          node --check web/review/domain.mjs
+          node --test web/review/*.test.mjs
+
       - name: Run unit tests
         run: cargo test
 

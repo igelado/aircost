@@ -164,7 +164,7 @@ impl LiveBenchmarkRunner {
         value_reference_year: i64,
         correlation_id: &str,
     ) -> Result<TaskExecution> {
-        let config = self.config_for_model(model, &[GeminiTask::GroundedMetadata])?;
+        let config = self.config_for_model(model, AVIONICS_PIPELINE_TASKS)?;
         let extractor = self.scoped_extractor(config, case, correlation_id)?;
         let response = extractor
             .estimate_avionics_metadata(&AvionicsMetadataContext {
@@ -191,10 +191,7 @@ impl LiveBenchmarkRunner {
         catalog_candidates: &[super::benchmark::BenchmarkCatalogCandidate],
         correlation_id: &str,
     ) -> Result<TaskExecution> {
-        let config = self.config_for_model(
-            model,
-            &[GeminiTask::AvionicsIdentity, GeminiTask::AvionicsReview],
-        )?;
+        let config = self.config_for_model(model, AVIONICS_PIPELINE_TASKS)?;
         let extractor = self.scoped_extractor(config, case, correlation_id)?;
         let context = AvionicsUnitResolutionContext {
             aircraft_manufacturer: aircraft.manufacturer.clone().unwrap_or_default(),
@@ -204,6 +201,8 @@ impl LiveBenchmarkRunner {
             source_url: case.source_url.clone(),
             listing_context: listing_evidence.to_string(),
             requires_listing_evidence: true,
+            authoritative_direct_source_urls: Vec::new(),
+            authoritative_identity_anchors: Vec::new(),
             candidate: AvionicsUnitResolutionCandidate {
                 manufacturer: candidate.manufacturer.clone(),
                 model: candidate.model.clone(),
@@ -456,6 +455,14 @@ impl LiveBenchmarkRunner {
     }
 }
 
+const AVIONICS_PIPELINE_TASKS: &[GeminiTask] = &[
+    GeminiTask::AvionicsApprovedCandidateAdjudication,
+    GeminiTask::AvionicsSearchGrounding,
+    GeminiTask::AvionicsUrlVerification,
+    GeminiTask::AvionicsStructure,
+    GeminiTask::AvionicsCollisionStructure,
+];
+
 impl BenchmarkRunner for LiveBenchmarkRunner {
     fn run<'a>(&'a self, model: &'a str, case: &'a BenchmarkCase) -> BenchmarkRunFuture<'a> {
         Box::pin(async move { self.run_case(model, case).await })
@@ -466,16 +473,31 @@ impl BenchmarkRunner for LiveBenchmarkRunner {
 struct TaskEvidence {
     grounded_requests: u64,
     successful_google_search_calls: u64,
+    successful_url_context_calls: u64,
     citation_urls: BTreeSet<String>,
 }
 
 impl TaskEvidence {
     fn observe_grounded_response(&mut self, response: &GroundedJsonResponse) {
         self.grounded_requests = self.grounded_requests.saturating_add(1);
-        if response.google_search_used {
-            self.successful_google_search_calls =
-                self.successful_google_search_calls.saturating_add(1);
-        }
+        let audited_search_calls = response
+            .interaction_audits
+            .iter()
+            .fold(0_u64, |sum, audit| {
+                sum.saturating_add(audit.successful_google_search_calls as u64)
+            });
+        let audited_url_context_calls = response
+            .interaction_audits
+            .iter()
+            .fold(0_u64, |sum, audit| {
+                sum.saturating_add(audit.successful_url_context_calls as u64)
+            });
+        self.successful_google_search_calls = self
+            .successful_google_search_calls
+            .saturating_add(audited_search_calls.max(u64::from(response.google_search_used)));
+        self.successful_url_context_calls = self
+            .successful_url_context_calls
+            .saturating_add(audited_url_context_calls.max(u64::from(response.url_context_used)));
         self.citation_urls.extend(
             response
                 .grounding_sources
@@ -520,7 +542,10 @@ fn aggregate_usage(records: &[UsageRecord], evidence: &TaskEvidence) -> Benchmar
             record.status == UsageStatus::Completed
                 && matches!(
                     record.task.as_str(),
-                    "grounded_metadata" | "avionics_identity" | "avionics_review"
+                    "grounded_metadata"
+                        | "avionics_identity"
+                        | "avionics_review"
+                        | "avionics_search_grounding"
                 )
         })
         .count() as u64;
@@ -542,7 +567,7 @@ fn aggregate_usage(records: &[UsageRecord], evidence: &TaskEvidence) -> Benchmar
         successful_google_search_calls: recorded_successful_searches
             .max(evidence.successful_google_search_calls),
         search_queries: sum_records(records, |record| record.metrics.search_query_count),
-        successful_url_context_calls: 0,
+        successful_url_context_calls: evidence.successful_url_context_calls,
         citation_url_count: evidence.citation_urls.len() as u64,
         attempts: records.iter().fold(0_u64, |sum, record| {
             sum.saturating_add(u64::from(record.attempt_count))
@@ -716,11 +741,18 @@ mod tests {
     use super::*;
     use crate::gemini::benchmark::BenchmarkPricing;
     use crate::gemini::usage::{
-        estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, ValidationStatus,
+        estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, ToolUseBilling,
+        ValidationStatus,
     };
 
     fn usage_record(id: i64, metrics: UsageMetrics) -> UsageRecord {
-        let cost = estimate_paid_list_cost("gemini-3.5-flash", "standard", &metrics).ok();
+        let cost = estimate_paid_list_cost(
+            "gemini-3.5-flash",
+            "standard",
+            ToolUseBilling::GoogleSearchContextExcluded,
+            &metrics,
+        )
+        .ok();
         UsageRecord {
             id,
             task: "listing_extraction".to_string(),
@@ -828,7 +860,8 @@ mod tests {
             );
         }
 
-        let complete_usage = aggregate_usage(&[complete.clone()], &TaskEvidence::default());
+        let complete_usage =
+            aggregate_usage(std::slice::from_ref(&complete), &TaskEvidence::default());
         assert!(complete_usage.billable_usage_complete);
         assert!(BenchmarkPricing::official_standard_defaults()
             .estimate("gemini-3.5-flash", &complete_usage)
@@ -867,8 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_counts_grounded_metadata_search_and_citations() {
-        let mut record = usage_record(
+    fn aggregate_counts_staged_avionics_grounding_and_citations() {
+        let mut search_record = usage_record(
             20,
             UsageMetrics {
                 input_tokens: Some(100),
@@ -879,24 +912,82 @@ mod tests {
                 search_query_count: Some(1),
             },
         );
-        record.task = "grounded_metadata".to_string();
+        search_record.task = "avionics_search_grounding".to_string();
+        let stage_metrics = UsageMetrics {
+            input_tokens: Some(50),
+            output_tokens: Some(10),
+            thought_tokens: Some(0),
+            cached_tokens: Some(0),
+            tool_tokens: Some(0),
+            search_query_count: Some(0),
+        };
+        let mut url_context_record = usage_record(21, stage_metrics.clone());
+        url_context_record.task = "avionics_url_verification".to_string();
+        let mut structure_record = usage_record(22, stage_metrics);
+        structure_record.task = "avionics_structure".to_string();
         let response = GroundedJsonResponse {
             value: json!({}),
             google_search_used: true,
+            url_context_used: true,
+            authoritative_direct_source_verified: false,
+            authoritative_direct_source_final_urls: Vec::new(),
             grounding_sources: vec![crate::extract::GeminiGroundingSource {
                 chunk_index: 0,
                 url: "https://www.garmin.com/example".to_string(),
                 title: "Garmin".to_string(),
             }],
             grounding_supports: Vec::new(),
+            source_evidence_proofs: Vec::new(),
+            interaction_audits: vec![crate::gemini::curation::workflow::InteractionAudit {
+                purpose: "benchmark_avionics_url_verification".to_string(),
+                request_json: json!({}),
+                interaction_id: Some("interaction-1".to_string()),
+                model: Some("gemini-3.5-flash".to_string()),
+                status: "completed".to_string(),
+                successful_google_search_calls: 1,
+                successful_url_context_calls: 1,
+                function_calls: 0,
+                citation_urls: vec!["https://www.garmin.com/example".to_string()],
+                total_input_tokens: Some(100),
+                total_output_tokens: Some(20),
+                raw_response: json!({}),
+            }],
+            verified_evidence: None,
         };
         let mut evidence = TaskEvidence::default();
         evidence.observe_grounded_response(&response);
 
-        let usage = aggregate_usage(&[record], &evidence);
+        let usage = aggregate_usage(
+            &[search_record, url_context_record, structure_record],
+            &evidence,
+        );
+        assert_eq!(usage.total_input_tokens, 200);
+        assert_eq!(usage.total_output_tokens, 40);
         assert_eq!(usage.grounded_requests, 1);
         assert_eq!(usage.successful_google_search_calls, 1);
+        assert_eq!(usage.successful_url_context_calls, 1);
         assert_eq!(usage.citation_url_count, 1);
+    }
+
+    #[test]
+    fn grounded_response_boolean_is_url_context_accounting_fallback() {
+        let response = GroundedJsonResponse {
+            value: json!({}),
+            google_search_used: true,
+            url_context_used: true,
+            authoritative_direct_source_verified: false,
+            authoritative_direct_source_final_urls: Vec::new(),
+            grounding_sources: Vec::new(),
+            grounding_supports: Vec::new(),
+            source_evidence_proofs: Vec::new(),
+            interaction_audits: Vec::new(),
+            verified_evidence: None,
+        };
+        let mut evidence = TaskEvidence::default();
+        evidence.observe_grounded_response(&response);
+
+        assert_eq!(evidence.successful_google_search_calls, 1);
+        assert_eq!(evidence.successful_url_context_calls, 1);
     }
 
     #[test]

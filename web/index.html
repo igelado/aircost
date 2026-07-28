@@ -18,7 +18,9 @@
       </div>
       <nav class="nav-tabs" aria-label="Primary">
         <button class="nav-tab is-active" type="button" data-panel="listings-panel">Listings</button>
+        <button class="nav-tab" type="button" data-panel="review-panel">Review</button>
         <button class="nav-tab" type="button" data-panel="aircraft-panel">Aircraft</button>
+        <button class="nav-tab" type="button" data-panel="avionics-panel">Avionics</button>
         <button class="nav-tab" type="button" data-panel="comparisons-panel">Comparisons</button>
         <button class="nav-tab" type="button" data-panel="rentals-panel">Rentals</button>
       </nav>
@@ -132,6 +134,142 @@
         </section>
       </section>
 
+      <section class="view-panel" id="review-panel">
+        <div class="metrics-row review-metrics" aria-label="Listing review summary">
+          <div class="metric">
+            <span class="metric-label">Pending listings</span>
+            <strong id="review-pending-count">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Pending checks</span>
+            <strong id="review-aspect-count">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Issue types</span>
+            <strong id="review-reason-count">0</strong>
+          </div>
+        </div>
+
+        <section class="data-panel review-queue" id="review-queue-view" aria-labelledby="review-queue-title">
+          <div class="review-toolbar">
+            <div>
+              <h2 id="review-queue-title">Listings needing verification</h2>
+              <p>Resolve every pending check before admitting a listing to valuation.</p>
+            </div>
+            <button class="icon-button" id="refresh-reviews" type="button" aria-label="Refresh review queue" title="Refresh review queue">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 2v4h4"></path><path d="M6 22v-4H2"></path></svg>
+            </button>
+          </div>
+          <div class="review-message" id="review-queue-message" role="status" aria-live="polite"></div>
+          <div class="table-shell review-table-shell" id="review-results" aria-busy="false">
+            <table class="review-table">
+              <caption class="sr-only">Listings waiting for verification</caption>
+              <thead>
+                <tr>
+                  <th>Aircraft</th>
+                  <th>Tail</th>
+                  <th>Year</th>
+                  <th>Checks</th>
+                  <th>Why review is needed</th>
+                  <th>Updated</th>
+                  <th><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="review-table-body"></tbody>
+            </table>
+            <div class="empty-state is-hidden" id="empty-reviews">No listings need verification.</div>
+          </div>
+        </section>
+
+        <section class="review-workspace is-hidden" id="review-workspace" aria-labelledby="review-workspace-title">
+          <header class="review-workspace-header">
+            <button class="button subtle" id="review-back" type="button">Back to queue</button>
+            <div class="review-workspace-heading">
+              <h2 id="review-workspace-title">Listing review</h2>
+              <p id="review-workspace-subtitle">Loading review details…</p>
+            </div>
+            <button class="button" id="review-next" type="button">Next pending</button>
+          </header>
+
+          <div class="review-message" id="review-workspace-message" role="status" aria-live="polite"></div>
+          <div class="review-stale is-hidden" id="review-stale" role="alert">
+            <div>
+              <strong>This review changed on the server.</strong>
+              <span>Reload it before making verification decisions.</span>
+            </div>
+            <button class="button" id="review-reload" type="button">Reload review</button>
+          </div>
+
+          <section class="review-source" aria-labelledby="review-source-title">
+            <div>
+              <span class="review-eyebrow" id="review-source-title">Listing source</span>
+              <strong id="review-source-label">No source recorded</strong>
+            </div>
+            <a class="button is-hidden" id="review-source-link" target="_blank" rel="noopener noreferrer">Open source</a>
+          </section>
+
+          <div class="review-tabs-shell">
+            <div class="review-tabs" role="tablist" aria-label="Listing review sections">
+              <button
+                class="review-tab"
+                id="review-aircraft-tab"
+                type="button"
+                role="tab"
+                aria-controls="review-aircraft-panel"
+                aria-selected="false"
+                tabindex="-1"
+              >
+                <span>Aircraft</span>
+                <span class="review-tab-count" id="review-aircraft-tab-count" aria-hidden="true">0</span>
+              </button>
+              <button
+                class="review-tab"
+                id="review-avionics-tab"
+                type="button"
+                role="tab"
+                aria-controls="review-avionics-panel"
+                aria-selected="true"
+                tabindex="0"
+              >
+                <span>Avionics</span>
+                <span class="review-tab-count" id="review-avionics-tab-count" aria-hidden="true">0</span>
+              </button>
+            </div>
+          </div>
+
+          <section
+            class="review-tab-panel"
+            id="review-aircraft-panel"
+            role="tabpanel"
+            aria-labelledby="review-aircraft-tab"
+            tabindex="0"
+            hidden
+          >
+            <div class="review-aircraft-summary" id="review-aircraft-summary"></div>
+          </section>
+
+          <section
+            class="review-tab-panel"
+            id="review-avionics-panel"
+            role="tabpanel"
+            aria-labelledby="review-avionics-tab"
+            tabindex="0"
+          >
+            <div class="review-listing-reasons" id="review-avionics-reasons"></div>
+            <div class="review-aspects" id="review-avionics-aspects" aria-busy="false"></div>
+          </section>
+
+          <footer class="review-workspace-footer">
+            <div class="review-progress">
+              <label for="review-progress">Decision progress</label>
+              <progress id="review-progress" max="1" value="0"></progress>
+              <span id="review-progress-label">0 of 0 decided</span>
+            </div>
+            <button class="button primary" id="verify-listing" type="button" disabled>Verify listing</button>
+          </footer>
+        </section>
+      </section>
+
       <section class="view-panel" id="aircraft-panel">
         <section class="data-panel aircraft-panel">
           <div class="aircraft-toolbar">
@@ -192,6 +330,73 @@
             </table>
             <div class="empty-state is-hidden" id="empty-aircraft-values">No aircraft values found.</div>
           </div>
+        </section>
+      </section>
+
+      <section class="view-panel" id="avionics-panel">
+        <div class="metrics-row avionics-metrics" aria-label="Avionics catalog summary">
+          <div class="metric">
+            <span class="metric-label">Catalog entries</span>
+            <strong id="avionics-total-count">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Complete on page</span>
+            <strong id="avionics-complete-count">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Observed in listings on page</span>
+            <strong id="avionics-used-count">0</strong>
+          </div>
+        </div>
+
+        <section class="data-panel avionics-catalog" aria-labelledby="avionics-catalog-title">
+          <h2 class="sr-only" id="avionics-catalog-title">Avionics catalog</h2>
+          <div class="avionics-toolbar">
+            <label class="search-box">
+              <span class="sr-only">Search avionics</span>
+              <input id="avionics-search" type="search" placeholder="Search manufacturer, model, or identifier" autocomplete="off">
+            </label>
+            <select id="avionics-status-filter" aria-label="Catalog status filter">
+              <option value="">All statuses</option>
+            </select>
+            <select id="avionics-capability-filter" aria-label="Capability filter">
+              <option value="">All capabilities</option>
+            </select>
+            <select id="avionics-completeness-filter" aria-label="Completeness filter">
+              <option value="">All completeness levels</option>
+              <option value="complete">Complete</option>
+              <option value="incomplete">Incomplete</option>
+            </select>
+            <button class="icon-button" id="refresh-avionics" type="button" aria-label="Refresh avionics" title="Refresh avionics">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 2v4h4"></path><path d="M6 22v-4H2"></path></svg>
+            </button>
+          </div>
+          <div class="avionics-message" id="avionics-message" role="status" aria-live="polite"></div>
+          <div class="table-shell avionics-table-shell" id="avionics-results" aria-busy="false">
+            <table class="avionics-table">
+              <caption class="sr-only">Avionics catalog search results</caption>
+              <thead>
+                <tr>
+                  <th>Manufacturer / model</th>
+                  <th>Identifier</th>
+                  <th>Capabilities</th>
+                  <th>Status</th>
+                  <th>Value</th>
+                  <th>Usage</th>
+                  <th><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="avionics-table-body"></tbody>
+            </table>
+            <div class="empty-state is-hidden" id="empty-avionics">No avionics match these filters.</div>
+          </div>
+          <nav class="catalog-pagination" aria-label="Avionics result pages">
+            <span id="avionics-page-summary">0 results</span>
+            <div>
+              <button class="button" id="avionics-previous-page" type="button">Previous</button>
+              <button class="button" id="avionics-next-page" type="button">Next</button>
+            </div>
+          </nav>
         </section>
       </section>
 
@@ -301,6 +506,19 @@
       <div class="form-message" id="form-message" role="status"></div>
     </form>
   </dialog>
-  <script src="/app.js"></script>
+
+  <dialog class="avionics-detail-dialog" id="avionics-detail-dialog" aria-labelledby="avionics-detail-title">
+    <div class="dialog-header">
+      <div>
+        <h2 id="avionics-detail-title">Avionics details</h2>
+        <span id="avionics-detail-subtitle">Catalog identity and usage</span>
+      </div>
+      <button class="icon-button" id="close-avionics-detail" type="button" aria-label="Close avionics details" title="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>
+      </button>
+    </div>
+    <div class="avionics-detail-body" id="avionics-detail-body" tabindex="-1"></div>
+  </dialog>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>
