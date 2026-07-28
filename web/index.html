@@ -137,15 +137,15 @@
       <section class="view-panel" id="review-panel">
         <div class="metrics-row review-metrics" aria-label="Listing review summary">
           <div class="metric">
-            <span class="metric-label">Pending listings</span>
+            <span class="metric-label" id="review-pending-label">Pending listings</span>
             <strong id="review-pending-count">0</strong>
           </div>
           <div class="metric">
-            <span class="metric-label">Pending checks</span>
+            <span class="metric-label" id="review-aspect-label">Pending checks</span>
             <strong id="review-aspect-count">0</strong>
           </div>
           <div class="metric">
-            <span class="metric-label">Issue types</span>
+            <span class="metric-label" id="review-reason-label">Issue types</span>
             <strong id="review-reason-count">0</strong>
           </div>
         </div>
@@ -153,15 +153,21 @@
         <section class="data-panel review-queue" id="review-queue-view" aria-labelledby="review-queue-title">
           <div class="review-toolbar">
             <div>
-              <h2 id="review-queue-title">Listings needing verification</h2>
-              <p>Resolve every pending check before admitting a listing to valuation.</p>
+              <h2 id="review-queue-title">Avionics needing verification</h2>
+              <p>Attest each product once, then validate its listing associations locally.</p>
             </div>
-            <button class="icon-button" id="refresh-reviews" type="button" aria-label="Refresh review queue" title="Refresh review queue">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 2v4h4"></path><path d="M6 22v-4H2"></path></svg>
-            </button>
+            <div class="review-toolbar-actions">
+              <div class="review-mode-switch" role="group" aria-label="Review queue grouping">
+                <button class="button is-active" id="review-mode-product" type="button" aria-pressed="true">By product</button>
+                <button class="button subtle" id="review-mode-listing" type="button" aria-pressed="false">By listing</button>
+              </div>
+              <button class="icon-button" id="refresh-reviews" type="button" aria-label="Refresh review queue" title="Refresh review queue">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15.5 6.2"></path><path d="M3 12A9 9 0 0 1 18.5 5.8"></path><path d="M18 2v4h4"></path><path d="M6 22v-4H2"></path></svg>
+              </button>
+            </div>
           </div>
           <div class="review-message" id="review-queue-message" role="status" aria-live="polite"></div>
-          <div class="table-shell review-table-shell" id="review-results" aria-busy="false">
+          <div class="table-shell review-table-shell is-hidden" id="review-results" aria-busy="false">
             <table class="review-table">
               <caption class="sr-only">Listings waiting for verification</caption>
               <thead>
@@ -178,6 +184,65 @@
               <tbody id="review-table-body"></tbody>
             </table>
             <div class="empty-state is-hidden" id="empty-reviews">No listings need verification.</div>
+          </div>
+          <div id="review-product-results" aria-busy="false">
+            <div class="table-shell review-table-shell">
+              <table class="review-product-table">
+                <caption class="sr-only">Products with pending listing associations</caption>
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Identity</th>
+                    <th>Pending</th>
+                    <th><span class="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody id="review-product-table-body"></tbody>
+              </table>
+              <div class="empty-state is-hidden" id="empty-review-products">No product associations need verification.</div>
+            </div>
+            <section class="review-product-workspace is-hidden" id="review-product-workspace" aria-labelledby="review-product-title">
+              <header class="review-product-heading">
+                <div>
+                  <span class="review-eyebrow">Selected product</span>
+                  <h3 id="review-product-title">Product review</h3>
+                  <p id="review-product-summary"></p>
+                </div>
+                <span class="status-pill" id="review-product-status">Checking identity…</span>
+              </header>
+              <form id="review-product-attestation-form">
+                <div class="form-grid review-product-dossier">
+                  <label>OEM source URL
+                    <input name="identity_source_url" type="url" required placeholder="https://manufacturer.example/product">
+                  </label>
+                  <label>OEM source title
+                    <input name="identity_source_title" required maxlength="200">
+                    <span class="field-hint" id="review-product-title-count">0 / 200</span>
+                  </label>
+                  <label class="full-width">Exact model and identifier excerpt
+                    <textarea name="identity_evidence_text" required maxlength="128" rows="3"></textarea>
+                    <span class="field-hint" id="review-product-evidence-count">0 / 128</span>
+                  </label>
+                </div>
+                <button class="button primary" id="review-product-attest" type="submit">Attest product from OEM source</button>
+              </form>
+              <div class="review-product-actions">
+                <button class="button primary" id="review-product-validate" type="button">Validate pending associations locally</button>
+                <span id="review-product-action-message" role="status" aria-live="polite"></span>
+              </div>
+              <div class="table-shell">
+                <table class="review-product-association-table">
+                  <thead>
+                    <tr>
+                      <th>Listing</th>
+                      <th>Observed text</th>
+                      <th>Result</th>
+                    </tr>
+                  </thead>
+                  <tbody id="review-product-association-body"></tbody>
+                </table>
+              </div>
+            </section>
           </div>
         </section>
 

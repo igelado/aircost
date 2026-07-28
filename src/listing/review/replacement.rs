@@ -13,19 +13,19 @@ use super::*;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ExistingProductAspectSelection {
+pub(crate) struct ReplacementProductSelection {
     pub aspect_id: ReviewAspectId,
-    pub avionics_model_id: i64,
+    pub product_id: i64,
     pub quantity: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UseExistingReplacementRelationshipRequest {
+pub(crate) struct ApproveReplacementProductsRequest {
     pub review_payload_sha256: String,
     pub catalog_revision_sha256: String,
-    pub parent: ExistingProductAspectSelection,
-    pub child: ExistingProductAspectSelection,
+    pub parent: ReplacementProductSelection,
+    pub child: ReplacementProductSelection,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,7 +44,7 @@ struct GraphIdentityRow {
 
 fn relationship_plan(
     aspects: &[PendingReviewAspect],
-    request: &UseExistingReplacementRelationshipRequest,
+    request: &ApproveReplacementProductsRequest,
 ) -> ReviewResult<RelationshipPlan> {
     if !valid_sha256(&request.review_payload_sha256)
         || !valid_sha256(&request.catalog_revision_sha256)
@@ -58,12 +58,13 @@ fn relationship_plan(
             "replacement parent and child must be different review aspects".to_string(),
         ));
     }
-    if request.parent.avionics_model_id <= 0
-        || request.child.avionics_model_id <= 0
-        || request.parent.avionics_model_id == request.child.avionics_model_id
+    if request.parent.product_id <= 0
+        || request.child.product_id <= 0
+        || request.parent.product_id == request.child.product_id
     {
         return Err(ReviewError::Validation(
-            "replacement parent and child must select different positive catalog IDs".to_string(),
+            "replacement parent and child must select different positive approved product IDs"
+                .to_string(),
         ));
     }
 
@@ -98,7 +99,7 @@ fn relationship_plan(
                 .contains(&ReviewAction::UseVerifiedProduct)
         {
             return Err(ReviewError::Validation(format!(
-                "replacement {role} aspect {} does not allow existing-product approval",
+                "replacement {role} aspect {} does not allow approved-product selection",
                 aspect.id
             )));
         }
@@ -110,7 +111,7 @@ fn relationship_plan(
         }
         if aspect
             .reuse_attestation_target_id
-            .is_some_and(|target_id| target_id != selection.avionics_model_id)
+            .is_some_and(|target_id| target_id != selection.product_id)
         {
             return Err(ReviewError::Conflict(format!(
                 "replacement {role} aspect {} is bound to a different catalog product",
@@ -247,11 +248,11 @@ fn validate_resulting_action_graph(
 
 /// Approve one complete parent/child replacement relationship without
 /// grounding, product mutation, or any other review decision.
-pub(crate) async fn use_existing_replacement_relationship_and_restage(
+pub(crate) async fn approve_replacement_products_and_restage(
     db: &AppDb,
     owner_user_id: i64,
     listing_id: i64,
-    request: &UseExistingReplacementRelationshipRequest,
+    request: &ApproveReplacementProductsRequest,
 ) -> ReviewResult<Option<StagedPendingReview>> {
     let lock_catalog = match db.backend() {
         DatabaseBackend::Sqlite(_) => db.sql(
@@ -405,8 +406,8 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
             reject_implicit_merge(
                 &assignments,
                 plan.covered_link_id,
-                request.parent.avionics_model_id,
-                request.child.avionics_model_id,
+                request.parent.product_id,
+                request.child.product_id,
             )?;
 
             let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
@@ -427,8 +428,8 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
                 .await?;
             let approved = approved_product_map(approved_rows);
             for selected_id in [
-                request.parent.avionics_model_id,
-                request.child.avionics_model_id,
+                request.parent.product_id,
+                request.child.product_id,
             ] {
                 if !approved.contains_key(&selected_id)
                     || !$reuse_attestation_is_current(db, &mut transaction, selected_id).await?
@@ -457,13 +458,13 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
                 } else {
                     assignments.push(ExistingAssignmentRow {
                         listing_link_id: -1,
-                        avionics_model_id: request.parent.avionics_model_id,
+                        avionics_model_id: request.parent.product_id,
                         quantity: request.parent.quantity,
                         source: "listing_review".to_string(),
                         source_notes: parent.source_evidence_text.clone(),
                         source_confidence: Some("high".to_string()),
                         configuration_action: "replaces".to_string(),
-                        replaces_avionics_model_id: Some(request.child.avionics_model_id),
+                        replaces_avionics_model_id: Some(request.child.product_id),
                         installed_catalog_status: Some("approved".to_string()),
                         replacement_catalog_status: Some("approved".to_string()),
                     });
@@ -471,13 +472,13 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
                 };
             {
                 let proposed = &mut assignments[proposed_assignment_index];
-                proposed.avionics_model_id = request.parent.avionics_model_id;
+                proposed.avionics_model_id = request.parent.product_id;
                 proposed.quantity = request.parent.quantity;
                 proposed.source = "listing_review".to_string();
                 proposed.source_notes = parent.source_evidence_text.clone();
                 proposed.source_confidence = Some("high".to_string());
                 proposed.configuration_action = "replaces".to_string();
-                proposed.replaces_avionics_model_id = Some(request.child.avionics_model_id);
+                proposed.replaces_avionics_model_id = Some(request.child.product_id);
                 proposed.installed_catalog_status = Some("approved".to_string());
                 proposed.replacement_catalog_status = Some("approved".to_string());
             }
@@ -492,10 +493,10 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
                     .get_mut(proposed_assignment_index)
                     .expect("proposed assignment index remains valid");
                 let changed = sqlx::query(&update_link)
-                    .bind(request.parent.avionics_model_id)
+                    .bind(request.parent.product_id)
                     .bind(request.parent.quantity)
                     .bind(source_notes)
-                    .bind(request.child.avionics_model_id)
+                    .bind(request.child.product_id)
                     .bind(listing_link_id)
                     .bind(listing_id)
                     .bind(original.avionics_model_id)
@@ -515,10 +516,10 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
             } else {
                 let listing_link_id = sqlx::query_scalar::<_, i64>(&insert_link)
                     .bind(listing_id)
-                    .bind(request.parent.avionics_model_id)
+                    .bind(request.parent.product_id)
                     .bind(request.parent.quantity)
                     .bind(source_notes)
-                    .bind(request.child.avionics_model_id)
+                    .bind(request.child.product_id)
                     .fetch_one(&mut *transaction)
                     .await?;
                 assignments[proposed_assignment_index].listing_link_id = listing_link_id;
@@ -565,12 +566,12 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
             let accepted_parent = CoveredListingAssociation {
                 listing_link_id,
                 role: ListingAssociationRole::Installed,
-                avionics_model_id: request.parent.avionics_model_id,
+                avionics_model_id: request.parent.product_id,
             };
             let accepted_child = CoveredListingAssociation {
                 listing_link_id,
                 role: ListingAssociationRole::Replacement,
-                avionics_model_id: request.child.avionics_model_id,
+                avionics_model_id: request.child.product_id,
             };
             if !corroborated_associations.contains(&accepted_parent)
                 || !corroborated_associations.contains(&accepted_child)
@@ -675,18 +676,18 @@ pub(crate) async fn use_existing_replacement_relationship_and_restage(
 mod tests {
     use super::*;
 
-    fn request() -> UseExistingReplacementRelationshipRequest {
-        UseExistingReplacementRelationshipRequest {
+    fn request() -> ApproveReplacementProductsRequest {
+        ApproveReplacementProductsRequest {
             review_payload_sha256: "a".repeat(64),
             catalog_revision_sha256: "b".repeat(64),
-            parent: ExistingProductAspectSelection {
+            parent: ReplacementProductSelection {
                 aspect_id: "parent".into(),
-                avionics_model_id: 10,
+                product_id: 10,
                 quantity: 2,
             },
-            child: ExistingProductAspectSelection {
+            child: ReplacementProductSelection {
                 aspect_id: "child".into(),
-                avionics_model_id: 20,
+                product_id: 20,
                 quantity: 1,
             },
         }
@@ -728,51 +729,47 @@ mod tests {
             "catalog_revision_sha256": "b".repeat(64),
             "parent": {
                 "aspect_id": "parent",
-                "avionics_model_id": 10,
+                "product_id": 10,
                 "quantity": 2
             },
             "child": {
                 "aspect_id": "child",
-                "avionics_model_id": 20,
+                "product_id": 20,
                 "quantity": 1
             }
         });
-        assert!(serde_json::from_value::<UseExistingReplacementRelationshipRequest>(value).is_ok());
+        assert!(serde_json::from_value::<ApproveReplacementProductsRequest>(value).is_ok());
         let legacy = serde_json::json!({
             "expected_review_payload_sha256": "a".repeat(64),
             "catalog_revision_sha256": "b".repeat(64),
             "parent": {
                 "aspect_id": "parent",
-                "avionics_model_id": 10,
+                "product_id": 10,
                 "quantity": 2
             },
             "child": {
                 "aspect_id": "child",
-                "avionics_model_id": 20,
+                "product_id": 20,
                 "quantity": 1
             }
         });
-        assert!(
-            serde_json::from_value::<UseExistingReplacementRelationshipRequest>(legacy).is_err()
-        );
+        assert!(serde_json::from_value::<ApproveReplacementProductsRequest>(legacy).is_err());
         let extra = serde_json::json!({
             "review_payload_sha256": "a".repeat(64),
             "catalog_revision_sha256": "b".repeat(64),
             "parent": {
                 "aspect_id": "parent",
-                "avionics_model_id": 10,
+                "product_id": 10,
                 "quantity": 2,
                 "legacy_product_id": 10
             },
             "child": {
                 "aspect_id": "child",
-                "avionics_model_id": 20,
+                "product_id": 20,
                 "quantity": 1
             }
         });
-        assert!(
-            serde_json::from_value::<UseExistingReplacementRelationshipRequest>(extra).is_err()
-        );
+        assert!(serde_json::from_value::<ApproveReplacementProductsRequest>(extra).is_err());
     }
 
     #[test]

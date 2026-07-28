@@ -13,12 +13,16 @@ pub(crate) mod replacement;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::aircraft::faa::{block_reason_code, require_listing_admission, AircraftAdmissionError};
-use crate::avionics::catalog::exact_product_identity_signal_is_present;
+use crate::avionics::catalog::{
+    exact_product_identity_signal_is_present, PendingProductAttestationCommitGuard,
+};
 use crate::avionics::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
     stage_batch_manufacturer_alias_collision_postgres,
@@ -179,7 +183,6 @@ impl From<i64> for ReviewAspectId {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewAction {
     UseVerifiedProduct,
-    VerifyExistingProduct,
     CreateVerifiedProduct,
     Discard,
 }
@@ -507,6 +510,75 @@ pub struct ListingReviewQueue {
     pub offset: i64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductReviewPageQuery {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductAttestationStatus {
+    Current,
+    Required,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PendingProductReviewGroup {
+    pub product: ReviewProduct,
+    pub attestation_status: ProductAttestationStatus,
+    pub pending_association_count: i64,
+    pub pending_listing_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PendingProductReviewPage {
+    pub catalog_revision_sha256: String,
+    pub items: Vec<PendingProductReviewGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PendingProductAssociation {
+    pub listing_id: i64,
+    pub listing_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    pub aspect_id: ReviewAspectId,
+    pub review_payload_sha256: String,
+    pub observed_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_evidence_text: Option<String>,
+    pub quantity: i64,
+    pub configuration_action: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PendingProductAssociationPage {
+    pub product: ReviewProduct,
+    pub attestation_status: ProductAttestationStatus,
+    pub catalog_revision_sha256: String,
+    pub associations: Vec<PendingProductAssociation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProductGroupCursor {
+    product_id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProductAssociationCursor {
+    product_id: i64,
+    listing_id: i64,
+    aspect_key: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReviewAspectView {
     pub id: ReviewAspectId,
@@ -556,15 +628,9 @@ pub struct ListingReviewDetail {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ResolveReviewRequest {
-    #[serde(
-        rename = "review_payload_sha256",
-        alias = "expected_review_payload_sha256"
-    )]
+    #[serde(rename = "review_payload_sha256")]
     pub expected_review_payload_sha256: String,
-    #[serde(
-        rename = "catalog_revision_sha256",
-        alias = "expected_catalog_revision_sha256"
-    )]
+    #[serde(rename = "catalog_revision_sha256")]
     pub expected_catalog_revision_sha256: String,
     /// Opt in to network-capable enrichment after the review transaction
     /// commits. Omitted requests only save decisions and leave the listing
@@ -580,17 +646,6 @@ pub enum ReviewDecision {
     UseVerifiedProduct {
         aspect_id: ReviewAspectId,
         avionics_model_id: i64,
-    },
-    /// Freshly ground an existing approved product and bind the positive
-    /// result to the current reuse policy. The product identity and
-    /// capabilities come from the locked catalog row; reviewers supply only
-    /// the authoritative source passage to verify.
-    VerifyExistingProduct {
-        aspect_id: ReviewAspectId,
-        avionics_model_id: i64,
-        identity_source_url: String,
-        identity_source_title: String,
-        identity_evidence_text: String,
     },
     CreateVerifiedProduct {
         aspect_id: ReviewAspectId,
@@ -622,7 +677,6 @@ impl ReviewDecision {
     fn aspect_id(&self) -> &ReviewAspectId {
         match self {
             Self::UseVerifiedProduct { aspect_id, .. }
-            | Self::VerifyExistingProduct { aspect_id, .. }
             | Self::CreateVerifiedProduct { aspect_id, .. }
             | Self::Discard { aspect_id, .. } => aspect_id,
         }
@@ -631,7 +685,6 @@ impl ReviewDecision {
     fn action(&self) -> ReviewAction {
         match self {
             Self::UseVerifiedProduct { .. } => ReviewAction::UseVerifiedProduct,
-            Self::VerifyExistingProduct { .. } => ReviewAction::VerifyExistingProduct,
             Self::CreateVerifiedProduct { .. } => ReviewAction::CreateVerifiedProduct,
             Self::Discard { .. } => ReviewAction::Discard,
         }
@@ -686,6 +739,19 @@ struct QueueRow {
     pending_aspect_count: i64,
     review_payload_json: String,
     updated_at: String,
+    manufacturer: String,
+    model: String,
+    variant: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ProductReviewSourceRow {
+    listing_id: i64,
+    source_url: Option<String>,
+    model_year: i64,
+    pending_aspect_count: i64,
+    review_payload_json: String,
+    review_payload_sha256: String,
     manufacturer: String,
     model: String,
     variant: String,
@@ -1271,11 +1337,7 @@ fn validated_aspects(aspects: &[PendingReviewAspect]) -> ReviewResult<Vec<Pendin
                     aspect.id
                 )));
             }
-            aspect.allowed_actions = vec![
-                ReviewAction::UseVerifiedProduct,
-                ReviewAction::VerifyExistingProduct,
-                ReviewAction::Discard,
-            ];
+            aspect.allowed_actions = vec![ReviewAction::Discard];
         } else if aspect.kind.starts_with("avionics") {
             // These are reviewer capabilities, not predictions made while the
             // bundle was staged. Product selection searches the live approved
@@ -2717,6 +2779,285 @@ fn queue_reason_codes(reason: &str) -> Vec<String> {
     }
 }
 
+fn product_review_page_limit(query: &ProductReviewPageQuery) -> ReviewResult<usize> {
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
+        return Err(ReviewError::Validation(format!(
+            "limit must be between 1 and {MAX_PAGE_LIMIT}"
+        )));
+    }
+    Ok(limit as usize)
+}
+
+fn encode_product_review_cursor<T: Serialize>(cursor: &T) -> ReviewResult<String> {
+    let bytes = serde_json::to_vec(cursor).map_err(|error| {
+        ReviewError::Database(format!("could not encode review cursor: {error}"))
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_product_review_cursor<T>(
+    cursor: Option<&str>,
+    cursor_kind: &str,
+) -> ReviewResult<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(cursor).map_err(|_| {
+        ReviewError::Validation(format!(
+            "{cursor_kind} cursor is not valid opaque base64url"
+        ))
+    })?;
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+        ReviewError::Validation(format!("{cursor_kind} cursor has an invalid payload"))
+    })
+}
+
+async fn load_product_review_source_rows(
+    db: &AppDb,
+    owner_user_id: i64,
+) -> ReviewResult<Vec<ProductReviewSourceRow>> {
+    let sql = db.sql(
+        r#"
+        SELECT
+          listing.id AS listing_id,
+          listing.source_url,
+          listing.model_year,
+          review.pending_aspect_count,
+          review.review_payload_json,
+          review.review_payload_sha256,
+          manufacturer.name AS manufacturer,
+          model.name AS model,
+          variant.name AS variant
+        FROM aircraft_sale_listing_pending_reviews review
+        JOIN aircraft_sale_listings listing ON listing.id = review.listing_id
+        JOIN aircraft_model_variants variant
+          ON variant.id = listing.aircraft_model_variant_id
+        JOIN aircraft_models model ON model.id = variant.aircraft_model_id
+        JOIN aircraft_manufacturers manufacturer
+          ON manufacturer.id = model.aircraft_manufacturer_id
+        WHERE listing.created_by_user_id = ?
+        ORDER BY listing.id
+        "#,
+    );
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => Ok(sqlx::query_as::<_, ProductReviewSourceRow>(&sql)
+            .bind(owner_user_id)
+            .fetch_all(pool)
+            .await?),
+        DatabaseBackend::Postgres(pool) => Ok(sqlx::query_as::<_, ProductReviewSourceRow>(&sql)
+            .bind(owner_user_id)
+            .fetch_all(pool)
+            .await?),
+    }
+}
+
+fn aspect_cursor_key(aspect_id: &ReviewAspectId) -> ReviewResult<String> {
+    serde_json::to_string(aspect_id)
+        .map_err(|error| ReviewError::Database(format!("could not encode aspect cursor: {error}")))
+}
+
+fn pending_product_associations_from_rows(
+    rows: Vec<ProductReviewSourceRow>,
+) -> ReviewResult<Vec<(i64, String, PendingProductAssociation)>> {
+    let mut associations = Vec::new();
+    for row in rows {
+        let payload = parse_payload(
+            &row.review_payload_json,
+            Some(&row.review_payload_sha256),
+            row.pending_aspect_count,
+        )?;
+        let listing_label =
+            listing_label(row.model_year, &row.manufacturer, &row.model, &row.variant);
+        for aspect in payload.aspects {
+            let Some(product_id) = aspect.reuse_attestation_target_id else {
+                continue;
+            };
+            let aspect_key = aspect_cursor_key(&aspect.id)?;
+            associations.push((
+                product_id,
+                aspect_key,
+                PendingProductAssociation {
+                    listing_id: row.listing_id,
+                    listing_label: listing_label.clone(),
+                    source_url: row.source_url.clone(),
+                    aspect_id: aspect.id,
+                    review_payload_sha256: row.review_payload_sha256.clone(),
+                    observed_text: aspect.observed_text,
+                    source_evidence_text: aspect.source_evidence_text,
+                    quantity: aspect.quantity,
+                    configuration_action: aspect.configuration_action,
+                },
+            ));
+        }
+    }
+    associations.sort_by(|left, right| {
+        (left.0, left.2.listing_id, left.1.as_str()).cmp(&(
+            right.0,
+            right.2.listing_id,
+            right.1.as_str(),
+        ))
+    });
+    Ok(associations)
+}
+
+pub async fn list_pending_product_reviews(
+    db: &AppDb,
+    owner_user_id: i64,
+    query: ProductReviewPageQuery,
+) -> ReviewResult<PendingProductReviewPage> {
+    let limit = product_review_page_limit(&query)?;
+    let cursor = decode_product_review_cursor::<ProductGroupCursor>(
+        query.cursor.as_deref(),
+        "product review",
+    )?;
+    let associations = pending_product_associations_from_rows(
+        load_product_review_source_rows(db, owner_user_id).await?,
+    )?;
+    let products = load_all_approved_product_map(db).await?;
+    let current_attestations = current_reuse_attested_product_ids(db).await?;
+    let mut counts = BTreeMap::<i64, (i64, HashSet<i64>)>::new();
+    for (product_id, _, association) in associations {
+        let count = counts
+            .entry(product_id)
+            .or_insert_with(|| (0, HashSet::new()));
+        count.0 += 1;
+        count.1.insert(association.listing_id);
+    }
+
+    let mut groups = Vec::new();
+    for (product_id, (pending_association_count, listing_ids)) in counts {
+        let product = products.get(&product_id).cloned().ok_or_else(|| {
+            ReviewError::Conflict(format!(
+                "pending review targets catalog id {product_id}, which is not a current approved product"
+            ))
+        })?;
+        let status = if current_attestations.contains(&product_id) {
+            ProductAttestationStatus::Current
+        } else {
+            ProductAttestationStatus::Required
+        };
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| product_id <= cursor.product_id)
+        {
+            continue;
+        }
+        groups.push((
+            product_id,
+            PendingProductReviewGroup {
+                product,
+                attestation_status: status,
+                pending_association_count,
+                pending_listing_count: listing_ids.len() as i64,
+            },
+        ));
+    }
+    groups.sort_by_key(|(product_id, _)| *product_id);
+    let has_more = groups.len() > limit;
+    groups.truncate(limit);
+    let next_cursor = if has_more {
+        groups
+            .last()
+            .map(|(product_id, _)| ProductGroupCursor {
+                product_id: *product_id,
+            })
+            .map(|cursor| encode_product_review_cursor(&cursor))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(PendingProductReviewPage {
+        catalog_revision_sha256: approved_catalog_revision_sha256(db).await?,
+        items: groups.into_iter().map(|(_, group)| group).collect(),
+        next_cursor,
+    })
+}
+
+pub async fn list_pending_product_associations(
+    db: &AppDb,
+    owner_user_id: i64,
+    product_id: i64,
+    query: ProductReviewPageQuery,
+) -> ReviewResult<PendingProductAssociationPage> {
+    if product_id <= 0 {
+        return Err(ReviewError::Validation(
+            "product_id must be positive".to_string(),
+        ));
+    }
+    let limit = product_review_page_limit(&query)?;
+    let cursor = decode_product_review_cursor::<ProductAssociationCursor>(
+        query.cursor.as_deref(),
+        "product association",
+    )?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.product_id != product_id)
+    {
+        return Err(ReviewError::Validation(
+            "product association cursor belongs to a different product".to_string(),
+        ));
+    }
+    let mut associations = pending_product_associations_from_rows(
+        load_product_review_source_rows(db, owner_user_id).await?,
+    )?
+    .into_iter()
+    .filter(|(candidate_id, _, _)| *candidate_id == product_id)
+    .collect::<Vec<_>>();
+    if associations.is_empty() {
+        return Err(ReviewError::NotFound(format!(
+            "no pending review associations target approved catalog id {product_id}"
+        )));
+    }
+    let product = load_all_approved_product_map(db)
+        .await?
+        .remove(&product_id)
+        .ok_or_else(|| {
+            ReviewError::Conflict(format!(
+                "pending review targets catalog id {product_id}, which is not a current approved product"
+            ))
+        })?;
+    associations.retain(|(_, aspect_key, association)| {
+        cursor.as_ref().is_none_or(|cursor| {
+            (association.listing_id, aspect_key.as_str())
+                > (cursor.listing_id, cursor.aspect_key.as_str())
+        })
+    });
+    let has_more = associations.len() > limit;
+    associations.truncate(limit);
+    let next_cursor = if has_more {
+        associations
+            .last()
+            .map(|(_, aspect_key, association)| ProductAssociationCursor {
+                product_id,
+                listing_id: association.listing_id,
+                aspect_key: aspect_key.clone(),
+            })
+            .map(|cursor| encode_product_review_cursor(&cursor))
+            .transpose()?
+    } else {
+        None
+    };
+    let current_attestations = current_reuse_attested_product_ids(db).await?;
+    Ok(PendingProductAssociationPage {
+        product,
+        attestation_status: if current_attestations.contains(&product_id) {
+            ProductAttestationStatus::Current
+        } else {
+            ProductAttestationStatus::Required
+        },
+        catalog_revision_sha256: approved_catalog_revision_sha256(db).await?,
+        associations: associations
+            .into_iter()
+            .map(|(_, _, association)| association)
+            .collect(),
+        next_cursor,
+    })
+}
+
 const REVIEW_SELECT_SQL: &str = r#"
     SELECT
       listing.id AS listing_id,
@@ -3938,10 +4279,15 @@ pub async fn restage_unattested_preserved_products(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExistingProductVerificationTarget {
+pub(crate) struct PendingProductAttestationTarget {
     pub product: ReviewProduct,
-    pub quantity: i64,
     pub already_reuse_attested: bool,
+    pub commit_guard: PendingProductAttestationCommitGuard,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExistingProductAssociationTarget {
+    pub product: ReviewProduct,
     pub listing_evidence_text: String,
     pub observation_sha256: String,
 }
@@ -4109,19 +4455,137 @@ fn validate_existing_product_verification_evidence(
     Ok(())
 }
 
-/// Read-only, cost-avoidance gate for one aspect-scoped grounding request.
-/// The final attestation mutation rechecks the immutable catalog identity.
-pub(crate) async fn preflight_existing_product_verification(
+/// Read-only, cost-avoidance gate for one global product attestation.
+///
+/// One exact hash-bound pending association is the authorization boundary. A
+/// current attestation is returned before source validation or network access
+/// so retries remain both idempotent and free.
+pub(crate) async fn preflight_pending_product_attestation(
+    db: &AppDb,
+    owner_user_id: i64,
+    product_id: i64,
+    listing_id: i64,
+    expected_review_payload_sha256: &str,
+    aspect_id: &ReviewAspectId,
+    expected_catalog_revision_sha256: &str,
+    identity_source_url: &str,
+    identity_source_title: &str,
+    identity_evidence_text: &str,
+) -> ReviewResult<PendingProductAttestationTarget> {
+    if product_id <= 0
+        || listing_id <= 0
+        || !valid_sha256(expected_review_payload_sha256)
+        || !valid_sha256(expected_catalog_revision_sha256)
+    {
+        return Err(ReviewError::Validation(
+            "product and listing IDs must be positive and review and catalog revisions must be lowercase SHA-256 hex values"
+                .to_string(),
+        ));
+    }
+    let row = load_review_row(db, listing_id).await?;
+    if row.owner_user_id != owner_user_id {
+        return Err(ReviewError::Permission(
+            "reviewers may only attest products through listings they own".to_string(),
+        ));
+    }
+    if row.ingestion_state != "pending_review" || row.is_verified {
+        return Err(ReviewError::Stale(format!(
+            "listing {listing_id} is no longer in its expected pending-review state"
+        )));
+    }
+    if row.review_payload_sha256 != expected_review_payload_sha256 {
+        return Err(ReviewError::Stale(format!(
+            "listing {listing_id} review payload changed during product attestation; reload and re-evaluate"
+        )));
+    }
+    let payload = parse_payload(
+        &row.review_payload_json,
+        Some(&row.review_payload_sha256),
+        row.pending_aspect_count,
+    )?;
+    let aspect = payload
+        .aspects
+        .into_iter()
+        .find(|aspect| &aspect.id == aspect_id)
+        .ok_or_else(|| {
+            ReviewError::NotFound(format!(
+                "pending review aspect {aspect_id} was not found for listing {listing_id}"
+            ))
+        })?;
+    if aspect.reuse_attestation_target_id != Some(product_id) {
+        return Err(ReviewError::Conflict(format!(
+            "pending review aspect {aspect_id} for listing {listing_id} does not target approved catalog id {product_id}"
+        )));
+    }
+    let commit_guard = PendingProductAttestationCommitGuard {
+        owner_user_id,
+        listing_id,
+        review_payload_sha256: row.review_payload_sha256,
+        aspect_id: serde_json::to_value(aspect.id).map_err(|error| {
+            ReviewError::Database(format!(
+                "could not bind pending product aspect authorization: {error}"
+            ))
+        })?,
+    };
+
+    let current_catalog_revision = approved_catalog_revision_sha256(db).await?;
+    if current_catalog_revision != expected_catalog_revision_sha256 {
+        return Err(ReviewError::Stale(
+            "approved avionics catalog changed during review; reload and re-evaluate".to_string(),
+        ));
+    }
+    let product = load_all_approved_product_map(db)
+        .await?
+        .remove(&product_id)
+        .ok_or_else(|| {
+            ReviewError::Conflict(format!(
+                "pending review targets catalog id {product_id}, which is not a current approved product"
+            ))
+        })?;
+    let already_reuse_attested = current_reuse_attested_product_ids(db)
+        .await?
+        .contains(&product_id);
+    if already_reuse_attested {
+        return Ok(PendingProductAttestationTarget {
+            product,
+            already_reuse_attested,
+            commit_guard,
+        });
+    }
+
+    let aspect_id = ReviewAspectId::from(format!("product:{product_id}"));
+    validate_existing_product_verification_evidence(
+        &aspect_id,
+        &product,
+        identity_source_url,
+        identity_source_title,
+        identity_evidence_text,
+    )?;
+    if !reuse_source_origin_is_authorized(db, product_id, identity_source_url).await? {
+        return Err(ReviewError::Conflict(format!(
+            "approved catalog id {product_id} cannot be attested from this source origin; curate an active exact manufacturer source origin or correct the catalog identity before grounding"
+        )));
+    }
+    Ok(PendingProductAttestationTarget {
+        product,
+        already_reuse_attested,
+        commit_guard,
+    })
+}
+
+/// Read-only gate for one source-free, association-only local verification.
+///
+/// Product identity is a global prerequisite and must already have a current
+/// reuse attestation. This function validates only the hash-bound listing
+/// occurrence and never accepts or replays a product dossier.
+pub(crate) async fn preflight_existing_product_association(
     db: &AppDb,
     owner_user_id: i64,
     listing_id: i64,
     aspect_id: &ReviewAspectId,
     expected_review_payload_sha256: &str,
     expected_catalog_revision_sha256: &str,
-    identity_source_url: &str,
-    identity_source_title: &str,
-    identity_evidence_text: &str,
-) -> ReviewResult<ExistingProductVerificationTarget> {
+) -> ReviewResult<ExistingProductAssociationTarget> {
     if !valid_sha256(expected_review_payload_sha256)
         || !valid_sha256(expected_catalog_revision_sha256)
     {
@@ -4272,25 +4736,13 @@ pub(crate) async fn preflight_existing_product_verification(
         association.role,
         &listing_evidence_text,
     );
-    let already_reuse_attested = reuse_attested_ids.contains(&target_id);
-    if !already_reuse_attested {
-        validate_existing_product_verification_evidence(
-            aspect_id,
-            &product,
-            identity_source_url,
-            identity_source_title,
-            identity_evidence_text,
-        )?;
-        if !reuse_source_origin_is_authorized(db, target_id, identity_source_url).await? {
-            return Err(ReviewError::Conflict(format!(
-                "approved catalog id {target_id} cannot be attested from this source origin; curate an active exact manufacturer source origin or correct the catalog identity before grounding"
-            )));
-        }
+    if !reuse_attested_ids.contains(&target_id) {
+        return Err(ReviewError::Conflict(format!(
+            "approved catalog id {target_id} requires global product attestation before listing associations can be verified"
+        )));
     }
-    Ok(ExistingProductVerificationTarget {
+    Ok(ExistingProductAssociationTarget {
         product,
-        quantity: aspect.quantity.max(1),
-        already_reuse_attested,
         listing_evidence_text,
         observation_sha256,
     })
@@ -4448,9 +4900,6 @@ fn index_decisions<'a>(
         }
         match decision {
             ReviewDecision::UseVerifiedProduct {
-                avionics_model_id, ..
-            }
-            | ReviewDecision::VerifyExistingProduct {
                 avionics_model_id, ..
             } if *avionics_model_id <= 0 => {
                 return Err(ReviewError::Validation(format!(
@@ -4679,11 +5128,7 @@ fn prepare_create_product(decision: &ReviewDecision) -> ReviewResult<CreateProdu
 fn preflight_decisions(
     review: &ListingReview,
     decisions: &[ReviewDecision],
-) -> ReviewResult<(
-    Vec<(ReviewAspectId, i64)>,
-    Vec<(ReviewAspectId, i64)>,
-    Vec<PreflightCreateProduct>,
-)> {
+) -> ReviewResult<(Vec<(ReviewAspectId, i64)>, Vec<PreflightCreateProduct>)> {
     let aspects = review
         .aspects
         .iter()
@@ -4691,7 +5136,6 @@ fn preflight_decisions(
         .collect::<HashMap<_, _>>();
     let mut indexed = HashMap::new();
     let mut referenced_products = Vec::new();
-    let mut verification_targets = Vec::new();
     let mut create_products = Vec::new();
 
     for decision in decisions {
@@ -4740,37 +5184,6 @@ fn preflight_decisions(
                     )));
                 }
                 referenced_products.push((aspect_id.clone(), *avionics_model_id));
-            }
-            ReviewDecision::VerifyExistingProduct {
-                aspect_id,
-                avionics_model_id,
-                identity_source_url,
-                identity_source_title,
-                identity_evidence_text,
-            } => {
-                if *avionics_model_id <= 0
-                    || aspect
-                        .reuse_attestation_target
-                        .as_ref()
-                        .and_then(|product| product.id)
-                        != Some(*avionics_model_id)
-                {
-                    return Err(ReviewError::Validation(format!(
-                        "review aspect {aspect_id} does not target approved catalog id {avionics_model_id} for fresh grounding"
-                    )));
-                }
-                let target = aspect
-                    .reuse_attestation_target
-                    .as_ref()
-                    .expect("target ID was checked above");
-                validate_existing_product_verification_evidence(
-                    aspect_id,
-                    target,
-                    identity_source_url,
-                    identity_source_title,
-                    identity_evidence_text,
-                )?;
-                verification_targets.push((aspect_id.clone(), *avionics_model_id));
             }
             ReviewDecision::CreateVerifiedProduct {
                 aspect_id,
@@ -4831,7 +5244,7 @@ fn preflight_decisions(
         }
     }
 
-    Ok((referenced_products, verification_targets, create_products))
+    Ok((referenced_products, create_products))
 }
 
 pub(crate) async fn approved_product_is_selectable(
@@ -5259,8 +5672,7 @@ pub async fn preflight_listing_review_resolution(
         ));
     }
 
-    let (referenced_products, verification_targets, create_products) =
-        preflight_decisions(review, &request.decisions)?;
+    let (referenced_products, create_products) = preflight_decisions(review, &request.decisions)?;
     let mut checked_product_ids = HashSet::new();
     for (aspect_id, avionics_model_id) in referenced_products {
         if checked_product_ids.insert(avionics_model_id)
@@ -5271,15 +5683,6 @@ pub async fn preflight_listing_review_resolution(
             )));
         }
     }
-    let all_approved = load_all_approved_product_map(db).await?;
-    for (aspect_id, avionics_model_id) in verification_targets {
-        if !all_approved.contains_key(&avionics_model_id) {
-            return Err(ReviewError::Stale(format!(
-                "review aspect {aspect_id} targets catalog id {avionics_model_id}, which is missing or no longer approved"
-            )));
-        }
-    }
-
     let mut batch_product_keys = HashMap::<(String, String), ReviewAspectId>::new();
     let mut batch_identifier_keys = HashMap::<(String, String, String), ReviewAspectId>::new();
     for creation in &create_products {
@@ -6143,12 +6546,6 @@ pub async fn resolve_listing_review(
                             )));
                         }
                         Some(approved)
-                    }
-                    ReviewDecision::VerifyExistingProduct { .. } => {
-                        return Err(ReviewError::Validation(
-                            "existing-product verification must be grounded by the server before the review transaction"
-                                .to_string(),
-                        ));
                     }
                     ReviewDecision::CreateVerifiedProduct { .. } => {
                         let product = prepare_create_product(decision)?;
@@ -7650,7 +8047,7 @@ mod tests {
         assert!(matches!(
             index_decisions(&payload, &inconsistent),
             Err(ReviewError::Validation(message))
-                if message.contains("must either both be accepted or both be discarded")
+                if message.contains("action UseVerifiedProduct is not allowed")
         ));
     }
 
@@ -7678,14 +8075,7 @@ mod tests {
             None,
             "approved targets must never use the unreviewed promotion ID"
         );
-        assert_eq!(
-            aspects[0].allowed_actions,
-            vec![
-                ReviewAction::UseVerifiedProduct,
-                ReviewAction::VerifyExistingProduct,
-                ReviewAction::Discard,
-            ]
-        );
+        assert_eq!(aspects[0].allowed_actions, vec![ReviewAction::Discard]);
     }
 
     #[test]
@@ -8258,6 +8648,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn product_review_pages_collapse_associations_and_use_stable_keyset_cursors() {
+        let db = test_db().await;
+        let (user_id, first_listing_id) = insert_listing(&db).await;
+        let (_, second_listing_id) = insert_listing(&db).await;
+        let current_product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let required_product_id =
+            insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
+        let pool = sqlite_pool(&db);
+
+        for (listing_id, product_id, evidence) in [
+            (
+                first_listing_id,
+                current_product_id,
+                "Garmin GNS 430W shown in the listing",
+            ),
+            (
+                second_listing_id,
+                current_product_id,
+                "Garmin GNS 430W shown in the listing",
+            ),
+            (
+                first_listing_id,
+                required_product_id,
+                "Garmin GTX 345 shown in the listing",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO aircraft_sale_listing_avionics (
+                  aircraft_sale_listing_id, avionics_model_id, quantity, source,
+                  source_notes, source_confidence, configuration_action
+                ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+                "#,
+            )
+            .bind(listing_id)
+            .bind(product_id)
+            .bind(evidence)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let products = load_all_approved_product_map(&db).await.unwrap();
+        for listing_id in [first_listing_id, second_listing_id] {
+            let assignments = load_existing_assignments(&db, listing_id).await.unwrap();
+            let aspects = assignments
+                .iter()
+                .map(|assignment| {
+                    preserved_product_aspect(
+                        assignment,
+                        ListingAssociationRole::Installed,
+                        products.get(&assignment.avionics_model_id).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            stage_pending_review(&db, listing_id, None, &aspects)
+                .await
+                .unwrap();
+        }
+        attest_approved_product_for_current_policy_reuse(&db, current_product_id).await;
+
+        let first_page = list_pending_product_reviews(
+            &db,
+            user_id,
+            ProductReviewPageQuery {
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].product.id, Some(current_product_id));
+        assert_eq!(
+            first_page.items[0].attestation_status,
+            ProductAttestationStatus::Current
+        );
+        assert_eq!(first_page.items[0].pending_association_count, 2);
+        assert_eq!(first_page.items[0].pending_listing_count, 2);
+        // Attestation status is mutable display state, not cursor order. A
+        // status change between pages must neither duplicate nor skip the
+        // next immutable product ID.
+        attest_approved_product_for_current_policy_reuse(&db, required_product_id).await;
+        let second_page = list_pending_product_reviews(
+            &db,
+            user_id,
+            ProductReviewPageQuery {
+                limit: Some(1),
+                cursor: first_page.next_cursor,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].product.id, Some(required_product_id));
+        assert_eq!(
+            second_page.items[0].attestation_status,
+            ProductAttestationStatus::Current
+        );
+        assert!(second_page.next_cursor.is_none());
+
+        let association_page = list_pending_product_associations(
+            &db,
+            user_id,
+            current_product_id,
+            ProductReviewPageQuery {
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(association_page.associations.len(), 1);
+        let association_cursor = association_page.next_cursor.clone();
+        let remaining = list_pending_product_associations(
+            &db,
+            user_id,
+            current_product_id,
+            ProductReviewPageQuery {
+                limit: Some(1),
+                cursor: association_cursor.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(remaining.associations.len(), 1);
+        assert_ne!(
+            association_page.associations[0].listing_id,
+            remaining.associations[0].listing_id
+        );
+        assert!(remaining.next_cursor.is_none());
+        assert!(matches!(
+            list_pending_product_associations(
+                &db,
+                user_id,
+                required_product_id,
+                ProductReviewPageQuery {
+                    limit: Some(1),
+                    cursor: association_cursor,
+                },
+            )
+            .await,
+            Err(ReviewError::Validation(message))
+                if message.contains("different product")
+        ));
+        assert!(matches!(
+            list_pending_product_reviews(
+                &db,
+                user_id,
+                ProductReviewPageQuery {
+                    limit: Some(1),
+                    cursor: Some("not-a-valid-cursor%%%".to_string()),
+                },
+            )
+            .await,
+            Err(ReviewError::Validation(_))
+        ));
+
+        let foreign_page =
+            list_pending_product_reviews(&db, user_id + 10_000, ProductReviewPageQuery::default())
+                .await
+                .unwrap();
+        assert!(foreign_page.items.is_empty());
+        let direct_authorization = &association_page.associations[0];
+        assert!(matches!(
+            preflight_pending_product_attestation(
+                &db,
+                user_id + 10_000,
+                current_product_id,
+                direct_authorization.listing_id,
+                &direct_authorization.review_payload_sha256,
+                &direct_authorization.aspect_id,
+                &first_page.catalog_revision_sha256,
+                "",
+                "",
+                "",
+            )
+            .await,
+            Err(ReviewError::Permission(_))
+        ));
+        assert!(matches!(
+            list_pending_product_associations(
+                &db,
+                user_id + 10_000,
+                current_product_id,
+                ProductReviewPageQuery::default(),
+            )
+            .await,
+            Err(ReviewError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_attestation_uses_only_the_supplied_direct_association_authorization() {
+        let db = test_db().await;
+        let (user_id, malformed_listing_id) = insert_listing(&db).await;
+        let target_listing_id = insert_additional_listing(
+            &db,
+            user_id,
+            "https://broker.example/aircraft/direct-attestation",
+        )
+        .await;
+        let product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let pool = sqlite_pool(&db);
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Garmin GNS 430W shown in the listing',
+                      'high', 'installed')
+            "#,
+        )
+        .bind(target_listing_id)
+        .bind(product_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let malformed_staged = stage_pending_review(
+            &db,
+            malformed_listing_id,
+            None,
+            &[PendingReviewAspect::avionics(
+                "unrelated",
+                "avionics_identity",
+                "Unrelated unit",
+                "Unrelated unit",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some("Unrelated unit".to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let assignments = load_existing_assignments(&db, target_listing_id)
+            .await
+            .unwrap();
+        let products = load_all_approved_product_map(&db).await.unwrap();
+        let target_aspect = preserved_product_aspect(
+            &assignments[0],
+            ListingAssociationRole::Installed,
+            products.get(&product_id).unwrap(),
+        );
+        let target_staged =
+            stage_pending_review(&db, target_listing_id, None, &[target_aspect.clone()])
+                .await
+                .unwrap();
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+
+        sqlx::query(
+            "UPDATE aircraft_sale_listing_pending_reviews SET review_payload_json = '{malformed' WHERE listing_id = ?",
+        )
+        .bind(malformed_listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let target = preflight_pending_product_attestation(
+            &db,
+            user_id,
+            product_id,
+            target_listing_id,
+            &target_staged.review_payload_sha256,
+            &target_aspect.id,
+            &target_staged.catalog_revision_sha256,
+            "",
+            "",
+            "",
+        )
+        .await
+        .expect("an unrelated malformed review must not poison direct authorization");
+        assert!(target.already_reuse_attested);
+        assert_eq!(target.commit_guard.listing_id, target_listing_id);
+
+        assert!(matches!(
+            preflight_pending_product_attestation(
+                &db,
+                user_id,
+                product_id,
+                target_listing_id,
+                &target_staged.review_payload_sha256,
+                &ReviewAspectId::from("different-aspect"),
+                &target_staged.catalog_revision_sha256,
+                "",
+                "",
+                "",
+            )
+            .await,
+            Err(ReviewError::NotFound(_))
+        ));
+        assert!(matches!(
+            preflight_pending_product_attestation(
+                &db,
+                user_id,
+                product_id,
+                malformed_listing_id,
+                &malformed_staged.review_payload_sha256,
+                &target_aspect.id,
+                &target_staged.catalog_revision_sha256,
+                "",
+                "",
+                "",
+            )
+            .await,
+            Err(ReviewError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn explicit_restage_hash_binds_hidden_preserved_product_and_is_idempotent() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
@@ -8315,9 +9016,7 @@ mod tests {
             preserved.id,
             preserved_review_aspect_id(link_id, ListingAssociationRole::Installed)
         );
-        assert!(preserved
-            .allowed_actions
-            .contains(&ReviewAction::VerifyExistingProduct));
+        assert_eq!(preserved.allowed_actions, vec![ReviewAction::Discard]);
 
         let second = restage_unattested_preserved_products(&db, user_id, listing_id)
             .await

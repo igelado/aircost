@@ -1261,6 +1261,25 @@ label span,
   border-bottom: 1px solid var(--line);
 }
 
+.review-toolbar-actions,
+.review-mode-switch,
+.review-product-actions,
+.review-product-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-mode-switch .button {
+  min-height: 32px;
+}
+
+.review-mode-switch .button.is-active {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: white;
+}
+
 .review-toolbar h2,
 .review-toolbar p,
 .review-workspace-header h2,
@@ -1319,6 +1338,107 @@ label span,
 
 .review-table th:nth-child(7) {
   width: 82px;
+}
+
+.review-product-table {
+  min-width: 760px;
+}
+
+.review-product-table th:nth-child(1) {
+  width: 38%;
+}
+
+.review-product-table th:nth-child(2) {
+  width: 24%;
+}
+
+.review-product-table th:nth-child(3) {
+  width: 25%;
+}
+
+.review-product-table th:nth-child(4) {
+  width: 140px;
+}
+
+.review-status-current,
+.review-outcome-accepted {
+  color: var(--accent-strong);
+}
+
+.review-status-required,
+.review-outcome-manual,
+.review-outcome-stale {
+  color: var(--warning);
+}
+
+.review-outcome-mismatch,
+.review-outcome-error {
+  color: var(--danger);
+}
+
+.review-product-workspace {
+  margin: 14px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.review-product-heading {
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.review-product-heading h3,
+.review-product-heading p {
+  margin: 0;
+}
+
+.review-product-heading p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.review-product-status.is-current {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.review-product-dossier {
+  margin-bottom: 10px;
+}
+
+.review-product-actions {
+  margin: 16px 0 10px;
+}
+
+.review-product-actions span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.review-product-association-table {
+  min-width: 760px;
+}
+
+.review-product-association-table th:nth-child(1) {
+  width: 28%;
+}
+
+.review-product-association-table th:nth-child(2) {
+  width: 48%;
+}
+
+.review-product-association-table th:nth-child(3) {
+  width: 24%;
+}
+
+.review-association-source {
+  display: block;
+  margin-top: 4px;
+  color: var(--accent-strong);
+  font-size: 11px;
 }
 
 .review-count-pill,
