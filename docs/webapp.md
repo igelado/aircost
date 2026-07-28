@@ -414,6 +414,7 @@ GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
 POST /api/review/listings/{listing_id}/avionics/verify-existing
+POST /api/review/listings/{listing_id}/avionics/approve-replacement
 POST /api/review/listings/{listing_id}/resolve
 ```
 
@@ -428,6 +429,18 @@ The association request carries only the canonical review hash, catalog
 revision, and aspect ID; source fields and legacy revision aliases are rejected.
 Attestation rechecks both the manufacturer-scoped collision snapshot and
 ownership of the exact pending association under the mutation lock.
+
+The replacement endpoint is the only aspect-scoped path that accepts a
+replacement relationship. Its strict source-free request names the staged
+parent and child aspect, selected approved product ID, and exact staged
+quantity for each. The parent must explicitly target the child; the child
+quantity is one. Both products must already have current global reuse
+attestations. The server changes one listing link atomically, preserves that
+link's ID when the bundle covers an existing relationship, and performs no
+Gemini or OEM fetch. It rejects half relationships, stale or cross-listing link
+coverage, implicit association merges, quantity changes, and invalid action
+graphs. The ordinary single-aspect `use-existing` route continues to reject
+both sides of a replacement relationship.
 
 The resolve request includes `review_payload_sha256`,
 `catalog_revision_sha256`, one decision for every returned aspect, and an

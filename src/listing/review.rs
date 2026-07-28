@@ -8,6 +8,7 @@
 //! scopes reads and resolution to the listing owner supplied by the server.
 
 pub(crate) mod automation;
+pub(crate) mod replacement;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
