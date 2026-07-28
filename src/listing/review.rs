@@ -1746,13 +1746,36 @@ async fn restage_pending_review_if_current_with_commit(
           AND association_role = 'installed'
         "#,
     );
-    let select_existing_product_link = db.sql(
+    let select_approved_product_identity = db.sql(
         r#"
-        SELECT id
-        FROM aircraft_sale_listing_avionics
-        WHERE aircraft_sale_listing_id = ?
-          AND avionics_model_id = ?
-        ORDER BY id
+        SELECT avionics_manufacturer_identity_id, canonical_product_key
+        FROM avionics_approved_product_graph_identities
+        WHERE avionics_model_id = ?
+        "#,
+    );
+    let select_colliding_product_relationship = db.sql(
+        r#"
+        SELECT existing.id
+        FROM aircraft_sale_listing_avionics existing
+        LEFT JOIN avionics_approved_product_graph_identities subject
+          ON subject.avionics_model_id = existing.avionics_model_id
+        LEFT JOIN avionics_approved_product_graph_identities displaced
+          ON displaced.avionics_model_id = existing.replaces_avionics_model_id
+        WHERE existing.aircraft_sale_listing_id = ?
+          AND existing.id <> COALESCE(?, -1)
+          AND (
+            (
+              existing.configuration_action IN ('installed', 'replaces')
+              AND subject.avionics_manufacturer_identity_id = ?
+              AND subject.canonical_product_key = ?
+            )
+            OR (
+              existing.configuration_action IN ('replaces', 'removes')
+              AND displaced.avionics_manufacturer_identity_id = ?
+              AND displaced.canonical_product_key = ?
+            )
+          )
+        ORDER BY existing.id
         LIMIT 1
         "#,
     );
@@ -2048,22 +2071,51 @@ async fn restage_pending_review_if_current_with_commit(
                     )));
                 }
 
+                let existing_action_graph_issues: i64 =
+                    sqlx::query_scalar(&invalid_action_graph_sql)
+                        .bind(listing_id)
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                if existing_action_graph_issues != 0 {
+                    return Err(ReviewError::Conflict(format!(
+                        "listing {listing_id} already has an invalid avionics action graph; aspect-scoped approval refuses to modify it"
+                    )));
+                }
                 let covered_link_id = aspect
                     .covered_associations
                     .first()
                     .map(|association| association.listing_link_id);
-                let existing_product_link: Option<i64> =
-                    sqlx::query_scalar(&select_existing_product_link)
-                        .bind(listing_id)
+                let product_identity: Option<(i64, String)> =
+                    sqlx::query_as(&select_approved_product_identity)
                         .bind(commit.avionics_model_id)
                         .fetch_optional(&mut *transaction)
                         .await?;
-                if existing_product_link.is_some()
-                    && existing_product_link != covered_link_id
-                {
+                let (manufacturer_identity_id, canonical_product_key) =
+                    product_identity.ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "approved catalog id {} has no canonical product identity",
+                            commit.avionics_model_id
+                        ))
+                    })?;
+                approved_avionics_product_key(
+                    manufacturer_identity_id,
+                    &canonical_product_key,
+                )
+                .map_err(ReviewError::Stale)?;
+                let colliding_relationship: Option<i64> =
+                    sqlx::query_scalar(&select_colliding_product_relationship)
+                        .bind(listing_id)
+                        .bind(covered_link_id)
+                        .bind(manufacturer_identity_id)
+                        .bind(canonical_product_key.as_str())
+                        .bind(manufacturer_identity_id)
+                        .bind(canonical_product_key.as_str())
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if let Some(colliding_link_id) = colliding_relationship {
                     return Err(ReviewError::Conflict(format!(
-                        "listing {listing_id} already associates catalog id {}; aspect-scoped approval refuses to merge independent quantities",
-                        commit.avionics_model_id
+                        "listing {listing_id} link {colliding_link_id} already installs or displaces the canonical identity of catalog id {}; aspect-scoped approval refuses to merge or contradict independent relationships",
+                        commit.avionics_model_id,
                     )));
                 }
 
@@ -9600,6 +9652,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aspect_scoped_approval_rejects_covered_quantity_mismatch_without_mutation() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 2, 'listing', 'Two Garmin GTX 345 units',
+                      'medium', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let mut covered = pending_aspect("covered", product_id).with_covered_association(
+            link_id,
+            ListingAssociationRole::Installed,
+            product_id,
+        );
+        covered.quantity = 3;
+        let staged = stage_pending_review(&db, listing_id, None, &[covered])
+            .await
+            .unwrap();
+
+        let error = use_existing_product_for_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &ReviewAspectId::from("covered"),
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+            product_id,
+        )
+        .await
+        .expect_err("the staged quantity must still describe the exact covered link");
+
+        assert!(matches!(error, ReviewError::Stale(_)));
+        let quantity: i64 =
+            sqlx::query_scalar("SELECT quantity FROM aircraft_sale_listing_avionics WHERE id = ?")
+                .bind(link_id)
+                .fetch_one(sqlite_pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(quantity, 2);
+        let row = load_review_row(&db, listing_id).await.unwrap();
+        assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
+    }
+
+    #[tokio::test]
     async fn final_aspect_scoped_approval_clears_review_without_finalizing_listing() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
@@ -9692,6 +9799,83 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(quantity, 1);
+        let row = load_review_row(&db, listing_id).await.unwrap();
+        assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
+    }
+
+    #[tokio::test]
+    async fn aspect_scoped_approval_rejects_displaced_product_collision_on_every_retry() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let replacement_id = insert_approved_product(&db, "GTN 750Xi", "GTN750XI", "GPS").await;
+        let displaced_id = insert_approved_product(&db, "GNS 530W", "GNS530W", "GPS").await;
+        attest_approved_product_for_current_policy_reuse(&db, displaced_id).await;
+        let replacement_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action,
+              replaces_avionics_model_id
+            ) VALUES (?, ?, 1, 'listing_review',
+                      'GTN 750Xi replaces GNS 530W', 'high', 'replaces', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(replacement_id)
+        .bind(displaced_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let mut selected = pending_aspect("selected", displaced_id);
+        selected.quantity = 3;
+        let staged = stage_pending_review(&db, listing_id, None, &[selected])
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let error = use_existing_product_for_aspect_and_restage(
+                &db,
+                user_id,
+                listing_id,
+                &ReviewAspectId::from("selected"),
+                &staged.review_payload_sha256,
+                &staged.catalog_revision_sha256,
+                displaced_id,
+            )
+            .await
+            .expect_err("an installed product cannot also be a displacement target");
+            assert!(matches!(
+                error,
+                ReviewError::Conflict(message)
+                    if message.contains("installs or displaces")
+                        && message.contains("refuses to merge or contradict")
+            ));
+        }
+
+        let links: Vec<(i64, i64, i64, String, Option<i64>)> = sqlx::query_as(
+            r#"
+            SELECT id, avionics_model_id, quantity, configuration_action,
+                   replaces_avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            ORDER BY id
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_all(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            links,
+            vec![(
+                replacement_link_id,
+                replacement_id,
+                1,
+                "replaces".to_string(),
+                Some(displaced_id),
+            )]
+        );
         let row = load_review_row(&db, listing_id).await.unwrap();
         assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
     }

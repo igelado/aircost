@@ -2283,6 +2283,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aspect_scoped_use_existing_preserves_quantity_three_and_rejects_stale_retry() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let product_id = insert_approved_garmin_product(&db).await;
+        attest_approved_garmin_product(&db, product_id).await;
+        let selected = PendingReviewAspect::avionics(
+            "selected-observation",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Three Garmin GNS 430W navigators",
+            "catalog_match_requires_review",
+            3,
+            "installed",
+            Some("Three Garmin GNS 430W navigators".to_string()),
+            Some("high".to_string()),
+        );
+        let remaining = PendingReviewAspect::avionics(
+            "remaining-observation",
+            "avionics_identity",
+            "Garmin GTX 345",
+            "Garmin GTX 345 transponder",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Garmin GTX 345 transponder".to_string()),
+            Some("medium".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[selected, remaining])
+            .await
+            .unwrap();
+        let usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let response = use_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256.clone(),
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256.clone(),
+                aspect_id: "selected-observation".into(),
+                avionics_model_id: product_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response["review_complete"], false);
+        let quantity: i64 = sqlx::query_scalar(
+            "SELECT quantity FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(quantity, 3);
+        let usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_after, usage_before);
+
+        let stale = use_existing_review_avionics_handler(
+            State(test_state(db)),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(UseExistingReviewAvionicsRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256,
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                aspect_id: "selected-observation".into(),
+                avionics_model_id: product_id,
+            }),
+        )
+        .await
+        .expect_err("the consumed review hash must not be replayable");
+        assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale.code, Some("review_stale"));
+    }
+
+    #[tokio::test]
     async fn product_attestation_api_reports_the_exact_source_title_limit() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let pool = sqlite_pool(&db);
