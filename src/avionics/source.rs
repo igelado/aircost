@@ -143,6 +143,18 @@ mod tests {
     }
 
     #[test]
+    fn generic_pdf_physical_lines_cannot_authorize_oem_proof() {
+        let target = identity(30, "GEA 71", "011-00831-00");
+        let rows = [row(
+            TextRowKind::PdfPhysicalLine,
+            0,
+            "GEA 71 | 011-00831-00",
+        )];
+
+        assert!(exact_oem_product_identity_row(&rows, true, target, &[target]).is_err());
+    }
+
+    #[test]
     fn rejects_a_row_that_proves_two_scoped_products() {
         let target = identity(125, "ME406", "453-6603");
         let neighbor = identity(126, "ME406HM", "453-6604");

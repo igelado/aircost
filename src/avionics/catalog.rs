@@ -5431,7 +5431,7 @@ mod tests {
             &catalog,
         )
         .expect_err("flat publisher text cannot replace one visible structural row");
-        assert!(error.contains("no bounded visible HTML table row or PDF physical line"));
+        assert!(error.contains("no bounded visible HTML table row or PDF visual row"));
     }
 
     #[test]
@@ -5467,7 +5467,7 @@ mod tests {
             &catalog,
         )
         .expect_err("adjacent PDF rows must never become one deterministic identity record");
-        assert!(error.contains("no bounded visible HTML table row or PDF physical line"));
+        assert!(error.contains("no bounded visible HTML table row or PDF visual row"));
     }
 
     async fn seed_unreviewed_legacy_identity(
