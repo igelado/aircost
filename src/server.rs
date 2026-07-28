@@ -37,6 +37,7 @@ use crate::avionics::inspection::{
 };
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
+use crate::gemini::source::ProductIdentityTarget;
 use crate::listing::review::replacement::{
     approve_replacement_products_and_restage, ApproveReplacementProductsRequest,
 };
@@ -752,6 +753,17 @@ async fn attest_review_avionics_product_handler(
         manufacturer_identifier_kind: stable_identifier.kind.clone(),
         manufacturer_identifier: stable_identifier.value.clone(),
     };
+    let source_target =
+        ProductIdentityTarget::new(&request.model, &request.manufacturer_identifier)
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "approved catalog id {product_id} has an invalid deterministic source target: {error}"
+                    ),
+                )
+                .with_code("avionics_identity_verification_failed")
+            })?;
     let extractor = state.extractor.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -760,7 +772,7 @@ async fn attest_review_avionics_product_handler(
         .with_code("avionics_grounding_unavailable")
     })?;
     let fetched = extractor
-        .fetch_public_same_origin_source_document(&payload.identity_source_url)
+        .fetch_public_same_origin_product_document(&payload.identity_source_url, source_target)
         .await
         .map_err(|error| {
             ApiError::new(

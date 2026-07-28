@@ -26,6 +26,7 @@ use crate::gemini::curation::workflow::{
 use crate::gemini::interactions::{
     FetchedSourceDocument, GeminiInteractionsClient, InteractionAccountingContext, RetryPolicy,
 };
+use crate::gemini::source::ProductIdentityTarget;
 use crate::gemini::usage::{
     estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, Outcome as UsageOutcome,
     SourceCorrelation, Start as UsageStart, Store as UsageStore, ToolUseBilling,
@@ -671,15 +672,16 @@ impl GeminiListingExtractor {
     /// Fetch one caller-selected publisher document through the same guarded
     /// SSRF-safe path used by direct-source grounding, without making a Gemini
     /// provider call or writing an API-usage row.
-    pub(crate) async fn fetch_public_same_origin_source_document(
+    pub(crate) async fn fetch_public_same_origin_product_document(
         &self,
         source_url: &str,
+        target: ProductIdentityTarget,
     ) -> Result<FetchedSourceDocument> {
         let client = self.interactions_client.as_ref().ok_or_else(|| {
             anyhow!("guarded public-source fetching is unavailable for this extractor")
         })?;
         client
-            .fetch_public_same_origin_source_document(source_url)
+            .fetch_public_same_origin_product_document(source_url, target)
             .await
             .map_err(|error| anyhow!("could not fetch authoritative publisher source: {error}"))
     }

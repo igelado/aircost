@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use lopdf::{Document, LoadOptions};
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE, RETRY_AFTER,
 };
@@ -28,6 +27,10 @@ use url::{Host, Url};
 use xml::reader::{ParserConfig as XmlParserConfig, XmlEvent};
 
 use crate::gemini::config::GeminiTask;
+use crate::gemini::source::{
+    normalize_text_row, pdf as source_pdf, ProductIdentityTarget, TextRow, TextRowKind,
+    MAX_TEXT_ROWS, MAX_TEXT_ROW_CHARACTERS,
+};
 use crate::gemini::usage::{
     estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, Outcome as UsageOutcome,
     SourceCorrelation, Start as UsageStart, Status as UsageStatus, Store as UsageStore,
@@ -47,11 +50,6 @@ const MAX_REQUEST_BYTES: usize = 20_000_000;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_REDIRECTS: usize = 10;
 const MAX_SOURCE_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SOURCE_PDF_PAGES: usize = 256;
-const MAX_SOURCE_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SOURCE_PDF_TEXT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_SOURCE_TEXT_ROWS: usize = 16_384;
-const MAX_SOURCE_TEXT_ROW_CHARACTERS: usize = 512;
 const MAX_ROBOTS_BYTES: usize = 256 * 1024;
 const MAX_SOURCE_INDEX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SOURCE_INDEXES: usize = 8;
@@ -1516,6 +1514,7 @@ impl GeminiInteractionsClient {
                 self.resolver_timeout,
                 MAX_SOURCE_DOCUMENT_BYTES,
                 None,
+                None,
             ),
         )
         .await
@@ -1536,6 +1535,26 @@ impl GeminiInteractionsClient {
         &self,
         source_url: &str,
     ) -> GeminiInteractionsResult<FetchedSourceDocument> {
+        self.fetch_public_same_origin_source_document_with_target(source_url, None)
+            .await
+    }
+
+    /// Fetch one exact-origin OEM document and retain only structural rows
+    /// relevant to the immutable server-owned product identity.
+    pub(crate) async fn fetch_public_same_origin_product_document(
+        &self,
+        source_url: &str,
+        target: ProductIdentityTarget,
+    ) -> GeminiInteractionsResult<FetchedSourceDocument> {
+        self.fetch_public_same_origin_source_document_with_target(source_url, Some(target))
+            .await
+    }
+
+    async fn fetch_public_same_origin_source_document_with_target(
+        &self,
+        source_url: &str,
+        target: Option<ProductIdentityTarget>,
+    ) -> GeminiInteractionsResult<FetchedSourceDocument> {
         let requested_url = Url::parse(source_url).map_err(|error| {
             GeminiInteractionsError::InvalidUrl(format!("{source_url:?}: {error}"))
         })?;
@@ -1547,6 +1566,7 @@ impl GeminiInteractionsClient {
                 self.resolver_timeout,
                 MAX_SOURCE_DOCUMENT_BYTES,
                 Some(requested_url),
+                target,
             ),
         )
         .await
@@ -1599,26 +1619,13 @@ pub(crate) struct FetchedSourceDocument {
     pub(crate) content_sha256: String,
     pub(crate) publisher_text: String,
     /// Bounded visible structural rows retained only for exact deterministic
-    /// source proof. Rows never cross an HTML table-row, PDF physical-line, or
+    /// source proof. Rows never cross an HTML table row, PDF visual row, or
     /// page boundary and are never persisted.
-    pub(crate) source_text_rows: Vec<SourceTextRow>,
-    /// False when any otherwise-visible structural row exceeded its row or
-    /// document-count bound. Deterministic proof must reject an incomplete
-    /// structural projection rather than ignore unseen ambiguity.
+    pub(crate) source_text_rows: Vec<TextRow>,
+    /// False when a relevant structural row exceeded its row or candidate-count
+    /// bound. A target-aware fetch ignores unrelated rows while scanning the
+    /// complete bounded document.
     pub(crate) source_text_rows_complete: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SourceTextRow {
-    pub(crate) kind: SourceTextRowKind,
-    pub(crate) ordinal: usize,
-    pub(crate) text: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SourceTextRowKind {
-    HtmlTableRow,
-    PdfPhysicalLine,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2086,13 +2093,16 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
 
 struct CleanedPublicSourceHtml {
     publisher_text: String,
-    source_text_rows: Vec<SourceTextRow>,
+    source_text_rows: Vec<TextRow>,
     source_text_rows_complete: bool,
 }
 
-fn clean_public_source_html(html: &str) -> CleanedPublicSourceHtml {
+fn clean_public_source_html(
+    html: &str,
+    target: Option<&ProductIdentityTarget>,
+) -> CleanedPublicSourceHtml {
     let publisher_text = crate::html::clean::clean_publisher_source_html(html);
-    let (source_text_rows, source_text_rows_complete) = source_html_table_rows(html);
+    let (source_text_rows, source_text_rows_complete) = source_html_table_rows(html, target);
     CleanedPublicSourceHtml {
         publisher_text,
         source_text_rows,
@@ -2100,7 +2110,10 @@ fn clean_public_source_html(html: &str) -> CleanedPublicSourceHtml {
     }
 }
 
-fn source_html_table_rows(html: &str) -> (Vec<SourceTextRow>, bool) {
+fn source_html_table_rows(
+    html: &str,
+    target: Option<&ProductIdentityTarget>,
+) -> (Vec<TextRow>, bool) {
     let document = Html::parse_document(html);
     let row_selector = Selector::parse("tr").expect("static table-row selector is valid");
     let mut rows = Vec::new();
@@ -2110,14 +2123,15 @@ fn source_html_table_rows(html: &str) -> (Vec<SourceTextRow>, bool) {
         if text.is_empty() {
             continue;
         }
-        if rows.len() >= MAX_SOURCE_TEXT_ROWS
-            || text.chars().count() > MAX_SOURCE_TEXT_ROW_CHARACTERS
-        {
+        if target.is_some_and(|target| !target.row_is_relevant(&text)) {
+            continue;
+        }
+        if rows.len() >= MAX_TEXT_ROWS || text.chars().count() > MAX_TEXT_ROW_CHARACTERS {
             complete = false;
             continue;
         }
-        rows.push(SourceTextRow {
-            kind: SourceTextRowKind::HtmlTableRow,
+        rows.push(TextRow {
+            kind: TextRowKind::HtmlTableRow,
             ordinal,
             text,
         });
@@ -2152,7 +2166,7 @@ fn visible_html_element_text(element: ElementRef<'_>) -> String {
         }
         text.push_str(node_text);
     }
-    normalize_source_text_row(&text)
+    normalize_text_row(&text)
 }
 
 fn inline_style_hides_source_element(style: &str) -> bool {
@@ -2172,26 +2186,12 @@ fn inline_style_hides_source_element(style: &str) -> bool {
     })
 }
 
-fn normalize_source_text_row(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character.is_control() && !character.is_whitespace() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 async fn fetch_public_source_document_inner(
     requested_url: Url,
     timeout: Duration,
     max_bytes: usize,
     required_origin: Option<Url>,
+    source_target: Option<ProductIdentityTarget>,
 ) -> GeminiInteractionsResult<FetchedSourceDocument> {
     let mut current_url = requested_url;
     for redirect_count in 0..=MAX_REDIRECTS {
@@ -2264,7 +2264,7 @@ async fn fetch_public_source_document_inner(
                 })?;
                 match document_kind {
                     SourceDocumentKind::Html => {
-                        let cleaned = clean_public_source_html(&body);
+                        let cleaned = clean_public_source_html(&body, source_target.as_ref());
                         (
                             cleaned.publisher_text,
                             cleaned.source_text_rows,
@@ -2280,14 +2280,16 @@ async fn fetch_public_source_document_inner(
                 }
             }
             SourceDocumentKind::Pdf => {
-                let extracted =
-                    tokio::task::spawn_blocking(move || extract_source_pdf_document(&body))
-                        .await
-                        .map_err(|_| {
-                            GeminiInteractionsError::InvalidResponse(
-                                "public source PDF extraction worker failed".to_string(),
-                            )
-                        })??;
+                let source_target = source_target.clone();
+                let extracted = tokio::task::spawn_blocking(move || {
+                    source_pdf::extract(&body, source_target.as_ref())
+                })
+                .await
+                .map_err(|_| {
+                    GeminiInteractionsError::InvalidResponse(
+                        "public source PDF extraction worker failed".to_string(),
+                    )
+                })??;
                 (
                     extracted.publisher_text,
                     extracted.source_text_rows,
@@ -2330,141 +2332,6 @@ fn source_document_redirect_target(
         None => validate_public_http_url(&target)?,
     }
     Ok(target)
-}
-
-#[derive(Clone, Copy)]
-struct SourcePdfLimits {
-    max_pages: usize,
-    max_page_decompressed_bytes: usize,
-    max_total_text_bytes: usize,
-}
-
-const SOURCE_PDF_LIMITS: SourcePdfLimits = SourcePdfLimits {
-    max_pages: MAX_SOURCE_PDF_PAGES,
-    max_page_decompressed_bytes: MAX_SOURCE_PDF_PAGE_DECOMPRESSED_BYTES,
-    max_total_text_bytes: MAX_SOURCE_PDF_TEXT_BYTES,
-};
-
-struct ExtractedSourcePdf {
-    publisher_text: String,
-    source_text_rows: Vec<SourceTextRow>,
-    source_text_rows_complete: bool,
-}
-
-fn extract_source_pdf_document(pdf: &[u8]) -> GeminiInteractionsResult<ExtractedSourcePdf> {
-    extract_source_pdf_document_with_limits(pdf, SOURCE_PDF_LIMITS)
-}
-
-fn validate_source_pdf_page_count(
-    page_count: usize,
-    max_pages: usize,
-) -> GeminiInteractionsResult<()> {
-    if page_count == 0 || page_count > max_pages {
-        return Err(GeminiInteractionsError::InvalidResponse(format!(
-            "public source PDF has {page_count} pages; expected 1..={max_pages}"
-        )));
-    }
-    Ok(())
-}
-
-fn extract_source_pdf_document_with_limits(
-    pdf: &[u8],
-    limits: SourcePdfLimits,
-) -> GeminiInteractionsResult<ExtractedSourcePdf> {
-    if limits.max_pages == 0
-        || limits.max_page_decompressed_bytes == 0
-        || limits.max_total_text_bytes == 0
-    {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "public source PDF extraction limits must be positive".to_string(),
-        ));
-    }
-    if !pdf.starts_with(b"%PDF-") {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "public source PDF is missing the PDF signature".to_string(),
-        ));
-    }
-    let document = Document::load_mem_with_options(
-        pdf,
-        LoadOptions {
-            strict: true,
-            max_decompressed_size: Some(limits.max_page_decompressed_bytes),
-            ..LoadOptions::default()
-        },
-    )
-    .map_err(|_| {
-        GeminiInteractionsError::InvalidResponse(
-            "public source PDF failed strict parsing".to_string(),
-        )
-    })?;
-    if document.is_encrypted() || document.was_encrypted() {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "encrypted public source PDFs are not allowed".to_string(),
-        ));
-    }
-    let pages = document.get_pages();
-    validate_source_pdf_page_count(pages.len(), limits.max_pages)?;
-
-    let mut extracted = String::new();
-    let mut source_text_rows = Vec::new();
-    let mut source_text_rows_complete = true;
-    let mut next_row_ordinal = 0usize;
-    let mut total_text_bytes = 0usize;
-    for page_number in pages.keys().copied() {
-        let text = document
-            .extract_text_with_limit(&[page_number], limits.max_page_decompressed_bytes)
-            .map_err(|_| {
-                GeminiInteractionsError::InvalidResponse(format!(
-                    "public source PDF page {page_number} text extraction failed"
-                ))
-            })?;
-        total_text_bytes = total_text_bytes.checked_add(text.len()).ok_or_else(|| {
-            GeminiInteractionsError::InvalidResponse(
-                "public source PDF extracted text exceeded its byte cap".to_string(),
-            )
-        })?;
-        if total_text_bytes > limits.max_total_text_bytes {
-            return Err(GeminiInteractionsError::InvalidResponse(format!(
-                "public source PDF extracted text exceeds {} bytes",
-                limits.max_total_text_bytes
-            )));
-        }
-        if !extracted.is_empty() {
-            extracted.push('\n');
-        }
-        extracted.push_str(&text);
-        for line in text.lines() {
-            let ordinal = next_row_ordinal;
-            next_row_ordinal = next_row_ordinal.saturating_add(1);
-            let text = normalize_source_text_row(line);
-            if text.is_empty() {
-                continue;
-            }
-            if source_text_rows.len() >= MAX_SOURCE_TEXT_ROWS
-                || text.chars().count() > MAX_SOURCE_TEXT_ROW_CHARACTERS
-            {
-                source_text_rows_complete = false;
-                continue;
-            }
-            source_text_rows.push(SourceTextRow {
-                kind: SourceTextRowKind::PdfPhysicalLine,
-                ordinal,
-                text,
-            });
-        }
-    }
-
-    let publisher_text = normalize_source_text_row(&extracted);
-    if publisher_text.is_empty() {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "public source PDF has no extractable publisher text".to_string(),
-        ));
-    }
-    Ok(ExtractedSourcePdf {
-        publisher_text,
-        source_text_rows,
-        source_text_rows_complete,
-    })
 }
 
 fn source_document_kind(headers: &HeaderMap) -> GeminiInteractionsResult<SourceDocumentKind> {
@@ -3894,8 +3761,6 @@ impl UrlCitationRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::content::{Content, Operation};
-    use lopdf::{dictionary, Object, Stream};
     use serde_json::json;
 
     fn response_from(raw: Value) -> InteractionResponse {
@@ -4563,15 +4428,12 @@ mod tests {
             </html>
         "#;
 
-        let cleaned = clean_public_source_html(html);
+        let cleaned = clean_public_source_html(html, None);
 
         assert_eq!(cleaned.source_text_rows.len(), 2);
         assert!(cleaned.source_text_rows_complete);
         assert_eq!(cleaned.source_text_rows[0].ordinal, 0);
-        assert_eq!(
-            cleaned.source_text_rows[0].kind,
-            SourceTextRowKind::HtmlTableRow
-        );
+        assert_eq!(cleaned.source_text_rows[0].kind, TextRowKind::HtmlTableRow);
         assert_eq!(cleaned.source_text_rows[0].text, "Product Part number");
         assert_eq!(cleaned.source_text_rows[1].text, "GEA 71 011-00831-00");
         assert!(cleaned.publisher_text.contains("GEA 71 011-00831-00"));
@@ -4596,7 +4458,7 @@ mod tests {
             </table>
         "#;
 
-        let cleaned = clean_public_source_html(html);
+        let cleaned = clean_public_source_html(html, None);
 
         assert_eq!(cleaned.source_text_rows.len(), 1);
         assert!(cleaned.source_text_rows_complete);
@@ -4606,200 +4468,41 @@ mod tests {
 
     #[test]
     fn source_html_drops_oversized_rows_instead_of_truncating_them() {
-        let oversized = "X".repeat(MAX_SOURCE_TEXT_ROW_CHARACTERS + 1);
+        let oversized = "X".repeat(MAX_TEXT_ROW_CHARACTERS + 1);
         let html = format!("<table><tr><td>{oversized}</td></tr></table>");
 
-        let cleaned = clean_public_source_html(&html);
+        let cleaned = clean_public_source_html(&html, None);
 
         assert!(cleaned.source_text_rows.is_empty());
         assert!(!cleaned.source_text_rows_complete);
         assert_eq!(cleaned.publisher_text, oversized);
     }
 
-    fn source_pdf(pages: &[&[&str]]) -> Vec<u8> {
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let font_id = document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Courier",
-        });
-        let resources_id = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-        });
-        let mut page_ids = Vec::new();
-        for lines in pages {
-            let mut operations = vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), 10.into()]),
-                Operation::new("Td", vec![50.into(), 740.into()]),
-            ];
-            for line in *lines {
-                operations.push(Operation::new("Tj", vec![Object::string_literal(*line)]));
-                operations.push(Operation::new("T*", vec![]));
-            }
-            operations.push(Operation::new("ET", vec![]));
-            let content_id = document.add_object(Stream::new(
-                dictionary! {},
-                Content { operations }.encode().unwrap(),
-            ));
-            page_ids.push(document.add_object(dictionary! {
-                "Type" => "Page",
-                "Parent" => pages_id,
-                "Contents" => content_id,
-            }));
-        }
-        document.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
-                "Count" => page_ids.len() as i64,
-                "Resources" => resources_id,
-                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            }),
-        );
-        let catalog_id = document.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id,
-        });
-        document.trailer.set("Root", catalog_id);
-        let mut bytes = Vec::new();
-        document.save_to(&mut bytes).unwrap();
-        bytes
-    }
-
     #[test]
-    fn source_pdf_extracts_bounded_text_and_preserves_physical_lines() {
-        let pdf = source_pdf(&[
-            &[
-                "GEA 71 Unit (011-00831-00) 010-00283-00",
-                "GEA 71 Unit Rack 115-00411-00",
-            ],
-            &["GEA 71 Installation Manual"],
-        ]);
+    fn targeted_source_html_ignores_unrelated_limits_but_not_target_overflow() {
+        let target = ProductIdentityTarget::new("GEA 71", "011-00831-00").unwrap();
+        let oversized = "unrelated ".repeat(MAX_TEXT_ROW_CHARACTERS);
+        let mut rows = (0..=MAX_TEXT_ROWS)
+            .map(|index| format!("<tr><td>unrelated {index}</td></tr>"))
+            .collect::<String>();
+        rows.push_str("<tr><td>GEA 71</td><td>011-00831-00</td></tr>");
+        let html = format!("<table><tr><td>{oversized}</td></tr>{rows}</table>");
 
-        let extracted = extract_source_pdf_document(&pdf).unwrap();
+        let cleaned = clean_public_source_html(&html, Some(&target));
+        assert!(cleaned.source_text_rows_complete);
+        assert_eq!(cleaned.source_text_rows.len(), 1);
+        assert_eq!(cleaned.source_text_rows[0].text, "GEA 71 011-00831-00");
 
-        assert!(extracted
-            .publisher_text
-            .contains("GEA 71 Unit (011-00831-00) 010-00283-00"));
-        assert!(extracted
-            .publisher_text
-            .contains("GEA 71 Installation Manual"));
-        assert!(!extracted.publisher_text.contains('\n'));
-        assert_eq!(extracted.source_text_rows.len(), 3);
-        assert!(extracted.source_text_rows_complete);
-        assert!(extracted
-            .source_text_rows
-            .iter()
-            .all(|row| row.kind == SourceTextRowKind::PdfPhysicalLine));
-        assert_eq!(
-            extracted.source_text_rows[0].text,
-            "GEA 71 Unit (011-00831-00) 010-00283-00"
+        let oversized_target = format!(
+            "GEA 71 011-00831-00 {}",
+            "target filler ".repeat(MAX_TEXT_ROW_CHARACTERS)
         );
-        assert_eq!(
-            extracted.source_text_rows[1].text,
-            "GEA 71 Unit Rack 115-00411-00"
+        let cleaned = clean_public_source_html(
+            &format!("<table><tr><td>{oversized_target}</td></tr></table>"),
+            Some(&target),
         );
-        assert_eq!(extracted.source_text_rows[2].ordinal, 2);
-        assert_eq!(
-            extracted.source_text_rows[2].text,
-            "GEA 71 Installation Manual"
-        );
-    }
-
-    #[test]
-    fn source_pdf_fails_closed_on_malformed_empty_page_and_resource_limits() {
-        assert!(extract_source_pdf_document(b"%PDF-not-a-document").is_err());
-
-        let empty = source_pdf(&[&[]]);
-        assert!(extract_source_pdf_document(&empty).is_err());
-
-        let two_pages = source_pdf(&[&["Garmin GIA 63"], &["Garmin GIA 63W"]]);
-        assert!(extract_source_pdf_document_with_limits(
-            &two_pages,
-            SourcePdfLimits {
-                max_pages: 1,
-                ..SOURCE_PDF_LIMITS
-            },
-        )
-        .is_err());
-        assert!(extract_source_pdf_document_with_limits(
-            &two_pages,
-            SourcePdfLimits {
-                max_total_text_bytes: 4,
-                ..SOURCE_PDF_LIMITS
-            },
-        )
-        .is_err());
-
-        let oversized_line = "X".repeat(MAX_SOURCE_TEXT_ROW_CHARACTERS + 1);
-        let oversized_pdf = source_pdf(&[&[oversized_line.as_str()]]);
-        let oversized = extract_source_pdf_document(&oversized_pdf).unwrap();
-        assert!(oversized.source_text_rows.is_empty());
-        assert!(!oversized.source_text_rows_complete);
-    }
-
-    #[test]
-    fn public_source_document_boundaries_match_the_guarded_limits() {
-        assert_eq!(MAX_SOURCE_DOCUMENT_BYTES, 8 * 1024 * 1024);
-        assert_eq!(SOURCE_PDF_LIMITS.max_pages, 256);
-        assert_eq!(
-            SOURCE_PDF_LIMITS.max_page_decompressed_bytes,
-            2 * 1024 * 1024
-        );
-        assert_eq!(SOURCE_PDF_LIMITS.max_total_text_bytes, 2 * 1024 * 1024);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            CONTENT_LENGTH,
-            HeaderValue::from_str(&MAX_SOURCE_DOCUMENT_BYTES.to_string()).unwrap(),
-        );
-        validate_source_content_length(
-            &headers,
-            Some(MAX_SOURCE_DOCUMENT_BYTES as u64),
-            MAX_SOURCE_DOCUMENT_BYTES,
-        )
-        .unwrap();
-
-        headers.insert(
-            CONTENT_LENGTH,
-            HeaderValue::from_str(&(MAX_SOURCE_DOCUMENT_BYTES + 1).to_string()).unwrap(),
-        );
-        assert!(validate_source_content_length(&headers, None, MAX_SOURCE_DOCUMENT_BYTES).is_err());
-        assert!(validate_source_content_length(
-            &HeaderMap::new(),
-            Some((MAX_SOURCE_DOCUMENT_BYTES + 1) as u64),
-            MAX_SOURCE_DOCUMENT_BYTES,
-        )
-        .is_err());
-
-        validate_source_pdf_page_count(MAX_SOURCE_PDF_PAGES, MAX_SOURCE_PDF_PAGES).unwrap();
-        assert!(
-            validate_source_pdf_page_count(MAX_SOURCE_PDF_PAGES + 1, MAX_SOURCE_PDF_PAGES).is_err()
-        );
-        assert!(validate_source_pdf_page_count(0, MAX_SOURCE_PDF_PAGES).is_err());
-    }
-
-    #[test]
-    fn source_pdf_fails_closed_when_an_encrypt_dictionary_is_present() {
-        let pdf = source_pdf(&[&["Garmin GIA 63W"]]);
-        let mut document = Document::load_mem(&pdf).unwrap();
-        let encrypt_id = document.add_object(dictionary! {
-            "Filter" => "Standard",
-            "V" => 1,
-            "R" => 2,
-            "Length" => 40,
-            "O" => Object::string_literal("owner"),
-            "U" => Object::string_literal("user"),
-            "P" => -4,
-        });
-        document.trailer.set("Encrypt", encrypt_id);
-        let mut encrypted = Vec::new();
-        document.save_to(&mut encrypted).unwrap();
-
-        assert!(extract_source_pdf_document(&encrypted).is_err());
+        assert!(cleaned.source_text_rows.is_empty());
+        assert!(!cleaned.source_text_rows_complete);
     }
 
     #[test]
