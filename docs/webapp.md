@@ -354,11 +354,14 @@ treated as ready data.
 
 ## Listing Review Workspace
 
-The Review tab lists the current user's listings that have one durable pending
-review bundle. The queue shows the aircraft, tail, year, aspect count, reason
-groups, and last update. Opening a listing shows every unresolved observation,
-its source context, and any suggested or proposed product. Catalog search in
-the workspace returns approved products only.
+The Review tab has **By product** and **By listing** queues. By product
+collapses every pending preserved association onto one approved avionics
+identity. A product is attested once from a guarded OEM fetch, without Gemini,
+then its listing associations are checked locally with bounded concurrency
+across listings and serial optimistic-lock updates within each listing. By
+listing shows the aircraft, tail, year, aspect count, reason groups, and last
+update. Opening a listing shows every unresolved observation, its source
+context, and any suggested or proposed product.
 
 Review access has a server-side allowlist until durable application roles are
 available. Production deployments must provide a comma-separated list of exact
@@ -377,8 +380,7 @@ authentication adapter trusts `X-User-Email`; production must expose these
 routes only behind a trusted proxy that strips any client-supplied value and
 injects the authenticated identity itself.
 
-Every avionics aspect offers all three actions, even when the server presents a
-suggested approved match or an explicit legacy candidate. The reviewer chooses
+Ordinary extracted avionics aspects offer three decisions. The reviewer chooses
 exactly one before the Verify Listing button is enabled:
 
 - **Use verified product** searches and selects one existing approved catalog
@@ -388,6 +390,11 @@ exactly one before the Verify Listing button is enabled:
   and authoritative identity source URL, title, and evidence text.
 - **Discard observation** requires a reason and creates neither a catalog row
   nor a listing association.
+
+A preserved approved-product association is not a fourth decision type.
+Product attestation and source-free occurrence corroboration are separate
+operations. Until local corroboration succeeds, the synthetic aspect remains
+pending and may only be explicitly discarded from the listing workflow.
 
 For an unlinked observation, an explicit legacy candidate means normalized
 manufacturer/model selected one and only one `unreviewed` catalog row. An
@@ -403,8 +410,20 @@ The corresponding API is:
 ```http
 GET /api/review/listings?limit=25&offset=0
 GET /api/review/listings/{listing_id}
+GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
+GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
+POST /api/review/avionics/products/{product_id}/attest
+POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/resolve
 ```
+
+Product cursors are opaque keyset tokens ordered by immutable product ID.
+Association cursors are bound to one product and ordered by listing and aspect.
+The attestation request carries the catalog revision and one OEM source
+dossier. The association request carries only the canonical review hash,
+catalog revision, and aspect ID; source fields and legacy revision aliases are
+rejected. Attestation rechecks both the manufacturer-scoped collision snapshot
+and ownership of the exact pending association under the mutation lock.
 
 The resolve request includes `review_payload_sha256`,
 `catalog_revision_sha256`, one decision for every returned aspect, and an

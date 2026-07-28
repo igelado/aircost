@@ -5,12 +5,14 @@ import {
   aircraftIdentityIsVerified,
   characterLimitState,
   describeAircraftIdentity,
+  describeProductAssociationOutcome,
   describeReviewReasons,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
+  runProductAssociationWorkers,
 } from "/review/domain.mjs";
 
 const REVIEW_LISTING_PARAM = "review_listing";
@@ -20,7 +22,6 @@ const CATALOG_RESULT_LIMIT = 8;
 const CATALOG_SEARCH_DELAY_MS = 250;
 const SUPPORTED_ACTIONS = Object.freeze([
   "use_verified_product",
-  "verify_existing_product",
   "create_verified_product",
   "discard",
 ]);
@@ -39,7 +40,15 @@ const state = {
   limit: QUEUE_LIMIT,
   offset: 0,
   queueLoaded: false,
+  queueMode: "product",
   queueRequestSequence: 0,
+  productRequestSequence: 0,
+  productDetailRequestSequence: 0,
+  productGroups: [],
+  selectedProduct: null,
+  productAssociations: [],
+  productOutcomes: new Map(),
+  productBusy: false,
   detailRequestSequence: 0,
   currentReview: null,
   drafts: new Map(),
@@ -75,16 +84,17 @@ export function initializeReviewWorkspace(shared) {
     activate() {
       const listingId = reviewListingIdFromLocation();
       if (listingId !== null) {
+        setQueueMode("listing", { load: false });
         state.activeArea = reviewAreaFromLocation() ?? "avionics";
         const queueLoad = state.queueLoaded ? Promise.resolve() : loadQueue({ quiet: true });
         const detailLoad = openReview(listingId, { historyMode: "none", discardDraft: true });
         return Promise.allSettled([queueLoad, detailLoad]);
       }
       showQueue({ historyMode: "none", discardDraft: true });
-      return state.queueLoaded ? Promise.resolve() : loadQueue();
+      return state.productGroups.length ? Promise.resolve() : loadProductQueue();
     },
     refresh() {
-      return loadQueue();
+      return refreshActiveQueue();
     },
     restoreFromLocation() {
       if (reviewListingIdFromLocation() !== null) {
@@ -98,14 +108,34 @@ function collectElements() {
   for (const [key, selector] of Object.entries({
     reviewPanel: "#review-panel",
     reviewPendingCount: "#review-pending-count",
+    reviewPendingLabel: "#review-pending-label",
     reviewAspectCount: "#review-aspect-count",
+    reviewAspectLabel: "#review-aspect-label",
     reviewReasonCount: "#review-reason-count",
+    reviewReasonLabel: "#review-reason-label",
     reviewQueueView: "#review-queue-view",
+    reviewQueueTitle: "#review-queue-title",
+    reviewModeProduct: "#review-mode-product",
+    reviewModeListing: "#review-mode-listing",
     refreshReviews: "#refresh-reviews",
     reviewQueueMessage: "#review-queue-message",
     reviewResults: "#review-results",
     reviewTableBody: "#review-table-body",
     emptyReviews: "#empty-reviews",
+    reviewProductResults: "#review-product-results",
+    reviewProductTableBody: "#review-product-table-body",
+    emptyReviewProducts: "#empty-review-products",
+    reviewProductWorkspace: "#review-product-workspace",
+    reviewProductTitle: "#review-product-title",
+    reviewProductSummary: "#review-product-summary",
+    reviewProductStatus: "#review-product-status",
+    reviewProductAttestationForm: "#review-product-attestation-form",
+    reviewProductTitleCount: "#review-product-title-count",
+    reviewProductEvidenceCount: "#review-product-evidence-count",
+    reviewProductAttest: "#review-product-attest",
+    reviewProductValidate: "#review-product-validate",
+    reviewProductActionMessage: "#review-product-action-message",
+    reviewProductAssociationBody: "#review-product-association-body",
     reviewWorkspace: "#review-workspace",
     reviewWorkspaceTitle: "#review-workspace-title",
     reviewWorkspaceSubtitle: "#review-workspace-subtitle",
@@ -137,7 +167,37 @@ function collectElements() {
 }
 
 function bindEvents() {
-  elements.refreshReviews.addEventListener("click", () => loadQueue());
+  elements.refreshReviews.addEventListener("click", () => refreshActiveQueue());
+  elements.reviewModeProduct.addEventListener("click", () => setQueueMode("product"));
+  elements.reviewModeListing.addEventListener("click", () => setQueueMode("listing"));
+  elements.reviewProductTableBody.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-review-product-id]");
+    const productId = positiveInteger(button?.dataset.reviewProductId);
+    if (productId !== null) {
+      openProductReview(productId);
+    }
+  });
+  elements.reviewProductAttestationForm.addEventListener(
+    "submit",
+    attestSelectedProduct,
+  );
+  elements.reviewProductValidate.addEventListener(
+    "click",
+    validateSelectedProductAssociations,
+  );
+  for (const [name, counter, limit] of [
+    ["identity_source_title", elements.reviewProductTitleCount,
+      REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle],
+    ["identity_evidence_text", elements.reviewProductEvidenceCount,
+      REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText],
+  ]) {
+    const input = elements.reviewProductAttestationForm.elements.namedItem(name);
+    input.addEventListener("input", () => {
+      const value = characterLimitState(input.value, limit);
+      counter.textContent = `${value.count} / ${value.limit}`;
+      counter.classList.toggle("over-limit", value.overLimit);
+    });
+  }
   elements.reviewTableBody.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-review-listing-id]");
     if (!button) {
@@ -190,6 +250,472 @@ function bindEvents() {
       openReview(listingId, { historyMode: "none", discardDraft: true, force: true });
     }
   });
+}
+
+function refreshActiveQueue() {
+  return state.queueMode === "product" ? loadProductQueue() : loadQueue();
+}
+
+function setQueueMode(mode, { load = true } = {}) {
+  state.queueMode = mode === "listing" ? "listing" : "product";
+  const productMode = state.queueMode === "product";
+  elements.reviewModeProduct.classList.toggle("is-active", productMode);
+  elements.reviewModeProduct.classList.toggle("subtle", !productMode);
+  elements.reviewModeProduct.setAttribute("aria-pressed", String(productMode));
+  elements.reviewModeListing.classList.toggle("is-active", !productMode);
+  elements.reviewModeListing.classList.toggle("subtle", productMode);
+  elements.reviewModeListing.setAttribute("aria-pressed", String(!productMode));
+  elements.reviewProductResults.classList.toggle("is-hidden", !productMode);
+  elements.reviewResults.classList.toggle("is-hidden", productMode);
+  elements.reviewQueueTitle.textContent = productMode
+    ? "Avionics needing verification"
+    : "Listings needing verification";
+  elements.reviewPendingLabel.textContent = productMode
+    ? "Product-listing pairs"
+    : "Pending listings";
+  elements.reviewAspectLabel.textContent = "Pending checks";
+  elements.reviewReasonLabel.textContent = productMode
+    ? "Products needing OEM check"
+    : "Issue types";
+  if (!load) {
+    return;
+  }
+  if (productMode) {
+    loadProductQueue();
+  } else {
+    loadQueue();
+  }
+}
+
+async function loadProductQueue({ quiet = false } = {}) {
+  const sequence = ++state.productRequestSequence;
+  if (!quiet) {
+    setQueueMessage("Loading product review queue…");
+  }
+  elements.reviewProductResults.setAttribute("aria-busy", "true");
+  setButtonBusy(elements.refreshReviews, true);
+  try {
+    const groups = [];
+    let cursor = null;
+    let catalogRevision = null;
+    do {
+      const params = new URLSearchParams({ limit: String(QUEUE_LIMIT) });
+      if (cursor) {
+        params.set("cursor", cursor);
+      }
+      const page = await api(`/api/review/avionics/products?${params}`);
+      if (sequence !== state.productRequestSequence) {
+        return false;
+      }
+      if (catalogRevision !== null && page.catalog_revision_sha256 !== catalogRevision) {
+        throw new Error("The avionics catalog changed while the product queue was loading.");
+      }
+      catalogRevision = page.catalog_revision_sha256;
+      groups.push(...(Array.isArray(page?.items) ? page.items : []));
+      cursor = nonBlank(page?.next_cursor) ? page.next_cursor : null;
+    } while (cursor);
+    state.productGroups = groups.sort((left, right) => {
+      const statusOrder = Number(left?.attestation_status !== "current")
+        - Number(right?.attestation_status !== "current");
+      return statusOrder
+        || (positiveInteger(left?.product?.id) ?? 0)
+          - (positiveInteger(right?.product?.id) ?? 0);
+    });
+    renderProductQueue();
+    if (!quiet) {
+      setQueueMessage(
+        `${groups.length} ${pluralize(groups.length, "product")} with pending associations.`,
+      );
+    }
+    return true;
+  } catch (error) {
+    if (sequence === state.productRequestSequence) {
+      setQueueMessage(`Could not load product review queue: ${error.message}`, true);
+    }
+    return false;
+  } finally {
+    if (sequence === state.productRequestSequence) {
+      elements.reviewProductResults.setAttribute("aria-busy", "false");
+      setButtonBusy(elements.refreshReviews, false);
+    }
+  }
+}
+
+function renderProductQueue() {
+  elements.reviewProductTableBody.replaceChildren(
+    ...state.productGroups.map(productQueueRow),
+  );
+  elements.emptyReviewProducts.classList.toggle(
+    "is-hidden",
+    state.productGroups.length > 0,
+  );
+  const associationCount = state.productGroups.reduce(
+    (sum, group) => sum + (nonNegativeInteger(group?.pending_association_count) ?? 0),
+    0,
+  );
+  const productListingPairs = state.productGroups.reduce(
+    (sum, group) => sum + (nonNegativeInteger(group?.pending_listing_count) ?? 0),
+    0,
+  );
+  elements.reviewPendingCount.textContent = formatNumber(productListingPairs, 0);
+  elements.reviewAspectCount.textContent = formatNumber(associationCount, 0);
+  elements.reviewReasonCount.textContent = formatNumber(
+    state.productGroups.filter((group) => group?.attestation_status === "required").length,
+    0,
+  );
+}
+
+function productQueueRow(group) {
+  const row = document.createElement("tr");
+  const product = group?.product || {};
+  const productId = positiveInteger(product.id);
+  const title = [product.manufacturer, product.model].filter(nonBlank).join(" ")
+    || `Catalog product ${productId ?? "-"}`;
+  const identity = product.stable_identifier;
+  const productCell = document.createElement("td");
+  productCell.dataset.label = "Product";
+  const name = document.createElement("strong");
+  name.textContent = title;
+  productCell.append(name, renderAvionicsChips(product.capabilities || []));
+  const identityCell = queueTextCell(
+    "Identity",
+    group?.attestation_status === "current"
+      ? "Current — ready for local checks"
+      : "OEM attestation required",
+  );
+  identityCell.classList.add(
+    group?.attestation_status === "current" ? "review-status-current" : "review-status-required",
+  );
+  const pendingCell = queueTextCell(
+    "Pending",
+    `${group?.pending_association_count ?? 0} across `
+      + `${group?.pending_listing_count ?? 0} ${pluralize(group?.pending_listing_count ?? 0, "listing")}`,
+  );
+  const actionCell = document.createElement("td");
+  actionCell.dataset.label = "Actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "button";
+  button.dataset.reviewProductId = String(productId ?? "");
+  button.disabled = productId === null;
+  button.textContent = group?.attestation_status === "current"
+    ? "Validate associations"
+    : "Review product";
+  actionCell.append(button);
+  row.append(
+    productCell,
+    identityCell,
+    pendingCell,
+    actionCell,
+  );
+  if (identity?.value) {
+    name.title = `${displayLabel(identity.kind)}: ${identity.value}`;
+  }
+  return row;
+}
+
+async function loadAllProductAssociations(productId, sequence) {
+  const associations = [];
+  let cursor = null;
+  let product = null;
+  let attestationStatus = null;
+  let catalogRevision = null;
+  do {
+    if (sequence !== state.productDetailRequestSequence) {
+      throw new Error("Product detail request was superseded.");
+    }
+    const params = new URLSearchParams({ limit: String(QUEUE_LIMIT) });
+    if (cursor) {
+      params.set("cursor", cursor);
+    }
+    const page = await api(
+      `/api/review/avionics/products/${productId}/associations?${params}`,
+    );
+    if (sequence !== state.productDetailRequestSequence) {
+      throw new Error("Product detail request was superseded.");
+    }
+    if (
+      positiveInteger(page?.product?.id) !== productId
+      || product !== null && JSON.stringify(page.product) !== JSON.stringify(product)
+      || attestationStatus !== null && page.attestation_status !== attestationStatus
+      || catalogRevision !== null && page.catalog_revision_sha256 !== catalogRevision
+    ) {
+      throw new Error(
+        "The product, attestation, or catalog revision changed between association pages.",
+      );
+    }
+    product = page.product;
+    attestationStatus = page.attestation_status;
+    catalogRevision = page.catalog_revision_sha256;
+    associations.push(...(Array.isArray(page?.associations) ? page.associations : []));
+    cursor = nonBlank(page?.next_cursor) ? page.next_cursor : null;
+  } while (cursor);
+  return { product, attestationStatus, catalogRevision, associations };
+}
+
+async function openProductReview(productId) {
+  const sequence = ++state.productDetailRequestSequence;
+  elements.reviewProductWorkspace.classList.remove("is-hidden");
+  elements.reviewProductActionMessage.textContent = "Loading product associations…";
+  try {
+    const detail = await loadAllProductAssociations(productId, sequence);
+    if (sequence !== state.productDetailRequestSequence) {
+      return { status: "superseded" };
+    }
+    state.selectedProduct = {
+      id: productId,
+      product: detail.product,
+      attestationStatus: detail.attestationStatus,
+      catalogRevision: detail.catalogRevision,
+    };
+    state.productAssociations = detail.associations;
+    renderSelectedProduct();
+    return { status: "loaded" };
+  } catch (error) {
+    if (sequence !== state.productDetailRequestSequence) {
+      return { status: "superseded" };
+    }
+    if (error?.status === 404) {
+      if (state.selectedProduct?.id === productId) {
+        state.selectedProduct = null;
+        state.productAssociations = [];
+      }
+      elements.reviewProductWorkspace.classList.add("is-hidden");
+      elements.reviewProductActionMessage.textContent = "";
+      return { status: "absent" };
+    }
+    elements.reviewProductActionMessage.textContent =
+      `Could not load product review: ${error.message}`;
+    return { status: "error", error };
+  }
+}
+
+function renderSelectedProduct() {
+  const selected = state.selectedProduct;
+  if (!selected) {
+    elements.reviewProductWorkspace.classList.add("is-hidden");
+    return;
+  }
+  const product = selected.product || {};
+  elements.reviewProductTitle.textContent =
+    [product.manufacturer, product.model].filter(nonBlank).join(" ")
+      || `Catalog product ${selected.id}`;
+  elements.reviewProductSummary.textContent = [
+    `Catalog ID ${selected.id}`,
+    product.stable_identifier?.value,
+    `${state.productAssociations.length} pending `
+      + pluralize(state.productAssociations.length, "association"),
+  ].filter(nonBlank).join(" · ");
+  const current = selected.attestationStatus === "current";
+  elements.reviewProductStatus.textContent = current
+    ? "Product identity current"
+    : "OEM attestation required";
+  elements.reviewProductStatus.classList.toggle("is-current", current);
+  elements.reviewProductAttestationForm.classList.toggle("is-hidden", current);
+  elements.reviewProductValidate.disabled = !current || state.productBusy;
+  if (!current) {
+    const form = elements.reviewProductAttestationForm.elements;
+    form.namedItem("identity_source_url").value = product.identity_source_url || "";
+    form.namedItem("identity_source_title").value = product.identity_source_title || "";
+    form.namedItem("identity_evidence_text").value = product.identity_evidence_text || "";
+    form.namedItem("identity_source_title").dispatchEvent(new Event("input"));
+    form.namedItem("identity_evidence_text").dispatchEvent(new Event("input"));
+  }
+  renderProductAssociationRows();
+  elements.reviewProductActionMessage.textContent = current
+    ? "Product identity is current. Local association checks will not call Gemini."
+    : "Attest this product once before validating its listing associations.";
+}
+
+function associationOutcomeKey(association) {
+  return `${association?.listing_id}:${aspectKey(association?.aspect_id)}`;
+}
+
+function renderProductAssociationRows() {
+  elements.reviewProductAssociationBody.replaceChildren(
+    ...state.productAssociations.map((association) => {
+      const row = document.createElement("tr");
+      const listing = document.createElement("td");
+      listing.dataset.label = "Listing";
+      const label = document.createElement("strong");
+      label.textContent = association.listing_label || `Listing ${association.listing_id}`;
+      listing.append(label);
+      const source = safeDetailLink(association.source_url, "Open listing");
+      if (source) {
+        source.className = "review-association-source";
+        listing.append(source);
+      }
+      const observed = queueTextCell(
+        "Observed text",
+        association.source_evidence_text || association.observed_text || "No retained text",
+      );
+      const result = queueTextCell(
+        "Result",
+        state.productOutcomes.get(associationOutcomeKey(association))?.label || "Pending",
+      );
+      const outcome = state.productOutcomes.get(associationOutcomeKey(association));
+      if (outcome) {
+        result.title = outcome.detail;
+        result.classList.add(`review-outcome-${outcome.kind}`);
+      }
+      row.append(listing, observed, result);
+      return row;
+    }),
+  );
+}
+
+async function attestSelectedProduct(event) {
+  event.preventDefault();
+  const selected = state.selectedProduct;
+  if (!selected || selected.attestationStatus === "current" || state.productBusy) {
+    return;
+  }
+  const form = elements.reviewProductAttestationForm.elements;
+  const sourceUrl = form.namedItem("identity_source_url").value.trim();
+  const sourceTitle = form.namedItem("identity_source_title").value.trim();
+  const evidenceText = form.namedItem("identity_evidence_text").value.trim();
+  const validation = reviewProductIdentitySourceValidation(sourceTitle, evidenceText);
+  if (!authoritativeIdentityUrl(sourceUrl) || !validation.valid) {
+    elements.reviewProductActionMessage.textContent = !authoritativeIdentityUrl(sourceUrl)
+      ? "Provide an authoritative HTTPS OEM source URL."
+      : validation.message;
+    return;
+  }
+  setProductBusy(true);
+  elements.reviewProductActionMessage.textContent =
+    "Fetching the OEM source and checking the immutable product identity…";
+  try {
+    const result = await api(
+      `/api/review/avionics/products/${selected.id}/attest`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          catalog_revision_sha256: selected.catalogRevision,
+          identity_source_url: sourceUrl,
+          identity_source_title: sourceTitle,
+          identity_evidence_text: evidenceText,
+        }),
+      },
+    );
+    selected.attestationStatus = "current";
+    elements.reviewProductActionMessage.textContent = result?.reused
+      ? "The product attestation was already current; no source fetch was needed."
+      : "Product identity attested from the guarded OEM source without Gemini.";
+    await loadProductQueue({ quiet: true });
+    await openProductReview(selected.id);
+  } catch (error) {
+    const outcome = describeProductAssociationOutcome(error);
+    elements.reviewProductActionMessage.textContent =
+      `${outcome.label}: ${outcome.detail}`;
+  } finally {
+    setProductBusy(false);
+  }
+}
+
+async function validateSelectedProductAssociations() {
+  const selected = state.selectedProduct;
+  if (!selected || selected.attestationStatus !== "current" || state.productBusy) {
+    return;
+  }
+  const initialAssociations = state.productAssociations.slice();
+  setProductBusy(true);
+  elements.reviewProductActionMessage.textContent =
+    `Validating ${initialAssociations.length} associations locally…`;
+  const results = await runProductAssociationWorkers(
+    initialAssociations,
+    async (listingId, associations) => {
+      let pending = associations.slice();
+      const failedAspectKeys = new Set();
+      let accepted = 0;
+      let failures = 0;
+      let current = pending[0];
+      while (current) {
+        try {
+          const response = await api(
+            `/api/review/listings/${listingId}/avionics/verify-existing`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                review_payload_sha256: current.review_payload_sha256,
+                catalog_revision_sha256: selected.catalogRevision,
+                aspect_id: current.aspect_id,
+              }),
+            },
+          );
+          state.productOutcomes.set(associationOutcomeKey(current), {
+            kind: "accepted",
+            label: "Accepted locally",
+            detail: "The retained listing text uniquely matched the attested product.",
+          });
+          accepted += 1;
+          renderProductAssociationRows();
+          const review = response?.review;
+          pending = Array.isArray(review?.aspects)
+            ? review.aspects
+              .filter(
+                (aspect) => positiveInteger(aspect?.reuse_attestation_target?.id) === selected.id,
+              )
+              .map((aspect) => ({
+                listing_id: listingId,
+                listing_label: current.listing_label,
+                source_url: current.source_url,
+                aspect_id: aspect.id,
+                review_payload_sha256: review.review_payload_sha256,
+                observed_text: aspect.observed_text,
+                source_evidence_text: aspect.source_evidence_text,
+              }))
+            : [];
+        } catch (error) {
+          failedAspectKeys.add(aspectKey(current.aspect_id));
+          failures += 1;
+          state.productOutcomes.set(
+            associationOutcomeKey(current),
+            describeProductAssociationOutcome(error),
+          );
+          renderProductAssociationRows();
+          pending = pending.filter(
+            (association) => aspectKey(association.aspect_id) !== aspectKey(current.aspect_id),
+          );
+        }
+        current = pending.find(
+          (association) => !failedAspectKeys.has(aspectKey(association.aspect_id)),
+        ) || null;
+      }
+      return { accepted, failures };
+    },
+    4,
+  );
+  const accepted = results
+    .filter((result) => result.status === "fulfilled")
+    .reduce((sum, result) => sum + (result.value?.accepted || 0), 0);
+  const manualAssociations = results.reduce(
+    (sum, result) => sum + (
+      result.status === "fulfilled" ? result.value?.failures || 0 : 1
+    ),
+    0,
+  );
+  const manualListings = results.filter(
+    (result) => result.status === "rejected" || (result.value?.failures || 0) > 0,
+  ).length;
+  elements.reviewProductActionMessage.textContent =
+    `${accepted} accepted locally; ${manualAssociations} `
+      + `${pluralize(manualAssociations, "association")} across ${manualListings} `
+      + `${pluralize(manualListings, "listing")} need manual review or refresh.`;
+  await loadProductQueue({ quiet: true });
+  const refreshed = await openProductReview(selected.id);
+  if (refreshed.status === "absent") {
+    state.selectedProduct = null;
+    renderSelectedProduct();
+  }
+  setProductBusy(false);
+}
+
+function setProductBusy(busy) {
+  state.productBusy = busy;
+  setButtonBusy(elements.reviewProductAttest, busy);
+  setButtonBusy(elements.reviewProductValidate, busy);
+  elements.reviewProductValidate.disabled =
+    busy || state.selectedProduct?.attestationStatus !== "current";
 }
 
 async function loadQueue({ quiet = false } = {}) {
@@ -734,6 +1260,18 @@ function renderAspect(aspect, index, total) {
     );
     target.classList.add("review-suggested-product");
     context.append(target);
+    const associationAction = document.createElement("button");
+    associationAction.type = "button";
+    associationAction.className = "button";
+    associationAction.textContent = "Validate this listing association locally";
+    associationAction.addEventListener("click", () => {
+      validateExistingAssociation(key, associationAction);
+    });
+    const associationHint = document.createElement("p");
+    associationHint.className = "review-catalog-message";
+    associationHint.textContent =
+      "Product identity is managed once in By product. This operation uses only retained listing text and the local catalog.";
+    context.append(associationAction, associationHint);
   }
   const suggestedId = positiveInteger(aspect.suggested_product?.id);
   const candidateId = positiveInteger(aspect.proposed_product?.id);
@@ -844,42 +1382,12 @@ function actionPanel(aspect, draft, action, key) {
   panel.dataset.reviewAction = action;
   if (action === "use_verified_product") {
     panel.append(...catalogSelectionControls(aspect, draft, key));
-  } else if (action === "verify_existing_product") {
-    panel.append(...verifyExistingProductControls(draft, key));
   } else if (action === "create_verified_product") {
     panel.append(...createProductControls(draft, key));
   } else if (action === "discard") {
     panel.append(discardControls(draft, key));
   }
   return panel;
-}
-
-function verifyExistingProductControls(draft, key) {
-  const controls = document.createElement("div");
-  controls.className = "review-create-product-grid";
-  controls.append(
-    draftInput("Authoritative identity source URL", draft.create.identitySourceUrl, (value) => {
-      draft.create.identitySourceUrl = value;
-      draftChanged(key);
-    }, "url", true),
-    draftInput("Authoritative identity source title", draft.create.identitySourceTitle, (value) => {
-      draft.create.identitySourceTitle = value;
-      draftChanged(key);
-    }, "text", true, REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle),
-    draftTextarea("Exact identity evidence", draft.create.identityEvidenceText, (value) => {
-      draft.create.identityEvidenceText = value;
-      draftChanged(key);
-    }, REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText),
-  );
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "button";
-  button.textContent = "Verify this product now";
-  button.addEventListener("click", () => verifyExistingProduct(key, button));
-  const hint = document.createElement("p");
-  hint.className = "review-catalog-message";
-  hint.textContent = "This grounds only this product. A successful verification is saved before the listing is resolved.";
-  return [controls, button, hint];
 }
 
 function catalogSelectionControls(aspect, draft, key) {
@@ -1089,23 +1597,6 @@ function validateDraft(draft) {
       return { valid: false, message: "Select one approved avionics catalog product." };
     }
     return validDraftResult(draft, "Verified catalog product selected.");
-  }
-  if (draft.action === "verify_existing_product") {
-    if (!nonBlank(draft.create.identitySourceUrl)
-      || !authoritativeIdentityUrl(draft.create.identitySourceUrl)) {
-      return { valid: false, message: "Provide an authoritative HTTPS product source URL." };
-    }
-    const identitySourceValidation = reviewProductIdentitySourceValidation(
-      draft.create.identitySourceTitle,
-      draft.create.identityEvidenceText,
-    );
-    if (!identitySourceValidation.valid) {
-      return identitySourceValidation;
-    }
-    return {
-      valid: false,
-      message: "Verify this product now; after success it will become a selectable verified product.",
-    };
   }
   if (draft.action === "create_verified_product") {
     if (!nonBlank(draft.create.manufacturer) || !nonBlank(draft.create.model)) {
@@ -1330,31 +1821,15 @@ async function resolveReview() {
   }
 }
 
-async function verifyExistingProduct(key, button) {
+async function validateExistingAssociation(key, button) {
   const review = state.currentReview;
   const draft = state.drafts.get(key);
   const targetId = positiveInteger(draft?.aspect?.reuse_attestation_target?.id);
   if (!review || !draft || targetId === null || state.stale) {
     return;
   }
-  if (!nonBlank(draft.create.identitySourceUrl)
-    || !authoritativeIdentityUrl(draft.create.identitySourceUrl)) {
-    setWorkspaceMessage(
-      "Provide an authoritative HTTPS product source URL before verification.",
-      true,
-    );
-    return;
-  }
-  const identitySourceValidation = reviewProductIdentitySourceValidation(
-    draft.create.identitySourceTitle,
-    draft.create.identityEvidenceText,
-  );
-  if (!identitySourceValidation.valid) {
-    setWorkspaceMessage(identitySourceValidation.message, true);
-    return;
-  }
   button.disabled = true;
-  setWorkspaceMessage(`Grounding catalog product ${targetId} for this aspect only…`);
+  setWorkspaceMessage(`Validating this listing association against catalog product ${targetId}…`);
   try {
     const payload = await api(
       `/api/review/listings/${review.listing_id}/avionics/verify-existing`,
@@ -1364,9 +1839,6 @@ async function verifyExistingProduct(key, button) {
           review_payload_sha256: review.review_payload_sha256,
           catalog_revision_sha256: review.catalog_revision_sha256,
           aspect_id: draft.aspect.id,
-          identity_source_url: draft.create.identitySourceUrl.trim(),
-          identity_source_title: draft.create.identitySourceTitle.trim(),
-          identity_evidence_text: draft.create.identityEvidenceText.trim(),
         }),
       },
     );
@@ -1384,13 +1856,14 @@ async function verifyExistingProduct(key, button) {
     initializeDrafts(refreshed);
     renderReview();
     setWorkspaceMessage(
-      `Catalog product ${targetId} is freshly verified. Review the remaining aspects.`,
+      `The listing text matched catalog product ${targetId}. Review the remaining aspects.`,
     );
   } catch (error) {
     if (isStaleError(error)) {
       markStale(error.message);
     } else {
-      setWorkspaceMessage(`Could not verify this avionics product: ${error.message}`, true);
+      const outcome = describeProductAssociationOutcome(error);
+      setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
       button.disabled = false;
     }
   }
@@ -1470,9 +1943,6 @@ function decisionFromDraft(draft) {
       identity_evidence_text: draft.create.identityEvidenceText.trim(),
     };
     return decision;
-  }
-  if (draft.action === "verify_existing_product") {
-    throw new Error("Existing products must be verified before resolving the listing.");
   }
   return {
     aspect_id: draft.aspect.id,
@@ -1753,7 +2223,6 @@ function allowedActions(aspect) {
 function actionTitle(action) {
   return {
     use_verified_product: "Use verified product",
-    verify_existing_product: "Verify source and keep product",
     create_verified_product: "Create verified product",
     discard: "Discard observation",
   }[action] || displayLabel(action);
@@ -1772,9 +2241,6 @@ function actionDescription(action, aspect) {
     return suggestedId !== null
       ? "Enter a corrected identity as a separate verified product."
       : "Approve the proposed identity as a new catalog product.";
-  }
-  if (action === "verify_existing_product") {
-    return "Run the one-time source check for this exact approved product without reviewing any other aspect.";
   }
   if (aspect.required === false) {
     return "Exclude this optional observation and record why.";
@@ -1911,7 +2377,9 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   elements.reviewWorkspace.classList.add("is-hidden");
   elements.reviewQueueView.classList.remove("is-hidden");
   updateReviewLocation(null, historyMode);
-  if (!state.queueLoaded) {
+  if (state.queueMode === "product" && !state.productGroups.length) {
+    loadProductQueue();
+  } else if (state.queueMode === "listing" && !state.queueLoaded) {
     loadQueue();
   }
   return true;
