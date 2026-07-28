@@ -119,6 +119,9 @@ struct VerifyExistingReviewAvionicsRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AttestReviewAvionicsProductRequest {
+    listing_id: i64,
+    review_payload_sha256: String,
+    aspect_id: ReviewAspectId,
     catalog_revision_sha256: String,
     identity_source_url: String,
     identity_source_title: String,
@@ -708,6 +711,9 @@ async fn attest_review_avionics_product_handler(
         &state.db,
         user.id,
         product_id,
+        payload.listing_id,
+        &payload.review_payload_sha256,
+        &payload.aspect_id,
         &payload.catalog_revision_sha256,
         &payload.identity_source_url,
         &payload.identity_source_title,
@@ -2083,6 +2089,17 @@ mod tests {
             .await
             .unwrap()
             .review;
+        let authorization = review
+            .aspects
+            .iter()
+            .find(|aspect| {
+                aspect
+                    .reuse_attestation_target
+                    .as_ref()
+                    .and_then(|product| product.id)
+                    == Some(product_id)
+            })
+            .expect("the pending product association must authorize attestation");
         let usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
             .fetch_one(pool)
             .await
@@ -2093,6 +2110,9 @@ mod tests {
             HeaderMap::new(),
             Path(product_id),
             Json(AttestReviewAvionicsProductRequest {
+                listing_id,
+                review_payload_sha256: review.review_payload_sha256.clone(),
+                aspect_id: authorization.id.clone(),
                 catalog_revision_sha256: review.catalog_revision_sha256,
                 identity_source_url: String::new(),
                 identity_source_title: String::new(),
@@ -2109,6 +2129,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(usage_after, usage_before);
+    }
+
+    #[test]
+    fn product_attestation_request_accepts_only_the_direct_authorization_contract() {
+        let canonical = serde_json::from_value::<AttestReviewAvionicsProductRequest>(json!({
+            "listing_id": 23,
+            "review_payload_sha256": "a".repeat(64),
+            "aspect_id": "preserved:1",
+            "catalog_revision_sha256": "b".repeat(64),
+            "identity_source_url": "https://www.garmin.com/aviation/product",
+            "identity_source_title": "Garmin product",
+            "identity_evidence_text": "Garmin GNS 430W 011-01064-40"
+        }));
+        assert!(canonical.is_ok());
+        assert!(
+            serde_json::from_value::<AttestReviewAvionicsProductRequest>(json!({
+                "catalog_revision_sha256": "b".repeat(64),
+                "identity_source_url": "https://www.garmin.com/aviation/product",
+                "identity_source_title": "Garmin product",
+                "identity_evidence_text": "Garmin GNS 430W 011-01064-40"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<AttestReviewAvionicsProductRequest>(json!({
+                "listing_id": 23,
+                "expected_review_payload_sha256": "a".repeat(64),
+                "aspect_id": "preserved:1",
+                "catalog_revision_sha256": "b".repeat(64),
+                "identity_source_url": "https://www.garmin.com/aviation/product",
+                "identity_source_title": "Garmin product",
+                "identity_evidence_text": "Garmin GNS 430W 011-01064-40"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2273,11 +2328,25 @@ mod tests {
             .await
             .unwrap()
             .review;
+        let authorization = review
+            .aspects
+            .iter()
+            .find(|aspect| {
+                aspect
+                    .reuse_attestation_target
+                    .as_ref()
+                    .and_then(|product| product.id)
+                    == Some(preserved_id)
+            })
+            .expect("the pending product association must authorize attestation");
         let error = attest_review_avionics_product_handler(
             State(test_state(db)),
             HeaderMap::new(),
             Path(preserved_id),
             Json(AttestReviewAvionicsProductRequest {
+                listing_id,
+                review_payload_sha256: review.review_payload_sha256.clone(),
+                aspect_id: authorization.id.clone(),
                 catalog_revision_sha256: review.catalog_revision_sha256.clone(),
                 identity_source_url: "https://www.garmin.com/aviation/product".to_string(),
                 identity_source_title: "x".repeat(201),

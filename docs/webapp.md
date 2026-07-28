@@ -419,11 +419,15 @@ POST /api/review/listings/{listing_id}/resolve
 
 Product cursors are opaque keyset tokens ordered by immutable product ID.
 Association cursors are bound to one product and ordered by listing and aspect.
-The attestation request carries the catalog revision and one OEM source
-dossier. The association request carries only the canonical review hash,
-catalog revision, and aspect ID; source fields and legacy revision aliases are
-rejected. Attestation rechecks both the manufacturer-scoped collision snapshot
-and ownership of the exact pending association under the mutation lock.
+The attestation request carries the catalog revision, one OEM source dossier,
+and exactly one direct association authorization tuple:
+`listing_id`, `review_payload_sha256`, and `aspect_id`. The server loads only
+that listing review and requires the exact hash-bound aspect to target the
+requested product; it does not scan other pending reviews for authorization.
+The association request carries only the canonical review hash, catalog
+revision, and aspect ID; source fields and legacy revision aliases are rejected.
+Attestation rechecks both the manufacturer-scoped collision snapshot and
+ownership of the exact pending association under the mutation lock.
 
 The resolve request includes `review_payload_sha256`,
 `catalog_revision_sha256`, one decision for every returned aspect, and an

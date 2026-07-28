@@ -307,6 +307,29 @@ export function groupProductAssociationsByListing(associations) {
   return [...groups.entries()].map(([listingId, items]) => ({ listingId, items }));
 }
 
+export function productDetailRequestMayCommit(productId, requestSequence, viewState) {
+  return Number.isSafeInteger(productId)
+    && productId > 0
+    && Number.isSafeInteger(requestSequence)
+    && requestSequence === viewState?.productDetailRequestSequence
+    && (
+      viewState?.productBusy !== true
+      || viewState?.productBusyProductId === productId
+    );
+}
+
+export function productActionContextIsCurrent(context, viewState) {
+  return Number.isSafeInteger(context?.productId)
+    && context.productId > 0
+    && Number.isSafeInteger(context?.detailSequence)
+    && Number.isSafeInteger(context?.actionSequence)
+    && viewState?.productBusy === true
+    && viewState?.productBusyProductId === context.productId
+    && viewState?.productActionSequence === context.actionSequence
+    && viewState?.productDetailRequestSequence === context.detailSequence
+    && viewState?.selectedProduct?.id === context.productId;
+}
+
 /// Run one serial task per listing with bounded concurrency across listings.
 ///
 /// The task owns the complete listing loop so it can refresh the review hash

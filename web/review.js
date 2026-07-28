@@ -10,6 +10,8 @@ import {
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
+  productActionContextIsCurrent,
+  productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
   runProductAssociationWorkers,
@@ -49,6 +51,8 @@ const state = {
   productAssociations: [],
   productOutcomes: new Map(),
   productBusy: false,
+  productBusyProductId: null,
+  productActionSequence: 0,
   detailRequestSequence: 0,
   currentReview: null,
   drafts: new Map(),
@@ -171,6 +175,9 @@ function bindEvents() {
   elements.reviewModeProduct.addEventListener("click", () => setQueueMode("product"));
   elements.reviewModeListing.addEventListener("click", () => setQueueMode("listing"));
   elements.reviewProductTableBody.addEventListener("click", (event) => {
+    if (state.productBusy) {
+      return;
+    }
     const button = event.target.closest("button[data-review-product-id]");
     const productId = positiveInteger(button?.dataset.reviewProductId);
     if (productId !== null) {
@@ -287,8 +294,12 @@ function setQueueMode(mode, { load = true } = {}) {
   }
 }
 
-async function loadProductQueue({ quiet = false } = {}) {
+async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
   const sequence = ++state.productRequestSequence;
+  const mayCommit = () => (
+    sequence === state.productRequestSequence
+    && (commitGuard === null || commitGuard())
+  );
   if (!quiet) {
     setQueueMessage("Loading product review queue…");
   }
@@ -304,7 +315,7 @@ async function loadProductQueue({ quiet = false } = {}) {
         params.set("cursor", cursor);
       }
       const page = await api(`/api/review/avionics/products?${params}`);
-      if (sequence !== state.productRequestSequence) {
+      if (!mayCommit()) {
         return false;
       }
       if (catalogRevision !== null && page.catalog_revision_sha256 !== catalogRevision) {
@@ -314,6 +325,9 @@ async function loadProductQueue({ quiet = false } = {}) {
       groups.push(...(Array.isArray(page?.items) ? page.items : []));
       cursor = nonBlank(page?.next_cursor) ? page.next_cursor : null;
     } while (cursor);
+    if (!mayCommit()) {
+      return false;
+    }
     state.productGroups = groups.sort((left, right) => {
       const statusOrder = Number(left?.attestation_status !== "current")
         - Number(right?.attestation_status !== "current");
@@ -329,7 +343,7 @@ async function loadProductQueue({ quiet = false } = {}) {
     }
     return true;
   } catch (error) {
-    if (sequence === state.productRequestSequence) {
+    if (mayCommit()) {
       setQueueMessage(`Could not load product review queue: ${error.message}`, true);
     }
     return false;
@@ -397,7 +411,7 @@ function productQueueRow(group) {
   button.type = "button";
   button.className = "button";
   button.dataset.reviewProductId = String(productId ?? "");
-  button.disabled = productId === null;
+  button.disabled = productId === null || state.productBusy;
   button.textContent = group?.attestation_status === "current"
     ? "Validate associations"
     : "Review product";
@@ -454,12 +468,15 @@ async function loadAllProductAssociations(productId, sequence) {
 }
 
 async function openProductReview(productId) {
+  if (state.productBusy && state.productBusyProductId !== productId) {
+    return { status: "busy" };
+  }
   const sequence = ++state.productDetailRequestSequence;
   elements.reviewProductWorkspace.classList.remove("is-hidden");
   elements.reviewProductActionMessage.textContent = "Loading product associations…";
   try {
     const detail = await loadAllProductAssociations(productId, sequence);
-    if (sequence !== state.productDetailRequestSequence) {
+    if (!productDetailRequestMayCommit(productId, sequence, state)) {
       return { status: "superseded" };
     }
     state.selectedProduct = {
@@ -472,7 +489,7 @@ async function openProductReview(productId) {
     renderSelectedProduct();
     return { status: "loaded" };
   } catch (error) {
-    if (sequence !== state.productDetailRequestSequence) {
+    if (!productDetailRequestMayCommit(productId, sequence, state)) {
       return { status: "superseded" };
     }
     if (error?.status === 404) {
@@ -527,8 +544,8 @@ function renderSelectedProduct() {
     : "Attest this product once before validating its listing associations.";
 }
 
-function associationOutcomeKey(association) {
-  return `${association?.listing_id}:${aspectKey(association?.aspect_id)}`;
+function associationOutcomeKey(association, productId = state.selectedProduct?.id) {
+  return `${productId}:${association?.listing_id}:${aspectKey(association?.aspect_id)}`;
 }
 
 function renderProductAssociationRows() {
@@ -570,6 +587,16 @@ async function attestSelectedProduct(event) {
   if (!selected || selected.attestationStatus === "current" || state.productBusy) {
     return;
   }
+  const authorization = state.productAssociations.find((association) => (
+    positiveInteger(association?.listing_id) !== null
+    && nonBlank(association?.review_payload_sha256)
+    && aspectKey(association?.aspect_id)
+  ));
+  if (!authorization) {
+    elements.reviewProductActionMessage.textContent =
+      "Reload this product to obtain a current pending association authorization.";
+    return;
+  }
   const form = elements.reviewProductAttestationForm.elements;
   const sourceUrl = form.namedItem("identity_source_url").value.trim();
   const sourceTitle = form.namedItem("identity_source_title").value.trim();
@@ -581,7 +608,7 @@ async function attestSelectedProduct(event) {
       : validation.message;
     return;
   }
-  setProductBusy(true);
+  const action = beginProductAction(selected);
   elements.reviewProductActionMessage.textContent =
     "Fetching the OEM source and checking the immutable product identity…";
   try {
@@ -590,6 +617,9 @@ async function attestSelectedProduct(event) {
       {
         method: "POST",
         body: JSON.stringify({
+          listing_id: authorization.listing_id,
+          review_payload_sha256: authorization.review_payload_sha256,
+          aspect_id: authorization.aspect_id,
           catalog_revision_sha256: selected.catalogRevision,
           identity_source_url: sourceUrl,
           identity_source_title: sourceTitle,
@@ -597,18 +627,30 @@ async function attestSelectedProduct(event) {
         }),
       },
     );
-    selected.attestationStatus = "current";
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    state.selectedProduct.attestationStatus = "current";
     elements.reviewProductActionMessage.textContent = result?.reused
       ? "The product attestation was already current; no source fetch was needed."
       : "Product identity attested from the guarded OEM source without Gemini.";
-    await loadProductQueue({ quiet: true });
-    await openProductReview(selected.id);
+    await loadProductQueue({
+      quiet: true,
+      commitGuard: () => productActionContextIsCurrent(action, state),
+    });
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    await openProductReview(action.productId);
   } catch (error) {
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
     const outcome = describeProductAssociationOutcome(error);
     elements.reviewProductActionMessage.textContent =
       `${outcome.label}: ${outcome.detail}`;
   } finally {
-    setProductBusy(false);
+    finishProductAction(action);
   }
 }
 
@@ -618,95 +660,138 @@ async function validateSelectedProductAssociations() {
     return;
   }
   const initialAssociations = state.productAssociations.slice();
-  setProductBusy(true);
+  const action = beginProductAction(selected);
   elements.reviewProductActionMessage.textContent =
     `Validating ${initialAssociations.length} associations locally…`;
-  const results = await runProductAssociationWorkers(
-    initialAssociations,
-    async (listingId, associations) => {
-      let pending = associations.slice();
-      const failedAspectKeys = new Set();
-      let accepted = 0;
-      let failures = 0;
-      let current = pending[0];
-      while (current) {
-        try {
-          const response = await api(
-            `/api/review/listings/${listingId}/avionics/verify-existing`,
-            {
-              method: "POST",
-              body: JSON.stringify({
-                review_payload_sha256: current.review_payload_sha256,
-                catalog_revision_sha256: selected.catalogRevision,
-                aspect_id: current.aspect_id,
-              }),
-            },
-          );
-          state.productOutcomes.set(associationOutcomeKey(current), {
-            kind: "accepted",
-            label: "Accepted locally",
-            detail: "The retained listing text uniquely matched the attested product.",
-          });
-          accepted += 1;
-          renderProductAssociationRows();
-          const review = response?.review;
-          pending = Array.isArray(review?.aspects)
-            ? review.aspects
-              .filter(
-                (aspect) => positiveInteger(aspect?.reuse_attestation_target?.id) === selected.id,
-              )
-              .map((aspect) => ({
-                listing_id: listingId,
-                listing_label: current.listing_label,
-                source_url: current.source_url,
-                aspect_id: aspect.id,
-                review_payload_sha256: review.review_payload_sha256,
-                observed_text: aspect.observed_text,
-                source_evidence_text: aspect.source_evidence_text,
-              }))
-            : [];
-        } catch (error) {
-          failedAspectKeys.add(aspectKey(current.aspect_id));
-          failures += 1;
-          state.productOutcomes.set(
-            associationOutcomeKey(current),
-            describeProductAssociationOutcome(error),
-          );
-          renderProductAssociationRows();
-          pending = pending.filter(
-            (association) => aspectKey(association.aspect_id) !== aspectKey(current.aspect_id),
-          );
+  try {
+    const results = await runProductAssociationWorkers(
+      initialAssociations,
+      async (listingId, associations) => {
+        let pending = associations.slice();
+        const failedAspectKeys = new Set();
+        let accepted = 0;
+        let failures = 0;
+        let current = pending[0];
+        while (current && productActionContextIsCurrent(action, state)) {
+          try {
+            const response = await api(
+              `/api/review/listings/${listingId}/avionics/verify-existing`,
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  review_payload_sha256: current.review_payload_sha256,
+                  catalog_revision_sha256: selected.catalogRevision,
+                  aspect_id: current.aspect_id,
+                }),
+              },
+            );
+            if (!productActionContextIsCurrent(action, state)) {
+              return { accepted, failures, superseded: true };
+            }
+            state.productOutcomes.set(associationOutcomeKey(current, action.productId), {
+              kind: "accepted",
+              label: "Accepted locally",
+              detail: "The retained listing text uniquely matched the attested product.",
+            });
+            accepted += 1;
+            renderProductAssociationRows();
+            const review = response?.review;
+            pending = Array.isArray(review?.aspects)
+              ? review.aspects
+                .filter(
+                  (aspect) => (
+                    positiveInteger(aspect?.reuse_attestation_target?.id) === action.productId
+                  ),
+                )
+                .map((aspect) => ({
+                  listing_id: listingId,
+                  listing_label: current.listing_label,
+                  source_url: current.source_url,
+                  aspect_id: aspect.id,
+                  review_payload_sha256: review.review_payload_sha256,
+                  observed_text: aspect.observed_text,
+                  source_evidence_text: aspect.source_evidence_text,
+                }))
+              : [];
+          } catch (error) {
+            if (!productActionContextIsCurrent(action, state)) {
+              return { accepted, failures, superseded: true };
+            }
+            failedAspectKeys.add(aspectKey(current.aspect_id));
+            failures += 1;
+            state.productOutcomes.set(
+              associationOutcomeKey(current, action.productId),
+              describeProductAssociationOutcome(error),
+            );
+            renderProductAssociationRows();
+            pending = pending.filter(
+              (association) => aspectKey(association.aspect_id) !== aspectKey(current.aspect_id),
+            );
+          }
+          current = pending.find(
+            (association) => !failedAspectKeys.has(aspectKey(association.aspect_id)),
+          ) || null;
         }
-        current = pending.find(
-          (association) => !failedAspectKeys.has(aspectKey(association.aspect_id)),
-        ) || null;
-      }
-      return { accepted, failures };
-    },
-    4,
-  );
-  const accepted = results
-    .filter((result) => result.status === "fulfilled")
-    .reduce((sum, result) => sum + (result.value?.accepted || 0), 0);
-  const manualAssociations = results.reduce(
-    (sum, result) => sum + (
-      result.status === "fulfilled" ? result.value?.failures || 0 : 1
-    ),
-    0,
-  );
-  const manualListings = results.filter(
-    (result) => result.status === "rejected" || (result.value?.failures || 0) > 0,
-  ).length;
-  elements.reviewProductActionMessage.textContent =
-    `${accepted} accepted locally; ${manualAssociations} `
-      + `${pluralize(manualAssociations, "association")} across ${manualListings} `
-      + `${pluralize(manualListings, "listing")} need manual review or refresh.`;
-  await loadProductQueue({ quiet: true });
-  const refreshed = await openProductReview(selected.id);
-  if (refreshed.status === "absent") {
-    state.selectedProduct = null;
-    renderSelectedProduct();
+        return {
+          accepted,
+          failures,
+          superseded: !productActionContextIsCurrent(action, state),
+        };
+      },
+      4,
+    );
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    const accepted = results
+      .filter((result) => result.status === "fulfilled")
+      .reduce((sum, result) => sum + (result.value?.accepted || 0), 0);
+    const manualAssociations = results.reduce(
+      (sum, result) => sum + (
+        result.status === "fulfilled" ? result.value?.failures || 0 : 1
+      ),
+      0,
+    );
+    const manualListings = results.filter(
+      (result) => result.status === "rejected" || (result.value?.failures || 0) > 0,
+    ).length;
+    elements.reviewProductActionMessage.textContent =
+      `${accepted} accepted locally; ${manualAssociations} `
+        + `${pluralize(manualAssociations, "association")} across ${manualListings} `
+        + `${pluralize(manualListings, "listing")} need manual review or refresh.`;
+    await loadProductQueue({
+      quiet: true,
+      commitGuard: () => productActionContextIsCurrent(action, state),
+    });
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    await openProductReview(action.productId);
+  } finally {
+    finishProductAction(action);
   }
+}
+
+function beginProductAction(selected) {
+  const action = {
+    productId: selected.id,
+    detailSequence: state.productDetailRequestSequence,
+    actionSequence: state.productActionSequence + 1,
+  };
+  state.productActionSequence = action.actionSequence;
+  state.productBusyProductId = action.productId;
+  setProductBusy(true);
+  return action;
+}
+
+function finishProductAction(action) {
+  if (
+    state.productActionSequence !== action.actionSequence
+    || state.productBusyProductId !== action.productId
+  ) {
+    return;
+  }
+  state.productBusyProductId = null;
   setProductBusy(false);
 }
 
@@ -716,6 +801,7 @@ function setProductBusy(busy) {
   setButtonBusy(elements.reviewProductValidate, busy);
   elements.reviewProductValidate.disabled =
     busy || state.selectedProduct?.attestationStatus !== "current";
+  renderProductQueue();
 }
 
 async function loadQueue({ quiet = false } = {}) {

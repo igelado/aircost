@@ -364,7 +364,10 @@ Preserved approved-product associations use a separate product-centric
 workflow. One current OEM attestation is shared by every pending occurrence of
 that product. The deterministic source proof is bound to the complete
 manufacturer-scoped collision snapshot, and the write transaction rechecks
-both that snapshot and ownership of the hash-bound pending association.
+both that snapshot and ownership of the hash-bound pending association. The
+attestation preflight accepts one listing ID, review hash, and aspect ID and
+loads only that review; an unrelated malformed review cannot poison or
+authorize the operation.
 Occurrence corroboration then uses only retained listing text and the local
 catalog; it accepts no OEM dossier and never invokes Gemini. Successful
 corroboration removes only that synthetic association aspect.

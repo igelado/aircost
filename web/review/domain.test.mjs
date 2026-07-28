@@ -13,6 +13,8 @@ import {
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
+  productActionContextIsCurrent,
+  productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
   runProductAssociationWorkers,
@@ -377,6 +379,43 @@ test("groups product associations by listing while preserving association order"
     { listingId: 8, items: [associations[0], associations[2]] },
     { listingId: 4, items: [associations[1]] },
   ]);
+});
+
+test("rapid product switches cannot commit over an active product action", () => {
+  const action = {
+    productId: 11,
+    detailSequence: 4,
+    actionSequence: 2,
+  };
+  const active = {
+    productBusy: true,
+    productBusyProductId: 11,
+    productActionSequence: 2,
+    productDetailRequestSequence: 4,
+    selectedProduct: { id: 11 },
+  };
+  assert.equal(productActionContextIsCurrent(action, active), true);
+  assert.equal(productDetailRequestMayCommit(11, 4, active), true);
+
+  const rapidSwitch = {
+    ...active,
+    productDetailRequestSequence: 5,
+  };
+  assert.equal(productActionContextIsCurrent(action, rapidSwitch), false);
+  assert.equal(
+    productDetailRequestMayCommit(22, 5, rapidSwitch),
+    false,
+    "a product B request that started before A became busy cannot replace A",
+  );
+  assert.equal(
+    productDetailRequestMayCommit(22, 5, {
+      ...rapidSwitch,
+      productBusy: false,
+      productBusyProductId: null,
+    }),
+    true,
+    "product B can commit after the active action is finished",
+  );
 });
 
 test("runs listing-owned association loops with bounded cross-listing concurrency", async () => {

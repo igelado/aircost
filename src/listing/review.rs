@@ -4456,60 +4456,83 @@ fn validate_existing_product_verification_evidence(
 
 /// Read-only, cost-avoidance gate for one global product attestation.
 ///
-/// Ownership of at least one pending association is the authorization
-/// boundary. A current attestation is returned before source validation or
-/// network access so retries remain both idempotent and free.
+/// One exact hash-bound pending association is the authorization boundary. A
+/// current attestation is returned before source validation or network access
+/// so retries remain both idempotent and free.
 pub(crate) async fn preflight_pending_product_attestation(
     db: &AppDb,
     owner_user_id: i64,
     product_id: i64,
+    listing_id: i64,
+    expected_review_payload_sha256: &str,
+    aspect_id: &ReviewAspectId,
     expected_catalog_revision_sha256: &str,
     identity_source_url: &str,
     identity_source_title: &str,
     identity_evidence_text: &str,
 ) -> ReviewResult<PendingProductAttestationTarget> {
-    if product_id <= 0 || !valid_sha256(expected_catalog_revision_sha256) {
+    if product_id <= 0
+        || listing_id <= 0
+        || !valid_sha256(expected_review_payload_sha256)
+        || !valid_sha256(expected_catalog_revision_sha256)
+    {
         return Err(ReviewError::Validation(
-            "product ID must be positive and catalog revision must be lowercase SHA-256 hex"
+            "product and listing IDs must be positive and review and catalog revisions must be lowercase SHA-256 hex values"
                 .to_string(),
         ));
     }
+    let row = load_review_row(db, listing_id).await?;
+    if row.owner_user_id != owner_user_id {
+        return Err(ReviewError::Permission(
+            "reviewers may only attest products through listings they own".to_string(),
+        ));
+    }
+    if row.ingestion_state != "pending_review" || row.is_verified {
+        return Err(ReviewError::Stale(format!(
+            "listing {listing_id} is no longer in its expected pending-review state"
+        )));
+    }
+    if row.review_payload_sha256 != expected_review_payload_sha256 {
+        return Err(ReviewError::Stale(format!(
+            "listing {listing_id} review payload changed during product attestation; reload and re-evaluate"
+        )));
+    }
+    let payload = parse_payload(
+        &row.review_payload_json,
+        Some(&row.review_payload_sha256),
+        row.pending_aspect_count,
+    )?;
+    let aspect = payload
+        .aspects
+        .into_iter()
+        .find(|aspect| &aspect.id == aspect_id)
+        .ok_or_else(|| {
+            ReviewError::NotFound(format!(
+                "pending review aspect {aspect_id} was not found for listing {listing_id}"
+            ))
+        })?;
+    if aspect.reuse_attestation_target_id != Some(product_id) {
+        return Err(ReviewError::Conflict(format!(
+            "pending review aspect {aspect_id} for listing {listing_id} does not target approved catalog id {product_id}"
+        )));
+    }
+    let commit_guard = PendingProductAttestationCommitGuard {
+        owner_user_id,
+        listing_id,
+        review_payload_sha256: row.review_payload_sha256,
+        aspect_id: serde_json::to_value(aspect.id).map_err(|error| {
+            ReviewError::Database(format!(
+                "could not bind pending product aspect authorization: {error}"
+            ))
+        })?,
+    };
+
     let current_catalog_revision = approved_catalog_revision_sha256(db).await?;
     if current_catalog_revision != expected_catalog_revision_sha256 {
         return Err(ReviewError::Stale(
             "approved avionics catalog changed during review; reload and re-evaluate".to_string(),
         ));
     }
-    let mut authorization = None;
-    for row in load_product_review_source_rows(db, owner_user_id).await? {
-        let payload = parse_payload(
-            &row.review_payload_json,
-            Some(&row.review_payload_sha256),
-            row.pending_aspect_count,
-        )?;
-        if let Some(aspect) = payload
-            .aspects
-            .into_iter()
-            .find(|aspect| aspect.reuse_attestation_target_id == Some(product_id))
-        {
-            authorization = Some(PendingProductAttestationCommitGuard {
-                owner_user_id,
-                listing_id: row.listing_id,
-                review_payload_sha256: row.review_payload_sha256,
-                aspect_id: serde_json::to_value(aspect.id).map_err(|error| {
-                    ReviewError::Database(format!(
-                        "could not bind pending product aspect authorization: {error}"
-                    ))
-                })?,
-            });
-            break;
-        }
-    }
-    let commit_guard = authorization.ok_or_else(|| {
-        ReviewError::NotFound(format!(
-            "no pending review associations target approved catalog id {product_id}"
-        ))
-    })?;
     let product = load_all_approved_product_map(db)
         .await?
         .remove(&product_id)
@@ -8786,18 +8809,22 @@ mod tests {
                 .await
                 .unwrap();
         assert!(foreign_page.items.is_empty());
+        let direct_authorization = &association_page.associations[0];
         assert!(matches!(
             preflight_pending_product_attestation(
                 &db,
                 user_id + 10_000,
                 current_product_id,
+                direct_authorization.listing_id,
+                &direct_authorization.review_payload_sha256,
+                &direct_authorization.aspect_id,
                 &first_page.catalog_revision_sha256,
                 "",
                 "",
                 "",
             )
             .await,
-            Err(ReviewError::NotFound(_))
+            Err(ReviewError::Permission(_))
         ));
         assert!(matches!(
             list_pending_product_associations(
@@ -8808,6 +8835,125 @@ mod tests {
             )
             .await,
             Err(ReviewError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_attestation_uses_only_the_supplied_direct_association_authorization() {
+        let db = test_db().await;
+        let (user_id, malformed_listing_id) = insert_listing(&db).await;
+        let target_listing_id = insert_additional_listing(
+            &db,
+            user_id,
+            "https://broker.example/aircraft/direct-attestation",
+        )
+        .await;
+        let product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let pool = sqlite_pool(&db);
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Garmin GNS 430W shown in the listing',
+                      'high', 'installed')
+            "#,
+        )
+        .bind(target_listing_id)
+        .bind(product_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let malformed_staged = stage_pending_review(
+            &db,
+            malformed_listing_id,
+            None,
+            &[PendingReviewAspect::avionics(
+                "unrelated",
+                "avionics_identity",
+                "Unrelated unit",
+                "Unrelated unit",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some("Unrelated unit".to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let assignments = load_existing_assignments(&db, target_listing_id)
+            .await
+            .unwrap();
+        let products = load_all_approved_product_map(&db).await.unwrap();
+        let target_aspect = preserved_product_aspect(
+            &assignments[0],
+            ListingAssociationRole::Installed,
+            products.get(&product_id).unwrap(),
+        );
+        let target_staged =
+            stage_pending_review(&db, target_listing_id, None, &[target_aspect.clone()])
+                .await
+                .unwrap();
+        attest_approved_product_for_current_policy_reuse(&db, product_id).await;
+
+        sqlx::query(
+            "UPDATE aircraft_sale_listing_pending_reviews SET review_payload_json = '{malformed' WHERE listing_id = ?",
+        )
+        .bind(malformed_listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let target = preflight_pending_product_attestation(
+            &db,
+            user_id,
+            product_id,
+            target_listing_id,
+            &target_staged.review_payload_sha256,
+            &target_aspect.id,
+            &target_staged.catalog_revision_sha256,
+            "",
+            "",
+            "",
+        )
+        .await
+        .expect("an unrelated malformed review must not poison direct authorization");
+        assert!(target.already_reuse_attested);
+        assert_eq!(target.commit_guard.listing_id, target_listing_id);
+
+        assert!(matches!(
+            preflight_pending_product_attestation(
+                &db,
+                user_id,
+                product_id,
+                target_listing_id,
+                &target_staged.review_payload_sha256,
+                &ReviewAspectId::from("different-aspect"),
+                &target_staged.catalog_revision_sha256,
+                "",
+                "",
+                "",
+            )
+            .await,
+            Err(ReviewError::NotFound(_))
+        ));
+        assert!(matches!(
+            preflight_pending_product_attestation(
+                &db,
+                user_id,
+                product_id,
+                malformed_listing_id,
+                &malformed_staged.review_payload_sha256,
+                &target_aspect.id,
+                &target_staged.catalog_revision_sha256,
+                "",
+                "",
+                "",
+            )
+            .await,
+            Err(ReviewError::Conflict(_))
         ));
     }
 
