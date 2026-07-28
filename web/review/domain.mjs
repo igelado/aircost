@@ -4,6 +4,20 @@ export const REVIEW_PRODUCT_IDENTITY_LIMITS = Object.freeze({
   evidenceText: 128,
 });
 
+// Build the single source-free request contract used for both preserved
+// associations and ordinary hash-bound extraction aspects.
+export function existingProductVerificationRequest(
+  reviewPayloadSha256,
+  catalogRevisionSha256,
+  aspectId,
+) {
+  return {
+    review_payload_sha256: reviewPayloadSha256,
+    catalog_revision_sha256: catalogRevisionSha256,
+    aspect_id: aspectId,
+  };
+}
+
 const MACHINE_REASON_CODE = /^[a-z0-9_]+$/;
 const UNCLASSIFIED_REASON_CODE = "unclassified_review_reason";
 const AIRCRAFT_IDENTITY_STATES = new Set(["verified", "curation_required"]);

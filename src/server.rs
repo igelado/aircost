@@ -41,15 +41,16 @@ use crate::listing::review::replacement::{
     approve_replacement_products_and_restage, ApproveReplacementProductsRequest,
 };
 use crate::listing::review::{
-    active_collision_closure_revision_sha256, corroborate_existing_product_association_and_restage,
-    get_listing_review, list_listing_reviews, list_pending_product_associations,
-    list_pending_product_reviews, preflight_existing_product_association,
-    preflight_listing_review_resolution, preflight_pending_product_attestation,
-    resolve_listing_review, resolved_review_response, restage_unattested_preserved_products,
-    use_existing_product_for_aspect_and_restage, ListingReview, ListingReviewDetail,
-    ListingReviewQueue, PendingProductAssociationPage, PendingProductReviewPage,
-    ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse, ReviewAspectId,
-    ReviewDecision, ReviewError, ReviewQueueQuery, StagedPendingReview,
+    active_collision_closure_revision_sha256, approve_locally_verified_ordinary_aspect_and_restage,
+    corroborate_existing_product_association_and_restage, get_listing_review, list_listing_reviews,
+    list_pending_product_associations, list_pending_product_reviews,
+    preflight_existing_product_association, preflight_listing_review_resolution,
+    preflight_pending_product_attestation, resolve_listing_review, resolved_review_response,
+    restage_unattested_preserved_products, use_existing_product_for_aspect_and_restage,
+    ExistingProductAssociationCommit, ListingReview, ListingReviewDetail, ListingReviewQueue,
+    PendingProductAssociationPage, PendingProductReviewPage, ProductReviewPageQuery,
+    ResolveReviewRequest, ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError,
+    ReviewQueueQuery, StagedPendingReview,
 };
 use crate::listings::{
     create_listing, delete_listing, ensure_listing_canonical_aircraft_identity,
@@ -928,8 +929,11 @@ async fn approve_replacement_products_handler(
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
 }
 
-/// Corroborate exactly one hash-bound listing association against an already
-/// attested product. This route is source-free, local-only, and zero-Gemini.
+/// Verify exactly one hash-bound listing aspect against an already attested
+/// product. This route is source-free, local-only, and zero-Gemini.
+///
+/// Preserved links are corroborated in place. Independent ordinary extraction
+/// aspects use the normal aspect-scoped existing-product transaction.
 async fn verify_existing_review_avionics_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -995,18 +999,35 @@ async fn verify_existing_review_avionics_handler(
         }
     }
 
-    let staged = corroborate_existing_product_association_and_restage(
-        &state.db,
-        user.id,
-        listing_id,
-        &payload.aspect_id,
-        &payload.review_payload_sha256,
-        &payload.catalog_revision_sha256,
-        &expected_collision_closure_sha256,
-        target_id,
-        &target.observation_sha256,
-    )
-    .await?;
+    let staged = match target.commit {
+        ExistingProductAssociationCommit::CorroboratePreserved { observation_sha256 } => {
+            corroborate_existing_product_association_and_restage(
+                &state.db,
+                user.id,
+                listing_id,
+                &payload.aspect_id,
+                &payload.review_payload_sha256,
+                &payload.catalog_revision_sha256,
+                &expected_collision_closure_sha256,
+                target_id,
+                &observation_sha256,
+            )
+            .await?
+        }
+        ExistingProductAssociationCommit::ApproveOrdinary => {
+            approve_locally_verified_ordinary_aspect_and_restage(
+                &state.db,
+                user.id,
+                listing_id,
+                &payload.aspect_id,
+                &payload.review_payload_sha256,
+                &payload.catalog_revision_sha256,
+                &expected_collision_closure_sha256,
+                target_id,
+            )
+            .await?
+        }
+    };
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
 }
 
@@ -1754,7 +1775,7 @@ mod tests {
     use crate::listing::review::{
         restage_unattested_preserved_products, stage_pending_review, ListingReview,
         PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
-        ReviewAircraftIdentityStatus, ReviewAircraftSummary,
+        ReviewAircraftIdentityStatus, ReviewAircraftSummary, ReviewAspectId,
     };
     use crate::models::PluginSubmissionRequest;
     use crate::normalize::{
@@ -2073,6 +2094,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(usage_after_cleanup, usage_before_cleanup);
+    }
+
+    #[tokio::test]
+    async fn ordinary_hash_bound_aspect_uses_existing_product_without_gemini_usage() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (_owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let product_id = insert_approved_garmin_product(&db).await;
+        attest_approved_garmin_product(&db, product_id).await;
+        let ordinary = PendingReviewAspect::avionics(
+            "observation-17",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Two Garmin GNS 430W navigators",
+            "catalog_match_requires_review",
+            2,
+            "installed",
+            Some("Two Garmin GNS 430W navigators".to_string()),
+            Some("high".to_string()),
+        )
+        .with_reuse_attestation_target(product_id);
+        let remaining = PendingReviewAspect::avionics(
+            "observation-18",
+            "avionics_identity",
+            "Unknown radio",
+            "Unknown radio",
+            "catalog_match_requires_review",
+            1,
+            "installed",
+            Some("Unknown radio".to_string()),
+            Some("low".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[ordinary, remaining])
+            .await
+            .unwrap();
+        let usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let response = verify_existing_review_avionics_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(VerifyExistingReviewAvionicsRequest {
+                review_payload_sha256: staged.review_payload_sha256.clone(),
+                catalog_revision_sha256: staged.catalog_revision_sha256.clone(),
+                aspect_id: ReviewAspectId::from("observation-17"),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(response["review"]["aspects"].as_array().unwrap().len(), 1);
+        assert_eq!(response["review"]["aspects"][0]["id"], "observation-18");
+        let link: (i64, i64, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, quantity, source, source_confidence
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            link,
+            (
+                product_id,
+                2,
+                "listing_review".to_string(),
+                Some("high".to_string()),
+            )
+        );
+        let usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_after, usage_before);
     }
 
     #[tokio::test]

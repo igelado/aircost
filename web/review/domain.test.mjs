@@ -9,6 +9,7 @@ import {
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeReviewReasons,
+  existingProductVerificationRequest,
   groupProductAssociationsByListing,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
@@ -64,6 +65,27 @@ const LIVE_REASON_CODES = [
   "raw_observation_ambiguous",
   "raw_observation_identity_unusable",
 ];
+
+test("builds one canonical source-free request for every existing-product aspect", () => {
+  const expected = {
+    review_payload_sha256: "a".repeat(64),
+    catalog_revision_sha256: "b".repeat(64),
+    aspect_id: "observation-17",
+  };
+  assert.deepEqual(
+    existingProductVerificationRequest(
+      expected.review_payload_sha256,
+      expected.catalog_revision_sha256,
+      expected.aspect_id,
+    ),
+    expected,
+  );
+  assert.deepEqual(Object.keys(expected).sort(), [
+    "aspect_id",
+    "catalog_revision_sha256",
+    "review_payload_sha256",
+  ]);
+});
 
 test("publishes the review product identity character limits", () => {
   assert.deepEqual(REVIEW_PRODUCT_IDENTITY_LIMITS, {

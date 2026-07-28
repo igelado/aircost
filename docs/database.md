@@ -360,17 +360,23 @@ model collisions, global references, and exact cross-listing coverage are
 rechecked under lock. A corrected manufacturer/model creates a separate
 approved identity and leaves the old candidate and unrelated links untouched.
 
-Preserved approved-product associations use a separate product-centric
-workflow. One current OEM attestation is shared by every pending occurrence of
-that product. The deterministic source proof is bound to the complete
-manufacturer-scoped collision snapshot, and the write transaction rechecks
-both that snapshot and ownership of the hash-bound pending association. The
-attestation preflight accepts one listing ID, review hash, and aspect ID and
-loads only that review; an unrelated malformed review cannot poison or
-authorize the operation.
-Occurrence corroboration then uses only retained listing text and the local
-catalog; it accepts no OEM dossier and never invokes Gemini. Successful
-corroboration removes only that synthetic association aspect.
+Hash-bound approved-product aspects use a product-centric workflow. One current
+OEM attestation is shared by every pending occurrence of that product. The
+deterministic source proof is bound to the complete manufacturer-scoped
+collision snapshot, and the write transaction rechecks both that snapshot and
+ownership of the hash-bound pending aspect. The attestation preflight accepts
+one listing ID, review hash, and aspect ID and loads only that review; an
+unrelated malformed review cannot poison or authorize the operation.
+Existing-product verification then uses only retained listing text and the
+live local catalog; it accepts no OEM dossier and never invokes Gemini. A
+synthetic preserved-link aspect records occurrence corroboration without
+rewriting the link. An ordinary installed, non-replacement aspect may cover
+zero or one installed link and is committed through the normal aspect-scoped
+`use-existing` transaction with its exact quantity. The transaction rechecks
+the hash-bound target, current reuse attestation, approved-catalog revision,
+active identity-collision closure, exact covered-link ownership, and listing
+action graph. Coupled replacement aspects, ambiguous identities, implicit
+merges, and stale collision decisions remain pending.
 
 The server checks mandatory FAA admission before entering this catalog-writing
 transaction. The transaction rejects stale payload or catalog hashes, applies
