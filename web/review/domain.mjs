@@ -1,4 +1,8 @@
 export const REVIEW_AREAS = Object.freeze(["aircraft", "avionics"]);
+export const REVIEW_PRODUCT_IDENTITY_LIMITS = Object.freeze({
+  sourceTitle: 200,
+  evidenceText: 128,
+});
 
 const MACHINE_REASON_CODE = /^[a-z0-9_]+$/;
 const UNCLASSIFIED_REASON_CODE = "unclassified_review_reason";
@@ -230,6 +234,62 @@ export function isCompletedReviewMaintenanceResponse(value) {
     && typeof value === "object"
     && value.review === null
     && value.review_complete === true;
+}
+
+export function characterLimitState(value, limit) {
+  const count = Array.from(typeof value === "string" ? value : "").length;
+  return {
+    count,
+    limit,
+    remaining: limit - count,
+    overLimit: count > limit,
+  };
+}
+
+export function reviewProductIdentitySourceValidation(sourceTitle, evidenceText) {
+  const sourceTitleText = typeof sourceTitle === "string" ? sourceTitle.trim() : "";
+  if (!sourceTitleText) {
+    return {
+      valid: false,
+      message: "An authoritative identity source title is required.",
+    };
+  }
+  if (
+    characterLimitState(
+      sourceTitleText,
+      REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle,
+    ).overLimit
+  ) {
+    return {
+      valid: false,
+      message:
+        `Authoritative identity source title must contain at most ${REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle} characters.`,
+    };
+  }
+
+  const evidenceTextValue = typeof evidenceText === "string" ? evidenceText.trim() : "";
+  if (!evidenceTextValue) {
+    return {
+      valid: false,
+      message: "Exact identity evidence is required.",
+    };
+  }
+  if (
+    characterLimitState(
+      evidenceTextValue,
+      REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText,
+    ).overLimit
+  ) {
+    return {
+      valid: false,
+      message:
+        `Exact identity evidence must contain at most ${REVIEW_PRODUCT_IDENTITY_LIMITS.evidenceText} characters.`,
+    };
+  }
+  return {
+    valid: true,
+    message: "Identity source fields are within their character limits.",
+  };
 }
 
 export function describeAircraftIdentity(value) {
