@@ -46,8 +46,8 @@ const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 20_000_000;
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_REDIRECTS: usize = 10;
-const MAX_SOURCE_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SOURCE_PDF_PAGES: usize = 128;
+const MAX_SOURCE_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SOURCE_PDF_PAGES: usize = 256;
 const MAX_SOURCE_PDF_PAGE_DECOMPRESSED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_PDF_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SOURCE_TEXT_ROWS: usize = 16_384;
@@ -2355,6 +2355,18 @@ fn extract_source_pdf_document(pdf: &[u8]) -> GeminiInteractionsResult<Extracted
     extract_source_pdf_document_with_limits(pdf, SOURCE_PDF_LIMITS)
 }
 
+fn validate_source_pdf_page_count(
+    page_count: usize,
+    max_pages: usize,
+) -> GeminiInteractionsResult<()> {
+    if page_count == 0 || page_count > max_pages {
+        return Err(GeminiInteractionsError::InvalidResponse(format!(
+            "public source PDF has {page_count} pages; expected 1..={max_pages}"
+        )));
+    }
+    Ok(())
+}
+
 fn extract_source_pdf_document_with_limits(
     pdf: &[u8],
     limits: SourcePdfLimits,
@@ -2391,13 +2403,7 @@ fn extract_source_pdf_document_with_limits(
         ));
     }
     let pages = document.get_pages();
-    if pages.is_empty() || pages.len() > limits.max_pages {
-        return Err(GeminiInteractionsError::InvalidResponse(format!(
-            "public source PDF has {} pages; expected 1..={}",
-            pages.len(),
-            limits.max_pages
-        )));
-    }
+    validate_source_pdf_page_count(pages.len(), limits.max_pages)?;
 
     let mut extracted = String::new();
     let mut source_text_rows = Vec::new();
@@ -4733,6 +4739,47 @@ mod tests {
         let oversized = extract_source_pdf_document(&oversized_pdf).unwrap();
         assert!(oversized.source_text_rows.is_empty());
         assert!(!oversized.source_text_rows_complete);
+    }
+
+    #[test]
+    fn public_source_document_boundaries_match_the_guarded_limits() {
+        assert_eq!(MAX_SOURCE_DOCUMENT_BYTES, 8 * 1024 * 1024);
+        assert_eq!(SOURCE_PDF_LIMITS.max_pages, 256);
+        assert_eq!(
+            SOURCE_PDF_LIMITS.max_page_decompressed_bytes,
+            2 * 1024 * 1024
+        );
+        assert_eq!(SOURCE_PDF_LIMITS.max_total_text_bytes, 2 * 1024 * 1024);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&MAX_SOURCE_DOCUMENT_BYTES.to_string()).unwrap(),
+        );
+        validate_source_content_length(
+            &headers,
+            Some(MAX_SOURCE_DOCUMENT_BYTES as u64),
+            MAX_SOURCE_DOCUMENT_BYTES,
+        )
+        .unwrap();
+
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&(MAX_SOURCE_DOCUMENT_BYTES + 1).to_string()).unwrap(),
+        );
+        assert!(validate_source_content_length(&headers, None, MAX_SOURCE_DOCUMENT_BYTES).is_err());
+        assert!(validate_source_content_length(
+            &HeaderMap::new(),
+            Some((MAX_SOURCE_DOCUMENT_BYTES + 1) as u64),
+            MAX_SOURCE_DOCUMENT_BYTES,
+        )
+        .is_err());
+
+        validate_source_pdf_page_count(MAX_SOURCE_PDF_PAGES, MAX_SOURCE_PDF_PAGES).unwrap();
+        assert!(
+            validate_source_pdf_page_count(MAX_SOURCE_PDF_PAGES + 1, MAX_SOURCE_PDF_PAGES).is_err()
+        );
+        assert!(validate_source_pdf_page_count(0, MAX_SOURCE_PDF_PAGES).is_err());
     }
 
     #[test]

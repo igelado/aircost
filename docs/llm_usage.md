@@ -130,7 +130,9 @@ fetched HTML or PDF must contain the complete graph-approved model and stable
 identifier in one bounded visible HTML table row or PDF physical line. Adjacent
 rows, hidden metadata, scripts, generic page text, and cross-line matches never
 authorize an identity. Documents without one unambiguous exact structural row
-remain unresolved.
+remain unresolved. Guarded source downloads are capped at 8 MiB; PDFs are
+additionally capped at 256 pages, 2 MiB of extracted text, and 2 MiB of
+decompressed data per page.
 
 Durable evidence is limited to source records and atomic claims that active
 catalog approval, FAA provenance, aircraft assignments, applicability, or
