@@ -292,6 +292,123 @@ export function reviewProductIdentitySourceValidation(sourceTitle, evidenceText)
   };
 }
 
+export function groupProductAssociationsByListing(associations) {
+  const groups = new Map();
+  for (const association of Array.isArray(associations) ? associations : []) {
+    const listingId = association?.listing_id;
+    if (!Number.isSafeInteger(listingId) || listingId <= 0) {
+      continue;
+    }
+    if (!groups.has(listingId)) {
+      groups.set(listingId, []);
+    }
+    groups.get(listingId).push(association);
+  }
+  return [...groups.entries()].map(([listingId, items]) => ({ listingId, items }));
+}
+
+export function productDetailRequestMayCommit(productId, requestSequence, viewState) {
+  return Number.isSafeInteger(productId)
+    && productId > 0
+    && Number.isSafeInteger(requestSequence)
+    && requestSequence === viewState?.productDetailRequestSequence
+    && (
+      viewState?.productBusy !== true
+      || viewState?.productBusyProductId === productId
+    );
+}
+
+export function productActionContextIsCurrent(context, viewState) {
+  return Number.isSafeInteger(context?.productId)
+    && context.productId > 0
+    && Number.isSafeInteger(context?.detailSequence)
+    && Number.isSafeInteger(context?.actionSequence)
+    && viewState?.productBusy === true
+    && viewState?.productBusyProductId === context.productId
+    && viewState?.productActionSequence === context.actionSequence
+    && viewState?.productDetailRequestSequence === context.detailSequence
+    && viewState?.selectedProduct?.id === context.productId;
+}
+
+/// Run one serial task per listing with bounded concurrency across listings.
+///
+/// The task owns the complete listing loop so it can refresh the review hash
+/// after every successful mutation. This prevents two association writes for
+/// one listing from racing with the same optimistic-lock token.
+export async function runProductAssociationWorkers(
+  associations,
+  verifyListing,
+  concurrency = 4,
+) {
+  if (typeof verifyListing !== "function") {
+    throw new TypeError("verifyListing must be a function");
+  }
+  const groups = groupProductAssociationsByListing(associations);
+  const workerCount = Math.min(
+    groups.length,
+    Math.max(1, Number.isSafeInteger(concurrency) ? concurrency : 4),
+  );
+  const results = new Array(groups.length);
+  let nextIndex = 0;
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < groups.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const group = groups[index];
+      try {
+        results[index] = {
+          listingId: group.listingId,
+          status: "fulfilled",
+          value: await verifyListing(group.listingId, group.items),
+        };
+      } catch (error) {
+        results[index] = {
+          listingId: group.listingId,
+          status: "rejected",
+          reason: error,
+        };
+      }
+    }
+  }));
+  return results;
+}
+
+export function describeProductAssociationOutcome(error) {
+  const code = typeof error?.payload?.error?.code === "string"
+    ? error.payload.error.code
+    : typeof error?.payload?.code === "string"
+      ? error.payload.code
+      : "";
+  if (code === "review_stale" || error?.status === 409 && /stale|changed/i.test(error?.message)) {
+    return {
+      kind: "stale",
+      label: "Stale — refresh required",
+      detail: "The listing or catalog changed while it was being checked.",
+    };
+  }
+  if (code === "avionics_association_unresolved") {
+    return {
+      kind: "manual",
+      label: "Manual review required",
+      detail: "The retained listing text does not uniquely identify this exact product.",
+    };
+  }
+  if (code === "avionics_identity_mismatch") {
+    return {
+      kind: "mismatch",
+      label: "Different product detected",
+      detail: "Local matching selected a different approved product.",
+    };
+  }
+  return {
+    kind: "error",
+    label: "Check failed",
+    detail: typeof error?.message === "string" && error.message.trim()
+      ? error.message
+      : "The association could not be checked.",
+  };
+}
+
 export function describeAircraftIdentity(value) {
   if (aircraftIdentityIsVerified(value)) {
     return {
