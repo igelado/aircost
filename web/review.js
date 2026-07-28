@@ -7,6 +7,7 @@ import {
   describeAircraftIdentity,
   describeProductAssociationOutcome,
   describeReviewReasons,
+  existingProductVerificationRequest,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
@@ -678,11 +679,11 @@ async function validateSelectedProductAssociations() {
               `/api/review/listings/${listingId}/avionics/verify-existing`,
               {
                 method: "POST",
-                body: JSON.stringify({
-                  review_payload_sha256: current.review_payload_sha256,
-                  catalog_revision_sha256: selected.catalogRevision,
-                  aspect_id: current.aspect_id,
-                }),
+                body: JSON.stringify(existingProductVerificationRequest(
+                  current.review_payload_sha256,
+                  selected.catalogRevision,
+                  current.aspect_id,
+                )),
               },
             );
             if (!productActionContextIsCurrent(action, state)) {
@@ -1921,11 +1922,11 @@ async function validateExistingAssociation(key, button) {
       `/api/review/listings/${review.listing_id}/avionics/verify-existing`,
       {
         method: "POST",
-        body: JSON.stringify({
-          review_payload_sha256: review.review_payload_sha256,
-          catalog_revision_sha256: review.catalog_revision_sha256,
-          aspect_id: draft.aspect.id,
-        }),
+        body: JSON.stringify(existingProductVerificationRequest(
+          review.review_payload_sha256,
+          review.catalog_revision_sha256,
+          draft.aspect.id,
+        )),
       },
     );
     const refreshed = payload?.review;
