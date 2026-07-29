@@ -249,8 +249,8 @@ for definition in \
   "$repository_root/migrations/20260807_avionics_product_reuse_v2.sqlite.sql" \
   "$repository_root/migrations/20260807_avionics_product_reuse_v2.postgres.sql"
 do
-  rg -q 'avionics_reuse_v2' "$definition"
-  rg -q '20260807_avionics_product_reuse_v2' "$definition"
+  grep -q 'avionics_reuse_v2' "$definition"
+  grep -q '20260807_avionics_product_reuse_v2' "$definition"
 done
 
 echo "Avionics product reuse-v2 migration contract passed"
