@@ -391,6 +391,21 @@ identity-collision closure, exact covered-link ownership, and listing action
 graph. Coupled replacement aspects, ambiguous identities, implicit merges,
 and stale collision decisions remain pending.
 
+`source_evidence_text` and `source_confidence` are one paired occurrence-proof
+value: neither is retained without the other, and `observed_text` is never an
+evidence fallback. Before review, the explicit restage transaction rechecks
+existing listing-link notes against the bound plugin capture. A unique,
+unqualified exact manufacturer/model occurrence replaces generated or stale
+notes with the visible source slice at high confidence for any unchanged
+positive quantity. An exact capture-backed existing pair is retained even when
+the association shape still requires manual review. For an otherwise
+auto-repairable installed link, ambiguous or missing source clears both link
+fields and both staged fields atomically. Unsupported replacement or
+unapproved shapes are not blanket-rewritten; their unverified link notes are
+excluded from review evidence. The reviewer endpoint
+`POST /api/review/listings/{id}/restage` is the apply path for this repair and
+updates the review hash in the same transaction.
+
 Reuse attestations use the `avionics_reuse_v2` policy and a v2 fingerprint
 domain that identifies the target-aware OEM proof semantics. The v2 migration
 does not promote or rewrite v1 conclusions: it removes every v1 product
@@ -837,7 +852,10 @@ including their exact installed and replacement roles, so stale imported links
 cannot bypass review. If no usable retained observations exist, those
 approved/high links are preserved rather than rejected without evidence.
 Associations with `listing_review` provenance are never reopened by this
-backfill.
+backfill. Retained extraction evidence is staged only as a complete
+evidence/confidence pair. Notes copied from unmatched legacy installed or
+replacement links are not occurrence evidence and are never copied into the
+new review bundle.
 
 Dry run is the default and is strictly read-only:
 
