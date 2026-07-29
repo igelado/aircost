@@ -30,31 +30,25 @@ max_output_tokens = 8192
 
 [tasks.avionics_search_grounding]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
-fallback_thinking_level = "medium"
 max_output_tokens = 12000
 
 [tasks.avionics_url_verification]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
-fallback_thinking_level = "medium"
 max_output_tokens = 12000
 
 [tasks.avionics_structure]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
 max_output_tokens = 12000
 
 # Collision responses reuse a bounded publisher dossier enriched with
 # identity, capability, and shortlist relevance hints. Start on Lite now that
 # the packet carries the comparison spans needed by the stricter schema, and
-# escalate only after a deterministic validation failure.
+# keep the bounded retry on Lite with the deterministic failure as feedback.
 [tasks.avionics_collision_structure]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
 max_output_tokens = 12000
 

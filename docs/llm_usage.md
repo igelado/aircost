@@ -15,21 +15,23 @@ an optional pinned fallback model and fallback thinking level, service tier,
 primary thinking level, and maximum output tokens. Aliases ending in `-latest`
 are rejected so request accounting and comparisons remain reproducible.
 
-The avionics and aircraft Search, URL Context, and ordinary structure routes
-use `gemini-3.5-flash-lite` with low thinking first. A valid primary response
-ends the stage without a fallback call. Only a returned response that fails the
-stage's deterministic grounding, citation, JSON, or provenance gates is retried
-with `gemini-3.6-flash`; Search and URL Context fallback calls use medium
-thinking, while ordinary structure fallback calls stay low. Transport failures
-do not escalate the model. The larger avionics collision schema uses its own
-`tasks.avionics_collision_structure` route with `gemini-3.5-flash-lite` first
-and `gemini-3.6-flash` only after deterministic validation failure. Direct
-publisher dossiers rank up to four bounded windows per source using separate
-optional capability and shortlist hints; those hints never participate in the
-required identity-anchor or exact-origin admission gates. Search prompts
-request no more than four focused queries as a soft cost bound; the application
-does not reject an otherwise valid response after the provider has already
-exceeded that request.
+The avionics Search, URL Context, ordinary structure, and collision structure
+routes use `gemini-3.5-flash-lite` with low thinking for both bounded attempts.
+A valid primary response ends the stage after one call. Only a returned
+response that fails the stage's deterministic grounding, citation, JSON, or
+provenance gates opens a second attempt, which reuses the configured primary
+model with the validation failure as correction feedback. Transport failures
+also remain on the primary model. No avionics validation retry automatically
+escalates to Flash.
+
+Aircraft Search, URL Context, and ordinary structure routes also start with
+`gemini-3.5-flash-lite`, but retain their separately configured
+`gemini-3.5-flash` validation fallback. Direct publisher dossiers rank up to
+four bounded windows per source using separate optional capability and
+shortlist hints; those hints never participate in the required identity-anchor
+or exact-origin admission gates. Search prompts request no more than four
+focused queries as a soft cost bound; the application does not reject an
+otherwise valid response after the provider has already exceeded that request.
 
 Grounded avionics requests use separate stage inputs. Search and URL Context
 receive a compact research brief containing the observed product and the full
@@ -52,8 +54,9 @@ later source taking precedence:
 
 Task-specific names use the task prefix plus `_MODEL`, `_FALLBACK_MODEL`,
 `_SERVICE_TIER`, `_THINKING_LEVEL`, `_FALLBACK_THINKING_LEVEL`, or
-`_MAX_OUTPUT_TOKENS`. An empty/`none` fallback model disables escalation, and
-an empty/`inherit` fallback thinking level inherits the primary thinking level.
+`_MAX_OUTPUT_TOKENS`. An empty/`none` fallback model disables model switching,
+not the bounded validation retry; that retry reuses the primary route. An
+empty/`inherit` fallback thinking level inherits the primary thinking level.
 For example,
 `AIRCOST_GEMINI_LISTING_EXTRACTION_MODEL` overrides only
 `tasks.listing_extraction`, while

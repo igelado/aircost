@@ -25,27 +25,21 @@ max_output_tokens = 8192
 
 [tasks.avionics_search_grounding]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
-fallback_thinking_level = "medium"
 max_output_tokens = 12000
 
 [tasks.avionics_url_verification]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
-fallback_thinking_level = "medium"
 max_output_tokens = 12000
 
 [tasks.avionics_structure]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
 max_output_tokens = 12000
 
 [tasks.avionics_collision_structure]
 model = "gemini-3.5-flash-lite"
-fallback_model = "gemini-3.6-flash"
 thinking_level = "low"
 max_output_tokens = 12000
 
