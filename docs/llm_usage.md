@@ -42,6 +42,11 @@ identity passes allow at most eight cited URLs; the independent collision pass
 keeps the shared maximum of twenty because it may need to distinguish a larger
 expanded shortlist. Both limits are enforced locally at citation resolution,
 the URL Context call trace, and the verified citation allow-list.
+An unusable Search-discovery redirect is discarded when another citation
+resolves successfully; the unresolved URL is never forwarded as a fallback.
+If none resolve, Search retries normally. URL Context citation resolution
+remains all-or-nothing because its verified output is evidence for the
+structure stage.
 
 Normal application startup resolves configuration in this order, with each
 later source taking precedence:

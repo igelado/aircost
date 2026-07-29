@@ -2309,7 +2309,7 @@ async fn resolve_search_citations(
         .iter()
         .map(|input| input.raw_url.clone())
         .collect::<BTreeSet<_>>();
-    let citations = resolve_citation_inputs(client, citation_inputs, raw_urls).await?;
+    let citations = resolve_search_citation_inputs(client, citation_inputs, raw_urls).await?;
     retain_ranked_search_citations(citations, max_url_context_urls, research_prompt)
 }
 
@@ -2379,6 +2379,59 @@ async fn resolve_citation_inputs(
             cited_text: input.cited_text,
         })
         .collect())
+}
+
+async fn resolve_search_citation_inputs(
+    client: &GeminiInteractionsClient,
+    citation_inputs: Vec<CitationInput>,
+    raw_urls: BTreeSet<String>,
+) -> Result<Vec<VerifiedCitation>> {
+    let mut resolved_urls = BTreeMap::new();
+    let mut first_resolution_error = None;
+    for raw_url in raw_urls {
+        match client.resolve_final_url(&raw_url).await {
+            Ok(resolved) => {
+                resolved_urls.insert(raw_url, resolved.final_url.to_string());
+            }
+            Err(error) => {
+                first_resolution_error.get_or_insert_with(|| {
+                    format!("could not resolve Gemini Search citation {raw_url}: {error}")
+                });
+            }
+        }
+    }
+    bind_resolved_search_citation_inputs(
+        citation_inputs,
+        &resolved_urls,
+        first_resolution_error.as_deref(),
+    )
+}
+
+fn bind_resolved_search_citation_inputs(
+    citation_inputs: Vec<CitationInput>,
+    resolved_urls: &BTreeMap<String, String>,
+    first_resolution_error: Option<&str>,
+) -> Result<Vec<VerifiedCitation>> {
+    let resolved = citation_inputs
+        .into_iter()
+        .filter_map(|input| {
+            resolved_urls
+                .get(&input.raw_url)
+                .map(|final_url| VerifiedCitation {
+                    final_url: final_url.clone(),
+                    raw_url: input.raw_url,
+                    title: input.title,
+                    cited_text: input.cited_text,
+                })
+        })
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        let detail = first_resolution_error
+            .map(|error| format!("; first failure: {error}"))
+            .unwrap_or_default();
+        bail!("could not resolve any Gemini Search citation{detail}");
+    }
+    Ok(resolved)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5083,6 +5136,79 @@ mod tests {
             "GEA 71B",
             "011-03682-00",
         ));
+    }
+
+    #[test]
+    fn search_citation_binding_keeps_every_span_for_successful_resolutions_only() {
+        let successful_raw = "https://search.example/garmin".to_string();
+        let failed_raw = "https://search.example/bad-tls".to_string();
+        let inputs = vec![
+            CitationInput {
+                raw_url: failed_raw.clone(),
+                title: "Unusable redirect".to_string(),
+                cited_text: "This span must not survive resolution.".to_string(),
+            },
+            CitationInput {
+                raw_url: successful_raw.clone(),
+                title: "Garmin manual".to_string(),
+                cited_text: "First exact cited span.".to_string(),
+            },
+            CitationInput {
+                raw_url: successful_raw.clone(),
+                title: "Garmin manual".to_string(),
+                cited_text: "Second exact cited span.".to_string(),
+            },
+        ];
+        let resolved_urls = [(
+            successful_raw.clone(),
+            "https://static.garmin.com/manual.pdf".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let citations = bind_resolved_search_citation_inputs(
+            inputs,
+            &resolved_urls,
+            Some("the unrelated redirect had an invalid certificate"),
+        )
+        .unwrap();
+
+        assert_eq!(citations.len(), 2);
+        assert!(citations
+            .iter()
+            .all(|citation| citation.raw_url == successful_raw));
+        assert!(citations
+            .iter()
+            .all(|citation| citation.final_url == "https://static.garmin.com/manual.pdf"));
+        assert_eq!(
+            citations
+                .iter()
+                .map(|citation| citation.cited_text.as_str())
+                .collect::<Vec<_>>(),
+            ["First exact cited span.", "Second exact cited span."]
+        );
+        assert!(citations
+            .iter()
+            .all(|citation| citation.raw_url != failed_raw));
+    }
+
+    #[test]
+    fn search_citation_binding_rejects_when_every_resolution_failed() {
+        let error = bind_resolved_search_citation_inputs(
+            vec![CitationInput {
+                raw_url: "https://search.example/bad-tls".to_string(),
+                title: "Unusable redirect".to_string(),
+                cited_text: "A cited span with no verified final URL.".to_string(),
+            }],
+            &BTreeMap::new(),
+            Some("invalid peer certificate"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("could not resolve any Gemini Search citation"));
+        assert!(error.to_string().contains("invalid peer certificate"));
     }
 
     #[test]
