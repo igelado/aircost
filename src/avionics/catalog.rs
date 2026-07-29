@@ -301,6 +301,13 @@ struct ReviewCatalogCandidate {
 }
 
 #[derive(Clone, Debug, FromRow)]
+struct AuthoritativeSourceHintRow {
+    evidence_source_url: String,
+    evidence_source_title: String,
+    evidence_text: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
 struct KnownApprovedRow {
     id: i64,
     manufacturer: String,
@@ -344,7 +351,20 @@ struct ApprovedCandidateAdjudicationPlan {
 struct AuthoritativeDirectSourcePlan {
     source_urls: Vec<String>,
     identity_anchors: Vec<String>,
-    admission: Option<ManufacturerSourceOriginAdmission>,
+    admission: ManufacturerSourceOriginAdmission,
+    requirement: DirectSourceRequirement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectSourceRequirement {
+    Explicit,
+    Opportunistic,
+}
+
+#[derive(Clone, Debug)]
+enum IdentityGroundingPlan {
+    Search,
+    Direct(AuthoritativeDirectSourcePlan),
 }
 
 #[derive(Clone, Debug)]
@@ -972,21 +992,15 @@ pub(crate) async fn resolve_approved_product_association(
     ))
 }
 
-async fn authoritative_direct_source_plan(
+async fn explicit_authoritative_direct_source_plan(
     db: &AppDb,
     request: &AvionicsIdentityRequest,
-) -> CatalogResult<AuthoritativeDirectSourcePlan> {
+) -> CatalogResult<Option<AuthoritativeDirectSourcePlan>> {
     match (
         request.authoritative_direct_source_urls.is_empty(),
         request.authoritative_identity_anchors.is_empty(),
     ) {
-        (true, true) => {
-            return Ok(AuthoritativeDirectSourcePlan {
-                source_urls: Vec::new(),
-                identity_anchors: Vec::new(),
-                admission: None,
-            });
-        }
+        (true, true) => return Ok(None),
         (true, false) | (false, true) => {
             return Err(CatalogError::Validation(
                 "authoritative avionics direct-source URLs and identity anchors must be supplied together"
@@ -1015,11 +1029,12 @@ async fn authoritative_direct_source_plan(
     )
     .await
     {
-        Ok(admission) => Ok(AuthoritativeDirectSourcePlan {
+        Ok(admission) => Ok(Some(AuthoritativeDirectSourcePlan {
             source_urls: request.authoritative_direct_source_urls.clone(),
             identity_anchors: request.authoritative_identity_anchors.clone(),
-            admission: Some(admission),
-        }),
+            admission,
+            requirement: DirectSourceRequirement::Explicit,
+        })),
         Err(ManufacturerIdentityError::Validation(message)) => {
             Err(CatalogError::Validation(format!(
                 "authoritative avionics direct-source admission failed: {message}"
@@ -1034,9 +1049,143 @@ async fn authoritative_direct_source_plan(
     }
 }
 
-fn should_run_listing_only_approved_candidate_adjudication(
-    _plan: &AuthoritativeDirectSourcePlan,
-) -> bool {
+async fn opportunistic_authoritative_direct_source_plan(
+    db: &AppDb,
+    request: &AvionicsIdentityRequest,
+    input_types: &[String],
+    manufacturer_identity_id: Option<i64>,
+    review_catalog: &[ReviewCatalogCandidate],
+) -> CatalogResult<Option<AuthoritativeDirectSourcePlan>> {
+    let Some(manufacturer_identity_id) = manufacturer_identity_id else {
+        return Ok(None);
+    };
+    let source_sql = db.sql(
+        r#"
+        SELECT
+          source_origin.evidence_source_url,
+          source_origin.evidence_source_title,
+          source_origin.evidence_text
+        FROM avionics_active_authoritative_source_origins source_origin
+        JOIN avionics_manufacturer_effective_identities effective
+          ON effective.identity_id =
+             source_origin.avionics_manufacturer_identity_id
+        WHERE source_origin.authority_kind = 'manufacturer_primary'
+          AND effective.avionics_manufacturer_identity_id = ?
+        ORDER BY source_origin.id
+        "#,
+    );
+    let source_hints = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, AuthoritativeSourceHintRow>(&source_sql)
+                .bind(manufacturer_identity_id)
+                .fetch_all(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, AuthoritativeSourceHintRow>(&source_sql)
+                .bind(manufacturer_identity_id)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    let source_urls = select_opportunistic_authoritative_source_urls(
+        request,
+        input_types,
+        manufacturer_identity_id,
+        review_catalog,
+        &source_hints,
+    );
+    if source_urls.is_empty() {
+        return Ok(None);
+    }
+
+    let admission =
+        match authorize_manufacturer_source_urls(db, &request.manufacturer, &source_urls).await {
+            Ok(admission) => admission,
+            Err(ManufacturerIdentityError::Validation(_))
+            | Err(ManufacturerIdentityError::Conflict(_)) => return Ok(None),
+            Err(ManufacturerIdentityError::Database(message)) => {
+                return Err(CatalogError::Database(message));
+            }
+        };
+    Ok(Some(AuthoritativeDirectSourcePlan {
+        source_urls,
+        identity_anchors: vec![request.manufacturer.clone(), request.model.clone()],
+        admission,
+        requirement: DirectSourceRequirement::Opportunistic,
+    }))
+}
+
+fn select_opportunistic_authoritative_source_urls(
+    request: &AvionicsIdentityRequest,
+    input_types: &[String],
+    manufacturer_identity_id: i64,
+    review_catalog: &[ReviewCatalogCandidate],
+    source_hints: &[AuthoritativeSourceHintRow],
+) -> Vec<String> {
+    let Some(exact_candidate) = select_unique_exact_review_candidate(
+        &request.manufacturer,
+        &request.model,
+        input_types,
+        Some(manufacturer_identity_id),
+        review_catalog,
+    ) else {
+        return Vec::new();
+    };
+    if exact_candidate.catalog_status == "rejected" {
+        return Vec::new();
+    }
+    let observed_model_key = normalize_avionics_identifier(&request.model);
+    let observed_manufacturer_key = normalize_avionics_identifier(&request.manufacturer);
+    if observed_model_key.is_empty() || observed_manufacturer_key.is_empty() {
+        return Vec::new();
+    }
+    let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
+        &request.manufacturer,
+        Some(manufacturer_identity_id),
+        review_catalog,
+    );
+    let longer_product_keys = manufacturer_catalog
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_key = normalize_avionics_identifier(&candidate.model);
+            (candidate_key != observed_model_key && candidate_key.starts_with(&observed_model_key))
+                .then_some(candidate_key)
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut seen_urls = BTreeSet::new();
+    source_hints
+        .iter()
+        .filter_map(|source| {
+            canonical_exact_https_origin(&source.evidence_source_url).ok()?;
+            let stored_evidence_identity =
+                format!("{} {}", source.evidence_source_title, source.evidence_text);
+            let conflict_identity = format!(
+                "{} {}",
+                source.evidence_source_url, stored_evidence_identity
+            );
+            if !exact_compact_identity_is_present(
+                &stored_evidence_identity,
+                &observed_manufacturer_key,
+            ) || !exact_compact_identity_is_present(
+                &stored_evidence_identity,
+                &observed_model_key,
+            ) || longer_product_keys
+                .iter()
+                .any(|longer_key| exact_compact_identity_is_present(&conflict_identity, longer_key))
+            {
+                return None;
+            }
+            seen_urls
+                .insert(source.evidence_source_url.clone())
+                .then_some(source.evidence_source_url.clone())
+        })
+        .take(2)
+        .collect()
+}
+
+fn should_run_listing_only_approved_candidate_adjudication(_plan: &IdentityGroundingPlan) -> bool {
     // A bounded list of currently approved products is not a closed product
     // family: an OEM sibling may be absent or still unreviewed (for example,
     // GDL 69A versus GDL 69A SXM). Until the adjudicator consumes a complete,
@@ -1049,9 +1198,6 @@ fn validate_authorized_direct_source_response(
     plan: &AuthoritativeDirectSourcePlan,
     response: &GroundedJsonResponse,
 ) -> CatalogResult<()> {
-    let Some(admission) = plan.admission.as_ref() else {
-        return Ok(());
-    };
     if !response.authoritative_direct_source_verified {
         return Err(CatalogError::Validation(
             "authoritative direct-source response did not retain verified direct-source provenance"
@@ -1090,7 +1236,7 @@ fn validate_authorized_direct_source_response(
 
     for final_url in final_urls {
         if !plan.source_urls.iter().any(|requested_url| {
-            admission
+            plan.admission
                 .require_authorized_final_url(requested_url, final_url)
                 .is_ok()
         }) {
@@ -1134,29 +1280,27 @@ fn manufacturer_origin_error(error: ManufacturerIdentityError) -> CatalogError {
 async fn revalidate_direct_source_admission_state(
     db: &AppDb,
     manufacturer: &str,
-    plan: &AuthoritativeDirectSourcePlan,
+    plan: &IdentityGroundingPlan,
     response: &GroundedJsonResponse,
 ) -> CatalogResult<()> {
-    if let Some(original_admission) = plan.admission.as_ref() {
-        let current_admission =
-            authorize_manufacturer_source_urls(db, manufacturer, &plan.source_urls)
-                .await
-                .map_err(|error| {
-                    match manufacturer_origin_error(error) {
-                        CatalogError::Database(message) => CatalogError::Database(message),
-                        error => CatalogError::Validation(format!(
-                            "authoritative direct-source admission changed or was revoked while grounding: {error}"
-                        )),
-                    }
-                })?;
-        if &current_admission != original_admission {
-            return Err(CatalogError::Validation(
-                "authoritative direct-source manufacturer binding changed while grounding"
-                    .to_string(),
-            ));
-        }
-        validate_authorized_direct_source_response(plan, response)?;
+    let IdentityGroundingPlan::Direct(plan) = plan else {
+        return Ok(());
+    };
+    let current_admission =
+        authorize_manufacturer_source_urls(db, manufacturer, &plan.source_urls)
+            .await
+            .map_err(|error| match manufacturer_origin_error(error) {
+                CatalogError::Database(message) => CatalogError::Database(message),
+                error => CatalogError::Validation(format!(
+                    "authoritative direct-source admission changed or was revoked while grounding: {error}"
+                )),
+            })?;
+    if current_admission != plan.admission {
+        return Err(CatalogError::Validation(
+            "authoritative direct-source manufacturer binding changed while grounding".to_string(),
+        ));
     }
+    validate_authorized_direct_source_response(plan, response)?;
     Ok(())
 }
 
@@ -1198,7 +1342,8 @@ async fn resolve_avionics_identity_with_write_mode(
             reason: "candidate is missing an avionics capability observation".to_string(),
         });
     }
-    let direct_source_plan = authoritative_direct_source_plan(db, request).await?;
+    let explicit_direct_source_plan =
+        explicit_authoritative_direct_source_plan(db, request).await?;
 
     if let Some(approved) = resolve_verified_local_avionics_identity(db, request).await? {
         return Ok(AvionicsIdentityOutcome::Approved(approved));
@@ -1209,8 +1354,8 @@ async fn resolve_avionics_identity_with_write_mode(
         .iter()
         .map(|candidate| candidate.candidate.clone())
         .collect::<Vec<_>>();
-    let input_manufacturer_identity_id = match direct_source_plan.admission.as_ref() {
-        Some(admission) => Some(admission.effective_manufacturer_identity_id),
+    let input_manufacturer_identity_id = match explicit_direct_source_plan.as_ref() {
+        Some(plan) => Some(plan.admission.effective_manufacturer_identity_id),
         None => resolve_input_manufacturer_identity(db, &request.manufacturer).await?,
     };
     let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
@@ -1218,7 +1363,22 @@ async fn resolve_avionics_identity_with_write_mode(
         input_manufacturer_identity_id,
         &review_catalog,
     );
-    if should_run_listing_only_approved_candidate_adjudication(&direct_source_plan) {
+    let mut grounding_plan = if let Some(plan) = explicit_direct_source_plan {
+        IdentityGroundingPlan::Direct(plan)
+    } else if let Some(plan) = opportunistic_authoritative_direct_source_plan(
+        db,
+        request,
+        &input_types,
+        input_manufacturer_identity_id,
+        &review_catalog,
+    )
+    .await?
+    {
+        IdentityGroundingPlan::Direct(plan)
+    } else {
+        IdentityGroundingPlan::Search
+    };
+    if should_run_listing_only_approved_candidate_adjudication(&grounding_plan) {
         let approved_candidates = load_known_approved_candidates(db).await?;
         if let Some(approved) = resolve_approved_catalog_candidate_with_gemini(
             db,
@@ -1242,7 +1402,13 @@ async fn resolve_avionics_identity_with_write_mode(
         None,
         &manufacturer_catalog,
     );
-    let context = AvionicsUnitResolutionContext {
+    let (direct_source_urls, direct_source_anchors) = match &grounding_plan {
+        IdentityGroundingPlan::Search => (Vec::new(), Vec::new()),
+        IdentityGroundingPlan::Direct(plan) => {
+            (plan.source_urls.clone(), plan.identity_anchors.clone())
+        }
+    };
+    let mut context = AvionicsUnitResolutionContext {
         aircraft_manufacturer: request.aircraft_manufacturer.clone(),
         aircraft_model: request.aircraft_model.clone(),
         aircraft_variant: request.aircraft_variant.clone(),
@@ -1250,8 +1416,8 @@ async fn resolve_avionics_identity_with_write_mode(
         source_url: request.source_url.clone(),
         listing_context: request.listing_context.clone(),
         requires_listing_evidence: request.requires_listing_evidence,
-        authoritative_direct_source_urls: direct_source_plan.source_urls.clone(),
-        authoritative_identity_anchors: direct_source_plan.identity_anchors.clone(),
+        authoritative_direct_source_urls: direct_source_urls,
+        authoritative_identity_anchors: direct_source_anchors,
         candidate: AvionicsUnitResolutionCandidate {
             manufacturer: request.manufacturer.clone(),
             model: request.model.clone(),
@@ -1261,21 +1427,51 @@ async fn resolve_avionics_identity_with_write_mode(
         catalog_candidates: shortlist.clone(),
     };
 
-    let mut grounded_response =
-        extractor
-            .resolve_avionics_unit(&context)
-            .await
-            .map_err(|error| {
-                CatalogError::Gemini(format!(
-                    "Gemini avionics identity resolution failed: {error:#}"
-                ))
-            })?;
+    let initial_response = match &grounding_plan {
+        IdentityGroundingPlan::Direct(plan)
+            if plan.requirement == DirectSourceRequirement::Opportunistic =>
+        {
+            extractor
+                .resolve_avionics_unit_opportunistically(&context)
+                .await
+        }
+        _ => extractor.resolve_avionics_unit(&context).await,
+    };
+    let mut grounded_response = match initial_response {
+        Ok(response) => response,
+        Err(direct_error)
+            if matches!(
+                &grounding_plan,
+                IdentityGroundingPlan::Direct(plan)
+                    if plan.requirement == DirectSourceRequirement::Opportunistic
+            ) && crate::gemini::curation::workflow::is_opportunistic_direct_source_unavailable(
+                &direct_error,
+            ) =>
+        {
+            grounding_plan = IdentityGroundingPlan::Search;
+            context.authoritative_direct_source_urls.clear();
+            context.authoritative_identity_anchors.clear();
+            extractor
+                .resolve_avionics_unit(&context)
+                .await
+                .map_err(|search_error| {
+                    CatalogError::Gemini(format!(
+                        "Gemini avionics Search fallback failed after the opportunistic local source preflight could not use its retrieval hint ({direct_error:#}): {search_error:#}"
+                    ))
+                })?
+        }
+        Err(error) => {
+            return Err(CatalogError::Gemini(format!(
+                "Gemini avionics identity resolution failed: {error:#}"
+            )));
+        }
+    };
     // Recheck only server-owned direct-source admission here. Model-owned
     // source URL defects belong to the bounded domain-correction pass below.
     revalidate_direct_source_admission_state(
         db,
         &request.manufacturer,
-        &direct_source_plan,
+        &grounding_plan,
         &grounded_response,
     )
     .await?;
@@ -1333,7 +1529,7 @@ async fn resolve_avionics_identity_with_write_mode(
         revalidate_direct_source_admission_state(
             db,
             &request.manufacturer,
-            &direct_source_plan,
+            &grounding_plan,
             &grounded_response,
         )
         .await?;
@@ -1397,7 +1593,7 @@ async fn resolve_avionics_identity_with_write_mode(
                 proposed,
                 Some(catalog_id),
                 grounded_response.verified_evidence.as_ref(),
-                &direct_source_plan,
+                &grounding_plan,
                 &catalog_snapshot,
                 persist,
             )
@@ -1415,7 +1611,7 @@ async fn resolve_avionics_identity_with_write_mode(
                 proposed,
                 None,
                 grounded_response.verified_evidence.as_ref(),
-                &direct_source_plan,
+                &grounding_plan,
                 &catalog_snapshot,
                 persist,
             )
@@ -1435,7 +1631,7 @@ async fn resolve_verified_identity(
     mut proposed: VerifiedIdentity,
     selected_existing_id: Option<i64>,
     source_evidence: Option<&crate::extract::GroundedAvionicsEvidence>,
-    direct_source_plan: &AuthoritativeDirectSourcePlan,
+    grounding_plan: &IdentityGroundingPlan,
     reviewed_catalog_fingerprint: &str,
     persist: bool,
 ) -> CatalogResult<AvionicsIdentityOutcome> {
@@ -1480,7 +1676,7 @@ async fn resolve_verified_identity(
     revalidate_direct_source_admission_state(
         db,
         &source_context.candidate.manufacturer,
-        direct_source_plan,
+        grounding_plan,
         &review_response,
     )
     .await?;
@@ -1534,7 +1730,7 @@ async fn resolve_verified_identity(
         revalidate_direct_source_admission_state(
             db,
             &source_context.candidate.manufacturer,
-            direct_source_plan,
+            grounding_plan,
             &review_response,
         )
         .await?;
@@ -4776,30 +4972,33 @@ mod tests {
     use super::{
         approved_candidate_adjudication_plan, approved_candidate_adjudication_selection,
         attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
-        authoritative_direct_source_plan, canonical_avionics_types_for_label,
-        canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
-        collision_response_issues, collision_reviews_with_direct_source_proofs,
+        canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
+        collision_correction_plan, collision_response_issues,
+        collision_reviews_with_direct_source_proofs,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
-        known_approved_local_match, load_catalog_candidates, load_known_approved_candidates,
-        load_review_catalog_candidates, manufacturer_collision_snapshot_sha256,
-        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
-        nonpositive_identity_outcome, persist_approved_capability_enrichment,
+        explicit_authoritative_direct_source_plan, known_approved_local_match,
+        load_catalog_candidates, load_known_approved_candidates, load_review_catalog_candidates,
+        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
+        model_identity_relation_score, nonpositive_identity_outcome,
+        opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
         persist_approved_identity, persist_existing_reuse_attestation,
         proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
-        revalidate_direct_source_admission_state, select_unique_exact_review_candidate,
-        shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
+        revalidate_direct_source_admission_state, select_opportunistic_authoritative_source_urls,
+        select_unique_exact_review_candidate, shortlist_avionics_candidates,
+        should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
         validate_collision_decision_relation, validate_evidence_values,
         verified_identity_from_response, ApprovedAvionicsIdentity,
         ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
-        AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate, AvionicsIdentityOutcome,
-        AvionicsIdentityRequest, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
-        CollisionCorrectionPlan, GeminiGroundingSource, GeminiGroundingSupport,
-        GroundedJsonResponse, KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
+        AuthoritativeDirectSourcePlan, AuthoritativeSourceHintRow, AvionicsCatalogCandidate,
+        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsUnitResolutionCandidate,
+        AvionicsUnitResolutionContext, CollisionCorrectionPlan, DirectSourceRequirement,
+        GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
+        KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
         ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
         KNOWN_APPROVED_SELECT_SQL,
     };
@@ -5837,20 +6036,17 @@ mod tests {
 
     #[test]
     fn listing_only_gemini_adjudication_requires_a_curated_oem_family_gate() {
-        let direct = AuthoritativeDirectSourcePlan {
+        let direct = IdentityGroundingPlan::Direct(AuthoritativeDirectSourcePlan {
             source_urls: vec!["https://static.garmin.com/pumac/catalog.pdf".to_string()],
             identity_anchors: vec!["Garmin".to_string(), "G1000 NXi".to_string()],
-            admission: Some(ManufacturerSourceOriginAdmission {
+            admission: ManufacturerSourceOriginAdmission {
                 avionics_manufacturer_id: 1,
                 effective_manufacturer_identity_id: 2,
                 canonical_origins: vec!["https://static.garmin.com".to_string()],
-            }),
-        };
-        let search = AuthoritativeDirectSourcePlan {
-            source_urls: Vec::new(),
-            identity_anchors: Vec::new(),
-            admission: None,
-        };
+            },
+            requirement: DirectSourceRequirement::Explicit,
+        });
+        let search = IdentityGroundingPlan::Search;
 
         assert!(!should_run_listing_only_approved_candidate_adjudication(
             &direct
@@ -5858,6 +6054,97 @@ mod tests {
         assert!(!should_run_listing_only_approved_candidate_adjudication(
             &search
         ));
+    }
+
+    fn source_hint(url: &str, title: &str, evidence: &str) -> AuthoritativeSourceHintRow {
+        AuthoritativeSourceHintRow {
+            evidence_source_url: url.to_string(),
+            evidence_source_title: title.to_string(),
+            evidence_text: evidence.to_string(),
+        }
+    }
+
+    #[test]
+    fn opportunistic_source_selection_requires_one_exact_capability_compatible_product() {
+        let mut request = local_request("Garmin GIA 63W GPS NAV COM");
+        request.model = "GIA 63W".to_string();
+        request.avionics_types = vec!["GPS".to_string(), "NAV".to_string(), "COM".to_string()];
+        let exact = review_candidate_with_types(239, "GIA63W", &["GPS", "NAV", "COM"]);
+        let shorter = review_candidate_with_types(11, "GIA 63", &["GPS", "NAV", "COM"]);
+        let source = source_hint(
+            "https://static.garmin.com/pumac/GIA63_GIA63W_InstallationManual.pdf",
+            "Garmin GIA 63/GIA 63W Installation Manual",
+            "GIA 63W Unit Only, (011-01105-00) 010-00386-00",
+        );
+
+        let selected = select_opportunistic_authoritative_source_urls(
+            &request,
+            &request.avionics_types,
+            1,
+            &[exact.clone(), shorter],
+            std::slice::from_ref(&source),
+        );
+        assert_eq!(selected, vec![source.evidence_source_url.clone()]);
+
+        let duplicate = review_candidate_with_types(240, "GIA-63W", &["GPS", "NAV", "COM"]);
+        assert!(select_opportunistic_authoritative_source_urls(
+            &request,
+            &request.avionics_types,
+            1,
+            &[exact.clone(), duplicate],
+            std::slice::from_ref(&source),
+        )
+        .is_empty());
+
+        let mut rejected = exact;
+        rejected.candidate.catalog_status = "rejected".to_string();
+        assert!(select_opportunistic_authoritative_source_urls(
+            &request,
+            &request.avionics_types,
+            1,
+            &[rejected],
+            std::slice::from_ref(&source),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn opportunistic_source_selection_rejects_capability_and_suffix_ambiguity() {
+        let source = source_hint(
+            "https://static.garmin.com/pumac/GIA63_GIA63W_InstallationManual.pdf",
+            "Garmin GIA 63/GIA 63W Installation Manual",
+            "GIA 63W Unit Only, (011-01105-00) 010-00386-00",
+        );
+        let mut mismatched = local_request("Garmin GDC 74 air data computer");
+        mismatched.model = "GDC 74".to_string();
+        mismatched.avionics_types = vec!["Air Data Computer".to_string()];
+        assert!(select_opportunistic_authoritative_source_urls(
+            &mismatched,
+            &mismatched.avionics_types,
+            1,
+            &[review_candidate_with_types(
+                86,
+                "GDC-74",
+                &["Integrated Flight Deck"],
+            )],
+            &[source.clone()],
+        )
+        .is_empty());
+
+        let mut base = local_request("Garmin GIA 63 GPS NAV COM");
+        base.model = "GIA 63".to_string();
+        base.avionics_types = vec!["GPS".to_string(), "NAV".to_string(), "COM".to_string()];
+        assert!(select_opportunistic_authoritative_source_urls(
+            &base,
+            &base.avionics_types,
+            1,
+            &[
+                review_candidate_with_types(11, "GIA 63", &["GPS", "NAV", "COM"]),
+                review_candidate_with_types(239, "GIA 63W", &["GPS", "NAV", "COM"]),
+            ],
+            &[source],
+        )
+        .is_empty());
     }
 
     #[test]
@@ -6080,16 +6367,17 @@ mod tests {
             vec!["https://static.garmin.com/pumac/GIA63.pdf".to_string()];
         request.authoritative_identity_anchors = vec!["Garmin".to_string(), "GIA 63W".to_string()];
 
-        let unknown = authoritative_direct_source_plan(&db, &request)
+        let unknown = explicit_authoritative_direct_source_plan(&db, &request)
             .await
             .expect_err("an unknown manufacturer authority must fail closed");
         assert!(unknown.to_string().contains("direct-source admission"));
 
         seed_garmin_static_source_authority(&db).await;
-        let authorized = authoritative_direct_source_plan(&db, &request)
+        let authorized = explicit_authoritative_direct_source_plan(&db, &request)
             .await
-            .expect("the exact curated Garmin origin should be admitted");
-        assert!(authorized.admission.is_some());
+            .expect("the exact curated Garmin origin should be admitted")
+            .expect("the request supplied an explicit direct source");
+        assert_eq!(authorized.admission.avionics_manufacturer_id, 1);
         assert_eq!(
             authorized.source_urls,
             request.authoritative_direct_source_urls
@@ -6097,17 +6385,114 @@ mod tests {
 
         request.authoritative_direct_source_urls =
             vec!["https://support.garmin.com/en-US/aviation/".to_string()];
-        let sibling = authoritative_direct_source_plan(&db, &request)
+        let sibling = explicit_authoritative_direct_source_plan(&db, &request)
             .await
             .expect_err("an unapproved sibling origin must fail before Gemini");
         assert!(sibling.to_string().contains("direct-source admission"));
 
         request.authoritative_direct_source_urls =
             vec!["https://reviewer@static.garmin.com/GIA63.pdf".to_string()];
-        let error = authoritative_direct_source_plan(&db, &request)
+        let error = explicit_authoritative_direct_source_plan(&db, &request)
             .await
             .expect_err("a malformed direct-source URL is a caller error");
         assert!(error.to_string().contains("cannot contain credentials"));
+    }
+
+    #[tokio::test]
+    async fn opportunistic_source_planner_loads_only_active_manufacturer_primary_hints() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let source_origin_id = seed_garmin_static_source_authority(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let (manufacturer_id, manufacturer_identity_id): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.id, membership.avionics_manufacturer_identity_id
+            FROM avionics_manufacturers manufacturer
+            JOIN avionics_manufacturer_identity_memberships membership
+              ON membership.avionics_manufacturer_id = manufacturer.id
+            WHERE manufacturer.normalized_name = 'garmin'
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("curated Garmin identity should load");
+        let product_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name
+            ) VALUES (?, 'GIA 63W', 'gia 63w')
+            RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .expect("GIA 63W should seed");
+        for capability in ["GPS", "NAV", "COM"] {
+            sqlx::query(
+                "INSERT INTO avionics_types (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+            )
+            .bind(capability)
+            .bind(capability.to_ascii_lowercase())
+            .execute(pool)
+            .await
+            .expect("capability should seed");
+            sqlx::query(
+                r#"
+                INSERT INTO avionics_model_types (
+                  avionics_model_id, avionics_type_id
+                )
+                SELECT ?, id
+                FROM avionics_types
+                WHERE normalized_name = ?
+                "#,
+            )
+            .bind(product_id)
+            .bind(capability.to_ascii_lowercase())
+            .execute(pool)
+            .await
+            .expect("product capability should seed");
+        }
+
+        let mut request = local_request("Garmin GIA 63W GPS NAV COM");
+        request.model = "GIA 63W".to_string();
+        request.avionics_types = vec!["GPS".to_string(), "NAV".to_string(), "COM".to_string()];
+        let review_catalog = load_review_catalog_candidates(&db)
+            .await
+            .expect("catalog should load");
+        let plan = opportunistic_authoritative_direct_source_plan(
+            &db,
+            &request,
+            &request.avionics_types,
+            Some(manufacturer_identity_id),
+            &review_catalog,
+        )
+        .await
+        .expect("planner should succeed")
+        .expect("the exact active source should be selected");
+        assert_eq!(plan.requirement, DirectSourceRequirement::Opportunistic);
+        assert_eq!(
+            plan.source_urls,
+            vec!["https://static.garmin.com/pumac/GIA63_GIA63W_InstallationManual.pdf".to_string()]
+        );
+
+        revoke_source_authority(&db, source_origin_id).await;
+        assert!(
+            opportunistic_authoritative_direct_source_plan(
+                &db,
+                &request,
+                &request.avionics_types,
+                Some(manufacturer_identity_id),
+                &review_catalog,
+            )
+            .await
+            .expect("revoked source should be treated as unavailable")
+            .is_none(),
+            "the active-source view must remove revoked retrieval hints"
+        );
     }
 
     #[test]
@@ -6117,11 +6502,12 @@ mod tests {
                 "https://static.garmin.com/pumac/GIA63_GIA63W_InstallationManual.pdf".to_string(),
             ],
             identity_anchors: vec!["Garmin".to_string(), "GIA 63W".to_string()],
-            admission: Some(ManufacturerSourceOriginAdmission {
+            admission: ManufacturerSourceOriginAdmission {
                 avionics_manufacturer_id: 1,
                 effective_manufacturer_identity_id: 2,
                 canonical_origins: vec!["https://static.garmin.com".to_string()],
-            }),
+            },
+            requirement: DirectSourceRequirement::Explicit,
         };
 
         let safe_nonpositive =
@@ -6184,18 +6570,24 @@ mod tests {
         request.authoritative_direct_source_urls =
             vec!["https://static.garmin.com/pumac/GIA63W.pdf".to_string()];
         request.authoritative_identity_anchors = vec!["Garmin".to_string(), "GIA 63W".to_string()];
-        let plan = authoritative_direct_source_plan(&db, &request)
+        let plan = explicit_authoritative_direct_source_plan(&db, &request)
             .await
-            .expect("the direct source should initially be admitted");
+            .expect("the direct source should initially be admitted")
+            .expect("the request supplied an explicit direct source");
         let response =
             direct_source_response(&["https://static.garmin.com/pumac/GIA63W-final.pdf"]);
         validate_authorized_direct_source_response(&plan, &response)
             .expect("the cached admission alone still appears valid");
 
         revoke_source_authority(&db, source_origin_id).await;
-        let error = revalidate_direct_source_admission_state(&db, "Garmin", &plan, &response)
-            .await
-            .expect_err("post-model validation must observe in-flight revocation");
+        let error = revalidate_direct_source_admission_state(
+            &db,
+            "Garmin",
+            &IdentityGroundingPlan::Direct(plan),
+            &response,
+        )
+        .await
+        .expect_err("post-model validation must observe in-flight revocation");
         assert!(error.to_string().contains("changed or was revoked"));
     }
 
@@ -6210,18 +6602,24 @@ mod tests {
         request.authoritative_direct_source_urls =
             vec!["https://static.garmin.com/pumac/GIA63W.pdf".to_string()];
         request.authoritative_identity_anchors = vec!["Garmin".to_string(), "GIA 63W".to_string()];
-        let plan = authoritative_direct_source_plan(&db, &request)
+        let plan = explicit_authoritative_direct_source_plan(&db, &request)
             .await
-            .expect("the direct source should be admitted");
+            .expect("the direct source should be admitted")
+            .expect("the request supplied an explicit direct source");
         let mut response =
             direct_source_response(&["https://static.garmin.com/pumac/GIA63W-final.pdf"]);
         response.value = json!({
             "candidate_source_url": "http://static.garmin.com/pumac/GIA63W-final.pdf"
         });
 
-        revalidate_direct_source_admission_state(&db, "Garmin", &plan, &response)
-            .await
-            .expect("server-owned direct-source provenance must be checked independently");
+        revalidate_direct_source_admission_state(
+            &db,
+            "Garmin",
+            &IdentityGroundingPlan::Direct(plan),
+            &response,
+        )
+        .await
+        .expect("server-owned direct-source provenance must be checked independently");
         let error = require_response_evidence_source_urls_not_revoked(&db, &response)
             .await
             .expect_err("the model-owned HTTP URL must remain invalid after domain correction");

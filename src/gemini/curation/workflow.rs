@@ -77,6 +77,62 @@ enum SourceDiscoveryPath {
     AuthorizedDirectFetch,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AuthorizedDirectFetchMode {
+    #[default]
+    Disabled,
+    Required,
+    Opportunistic,
+}
+
+impl AuthorizedDirectFetchMode {
+    const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
+#[derive(Debug)]
+struct OpportunisticDirectSourceUnavailable {
+    reason: String,
+}
+
+impl fmt::Display for OpportunisticDirectSourceUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "opportunistic authorized direct-source preflight was unavailable: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for OpportunisticDirectSourceUnavailable {}
+
+pub(crate) fn is_opportunistic_direct_source_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<OpportunisticDirectSourceUnavailable>())
+}
+
+fn finish_authorized_direct_source_preflight<T>(
+    mode: AuthorizedDirectFetchMode,
+    preflight: Result<T>,
+) -> Result<T> {
+    match preflight {
+        Ok(prepared) => Ok(prepared),
+        Err(error) if mode == AuthorizedDirectFetchMode::Opportunistic => {
+            Err(OpportunisticDirectSourceUnavailable {
+                reason: format!("{error:#}"),
+            }
+            .into())
+        }
+        Err(error) => {
+            Err(error
+                .context("authorized direct-source preflight failed before structure conversion"))
+        }
+    }
+}
+
 /// One server-owned catalog identity that must be provable from the transient
 /// direct-source document set before a tools-disabled structure call may run.
 ///
@@ -124,7 +180,7 @@ pub struct GroundedJsonPassRequest {
     /// not require every individual document to name every catalog product.
     direct_source_product_identity_requirements: Vec<DirectSourceProductIdentityRequirement>,
     revalidated_direct_source_urls: Vec<String>,
-    authorized_direct_fetch: bool,
+    authorized_direct_fetch_mode: AuthorizedDirectFetchMode,
     structure_attempt_policy: StructureAttemptPolicy,
 }
 
@@ -155,7 +211,7 @@ impl GroundedJsonPassRequest {
             direct_source_relevance_hints: Vec::new(),
             direct_source_product_identity_requirements: Vec::new(),
             revalidated_direct_source_urls: Vec::new(),
-            authorized_direct_fetch: false,
+            authorized_direct_fetch_mode: AuthorizedDirectFetchMode::Disabled,
             structure_attempt_policy: StructureAttemptPolicy::Standard,
         }
     }
@@ -283,7 +339,18 @@ impl GroundedJsonPassRequest {
     /// source-origin admission before constructing the request. The shared
     /// Search/URL Context path, including non-opted direct URLs, is unchanged.
     pub(crate) fn with_authorized_direct_fetch(mut self) -> Self {
-        self.authorized_direct_fetch = true;
+        self.authorized_direct_fetch_mode = AuthorizedDirectFetchMode::Required;
+        self
+    }
+
+    /// Use a server-selected retrieval hint only when its fresh publisher
+    /// preflight succeeds before any provider request.
+    ///
+    /// Callers may fall back to Search only for the typed preflight-unavailable
+    /// error. Once structure starts, this mode is identical to a required
+    /// authorized direct fetch and remains fail-closed.
+    pub(crate) fn with_opportunistic_authorized_direct_fetch(mut self) -> Self {
+        self.authorized_direct_fetch_mode = AuthorizedDirectFetchMode::Opportunistic;
         self
     }
 
@@ -448,7 +515,9 @@ impl GroundedJsonPassRequest {
         {
             bail!("revalidated direct-source URLs require direct-source text verification");
         }
-        if self.authorized_direct_fetch && self.revalidated_direct_source_urls.is_empty() {
+        if self.authorized_direct_fetch_mode.is_enabled()
+            && self.revalidated_direct_source_urls.is_empty()
+        {
             bail!("authorized direct fetch requires at least one revalidated direct-source URL");
         }
         let mut revalidated_url_keys = BTreeSet::new();
@@ -495,7 +564,7 @@ impl GroundedJsonPassRequest {
     }
 
     fn source_discovery_path(&self) -> SourceDiscoveryPath {
-        if self.authorized_direct_fetch {
+        if self.authorized_direct_fetch_mode.is_enabled() {
             SourceDiscoveryPath::AuthorizedDirectFetch
         } else if self.revalidated_direct_source_urls.is_empty() {
             SourceDiscoveryPath::GoogleSearch
@@ -754,7 +823,7 @@ impl VerifiedEvidenceDossier {
         {
             bail!("verified evidence was produced by a different grounding task pair");
         }
-        let expected_provenance = if request.authorized_direct_fetch {
+        let expected_provenance = if request.authorized_direct_fetch_mode.is_enabled() {
             EvidenceProvenance::AuthorizedDirectFetch
         } else {
             EvidenceProvenance::SearchUrlContext
@@ -1148,20 +1217,33 @@ where
         request.source_discovery_path(),
         SourceDiscoveryPath::AuthorizedDirectFetch
     ) {
-        let (_citations, candidate_urls, direct_source_documents) =
-            prepare_url_context_sources(client, Vec::new(), &request)
-                .await
-                .context("authorized direct-source preflight failed before structure conversion")?;
-        if candidate_urls.is_empty() || candidate_urls.len() > request.max_url_context_urls {
-            bail!(
-                "authorized direct-source preflight retained {} distinct URLs; expected 1..={}",
-                candidate_urls.len(),
-                request.max_url_context_urls
-            );
+        let preflight = async {
+            let (_citations, candidate_urls, direct_source_documents) =
+                prepare_url_context_sources(client, Vec::new(), &request).await?;
+            if candidate_urls.is_empty() || candidate_urls.len() > request.max_url_context_urls {
+                bail!(
+                    "authorized direct-source preflight retained {} distinct URLs; expected 1..={}",
+                    candidate_urls.len(),
+                    request.max_url_context_urls
+                );
+            }
+            let direct_source_documents = direct_source_documents.ok_or_else(|| {
+                anyhow!("authorized direct-source preflight returned no publisher documents")
+            })?;
+            // Complete every deterministic publisher-window and grouped
+            // product-proof check before choosing whether an opportunistic
+            // hint may fall back to Search. The structure stage reconstructs
+            // the same transient packet, but no provider call can occur
+            // between these two checks.
+            prepare_direct_source_evidence_packet(&request, &[], &direct_source_documents)
+                .context("authorized direct-source product-proof preflight failed")?;
+            Ok::<_, anyhow::Error>((candidate_urls, direct_source_documents))
         }
-        let direct_source_documents = direct_source_documents.ok_or_else(|| {
-            anyhow!("authorized direct-source preflight returned no publisher documents")
-        })?;
+        .await;
+        let (candidate_urls, direct_source_documents) = finish_authorized_direct_source_preflight(
+            request.authorized_direct_fetch_mode,
+            preflight,
+        )?;
         return run_authorized_direct_fetch_pass(
             client,
             config,
@@ -5023,7 +5105,10 @@ mod tests {
         assert!(request.direct_source_relevance_anchors.is_empty());
         assert!(request.direct_source_relevance_hints.is_empty());
         assert!(request.revalidated_direct_source_urls.is_empty());
-        assert!(!request.authorized_direct_fetch);
+        assert_eq!(
+            request.authorized_direct_fetch_mode,
+            AuthorizedDirectFetchMode::Disabled
+        );
         assert!(build_search_prompt(
             request.research_prompt(),
             request.max_google_search_queries,
@@ -5033,6 +5118,45 @@ mod tests {
         )
         .contains(request.prompt.as_str()));
         request.validate().unwrap();
+    }
+
+    #[test]
+    fn only_opportunistic_preflight_failures_are_safe_search_fallback_signals() {
+        let scope = EvidenceScope::new("avionics_identity", "garmin-gtx-345r").unwrap();
+        let request = authorized_direct_fetch_request(scope);
+        let documents = TransientSourceDocuments {
+            verified: [(
+                "https://www.garmin.com/manual".to_string(),
+                TransientSourceDocument {
+                    content_sha256: "b".repeat(64),
+                    publisher_text: "Unrelated publisher navigation and legal text.".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+        let failed_product_preflight =
+            || prepare_direct_source_evidence_packet(&request, &[], &documents).map(drop);
+
+        let explicit_error = finish_authorized_direct_source_preflight::<()>(
+            AuthorizedDirectFetchMode::Required,
+            failed_product_preflight(),
+        )
+        .expect_err("an explicit direct source must fail closed");
+        assert!(!is_opportunistic_direct_source_unavailable(&explicit_error));
+        assert!(format!("{explicit_error:#}")
+            .contains("authorized direct-source preflight failed before structure conversion"));
+
+        let opportunistic_error = finish_authorized_direct_source_preflight::<()>(
+            AuthorizedDirectFetchMode::Opportunistic,
+            failed_product_preflight(),
+        )
+        .expect_err("an opportunistic retrieval hint should expose a typed fallback boundary");
+        assert!(is_opportunistic_direct_source_unavailable(
+            &opportunistic_error
+        ));
+        assert!(format!("{opportunistic_error:#}").contains("no bounded publisher-text window"));
     }
 
     #[test]
