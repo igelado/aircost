@@ -334,13 +334,13 @@ struct IdentityAttempt {
 /// Automate only listings already waiting in the review queue. The exact
 /// plugin submission attached to the pending bundle is replayed; no newer
 /// same-URL submission may silently replace its evidence. Legacy extraction
-/// payloads are never transformed: when they do not contain capability arrays,
-/// the tool runs the current Gemini listing extractor against the retained,
-/// hash-verified HTML and uses that transient result. Dry-run still makes paid
-/// preview calls without domain writes. Apply mode atomically accepts only
-/// grounded products with exact high-confidence listing evidence, safely
-/// discards grounded garbage, and leaves every other aspect pending. Signed
-/// plugin payloads are never overwritten.
+/// payloads are never transformed: when they do not contain capability arrays
+/// and exact listing-evidence fields, the tool runs the current Gemini listing
+/// extractor against the retained, hash-verified HTML and uses that transient
+/// result. Dry-run still makes paid preview calls without domain writes. Apply
+/// mode atomically accepts only grounded products with exact high-confidence
+/// listing evidence, safely discards grounded garbage, and leaves every other
+/// aspect pending. Signed plugin payloads are never overwritten.
 pub async fn repopulate_listing_avionics(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
@@ -491,7 +491,11 @@ async fn preflight_listing(
         report.note = error.to_string();
         return report;
     }
-    let raw_avionics = match retained_avionics_source(row.extracted_listing_json.as_deref()) {
+    let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+    let raw_avionics = match retained_avionics_source(
+        row.extracted_listing_json.as_deref(),
+        &listing_context,
+    ) {
         RetainedAvionicsSource::Current(avionics) => avionics,
         RetainedAvionicsSource::RequiresReextraction { reason } => {
             report.reextraction_required = true;
@@ -517,7 +521,6 @@ async fn preflight_listing(
             return report;
         }
     };
-    let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
     for raw in &raw_avionics {
         if raw_candidate_issue(raw).is_some() {
@@ -730,7 +733,11 @@ async fn process_listing(
             return listing_report;
         }
     };
-    let raw_avionics = match retained_avionics_source(row.extracted_listing_json.as_deref()) {
+    let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+    let raw_avionics = match retained_avionics_source(
+        row.extracted_listing_json.as_deref(),
+        &listing_context,
+    ) {
         RetainedAvionicsSource::Current(avionics) => {
             listing_report.raw_avionics_source = "retained_extraction".to_string();
             avionics
@@ -772,7 +779,7 @@ async fn process_listing(
                 }
             };
             listing_report.reextraction_attempted = true;
-            match reextract_avionics(&scoped_extractor, &listing_text).await {
+            match reextract_avionics(&scoped_extractor, &listing_text, &listing_context).await {
                 Ok(avionics) => {
                     listing_report.raw_avionics_source = "gemini_reextraction".to_string();
                     listing_report.reextraction_succeeded = true;
@@ -797,7 +804,6 @@ async fn process_listing(
         );
         return listing_report;
     }
-    let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
     let mut prepared: Vec<PreparedLink> = Vec::new();
     let mut residual_aspects = Vec::new();
@@ -2219,7 +2225,10 @@ enum RetainedAvionicsSource {
     RequiresReextraction { reason: String },
 }
 
-fn retained_avionics_source(raw_json: Option<&str>) -> RetainedAvionicsSource {
+fn retained_avionics_source(
+    raw_json: Option<&str>,
+    listing_context: &ListingEvidenceContext,
+) -> RetainedAvionicsSource {
     let Some(raw_json) = raw_json.filter(|raw_json| !raw_json.trim().is_empty()) else {
         return RetainedAvionicsSource::RequiresReextraction {
             reason: "the retained plugin submission has no extracted listing JSON".to_string(),
@@ -2232,7 +2241,14 @@ fn retained_avionics_source(raw_json: Option<&str>) -> RetainedAvionicsSource {
                     .to_string(),
             }
         }
-        Ok(avionics) => RetainedAvionicsSource::Current(avionics),
+        Ok(avionics) => match validate_exact_listing_evidence(&avionics, listing_context) {
+            Ok(()) => RetainedAvionicsSource::Current(avionics),
+            Err(error) => RetainedAvionicsSource::RequiresReextraction {
+                reason: format!(
+                    "the retained plugin extraction has invalid listing evidence: {error}"
+                ),
+            },
+        },
         Err(error) => RetainedAvionicsSource::RequiresReextraction {
             reason: format!(
                 "the retained plugin extraction is not compatible with the current capability-array schema: {error}"
@@ -2254,16 +2270,21 @@ fn prepare_stored_listing_text(source_url: &str, rendered_html: &str) -> Result<
 async fn reextract_avionics(
     extractor: &GeminiListingExtractor,
     listing_text: &str,
+    listing_context: &ListingEvidenceContext,
 ) -> Result<Vec<ParsedAvionics>, String> {
     let extracted = extractor
         .extract(listing_text)
         .await
         .map_err(|error| format!("Gemini listing extraction request failed: {error}"))?;
-    parse_raw_avionics_value(&extracted).map_err(|error| {
+    let avionics = parse_raw_avionics_value(&extracted).map_err(|error| {
         format!(
             "Gemini returned output incompatible with the current capability-array schema: {error}"
         )
-    })
+    })?;
+    validate_exact_listing_evidence(&avionics, listing_context).map_err(|error| {
+        format!("Gemini returned listing evidence not present in the retained source: {error}")
+    })?;
+    Ok(avionics)
 }
 
 fn parse_raw_avionics(raw_json: &str) -> Result<Vec<ParsedAvionics>, String> {
@@ -2282,6 +2303,7 @@ fn parse_raw_avionics_value(value: &Value) -> Result<Vec<ParsedAvionics>, String
         .enumerate()
         .map(|(index, value)| {
             validate_capability_array(value, &format!("avionics[{index}]"))?;
+            validate_listing_evidence_fields(value, &format!("avionics[{index}]"))?;
             if let Some(replacement) = value.get("replaces").filter(|value| !value.is_null()) {
                 validate_capability_array(replacement, &format!("avionics[{index}].replaces"))?;
             }
@@ -2307,6 +2329,58 @@ fn validate_capability_array(value: &Value, path: &str) -> Result<(), String> {
         return Err(format!(
             "{path}.types must contain at least one non-empty string"
         ));
+    }
+    Ok(())
+}
+
+fn validate_listing_evidence_fields(value: &Value, path: &str) -> Result<(), String> {
+    let evidence = value
+        .get("source_evidence_text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|evidence| !evidence.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{path}.source_evidence_text must be one non-empty exact listing-source excerpt"
+            )
+        })?;
+    if evidence.len() > crate::listing::evidence::MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES {
+        return Err(format!(
+            "{path}.source_evidence_text exceeds the bounded listing-evidence limit"
+        ));
+    }
+    let confidence = value
+        .get("source_confidence")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{path}.source_confidence must be high, medium, or low"))?;
+    if !matches!(confidence, "high" | "medium" | "low") {
+        return Err(format!(
+            "{path}.source_confidence must be high, medium, or low"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_listing_evidence(
+    avionics: &[ParsedAvionics],
+    listing_context: &ListingEvidenceContext,
+) -> Result<(), String> {
+    for (index, observation) in avionics.iter().enumerate() {
+        let evidence = observation
+            .source_evidence_text
+            .as_deref()
+            .expect("schema validation requires listing evidence")
+            .trim();
+        let bounded_context = listing_context.for_candidate(
+            &observation.manufacturer,
+            &observation.model,
+            Some(evidence),
+        );
+        if !bounded_context.contains(evidence) {
+            return Err(format!(
+                "avionics[{index}].source_evidence_text is not one exact bounded excerpt containing the candidate identity"
+            ));
+        }
     }
     Ok(())
 }
@@ -2681,7 +2755,11 @@ mod tests {
         let parsed = parse_raw_avionics(
             r#"{
               "avionics": [
-                {"manufacturer":"Garmin","model":"GTX 345R","types":["Transponder"],"quantity":1},
+                {
+                  "manufacturer":"Garmin","model":"GTX 345R","types":["Transponder"],"quantity":1,
+                  "source_evidence_text":"Garmin GTX 345R transponder",
+                  "source_confidence":"high"
+                },
                 {
                   "manufacturer":"Garmin","model":"GTN 750Xi","types":["GPS","NAV","COM"],"quantity":1,
                   "configuration_action":"replaces",
@@ -2696,8 +2774,11 @@ mod tests {
         assert_eq!(parsed[0].configuration_action, "installed");
         assert_eq!(parsed[0].avionics_types, vec!["Transponder"]);
         assert!(parsed[0].replaces.is_none());
-        assert!(parsed[0].source_evidence_text.is_none());
-        assert!(parsed[0].source_confidence.is_none());
+        assert_eq!(
+            parsed[0].source_evidence_text.as_deref(),
+            Some("Garmin GTX 345R transponder")
+        );
+        assert_eq!(parsed[0].source_confidence.as_deref(), Some("high"));
         assert_eq!(parsed[1].configuration_action, "replaces");
         assert_eq!(parsed[1].avionics_types, vec!["GPS", "NAV", "COM"]);
         assert_eq!(
@@ -3002,7 +3083,10 @@ mod tests {
           ]
         }"#;
 
-        let source = retained_avionics_source(Some(legacy));
+        let source = retained_avionics_source(
+            Some(legacy),
+            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+        );
 
         let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
             panic!("a scalar legacy type must never be replayed or converted locally")
@@ -3018,12 +3102,17 @@ mod tests {
               "manufacturer":"Garmin",
               "model":"GNX 375",
               "types":["GPS","Transponder"],
-              "quantity":1
+              "quantity":1,
+              "source_evidence_text":"Garmin GNX 375",
+              "source_confidence":"high"
             }
           ]
         }"#;
 
-        let source = retained_avionics_source(Some(current));
+        let source = retained_avionics_source(
+            Some(current),
+            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+        );
 
         let RetainedAvionicsSource::Current(avionics) = source else {
             panic!("a current capability-array payload should be replayable")
@@ -3033,33 +3122,85 @@ mod tests {
     }
 
     #[test]
+    fn capability_array_without_exact_evidence_requires_reextraction() {
+        let missing_evidence = r#"{
+          "avionics": [{
+            "manufacturer":"Garmin",
+            "model":"GNX 375",
+            "types":["GPS","Transponder"],
+            "quantity":1
+          }]
+        }"#;
+
+        let source = retained_avionics_source(
+            Some(missing_evidence),
+            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+        );
+
+        let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
+            panic!("an evidence-less extraction must never be replayed")
+        };
+        assert!(reason.contains("source_evidence_text"));
+    }
+
+    #[test]
     fn missing_or_invalid_capability_arrays_fail_closed_to_reextraction() {
         assert!(matches!(
-            retained_avionics_source(None),
+            retained_avionics_source(None, &ListingEvidenceContext::default()),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
-            retained_avionics_source(Some(r#"{"avionics":[]}"#)),
+            retained_avionics_source(
+                Some(r#"{"avionics":[]}"#),
+                &ListingEvidenceContext::default()
+            ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
-            retained_avionics_source(Some(
-                r#"{"avionics":[{"manufacturer":"Garmin","model":"GTN 750Xi","types":[]}]}"#
-            )),
+            retained_avionics_source(
+                Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"GTN 750Xi","types":[]}]}"#),
+                &ListingEvidenceContext::default()
+            ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
-            retained_avionics_source(Some(
-                r#"{
+            retained_avionics_source(
+                Some(
+                    r#"{
                   "avionics":[{
                     "manufacturer":"Garmin","model":"GTN 750Xi","types":["GPS"],
                     "configuration_action":"replaces",
                     "replaces":{"manufacturer":"Garmin","model":"GNS 530W","type":"GPS"}
                   }]
                 }"#
-            )),
+                ),
+                &ListingEvidenceContext::default()
+            ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
+    }
+
+    #[test]
+    fn fabricated_evidence_requires_reextraction() {
+        let fabricated = r#"{
+          "avionics": [{
+            "manufacturer":"Garmin",
+            "model":"GNX 375",
+            "types":["GPS","Transponder"],
+            "source_evidence_text":"Garmin GNX 375 with invented qualifier",
+            "source_confidence":"high"
+          }]
+        }"#;
+
+        let source = retained_avionics_source(
+            Some(fabricated),
+            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375 installed"),
+        );
+
+        let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
+            panic!("model-produced evidence absent from the source must never be replayed")
+        };
+        assert!(reason.contains("not one exact bounded excerpt"));
     }
 
     #[test]
@@ -3363,7 +3504,7 @@ mod tests {
             "https://example.test/listing/51",
             "<p>Attached GTX 345R installed</p>",
             Some(
-                r#"{"avionics":[{"manufacturer":"Garmin","model":"Attached","types":["Transponder"]}]}"#,
+                r#"{"avionics":[{"manufacturer":"Garmin","model":"Attached","types":["Transponder"],"source_evidence_text":"Attached GTX 345R installed","source_confidence":"high"}]}"#,
             ),
             None,
             Some("prior extraction warning"),
@@ -3441,7 +3582,10 @@ mod tests {
             Some("<p>Garmin GNX 375 installed</p>")
         );
         assert!(matches!(
-            retained_avionics_source(rows[0].extracted_listing_json.as_deref()),
+            retained_avionics_source(
+                rows[0].extracted_listing_json.as_deref(),
+                &ListingEvidenceContext::from_rendered_html(rows[0].rendered_html.as_deref())
+            ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert_eq!(
