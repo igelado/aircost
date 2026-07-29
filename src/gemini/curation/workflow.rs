@@ -1399,11 +1399,13 @@ where
     let mut url_result = None;
     let mut url_error = None;
     let mut url_attempt_model = AttemptModel::Primary;
+    let mut url_attempt_search_citations = search_citations.clone();
+    let mut url_attempt_candidate_urls = candidate_urls.clone();
     for attempt in 1..=LOGICAL_ATTEMPTS {
         let url_prompt = build_url_context_prompt(
             request.research_prompt(),
-            &search_citations,
-            &candidate_urls,
+            &url_attempt_search_citations,
+            &url_attempt_candidate_urls,
             request.max_url_context_urls,
             !request.revalidated_direct_source_urls.is_empty(),
             attempt,
@@ -1449,8 +1451,11 @@ where
                 require_exclusive_stage_trace(&response, GroundingStage::UrlContext)?;
                 Ok(output)
             });
-        let trace_result =
-            validate_url_context_trace(&response, &candidate_urls, request.max_url_context_urls);
+        let trace_result = validate_url_context_trace(
+            &response,
+            &url_attempt_candidate_urls,
+            request.max_url_context_urls,
+        );
         let citations_result =
             resolve_citations(client, &response, request.max_url_context_urls).await;
         interactions.push(interaction_audit(
@@ -1459,22 +1464,41 @@ where
             request_json,
             citations_result.as_deref().unwrap_or_default(),
         ));
+        let narrowed_retry_scope = url_context_retry_scope(
+            attempt,
+            uses_verified_direct_source,
+            output_result.is_ok(),
+            &search_citations,
+            &candidate_urls,
+            trace_result.as_ref().ok(),
+            prefetched_source_documents.as_ref(),
+        );
         match (output_result, trace_result, citations_result) {
             (Ok(output), Ok(successful_urls), Ok(citations)) if !citations.is_empty() => {
-                if let Err(error) = require_citations_from_successful_urls(
+                let successful_candidate_urls = match accepted_url_context_candidate_scope(
                     &citations,
-                    &candidate_urls,
+                    &url_attempt_candidate_urls,
                     &successful_urls,
                 ) {
-                    url_error = Some(error.to_string());
-                    url_attempt_model = AttemptModel::ValidationFallback;
-                    continue;
-                }
+                    Ok(successful_candidate_urls) => successful_candidate_urls,
+                    Err(error) => {
+                        url_error = Some(error.to_string());
+                        url_attempt_model = AttemptModel::ValidationFallback;
+                        if let Some((retry_search_citations, retry_candidate_urls)) =
+                            narrowed_retry_scope
+                        {
+                            url_attempt_search_citations = retry_search_citations;
+                            url_attempt_candidate_urls = retry_candidate_urls;
+                        }
+                        continue;
+                    }
+                };
                 url_result = Some((
                     output,
                     citations,
                     grounding_trace(&response),
                     response.interaction.id.clone(),
+                    successful_candidate_urls,
                 ));
                 break;
             }
@@ -1499,30 +1523,32 @@ where
                 url_error = Some(errors.join("; "));
                 url_attempt_model =
                     AttemptModel::after_validation(deterministic_validation_failure);
+                if let Some((retry_search_citations, retry_candidate_urls)) = narrowed_retry_scope {
+                    url_attempt_search_citations = retry_search_citations;
+                    url_attempt_candidate_urls = retry_candidate_urls;
+                }
             }
         }
     }
-    let (url_output, verified_citations, url_trace, url_interaction_id) =
-        url_result.ok_or_else(|| {
-            anyhow!(
-            "URL Context verification failed grounding gates after {LOGICAL_ATTEMPTS} attempts: {}",
-            url_error.as_deref().unwrap_or("unknown failure")
-        )
-        })?;
+    let (url_output, verified_citations, url_trace, url_interaction_id, successful_candidate_urls) =
+        finish_url_context_stage(url_result, url_error.as_deref())?;
     let (verified_citations, direct_source_documents) = prepare_direct_source_documents(
         client,
         verified_citations,
         &request,
-        &candidate_urls,
+        &successful_candidate_urls,
         prefetched_source_documents,
     )
     .await
     .context("could not verify Gemini citations against publisher source text")?;
     if !request.revalidated_direct_source_urls.is_empty() {
-        require_citations_from_revalidated_candidate_urls(&verified_citations, &candidate_urls)
-            .context(
-                "verified citations escaped the successful revalidated direct-source candidate set",
-            )?;
+        require_citations_from_revalidated_candidate_urls(
+            &verified_citations,
+            &successful_candidate_urls,
+        )
+        .context(
+            "verified citations escaped the successful revalidated direct-source candidate set",
+        )?;
     }
 
     let (grounding_sources, grounding_supports) = citation_evidence(&verified_citations);
@@ -3225,6 +3251,9 @@ async fn prepare_direct_source_documents(
             &documents,
         )?;
     } else {
+        documents
+            .verified
+            .retain(|final_url, _| candidate_urls.contains(final_url));
         let source_urls = citations
             .iter()
             .map(|citation| citation.final_url.clone())
@@ -4368,6 +4397,76 @@ fn validate_url_context_trace(
         bail!("URL Context did not report any successful URL retrieval");
     }
     Ok(successful)
+}
+
+fn url_context_retry_candidate_subset(
+    original_candidate_urls: &BTreeSet<String>,
+    successful_urls: &BTreeSet<String>,
+    prefetched_documents: Option<&TransientSourceDocuments>,
+) -> Option<BTreeSet<String>> {
+    let prefetched_documents = prefetched_documents?;
+    let retry_candidate_urls = original_candidate_urls
+        .iter()
+        .filter(|candidate_url| {
+            prefetched_documents.verified.contains_key(*candidate_url)
+                && canonical_url_key(candidate_url)
+                    .ok()
+                    .is_some_and(|key| successful_urls.contains(&key))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    (!retry_candidate_urls.is_empty()).then_some(retry_candidate_urls)
+}
+
+fn finish_url_context_stage<T>(url_result: Option<T>, url_error: Option<&str>) -> Result<T> {
+    url_result.ok_or_else(|| {
+        anyhow!(
+            "URL Context verification failed grounding gates after {LOGICAL_ATTEMPTS} attempts: {}",
+            url_error.unwrap_or("unknown failure")
+        )
+    })
+}
+
+fn url_context_retry_scope(
+    completed_attempt: usize,
+    uses_verified_direct_source: bool,
+    output_is_valid: bool,
+    original_search_citations: &[VerifiedCitation],
+    original_candidate_urls: &BTreeSet<String>,
+    successful_urls: Option<&BTreeSet<String>>,
+    prefetched_documents: Option<&TransientSourceDocuments>,
+) -> Option<(Vec<VerifiedCitation>, BTreeSet<String>)> {
+    if completed_attempt != 1 || uses_verified_direct_source || !output_is_valid {
+        return None;
+    }
+    let retry_candidate_urls = url_context_retry_candidate_subset(
+        original_candidate_urls,
+        successful_urls?,
+        prefetched_documents,
+    )?;
+    let retry_search_citations =
+        citations_for_candidate_urls(original_search_citations, &retry_candidate_urls);
+    Some((retry_search_citations, retry_candidate_urls))
+}
+
+fn accepted_url_context_candidate_scope(
+    citations: &[VerifiedCitation],
+    candidate_urls: &BTreeSet<String>,
+    successful_urls: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    require_citations_from_successful_urls(citations, candidate_urls, successful_urls)?;
+    Ok(candidate_urls.clone())
+}
+
+fn citations_for_candidate_urls(
+    citations: &[VerifiedCitation],
+    candidate_urls: &BTreeSet<String>,
+) -> Vec<VerifiedCitation> {
+    citations
+        .iter()
+        .filter(|citation| candidate_urls.contains(&citation.final_url))
+        .cloned()
+        .collect()
 }
 
 fn require_citations_from_successful_urls(
@@ -6765,6 +6864,437 @@ mod tests {
                 .iter()
                 .map(|url| canonical_url_key(url).unwrap())
                 .collect()
+        );
+    }
+
+    #[test]
+    fn url_context_retry_scope_narrows_the_request_and_search_citation_records() {
+        let retained_url = "https://example.com/retained".to_string();
+        let unsuccessful_url = "https://example.com/unsuccessful".to_string();
+        let unverified_url = "https://example.com/unverified".to_string();
+        let candidate_urls = [
+            retained_url.clone(),
+            unsuccessful_url.clone(),
+            unverified_url.clone(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let citations = candidate_urls
+            .iter()
+            .map(|url| VerifiedCitation {
+                raw_url: url.clone(),
+                final_url: url.clone(),
+                title: format!("Source {url}"),
+                cited_text: "Evidence.".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let successful_urls = [retained_url.clone(), unverified_url]
+            .into_iter()
+            .map(|url| canonical_url_key(&url).unwrap())
+            .collect::<BTreeSet<_>>();
+        let documents = TransientSourceDocuments {
+            verified: [
+                (
+                    retained_url.clone(),
+                    TransientSourceDocument {
+                        content_sha256: "a".repeat(64),
+                        publisher_text: "Retained source.".to_string(),
+                    },
+                ),
+                (
+                    unsuccessful_url,
+                    TransientSourceDocument {
+                        content_sha256: "b".repeat(64),
+                        publisher_text: "Unsuccessful source.".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+
+        let (retry_citations, retry_candidate_urls) = url_context_retry_scope(
+            1,
+            false,
+            true,
+            &citations,
+            &candidate_urls,
+            Some(&successful_urls),
+            Some(&documents),
+        )
+        .expect("a successful, prefetched URL must narrow attempt two");
+
+        assert_eq!(
+            retry_candidate_urls,
+            [retained_url.clone()].into_iter().collect()
+        );
+        assert_eq!(retry_citations.len(), 1);
+        assert_eq!(retry_citations[0].final_url, retained_url);
+        let retry_prompt = build_url_context_prompt(
+            "Research.",
+            &retry_citations,
+            &retry_candidate_urls,
+            MAX_URL_CONTEXT_URLS,
+            false,
+            2,
+            Some("attempt one failed validation"),
+        )
+        .unwrap();
+        assert!(retry_prompt.contains("https://example.com/retained"));
+        assert!(!retry_prompt.contains("https://example.com/unsuccessful"));
+        assert!(!retry_prompt.contains("https://example.com/unverified"));
+    }
+
+    #[test]
+    fn url_context_retry_scope_keeps_the_full_retry_for_empty_or_invalid_trace_subsets() {
+        let candidate_urls = ["https://example.com/manual".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let citations = vec![VerifiedCitation {
+            raw_url: "https://example.com/manual".to_string(),
+            final_url: "https://example.com/manual".to_string(),
+            title: "Manual".to_string(),
+            cited_text: "Evidence.".to_string(),
+        }];
+        let successful_urls = candidate_urls
+            .iter()
+            .map(|url| canonical_url_key(url).unwrap())
+            .collect::<BTreeSet<_>>();
+        let no_verified_documents = TransientSourceDocuments::default();
+
+        assert!(
+            url_context_retry_scope(
+                1,
+                false,
+                true,
+                &citations,
+                &candidate_urls,
+                Some(&successful_urls),
+                Some(&no_verified_documents),
+            )
+            .is_none(),
+            "an empty verified intersection must preserve the original retry scope"
+        );
+        assert!(
+            url_context_retry_scope(
+                1,
+                false,
+                true,
+                &citations,
+                &candidate_urls,
+                None,
+                Some(&no_verified_documents),
+            )
+            .is_none(),
+            "an invalid trace supplies no successful URL set and must preserve the original scope"
+        );
+    }
+
+    #[test]
+    fn valid_url_trace_with_invalid_exclusive_stage_output_keeps_the_full_retry_scope() {
+        let candidate_url = "https://example.com/manual".to_string();
+        let candidate_urls = [candidate_url.clone()].into_iter().collect::<BTreeSet<_>>();
+        let response = response(json!({
+            "id": "url-with-cross-stage-search",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {"type": "url_context_call", "id": "url-1", "arguments": {"urls": [candidate_url.clone()]}},
+                {"type": "url_context_result", "call_id": "url-1", "result": [{"url": candidate_url.clone(), "status": "success"}]},
+                {"type": "google_search_call", "id": "search-1", "arguments": {"query": "cross-stage activity"}},
+                {"type": "google_search_result", "call_id": "search-1", "result": {}},
+                {"type": "model_output", "content": [{"type": "text", "text": "verified"}]}
+            ]
+        }));
+        let successful_urls =
+            validate_url_context_trace(&response, &candidate_urls, MAX_URL_CONTEXT_URLS)
+                .expect("the URL retrieval trace itself is valid");
+        assert!(
+            require_exclusive_stage_trace(&response, GroundingStage::UrlContext).is_err(),
+            "cross-stage tool activity must invalidate the output contract"
+        );
+        let citations = vec![VerifiedCitation {
+            raw_url: candidate_url.clone(),
+            final_url: candidate_url.clone(),
+            title: "Manual".to_string(),
+            cited_text: "Evidence.".to_string(),
+        }];
+        let documents = TransientSourceDocuments {
+            verified: [(
+                candidate_url,
+                TransientSourceDocument {
+                    content_sha256: "a".repeat(64),
+                    publisher_text: "Publisher evidence.".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+
+        assert!(
+            url_context_retry_scope(
+                1,
+                false,
+                false,
+                &citations,
+                &candidate_urls,
+                Some(&successful_urls),
+                Some(&documents),
+            )
+            .is_none(),
+            "invalid stage output must preserve the full attempt-two request"
+        );
+    }
+
+    #[test]
+    fn canonical_equivalent_trace_spelling_can_select_the_exact_prefetched_candidate() {
+        let candidate_url = "https://example.com/manual".to_string();
+        let candidate_urls = [candidate_url.clone()].into_iter().collect::<BTreeSet<_>>();
+        let response = response(json!({
+            "id": "url-canonical-spelling",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {"type": "url_context_call", "id": "url-1", "arguments": {"urls": [candidate_url.clone()]}},
+                {"type": "url_context_result", "call_id": "url-1", "result": [{"url": "https://example.com/manual/", "status": "success"}]},
+                {"type": "model_output", "content": [{"type": "text", "text": "verified"}]}
+            ]
+        }));
+        let successful_urls =
+            validate_url_context_trace(&response, &candidate_urls, MAX_URL_CONTEXT_URLS).unwrap();
+        let citations = vec![VerifiedCitation {
+            raw_url: candidate_url.clone(),
+            final_url: candidate_url.clone(),
+            title: "Manual".to_string(),
+            cited_text: "Evidence.".to_string(),
+        }];
+        let documents = TransientSourceDocuments {
+            verified: [(
+                candidate_url.clone(),
+                TransientSourceDocument {
+                    content_sha256: "a".repeat(64),
+                    publisher_text: "Publisher evidence.".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+
+        let (_, retry_candidate_urls) = url_context_retry_scope(
+            1,
+            false,
+            true,
+            &citations,
+            &candidate_urls,
+            Some(&successful_urls),
+            Some(&documents),
+        )
+        .expect("canonical-equivalent retrieval metadata must retain the exact stored URL");
+
+        assert_eq!(retry_candidate_urls, [candidate_url].into_iter().collect());
+    }
+
+    #[test]
+    fn authoritative_direct_source_retry_is_never_narrowed() {
+        let candidate_urls = ["https://example.com/manual".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let citations = vec![VerifiedCitation {
+            raw_url: "https://example.com/manual".to_string(),
+            final_url: "https://example.com/manual".to_string(),
+            title: "Manual".to_string(),
+            cited_text: "Evidence.".to_string(),
+        }];
+        let successful_urls = candidate_urls
+            .iter()
+            .map(|url| canonical_url_key(url).unwrap())
+            .collect::<BTreeSet<_>>();
+        let documents = TransientSourceDocuments {
+            verified: [(
+                "https://example.com/manual".to_string(),
+                TransientSourceDocument {
+                    content_sha256: "a".repeat(64),
+                    publisher_text: "Publisher evidence.".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+
+        assert!(
+            url_context_retry_scope(
+                1,
+                true,
+                true,
+                &citations,
+                &candidate_urls,
+                Some(&successful_urls),
+                Some(&documents),
+            )
+            .is_none(),
+            "the direct-source path must continue retrying its complete exact-origin set"
+        );
+    }
+
+    #[test]
+    fn citation_failure_transitions_to_narrowed_retry_and_propagates_accepted_scope() {
+        let retained_url = "https://example.com/retained".to_string();
+        let excluded_url = "https://example.com/excluded".to_string();
+        let original_candidate_urls = [retained_url.clone(), excluded_url.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let original_citations = vec![
+            VerifiedCitation {
+                raw_url: retained_url.clone(),
+                final_url: retained_url.clone(),
+                title: "Retained source".to_string(),
+                cited_text: "Retained evidence.".to_string(),
+            },
+            VerifiedCitation {
+                raw_url: excluded_url.clone(),
+                final_url: excluded_url.clone(),
+                title: "Excluded source".to_string(),
+                cited_text: "Excluded evidence.".to_string(),
+            },
+        ];
+        let attempt_one_successful_urls = [retained_url.clone()]
+            .into_iter()
+            .map(|url| canonical_url_key(&url).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            require_citations_from_successful_urls(
+                &original_citations,
+                &original_candidate_urls,
+                &attempt_one_successful_urls,
+            )
+            .is_err(),
+            "attempt one cites a URL without successful retrieval metadata"
+        );
+        let documents = TransientSourceDocuments {
+            verified: [(
+                retained_url.clone(),
+                TransientSourceDocument {
+                    content_sha256: "a".repeat(64),
+                    publisher_text: "Retained publisher evidence.".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+
+        let (retry_citations, retry_candidate_urls) = url_context_retry_scope(
+            1,
+            false,
+            true,
+            &original_citations,
+            &original_candidate_urls,
+            Some(&attempt_one_successful_urls),
+            Some(&documents),
+        )
+        .expect("citation-only failure should narrow attempt two");
+        assert_eq!(retry_citations.len(), 1);
+
+        let attempt_two_successful_urls = retry_candidate_urls
+            .iter()
+            .map(|url| canonical_url_key(url).unwrap())
+            .collect::<BTreeSet<_>>();
+        let accepted_candidate_urls = accepted_url_context_candidate_scope(
+            &retry_citations,
+            &retry_candidate_urls,
+            &attempt_two_successful_urls,
+        )
+        .expect("attempt two citations are valid for the narrowed request");
+
+        assert_eq!(
+            accepted_candidate_urls,
+            [retained_url].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn narrowed_url_context_scope_rejects_a_citation_from_the_original_outer_set() {
+        let retained_url = "https://example.com/retained".to_string();
+        let excluded_url = "https://example.com/excluded".to_string();
+        let retry_candidate_urls = [retained_url.clone()].into_iter().collect::<BTreeSet<_>>();
+        let successful_urls = retry_candidate_urls
+            .iter()
+            .map(|url| canonical_url_key(url).unwrap())
+            .collect::<BTreeSet<_>>();
+        let citations = vec![VerifiedCitation {
+            raw_url: excluded_url.clone(),
+            final_url: excluded_url,
+            title: "Excluded source".to_string(),
+            cited_text: "Evidence from outside the narrowed attempt.".to_string(),
+        }];
+
+        assert!(require_citations_from_successful_urls(
+            &citations,
+            &retry_candidate_urls,
+            &successful_urls,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn narrowed_candidate_set_prunes_prefetched_documents_before_acceptance() {
+        let retained_url = "https://example.com/retained".to_string();
+        let excluded_url = "https://example.com/excluded".to_string();
+        let candidate_urls = [retained_url.clone()].into_iter().collect::<BTreeSet<_>>();
+        let citations = vec![VerifiedCitation {
+            raw_url: retained_url.clone(),
+            final_url: retained_url.clone(),
+            title: "Garmin GTX 345R manual".to_string(),
+            cited_text: "Garmin GTX 345R product evidence.".to_string(),
+        }];
+        let documents = TransientSourceDocuments {
+            verified: [
+                (
+                    retained_url.clone(),
+                    TransientSourceDocument {
+                        content_sha256: "a".repeat(64),
+                        publisher_text: "Garmin GTX 345R product evidence.".to_string(),
+                    },
+                ),
+                (
+                    excluded_url,
+                    TransientSourceDocument {
+                        content_sha256: "b".repeat(64),
+                        publisher_text: "Garmin GTX 345R unrelated outer-set copy.".to_string(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            failures: BTreeMap::new(),
+        };
+        let request = evidence_request()
+            .with_direct_source_text_verification()
+            .with_direct_source_relevance_anchors(["Garmin", "GTX 345R"]);
+        let client = GeminiInteractionsClient::new("test-key").unwrap();
+
+        let (verified_citations, retained_documents) = prepare_direct_source_documents(
+            &client,
+            citations,
+            &request,
+            &candidate_urls,
+            Some(documents),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(verified_citations.len(), 1);
+        assert_eq!(
+            retained_documents
+                .unwrap()
+                .verified
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
+            [retained_url].into_iter().collect()
         );
     }
 
