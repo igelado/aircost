@@ -68,6 +68,10 @@ const AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION: &str =
 const AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION: i64 = 2;
 const AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_FINGERPRINT: &str =
     "8ad6e935e1222a03e2da4848a9e3c6f4b7f50ee027a6e50ede3b692d034cae55";
+const AVIONICS_PRODUCT_REUSE_V2_MIGRATION: &str = "20260807_avionics_product_reuse_v2";
+const AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION: i64 = 1;
+const AVIONICS_PRODUCT_REUSE_V2_CONTRACT_FINGERPRINT: &str =
+    "efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc";
 const AVIONICS_GROUNDED_EVIDENCE_REFRESH_MIGRATION: &str =
     "20260804_avionics_grounded_evidence_refresh";
 const AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_VERSION: i64 = 1;
@@ -1974,7 +1978,7 @@ impl AppDb {
                               'avionics_product_reuse_attestations'
                             AND instr(
                               lower(actual.sql),
-                              'check (policy_version = ''avionics_reuse_v1'')'
+                              'check (policy_version = ''avionics_reuse_v2'')'
                             ) > 0
                             AND instr(
                               lower(actual.sql),
@@ -2209,7 +2213,7 @@ impl AppDb {
                           )
                             AND actual.contype = 'c'
                             AND position(
-                              'avionics_reuse_v1'
+                              'avionics_reuse_v2'
                               IN pg_get_constraintdef(actual.oid)
                             ) > 0
                         )
@@ -2291,6 +2295,14 @@ impl AppDb {
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION,
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_FINGERPRINT,
+                )
+                .await?
+            || self
+                .migration_contract_missing(
+                    "avionics_models",
+                    AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
+                    AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION,
+                    AVIONICS_PRODUCT_REUSE_V2_CONTRACT_FINGERPRINT,
                 )
                 .await?;
         if missing_avionics_reuse_attestations {
@@ -3226,8 +3238,8 @@ fn avionics_product_reuse_attestations_migration_required_message(kind: Database
     };
     format!(
         "database migration required before startup: approved avionics products must use the \
-         positive-only current-policy reuse-attestation gate; back up the database, apply \
-         `migrations/{AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION}.{backend}.sql`, then \
+         target-aware current-policy reuse-attestation gate; back up the database, apply \
+         `migrations/{AVIONICS_PRODUCT_REUSE_V2_MIGRATION}.{backend}.sql`, then \
          restart aircost"
     )
 }
@@ -3315,6 +3327,8 @@ mod tests {
         AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_FINGERPRINT,
         AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION,
         AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
+        AVIONICS_PRODUCT_REUSE_V2_CONTRACT_FINGERPRINT, AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION,
+        AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
@@ -3354,7 +3368,10 @@ mod tests {
         include_str!("../migrations/20260803_avionics_product_reuse_attestations.sqlite.sql");
     const AVIONICS_REUSE_ATTESTATIONS_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260803_avionics_product_reuse_attestations.postgres.sql");
-
+    const AVIONICS_REUSE_V2_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260807_avionics_product_reuse_v2.sqlite.sql");
+    const AVIONICS_REUSE_V2_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260807_avionics_product_reuse_v2.postgres.sql");
     async fn sqlite_db_with_statements(statements: &[&str]) -> AppDb {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -4238,11 +4255,11 @@ mod tests {
             .await
             .expect_err("same-name no-op reuse objects must not pass startup")
             .to_string();
-        assert!(error.contains("positive-only current-policy reuse-attestation gate"));
-        assert!(error.contains("20260803_avionics_product_reuse_attestations.sqlite.sql"));
+        assert!(error.contains("target-aware current-policy reuse-attestation gate"));
+        assert!(error.contains("20260807_avionics_product_reuse_v2.sqlite.sql"));
 
         let mut connection = pool.acquire().await.unwrap();
-        for statement in split_sql_statements(AVIONICS_REUSE_ATTESTATIONS_SQLITE_MIGRATION_SQL) {
+        for statement in split_sql_statements(AVIONICS_REUSE_V2_SQLITE_MIGRATION_SQL) {
             connection.execute(statement).await.unwrap();
         }
         drop(connection);
@@ -4459,23 +4476,65 @@ mod tests {
             "SQLite/Postgres migration column mismatch for {table}"
         );
         assert_eq!(AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION, 2);
+        assert_eq!(AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION, 1);
         for contract_value in [
             AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
             AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_FINGERPRINT,
+            AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
+            AVIONICS_PRODUCT_REUSE_V2_CONTRACT_FINGERPRINT,
         ] {
             assert!(SQLITE_SCHEMA_SQL.contains(contract_value));
             assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
-            assert!(AVIONICS_REUSE_ATTESTATIONS_SQLITE_MIGRATION_SQL.contains(contract_value));
-            assert!(AVIONICS_REUSE_ATTESTATIONS_POSTGRES_MIGRATION_SQL.contains(contract_value));
+            assert!(
+                AVIONICS_REUSE_ATTESTATIONS_SQLITE_MIGRATION_SQL.contains(contract_value)
+                    || AVIONICS_REUSE_V2_SQLITE_MIGRATION_SQL.contains(contract_value)
+            );
+            assert!(
+                AVIONICS_REUSE_ATTESTATIONS_POSTGRES_MIGRATION_SQL.contains(contract_value)
+                    || AVIONICS_REUSE_V2_POSTGRES_MIGRATION_SQL.contains(contract_value)
+            );
         }
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            AVIONICS_REUSE_V2_SQLITE_MIGRATION_SQL,
+            AVIONICS_REUSE_V2_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains("avionics_reuse_v2"));
+        }
+        assert!(!SQLITE_SCHEMA_SQL.contains("avionics_reuse_v1"));
+        assert!(!POSTGRES_SCHEMA_SQL.contains("avionics_reuse_v1"));
         for repaired_object in [
             "DROP INDEX IF EXISTS idx_avionics_product_reuse_origin",
             "DROP TRIGGER IF EXISTS\n  avionics_product_reuse_attestations_validate_insert",
-            "DROP TRIGGER IF EXISTS\n  avionics_product_reuse_invalidate_origin_revocation",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_type_insert",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_type_delete",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_type_update",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_capability_update",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_identity_update",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_origin_revocation",
+            "DROP TRIGGER IF EXISTS listing_avionics_corroborations_validate_insert",
         ] {
             assert!(
-                AVIONICS_REUSE_ATTESTATIONS_SQLITE_MIGRATION_SQL.contains(repaired_object),
-                "SQLite repair migration is missing {repaired_object}"
+                AVIONICS_REUSE_V2_SQLITE_MIGRATION_SQL.contains(repaired_object),
+                "SQLite v2 repair migration is missing {repaired_object}"
+            );
+        }
+        for repaired_object in [
+            "DROP INDEX IF EXISTS idx_avionics_product_reuse_origin",
+            "$drop_policy_constraints$",
+            "ADD CONSTRAINT avionics_product_reuse_attestations_policy_version_check",
+            "CREATE OR REPLACE FUNCTION validate_avionics_product_reuse_attestation()",
+            "CREATE OR REPLACE FUNCTION preserve_avionics_product_reuse_attestation()",
+            "CREATE OR REPLACE FUNCTION invalidate_avionics_product_reuse_for_type()",
+            "CREATE OR REPLACE FUNCTION invalidate_avionics_product_reuse_for_capability()",
+            "CREATE OR REPLACE FUNCTION invalidate_avionics_product_reuse_for_identity()",
+            "CREATE OR REPLACE FUNCTION invalidate_avionics_product_reuse_for_revocation()",
+            "DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_origin_revocation",
+        ] {
+            assert!(
+                AVIONICS_REUSE_V2_POSTGRES_MIGRATION_SQL.contains(repaired_object),
+                "Postgres v2 repair migration is missing {repaired_object}"
             );
         }
     }
@@ -4776,8 +4835,6 @@ mod tests {
 
         let reuse_attestations =
             avionics_product_reuse_attestations_migration_required_message(DatabaseKind::Sqlite);
-        assert!(
-            reuse_attestations.contains("20260803_avionics_product_reuse_attestations.sqlite.sql")
-        );
+        assert!(reuse_attestations.contains("20260807_avionics_product_reuse_v2.sqlite.sql"));
     }
 }

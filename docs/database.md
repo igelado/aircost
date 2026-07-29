@@ -391,6 +391,13 @@ identity-collision closure, exact covered-link ownership, and listing action
 graph. Coupled replacement aspects, ambiguous identities, implicit merges,
 and stale collision decisions remain pending.
 
+Reuse attestations use the `avionics_reuse_v2` policy and a v2 fingerprint
+domain that identifies the target-aware OEM proof semantics. The v2 migration
+does not promote or rewrite v1 conclusions: it removes every v1 product
+attestation and lets the dependent listing corroborations and collision scopes
+be removed with it. Catalog products, listing links, and pending reviews are
+preserved and must earn new positive conclusions through the current workflow.
+
 The server checks mandatory FAA admission before entering this catalog-writing
 transaction. The transaction rejects stale payload or catalog hashes, applies
 all catalog decisions and only the exact covered listing-link ID/role pairs,

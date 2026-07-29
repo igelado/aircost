@@ -14,8 +14,9 @@ use sqlx::{FromRow, Postgres, Sqlite, Transaction};
 use super::manufacturer::canonical_exact_https_origin;
 use crate::db::{AppDb, DatabaseBackend};
 
-pub(crate) const AVIONICS_REUSE_POLICY_VERSION: &str = "avionics_reuse_v1";
-const AVIONICS_REUSE_FINGERPRINT_DOMAIN: &[u8] = b"aircost:avionics-product-reuse-attestation:v1\0";
+pub(crate) const AVIONICS_REUSE_POLICY_VERSION: &str = "avionics_reuse_v2";
+const AVIONICS_REUSE_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:avionics-product-reuse-attestation:v2:target-aware-oem-proof\0";
 
 #[derive(Clone, Debug, FromRow)]
 struct ReuseAttestationRow {
@@ -629,7 +630,7 @@ mod tests {
 
     #[test]
     fn fingerprint_is_order_independent_but_identity_and_capability_bound() {
-        assert_eq!(AVIONICS_REUSE_POLICY_VERSION, "avionics_reuse_v1");
+        assert_eq!(AVIONICS_REUSE_POLICY_VERSION, "avionics_reuse_v2");
         let com = row("COM");
         let nav = row("NAV");
         let expected = fingerprint_rows(&[com.clone(), nav.clone()]).unwrap();
