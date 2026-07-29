@@ -219,6 +219,61 @@ pub(crate) struct ApprovedProductAssociationRequest {
     pub listing_evidence_text: String,
 }
 
+/// Immutable catalog projection used by source-free listing association checks.
+///
+/// Loading this once lets a review page evaluate every returned association
+/// against one coherent local catalog view without repeating the full catalog
+/// and manufacturer-identity queries for each row.
+pub(crate) struct ApprovedProductAssociationResolver {
+    manufacturer_identity_memberships: Vec<(String, i64)>,
+    catalog: Vec<AvionicsCatalogCandidate>,
+    approved_candidates: Vec<KnownApprovedAvionicsCandidate>,
+}
+
+impl ApprovedProductAssociationResolver {
+    pub(crate) async fn load_with_reuse_attested_product_ids(
+        db: &AppDb,
+        reuse_attested_ids: &HashSet<i64>,
+    ) -> CatalogResult<Self> {
+        Ok(Self {
+            manufacturer_identity_memberships: load_manufacturer_identity_memberships(db).await?,
+            catalog: load_catalog_candidates(db).await?,
+            approved_candidates: load_known_approved_candidates_for_ids(db, reuse_attested_ids)
+                .await?,
+        })
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        request: &ApprovedProductAssociationRequest,
+    ) -> Option<ApprovedAvionicsIdentity> {
+        if request.listing_evidence_text.trim().is_empty()
+            || request.manufacturer.trim().is_empty()
+            || request.model.trim().is_empty()
+            || request.avionics_types.is_empty()
+            || request.avionics_types.iter().any(|capability| {
+                let capability = capability.trim();
+                capability.is_empty() || !CURATED_AVIONICS_TYPES.contains(&capability)
+            })
+        {
+            return None;
+        }
+        let observed_types = canonicalize_avionics_types(&request.avionics_types);
+        let manufacturer_identity_id = resolve_input_manufacturer_identity_from_memberships(
+            &request.manufacturer,
+            &self.manufacturer_identity_memberships,
+        )?;
+        known_approved_local_match_core(
+            &request.model,
+            &request.listing_evidence_text,
+            &observed_types,
+            manufacturer_identity_id,
+            &self.approved_candidates,
+            &self.catalog,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingProductAttestationCommitGuard {
     pub owner_user_id: i64,
@@ -952,39 +1007,6 @@ pub async fn resolve_verified_local_avionics_identity(
     Ok(known_approved_local_match_core(
         &request.model,
         &request.listing_context,
-        &observed_types,
-        manufacturer_identity_id,
-        &approved_candidates,
-        &catalog,
-    ))
-}
-
-pub(crate) async fn resolve_approved_product_association(
-    db: &AppDb,
-    request: &ApprovedProductAssociationRequest,
-) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
-    if request.listing_evidence_text.trim().is_empty()
-        || request.manufacturer.trim().is_empty()
-        || request.model.trim().is_empty()
-        || request.avionics_types.is_empty()
-        || request.avionics_types.iter().any(|capability| {
-            let capability = capability.trim();
-            capability.is_empty() || !CURATED_AVIONICS_TYPES.contains(&capability)
-        })
-    {
-        return Ok(None);
-    }
-    let observed_types = canonicalize_avionics_types(&request.avionics_types);
-    let Some(manufacturer_identity_id) =
-        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
-    else {
-        return Ok(None);
-    };
-    let catalog = load_catalog_candidates(db).await?;
-    let approved_candidates = load_known_approved_candidates(db).await?;
-    Ok(known_approved_local_match_core(
-        &request.model,
-        &request.listing_evidence_text,
         &observed_types,
         manufacturer_identity_id,
         &approved_candidates,
@@ -2034,9 +2056,14 @@ async fn resolve_input_manufacturer_identity(
     db: &AppDb,
     manufacturer: &str,
 ) -> CatalogResult<Option<i64>> {
-    if is_generic_avionics_manufacturer_name(manufacturer) {
-        return Ok(None);
-    }
+    let rows = load_manufacturer_identity_memberships(db).await?;
+    Ok(resolve_input_manufacturer_identity_from_memberships(
+        manufacturer,
+        &rows,
+    ))
+}
+
+async fn load_manufacturer_identity_memberships(db: &AppDb) -> CatalogResult<Vec<(String, i64)>> {
     let sql = db.sql(
         r#"
         SELECT manufacturer.name,
@@ -2047,28 +2074,45 @@ async fn resolve_input_manufacturer_identity(
         ORDER BY manufacturer.id
         "#,
     );
-    let rows: Vec<(String, i64)> = match db.backend() {
+    let rows = match db.backend() {
         DatabaseBackend::Sqlite(pool) => sqlx::query_as(&sql).fetch_all(pool).await?,
         DatabaseBackend::Postgres(pool) => sqlx::query_as(&sql).fetch_all(pool).await?,
     };
+    Ok(rows)
+}
+
+fn resolve_input_manufacturer_identity_from_memberships(
+    manufacturer: &str,
+    rows: &[(String, i64)],
+) -> Option<i64> {
+    if is_generic_avionics_manufacturer_name(manufacturer) {
+        return None;
+    }
     let input_key = exact_manufacturer_name_key(manufacturer);
     let identities = rows
-        .into_iter()
+        .iter()
         .filter(|(stored_name, _)| exact_manufacturer_name_key(stored_name) == input_key)
-        .map(|(_, identity_id)| identity_id)
+        .map(|(_, identity_id)| *identity_id)
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let [identity_id] = identities.as_slice() else {
-        return Ok(None);
+        return None;
     };
-    Ok(Some(*identity_id))
+    Some(*identity_id)
 }
 
 async fn load_known_approved_candidates(
     db: &AppDb,
 ) -> CatalogResult<Vec<KnownApprovedAvionicsCandidate>> {
     let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
+    load_known_approved_candidates_for_ids(db, &reuse_attested_ids).await
+}
+
+async fn load_known_approved_candidates_for_ids(
+    db: &AppDb,
+    reuse_attested_ids: &HashSet<i64>,
+) -> CatalogResult<Vec<KnownApprovedAvionicsCandidate>> {
     let mut candidates = load_graph_approved_candidates(db)
         .await?
         .into_iter()

@@ -5,6 +5,8 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  authoritativeIdentityUrl,
+  autoVerifiableProductAssociations,
   characterLimitState,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
@@ -14,7 +16,10 @@ import {
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
+  productAssociationEvidenceDisplay,
+  productAssociationEligibilityOutcome,
   productActionContextIsCurrent,
+  productAttestationDraft,
   productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
@@ -139,6 +144,87 @@ test("validates review identity source fields at the exact server boundaries", (
       message: "Exact identity evidence must contain at most 128 characters.",
     },
   );
+});
+
+test("prepares fresh product attestation fields without replaying catalog evidence", () => {
+  const draft = productAttestationDraft({
+    identity_source_url: "https://www.garmin.com/aviation/product",
+    identity_source_title: "Garmin G1000 NXi product identity",
+    identity_evidence_text: "x".repeat(158),
+  });
+  assert.deepEqual(draft, {
+    sourceUrl: "https://www.garmin.com/aviation/product",
+    sourceTitle: "Garmin G1000 NXi product identity",
+    evidenceText: "",
+  });
+  assert.equal(authoritativeIdentityUrl("http://www.garmin.com/product"), false);
+  assert.deepEqual(productAttestationDraft({
+    identity_source_url: "https://market.example/listings/unit",
+    identity_source_title: "x".repeat(201),
+    identity_evidence_text: "short historical evidence",
+  }), {
+    sourceUrl: "",
+    sourceTitle: "",
+    evidenceText: "",
+  });
+});
+
+test("describes and filters server-supplied product association eligibility", () => {
+  const associations = [
+    {
+      listing_id: 1,
+      verification_eligibility: { status: "auto_verifiable" },
+    },
+    {
+      listing_id: 2,
+      verification_eligibility: {
+        status: "product_attestation_required",
+        reason_code: "product_attestation_required",
+        reason: "Attest this product first.",
+      },
+    },
+    {
+      listing_id: 3,
+      verification_eligibility: {
+        status: "manual_review_required",
+        reason_code: "catalog_identity_ambiguous",
+        reason: "The exact product is ambiguous.",
+      },
+    },
+  ];
+  assert.deepEqual(autoVerifiableProductAssociations(associations), [associations[0]]);
+  assert.deepEqual(productAssociationEligibilityOutcome(associations[0]), {
+    kind: "ready",
+    label: "Ready for local validation",
+    detail: "The retained listing proof uniquely identifies the current approved product.",
+  });
+  assert.deepEqual(productAssociationEligibilityOutcome(associations[1]), {
+    kind: "required",
+    label: "OEM attestation required",
+    detail: "Attest this product first.",
+  });
+  assert.deepEqual(productAssociationEligibilityOutcome(associations[2]), {
+    kind: "manual",
+    label: "Manual review required",
+    detail: "The exact product is ambiguous.",
+  });
+});
+
+test("keeps observed text distinct from retained product-association evidence", () => {
+  assert.deepEqual(productAssociationEvidenceDisplay({
+    observed_text: "Garmin GTN 750",
+    source_evidence_text: null,
+  }), {
+    observedText: "Garmin GTN 750",
+    sourceEvidenceText: "No retained source evidence",
+  });
+  assert.deepEqual(productAssociationEvidenceDisplay({
+    observed_text: "Garmin GTN 750",
+    source_evidence_text: "Dual Garmin GTN 750 navigators",
+  }), {
+    observedText: "Garmin GTN 750",
+    sourceEvidenceText: "Dual Garmin GTN 750 navigators",
+  });
 });
 
 test("describes a consolidated catalog collision as pending identity verification", () => {

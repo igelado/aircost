@@ -21,7 +21,8 @@ use sqlx::FromRow;
 
 use crate::aircraft::faa::{block_reason_code, require_listing_admission, AircraftAdmissionError};
 use crate::avionics::catalog::{
-    exact_product_identity_signal_is_present, PendingProductAttestationCommitGuard,
+    exact_product_identity_signal_is_present, ApprovedProductAssociationRequest,
+    ApprovedProductAssociationResolver, PendingProductAttestationCommitGuard,
 };
 use crate::avionics::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
@@ -540,6 +541,23 @@ pub struct PendingProductReviewPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductAssociationEligibilityStatus {
+    AutoVerifiable,
+    ProductAttestationRequired,
+    ManualReviewRequired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProductAssociationVerificationEligibility {
+    pub status: ProductAssociationEligibilityStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PendingProductAssociation {
     pub listing_id: i64,
@@ -553,6 +571,40 @@ pub struct PendingProductAssociation {
     pub source_evidence_text: Option<String>,
     pub quantity: i64,
     pub configuration_action: String,
+    pub verification_eligibility: ProductAssociationVerificationEligibility,
+}
+
+#[derive(Clone, Debug)]
+struct PendingProductAssociationSource {
+    listing_id: i64,
+    listing_label: String,
+    source_url: Option<String>,
+    aspect_id: ReviewAspectId,
+    review_payload_sha256: String,
+    observed_text: String,
+    source_evidence_text: Option<String>,
+    quantity: i64,
+    configuration_action: String,
+}
+
+impl PendingProductAssociationSource {
+    fn project(
+        self,
+        verification_eligibility: ProductAssociationVerificationEligibility,
+    ) -> PendingProductAssociation {
+        PendingProductAssociation {
+            listing_id: self.listing_id,
+            listing_label: self.listing_label,
+            source_url: self.source_url,
+            aspect_id: self.aspect_id,
+            review_payload_sha256: self.review_payload_sha256,
+            observed_text: self.observed_text,
+            source_evidence_text: self.source_evidence_text,
+            quantity: self.quantity,
+            configuration_action: self.configuration_action,
+            verification_eligibility,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -3199,7 +3251,7 @@ fn aspect_cursor_key(aspect_id: &ReviewAspectId) -> ReviewResult<String> {
 
 fn pending_product_associations_from_rows(
     rows: Vec<ProductReviewSourceRow>,
-) -> ReviewResult<Vec<(i64, String, PendingProductAssociation)>> {
+) -> ReviewResult<Vec<(i64, String, PendingProductAssociationSource)>> {
     let mut associations = Vec::new();
     for row in rows {
         let payload = parse_payload(
@@ -3217,7 +3269,7 @@ fn pending_product_associations_from_rows(
             associations.push((
                 product_id,
                 aspect_key,
-                PendingProductAssociation {
+                PendingProductAssociationSource {
                     listing_id: row.listing_id,
                     listing_label: listing_label.clone(),
                     source_url: row.source_url.clone(),
@@ -3349,9 +3401,11 @@ pub async fn list_pending_product_associations(
             "no pending review associations target approved catalog id {product_id}"
         )));
     }
-    let product = load_all_approved_product_map(db)
-        .await?
-        .remove(&product_id)
+    let snapshot = load_existing_product_association_global_snapshot(db).await?;
+    let product = snapshot
+        .products
+        .get(&product_id)
+        .cloned()
         .ok_or_else(|| {
             ReviewError::Conflict(format!(
                 "pending review targets catalog id {product_id}, which is not a current approved product"
@@ -3378,19 +3432,30 @@ pub async fn list_pending_product_associations(
     } else {
         None
     };
-    let current_attestations = current_reuse_attested_product_ids(db).await?;
+    let mut projected_associations = Vec::with_capacity(associations.len());
+    for (_, _, association) in associations {
+        let eligibility = evaluate_existing_product_association_with_snapshot(
+            db,
+            &snapshot,
+            owner_user_id,
+            association.listing_id,
+            &association.aspect_id,
+            &association.review_payload_sha256,
+            &snapshot.catalog_revision_sha256,
+        )
+        .await?
+        .eligibility();
+        projected_associations.push(association.project(eligibility));
+    }
     Ok(PendingProductAssociationPage {
         product,
-        attestation_status: if current_attestations.contains(&product_id) {
+        attestation_status: if snapshot.reuse_attested_ids.contains(&product_id) {
             ProductAttestationStatus::Current
         } else {
             ProductAttestationStatus::Required
         },
-        catalog_revision_sha256: approved_catalog_revision_sha256(db).await?,
-        associations: associations
-            .into_iter()
-            .map(|(_, _, association)| association)
-            .collect(),
+        catalog_revision_sha256: snapshot.catalog_revision_sha256,
+        associations: projected_associations,
         next_cursor,
     })
 }
@@ -4886,6 +4951,93 @@ pub(crate) enum ExistingProductAssociationCommit {
     ApproveOrdinary,
 }
 
+struct ExistingProductAssociationGlobalSnapshot {
+    catalog_revision_sha256: String,
+    products: HashMap<i64, ReviewProduct>,
+    reuse_attested_ids: HashSet<i64>,
+    active_collision_catalog_rows: Vec<ActiveCollisionCatalogFingerprintRow>,
+    resolver: ApprovedProductAssociationResolver,
+}
+
+enum ExistingProductAssociationPreflight {
+    Ready(ExistingProductAssociationTarget),
+    ProductAttestationRequired { product_id: i64 },
+}
+
+pub(crate) enum ExistingProductAssociationEvaluation {
+    AutoVerifiable(ExistingProductAssociationTarget),
+    ProductAttestationRequired {
+        eligibility: ProductAssociationVerificationEligibility,
+    },
+    ManualReviewRequired {
+        eligibility: ProductAssociationVerificationEligibility,
+        error: ReviewError,
+    },
+}
+
+impl ExistingProductAssociationEvaluation {
+    pub(crate) fn eligibility(&self) -> ProductAssociationVerificationEligibility {
+        match self {
+            Self::AutoVerifiable(_) => ProductAssociationVerificationEligibility {
+                status: ProductAssociationEligibilityStatus::AutoVerifiable,
+                reason_code: None,
+                reason: None,
+            },
+            Self::ProductAttestationRequired { eligibility }
+            | Self::ManualReviewRequired { eligibility, .. } => eligibility.clone(),
+        }
+    }
+}
+
+fn manual_product_association_eligibility(
+    reason_code: impl Into<String>,
+    reason: impl Into<String>,
+) -> ProductAssociationVerificationEligibility {
+    ProductAssociationVerificationEligibility {
+        status: ProductAssociationEligibilityStatus::ManualReviewRequired,
+        reason_code: Some(reason_code.into()),
+        reason: Some(reason.into()),
+    }
+}
+
+fn product_attestation_required_eligibility(
+    product_id: i64,
+) -> ProductAssociationVerificationEligibility {
+    ProductAssociationVerificationEligibility {
+        status: ProductAssociationEligibilityStatus::ProductAttestationRequired,
+        reason_code: Some("product_attestation_required".to_string()),
+        reason: Some(format!(
+            "Catalog product {product_id} needs one current OEM attestation before its listing associations can be verified locally."
+        )),
+    }
+}
+
+async fn load_existing_product_association_global_snapshot(
+    db: &AppDb,
+) -> ReviewResult<ExistingProductAssociationGlobalSnapshot> {
+    let catalog_revision_sha256 = approved_catalog_revision_sha256(db).await?;
+    let products = load_all_approved_product_map(db).await?;
+    let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
+    let active_collision_catalog_rows = load_active_collision_catalog_rows(db).await?;
+    let resolver = ApprovedProductAssociationResolver::load_with_reuse_attested_product_ids(
+        db,
+        &reuse_attested_ids,
+    )
+    .await
+    .map_err(|error| {
+        ReviewError::Database(format!(
+            "could not load the local approved-product association resolver: {error}"
+        ))
+    })?;
+    Ok(ExistingProductAssociationGlobalSnapshot {
+        catalog_revision_sha256,
+        products,
+        reuse_attested_ids,
+        active_collision_catalog_rows,
+        resolver,
+    })
+}
+
 fn compact_listing_identity_spans(source: &str, model: &str) -> Vec<(usize, usize)> {
     let target = normalize_avionics_identifier(model);
     if target.len() < 3 {
@@ -5172,7 +5324,8 @@ pub(crate) async fn preflight_pending_product_attestation(
 /// Product identity is a global prerequisite and must already have a current
 /// reuse attestation. This function validates only the hash-bound listing
 /// occurrence and never accepts or replays a product dossier.
-pub(crate) async fn preflight_existing_product_association(
+#[cfg(test)]
+async fn preflight_existing_product_association(
     db: &AppDb,
     owner_user_id: i64,
     listing_id: i64,
@@ -5180,6 +5333,37 @@ pub(crate) async fn preflight_existing_product_association(
     expected_review_payload_sha256: &str,
     expected_catalog_revision_sha256: &str,
 ) -> ReviewResult<ExistingProductAssociationTarget> {
+    let snapshot = load_existing_product_association_global_snapshot(db).await?;
+    match preflight_existing_product_association_with_snapshot(
+        db,
+        &snapshot,
+        owner_user_id,
+        listing_id,
+        aspect_id,
+        expected_review_payload_sha256,
+        expected_catalog_revision_sha256,
+    )
+    .await?
+    {
+        ExistingProductAssociationPreflight::Ready(target) => Ok(target),
+        ExistingProductAssociationPreflight::ProductAttestationRequired { product_id } => {
+            Err(ReviewError::Conflict(format!(
+                "approved catalog id {product_id} requires global product attestation before listing associations can be verified"
+            )))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn preflight_existing_product_association_with_snapshot(
+    db: &AppDb,
+    snapshot: &ExistingProductAssociationGlobalSnapshot,
+    owner_user_id: i64,
+    listing_id: i64,
+    aspect_id: &ReviewAspectId,
+    expected_review_payload_sha256: &str,
+    expected_catalog_revision_sha256: &str,
+) -> ReviewResult<ExistingProductAssociationPreflight> {
     if !valid_sha256(expected_review_payload_sha256)
         || !valid_sha256(expected_catalog_revision_sha256)
     {
@@ -5208,28 +5392,25 @@ pub(crate) async fn preflight_existing_product_association(
         Some(&row.review_payload_sha256),
         row.pending_aspect_count,
     )?;
-    let current_catalog_revision = approved_catalog_revision_sha256(db).await?;
-    if current_catalog_revision != expected_catalog_revision_sha256 {
+    if snapshot.catalog_revision_sha256 != expected_catalog_revision_sha256 {
         return Err(ReviewError::Stale(
             "approved avionics catalog changed during review; reload and re-evaluate".to_string(),
         ));
     }
     let assignments = load_existing_assignments(db, listing_id).await?;
     validate_current_covered_associations(&payload.aspects, &assignments)?;
-    let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
     let corroboration_rows = load_association_corroborations(db, listing_id).await?;
-    let active_collision_catalog_rows = load_active_collision_catalog_rows(db).await?;
     let corroborated_associations = current_corroborated_associations(
         listing_id,
         &assignments,
         &corroboration_rows,
-        &reuse_attested_ids,
-        &active_collision_catalog_rows,
+        &snapshot.reuse_attested_ids,
+        &snapshot.active_collision_catalog_rows,
     );
     let hidden = hidden_preserved_blockers(
         &payload.aspects,
         &assignments,
-        &reuse_attested_ids,
+        &snapshot.reuse_attested_ids,
         &corroborated_associations,
     );
     if !hidden.is_empty() {
@@ -5248,14 +5429,11 @@ pub(crate) async fn preflight_existing_product_association(
             "review aspect {aspect_id} is not an existing-product verification aspect"
         ))
     })?;
-    let product = load_all_approved_product_map(db)
-        .await?
-        .remove(&target_id)
-        .ok_or_else(|| {
-            ReviewError::Stale(format!(
-                "approved catalog id {target_id} is no longer available for review aspect {aspect_id}"
-            ))
-        })?;
+    let product = snapshot.products.get(&target_id).cloned().ok_or_else(|| {
+        ReviewError::Stale(format!(
+            "approved catalog id {target_id} is no longer available for review aspect {aspect_id}"
+        ))
+    })?;
     let listing_evidence_text = aspect
         .source_evidence_text
         .as_ref()
@@ -5321,17 +5499,158 @@ pub(crate) async fn preflight_existing_product_association(
         validate_independent_ordinary_aspect(aspect, &payload.aspects)?;
         ExistingProductAssociationCommit::ApproveOrdinary
     };
-    if !reuse_attested_ids.contains(&target_id) {
-        return Err(ReviewError::Conflict(format!(
-            "approved catalog id {target_id} requires global product attestation before listing associations can be verified"
-        )));
+    if !snapshot.reuse_attested_ids.contains(&target_id) {
+        return Ok(
+            ExistingProductAssociationPreflight::ProductAttestationRequired {
+                product_id: target_id,
+            },
+        );
     }
-    Ok(ExistingProductAssociationTarget {
-        product,
-        listing_evidence_text,
-        listing_evidence_provenance,
-        commit,
-    })
+    Ok(ExistingProductAssociationPreflight::Ready(
+        ExistingProductAssociationTarget {
+            product,
+            listing_evidence_text,
+            listing_evidence_provenance,
+            commit,
+        },
+    ))
+}
+
+fn manual_eligibility_from_preflight_error(
+    error: &ReviewError,
+) -> ProductAssociationVerificationEligibility {
+    let (reason_code, reason) = match error {
+        ReviewError::Stale(_) => (
+            "listing_restage_required",
+            "The listing review or one of its covered avionics links changed. Restage the listing before retrying.",
+        ),
+        ReviewError::Conflict(_) => (
+            "catalog_preflight_conflict",
+            "The current avionics catalog conflicts with this staged association. Review the complete listing.",
+        ),
+        ReviewError::Validation(_) => (
+            "association_preflight_rejected",
+            "The retained listing proof or association shape does not meet automatic verification requirements.",
+        ),
+        ReviewError::NotFound(_) => (
+            "pending_association_missing",
+            "This pending association is no longer available. Reload the product review.",
+        ),
+        ReviewError::Permission(_) => (
+            "association_access_denied",
+            "This pending association is not available to the current reviewer.",
+        ),
+        ReviewError::Database(_) => (
+            "association_preflight_failed",
+            "The automatic verification preflight could not be completed.",
+        ),
+    };
+    manual_product_association_eligibility(reason_code, reason)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_existing_product_association_with_snapshot(
+    db: &AppDb,
+    snapshot: &ExistingProductAssociationGlobalSnapshot,
+    owner_user_id: i64,
+    listing_id: i64,
+    aspect_id: &ReviewAspectId,
+    expected_review_payload_sha256: &str,
+    expected_catalog_revision_sha256: &str,
+) -> ReviewResult<ExistingProductAssociationEvaluation> {
+    let preflight = match preflight_existing_product_association_with_snapshot(
+        db,
+        snapshot,
+        owner_user_id,
+        listing_id,
+        aspect_id,
+        expected_review_payload_sha256,
+        expected_catalog_revision_sha256,
+    )
+    .await
+    {
+        Ok(preflight) => preflight,
+        Err(error @ ReviewError::Permission(_))
+        | Err(error @ ReviewError::NotFound(_))
+        | Err(error @ ReviewError::Database(_)) => return Err(error),
+        Err(error) => {
+            return Ok(ExistingProductAssociationEvaluation::ManualReviewRequired {
+                eligibility: manual_eligibility_from_preflight_error(&error),
+                error,
+            });
+        }
+    };
+    let target = match preflight {
+        ExistingProductAssociationPreflight::Ready(target) => target,
+        ExistingProductAssociationPreflight::ProductAttestationRequired { product_id } => {
+            return Ok(
+                ExistingProductAssociationEvaluation::ProductAttestationRequired {
+                    eligibility: product_attestation_required_eligibility(product_id),
+                },
+            );
+        }
+    };
+    let target_id = target
+        .product
+        .id
+        .expect("existing-product targets come from the approved catalog snapshot");
+    let request = ApprovedProductAssociationRequest {
+        listing_evidence_text: target.listing_evidence_text.clone(),
+        manufacturer: target.product.manufacturer.clone(),
+        model: target.product.model.clone(),
+        avionics_types: target.product.capabilities.clone(),
+    };
+    match snapshot.resolver.resolve(&request) {
+        Some(approved) if approved.id == target_id => {
+            Ok(ExistingProductAssociationEvaluation::AutoVerifiable(target))
+        }
+        Some(approved) => {
+            let reason = format!(
+                "Local matching selected catalog id {} instead of the hash-bound catalog id {target_id}.",
+                approved.id
+            );
+            Ok(ExistingProductAssociationEvaluation::ManualReviewRequired {
+                eligibility: manual_product_association_eligibility(
+                    "different_product_detected",
+                    &reason,
+                ),
+                error: ReviewError::Conflict(reason),
+            })
+        }
+        None => {
+            let reason = format!(
+                "Retained listing evidence does not unambiguously identify current catalog id {target_id}; this association requires manual or full-listing review."
+            );
+            Ok(ExistingProductAssociationEvaluation::ManualReviewRequired {
+                eligibility: manual_product_association_eligibility(
+                    "catalog_identity_ambiguous",
+                    &reason,
+                ),
+                error: ReviewError::Conflict(reason),
+            })
+        }
+    }
+}
+
+pub(crate) async fn evaluate_existing_product_association(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    aspect_id: &ReviewAspectId,
+    expected_review_payload_sha256: &str,
+    expected_catalog_revision_sha256: &str,
+) -> ReviewResult<ExistingProductAssociationEvaluation> {
+    let snapshot = load_existing_product_association_global_snapshot(db).await?;
+    evaluate_existing_product_association_with_snapshot(
+        db,
+        &snapshot,
+        owner_user_id,
+        listing_id,
+        aspect_id,
+        expected_review_payload_sha256,
+        expected_catalog_revision_sha256,
+    )
+    .await
 }
 
 pub async fn get_listing_review(
@@ -9500,6 +9819,155 @@ mod tests {
             .await,
             Err(ReviewError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn product_association_pages_report_complete_read_only_eligibility() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let rendered_html =
+            "<html><body><p>Garmin GNS 430W navigator</p><p>Garmin GTX 345 transponder</p></body></html>";
+        let submission_id =
+            insert_review_bound_submission(&db, user_id, listing_id, rendered_html).await;
+        let attested_product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let unattested_product_id =
+            insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
+        attest_approved_product_for_current_policy_reuse(&db, attested_product_id).await;
+        let aspects = vec![
+            PendingReviewAspect::avionics(
+                "auto",
+                "avionics_identity",
+                "Garmin GNS 430W",
+                "Garmin GNS 430W navigator",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some("Garmin GNS 430W navigator".to_string()),
+                Some("high".to_string()),
+            )
+            .with_reuse_attestation_target(attested_product_id),
+            PendingReviewAspect::avionics(
+                "manual",
+                "avionics_identity",
+                "Garmin GNS 430W",
+                "Garmin GNS 430W generated explanation",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some("Garmin GNS 430W generated explanation".to_string()),
+                Some("high".to_string()),
+            )
+            .with_reuse_attestation_target(attested_product_id),
+            PendingReviewAspect::avionics(
+                "attestation",
+                "avionics_identity",
+                "Garmin GTX 345",
+                "Garmin GTX 345 transponder",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                Some("Garmin GTX 345 transponder".to_string()),
+                Some("high".to_string()),
+            )
+            .with_reuse_attestation_target(unattested_product_id),
+        ];
+        let staged = stage_pending_review(&db, listing_id, Some(submission_id), &aspects)
+            .await
+            .unwrap();
+        let links_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let first = list_pending_product_associations(
+            &db,
+            user_id,
+            attested_product_id,
+            ProductReviewPageQuery {
+                limit: Some(1),
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.associations.len(), 1);
+        assert_eq!(
+            first.associations[0].verification_eligibility,
+            ProductAssociationVerificationEligibility {
+                status: ProductAssociationEligibilityStatus::AutoVerifiable,
+                reason_code: None,
+                reason: None,
+            }
+        );
+        let serialized = serde_json::to_value(&first).unwrap();
+        assert_eq!(
+            serialized["associations"][0]["verification_eligibility"]["status"],
+            "auto_verifiable"
+        );
+        assert!(serialized["associations"][0]["verification_eligibility"]
+            .get("reason_code")
+            .is_none());
+        let second = list_pending_product_associations(
+            &db,
+            user_id,
+            attested_product_id,
+            ProductReviewPageQuery {
+                limit: Some(1),
+                cursor: first.next_cursor,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.associations[0].verification_eligibility.status,
+            ProductAssociationEligibilityStatus::ManualReviewRequired
+        );
+        assert_eq!(
+            second.associations[0]
+                .verification_eligibility
+                .reason_code
+                .as_deref(),
+            Some("association_preflight_rejected")
+        );
+        assert!(second.associations[0]
+            .verification_eligibility
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason
+                == "The retained listing proof or association shape does not meet automatic verification requirements."));
+
+        let unattested = list_pending_product_associations(
+            &db,
+            user_id,
+            unattested_product_id,
+            ProductReviewPageQuery::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unattested.associations[0].verification_eligibility,
+            product_attestation_required_eligibility(unattested_product_id)
+        );
+
+        let links_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(links_after, links_before);
+        let retained_hash: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(retained_hash, staged.review_payload_sha256);
     }
 
     #[tokio::test]

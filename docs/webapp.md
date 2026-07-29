@@ -451,6 +451,17 @@ POST /api/review/listings/{listing_id}/resolve
 
 Product cursors are opaque keyset tokens ordered by immutable product ID.
 Association cursors are bound to one product and ordered by listing and aspect.
+Each returned association includes a read-only `verification_eligibility`
+object. Its `status` is `auto_verifiable`, `product_attestation_required`, or
+`manual_review_required`; blocked rows also include a stable `reason_code` and
+an explanatory `reason`. The projection runs the same retained-source
+preflight and complete local catalog collision decision as the mutation, but
+does not fetch a source, call Gemini, or write data. It is advisory: the POST
+rechecks every fact and its optimistic guards under current state. The web
+client submits only associations reported as `auto_verifiable`; it displays the
+remaining reason instead of issuing a mutation merely to discover that manual
+review is required.
+
 The attestation request carries the catalog revision, one OEM source dossier,
 and exactly one direct association authorization tuple:
 `listing_id`, `review_payload_sha256`, and `aspect_id`. The server loads only
@@ -468,6 +479,13 @@ installed, positive-quantity, and independent of every replacement edge; they
 may cover zero or one installed link. Attestation separately rechecks both the
 manufacturer-scoped collision snapshot and ownership of the exact pending
 aspect under the mutation lock.
+
+Catalog `identity_evidence_text` is historical approved-product provenance, not
+the fresh attestation excerpt. The product form may suggest a valid HTTPS OEM
+URL and a source title within the request limit, but it deliberately leaves the
+new exact publisher excerpt blank. A reviewer must provide one exact excerpt of
+at most 128 characters from the source being freshly checked; unconstrained
+historical catalog prose is never copied into that request field.
 
 The replacement endpoint is the only aspect-scoped path that accepts a
 replacement relationship. Its strict source-free request names the staged
