@@ -1361,11 +1361,13 @@ label span,
 }
 
 .review-status-current,
+.review-outcome-ready,
 .review-outcome-accepted {
   color: var(--accent-strong);
 }
 
 .review-status-required,
+.review-outcome-required,
 .review-outcome-manual,
 .review-outcome-stale {
   color: var(--warning);
@@ -1423,15 +1425,19 @@ label span,
 }
 
 .review-product-association-table th:nth-child(1) {
-  width: 28%;
+  width: 22%;
 }
 
 .review-product-association-table th:nth-child(2) {
-  width: 48%;
+  width: 24%;
 }
 
 .review-product-association-table th:nth-child(3) {
-  width: 24%;
+  width: 34%;
+}
+
+.review-product-association-table th:nth-child(4) {
+  width: 20%;
 }
 
 .review-association-source {

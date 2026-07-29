@@ -306,6 +306,98 @@ export function reviewProductIdentitySourceValidation(sourceTitle, evidenceText)
   };
 }
 
+export function authoritativeIdentityUrl(value) {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    if (parsed.protocol !== "https:") {
+      return false;
+    }
+    const lower = parsed.href.toLowerCase();
+    return ![
+      "/listing/",
+      "/listings/",
+      "/aircraft-for-sale/",
+      "/classifieds/",
+    ].some((marker) => lower.includes(marker));
+  } catch {
+    return false;
+  }
+}
+
+/// Prepare suggestions for a fresh OEM attestation without treating historical
+/// catalog evidence as a new exact publisher excerpt.
+export function productAttestationDraft(product) {
+  const sourceUrl = typeof product?.identity_source_url === "string"
+    && authoritativeIdentityUrl(product.identity_source_url)
+    ? product.identity_source_url.trim()
+    : "";
+  const sourceTitle = typeof product?.identity_source_title === "string"
+    && product.identity_source_title.trim()
+    && !characterLimitState(
+      product.identity_source_title.trim(),
+      REVIEW_PRODUCT_IDENTITY_LIMITS.sourceTitle,
+    ).overLimit
+    ? product.identity_source_title.trim()
+    : "";
+  return {
+    sourceUrl,
+    sourceTitle,
+    evidenceText: "",
+  };
+}
+
+export function productAssociationEligibilityOutcome(association) {
+  const eligibility = association?.verification_eligibility;
+  if (eligibility?.status === "auto_verifiable") {
+    return {
+      kind: "ready",
+      label: "Ready for local validation",
+      detail: "The retained listing proof uniquely identifies the current approved product.",
+    };
+  }
+  if (eligibility?.status === "product_attestation_required") {
+    return {
+      kind: "required",
+      label: "OEM attestation required",
+      detail: typeof eligibility.reason === "string" && eligibility.reason.trim()
+        ? eligibility.reason
+        : "Attest the product once before validating this listing association.",
+    };
+  }
+  if (eligibility?.status === "manual_review_required") {
+    return {
+      kind: "manual",
+      label: "Manual review required",
+      detail: typeof eligibility.reason === "string" && eligibility.reason.trim()
+        ? eligibility.reason
+        : "This association did not pass the complete local verification preflight.",
+    };
+  }
+  return {
+    kind: "error",
+    label: "Eligibility unavailable",
+    detail: "Reload the product review before attempting this association.",
+  };
+}
+
+export function productAssociationEvidenceDisplay(association) {
+  const observedText = typeof association?.observed_text === "string"
+    && association.observed_text.trim()
+    ? association.observed_text.trim()
+    : "No observed text";
+  const sourceEvidenceText = typeof association?.source_evidence_text === "string"
+    && association.source_evidence_text.trim()
+    ? association.source_evidence_text.trim()
+    : "No retained source evidence";
+  return { observedText, sourceEvidenceText };
+}
+
+export function autoVerifiableProductAssociations(associations) {
+  return (Array.isArray(associations) ? associations : []).filter(
+    (association) => association?.verification_eligibility?.status === "auto_verifiable",
+  );
+}
+
 export function groupProductAssociationsByListing(associations) {
   const groups = new Map();
   for (const association of Array.isArray(associations) ? associations : []) {

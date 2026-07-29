@@ -3,6 +3,8 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  authoritativeIdentityUrl,
+  autoVerifiableProductAssociations,
   characterLimitState,
   describeAircraftIdentity,
   describeProductAssociationOutcome,
@@ -11,7 +13,10 @@ import {
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
+  productAssociationEvidenceDisplay,
+  productAssociationEligibilityOutcome,
   productActionContextIsCurrent,
+  productAttestationDraft,
   productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
@@ -530,18 +535,22 @@ function renderSelectedProduct() {
     : "OEM attestation required";
   elements.reviewProductStatus.classList.toggle("is-current", current);
   elements.reviewProductAttestationForm.classList.toggle("is-hidden", current);
-  elements.reviewProductValidate.disabled = !current || state.productBusy;
+  const autoVerifiable = autoVerifiableProductAssociations(state.productAssociations);
+  elements.reviewProductValidate.disabled = !current
+    || autoVerifiable.length === 0
+    || state.productBusy;
   if (!current) {
     const form = elements.reviewProductAttestationForm.elements;
-    form.namedItem("identity_source_url").value = product.identity_source_url || "";
-    form.namedItem("identity_source_title").value = product.identity_source_title || "";
-    form.namedItem("identity_evidence_text").value = product.identity_evidence_text || "";
+    const draft = productAttestationDraft(product);
+    form.namedItem("identity_source_url").value = draft.sourceUrl;
+    form.namedItem("identity_source_title").value = draft.sourceTitle;
+    form.namedItem("identity_evidence_text").value = draft.evidenceText;
     form.namedItem("identity_source_title").dispatchEvent(new Event("input"));
     form.namedItem("identity_evidence_text").dispatchEvent(new Event("input"));
   }
   renderProductAssociationRows();
   elements.reviewProductActionMessage.textContent = current
-    ? "Product identity is current. Local association checks will not call Gemini."
+    ? `${autoVerifiable.length} ${pluralize(autoVerifiable.length, "association")} can be validated locally without Gemini.`
     : "Attest this product once before validating its listing associations.";
 }
 
@@ -563,20 +572,25 @@ function renderProductAssociationRows() {
         source.className = "review-association-source";
         listing.append(source);
       }
+      const evidenceDisplay = productAssociationEvidenceDisplay(association);
       const observed = queueTextCell(
-        "Source evidence",
-        association.source_evidence_text || "No exact source evidence",
+        "Observed text",
+        evidenceDisplay.observedText,
       );
+      const retainedEvidence = queueTextCell(
+        "Retained source evidence",
+        evidenceDisplay.sourceEvidenceText,
+      );
+      const eligibilityOutcome = productAssociationEligibilityOutcome(association);
+      const outcome = state.productOutcomes.get(associationOutcomeKey(association))
+        || eligibilityOutcome;
       const result = queueTextCell(
         "Result",
-        state.productOutcomes.get(associationOutcomeKey(association))?.label || "Pending",
+        outcome.label,
       );
-      const outcome = state.productOutcomes.get(associationOutcomeKey(association));
-      if (outcome) {
-        result.title = outcome.detail;
-        result.classList.add(`review-outcome-${outcome.kind}`);
-      }
-      row.append(listing, observed, result);
+      result.title = outcome.detail;
+      result.classList.add(`review-outcome-${outcome.kind}`);
+      row.append(listing, observed, retainedEvidence, result);
       return row;
     }),
   );
@@ -660,7 +674,14 @@ async function validateSelectedProductAssociations() {
   if (!selected || selected.attestationStatus !== "current" || state.productBusy) {
     return;
   }
-  const initialAssociations = state.productAssociations.slice();
+  const initialAssociations = autoVerifiableProductAssociations(state.productAssociations);
+  const manualAssociationsBeforeRun = state.productAssociations.length
+    - initialAssociations.length;
+  if (initialAssociations.length === 0) {
+    elements.reviewProductActionMessage.textContent =
+      "No pending associations currently pass the complete local preflight.";
+    return;
+  }
   const action = beginProductAction(selected);
   elements.reviewProductActionMessage.textContent =
     `Validating ${initialAssociations.length} associations locally…`;
@@ -697,22 +718,29 @@ async function validateSelectedProductAssociations() {
             accepted += 1;
             renderProductAssociationRows();
             const review = response?.review;
+            const initialByAspect = new Map(
+              associations.map((association) => [
+                aspectKey(association.aspect_id),
+                association,
+              ]),
+            );
             pending = Array.isArray(review?.aspects)
               ? review.aspects
                 .filter(
                   (aspect) => (
                     positiveInteger(aspect?.reuse_attestation_target?.id) === action.productId
+                    && initialByAspect.has(aspectKey(aspect.id))
                   ),
                 )
-                .map((aspect) => ({
-                  listing_id: listingId,
-                  listing_label: current.listing_label,
-                  source_url: current.source_url,
-                  aspect_id: aspect.id,
-                  review_payload_sha256: review.review_payload_sha256,
-                  observed_text: aspect.observed_text,
-                  source_evidence_text: aspect.source_evidence_text,
-                }))
+                .map((aspect) => {
+                  const initial = initialByAspect.get(aspectKey(aspect.id));
+                  return {
+                    ...initial,
+                    review_payload_sha256: review.review_payload_sha256,
+                    observed_text: aspect.observed_text,
+                    source_evidence_text: aspect.source_evidence_text,
+                  };
+                })
               : [];
           } catch (error) {
             if (!productActionContextIsCurrent(action, state)) {
@@ -747,15 +775,26 @@ async function validateSelectedProductAssociations() {
     const accepted = results
       .filter((result) => result.status === "fulfilled")
       .reduce((sum, result) => sum + (result.value?.accepted || 0), 0);
-    const manualAssociations = results.reduce(
+    const failedAssociations = results.reduce(
       (sum, result) => sum + (
         result.status === "fulfilled" ? result.value?.failures || 0 : 1
       ),
       0,
     );
-    const manualListings = results.filter(
-      (result) => result.status === "rejected" || (result.value?.failures || 0) > 0,
-    ).length;
+    const manualAssociations = manualAssociationsBeforeRun + failedAssociations;
+    const manualListingIds = new Set(
+      state.productAssociations
+        .filter((association) => (
+          association?.verification_eligibility?.status !== "auto_verifiable"
+        ))
+        .map((association) => association.listing_id),
+    );
+    for (const result of results) {
+      if (result.status === "rejected" || (result.value?.failures || 0) > 0) {
+        manualListingIds.add(result.listingId);
+      }
+    }
+    const manualListings = manualListingIds.size;
     elements.reviewProductActionMessage.textContent =
       `${accepted} accepted locally; ${manualAssociations} `
         + `${pluralize(manualAssociations, "association")} across ${manualListings} `
@@ -801,7 +840,9 @@ function setProductBusy(busy) {
   setButtonBusy(elements.reviewProductAttest, busy);
   setButtonBusy(elements.reviewProductValidate, busy);
   elements.reviewProductValidate.disabled =
-    busy || state.selectedProduct?.attestationStatus !== "current";
+    busy
+    || state.selectedProduct?.attestationStatus !== "current"
+    || autoVerifiableProductAssociations(state.productAssociations).length === 0;
   renderProductQueue();
 }
 
@@ -2609,24 +2650,6 @@ function commaSeparatedValues(value) {
 
 function allowedCapabilities() {
   return normalizedTextList(state.currentReview?.allowed_capabilities);
-}
-
-function authoritativeIdentityUrl(value) {
-  try {
-    const parsed = new URL(String(value || "").trim());
-    if (parsed.protocol !== "https:") {
-      return false;
-    }
-    const lower = parsed.href.toLowerCase();
-    return ![
-      "/listing/",
-      "/listings/",
-      "/aircraft-for-sale/",
-      "/classifieds/",
-    ].some((marker) => lower.includes(marker));
-  } catch {
-    return false;
-  }
 }
 
 function aspectKey(value) {

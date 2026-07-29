@@ -21,9 +21,8 @@ use crate::aircraft::{
 };
 use crate::avionics::catalog::{
     attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
-    preview_avionics_identity, resolve_approved_product_association,
-    verify_approved_avionics_product_source_without_gemini, ApprovedAvionicsProductSourceRequest,
-    ApprovedProductAssociationRequest, ApprovedProductSourceVerificationOutcome,
+    preview_avionics_identity, verify_approved_avionics_product_source_without_gemini,
+    ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerificationOutcome,
     AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
 };
 use crate::avionics::consolidation::{
@@ -43,15 +42,15 @@ use crate::listing::review::replacement::{
 };
 use crate::listing::review::{
     active_collision_closure_revision_sha256, approve_locally_verified_ordinary_aspect_and_restage,
-    corroborate_existing_product_association_and_restage, get_listing_review, list_listing_reviews,
-    list_pending_product_associations, list_pending_product_reviews,
-    preflight_existing_product_association, preflight_listing_review_resolution,
+    corroborate_existing_product_association_and_restage, evaluate_existing_product_association,
+    get_listing_review, list_listing_reviews, list_pending_product_associations,
+    list_pending_product_reviews, preflight_listing_review_resolution,
     preflight_pending_product_attestation, resolve_listing_review, resolved_review_response,
     restage_unattested_preserved_products, use_existing_product_for_aspect_and_restage,
-    ExistingProductAssociationCommit, ListingReview, ListingReviewDetail, ListingReviewQueue,
-    PendingProductAssociationPage, PendingProductReviewPage, ProductReviewPageQuery,
-    ResolveReviewRequest, ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError,
-    ReviewQueueQuery, StagedPendingReview,
+    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingReview,
+    ListingReviewDetail, ListingReviewQueue, PendingProductAssociationPage,
+    PendingProductReviewPage, ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse,
+    ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery, StagedPendingReview,
 };
 use crate::listings::{
     create_listing, delete_listing, ensure_listing_canonical_aircraft_identity,
@@ -954,7 +953,7 @@ async fn verify_existing_review_avionics_handler(
 ) -> Result<Json<Value>, ApiError> {
     let user = load_current_user(&state.db, &headers).await?;
     require_listing_reviewer(&user)?;
-    let target = preflight_existing_product_association(
+    let evaluation = evaluate_existing_product_association(
         &state.db,
         user.id,
         listing_id,
@@ -963,53 +962,37 @@ async fn verify_existing_review_avionics_handler(
         &payload.catalog_revision_sha256,
     )
     .await?;
+    let target = match evaluation {
+        ExistingProductAssociationEvaluation::AutoVerifiable(target) => target,
+        ExistingProductAssociationEvaluation::ProductAttestationRequired { eligibility } => {
+            return Err(ReviewError::Conflict(eligibility.reason.unwrap_or_else(|| {
+                "global product attestation is required before local verification".to_string()
+            }))
+            .into());
+        }
+        ExistingProductAssociationEvaluation::ManualReviewRequired { eligibility, error } => {
+            match eligibility.reason_code.as_deref() {
+                Some("different_product_detected") => {
+                    return Err(ApiError::new(StatusCode::CONFLICT, error.to_string())
+                        .with_code("avionics_identity_mismatch"));
+                }
+                Some("catalog_identity_ambiguous") => {
+                    return Err(ApiError::new(StatusCode::CONFLICT, error.to_string())
+                        .with_code("avionics_association_unresolved"));
+                }
+                _ => return Err(error.into()),
+            }
+        }
+    };
     let target_id = target
         .product
         .id
         .expect("verification target always comes from an approved catalog row");
-    let request = ApprovedProductAssociationRequest {
-        listing_evidence_text: target.listing_evidence_text.clone(),
-        manufacturer: target.product.manufacturer.clone(),
-        model: target.product.model.clone(),
-        avionics_types: target.product.capabilities.clone(),
-    };
 
     // Capture the complete collision closure immediately before the local
     // association decision that consumes it.
     let expected_collision_closure_sha256 =
         active_collision_closure_revision_sha256(&state.db, target_id).await?;
-
-    let local = resolve_approved_product_association(&state.db, &request)
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not evaluate the local avionics fast path: {error}"),
-            )
-            .with_code("avionics_local_match_failed")
-        })?;
-    match local {
-        Some(approved) if approved.id == target_id => {}
-        Some(approved) => {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!(
-                    "local matching selected catalog id {} instead of hash-bound catalog id {target_id}",
-                    approved.id
-                ),
-            )
-            .with_code("avionics_identity_mismatch"));
-        }
-        None => {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!(
-                    "retained listing evidence does not unambiguously identify current catalog id {target_id}; this association stays pending for manual/full-listing review"
-                ),
-            )
-            .with_code("avionics_association_unresolved"));
-        }
-    }
 
     let staged = match target.commit {
         ExistingProductAssociationCommit::CorroboratePreserved { observation_sha256 } => {
