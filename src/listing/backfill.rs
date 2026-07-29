@@ -225,7 +225,6 @@ struct ListingLinkRow {
     source: String,
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
-    source_notes: Option<String>,
     source_confidence: Option<String>,
 }
 
@@ -732,8 +731,8 @@ fn prepare_listing_review(
             reasons.join(","),
             link.quantity.max(1),
             link.configuration_action.clone(),
-            link.source_notes.clone(),
-            link.source_confidence.clone(),
+            None,
+            None,
         );
         if product.catalog_status == "approved" {
             aspect = aspect.with_suggested_product(product.review_product());
@@ -1071,8 +1070,8 @@ fn attach_link_replacement(
         reasons.join(","),
         1,
         "installed",
-        link.source_notes.clone(),
-        link.source_confidence.clone(),
+        None,
+        None,
     )
     .with_covered_association(link.id, ListingAssociationRole::Replacement, replacement.id);
     if replacement.catalog_status == "approved" {
@@ -1260,13 +1259,13 @@ fn parse_observation(
     if matches!(configuration_action.as_str(), "replaces" | "removes") && replaces.is_none() {
         issues.push("replacement_identity_missing".to_string());
     }
-    let source_evidence_text = object
+    let mut source_evidence_text = object
         .and_then(|object| object.get("source_evidence_text"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
-    let source_confidence = object
+    let mut source_confidence = object
         .and_then(|object| object.get("source_confidence"))
         .and_then(Value::as_str)
         .map(str::trim)
@@ -1279,6 +1278,11 @@ fn parse_observation(
                 None
             }
         });
+    if source_evidence_text.is_none() != source_confidence.is_none() {
+        issues.push("raw_observation_source_evidence_pair_incomplete".to_string());
+        source_evidence_text = None;
+        source_confidence = None;
+    }
     if !issues.is_empty() {
         source_issues.push(format!("avionics[{index}]: {}", issues.join(",")));
     }
@@ -1678,7 +1682,6 @@ async fn load_listing_links(db: &AppDb, listing_id: i64) -> BackfillResult<Vec<L
           source,
           configuration_action,
           replaces_avionics_model_id,
-          source_notes,
           source_confidence
         FROM aircraft_sale_listing_avionics
         WHERE aircraft_sale_listing_id = ?
@@ -1839,7 +1842,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
-            source_notes: Some("listing says GTN 750Xi".to_string()),
             source_confidence: Some("high".to_string()),
         }];
         let prepared = prepare_listing_review(42, Some(raw), &links, &catalog, &catalog_by_id);
@@ -1939,7 +1941,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
-            source_notes: Some("listing says GTN 750Xi".to_string()),
             source_confidence: Some("high".to_string()),
         }];
         let prepared = prepare_listing_review(42, Some(raw), &links, &catalog, &catalog_by_id);
@@ -1957,7 +1958,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "removes".to_string(),
             replaces_avionics_model_id: Some(7),
-            source_notes: Some("GNS 430W removed".to_string()),
             source_confidence: Some("high".to_string()),
         }];
 
@@ -1978,7 +1978,6 @@ mod tests {
                 source: "listing".to_string(),
                 configuration_action: "replaces".to_string(),
                 replaces_avionics_model_id: Some(7),
-                source_notes: None,
                 source_confidence: Some("high".to_string()),
             },
             ListingLinkRow {
@@ -1988,7 +1987,6 @@ mod tests {
                 source: "listing".to_string(),
                 configuration_action: "replaces".to_string(),
                 replaces_avionics_model_id: Some(7),
-                source_notes: None,
                 source_confidence: Some("high".to_string()),
             },
         ];
@@ -2003,7 +2001,6 @@ mod tests {
                 source: "listing".to_string(),
                 configuration_action: "replaces".to_string(),
                 replaces_avionics_model_id: Some(8),
-                source_notes: None,
                 source_confidence: Some("high".to_string()),
             },
         ];
@@ -2024,7 +2021,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "replaces".to_string(),
             replaces_avionics_model_id: Some(8),
-            source_notes: Some("legacy extraction says GTN 750Xi replaces GNS 530W".to_string()),
             source_confidence: Some("high".to_string()),
         }];
 
@@ -2049,6 +2045,11 @@ mod tests {
                 },
             ])
         );
+        assert!(prepared
+            .aspects
+            .iter()
+            .all(|aspect| aspect.source_evidence_text.is_none()
+                && aspect.source_confidence.is_none()));
         assert_eq!(prepared.associations_requiring_coverage, 2);
         assert_eq!(prepared.covered_association_count, 2);
         assert!(prepared.association_coverage_complete);
@@ -2080,7 +2081,6 @@ mod tests {
             source: "listing_review".to_string(),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
-            source_notes: Some("reviewer corroborated GTN 750Xi".to_string()),
             source_confidence: Some("high".to_string()),
         }];
 
@@ -2112,7 +2112,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
-            source_notes: Some("legacy extraction says GTN 750Xi".to_string()),
             source_confidence: Some("high".to_string()),
         }];
 
@@ -2136,7 +2135,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
-            source_notes: Some("listing says GTN 750Xi".to_string()),
             source_confidence: Some("medium".to_string()),
         }];
         let prepared = prepare_listing_review(42, Some(raw), &links, &catalog, &catalog_by_id);
@@ -2150,7 +2148,43 @@ mod tests {
             }]
         );
         assert!(prepared.aspects[0].suggested_product.is_some());
+        assert_eq!(prepared.aspects[0].source_evidence_text, None);
+        assert_eq!(prepared.aspects[0].source_confidence, None);
         assert!(prepared.association_coverage_complete);
+    }
+
+    #[test]
+    fn retained_extraction_keeps_only_a_complete_evidence_confidence_pair() {
+        let raw = r#"{"avionics":[{
+          "manufacturer":"Garmin",
+          "model":"GNX 375",
+          "type":"GPS",
+          "source_evidence_text":"Installed Garmin GNX 375",
+          "source_confidence":"high"
+        }]}"#;
+        let prepared = prepare_listing_review(42, Some(raw), &[], &[], &HashMap::new());
+        assert_eq!(
+            prepared.aspects[0].source_evidence_text.as_deref(),
+            Some("Installed Garmin GNX 375")
+        );
+        assert_eq!(
+            prepared.aspects[0].source_confidence.as_deref(),
+            Some("high")
+        );
+
+        let incomplete = r#"{"avionics":[{
+          "manufacturer":"Garmin",
+          "model":"GNX 375",
+          "type":"GPS",
+          "source_evidence_text":"Installed Garmin GNX 375"
+        }]}"#;
+        let prepared = prepare_listing_review(42, Some(incomplete), &[], &[], &HashMap::new());
+        assert_eq!(prepared.aspects[0].source_evidence_text, None);
+        assert_eq!(prepared.aspects[0].source_confidence, None);
+        assert!(prepared
+            .source_issues
+            .iter()
+            .any(|issue| { issue.contains("raw_observation_source_evidence_pair_incomplete") }));
     }
 
     #[test]
@@ -2183,7 +2217,6 @@ mod tests {
             source: "listing".to_string(),
             configuration_action: "replaces".to_string(),
             replaces_avionics_model_id: Some(8),
-            source_notes: Some("GTN 750Xi replaces GNS 530W".to_string()),
             source_confidence: Some("medium".to_string()),
         }];
         let prepared = prepare_listing_review(42, Some(raw), &links, &catalog, &catalog_by_id);

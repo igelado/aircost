@@ -456,9 +456,19 @@ pub(crate) async fn approve_replacement_products_and_restage(
                         .position(|assignment| assignment.listing_link_id == listing_link_id)
                         .expect("covered relationship was validated against current assignments")
                 } else {
+                    let parent_product = approved
+                        .get(&request.parent.product_id)
+                        .expect("approved parent product was loaded under lock");
+                    let child_product = approved
+                        .get(&request.child.product_id)
+                        .expect("approved child product was loaded under lock");
                     assignments.push(ExistingAssignmentRow {
                         listing_link_id: -1,
                         avionics_model_id: request.parent.product_id,
+                        installed_manufacturer: Some(parent_product.manufacturer.clone()),
+                        installed_model: Some(parent_product.model.clone()),
+                        replacement_manufacturer: Some(child_product.manufacturer.clone()),
+                        replacement_model: Some(child_product.model.clone()),
                         quantity: request.parent.quantity,
                         source: "listing_review".to_string(),
                         source_notes: parent.source_evidence_text.clone(),
@@ -472,7 +482,17 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 };
             {
                 let proposed = &mut assignments[proposed_assignment_index];
+                let parent_product = approved
+                    .get(&request.parent.product_id)
+                    .expect("approved parent product was loaded under lock");
+                let child_product = approved
+                    .get(&request.child.product_id)
+                    .expect("approved child product was loaded under lock");
                 proposed.avionics_model_id = request.parent.product_id;
+                proposed.installed_manufacturer = Some(parent_product.manufacturer.clone());
+                proposed.installed_model = Some(parent_product.model.clone());
+                proposed.replacement_manufacturer = Some(child_product.manufacturer.clone());
+                proposed.replacement_model = Some(child_product.model.clone());
                 proposed.quantity = request.parent.quantity;
                 proposed.source = "listing_review".to_string();
                 proposed.source_notes = parent.source_evidence_text.clone();
@@ -826,6 +846,10 @@ mod tests {
         ExistingAssignmentRow {
             listing_link_id,
             avionics_model_id: subject,
+            installed_manufacturer: Some("Garmin".to_string()),
+            installed_model: Some(format!("Product {subject}")),
+            replacement_manufacturer: target.map(|_| "Garmin".to_string()),
+            replacement_model: target.map(|id| format!("Product {id}")),
             quantity: 1,
             source: "listing_review".to_string(),
             source_notes: Some("listing evidence".to_string()),

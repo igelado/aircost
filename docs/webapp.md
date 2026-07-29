@@ -415,6 +415,17 @@ from external CSS absent from the retained outer HTML. The submission must
 belong to the listing owner, name that exact canonical listing, and retain its
 stored content hash. Missing captures, generated explanations, hidden
 metadata, corrected text, and substring-only model matches remain pending.
+The UI labels exact source evidence separately and never substitutes the
+structured `observed_text` label when occurrence evidence is absent.
+
+Restaging also repairs legacy occurrence evidence under the same listing,
+review, link, catalog, and capture locks. Exact capture-backed pairs remain
+available; a unique unqualified manufacturer/model occurrence can replace
+generated notes for an installed link of any positive quantity. Ambiguous or
+missing evidence is removed from auto-repairable installed links and from the
+hash-bound aspect, so the listing remains pending. Replacement and other
+manual-review shapes are not blanket-mutated, but their unverified notes are
+not exposed as source evidence.
 
 For an unlinked observation, an explicit legacy candidate means normalized
 manufacturer/model selected one and only one `unreviewed` catalog row. An

@@ -564,8 +564,8 @@ function renderProductAssociationRows() {
         listing.append(source);
       }
       const observed = queueTextCell(
-        "Observed text",
-        association.source_evidence_text || association.observed_text || "No retained text",
+        "Source evidence",
+        association.source_evidence_text || "No exact source evidence",
       );
       const result = queueTextCell(
         "Result",

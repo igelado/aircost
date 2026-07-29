@@ -66,7 +66,6 @@ const ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION: &str = "listing_avionics_col
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
-const HISTORICAL_GENERIC_AVIONICS_EVIDENCE: &str = "reused previously grounded avionics metadata";
 const PRESERVED_ASSOCIATION_REVIEW_REASON: &str =
     "catalog_product_or_listing_corroboration_missing";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
@@ -817,6 +816,10 @@ struct RecoverableCatalogIdentityRow {
 struct ExistingAssignmentRow {
     listing_link_id: i64,
     avionics_model_id: i64,
+    installed_manufacturer: Option<String>,
+    installed_model: Option<String>,
+    replacement_manufacturer: Option<String>,
+    replacement_model: Option<String>,
     quantity: i64,
     source: String,
     source_notes: Option<String>,
@@ -1308,6 +1311,16 @@ fn validated_aspects(aspects: &[PendingReviewAspect]) -> ReviewResult<Vec<Pendin
                 aspect.id
             )));
         }
+        aspect.source_evidence_text = aspect
+            .source_evidence_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|evidence| !evidence.is_empty())
+            .map(str::to_string);
+        if aspect.source_evidence_text.is_none() || aspect.source_confidence.is_none() {
+            aspect.source_evidence_text = None;
+            aspect.source_confidence = None;
+        }
         let has_replacement =
             aspect.replaces_product_id.is_some() || aspect.replacement_aspect_id.is_some();
         if aspect.replaces_product_id.is_some() && aspect.replacement_aspect_id.is_some() {
@@ -1765,18 +1778,22 @@ async fn restage_pending_review_if_current_with_commit(
         WHERE listing_id = ?
         "#,
     );
-    let recover_association_evidence = db.sql(
+    let set_association_evidence = db.sql(
         r#"
         UPDATE aircraft_sale_listing_avionics
         SET source_notes = ?, source_confidence = 'high'
         WHERE id = ?
           AND aircraft_sale_listing_id = ?
           AND avionics_model_id = ?
-          AND quantity = 1
-          AND source = 'listing'
-          AND source_notes = ?
-          AND configuration_action = 'installed'
-          AND replaces_avionics_model_id IS NULL
+        "#,
+    );
+    let clear_association_evidence = db.sql(
+        r#"
+        UPDATE aircraft_sale_listing_avionics
+        SET source_notes = NULL, source_confidence = NULL
+        WHERE id = ?
+          AND aircraft_sale_listing_id = ?
+          AND avionics_model_id = ?
         "#,
     );
     let update_review = db.sql(
@@ -1961,6 +1978,9 @@ async fn restage_pending_review_if_current_with_commit(
                 Some(&row.review_payload_sha256),
                 row.pending_aspect_count,
             )?;
+            let normalized_payload = serialize_review_payload(&payload.aspects)?;
+            let mut repaired_evidence =
+                normalized_payload.review_payload_json != row.review_payload_json;
             let local_evidence_guard = match maintenance_commit {
                 Some(ReviewMaintenanceCommit::CorroborateAssociation(commit)) => {
                     Some((&commit.aspect_id, &commit.evidence_provenance))
@@ -2049,7 +2069,7 @@ async fn restage_pending_review_if_current_with_commit(
             let catalog_revision_sha256 =
                 fingerprint_catalog_products(&catalog_products(catalog_rows));
 
-            let mut recovered_evidence = false;
+            let mut exact_association_evidence = HashMap::new();
             if maintenance_commit.is_none() {
                 let action_graph_issues: i64 =
                     sqlx::query_scalar(&invalid_action_graph_sql)
@@ -2067,64 +2087,121 @@ async fn restage_pending_review_if_current_with_commit(
                     }
                     _ => None,
                 };
-                if let Some(rendered_html) = rendered_html {
-                    let source = ListingEvidenceContext::from_rendered_html(Some(&rendered_html));
-                    let recoveries = plan_historical_association_evidence_recovery(
-                        &payload,
-                        &assignments,
-                        &approved,
-                        &catalog_identity_rows,
-                        &source,
-                    );
-                    for recovery in recoveries {
-                        let assignment = &mut assignments[recovery.assignment_index];
-                        let changed = sqlx::query(&recover_association_evidence)
-                            .bind(recovery.evidence_text.as_str())
-                            .bind(assignment.listing_link_id)
-                            .bind(listing_id)
-                            .bind(assignment.avionics_model_id)
-                            .bind(HISTORICAL_GENERIC_AVIONICS_EVIDENCE)
-                            .execute(&mut *transaction)
-                            .await?
-                            .rows_affected();
+                let source = rendered_html
+                    .as_deref()
+                    .map(|html| ListingEvidenceContext::from_publisher_html(Some(html)));
+                let repairs = plan_pending_association_evidence_repair(
+                    &payload,
+                    &assignments,
+                    &approved,
+                    &catalog_identity_rows,
+                    source.as_ref(),
+                    rendered_html.as_deref(),
+                );
+                for repair in repairs {
+                    let assignment = &mut assignments[repair.assignment_index];
+                    let expected_evidence = repair.link_evidence_text.as_deref();
+                    let expected_confidence = expected_evidence.map(|_| "high");
+                    let link_changed = repair.update_link
+                        && (assignment.source_notes.as_deref() != expected_evidence
+                            || assignment.source_confidence.as_deref() != expected_confidence);
+                    if link_changed {
+                        let changed = match expected_evidence {
+                            Some(evidence) => sqlx::query(&set_association_evidence)
+                                .bind(evidence)
+                                .bind(assignment.listing_link_id)
+                                .bind(listing_id)
+                                .bind(assignment.avionics_model_id)
+                                .execute(&mut *transaction)
+                                .await?
+                                .rows_affected(),
+                            None => sqlx::query(&clear_association_evidence)
+                                .bind(assignment.listing_link_id)
+                                .bind(listing_id)
+                                .bind(assignment.avionics_model_id)
+                                .execute(&mut *transaction)
+                                .await?
+                                .rows_affected(),
+                        };
                         if changed != 1 {
                             return Err(ReviewError::Stale(format!(
-                                "listing link {} changed while retained source evidence was being recovered",
+                                "listing link {} changed while occurrence evidence was being repaired",
                                 assignment.listing_link_id
                             )));
                         }
-                        assignment.source_notes = Some(recovery.evidence_text.clone());
-                        assignment.source_confidence = Some("high".to_string());
-                        if let Some(aspect_index) = recovery.aspect_index {
-                            if recovery.replace_redundant_primary
-                                || is_synthetic_preserved_attestation_aspect(
-                                    &payload.aspects[aspect_index],
-                                )
-                            {
-                                let product = approved
-                                    .get(&assignment.avionics_model_id)
-                                    .expect("recovery plans only approved products");
-                                payload.aspects[aspect_index] = preserved_product_aspect(
-                                    assignment,
-                                    ListingAssociationRole::Installed,
-                                    product,
-                                );
-                            } else {
-                                payload.aspects[aspect_index].source_evidence_text =
-                                    Some(recovery.evidence_text);
-                                payload.aspects[aspect_index].source_confidence =
-                                    Some("high".to_string());
-                            }
+                        assignment.source_notes = repair.link_evidence_text.clone();
+                        assignment.source_confidence =
+                            expected_confidence.map(str::to_string);
+                        repaired_evidence = true;
+                    }
+                    let association = CoveredListingAssociation {
+                        listing_link_id: assignment.listing_link_id,
+                        role: ListingAssociationRole::Installed,
+                        avionics_model_id: assignment.avionics_model_id,
+                    };
+                    if let Some(evidence) = repair.evidence_text.as_ref() {
+                        exact_association_evidence.insert(association, evidence.clone());
+                    }
+                    if let Some(aspect_index) = repair.aspect_index {
+                        let before = payload.aspects[aspect_index].clone();
+                        if repair.replace_redundant_primary
+                            || is_synthetic_preserved_attestation_aspect(
+                                &payload.aspects[aspect_index],
+                            )
+                        {
+                            let product = approved
+                                .get(&assignment.avionics_model_id)
+                                .expect("exact evidence repairs only approved products");
+                            payload.aspects[aspect_index] = preserved_product_aspect(
+                                assignment,
+                                ListingAssociationRole::Installed,
+                                product,
+                                None,
+                            );
                         }
-                        recovered_evidence = true;
+                        payload.aspects[aspect_index].source_evidence_text =
+                            repair.evidence_text.clone();
+                        payload.aspects[aspect_index].source_confidence = repair
+                            .evidence_text
+                            .as_ref()
+                            .map(|_| "high".to_string());
+                        repaired_evidence |= payload.aspects[aspect_index] != before;
                     }
-                    if recovered_evidence {
-                        payload.aspects = validated_aspects(&payload.aspects)?;
-                        validate_current_covered_associations(
-                            &payload.aspects,
-                            &assignments,
-                        )?;
+                    let replacement_association = assignment
+                        .replaces_avionics_model_id
+                        .map(|avionics_model_id| CoveredListingAssociation {
+                            listing_link_id: assignment.listing_link_id,
+                            role: ListingAssociationRole::Replacement,
+                            avionics_model_id,
+                        });
+                    if let (Some(association), Some(evidence)) = (
+                        replacement_association,
+                        repair.replacement_evidence_text.as_ref(),
+                    ) {
+                        exact_association_evidence.insert(association, evidence.clone());
                     }
+                    if let Some(aspect_index) = repair.replacement_aspect_index {
+                        let aspect = &mut payload.aspects[aspect_index];
+                        let before = (
+                            aspect.source_evidence_text.clone(),
+                            aspect.source_confidence.clone(),
+                        );
+                        aspect.source_evidence_text =
+                            repair.replacement_evidence_text.clone();
+                        aspect.source_confidence = repair
+                            .replacement_evidence_text
+                            .as_ref()
+                            .map(|_| "high".to_string());
+                        repaired_evidence |= before
+                            != (
+                                aspect.source_evidence_text.clone(),
+                                aspect.source_confidence.clone(),
+                            );
+                    }
+                }
+                if repaired_evidence {
+                    payload.aspects = validated_aspects(&payload.aspects)?;
+                    validate_current_covered_associations(&payload.aspects, &assignments)?;
                 }
             }
 
@@ -2254,6 +2331,9 @@ async fn restage_pending_review_if_current_with_commit(
                 }
 
                 let source_notes = aspect.source_evidence_text.as_deref();
+                let selected_product = approved
+                    .get(&commit.avionics_model_id)
+                    .expect("approved aspect-scoped product was loaded under lock");
                 if let Some(association) = aspect.covered_associations.first() {
                     let assignment = assignments
                         .iter_mut()
@@ -2281,6 +2361,11 @@ async fn restage_pending_review_if_current_with_commit(
                         )));
                     }
                     assignment.avionics_model_id = commit.avionics_model_id;
+                    assignment.installed_manufacturer =
+                        Some(selected_product.manufacturer.clone());
+                    assignment.installed_model = Some(selected_product.model.clone());
+                    assignment.replacement_manufacturer = None;
+                    assignment.replacement_model = None;
                     assignment.quantity = aspect.quantity;
                     assignment.source = "listing_review".to_string();
                     assignment.source_notes = aspect.source_evidence_text.clone();
@@ -2300,6 +2385,10 @@ async fn restage_pending_review_if_current_with_commit(
                     assignments.push(ExistingAssignmentRow {
                         listing_link_id,
                         avionics_model_id: commit.avionics_model_id,
+                        installed_manufacturer: Some(selected_product.manufacturer.clone()),
+                        installed_model: Some(selected_product.model.clone()),
+                        replacement_manufacturer: None,
+                        replacement_model: None,
                         quantity: aspect.quantity,
                         source: "listing_review".to_string(),
                         source_notes: aspect.source_evidence_text.clone(),
@@ -2495,6 +2584,10 @@ async fn restage_pending_review_if_current_with_commit(
                 &reuse_attested_ids,
                 &corroborated_associations,
             )?;
+            repaired_evidence |= apply_exact_association_evidence(
+                &mut payload.aspects,
+                &exact_association_evidence,
+            );
             validate_current_covered_associations(&payload.aspects, &assignments)?;
             let hidden_blockers = hidden_preserved_blockers(
                 &payload.aspects,
@@ -2539,7 +2632,7 @@ async fn restage_pending_review_if_current_with_commit(
             let (review_payload_sha256, pending_aspect_count) =
                 if removed_attested
                     || added_unattested
-                    || recovered_evidence
+                    || repaired_evidence
                     || ordinary_aspect_used
                 {
                     let serialized = serialize_review_payload(&payload.aspects)?;
@@ -3356,6 +3449,10 @@ const EXISTING_ASSIGNMENT_ROWS_SQL: &str = r#"
     SELECT
       link.id AS listing_link_id,
       link.avionics_model_id,
+      installed_manufacturer.name AS installed_manufacturer,
+      installed.name AS installed_model,
+      replacement_manufacturer.name AS replacement_manufacturer,
+      replaced.name AS replacement_model,
       link.quantity,
       link.source,
       link.source_notes,
@@ -3366,7 +3463,11 @@ const EXISTING_ASSIGNMENT_ROWS_SQL: &str = r#"
       replaced.catalog_status AS replacement_catalog_status
     FROM aircraft_sale_listing_avionics link
     LEFT JOIN avionics_models installed ON installed.id = link.avionics_model_id
+    LEFT JOIN avionics_manufacturers installed_manufacturer
+      ON installed_manufacturer.id = installed.avionics_manufacturer_id
     LEFT JOIN avionics_models replaced ON replaced.id = link.replaces_avionics_model_id
+    LEFT JOIN avionics_manufacturers replacement_manufacturer
+      ON replacement_manufacturer.id = replaced.avionics_manufacturer_id
     WHERE link.aircraft_sale_listing_id = ?
     ORDER BY link.id
 "#;
@@ -3890,6 +3991,7 @@ fn preserved_product_aspect(
     assignment: &ExistingAssignmentRow,
     role: ListingAssociationRole,
     product: &ReviewProduct,
+    exact_evidence: Option<&str>,
 ) -> PendingReviewAspect {
     let (product_id, quantity, configuration_action) = match role {
         ListingAssociationRole::Installed => (
@@ -3910,34 +4012,31 @@ fn preserved_product_aspect(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let observed_text = assignment
-        .source_notes
-        .as_deref()
-        .map(str::trim)
-        .filter(|notes| !notes.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| label.clone());
     PendingReviewAspect::avionics(
         preserved_review_aspect_id(assignment.listing_link_id, role),
         "avionics_reuse_attestation",
+        label.clone(),
         label,
-        observed_text,
         PRESERVED_ASSOCIATION_REVIEW_REASON,
         quantity,
         configuration_action,
-        assignment.source_notes.clone(),
-        assignment.source_confidence.clone(),
+        exact_evidence.map(str::to_string),
+        exact_evidence.map(|_| "high".to_string()),
     )
     .with_covered_association(assignment.listing_link_id, role, product_id)
     .with_reuse_attestation_target(product_id)
 }
 
 #[derive(Clone, Debug)]
-struct RecoveredAssociationEvidence {
+struct AssociationEvidenceRepair {
     assignment_index: usize,
     aspect_index: Option<usize>,
+    replacement_aspect_index: Option<usize>,
     replace_redundant_primary: bool,
-    evidence_text: String,
+    update_link: bool,
+    link_evidence_text: Option<String>,
+    evidence_text: Option<String>,
+    replacement_evidence_text: Option<String>,
 }
 
 fn catalog_identity_is_unique(
@@ -4016,65 +4115,170 @@ fn redundant_historical_association_aspect(
             .any(|candidate| candidate.replacement_aspect_id.as_ref() == Some(&aspect.id))
 }
 
-fn plan_historical_association_evidence_recovery(
+fn plan_pending_association_evidence_repair(
     payload: &PendingReviewPayload,
     assignments: &[ExistingAssignmentRow],
     approved: &HashMap<i64, ReviewProduct>,
     catalog: &[RecoverableCatalogIdentityRow],
-    source: &ListingEvidenceContext,
-) -> Vec<RecoveredAssociationEvidence> {
+    source: Option<&ListingEvidenceContext>,
+    rendered_html: Option<&str>,
+) -> Vec<AssociationEvidenceRepair> {
     let owners = covered_association_owners(&payload.aspects);
     assignments
         .iter()
         .enumerate()
-        .filter_map(|(assignment_index, assignment)| {
-            if assignment.source != "listing"
-                || assignment.source_notes.as_deref() != Some(HISTORICAL_GENERIC_AVIONICS_EVIDENCE)
-                || assignment.quantity != 1
-                || assignment.configuration_action != "installed"
-                || assignment.replaces_avionics_model_id.is_some()
-                || assignment.installed_catalog_status.as_deref() != Some("approved")
-            {
-                return None;
-            }
-            let product = approved.get(&assignment.avionics_model_id)?;
-            if !catalog_identity_is_unique(product, catalog) {
-                return None;
-            }
-            let evidence_text =
-                source.unique_exact_product_slice(&product.manufacturer, &product.model)?;
+        .map(|(assignment_index, assignment)| {
             let aspect_index = owners
                 .get(&(
                     assignment.listing_link_id,
                     ListingAssociationRole::Installed,
                 ))
                 .copied();
-            if aspect_index.is_some_and(|index| {
+            let replacement_aspect_index = owners
+                .get(&(
+                    assignment.listing_link_id,
+                    ListingAssociationRole::Replacement,
+                ))
+                .copied();
+            let aspect_shape_is_unique = aspect_index.is_none_or(|index| {
                 let aspect = &payload.aspects[index];
-                aspect.covered_associations.len() != 1
-                    || aspect.quantity != 1
-                    || aspect.configuration_action != "installed"
-                    || aspect.replaces_product_id.is_some()
-                    || aspect.replacement_aspect_id.is_some()
-            }) {
-                return None;
-            }
-            let replace_redundant_primary = aspect_index.is_some_and(|index| {
-                redundant_historical_association_aspect(
-                    &payload.aspects[index],
-                    assignment,
-                    product,
-                    &payload.aspects,
-                )
+                aspect.covered_associations.len() == 1
+                    && aspect.quantity == assignment.quantity
+                    && aspect.configuration_action == assignment.configuration_action
+                    && aspect.replaces_product_id.is_none()
+                    && aspect.replacement_aspect_id.is_none()
             });
-            Some(RecoveredAssociationEvidence {
+            let approved_product = approved
+                .get(&assignment.avionics_model_id)
+                .filter(|product| catalog_identity_is_unique(product, catalog));
+            let installed_identity = assignment
+                .installed_manufacturer
+                .as_deref()
+                .zip(assignment.installed_model.as_deref());
+            let exact_retained_evidence = installed_identity.and_then(|(manufacturer, model)| {
+                assignment
+                    .source_notes
+                    .as_deref()
+                    .filter(|_| assignment.source_confidence.is_some())
+                    .filter(|evidence| {
+                        source.is_some_and(|source| {
+                            source.contains_exact_product_evidence(evidence, manufacturer, model)
+                        }) && rendered_html.is_some_and(|html| {
+                            listing_body_contains_exact_structurally_visible_text_span(
+                                html, evidence,
+                            )
+                        })
+                    })
+                    .map(str::trim)
+                    .map(str::to_string)
+            });
+            let replacement_identity = assignment
+                .replacement_manufacturer
+                .as_deref()
+                .zip(assignment.replacement_model.as_deref());
+            let exact_retained_replacement_evidence =
+                replacement_identity.and_then(|(manufacturer, model)| {
+                    assignment
+                        .source_notes
+                        .as_deref()
+                        .filter(|_| assignment.source_confidence.is_some())
+                        .filter(|evidence| {
+                            source.is_some_and(|source| {
+                                source.contains_exact_product_evidence(
+                                    evidence,
+                                    manufacturer,
+                                    model,
+                                )
+                            }) && rendered_html.is_some_and(|html| {
+                                listing_body_contains_exact_structurally_visible_text_span(
+                                    html, evidence,
+                                )
+                            })
+                        })
+                        .map(str::trim)
+                        .map(str::to_string)
+                });
+            let automatic_repair_shape = assignment.quantity > 0
+                && assignment.configuration_action == "installed"
+                && assignment.replaces_avionics_model_id.is_none()
+                && assignment.installed_catalog_status.as_deref() == Some("approved")
+                && aspect_shape_is_unique
+                && approved_product.is_some();
+            let retained_evidence_is_exact = exact_retained_evidence.is_some();
+            let retained_replacement_evidence_is_exact =
+                exact_retained_replacement_evidence.is_some();
+            let evidence_text = if retained_evidence_is_exact {
+                exact_retained_evidence
+            } else if !automatic_repair_shape {
+                None
+            } else {
+                approved_product.and_then(|product| {
+                    source.and_then(|source| {
+                        source
+                            .unique_exact_product_slice(&product.manufacturer, &product.model)
+                            .filter(|evidence| {
+                                rendered_html.is_some_and(|html| {
+                                    listing_body_contains_exact_structurally_visible_text_span(
+                                        html, evidence,
+                                    )
+                                })
+                            })
+                    })
+                })
+            };
+            let update_link = retained_evidence_is_exact
+                || retained_replacement_evidence_is_exact
+                || automatic_repair_shape;
+            let link_evidence_text = evidence_text
+                .clone()
+                .or_else(|| exact_retained_replacement_evidence.clone());
+            let replace_redundant_primary = automatic_repair_shape
+                && evidence_text.is_some()
+                && aspect_index.is_some_and(|index| {
+                    let product = approved
+                        .get(&assignment.avionics_model_id)
+                        .expect("exact evidence requires an approved product");
+                    redundant_historical_association_aspect(
+                        &payload.aspects[index],
+                        assignment,
+                        product,
+                        &payload.aspects,
+                    )
+                });
+            AssociationEvidenceRepair {
                 assignment_index,
                 aspect_index,
+                replacement_aspect_index,
                 replace_redundant_primary,
+                update_link,
+                link_evidence_text,
                 evidence_text,
-            })
+                replacement_evidence_text: exact_retained_replacement_evidence,
+            }
         })
         .collect()
+}
+
+fn apply_exact_association_evidence(
+    aspects: &mut [PendingReviewAspect],
+    exact_evidence: &HashMap<CoveredListingAssociation, String>,
+) -> bool {
+    let owners = covered_association_owners(aspects);
+    let mut changed = false;
+    for (association, evidence) in exact_evidence {
+        let Some(index) = owners.get(&(association.listing_link_id, association.role)) else {
+            continue;
+        };
+        let aspect = &mut aspects[*index];
+        if aspect.source_evidence_text.as_deref() != Some(evidence.as_str())
+            || aspect.source_confidence.as_deref() != Some("high")
+        {
+            aspect.source_evidence_text = Some(evidence.clone());
+            aspect.source_confidence = Some("high".to_string());
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn is_synthetic_preserved_attestation_aspect(aspect: &PendingReviewAspect) -> bool {
@@ -4575,6 +4779,7 @@ fn add_unattested_preserved_aspects(
                 assignment,
                 ListingAssociationRole::Installed,
                 product,
+                None,
             ));
             owners.insert(installed_key, index);
             changed = true;
@@ -4622,6 +4827,7 @@ fn add_unattested_preserved_aspects(
                 assignment,
                 ListingAssociationRole::Replacement,
                 product,
+                None,
             ));
             owners.insert(replacement_key, child_index);
             changed = true;
@@ -7595,6 +7801,10 @@ mod tests {
         ExistingAssignmentRow {
             listing_link_id,
             avionics_model_id,
+            installed_manufacturer: Some("Garmin".to_string()),
+            installed_model: Some(format!("Product {avionics_model_id}")),
+            replacement_manufacturer: replaces_avionics_model_id.map(|_| "Garmin".to_string()),
+            replacement_model: replaces_avionics_model_id.map(|id| format!("Product {id}")),
             quantity,
             source: "listing".to_string(),
             source_notes: Some("retained listing evidence".to_string()),
@@ -8474,6 +8684,7 @@ mod tests {
             &assignment,
             ListingAssociationRole::Installed,
             approved.get(&11).unwrap(),
+            None,
         );
         aspect.reason = "catalog_product_reuse_attestation_missing".to_string();
         let mut aspects = vec![aspect];
@@ -8653,7 +8864,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_recovery_plan_fails_closed_for_unsafe_link_shapes() {
+    fn pending_association_repair_derives_exact_evidence_or_clears_it() {
         let product =
             ReviewProduct::verified(10, "Garmin", "GMA 1347", vec!["Audio Panel".to_string()])
                 .with_stable_identifier("manufacturer_part_number", "011-00809-00");
@@ -8681,67 +8892,130 @@ mod tests {
             vec!["Audio Panel".to_string()],
         ))
         .with_covered_association(7, ListingAssociationRole::Installed, 10);
-        let payload = PendingReviewPayload {
+        let mut payload = PendingReviewPayload {
             version: REVIEW_PAYLOAD_VERSION,
             aspects: vec![aspect],
         };
-        let source = ListingEvidenceContext::from_cleaned_text(
-            "The listing identifies a Garmin GMA-1347 audio panel.",
-        );
+        let source_html = "<body>The listing identifies a Garmin GMA-1347 audio panel.</body>";
+        let source = ListingEvidenceContext::from_publisher_html(Some(source_html));
         let mut assignment = existing_assignment(7, 10, 1, "installed", None);
-        assignment.source_notes = Some(HISTORICAL_GENERIC_AVIONICS_EVIDENCE.to_string());
+        assignment.installed_manufacturer = Some("Garmin".to_string());
+        assignment.installed_model = Some("GMA 1347".to_string());
+        assignment.source_notes = Some("generated resolver explanation".to_string());
+        let repairs = plan_pending_association_evidence_repair(
+            &payload,
+            std::slice::from_ref(&assignment),
+            &approved,
+            &catalog,
+            Some(&source),
+            Some(source_html),
+        );
+        assert_eq!(repairs[0].evidence_text.as_deref(), Some("Garmin GMA-1347"));
+
+        assignment.quantity = 2;
+        payload.aspects[0].quantity = 2;
         assert_eq!(
-            plan_historical_association_evidence_recovery(
+            plan_pending_association_evidence_repair(
                 &payload,
                 std::slice::from_ref(&assignment),
                 &approved,
                 &catalog,
-                &source,
-            )
-            .len(),
-            1
+                Some(&source),
+                Some(source_html),
+            )[0]
+            .evidence_text
+            .as_deref(),
+            Some("Garmin GMA-1347")
         );
-
-        assignment.source_notes = Some("already retained exact evidence".to_string());
-        assert!(plan_historical_association_evidence_recovery(
-            &payload,
-            std::slice::from_ref(&assignment),
-            &approved,
-            &catalog,
-            &source,
-        )
-        .is_empty());
-        assignment.source_notes = Some(HISTORICAL_GENERIC_AVIONICS_EVIDENCE.to_string());
-        assignment.quantity = 2;
-        assert!(plan_historical_association_evidence_recovery(
-            &payload,
-            std::slice::from_ref(&assignment),
-            &approved,
-            &catalog,
-            &source,
-        )
-        .is_empty());
         assignment.quantity = 1;
+        payload.aspects[0].quantity = 1;
         assignment.configuration_action = "replaces".to_string();
         assignment.replaces_avionics_model_id = Some(11);
-        assert!(plan_historical_association_evidence_recovery(
+        let repair = plan_pending_association_evidence_repair(
             &payload,
             std::slice::from_ref(&assignment),
             &approved,
             &catalog,
-            &source,
-        )
-        .is_empty());
+            Some(&source),
+            Some(source_html),
+        );
+        assert_eq!(repair[0].evidence_text, None);
+        assert!(!repair[0].update_link);
         assignment.configuration_action = "installed".to_string();
         assignment.replaces_avionics_model_id = None;
-        assert!(plan_historical_association_evidence_recovery(
-            &payload,
-            std::slice::from_ref(&assignment),
-            &approved,
-            &catalog,
-            &ListingEvidenceContext::default(),
-        )
-        .is_empty());
+        assert_eq!(
+            plan_pending_association_evidence_repair(
+                &payload,
+                std::slice::from_ref(&assignment),
+                &approved,
+                &catalog,
+                None,
+                None,
+            )[0]
+            .evidence_text,
+            None
+        );
+
+        let ambiguous_html = "<body>Garmin GMA-1347 and Garmin GMA-1347 NXi</body>";
+        let ambiguous = ListingEvidenceContext::from_publisher_html(Some(ambiguous_html));
+        assert_eq!(
+            plan_pending_association_evidence_repair(
+                &payload,
+                std::slice::from_ref(&assignment),
+                &approved,
+                &catalog,
+                Some(&ambiguous),
+                Some(ambiguous_html),
+            )[0]
+            .evidence_text,
+            None
+        );
+    }
+
+    #[test]
+    fn review_evidence_and_confidence_are_a_paired_invariant() {
+        for (evidence, confidence) in [
+            (Some("Garmin GTX 345".to_string()), None),
+            (None, Some("high".to_string())),
+            (Some("   ".to_string()), Some("high".to_string())),
+        ] {
+            let aspect = PendingReviewAspect::avionics(
+                "pair",
+                "avionics",
+                "Garmin GTX 345",
+                "Garmin GTX 345",
+                "pending",
+                1,
+                "installed",
+                evidence,
+                confidence,
+            );
+            let validated = validated_aspects(&[aspect]).unwrap();
+            assert_eq!(validated[0].source_evidence_text, None);
+            assert_eq!(validated[0].source_confidence, None);
+        }
+
+        let paired = PendingReviewAspect::avionics(
+            "pair",
+            "avionics",
+            "Garmin GTX 345",
+            "structured observation",
+            "pending",
+            1,
+            "installed",
+            Some("  Garmin GTX 345  ".to_string()),
+            Some("high".to_string()),
+        );
+        let validated = validated_aspects(&[paired]).unwrap();
+        assert_eq!(
+            validated[0].source_evidence_text.as_deref(),
+            Some("Garmin GTX 345")
+        );
+        assert_eq!(validated[0].source_confidence.as_deref(), Some("high"));
+        assert_ne!(
+            validated[0].source_evidence_text.as_deref(),
+            Some(validated[0].observed_text.as_str())
+        );
     }
 
     async fn test_db() -> AppDb {
@@ -9087,6 +9361,7 @@ mod tests {
                         assignment,
                         ListingAssociationRole::Installed,
                         products.get(&assignment.avionics_model_id).unwrap(),
+                        None,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -9280,6 +9555,7 @@ mod tests {
             &assignments[0],
             ListingAssociationRole::Installed,
             products.get(&product_id).unwrap(),
+            None,
         );
         let target_staged =
             stage_pending_review(&db, target_listing_id, None, &[target_aspect.clone()])
@@ -9405,6 +9681,9 @@ mod tests {
             preserved_review_aspect_id(link_id, ListingAssociationRole::Installed)
         );
         assert_eq!(preserved.allowed_actions, vec![ReviewAction::Discard]);
+        assert_eq!(preserved.observed_text, "Garmin GNS 430W");
+        assert_eq!(preserved.source_evidence_text, None);
+        assert_eq!(preserved.source_confidence, None);
 
         let second = restage_unattested_preserved_products(&db, user_id, listing_id)
             .await
@@ -9423,7 +9702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_restage_recovers_exact_generic_evidence_and_is_idempotent() {
+    async fn explicit_restage_replaces_generated_notes_with_exact_evidence_and_is_idempotent() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
@@ -9446,7 +9725,7 @@ mod tests {
         )
         .bind(listing_id)
         .bind(product_id)
-        .bind(HISTORICAL_GENERIC_AVIONICS_EVIDENCE)
+        .bind("Generated resolver prose that is not listing evidence")
         .fetch_one(sqlite_pool(&db))
         .await
         .unwrap();
@@ -9513,6 +9792,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_restage_clears_unrecoverable_notes_and_staged_evidence() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "GTX 33", "GTX33", "Transponder").await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<main>Garmin GTX 33 transponder and Garmin GTX 33 ES transponder.</main>",
+        )
+        .await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Generated resolver explanation',
+                      'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let aspect = PendingReviewAspect::avionics(
+            "ambiguous-transponder",
+            "avionics",
+            "Garmin GTX 33",
+            "structured observation",
+            "listing_link_confidence_not_high",
+            1,
+            "installed",
+            Some("Generated resolver explanation".to_string()),
+            Some("high".to_string()),
+        )
+        .with_covered_association(link_id, ListingAssociationRole::Installed, product_id);
+        let original = stage_pending_review(&db, listing_id, Some(submission_id), &[aspect])
+            .await
+            .unwrap();
+
+        let restaged = restage_unattested_preserved_products(&db, user_id, listing_id)
+            .await
+            .unwrap()
+            .expect("ambiguous occurrence must remain pending");
+        assert_ne!(
+            restaged.review_payload_sha256,
+            original.review_payload_sha256
+        );
+        let link: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT source_notes, source_confidence FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(link, (None, None));
+
+        let row = load_review_row(&db, listing_id).await.unwrap();
+        let payload = parse_payload(
+            &row.review_payload_json,
+            Some(&row.review_payload_sha256),
+            row.pending_aspect_count,
+        )
+        .unwrap();
+        assert_eq!(payload.aspects[0].source_evidence_text, None);
+        assert_eq!(payload.aspects[0].source_confidence, None);
+        assert_eq!(
+            restage_unattested_preserved_products(&db, user_id, listing_id)
+                .await
+                .unwrap(),
+            Some(restaged)
+        );
+    }
+
+    #[tokio::test]
     async fn recovered_exact_association_keeps_primary_with_extra_capability() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
@@ -9536,7 +9892,7 @@ mod tests {
         )
         .bind(listing_id)
         .bind(product_id)
-        .bind(HISTORICAL_GENERIC_AVIONICS_EVIDENCE)
+        .bind("Factory default description generated by a resolver")
         .fetch_one(sqlite_pool(&db))
         .await
         .unwrap();
@@ -10371,8 +10727,12 @@ mod tests {
             .unwrap()
             .remove(&product_id)
             .unwrap();
-        let synthetic =
-            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let synthetic = preserved_product_aspect(
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product,
+            None,
+        );
         let synthetic_id = synthetic.id.clone();
         let synthetic_staged =
             stage_pending_review(&other_db, other_listing_id, None, &[synthetic])
@@ -10836,8 +11196,12 @@ mod tests {
             .unwrap()
             .remove(&product_id)
             .unwrap();
-        let synthetic =
-            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let synthetic = preserved_product_aspect(
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product,
+            assignment.source_notes.as_deref(),
+        );
         let staged =
             stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
                 .await
@@ -10938,8 +11302,12 @@ mod tests {
             .unwrap()
             .remove(&product_id)
             .unwrap();
-        let synthetic =
-            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let synthetic = preserved_product_aspect(
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product,
+            assignment.source_notes.as_deref(),
+        );
         let staged =
             stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
                 .await
@@ -11047,8 +11415,12 @@ mod tests {
             .unwrap()
             .remove(&product_id)
             .unwrap();
-        let synthetic =
-            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let synthetic = preserved_product_aspect(
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product,
+            assignment.source_notes.as_deref(),
+        );
         let staged =
             stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
                 .await
@@ -11497,8 +11869,12 @@ mod tests {
             .unwrap()
             .remove(&product_id)
             .unwrap();
-        let synthetic =
-            preserved_product_aspect(&assignment, ListingAssociationRole::Installed, &product);
+        let synthetic = preserved_product_aspect(
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product,
+            assignment.source_notes.as_deref(),
+        );
         let staged =
             stage_pending_review(&db, listing_id, Some(submission_id), &[synthetic.clone()])
                 .await

@@ -549,6 +549,14 @@ text, installation action, source evidence, and replacement relationships are
 review context only; they do not become catalog products or canonical listing
 links before a decision.
 
+Occurrence evidence and its confidence are an inseparable pair. Structured
+`observed_text`, catalog identity evidence, resolver explanations, and legacy
+listing-link notes never fill a missing `source_evidence_text`. Legacy review
+backfill retains complete extraction evidence pairs, but stages unmatched
+installed/replacement link notes without evidence. The explicit local restage
+path can recover a unique exact visible manufacturer/model slice from the
+bound plugin capture without Gemini; otherwise the aspect remains pending.
+
 All three actions remain available for every avionics aspect, including an
 aspect with a suggested match or legacy candidate. The reviewer must make
 exactly one decision for every aspect in the bundle:

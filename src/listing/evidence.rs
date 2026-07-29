@@ -4,7 +4,7 @@
 //! always consists of slices copied from the cleaned source corpus, separated
 //! by a fixed delimiter. No raw hint is ever copied into the result.
 
-use crate::html::clean::clean_listing_html_with_limit;
+use crate::html::clean::{clean_listing_html_with_limit, clean_publisher_source_html};
 
 pub(crate) const MAX_LISTING_EVIDENCE_CONTEXT_BYTES: usize = 4_096;
 pub(crate) const MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES: usize = 256;
@@ -63,6 +63,16 @@ impl ListingEvidenceContext {
             rendered_html,
             MAX_CLEANED_LISTING_SOURCE_BYTES,
         ))
+    }
+
+    /// Index all publisher-authored visible text. Callers using this broader
+    /// corpus for occurrence proof must still require the selected slice to
+    /// pass the exact structurally-visible listing-body gate.
+    pub(crate) fn from_publisher_html(rendered_html: Option<&str>) -> Self {
+        rendered_html
+            .map(clean_publisher_source_html)
+            .map(Self::from_cleaned_text)
+            .unwrap_or_default()
     }
 
     pub(crate) fn from_cleaned_text(cleaned: impl Into<String>) -> Self {
@@ -137,6 +147,30 @@ impl ListingEvidenceContext {
             selected.get_or_insert_with(|| source_slice.to_string());
         }
         selected
+    }
+
+    /// Confirm that retained occurrence evidence is an exact source slice and
+    /// contains the same unique, unqualified product identity as the corpus.
+    pub(crate) fn contains_exact_product_evidence(
+        &self,
+        evidence: &str,
+        manufacturer: &str,
+        model: &str,
+    ) -> bool {
+        let evidence = evidence.trim();
+        if evidence.is_empty()
+            || evidence.len() > MAX_LISTING_EVIDENCE_CONTEXT_BYTES
+            || !self.cleaned.contains(evidence)
+        {
+            return false;
+        }
+        let Some(identity) = self.unique_exact_product_slice(manufacturer, model) else {
+            return false;
+        };
+        ListingEvidenceContext::from_cleaned_text(evidence)
+            .unique_exact_product_slice(manufacturer, model)
+            .as_deref()
+            == Some(identity.as_str())
     }
 
     fn ranges_for_candidate(
@@ -267,6 +301,18 @@ impl ListingEvidenceContext {
 
 fn has_distinct_product_suffix(source: &str, identity: SourceRange) -> bool {
     let tail = &source[identity.end..];
+    let trimmed_tail = tail.trim_start_matches(char::is_whitespace);
+    let lowercase_tail = trimmed_tail.to_ascii_lowercase();
+    if ["p/n", "pn", "part number"].into_iter().any(|label| {
+        lowercase_tail.strip_prefix(label).is_some_and(|remaining| {
+            remaining
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_ascii_alphanumeric())
+        })
+    }) {
+        return false;
+    }
     let mut characters = tail.char_indices().peekable();
     let mut slash_delimited = false;
     while characters
@@ -524,6 +570,14 @@ mod tests {
 
         assert_eq!(recovered.as_deref(), Some("Garmin GMA-1347"));
         assert!(source.contains(recovered.as_deref().unwrap()));
+        assert_eq!(
+            ListingEvidenceContext::from_cleaned_text(
+                "Garmin GNS 430W P/N 011-01064-40 shown in the listing",
+            )
+            .unique_exact_product_slice("Garmin", "GNS 430W")
+            .as_deref(),
+            Some("Garmin GNS 430W")
+        );
     }
 
     #[test]
@@ -560,5 +614,47 @@ mod tests {
                 "{source:?} must not recover a base product"
             );
         }
+    }
+
+    #[test]
+    fn retained_exact_product_evidence_must_be_a_visible_unambiguous_slice() {
+        let context = ListingEvidenceContext::from_publisher_html(Some(
+            "<html><body>Garmin GDL 69A shown in the listing. Weather Radar.</body></html>",
+        ));
+        assert_eq!(
+            context.cleaned,
+            "Garmin GDL 69A shown in the listing. Weather Radar."
+        );
+        assert_eq!(
+            context
+                .unique_exact_product_slice("Garmin", "GDL 69A")
+                .as_deref(),
+            Some("Garmin GDL 69A")
+        );
+        assert_eq!(
+            ListingEvidenceContext::from_cleaned_text("Garmin GDL 69A shown in the listing",)
+                .unique_exact_product_slice("Garmin", "GDL 69A")
+                .as_deref(),
+            Some("Garmin GDL 69A")
+        );
+        assert!(context.contains_exact_product_evidence(
+            "Garmin GDL 69A shown in the listing",
+            "Garmin",
+            "GDL 69A",
+        ));
+        assert!(!context.contains_exact_product_evidence(
+            "generated resolver explanation",
+            "Garmin",
+            "GDL 69A",
+        ));
+
+        let ambiguous = ListingEvidenceContext::from_cleaned_text(
+            "Garmin GDL 69A shown in the listing\nGarmin GDL 69A NXi",
+        );
+        assert!(!ambiguous.contains_exact_product_evidence(
+            "Garmin GDL 69A shown in the listing",
+            "Garmin",
+            "GDL 69A",
+        ));
     }
 }
