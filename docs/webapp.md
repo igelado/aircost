@@ -462,6 +462,16 @@ client submits only associations reported as `auto_verifiable`; it displays the
 remaining reason instead of issuing a mutation merely to discover that manual
 review is required.
 
+The product queue summarizes associations as total pending, ready locally,
+needing source recovery, needing OEM attestation, or manual/ambiguous. Its
+`eligibility_counts` projection uses the same categories as association
+preflight. Missing retained occurrence proof is reported separately as
+`source_evidence_missing`; meaningful model or capability qualifiers remain
+manual rather than being treated as recoverable text. The browser can restage
+each affected listing once, with bounded concurrency across listings, then
+reloads current review hashes before offering local validation. Restaging does
+not promise that evidence can be recovered and does not call Gemini.
+
 The attestation request carries the catalog revision, one OEM source dossier,
 and exactly one direct association authorization tuple:
 `listing_id`, `review_payload_sha256`, and `aspect_id`. The server loads only

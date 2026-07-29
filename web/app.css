@@ -1367,6 +1367,7 @@ label span,
 }
 
 .review-status-required,
+.review-outcome-recovery,
 .review-outcome-required,
 .review-outcome-manual,
 .review-outcome-stale {
@@ -1411,8 +1412,38 @@ label span,
   margin-bottom: 10px;
 }
 
+.review-product-breakdown {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(110px, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.review-product-breakdown div {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.review-product-breakdown span,
+.review-product-breakdown strong {
+  display: block;
+}
+
+.review-product-breakdown span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-product-breakdown strong {
+  margin-top: 3px;
+  font-size: 18px;
+}
+
 .review-product-actions {
   margin: 16px 0 10px;
+  flex-wrap: wrap;
 }
 
 .review-product-actions span {
@@ -1445,6 +1476,12 @@ label span,
   margin-top: 4px;
   color: var(--accent-strong);
   font-size: 11px;
+}
+
+@media (max-width: 900px) {
+  .review-product-breakdown {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
 }
 
 .review-count-pill,
