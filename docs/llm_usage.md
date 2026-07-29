@@ -136,6 +136,12 @@ that contains sibling products cannot authorize an identity, although a
 separate clean exact row in the same document can. Hidden metadata, scripts,
 generic page text, and cross-row matches never authorize.
 
+Only `avionics_reuse_v2` attestations are current. Their fingerprint domain is
+explicitly bound to this target-aware OEM verifier contract. Earlier
+attestations and their listing-level corroborations are invalidated rather
+than copied forward, so a policy upgrade cannot silently reuse proof admitted
+under weaker verifier semantics.
+
 Unrelated oversized or excess rows do not invalidate a targeted projection.
 Target-relevant overflow, missing or undecodable invoked fonts, unhandled
 invoked Form XObjects, malformed transforms, and incomplete page or resource

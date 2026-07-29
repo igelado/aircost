@@ -6836,7 +6836,7 @@ CREATE TABLE IF NOT EXISTS avionics_product_reuse_attestations (
   avionics_authoritative_source_origin_id INTEGER NOT NULL
     REFERENCES avionics_authoritative_source_origins(id) ON DELETE RESTRICT,
   policy_version TEXT NOT NULL
-    CHECK (policy_version = 'avionics_reuse_v1'),
+    CHECK (policy_version = 'avionics_reuse_v2'),
   product_fingerprint TEXT NOT NULL,
   attested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(product_fingerprint) = 64),
@@ -6947,6 +6947,19 @@ INSERT INTO schema_migration_contracts (
   '20260803_avionics_product_reuse_attestations',
   2,
   '8ad6e935e1222a03e2da4848a9e3c6f4b7f50ee027a6e50ede3b692d034cae55',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = excluded.contract_version,
+  contract_fingerprint = excluded.contract_fingerprint,
+  installed_at = excluded.installed_at;
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260807_avionics_product_reuse_v2',
+  1,
+  'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET

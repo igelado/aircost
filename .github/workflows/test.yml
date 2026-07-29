@@ -39,5 +39,8 @@ jobs:
       - name: Run unit tests
         run: cargo test
 
+      - name: Check avionics reuse-v2 migration
+        run: bash tests/schema/test_avionics_product_reuse_v2.sh
+
       - name: Check build
         run: cargo check
