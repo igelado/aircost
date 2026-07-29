@@ -2890,6 +2890,19 @@ fn parse_payload(
     })
 }
 
+pub(crate) fn parse_current_pending_review_aspects(
+    review_payload_json: &str,
+    review_payload_sha256: &str,
+    pending_aspect_count: i64,
+) -> ReviewResult<Vec<PendingReviewAspect>> {
+    Ok(parse_payload(
+        review_payload_json,
+        Some(review_payload_sha256),
+        pending_aspect_count,
+    )?
+    .aspects)
+}
+
 pub async fn list_listing_reviews(
     db: &AppDb,
     owner_user_id: i64,
