@@ -196,12 +196,16 @@ impl GroundedJsonPassRequest {
         self
     }
 
-    /// Require structured evidence excerpts to exist in publisher text fetched
-    /// directly by this server, in addition to Gemini citation provenance.
+    /// Fetch publisher text directly and emit exact source proofs whenever a
+    /// Search citation matches the immutable identity anchors. Search keeps
+    /// ordinary verified citations when no publisher page matches so callers
+    /// can still make claim-bound negative decisions; callers must require a
+    /// returned proof for every positive decision.
     ///
-    /// Source bodies are transient and discarded after this pass. The result
-    /// exposes only hashes and the exact normalized spans that were actually
-    /// used by the structured output.
+    /// Caller-selected direct-source requests remain strict: every admitted
+    /// source must pass the publisher-text preflight. Source bodies are
+    /// transient and discarded after this pass. The result exposes only hashes
+    /// and exact normalized spans actually used by the structured output.
     pub fn with_direct_source_text_verification(mut self) -> Self {
         self.direct_source_text_verification = true;
         self
@@ -782,8 +786,13 @@ impl VerifiedEvidenceDossier {
         {
             bail!("verified evidence revalidated direct-source URL mismatch");
         }
-        if self.direct_source_text_verification != self.direct_source_documents.is_some() {
-            bail!("verified evidence direct-source document cache is inconsistent");
+        if !self.direct_source_text_verification && self.direct_source_documents.is_some() {
+            bail!("verified evidence unexpectedly contains a direct-source document cache");
+        }
+        if self.provenance == EvidenceProvenance::AuthorizedDirectFetch
+            && self.direct_source_documents.is_none()
+        {
+            bail!("verified authorized direct-fetch evidence has no publisher document cache");
         }
         if self.provenance == EvidenceProvenance::AuthorizedDirectFetch {
             return self.validate_authorized_direct_fetch_payload(request);
@@ -2746,27 +2755,21 @@ async fn prepare_url_context_sources(
             citation.final_url.clone_from(final_url);
         }
     }
-    citations.retain(|citation| {
-        documents
-            .verified
-            .get(&citation.final_url)
-            .is_some_and(|document| {
-                publisher_document_identity_token_score(&document.publisher_text, &identity_tokens)
-                    >= minimum_document_matches
-            })
+    documents.verified.retain(|_, document| {
+        publisher_document_identity_token_score(&document.publisher_text, &identity_tokens)
+            >= minimum_document_matches
     });
 
     let mut candidate_urls = citations
         .iter()
         .map(|citation| citation.final_url.clone())
         .collect::<BTreeSet<_>>();
-    if candidate_urls.is_empty() {
-        bail!(
-            "no Search-cited publisher page both direct-fetched successfully and matched the immutable identity anchors"
-        );
-    }
-
-    let qualified_origins = qualified_publisher_index_origins(&citations);
+    let publisher_citations = citations
+        .iter()
+        .filter(|citation| documents.verified.contains_key(&citation.final_url))
+        .cloned()
+        .collect::<Vec<_>>();
+    let qualified_origins = qualified_publisher_index_origins(&publisher_citations);
     let available_additions = request
         .max_url_context_urls
         .saturating_sub(candidate_urls.len())
@@ -2852,7 +2855,8 @@ async fn prepare_url_context_sources(
     documents
         .verified
         .retain(|final_url, _| candidate_urls.contains(final_url));
-    Ok((citations, candidate_urls, Some(documents)))
+    let documents = (!documents.verified.is_empty()).then_some(documents);
+    Ok((citations, candidate_urls, documents))
 }
 
 fn insert_transient_source_document(
@@ -3128,27 +3132,44 @@ async fn prepare_direct_source_documents(
     let identity_tokens = publisher_index_identity_tokens(&request.direct_source_relevance_anchors);
     let minimum_document_matches =
         MIN_DIRECT_SOURCE_IDENTITY_TOKEN_MATCHES.min(identity_tokens.len());
-    citations.retain(|citation| {
+    if !request.revalidated_direct_source_urls.is_empty() {
+        citations.retain(|citation| {
+            documents
+                .verified
+                .get(&citation.final_url)
+                .is_some_and(|document| {
+                    publisher_document_identity_token_score(
+                        &document.publisher_text,
+                        &identity_tokens,
+                    ) >= minimum_document_matches
+                })
+        });
+        if citations.is_empty() {
+            bail!("none of the URL Context citations passed direct publisher-source verification");
+        }
+        let cited_urls = citations
+            .iter()
+            .map(|citation| citation.final_url.clone())
+            .collect::<BTreeSet<_>>();
         documents
             .verified
-            .get(&citation.final_url)
-            .is_some_and(|document| {
-                publisher_document_identity_token_score(&document.publisher_text, &identity_tokens)
-                    >= minimum_document_matches
-            })
-    });
-    if citations.is_empty() {
-        bail!("none of the URL Context citations passed direct publisher-source verification");
+            .retain(|final_url, _| cited_urls.contains(final_url));
+        documents.failures.clear();
+        return Ok((citations, Some(documents)));
     }
+
     let cited_urls = citations
         .iter()
         .map(|citation| citation.final_url.clone())
         .collect::<BTreeSet<_>>();
-    documents
-        .verified
-        .retain(|final_url, _| cited_urls.contains(final_url));
+    documents.verified.retain(|final_url, document| {
+        cited_urls.contains(final_url)
+            && publisher_document_identity_token_score(&document.publisher_text, &identity_tokens)
+                >= minimum_document_matches
+    });
     documents.failures.clear();
-    Ok((citations, Some(documents)))
+    let documents = (!documents.verified.is_empty()).then_some(documents);
+    Ok((citations, documents))
 }
 
 fn bind_citations_to_revalidated_prefetched_documents(
@@ -6639,6 +6660,53 @@ mod tests {
         assert!(error
             .to_string()
             .contains("direct-source verification mode mismatch"));
+    }
+
+    #[tokio::test]
+    async fn search_grounding_without_a_publisher_match_can_reach_negative_structure() {
+        let scope = EvidenceScope::new("avionics_identity", "generic-negative").unwrap();
+        let mut dossier = evidence_dossier(scope.clone());
+        dossier.direct_source_text_verification = true;
+        dossier.direct_source_relevance_anchors =
+            ["garmin".to_string(), "nonexistent feature".to_string()]
+                .into_iter()
+                .collect();
+        dossier.direct_source_documents = None;
+        let request = evidence_request()
+            .with_evidence_scope(scope.clone())
+            .with_direct_source_text_verification()
+            .with_direct_source_relevance_anchors(["Garmin", "Nonexistent Feature"]);
+        let structured = json!({
+            "source_url": "https://example.com/manual",
+            "evidence_excerpt": "The GTX 345R is part number 011-03378-40."
+        });
+        let (endpoint, server, _) =
+            one_response_interactions_server(structure_response("negative-structure", &structured));
+        let client = GeminiInteractionsClient::with_test_endpoint(
+            "test-key",
+            endpoint,
+            RetryPolicy::new(1, Duration::from_millis(1), Duration::from_millis(1)).unwrap(),
+        )
+        .unwrap();
+
+        let pass = run_grounded_json_pass_reusing(
+            &client,
+            &GeminiRuntimeConfig::default(),
+            request,
+            &scope,
+            &dossier,
+            |task, purpose| InteractionAccountingContext::new(task, purpose),
+        )
+        .await
+        .expect("claim-bound Search grounding must remain usable for reject or unresolved");
+        server.join().unwrap();
+
+        assert_eq!(pass.value, structured);
+        assert!(pass.source_evidence_proofs.is_empty());
+        assert!(pass
+            .verified_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.direct_source_documents.is_none()));
     }
 
     #[test]
