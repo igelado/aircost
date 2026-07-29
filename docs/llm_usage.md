@@ -164,12 +164,43 @@ than copied forward, so a policy upgrade cannot silently reuse proof admitted
 under weaker verifier semantics.
 
 Unrelated oversized or excess rows do not invalidate a targeted projection.
-Target-relevant overflow, missing or undecodable invoked fonts, unhandled
-invoked Form XObjects, malformed transforms, and incomplete page or resource
-structures fail closed. Guarded source downloads are capped at 8 MiB; PDFs are
-additionally capped at 256 pages, 2 MiB of extracted publisher text, and 2 MiB of
-page content plus inspected invoked resources per page. Invoked font and Form
-counts, graphics-state depth, and page-tree depth are independently bounded.
+Target-aware PDF projection recursively interprets bounded text-bearing Form
+XObjects. Each Form uses its own resource dictionary when present and otherwise
+falls back only to the nearest inherited page resource dictionary; page-tree
+resources are inherited as a whole dictionary and never merged name by name.
+Form matrices compose with the invoking graphics transform, Form invocation
+restores the caller's graphics and resolved font state, and Form bounding boxes
+and supported rectangular clips must contain the conservative painted extent of
+the complete text run, not merely its origin. Repeated invocation is allowed at
+each invocation's transform, while active-path cycles are rejected.
+
+Target-relevant overflow, malformed Form types, subtypes, resources, matrices,
+bounding boxes, or operators, unsupported reference XObjects, and incomplete
+page or resource structures fail closed. Text painted with a missing,
+undecodable, or unsupported font is ineligible to establish proof; the verifier
+never substitutes a fallback encoding for it.
+Every declared page and Form content stream must decompress successfully within
+the cumulative page budget and parse without ignored trailing syntax. Font
+encodings and `ToUnicode` maps are explicit and validated, except for the
+spec-defined StandardEncoding default on exact, unembedded Latin Base-14 Type1
+fonts; encoding-difference dictionaries must name their recognized base
+encoding. Unsupported custom glyph programs and Type0/CID fonts whose descendant
+metrics are not interpreted cannot establish proof. Text-state advancement,
+text rise, the leaf Page's non-inherited `UserUnit`, and the graphics transform
+at the time a clipping path is constructed are included in layout decisions.
+Text under unsupported optional-content, transparency-group, soft-mask,
+nonstandard blend, arbitrary clipping, or non-painting text-rendering state
+cannot establish deterministic proof. Guarded source downloads are capped at 8
+MiB; PDFs are additionally capped at 256 pages, 2 MiB of extracted publisher
+text, and 2 MiB of page content plus recursively inspected invoked resources per
+page. Distinct invoked fonts and Forms, total XObject invocations, Form
+recursion, graphics-state depth, and page-tree depth are independently bounded.
+The lopdf loader's eager cross-reference and object-stream decompression cap is
+currently per structural stream. The cumulative 2 MiB inspection budget starts
+after loading, when page, Form, and font streams are inspected; it does not
+aggregate eager structural-stream inflation. A true aggregate load-time
+decompression budget requires a shared counter in lopdf's `Reader` and
+`ObjectStream` paths and cannot be proven by application-level post-load checks.
 
 Durable evidence is limited to source records and atomic claims that active
 catalog approval, FAA provenance, aircraft assignments, applicability, or
