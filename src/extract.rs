@@ -297,10 +297,9 @@ pub struct GroundedJsonResponse {
     pub grounding_sources: Vec<GeminiGroundingSource>,
     pub grounding_supports: Vec<GeminiGroundingSupport>,
     /// Server-fetched publisher-text proofs for the exact evidence excerpts
-    /// returned by a verified authoritative direct-source structure pass.
-    ///
-    /// Search-grounded responses leave this empty. A caller-supplied URL or
-    /// reviewer excerpt alone can never populate it.
+    /// returned by a verified Search or authoritative direct-source structure
+    /// pass. A caller-supplied URL, Gemini citation, or reviewer excerpt alone
+    /// can never populate it.
     pub source_evidence_proofs: Vec<SourceEvidenceProof>,
     pub interaction_audits: Vec<InteractionAudit>,
     /// Present only when Search/URL Context or authorized server-fetch evidence
@@ -494,6 +493,27 @@ fn avionics_identity_direct_source_relevance_hints(
     hints
 }
 
+fn avionics_identity_publisher_anchors(context: &AvionicsUnitResolutionContext) -> Vec<String> {
+    let mut anchors = Vec::new();
+    let mut seen = HashSet::new();
+    for value in [&context.candidate.manufacturer, &context.candidate.model] {
+        let value = value.trim();
+        let key = normalize_name(value);
+        if !key.is_empty() && seen.insert(key) {
+            anchors.push(value.to_string());
+        }
+    }
+    anchors
+}
+
+fn effective_avionics_publisher_anchors(context: &AvionicsUnitResolutionContext) -> Vec<String> {
+    if context.authoritative_identity_anchors.is_empty() {
+        avionics_identity_publisher_anchors(context)
+    } else {
+        context.authoritative_identity_anchors.clone()
+    }
+}
+
 fn avionics_collision_direct_source_relevance_hints(
     context: &AvionicsCatalogCollisionReviewContext,
 ) -> Vec<String> {
@@ -545,6 +565,16 @@ fn avionics_direct_source_product_identity_requirements(
         .collect()
 }
 
+fn effective_avionics_product_identity_requirements(
+    context: &AvionicsUnitResolutionContext,
+) -> Vec<DirectSourceProductIdentityRequirement> {
+    if context.authoritative_direct_source_urls.is_empty() {
+        Vec::new()
+    } else {
+        avionics_direct_source_product_identity_requirements(context)
+    }
+}
+
 fn configure_avionics_authoritative_direct_sources(
     mut request: GroundedJsonPassRequest,
     urls: &[String],
@@ -554,6 +584,13 @@ fn configure_avionics_authoritative_direct_sources(
 ) -> Result<GroundedJsonPassRequest> {
     match (urls.is_empty(), identity_anchors.is_empty()) {
         (true, true) => Ok(request),
+        (true, false) => Ok(request
+            .with_direct_source_text_verification()
+            .with_direct_source_relevance_anchors(identity_anchors.iter().cloned())
+            .with_direct_source_relevance_hints(relevance_hints.iter().cloned())
+            .with_direct_source_product_identity_requirements(
+                product_identity_requirements.iter().cloned(),
+            )),
         (false, false) => {
             request = request
                 .with_direct_source_text_verification()
@@ -566,9 +603,9 @@ fn configure_avionics_authoritative_direct_sources(
                 .with_authorized_direct_fetch();
             Ok(request)
         }
-        _ => bail!(
-            "authoritative avionics direct-source URLs and identity anchors must be supplied together"
-        ),
+        (false, true) => {
+            bail!("authoritative avionics direct-source URLs require identity anchors")
+        }
     }
 }
 
@@ -839,9 +876,10 @@ impl GeminiListingExtractor {
         context: &AvionicsUnitResolutionContext,
     ) -> Result<GroundedJsonResponse> {
         let evidence_scope = avionics_identity_evidence_scope(context)?;
+        let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            avionics_direct_source_product_identity_requirements(context);
+            effective_avionics_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_identity",
             build_avionics_unit_resolution_prompt(context),
@@ -853,7 +891,7 @@ impl GeminiListingExtractor {
             Some(evidence_scope),
             None,
             &context.authoritative_direct_source_urls,
-            &context.authoritative_identity_anchors,
+            &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
         )
@@ -865,9 +903,11 @@ impl GeminiListingExtractor {
         context: &AvionicsCatalogCollisionReviewContext,
     ) -> Result<GroundedJsonResponse> {
         let evidence_scope = avionics_collision_evidence_scope(context)?;
+        let publisher_anchors =
+            effective_avionics_publisher_anchors(&context.classification_context);
         let relevance_hints = avionics_collision_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            avionics_direct_source_product_identity_requirements(&context.classification_context);
+            effective_avionics_product_identity_requirements(&context.classification_context);
         self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review",
             build_avionics_catalog_collision_review_prompt(context),
@@ -881,9 +921,7 @@ impl GeminiListingExtractor {
             &context
                 .classification_context
                 .authoritative_direct_source_urls,
-            &context
-                .classification_context
-                .authoritative_identity_anchors,
+            &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
         )
@@ -905,9 +943,11 @@ impl GeminiListingExtractor {
     ) -> Result<GroundedJsonResponse> {
         let (source_scope, evidence_scope) =
             avionics_direct_source_chain_scopes(source_context, context)?;
+        let publisher_anchors =
+            effective_avionics_publisher_anchors(&context.classification_context);
         let relevance_hints = avionics_collision_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            avionics_direct_source_product_identity_requirements(&context.classification_context);
+            effective_avionics_product_identity_requirements(&context.classification_context);
         self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review",
             build_avionics_catalog_collision_review_prompt(context),
@@ -924,9 +964,7 @@ impl GeminiListingExtractor {
             &context
                 .classification_context
                 .authoritative_direct_source_urls,
-            &context
-                .classification_context
-                .authoritative_identity_anchors,
+            &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
         )
@@ -941,9 +979,11 @@ impl GeminiListingExtractor {
         evidence: &VerifiedEvidenceDossier,
     ) -> Result<GroundedJsonResponse> {
         let evidence_scope = avionics_collision_evidence_scope(context)?;
+        let publisher_anchors =
+            effective_avionics_publisher_anchors(&context.classification_context);
         let relevance_hints = avionics_collision_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            avionics_direct_source_product_identity_requirements(&context.classification_context);
+            effective_avionics_product_identity_requirements(&context.classification_context);
         self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review_correction",
             build_avionics_catalog_collision_review_correction_prompt(
@@ -963,9 +1003,7 @@ impl GeminiListingExtractor {
             &context
                 .classification_context
                 .authoritative_direct_source_urls,
-            &context
-                .classification_context
-                .authoritative_identity_anchors,
+            &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
         )
@@ -979,9 +1017,10 @@ impl GeminiListingExtractor {
         correction_context: &AvionicsUnitResolutionCorrectionContext,
     ) -> Result<GroundedJsonResponse> {
         let evidence_scope = avionics_identity_evidence_scope(context)?;
+        let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            avionics_direct_source_product_identity_requirements(context);
+            effective_avionics_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_identity_correction",
             build_avionics_unit_resolution_correction_prompt(
@@ -997,7 +1036,7 @@ impl GeminiListingExtractor {
             Some(evidence_scope),
             None,
             &context.authoritative_direct_source_urls,
-            &context.authoritative_identity_anchors,
+            &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
         )
@@ -1012,9 +1051,10 @@ impl GeminiListingExtractor {
         evidence: &VerifiedEvidenceDossier,
     ) -> Result<GroundedJsonResponse> {
         let evidence_scope = avionics_identity_evidence_scope(context)?;
+        let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            avionics_direct_source_product_identity_requirements(context);
+            effective_avionics_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_identity_correction",
             build_avionics_unit_resolution_correction_prompt(
@@ -1030,7 +1070,7 @@ impl GeminiListingExtractor {
             Some(evidence_scope),
             Some(AvionicsEvidenceReuse::Exact(evidence)),
             &context.authoritative_direct_source_urls,
-            &context.authoritative_identity_anchors,
+            &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
         )
@@ -2019,7 +2059,7 @@ Rules:\n\
 - Do not substitute factory/default equipment for an ambiguous listing candidate. Factory defaults are modeled separately from listing-installed equipment.\n\
 - Do not treat generic features/classes as concrete units. Examples: ADS-B, WAAS GPS, Dual WAAS, Remote Transponder, Standard Audio Panel, Audio Controller, Autopilot, Synthetic Vision, Engine Monitor, radios, NAV/COM, GPS, Traffic, Datalink Weather, Backup Instruments.\n\
 - identity_source_url/title/evidence must cite authoritative identity evidence for existing_match or propose_new, and identity_source_url must copy the final verified HTTPS URL exactly, including its query when present; do not return an earlier redirect URL or rewrite the URL. Prefer manufacturer product pages, official manuals/service documents, FAA approval records, or equivalent primary references. An ordinary sale listing is installation context, not authoritative product-identity evidence.\n\
-- For every positive decision, identity_evidence must be one exact, short source passage that itself contains the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. When manufacturer_identifier is the same official model designation as canonical_model after punctuation normalization, one exact occurrence satisfies both fields, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Model and identifier mentions elsewhere on a multi-product page cannot repair an unrelated excerpt.\n\
+- For every positive decision, identity_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this structure call. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. The passage must itself contain the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. When manufacturer_identifier is the same official model designation as canonical_model after punctuation normalization, one exact occurrence satisfies both fields, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Model and identifier mentions elsewhere on a multi-product page cannot repair an unrelated excerpt. If no supplied publisher passage satisfies these rules, return unresolved.\n\
 - For propose_new, promotion of an unreviewed candidate, or capability enrichment of an approved candidate, identity_evidence must explicitly support the exact product identifier and every new returned canonical_types capability. Omit an unproven capability on new/unreviewed identities; for an approved identity with an unverified new observation, return unresolved instead of dropping the observation or changing the stored capability set.\n\
 - For reject or unresolved, use empty canonical identity/source/identifier strings, an empty canonical_types array, manufacturer_identifier_kind=none, and manufacturer_identifier_scope=none.\n\
 - reason must briefly explain the evidence-based identity decision. For reject, reason must be a candidate-specific negative claim conservatively copied from one cited support span, explicitly naming the observed model and its usable manufacturer; do not paraphrase or infer a negative conclusion from an identity-only citation.\n\
@@ -2094,7 +2134,7 @@ Correction rules:\n\
 - Identifier scope is relative to canonical_model. A concrete LRU, internal box, replaceable component, sensor, display, or controller may be the exact catalog product; its own identifier is exact_catalog_product. That identifier cannot identify a different containing multi-box system, integrated suite, or named package. A manufacturer model number is acceptable when authoritative evidence establishes it as the identifier of the exact proposed product, including a concrete LRU, rather than a broad family.\n\
 - Positive canonical_types must be distinct exact server values from: {curated_types}. Include every verified multifunction capability; use both NAV and COM rather than NAV/COM.\n\
 - Use official manufacturer documents or equivalent primary records. identity_source_url must copy the final verified HTTPS URL exactly, including its query when present; identity_source_url/title/evidence must identify the exact source and support the exact product, exact-scope identifier, and every new/promoted capability. Never invent, paraphrase, or broaden a support passage; preserve conflicts.\n\
-- For every positive decision, identity_evidence must be one exact, short source passage that itself contains the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. When the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Separate mentions elsewhere on a multi-product page are insufficient.\n\
+- For every positive decision, identity_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this correction call. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. The passage must itself contain the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. When the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Separate mentions elsewhere on a multi-product page are insufficient. If no supplied publisher passage satisfies these rules, return unresolved.\n\
 - reject and unresolved require catalog_id=0, an empty canonical_types array, blank identity/source/identifier fields, identifier kind none, and manufacturer_identifier_scope=none. reject requires rejection_basis=generic_or_class_only, feature_only, not_installed_equipment, or demonstrably_nonexistent; every other status requires rejection_basis=none.\n\
 - reject additionally requires high/very_high confidence and one linked authoritative support span containing the complete candidate-specific negative reason and substantiating rejection_basis; an identity-only mention is insufficient.\n\
 - If evidence cannot satisfy an exact identity, exact identifier scope, capability, source, evidence, or confidence requirement, return unresolved. Fill every schema field without nulls or extras.\n\n\
@@ -2165,8 +2205,8 @@ Rules:\n\
 - Do not return different_product when the independently proven identities have the same exact stable identifier, or the same complete normalized model for a legacy candidate without an identifier.\n\
 - Treat different hardware suffixes, generations, form factors, certification variants, remote versus panel units, materially different packages, and separate manufacturer part/model numbers as different products unless authoritative evidence proves they are the same identity.\n\
 - Compare manufacturer_identifier_kind and manufacturer_identifier whenever present, but verify them against authoritative sources. String similarity and mechanical normalization are not identity evidence.\n\
-- The top-level proposal_source_url, proposal_source_title, and proposal_evidence are the one authoritative proof of the proposed identity, and proposal_source_url must copy the final verified HTTPS URL exactly, including its query when present. proposal_evidence must be one exact, short passage containing the complete proposed canonical_model and manufacturer_identifier; when the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also name the canonical manufacturer and cannot be shorter than 12 characters.\n\
-- Each review's candidate_source_url, candidate_source_title, and candidate_evidence are the authoritative proof of that reviewed catalog candidate. candidate_evidence must be one exact, short passage containing the candidate's complete model and manufacturer identifier when present.\n\
+- The top-level proposal_source_url, proposal_source_title, and proposal_evidence are the one authoritative proof of the proposed identity, and proposal_source_url must copy the final verified HTTPS URL exactly, including its query when present. proposal_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this structure call; Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. The passage must contain the complete proposed canonical_model and manufacturer_identifier; when the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also name the canonical manufacturer and cannot be shorter than 12 characters.\n\
+- Each review's candidate_source_url must copy its final verified HTTPS URL exactly, including its query when present. candidate_source_title and candidate_evidence are the authoritative proof of that reviewed catalog candidate. candidate_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this structure call and contain the candidate's complete model and manufacturer identifier when present.\n\
 - Proposal and candidate proof passages are independently source-bound and may come from separate exact rows or passages, including separate rows on the same authoritative page. Do not require one passage to contain both products. Use decision and reason to compare the two independently proven identities.\n\
 - Use manufacturer pages, manuals, service documents, FAA approval records, or equivalent primary identity references for both proofs. Ordinary sale listings and retailer-generated SKUs are not authoritative identity evidence.\n\
 - For confirmed_same_as_input, confidence must be very_high for every candidate review. Use very_high only when identifiers or authoritative documentation establish that candidate decision directly. If any review would have high, medium, or low confidence, return proposal_decision=not_confirmed and preserve the honest review confidence instead.\n\
@@ -2221,8 +2261,8 @@ Correction rules:\n\
 - same_product requires the exact same physical product or named suite/package. Distinct suffixes, generations, remote/panel form factors, certification variants, packages, or manufacturer identifiers are different_product unless the verified evidence directly establishes sameness.\n\
 - Under this split-proof schema, same_product must have the same exact manufacturer identifier kind/value after punctuation normalization when the candidate has an identifier, or the same complete normalized model when a legacy candidate has no identifier. If those stable signals differ, use proposal_decision=not_confirmed rather than asserting an ungrounded relationship in reason.\n\
 - Do not return different_product for identities carrying the same exact stable signal.\n\
-- The top-level proposal source/evidence triplet must come from the verified dossier, copy the final verified HTTPS URL exactly including its query when present, and prove the complete proposed canonical model and manufacturer identifier in one exact, short passage. When the official manufacturer model number equals the canonical model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also name the canonical manufacturer and cannot be shorter than 12 characters.\n\
-- Each review's candidate_source_url, candidate_source_title, and candidate_evidence must come from the verified dossier and prove only that reviewed candidate's complete model and manufacturer identifier in one exact, short passage.\n\
+- The top-level proposal source/evidence triplet must come from the verified dossier, copy the final verified HTTPS URL exactly including its query when present, and copy one exact, short server-fetched publisher passage proving the complete proposed canonical model and manufacturer identifier. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. When the official manufacturer model number equals the canonical model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also name the canonical manufacturer and cannot be shorter than 12 characters.\n\
+- Each review's candidate_source_url must copy its final verified HTTPS URL exactly, including its query when present. candidate_source_title and candidate_evidence must come from the verified dossier and prove only that reviewed candidate's complete model and manufacturer identifier in one exact, short server-fetched publisher passage. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence.\n\
 - Proposal and candidate passages are independently source-bound and may be separate exact rows or passages, including separate rows on one authoritative page. Do not require or fabricate one passage containing both products. Use decision and reason to compare the two proven identities.\n\
 - Preserve conflicts; do not broaden, paraphrase, or combine unrelated mentions elsewhere on a multi-product page.\n\
 - When listing evidence is required, input_evidence_text must be an exact nonempty substring of the immutable listing_context containing both the complete raw observed candidate model and the complete proposed canonical model at alphanumeric boundaries. Do not narrow a suite/family label to an unmentioned LRU or component.\n\
@@ -3829,6 +3869,7 @@ mod tests {
         build_avionics_unit_resolution_correction_prompt, build_avionics_unit_resolution_prompt,
         build_avionics_unit_resolution_research_prompt, build_extraction_prompt,
         configure_avionics_authoritative_direct_sources,
+        effective_avionics_product_identity_requirements, effective_avionics_publisher_anchors,
         gemini_aircraft_spec_metadata_response_schema,
         gemini_avionics_approved_candidate_adjudication_response_schema,
         gemini_avionics_catalog_collision_review_response_schema,
@@ -3974,6 +4015,12 @@ mod tests {
         for capability in ["AHRS", "NAV", "COM"] {
             assert!(prompt.contains(capability));
         }
+        assert!(prompt.contains(
+            "identity_evidence must be copied verbatim from one bounded server-fetched publisher passage"
+        ));
+        assert!(prompt.contains(
+            "Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence"
+        ));
         assert!(!CURATED_AVIONICS_TYPES.contains(&"NAV/COM"));
         assert_eq!(
             schema["properties"]["manufacturer_identifier_scope"]["enum"],
@@ -4333,7 +4380,10 @@ mod tests {
         ));
         assert!(prompt.contains("Do not require one passage to contain both products"));
         assert!(prompt.contains(
-            "candidate_evidence must be one exact, short passage containing the candidate's complete model and manufacturer identifier when present"
+            "candidate_evidence must be copied verbatim from one bounded server-fetched publisher passage"
+        ));
+        assert!(prompt.contains(
+            "Each review's candidate_source_url must copy its final verified HTTPS URL exactly"
         ));
         let serialized = serde_json::to_string(&context).expect("review context should serialize");
         for forbidden in [
@@ -4646,6 +4696,8 @@ mod tests {
             "identity_source_url",
             "identity_evidence",
             "candidate-specific negative reason",
+            "server-fetched publisher passage",
+            "paraphrases are not publisher evidence",
         ] {
             assert!(
                 correction.contains(required),
@@ -4721,6 +4773,8 @@ mod tests {
             "candidate_evidence",
             "Do not require or fabricate one passage containing both products",
             "every candidate catalog_id",
+            "server-fetched publisher passage",
+            "paraphrases are not publisher evidence",
         ] {
             assert!(
                 collision_correction.contains(required),
@@ -4871,7 +4925,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_avionics_sources_require_explicit_urls_and_anchors_together() {
+    fn avionics_publisher_verification_requires_anchors_and_makes_urls_optional() {
         use crate::gemini::config::GeminiTask;
         use crate::gemini::curation::workflow::GroundedJsonPassRequest;
 
@@ -4889,29 +4943,58 @@ mod tests {
         let urls = vec!["https://static.garmin.com/manual.pdf".to_string()];
         let anchors = vec!["Garmin".to_string(), "GIA 63W".to_string()];
 
-        assert!(
-            configure_avionics_authoritative_direct_sources(request(), &[], &[], &[], &[]).is_ok()
-        );
+        configure_avionics_authoritative_direct_sources(request(), &[], &[], &[], &[])
+            .expect("non-identity callers may omit publisher verification");
         assert!(
             configure_avionics_authoritative_direct_sources(request(), &urls, &[], &[], &[],)
                 .is_err()
         );
-        assert!(configure_avionics_authoritative_direct_sources(
-            request(),
-            &[],
-            &anchors,
-            &[],
-            &[],
-        )
-        .is_err());
-        assert!(configure_avionics_authoritative_direct_sources(
+        configure_avionics_authoritative_direct_sources(request(), &[], &anchors, &[], &[])
+            .expect("ordinary Search evidence should use exact publisher verification");
+
+        configure_avionics_authoritative_direct_sources(
             request(),
             &urls,
             &anchors,
             &["COM".to_string(), "GIA 63 011-00781-00".to_string()],
             &[],
         )
-        .is_ok());
+        .expect("authorized direct sources should retain exact publisher verification");
+    }
+
+    #[test]
+    fn ordinary_avionics_search_uses_server_owned_observed_identity_anchors() {
+        let context = avionics_identity_context();
+        assert_eq!(
+            effective_avionics_publisher_anchors(&context),
+            vec!["Garmin".to_string(), "GTX 345R".to_string()]
+        );
+
+        let mut direct = context;
+        direct.authoritative_identity_anchors =
+            vec!["Garmin".to_string(), "GTX 345R approved source".to_string()];
+        assert_eq!(
+            effective_avionics_publisher_anchors(&direct),
+            direct.authoritative_identity_anchors
+        );
+    }
+
+    #[test]
+    fn ordinary_search_does_not_require_proof_for_every_similarity_candidate() {
+        let context = avionics_identity_context();
+        assert!(
+            effective_avionics_product_identity_requirements(&context).is_empty(),
+            "ordinary Search must be able to return unresolved or reject without proving every shortlist row"
+        );
+
+        let mut direct = context;
+        direct.authoritative_direct_source_urls =
+            vec!["https://static.garmin.com/manual.pdf".to_string()];
+        assert_eq!(
+            effective_avionics_product_identity_requirements(&direct).len(),
+            direct.catalog_candidates.len(),
+            "caller-selected direct-source review retains strict shortlist coverage"
+        );
     }
 
     #[test]

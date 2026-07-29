@@ -1473,8 +1473,6 @@ async fn resolve_verified_identity(
         context,
         &proposed,
         &review_response.value,
-        &review_response.grounding_sources,
-        &review_response.grounding_supports,
         &review_response.source_evidence_proofs,
     );
     if !domain_issues.is_empty() {
@@ -1529,8 +1527,6 @@ async fn resolve_verified_identity(
             context,
             &proposed,
             &review_response.value,
-            &review_response.grounding_sources,
-            &review_response.grounding_supports,
             &review_response.source_evidence_proofs,
         );
         if !domain_issues.is_empty() {
@@ -1544,8 +1540,6 @@ async fn resolve_verified_identity(
         context,
         &proposed,
         &review_response.value,
-        &review_response.grounding_sources,
-        &review_response.grounding_supports,
         &review_response.source_evidence_proofs,
     )?;
     if !attestation.confirmed {
@@ -1566,8 +1560,6 @@ async fn resolve_verified_identity(
     let reviews = collision_reviews_with_direct_source_proofs(
         context,
         &review_response.value,
-        &review_response.grounding_sources,
-        &review_response.grounding_supports,
         &review_response.source_evidence_proofs,
     )?;
     let mut grounded_claim_source_urls = Vec::new();
@@ -3240,8 +3232,6 @@ fn resolution_issues_with_direct_source_proofs(
             validate_authoritative_evidence(
                 response,
                 &context.source_url,
-                grounding_sources,
-                grounding_supports,
                 source_evidence_proofs,
                 &mut issues,
             );
@@ -3273,8 +3263,6 @@ fn resolution_issues_with_direct_source_proofs(
             validate_authoritative_evidence(
                 response,
                 &context.source_url,
-                grounding_sources,
-                grounding_supports,
                 source_evidence_proofs,
                 &mut issues,
             );
@@ -3591,57 +3579,29 @@ fn collision_response_issues(
     context: &AvionicsUnitResolutionContext,
     proposed: &VerifiedIdentity,
     response: &Value,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
     source_evidence_proofs: &[SourceEvidenceProof],
 ) -> Vec<String> {
     match proposal_attestation_with_direct_source_proofs(
         context,
         proposed,
         response,
-        grounding_sources,
-        grounding_supports,
         source_evidence_proofs,
     ) {
         Err(error) => vec![error.to_string()],
-        Ok(attestation) if attestation.confirmed => collision_reviews_with_direct_source_proofs(
-            context,
-            response,
-            grounding_sources,
-            grounding_supports,
-            source_evidence_proofs,
-        )
-        .err()
-        .map(|error| vec![error.to_string()])
-        .unwrap_or_default(),
+        Ok(attestation) if attestation.confirmed => {
+            collision_reviews_with_direct_source_proofs(context, response, source_evidence_proofs)
+                .err()
+                .map(|error| vec![error.to_string()])
+                .unwrap_or_default()
+        }
         Ok(_) => Vec::new(),
     }
-}
-
-#[cfg(test)]
-fn proposal_attestation(
-    context: &AvionicsUnitResolutionContext,
-    proposed: &VerifiedIdentity,
-    response: &Value,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
-) -> CatalogResult<ProposalAttestation> {
-    proposal_attestation_with_direct_source_proofs(
-        context,
-        proposed,
-        response,
-        grounding_sources,
-        grounding_supports,
-        &[],
-    )
 }
 
 fn proposal_attestation_with_direct_source_proofs(
     context: &AvionicsUnitResolutionContext,
     proposed: &VerifiedIdentity,
     response: &Value,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
     source_evidence_proofs: &[SourceEvidenceProof],
 ) -> CatalogResult<ProposalAttestation> {
     for (field, expected) in [
@@ -3744,8 +3704,6 @@ fn proposal_attestation_with_direct_source_proofs(
         proposed.canonical_model.as_str(),
         proposed.manufacturer_identifier.as_str(),
         &context.source_url,
-        grounding_sources,
-        grounding_supports,
         source_evidence_proofs,
         &mut issues,
     );
@@ -3764,27 +3722,9 @@ fn proposal_attestation_with_direct_source_proofs(
     })
 }
 
-#[cfg(test)]
-fn collision_reviews(
-    context: &AvionicsUnitResolutionContext,
-    response: &Value,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
-) -> CatalogResult<Vec<CollisionReview>> {
-    collision_reviews_with_direct_source_proofs(
-        context,
-        response,
-        grounding_sources,
-        grounding_supports,
-        &[],
-    )
-}
-
 fn collision_reviews_with_direct_source_proofs(
     context: &AvionicsUnitResolutionContext,
     response: &Value,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
     source_evidence_proofs: &[SourceEvidenceProof],
 ) -> CatalogResult<Vec<CollisionReview>> {
     let values = response
@@ -3849,8 +3789,6 @@ fn collision_reviews_with_direct_source_proofs(
             &reviewed_candidate.model,
             &reviewed_candidate.manufacturer_identifier,
             &context.source_url,
-            grounding_sources,
-            grounding_supports,
             source_evidence_proofs,
             &mut issues,
         );
@@ -3937,8 +3875,6 @@ fn validate_collision_decision_relation(
 fn validate_authoritative_evidence(
     response: &Value,
     listing_source_url: &str,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
     source_evidence_proofs: &[SourceEvidenceProof],
     issues: &mut Vec<String>,
 ) {
@@ -3950,8 +3886,6 @@ fn validate_authoritative_evidence(
         string_field(response, "canonical_model"),
         string_field(response, "manufacturer_identifier"),
         listing_source_url,
-        grounding_sources,
-        grounding_supports,
         source_evidence_proofs,
         issues,
     );
@@ -3965,8 +3899,6 @@ fn validate_evidence_values(
     canonical_model: &str,
     manufacturer_identifier: &str,
     listing_source_url: &str,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
     source_evidence_proofs: &[SourceEvidenceProof],
     issues: &mut Vec<String>,
 ) {
@@ -4047,17 +3979,15 @@ fn validate_evidence_values(
             );
         }
     }
-    if !evidence_is_bound_to_grounding(source_url, evidence, grounding_sources, grounding_supports)
-        && !evidence_is_bound_to_direct_source_proof(
-            source_url,
-            evidence,
-            canonical_model,
-            manufacturer_identifier,
-            source_evidence_proofs,
-        )
-    {
+    if !evidence_is_bound_to_direct_source_proof(
+        source_url,
+        evidence,
+        canonical_model,
+        manufacturer_identifier,
+        source_evidence_proofs,
+    ) {
         issues.push(
-            "identity evidence must be linked by Gemini grounding support or an exact server-fetched publisher-span proof to the claimed web source"
+            "identity evidence must be an exact server-fetched publisher span bound to the final source URL and content digest"
                 .to_string(),
         );
     }
@@ -4093,43 +4023,6 @@ fn exact_evidence_identity_signal_is_present(
     } else {
         exact_product_identity_signal_is_present(evidence, canonical_model, manufacturer_identifier)
     }
-}
-
-fn evidence_is_bound_to_grounding(
-    source_url: &str,
-    evidence: &str,
-    grounding_sources: &[GeminiGroundingSource],
-    grounding_supports: &[GeminiGroundingSupport],
-) -> bool {
-    let evidence_key = normalize_name(evidence);
-    if evidence_key.len() < 12 {
-        return false;
-    }
-    grounding_supports.iter().any(|support| {
-        let support_key = normalize_name(&support.text);
-        support_key.contains(&evidence_key)
-            && support.source_indices.iter().any(|source_index| {
-                grounding_sources.iter().any(|source| {
-                    source.chunk_index == *source_index
-                        && grounding_source_matches_claim(source, source_url)
-                })
-            })
-    })
-}
-
-fn grounding_source_matches_claim(source: &GeminiGroundingSource, claimed_url: &str) -> bool {
-    normalized_evidence_url(&source.url)
-        .zip(normalized_evidence_url(claimed_url))
-        .is_some_and(|(source, claimed)| source == claimed)
-}
-
-fn normalized_evidence_url(value: &str) -> Option<String> {
-    let mut parsed = url::Url::parse(value).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    parsed.set_fragment(None);
-    Some(parsed.to_string())
 }
 
 fn approved_identity_from_verified(
@@ -4867,16 +4760,15 @@ mod tests {
         attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
         authoritative_direct_source_plan, canonical_avionics_types_for_label,
         canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
-        collision_reviews, collision_reviews_with_direct_source_proofs,
+        collision_reviews_with_direct_source_proofs,
         deterministic_graph_approved_identity_from_source,
-        evidence_is_bound_to_direct_source_proof, evidence_is_bound_to_grounding,
-        exact_compact_identity_is_present, exact_product_identity_signal_is_present,
-        expanded_collision_context, grounding_source_matches_claim, known_approved_local_match,
-        load_catalog_candidates, load_known_approved_candidates, load_review_catalog_candidates,
-        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
-        model_identity_relation_score, nonpositive_identity_outcome,
-        persist_approved_capability_enrichment, persist_approved_identity,
-        persist_existing_reuse_attestation, proposal_attestation,
+        evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
+        exact_product_identity_signal_is_present, expanded_collision_context,
+        known_approved_local_match, load_catalog_candidates, load_known_approved_candidates,
+        load_review_catalog_candidates, manufacturer_collision_snapshot_sha256,
+        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
+        nonpositive_identity_outcome, persist_approved_capability_enrichment,
+        persist_approved_identity, persist_existing_reuse_attestation,
         proposal_attestation_with_direct_source_proofs, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
         select_unique_exact_review_candidate, shortlist_avionics_candidates,
@@ -5812,45 +5704,6 @@ mod tests {
     }
 
     #[test]
-    fn grounding_evidence_requires_normalized_containment_in_cited_span() {
-        let (sources, exact_supports) = grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "GTX 345R installation manual",
-            "The Garmin manual identifies the exact GTX-345R product and part number.",
-        );
-        assert!(evidence_is_bound_to_grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "Garmin manual identifies the exact GTX 345R product",
-            &sources,
-            &exact_supports,
-        ));
-
-        let (_, paraphrased_supports) = grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "GTX 345R installation manual",
-            "The part number for GTX 345R appears in the Garmin manual.",
-        );
-        assert!(!evidence_is_bound_to_grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "Garmin manual identifies the GTX 345R part number",
-            &sources,
-            &paraphrased_supports,
-        ));
-
-        let (_, partial_supports) = grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "GTX 345R installation manual",
-            "The manual identifies the GTX 345R.",
-        );
-        assert!(!evidence_is_bound_to_grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "The manual identifies the GTX 345R and confirms part number 011-03520-00.",
-            &sources,
-            &partial_supports,
-        ));
-    }
-
-    #[test]
     fn exact_server_fetched_direct_source_proof_can_replace_missing_support_metadata() {
         let source_url = "https://static.garmin.com/manuals/gtx345r.pdf";
         let evidence = "The manual identifies the remote GTX 345R as part number 011-03520-00.";
@@ -5893,31 +5746,6 @@ mod tests {
             "GTX 345R",
             "011-03520-00",
             &[malformed],
-        ));
-    }
-
-    #[test]
-    fn grounding_source_requires_exact_final_url_including_query() {
-        let source = GeminiGroundingSource {
-            chunk_index: 0,
-            url: "https://static.garmin.com/manuals/gtx345r.pdf/?download=1#page=4".to_string(),
-            title: "GTX 345R installation manual".to_string(),
-        };
-        assert!(grounding_source_matches_claim(
-            &source,
-            "https://static.garmin.com/manuals/gtx345r.pdf/?download=1"
-        ));
-        assert!(!grounding_source_matches_claim(
-            &source,
-            "https://static.garmin.com/manuals/gtx345r.pdf/?download=2"
-        ));
-        assert!(!grounding_source_matches_claim(
-            &source,
-            "https://static.garmin.com/manuals/gtx345r.pdf/"
-        ));
-        assert!(!grounding_source_matches_claim(
-            &source,
-            "https://unrelated.example/manuals/gtx345r.pdf"
         ));
     }
 
@@ -7126,7 +6954,6 @@ mod tests {
     fn official_model_number_identity_accepts_one_specific_model_occurrence() {
         let source_url = "https://static.garmin.com/manuals/gia63w.pdf";
         let evidence = "Garmin GIA 63W";
-        let (sources, supports) = grounding(source_url, "GIA 63W manual", evidence);
         let mut issues = Vec::new();
 
         validate_evidence_values(
@@ -7137,13 +6964,16 @@ mod tests {
             "GIA 63W",
             "GIA 63W",
             "https://listing.example/aircraft/1",
-            &sources,
-            &supports,
             &[],
             &mut issues,
         );
 
-        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+        assert!(
+            issues.iter().any(|issue| issue.contains(
+                "exact server-fetched publisher span bound to the final source URL and content digest"
+            )),
+            "grounding-only evidence must not approve a product identity: {issues:?}"
+        );
 
         let proof = direct_source_proof(source_url, evidence);
         let mut direct_source_issues = Vec::new();
@@ -7155,8 +6985,6 @@ mod tests {
             "GIA 63W",
             "GIA 63W",
             "https://listing.example/aircraft/1",
-            &[],
-            &[],
             &[proof],
             &mut direct_source_issues,
         );
@@ -7181,8 +7009,6 @@ mod tests {
             "G5",
             "G5",
             "https://listing.example/aircraft/1",
-            &[],
-            &[],
             &[proof],
             &mut issues,
         );
@@ -7196,7 +7022,6 @@ mod tests {
     fn identity_evidence_rejects_non_https_source_claims() {
         let source_url = "http://static.garmin.com/manuals/gia63w.pdf";
         let evidence = "Garmin GIA 63W";
-        let (sources, supports) = grounding(source_url, "GIA 63W manual", evidence);
         let mut issues = Vec::new();
 
         validate_evidence_values(
@@ -7207,8 +7032,6 @@ mod tests {
             "GIA 63W",
             "GIA 63W",
             "https://listing.example/aircraft/1",
-            &sources,
-            &supports,
             &[],
             &mut issues,
         );
@@ -7262,7 +7085,12 @@ mod tests {
             "GTX 345R installation manual",
             "The manual identifies the remote GTX 345R as part number 011-TEST-1.",
         );
-        assert!(resolution_issues(&context, &response, true, &sources, &supports).is_empty());
+        assert!(
+            resolution_issues(&context, &response, true, &sources, &supports)
+                .iter()
+                .any(|issue| issue.contains("exact server-fetched publisher span")),
+            "Gemini-authored citation prose must not authorize a positive identity"
+        );
         assert!(
             resolution_issues(&context, &response, false, &sources, &supports)
                 .iter()
@@ -7280,11 +7108,6 @@ mod tests {
                 .any(|issue| issue.contains("verified Search + URL Context")),
             "a raw caller URL must not authorize a catalog identity"
         );
-        assert!(
-            resolution_issues(&direct_context, &response, true, &sources, &supports).is_empty(),
-            "verified direct-source + URL Context evidence may authorize the same identity"
-        );
-
         let direct_source_proofs = [direct_source_proof(
             "https://static.garmin.com/manuals/gtx345r.pdf",
             "The manual identifies the remote GTX 345R as part number 011-TEST-1.",
@@ -7376,10 +7199,19 @@ mod tests {
             "Garmin GNX 375 pilot guide",
             "Garmin documents the GNX 375 as a GPS navigator with an integrated transponder.",
         );
-        assert!(resolution_issues(&context, &response, true, &sources, &supports).is_empty());
+        let proofs = [direct_source_proof(
+            "https://static.garmin.com/manuals/gnx375.pdf",
+            "Garmin documents the GNX 375 as a GPS navigator with an integrated transponder.",
+        )];
+        assert!(resolution_issues_with_direct_source_proofs(
+            &context, &response, true, &sources, &supports, &proofs,
+        )
+        .is_empty());
 
         response["canonical_types"] = json!(["Transponder"]);
-        let issues = resolution_issues(&context, &response, true, &sources, &supports);
+        let issues = resolution_issues_with_direct_source_proofs(
+            &context, &response, true, &sources, &supports, &proofs,
+        );
         assert!(issues
             .iter()
             .any(|issue| issue.contains("newly observed capability \"GPS\" or return unresolved")));
@@ -7453,12 +7285,12 @@ mod tests {
                 "reason": "Different form factor and part number."
             }]
         });
-        let (sources, supports) = grounding(
+        let proofs = [direct_source_proof(
             "https://static.garmin.com/manuals/gtx345.pdf",
-            "GTX 345 manual",
             "The manual identifies panel GTX 345 part number 011-TEST-1.",
-        );
-        let error = collision_reviews(&context, &response, &sources, &supports).unwrap_err();
+        )];
+        let error =
+            collision_reviews_with_direct_source_proofs(&context, &response, &proofs).unwrap_err();
         assert!(error.to_string().contains("omitted"));
     }
 
@@ -7484,9 +7316,8 @@ mod tests {
             evidence,
         )];
 
-        let error =
-            collision_reviews_with_direct_source_proofs(&context, &response, &[], &[], &proofs)
-                .expect_err("proposal-only evidence cannot adjudicate a catalog candidate");
+        let error = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect_err("proposal-only evidence cannot adjudicate a catalog candidate");
         assert!(error
             .to_string()
             .contains("canonical model and manufacturer identifier"));
@@ -7517,9 +7348,8 @@ mod tests {
         });
         let proofs = [direct_source_proof(source_url, candidate_evidence)];
 
-        let reviews =
-            collision_reviews_with_direct_source_proofs(&context, &response, &[], &[], &proofs)
-                .expect("an exact model row should prove a legacy candidate with no identifier");
+        let reviews = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect("an exact model row should prove a legacy candidate with no identifier");
         assert_eq!(reviews.len(), 1);
     }
 
@@ -7568,18 +7398,10 @@ mod tests {
             direct_source_proof(source_url, candidate_evidence),
         ];
 
-        proposal_attestation_with_direct_source_proofs(
-            &context,
-            &proposed,
-            &response,
-            &[],
-            &[],
-            &proofs,
-        )
-        .expect("the proposal row should independently prove GIA 63W");
-        let reviews =
-            collision_reviews_with_direct_source_proofs(&context, &response, &[], &[], &proofs)
-                .expect("a separate exact candidate row should support different_product");
+        proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &proofs)
+            .expect("the proposal row should independently prove GIA 63W");
+        let reviews = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect("a separate exact candidate row should support different_product");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].decision, "different_product");
     }
@@ -7610,9 +7432,8 @@ mod tests {
             evidence,
         )];
 
-        let reviews =
-            collision_reviews_with_direct_source_proofs(&context, &response, &[], &[], &proofs)
-                .expect("one exact signal may prove harmless typography variants of one product");
+        let reviews = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect("one exact signal may prove harmless typography variants of one product");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].decision, "same_product");
     }
@@ -7642,9 +7463,8 @@ mod tests {
             candidate_evidence,
         )];
 
-        let error =
-            collision_reviews_with_direct_source_proofs(&context, &response, &[], &[], &proofs)
-                .expect_err("different stable identifiers cannot support same_product");
+        let error = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect_err("different stable identifiers cannot support same_product");
         assert!(error
             .to_string()
             .contains(
@@ -7679,14 +7499,13 @@ mod tests {
             candidate_evidence,
         )];
 
-        let error =
-            collision_reviews_with_direct_source_proofs(&context, &response, &[], &[], &proofs)
-                .expect_err("one exact stable identity cannot support different_product");
+        let error = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect_err("one exact stable identity cannot support different_product");
         assert!(error.to_string().contains("cannot claim different_product"));
     }
 
     #[test]
-    fn empty_shortlist_still_requires_independent_grounded_proposal_attestation() {
+    fn empty_shortlist_still_requires_exact_publisher_proposal_attestation() {
         let context = context(vec![]);
         let proposed = verified_identity();
         let mut response = json!({
@@ -7705,14 +7524,12 @@ mod tests {
             "proposal_reason": "The listing excerpt and official manual identify one exact unit.",
             "reviews": []
         });
-        let (sources, supports) = grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "GTX 345R installation manual",
-            "The manufacturer manual identifies GTX 345R as part number 011-03520-00.",
-        );
-        let attestation = proposal_attestation(&context, &proposed, &response, &sources, &supports)
-            .expect("grounded attestation should validate");
-        assert!(attestation.confirmed);
+        let error =
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &[])
+                .expect_err("Gemini-authored citation prose must not approve a product identity");
+        assert!(error.to_string().contains(
+            "exact server-fetched publisher span bound to the final source URL and content digest"
+        ));
         let direct_source_proofs = [direct_source_proof(
             "https://static.garmin.com/manuals/gtx345r.pdf",
             "The manufacturer manual identifies GTX 345R as part number 011-03520-00.",
@@ -7721,16 +7538,15 @@ mod tests {
             &context,
             &proposed,
             &response,
-            &sources,
-            &[],
             &direct_source_proofs,
         )
-        .expect("server-fetched publisher proof should replace omitted support metadata");
+        .expect("server-fetched publisher proof should attest the exact identity");
         assert!(attestation.confirmed);
 
         response["proposal_manufacturer_identifier_scope"] = json!("component_of_catalog_product");
         let error =
-            proposal_attestation(&context, &proposed, &response, &sources, &supports).unwrap_err();
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &[])
+                .unwrap_err();
         assert!(error
             .to_string()
             .contains("proposal_manufacturer_identifier_scope=exact_catalog_product"));
@@ -7738,7 +7554,8 @@ mod tests {
         response["proposal_manufacturer_identifier_scope"] = json!("exact_catalog_product");
         response["input_evidence_text"] = json!("GTX 345R");
         let error =
-            proposal_attestation(&context, &proposed, &response, &sources, &supports).unwrap_err();
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &[])
+                .unwrap_err();
         assert!(error.to_string().contains("copied exactly"));
     }
 
@@ -7830,14 +7647,9 @@ mod tests {
             "proposal_reason": "The listing excerpt and official manual identify one exact unit.",
             "reviews": []
         });
-        let (sources, supports) = grounding(
-            "https://static.garmin.com/manuals/gtx345r.pdf",
-            "GTX 345R installation manual",
-            "The manufacturer manual identifies GTX 345R as part number 011-03520-00.",
-        );
-
         let error =
-            proposal_attestation(&context, &proposed, &response, &sources, &supports).unwrap_err();
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &[])
+                .unwrap_err();
         assert!(
             error.to_string().contains("alphanumeric boundaries"),
             "a longer listing model must not attest a truncated raw model: {error}"
@@ -7882,8 +7694,9 @@ mod tests {
             "reviews": []
         });
 
-        let error = proposal_attestation(&context, &proposed, &response, &[], &[])
-            .expect_err("a containing suite label cannot prove an unmentioned component");
+        let error =
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &[])
+                .expect_err("a containing suite label cannot prove an unmentioned component");
         assert!(error
             .to_string()
             .contains("complete proposed canonical model"));
@@ -7910,14 +7723,13 @@ mod tests {
             "proposal_reason": "The listing excerpt and official manual identify one exact unit.",
             "reviews": []
         });
-        let (sources, supports) = grounding(
+        let proofs = [direct_source_proof(
             "https://static.garmin.com/manuals/gtx345r.pdf",
-            "GTX 345R installation manual",
             "The manufacturer manual identifies GTX 345R as part number 011-03520-00.",
-        );
-
-        let attestation = proposal_attestation(&context, &proposed, &response, &sources, &supports)
-            .expect("punctuation-only listing typography should remain admissible");
+        )];
+        let attestation =
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &proofs)
+                .expect("punctuation-only listing typography should remain admissible");
         assert!(attestation.confirmed);
     }
 
@@ -7941,8 +7753,9 @@ mod tests {
             "proposal_reason": "The stored listing excerpt is insufficient to prove the mapping.",
             "reviews": []
         });
-        let attestation = proposal_attestation(&context, &proposed, &response, &[], &[])
-            .expect("an honest negative should remain a normal unresolved outcome");
+        let attestation =
+            proposal_attestation_with_direct_source_proofs(&context, &proposed, &response, &[])
+                .expect("an honest negative should remain a normal unresolved outcome");
         assert!(!attestation.confirmed);
     }
 
