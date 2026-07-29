@@ -3556,6 +3556,15 @@ fn verified_identity_from_response(response: &Value) -> CatalogResult<VerifiedId
             "verified identity has an unusable manufacturer identifier".to_string(),
         ));
     }
+    if normalize_avionics_identifier(&identity.manufacturer_identifier)
+        == normalize_avionics_identifier(&identity.canonical_model)
+        && identity.manufacturer_identifier_kind != "manufacturer_model_number"
+    {
+        return Err(CatalogError::Validation(
+            "an identifier equal to the canonical model must use manufacturer_model_number"
+                .to_string(),
+        ));
+    }
     Ok(identity)
 }
 
@@ -3714,6 +3723,13 @@ fn proposal_attestation_with_direct_source_proofs(
                     .to_string(),
             ));
         }
+        let canonical_model_key = normalize_avionics_identifier(&proposed.canonical_model);
+        if !exact_compact_identity_is_present(&input_evidence, &canonical_model_key) {
+            return Err(CatalogError::Validation(
+                "listing input evidence does not contain the complete proposed canonical model at alphanumeric boundaries"
+                    .to_string(),
+            ));
+        }
     }
 
     let source_url = required_field(response, "proposal_source_url")?;
@@ -3724,6 +3740,7 @@ fn proposal_attestation_with_direct_source_proofs(
         &source_url,
         &source_title,
         &evidence,
+        proposed.canonical_manufacturer.as_str(),
         proposed.canonical_model.as_str(),
         proposed.manufacturer_identifier.as_str(),
         &context.source_url,
@@ -3828,6 +3845,7 @@ fn collision_reviews_with_direct_source_proofs(
             &candidate_source_url,
             &candidate_source_title,
             &candidate_evidence,
+            &reviewed_candidate.manufacturer,
             &reviewed_candidate.model,
             &reviewed_candidate.manufacturer_identifier,
             &context.source_url,
@@ -3928,6 +3946,7 @@ fn validate_authoritative_evidence(
         string_field(response, "identity_source_url"),
         string_field(response, "identity_source_title"),
         string_field(response, "identity_evidence"),
+        string_field(response, "canonical_manufacturer"),
         string_field(response, "canonical_model"),
         string_field(response, "manufacturer_identifier"),
         listing_source_url,
@@ -3942,6 +3961,7 @@ fn validate_evidence_values(
     source_url: &str,
     source_title: &str,
     evidence: &str,
+    canonical_manufacturer: &str,
     canonical_model: &str,
     manufacturer_identifier: &str,
     listing_source_url: &str,
@@ -3994,6 +4014,21 @@ fn validate_evidence_values(
     }
     if source_title.trim().chars().count() < 4 {
         issues.push("identity source title must be specific and non-empty".to_string());
+    }
+    let evidence_character_count = evidence.trim().chars().count();
+    let model_key = normalize_avionics_identifier(canonical_model);
+    let identifier_key = normalize_avionics_identifier(manufacturer_identifier);
+    let manufacturer_key = normalize_avionics_identifier(canonical_manufacturer);
+    let is_specific_short_model_designation = evidence_character_count >= 12
+        && !model_key.is_empty()
+        && model_key == identifier_key
+        && !manufacturer_key.is_empty()
+        && exact_compact_identity_is_present(evidence, &manufacturer_key);
+    if evidence_character_count < 20 && !is_specific_short_model_designation {
+        issues.push(
+            "identity evidence must contain a specific supporting fact; a short model-designation row must also name the canonical manufacturer"
+                .to_string(),
+        );
     }
     if !exact_evidence_identity_signal_is_present(
         evidence,
@@ -4094,13 +4129,6 @@ fn normalized_evidence_url(value: &str) -> Option<String> {
         return None;
     }
     parsed.set_fragment(None);
-    parsed.set_query(None);
-    let normalized_path = parsed.path().trim_end_matches('/').to_string();
-    parsed.set_path(if normalized_path.is_empty() {
-        "/"
-    } else {
-        &normalized_path
-    });
     Some(parsed.to_string())
 }
 
@@ -5869,7 +5897,7 @@ mod tests {
     }
 
     #[test]
-    fn grounding_source_requires_exact_normalized_url_not_matching_title() {
+    fn grounding_source_requires_exact_final_url_including_query() {
         let source = GeminiGroundingSource {
             chunk_index: 0,
             url: "https://static.garmin.com/manuals/gtx345r.pdf/?download=1#page=4".to_string(),
@@ -5877,7 +5905,15 @@ mod tests {
         };
         assert!(grounding_source_matches_claim(
             &source,
-            "https://static.garmin.com/manuals/gtx345r.pdf"
+            "https://static.garmin.com/manuals/gtx345r.pdf/?download=1"
+        ));
+        assert!(!grounding_source_matches_claim(
+            &source,
+            "https://static.garmin.com/manuals/gtx345r.pdf/?download=2"
+        ));
+        assert!(!grounding_source_matches_claim(
+            &source,
+            "https://static.garmin.com/manuals/gtx345r.pdf/"
         ));
         assert!(!grounding_source_matches_claim(
             &source,
@@ -7087,7 +7123,7 @@ mod tests {
     }
 
     #[test]
-    fn official_model_number_identity_accepts_one_grounded_model_occurrence() {
+    fn official_model_number_identity_accepts_one_specific_model_occurrence() {
         let source_url = "https://static.garmin.com/manuals/gia63w.pdf";
         let evidence = "Garmin GIA 63W";
         let (sources, supports) = grounding(source_url, "GIA 63W manual", evidence);
@@ -7097,6 +7133,7 @@ mod tests {
             source_url,
             "GIA 63W manual",
             evidence,
+            "Garmin",
             "GIA 63W",
             "GIA 63W",
             "https://listing.example/aircraft/1",
@@ -7107,6 +7144,52 @@ mod tests {
         );
 
         assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+
+        let proof = direct_source_proof(source_url, evidence);
+        let mut direct_source_issues = Vec::new();
+        validate_evidence_values(
+            source_url,
+            "GIA 63W manual",
+            evidence,
+            "Garmin",
+            "GIA 63W",
+            "GIA 63W",
+            "https://listing.example/aircraft/1",
+            &[],
+            &[],
+            &[proof],
+            &mut direct_source_issues,
+        );
+        assert!(
+            direct_source_issues.is_empty(),
+            "unexpected direct-source issues: {direct_source_issues:?}"
+        );
+    }
+
+    #[test]
+    fn short_incidental_model_token_is_not_sufficient_identity_evidence() {
+        let source_url = "https://static.garmin.com/manuals/g5.pdf";
+        let evidence = "Garmin G5";
+        let proof = direct_source_proof(source_url, evidence);
+        let mut issues = Vec::new();
+
+        validate_evidence_values(
+            source_url,
+            "G5 manual",
+            evidence,
+            "Garmin",
+            "G5",
+            "G5",
+            "https://listing.example/aircraft/1",
+            &[],
+            &[],
+            &[proof],
+            &mut issues,
+        );
+
+        assert!(issues
+            .iter()
+            .any(|issue| issue.contains("specific supporting fact")));
     }
 
     #[test]
@@ -7120,6 +7203,7 @@ mod tests {
             source_url,
             "GIA 63W manual",
             evidence,
+            "Garmin",
             "GIA 63W",
             "GIA 63W",
             "https://listing.example/aircraft/1",
@@ -7130,6 +7214,28 @@ mod tests {
         );
 
         assert!(issues.iter().any(|issue| issue.contains("final HTTPS URL")));
+    }
+
+    #[test]
+    fn model_designation_cannot_be_mislabeled_as_a_part_number() {
+        let response = json!({
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "GIA 63W",
+            "canonical_types": ["NAV", "COM"],
+            "manufacturer_identifier_kind": "manufacturer_part_number",
+            "manufacturer_identifier": "GIA 63W",
+            "manufacturer_identifier_scope": "exact_catalog_product",
+            "identity_source_url": "https://static.garmin.com/manuals/gia63w.pdf",
+            "identity_source_title": "GIA 63W manual",
+            "identity_evidence": "Garmin identifies the GIA 63W model.",
+            "reason": "The official manual identifies the exact model."
+        });
+
+        let error = verified_identity_from_response(&response)
+            .expect_err("a model designation is not an OEM part number");
+        assert!(error
+            .to_string()
+            .contains("must use manufacturer_model_number"));
     }
 
     #[test]
@@ -7736,6 +7842,51 @@ mod tests {
             error.to_string().contains("alphanumeric boundaries"),
             "a longer listing model must not attest a truncated raw model: {error}"
         );
+    }
+
+    #[test]
+    fn proposal_attestation_rejects_unmentioned_component_narrowing() {
+        let mut context = context(vec![]);
+        context.candidate.model = "G1000".to_string();
+        context.candidate.avionics_types = vec!["Integrated Flight Deck".to_string()];
+        context.listing_context = "Garmin G1000 integrated avionics installed".to_string();
+        let proposed = VerifiedIdentity {
+            canonical_manufacturer: "Garmin".to_string(),
+            canonical_model: "GIA 63".to_string(),
+            canonical_types: vec!["NAV".to_string(), "COM".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "GIA 63".to_string(),
+            manufacturer_identifier_scope: "exact_catalog_product".to_string(),
+            identity_source_url: "https://static.garmin.com/manuals/gia63.pdf".to_string(),
+            identity_source_title: "GIA 63 manual".to_string(),
+            identity_evidence: "Garmin identifies the GIA 63 model.".to_string(),
+            reason: "The official manual identifies the exact LRU.".to_string(),
+            grounded_claim_source_urls: vec![
+                "https://static.garmin.com/manuals/gia63.pdf".to_string()
+            ],
+        };
+        let response = json!({
+            "proposal_decision": "confirmed_same_as_input",
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "GIA 63",
+            "canonical_types": ["NAV", "COM"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "GIA 63",
+            "proposal_manufacturer_identifier_scope": "exact_catalog_product",
+            "proposal_confidence": "very_high",
+            "input_evidence_text": "G1000",
+            "proposal_source_url": "https://static.garmin.com/manuals/gia63.pdf",
+            "proposal_source_title": "GIA 63 manual",
+            "proposal_evidence": "Garmin identifies the GIA 63 model.",
+            "proposal_reason": "The listing names the containing suite, not the proposed LRU.",
+            "reviews": []
+        });
+
+        let error = proposal_attestation(&context, &proposed, &response, &[], &[])
+            .expect_err("a containing suite label cannot prove an unmentioned component");
+        assert!(error
+            .to_string()
+            .contains("complete proposed canonical model"));
     }
 
     #[test]
