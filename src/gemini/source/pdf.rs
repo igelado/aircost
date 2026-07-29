@@ -6,6 +6,7 @@
 //! exclusively by page and baseline; source-order adjacency is never enough.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use lopdf::content::Content;
 use lopdf::{Document, Encoding, LoadOptions, Object, ObjectId};
@@ -24,7 +25,13 @@ const MAX_GRAPHICS_STATE_DEPTH: usize = 256;
 const MAX_PAGE_TREE_DEPTH: usize = 256;
 const MAX_INVOKED_XOBJECT_NAMES_PER_PAGE: usize = 4_096;
 const MAX_INVOKED_FORM_XOBJECTS_PER_PAGE: usize = 64;
+const MAX_FORM_XOBJECT_DEPTH: usize = 32;
+const MAX_XOBJECT_INVOCATIONS_PER_PAGE: usize = 4_096;
 const MAX_INVOKED_FONTS_PER_PAGE: usize = 64;
+const MAX_CONTENT_OBJECT_DEPTH: usize = 256;
+const MAX_CONTENT_OBJECTS_PER_PAGE: usize = 65_536;
+const MAX_STREAM_FILTERS: usize = 16;
+const MAX_PAGE_TREE_NODES: usize = MAX_PAGES * MAX_PAGE_TREE_DEPTH;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
@@ -100,15 +107,14 @@ fn extract_with_limits(
             "encrypted public source PDFs are not allowed".to_string(),
         ));
     }
-    let pages = document.get_pages();
-    validate_page_count(pages.len(), limits.max_pages)?;
+    let pages = strict_pages(&document, limits.max_pages)?;
 
     let mut extracted = String::new();
     let mut source_text_rows = Vec::new();
     let mut source_text_rows_complete = true;
     let mut next_row_ordinal = 0usize;
     let mut total_text_bytes = 0usize;
-    for (page_number, page_id) in pages.iter().map(|(number, id)| (*number, *id)) {
+    for (page_number, page_id) in pages.iter().copied() {
         match target {
             Some(target) => {
                 let (visual_rows, page_complete) = target_visual_rows(
@@ -205,6 +211,119 @@ fn extract_with_limits(
     })
 }
 
+fn strict_pages(
+    document: &Document,
+    max_pages: usize,
+) -> GeminiInteractionsResult<Vec<(u32, ObjectId)>> {
+    let catalog = document.catalog().map_err(|_| {
+        GeminiInteractionsError::InvalidResponse(
+            "public source PDF catalog could not be read".to_string(),
+        )
+    })?;
+    if catalog.get(b"Type").and_then(Object::as_name).ok() != Some(b"Catalog") {
+        return Err(GeminiInteractionsError::InvalidResponse(
+            "public source PDF catalog has an invalid Type".to_string(),
+        ));
+    }
+    let root = catalog
+        .get(b"Pages")
+        .and_then(Object::as_reference)
+        .map_err(|_| {
+            GeminiInteractionsError::InvalidResponse(
+                "public source PDF catalog Pages is invalid".to_string(),
+            )
+        })?;
+    let mut stack = vec![(root, None, 0usize)];
+    let mut visited = HashSet::new();
+    let mut pages = Vec::new();
+    while let Some((id, expected_parent, depth)) = stack.pop() {
+        if depth > MAX_PAGE_TREE_DEPTH || visited.len() >= MAX_PAGE_TREE_NODES {
+            return Err(GeminiInteractionsError::InvalidResponse(
+                "public source PDF page tree exceeded its structural bound".to_string(),
+            ));
+        }
+        if !visited.insert(id) {
+            return Err(GeminiInteractionsError::InvalidResponse(
+                "public source PDF page tree contains a cycle or shared node".to_string(),
+            ));
+        }
+        let dictionary = document.get_dictionary(id).map_err(|_| {
+            GeminiInteractionsError::InvalidResponse(
+                "public source PDF page tree node could not be read".to_string(),
+            )
+        })?;
+        if let Some(expected_parent) = expected_parent {
+            if dictionary
+                .get(b"Parent")
+                .and_then(Object::as_reference)
+                .ok()
+                != Some(expected_parent)
+            {
+                return Err(GeminiInteractionsError::InvalidResponse(
+                    "public source PDF page tree Parent does not match its containing node"
+                        .to_string(),
+                ));
+            }
+        } else if dictionary.get(b"Parent").is_ok() {
+            return Err(GeminiInteractionsError::InvalidResponse(
+                "public source PDF root Pages node unexpectedly has a Parent".to_string(),
+            ));
+        }
+        match dictionary.get(b"Type").and_then(Object::as_name).ok() {
+            Some(b"Page") => {
+                if dictionary.get(b"Kids").is_ok() {
+                    return Err(GeminiInteractionsError::InvalidResponse(
+                        "public source PDF Page node unexpectedly has Kids".to_string(),
+                    ));
+                }
+                pages.push(id);
+                if pages.len() > max_pages {
+                    return Err(GeminiInteractionsError::InvalidResponse(format!(
+                        "public source PDF has more than {max_pages} pages"
+                    )));
+                }
+            }
+            Some(b"Pages") => {
+                let kids = dictionary
+                    .get_deref(b"Kids", document)
+                    .and_then(Object::as_array)
+                    .map_err(|_| {
+                        GeminiInteractionsError::InvalidResponse(
+                            "public source PDF Pages Kids is invalid".to_string(),
+                        )
+                    })?;
+                if kids.is_empty() {
+                    return Err(GeminiInteractionsError::InvalidResponse(
+                        "public source PDF Pages node has no Kids".to_string(),
+                    ));
+                }
+                let mut child_ids = Vec::with_capacity(kids.len());
+                for kid in kids {
+                    child_ids.push(kid.as_reference().map_err(|_| {
+                        GeminiInteractionsError::InvalidResponse(
+                            "public source PDF Pages Kid is not an indirect reference".to_string(),
+                        )
+                    })?);
+                }
+                for child in child_ids.into_iter().rev() {
+                    stack.push((child, Some(id), depth + 1));
+                }
+            }
+            _ => {
+                return Err(GeminiInteractionsError::InvalidResponse(
+                    "public source PDF page tree node has an invalid Type".to_string(),
+                ));
+            }
+        }
+    }
+    validate_page_count(pages.len(), max_pages)?;
+    Ok(pages
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| ((index + 1) as u32, id))
+        .collect())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Transform {
     a: f64,
@@ -252,6 +371,28 @@ impl Transform {
             && self.a.abs() > EPSILON
             && self.d.abs() > EPSILON
     }
+
+    fn inverse(self) -> Option<Self> {
+        const EPSILON: f64 = 0.000_001;
+        let determinant = self.a * self.d - self.b * self.c;
+        if !determinant.is_finite() || determinant.abs() <= EPSILON {
+            return None;
+        }
+        let inverse = Self {
+            a: self.d / determinant,
+            b: -self.b / determinant,
+            c: -self.c / determinant,
+            d: self.a / determinant,
+            e: (self.c * self.f - self.d * self.e) / determinant,
+            f: (self.b * self.e - self.a * self.f) / determinant,
+        };
+        [
+            inverse.a, inverse.b, inverse.c, inverse.d, inverse.e, inverse.f,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+        .then_some(inverse)
+    }
 }
 
 fn page_display_transform(
@@ -260,6 +401,8 @@ fn page_display_transform(
 ) -> GeminiInteractionsResult<Transform> {
     let mut current_id = page_id;
     let mut visited = HashSet::new();
+    let mut rotation = None;
+    let mut user_unit = None;
     for _ in 0..MAX_PAGE_TREE_DEPTH {
         if !visited.insert(current_id) {
             return Err(GeminiInteractionsError::InvalidResponse(
@@ -271,46 +414,76 @@ fn page_display_transform(
                 "public source PDF page tree could not be read".to_string(),
             )
         })?;
-        if let Ok(rotation) = dictionary.get(b"Rotate") {
-            let degrees = rotation.as_i64().map_err(|_| {
+        if rotation.is_none() && dictionary.get(b"Rotate").is_ok() {
+            let value = dictionary
+                .get(b"Rotate")
+                .expect("Rotate existence was checked");
+            let degrees = value.as_i64().map_err(|_| {
                 GeminiInteractionsError::InvalidResponse(
                     "public source PDF page rotation is invalid".to_string(),
                 )
             })?;
             let degrees = degrees.rem_euclid(360);
-            return match degrees {
-                0 => Ok(Transform::IDENTITY),
-                90 => Ok(Transform {
+            rotation = Some(match degrees {
+                0 => Transform::IDENTITY,
+                90 => Transform {
                     a: 0.0,
                     b: 1.0,
                     c: -1.0,
                     d: 0.0,
                     e: 0.0,
                     f: 0.0,
-                }),
-                180 => Ok(Transform {
+                },
+                180 => Transform {
                     a: -1.0,
                     b: 0.0,
                     c: 0.0,
                     d: -1.0,
                     e: 0.0,
                     f: 0.0,
-                }),
-                270 => Ok(Transform {
+                },
+                270 => Transform {
                     a: 0.0,
                     b: -1.0,
                     c: 1.0,
                     d: 0.0,
                     e: 0.0,
                     f: 0.0,
-                }),
-                _ => Err(GeminiInteractionsError::InvalidResponse(
-                    "public source PDF page rotation is not a right angle".to_string(),
-                )),
-            };
+                },
+                _ => {
+                    return Err(GeminiInteractionsError::InvalidResponse(
+                        "public source PDF page rotation is not a right angle".to_string(),
+                    ));
+                }
+            });
         }
-        let Ok(parent_id) = dictionary.get(b"Parent").and_then(Object::as_reference) else {
-            return Ok(Transform::IDENTITY);
+        if current_id == page_id && dictionary.get(b"UserUnit").is_ok() {
+            let value = dictionary
+                .get(b"UserUnit")
+                .expect("UserUnit existence was checked");
+            let scale = number(value).filter(|scale| scale.is_finite() && *scale > 0.0);
+            user_unit = Some(scale.ok_or_else(|| {
+                GeminiInteractionsError::InvalidResponse(
+                    "public source PDF page UserUnit is invalid".to_string(),
+                )
+            })?);
+        }
+        let parent = match dictionary.get(b"Parent") {
+            Ok(parent) => Some(parent.as_reference().map_err(|_| {
+                GeminiInteractionsError::InvalidResponse(
+                    "public source PDF page tree Parent is invalid".to_string(),
+                )
+            })?),
+            Err(_) => None,
+        };
+        let Some(parent_id) = parent else {
+            let scale = user_unit.unwrap_or(1.0);
+            return Ok(Transform {
+                a: scale,
+                d: scale,
+                ..Transform::IDENTITY
+            }
+            .concatenate(rotation.unwrap_or(Transform::IDENTITY)));
         };
         current_id = parent_id;
     }
@@ -331,8 +504,8 @@ struct TextFragment {
 struct TextPosition {
     current: Transform,
     line: Transform,
-    leading: f64,
     known: bool,
+    line_known: bool,
 }
 
 impl Default for TextPosition {
@@ -340,8 +513,8 @@ impl Default for TextPosition {
         Self {
             current: Transform::IDENTITY,
             line: Transform::IDENTITY,
-            leading: 0.0,
             known: false,
+            line_known: false,
         }
     }
 }
@@ -410,233 +583,1055 @@ fn decode_text_operands(
     Ok(())
 }
 
-fn collect_page_xobject_safety(
-    document: &Document,
-    page_id: ObjectId,
-    content: &Content<Vec<lopdf::content::Operation>>,
-    remaining_decompressed_bytes: &mut usize,
-) -> GeminiInteractionsResult<HashMap<Vec<u8>, bool>> {
-    let invoked = content
-        .operations
-        .iter()
-        .filter(|operation| operation.operator == "Do")
-        .filter_map(|operation| {
-            operation
-                .operands
-                .first()
-                .and_then(|operand| operand.as_name().ok())
-                .map(ToOwned::to_owned)
-        })
-        .collect::<HashSet<_>>();
-    if invoked.len() > MAX_INVOKED_XOBJECT_NAMES_PER_PAGE {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "public source PDF invoked too many XObjects on one page".to_string(),
-        ));
-    }
-
-    fn object_is_safe(
-        document: &Document,
-        value: &Object,
-        remaining_decompressed_bytes: &mut usize,
-        inspected_forms: &mut usize,
-    ) -> bool {
-        let stream = match value {
-            Object::Reference(id) => document.get_object(*id).and_then(Object::as_stream).ok(),
-            Object::Stream(stream) => Some(stream),
-            _ => None,
-        };
-        let Some(stream) = stream else {
-            return false;
-        };
-        let subtype = stream.dict.get(b"Subtype").and_then(Object::as_name).ok();
-        if subtype == Some(b"Image") {
-            return true;
-        }
-        if subtype != Some(b"Form") {
-            return false;
-        }
-        if *inspected_forms >= MAX_INVOKED_FORM_XOBJECTS_PER_PAGE {
-            return false;
-        }
-        *inspected_forms = inspected_forms.saturating_add(1);
-        if *remaining_decompressed_bytes == 0 {
-            return false;
-        }
-        let Some(content) = stream
-            .decompressed_content_with_limit(*remaining_decompressed_bytes)
-            .ok()
-        else {
-            return false;
-        };
-        *remaining_decompressed_bytes = remaining_decompressed_bytes.saturating_sub(content.len());
-        Content::decode(&content).ok().is_some_and(|content| {
-            !content.operations.iter().any(|operation| {
-                matches!(operation.operator.as_str(), "Tj" | "TJ" | "'" | "\"" | "Do")
-            })
-        })
-    }
-
-    fn collect(
-        document: &Document,
-        resources: &lopdf::Dictionary,
-        invoked: &HashSet<Vec<u8>>,
-        remaining_decompressed_bytes: &mut usize,
-        inspected_forms: &mut usize,
-        result: &mut HashMap<Vec<u8>, bool>,
-    ) {
-        let Some(xobjects) = resources
-            .get(b"XObject")
-            .ok()
-            .and_then(|object| match object {
-                Object::Reference(id) => document.get_dictionary(*id).ok(),
-                Object::Dictionary(dictionary) => Some(dictionary),
-                _ => None,
-            })
-        else {
-            return;
-        };
-        for (name, value) in xobjects.iter().filter(|(name, _)| invoked.contains(*name)) {
-            if result.contains_key(name) {
-                continue;
-            }
-            let safe = object_is_safe(
-                document,
-                value,
-                remaining_decompressed_bytes,
-                inspected_forms,
-            );
-            result.insert(name.clone(), safe);
-        }
-    }
-
-    let (direct_resources, inherited_resource_ids) =
-        document.get_page_resources(page_id).map_err(|_| {
-            GeminiInteractionsError::InvalidResponse(
-                "public source PDF page resources could not be read".to_string(),
-            )
-        })?;
-    let mut result = HashMap::new();
-    let mut inspected_forms = 0usize;
-    if let Some(resources) = direct_resources {
-        collect(
-            document,
-            resources,
-            &invoked,
-            remaining_decompressed_bytes,
-            &mut inspected_forms,
-            &mut result,
-        );
-    }
-    for resource_id in inherited_resource_ids {
-        if let Ok(resources) = document.get_dictionary(resource_id) {
-            collect(
-                document,
-                resources,
-                &invoked,
-                remaining_decompressed_bytes,
-                &mut inspected_forms,
-                &mut result,
-            );
-        }
-    }
-    for name in invoked {
-        result.entry(name).or_insert(false);
-    }
-    Ok(result)
+#[derive(Clone)]
+struct ResourceScope<'a> {
+    layers: Vec<&'a lopdf::Dictionary>,
 }
 
-fn collect_page_font_encodings<'a>(
-    document: &'a Document,
-    page_id: ObjectId,
-    content: &Content<Vec<lopdf::content::Operation>>,
-    remaining_decompressed_bytes: usize,
-) -> GeminiInteractionsResult<BTreeMap<Vec<u8>, Result<Encoding<'a>, ()>>> {
-    let invoked = content
-        .operations
-        .iter()
-        .filter(|operation| operation.operator == "Tf")
-        .filter_map(|operation| {
-            operation
-                .operands
-                .first()
-                .and_then(|operand| operand.as_name().ok())
-                .map(ToOwned::to_owned)
-        })
-        .collect::<HashSet<_>>();
-    if invoked.len() > MAX_INVOKED_FONTS_PER_PAGE {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "public source PDF invoked too many fonts on one page".to_string(),
-        ));
-    }
+#[derive(Clone)]
+struct FontMetrics {
+    widths: [Option<f64>; 256],
+    bounds: Option<FormBounds>,
+}
 
-    fn collect<'a>(
-        document: &'a Document,
-        resources: &'a lopdf::Dictionary,
-        invoked: &HashSet<Vec<u8>>,
-        result: &mut HashMap<Vec<u8>, &'a lopdf::Dictionary>,
-    ) {
-        let Some(fonts) = resources.get(b"Font").ok().and_then(|object| match object {
-            Object::Reference(id) => document.get_dictionary(*id).ok(),
-            Object::Dictionary(dictionary) => Some(dictionary),
-            _ => None,
-        }) else {
-            return;
-        };
-        for (name, value) in fonts.iter().filter(|(name, _)| invoked.contains(*name)) {
-            if result.contains_key(name) {
-                continue;
-            }
-            let font = match value {
-                Object::Reference(id) => document.get_dictionary(*id).ok(),
-                Object::Dictionary(dictionary) => Some(dictionary),
-                _ => None,
-            };
-            if let Some(font) = font {
-                result.insert(name.clone(), font);
-            }
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FormKey {
+    Indirect(ObjectId),
+    Direct(usize),
+}
 
-    let (direct_resources, inherited_resource_ids) =
-        document.get_page_resources(page_id).map_err(|_| {
-            GeminiInteractionsError::InvalidResponse(
-                "public source PDF page resources could not be read".to_string(),
-            )
-        })?;
-    let mut fonts = HashMap::new();
-    if let Some(resources) = direct_resources {
-        collect(document, resources, &invoked, &mut fonts);
-    }
-    for resource_id in inherited_resource_ids {
-        if let Ok(resources) = document.get_dictionary(resource_id) {
-            collect(document, resources, &invoked, &mut fonts);
-        }
-    }
+#[derive(Clone, Copy)]
+struct FormBounds {
+    left: f64,
+    bottom: f64,
+    right: f64,
+    top: f64,
+}
 
-    let per_font_budget = if invoked.is_empty() {
-        remaining_decompressed_bytes
-    } else {
-        remaining_decompressed_bytes / invoked.len()
-    };
-    let mut encodings = BTreeMap::new();
-    for name in invoked {
-        let encoding = fonts.get(&name).ok_or(()).and_then(|font| {
-            if per_font_budget == 0 {
-                return Err(());
-            }
-            font.get_font_encoding_with_limit(document, per_font_budget)
-                .map_err(|_| ())
-        });
-        encodings.insert(name, encoding);
+impl FormBounds {
+    fn contains(self, x: f64, y: f64) -> bool {
+        x.is_finite()
+            && y.is_finite()
+            && x >= self.left
+            && x < self.right
+            && y >= self.bottom
+            && y < self.top
     }
-    Ok(encodings)
+}
+
+struct PreparedForm<'a> {
+    content: Rc<Content<Vec<lopdf::content::Operation>>>,
+    resources: ResourceScope<'a>,
+    matrix: Transform,
+    bounds: FormBounds,
+    proof_visibility_supported: bool,
 }
 
 struct PageText<'a> {
-    encodings: BTreeMap<Vec<u8>, Result<Encoding<'a>, ()>>,
-    xobject_safety: HashMap<Vec<u8>, bool>,
+    document: &'a Document,
+    root_resources: ResourceScope<'a>,
+    encodings: HashMap<usize, Encoding<'a>>,
+    font_metrics: HashMap<usize, FontMetrics>,
+    forms: HashMap<FormKey, PreparedForm<'a>>,
     content: Content<Vec<lopdf::content::Operation>>,
     display_transform: Transform,
+}
+
+struct Preparation<'a> {
+    document: &'a Document,
+    root_resources: ResourceScope<'a>,
+    remaining_decompressed_bytes: usize,
+    fonts: BTreeMap<usize, &'a lopdf::Dictionary>,
+    forms: HashMap<FormKey, PreparedForm<'a>>,
+    active_forms: HashSet<FormKey>,
+    invoked_xobjects: HashSet<FormKey>,
+}
+
+fn invalid_pdf(message: impl Into<String>) -> GeminiInteractionsError {
+    GeminiInteractionsError::InvalidResponse(message.into())
+}
+
+fn validate_stream_filters(
+    stream: &lopdf::Stream,
+    description: &str,
+) -> GeminiInteractionsResult<()> {
+    if stream.dict.get(b"Filter").is_err() {
+        return Ok(());
+    }
+    let filters = stream.filters().map_err(|_| {
+        invalid_pdf(format!(
+            "public source PDF {description} has an invalid Filter entry"
+        ))
+    })?;
+    if filters.len() > MAX_STREAM_FILTERS {
+        return Err(invalid_pdf(format!(
+            "public source PDF {description} exceeds the filter-chain bound"
+        )));
+    }
+    Ok(())
+}
+
+fn strict_stream_content(
+    stream: &lopdf::Stream,
+    max_decompressed_bytes: usize,
+    description: &str,
+) -> GeminiInteractionsResult<Vec<u8>> {
+    validate_stream_filters(stream, description)?;
+    stream
+        .get_plain_content_with_limit(max_decompressed_bytes)
+        .map_err(|_| {
+            invalid_pdf(format!(
+                "public source PDF {description} is undecodable or exceeded its decompressed byte cap"
+            ))
+        })
+}
+
+fn dictionary_object<'a>(
+    document: &'a Document,
+    object: &'a Object,
+    description: &str,
+) -> GeminiInteractionsResult<&'a lopdf::Dictionary> {
+    match object {
+        Object::Reference(id) => document
+            .get_dictionary(*id)
+            .map_err(|_| invalid_pdf(format!("public source PDF {description} could not be read"))),
+        Object::Dictionary(dictionary) => Ok(dictionary),
+        _ => Err(invalid_pdf(format!(
+            "public source PDF {description} is not a dictionary"
+        ))),
+    }
+}
+
+fn page_resource_scope<'a>(
+    document: &'a Document,
+    page_id: ObjectId,
+) -> GeminiInteractionsResult<ResourceScope<'a>> {
+    let mut current_id = page_id;
+    let mut visited = HashSet::new();
+    for _ in 0..=MAX_PAGE_TREE_DEPTH {
+        if !visited.insert(current_id) {
+            return Err(invalid_pdf("public source PDF page tree contains a cycle"));
+        }
+        let dictionary = document
+            .get_dictionary(current_id)
+            .map_err(|_| invalid_pdf("public source PDF page tree could not be read"))?;
+        if let Ok(resources) = dictionary.get(b"Resources") {
+            return Ok(ResourceScope {
+                layers: vec![dictionary_object(
+                    document,
+                    resources,
+                    "nearest page Resources",
+                )?],
+            });
+        }
+        match dictionary.get(b"Parent") {
+            Ok(parent) => {
+                current_id = parent
+                    .as_reference()
+                    .map_err(|_| invalid_pdf("public source PDF page tree Parent is invalid"))?;
+            }
+            Err(_) => return Ok(ResourceScope { layers: Vec::new() }),
+        }
+    }
+    Err(invalid_pdf(
+        "public source PDF page tree exceeded its depth bound",
+    ))
+}
+
+fn strict_page_content(
+    document: &Document,
+    page_id: ObjectId,
+    max_decompressed_bytes: usize,
+) -> GeminiInteractionsResult<Vec<u8>> {
+    fn append(
+        document: &Document,
+        object: &Object,
+        active_references: &mut HashSet<ObjectId>,
+        visited_objects: &mut usize,
+        output: &mut Vec<u8>,
+        limit: usize,
+        depth: usize,
+    ) -> GeminiInteractionsResult<()> {
+        if depth > MAX_CONTENT_OBJECT_DEPTH || *visited_objects >= MAX_CONTENT_OBJECTS_PER_PAGE {
+            return Err(invalid_pdf(
+                "public source PDF page Contents exceeded its structural bound",
+            ));
+        }
+        *visited_objects = visited_objects.saturating_add(1);
+        match object {
+            Object::Reference(id) => {
+                if !active_references.insert(*id) {
+                    return Err(invalid_pdf(
+                        "public source PDF page Contents contains a reference cycle",
+                    ));
+                }
+                let resolved = document.get_object(*id).map_err(|_| {
+                    invalid_pdf("public source PDF page Contents reference could not be read")
+                })?;
+                let result = append(
+                    document,
+                    resolved,
+                    active_references,
+                    visited_objects,
+                    output,
+                    limit,
+                    depth + 1,
+                );
+                active_references.remove(id);
+                result
+            }
+            Object::Array(objects) => {
+                for object in objects {
+                    append(
+                        document,
+                        object,
+                        active_references,
+                        visited_objects,
+                        output,
+                        limit,
+                        depth + 1,
+                    )?;
+                }
+                Ok(())
+            }
+            Object::Stream(stream) => {
+                let separator = usize::from(!output.is_empty());
+                let remaining = limit
+                    .checked_sub(output.len())
+                    .and_then(|remaining| remaining.checked_sub(separator))
+                    .ok_or_else(|| {
+                        invalid_pdf(
+                            "public source PDF page content exceeded its decompressed byte cap",
+                        )
+                    })?;
+                let data = strict_stream_content(stream, remaining, "page content stream")?;
+                if separator != 0 {
+                    output.push(b'\n');
+                }
+                output.extend_from_slice(&data);
+                Ok(())
+            }
+            _ => Err(invalid_pdf(
+                "public source PDF page Contents is not a stream or stream array",
+            )),
+        }
+    }
+
+    let page = document
+        .get_dictionary(page_id)
+        .map_err(|_| invalid_pdf("public source PDF page could not be read"))?;
+    let contents = page
+        .get(b"Contents")
+        .map_err(|_| invalid_pdf("public source PDF page is missing Contents"))?;
+    let mut output = Vec::new();
+    append(
+        document,
+        contents,
+        &mut HashSet::new(),
+        &mut 0,
+        &mut output,
+        max_decompressed_bytes,
+        0,
+    )?;
+    Ok(output)
+}
+
+fn named_resource<'a>(
+    document: &'a Document,
+    resources: &ResourceScope<'a>,
+    category: &[u8],
+    name: &[u8],
+) -> GeminiInteractionsResult<&'a Object> {
+    for layer in &resources.layers {
+        let Ok(category_object) = layer.get(category) else {
+            continue;
+        };
+        let category_dictionary = dictionary_object(
+            document,
+            category_object,
+            &format!("{} resource dictionary", String::from_utf8_lossy(category)),
+        )?;
+        if let Ok(resource) = category_dictionary.get(name) {
+            return Ok(resource);
+        }
+    }
+    Err(invalid_pdf(format!(
+        "public source PDF invoked missing {} resource {}",
+        String::from_utf8_lossy(category),
+        String::from_utf8_lossy(name)
+    )))
+}
+
+fn font_dictionary<'a>(
+    document: &'a Document,
+    resources: &ResourceScope<'a>,
+    name: &[u8],
+) -> GeminiInteractionsResult<&'a lopdf::Dictionary> {
+    dictionary_object(
+        document,
+        named_resource(document, resources, b"Font", name)?,
+        "font resource",
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedEncoding {
+    OneByte,
+    Differences,
+    Unicode,
+}
+
+fn has_base14_latin_default_encoding(font: &lopdf::Dictionary, subtype: &[u8]) -> bool {
+    subtype == b"Type1"
+        && font.get(b"FontDescriptor").is_err()
+        && font
+            .get(b"BaseFont")
+            .and_then(Object::as_name)
+            .is_ok_and(|name| {
+                matches!(
+                    name,
+                    b"Times-Roman"
+                        | b"Times-Bold"
+                        | b"Times-Italic"
+                        | b"Times-BoldItalic"
+                        | b"Helvetica"
+                        | b"Helvetica-Bold"
+                        | b"Helvetica-Oblique"
+                        | b"Helvetica-BoldOblique"
+                        | b"Courier"
+                        | b"Courier-Bold"
+                        | b"Courier-Oblique"
+                        | b"Courier-BoldOblique"
+                )
+            })
+}
+
+fn expected_font_encoding(
+    document: &Document,
+    object: &Object,
+    active: &mut HashSet<ObjectId>,
+    depth: usize,
+) -> GeminiInteractionsResult<ExpectedEncoding> {
+    if depth > MAX_CONTENT_OBJECT_DEPTH {
+        return Err(invalid_pdf(
+            "public source PDF font Encoding exceeded its structural bound",
+        ));
+    }
+    match object {
+        Object::Reference(id) => {
+            if !active.insert(*id) {
+                return Err(invalid_pdf(
+                    "public source PDF font Encoding contains a reference cycle",
+                ));
+            }
+            let resolved = document
+                .get_object(*id)
+                .map_err(|_| invalid_pdf("public source PDF font Encoding could not be read"))?;
+            let result = expected_font_encoding(document, resolved, active, depth + 1);
+            active.remove(id);
+            result
+        }
+        Object::Name(name) => match name.as_slice() {
+            b"StandardEncoding" | b"MacRomanEncoding" | b"MacExpertEncoding"
+            | b"WinAnsiEncoding" => Ok(ExpectedEncoding::OneByte),
+            b"Identity-H" | b"Identity-V" => Ok(ExpectedEncoding::Unicode),
+            _ => Err(invalid_pdf(
+                "public source PDF font uses an unsupported named Encoding",
+            )),
+        },
+        Object::Dictionary(dictionary) => {
+            if dictionary.get(b"Type").and_then(Object::as_name).ok() != Some(b"Encoding") {
+                return Err(invalid_pdf(
+                    "public source PDF font Encoding dictionary has an invalid Type",
+                ));
+            }
+            let base_encoding = dictionary.get(b"BaseEncoding").map_err(|_| {
+                invalid_pdf("public source PDF font Encoding dictionary is missing BaseEncoding")
+            })?;
+            if !base_encoding.as_name().is_ok_and(|name| {
+                matches!(
+                    name,
+                    b"StandardEncoding"
+                        | b"MacRomanEncoding"
+                        | b"MacExpertEncoding"
+                        | b"WinAnsiEncoding"
+                )
+            }) {
+                return Err(invalid_pdf(
+                    "public source PDF font Encoding dictionary has an unsupported BaseEncoding",
+                ));
+            }
+            let differences = dictionary
+                .get(b"Differences")
+                .and_then(Object::as_array)
+                .map_err(|_| {
+                    invalid_pdf(
+                        "public source PDF font Encoding dictionary has invalid Differences",
+                    )
+                })?;
+            let mut next_code = None;
+            let mut names_after_code = false;
+            for value in differences {
+                match value {
+                    Object::Integer(code) if (0..=255).contains(code) => {
+                        if next_code.is_some() && !names_after_code {
+                            return Err(invalid_pdf(
+                                "public source PDF font Encoding dictionary has invalid Differences",
+                            ));
+                        }
+                        next_code = Some(*code as u16);
+                        names_after_code = false;
+                    }
+                    Object::Name(_) => {
+                        let code = next_code.ok_or_else(|| {
+                            invalid_pdf(
+                                "public source PDF font Encoding dictionary has invalid Differences",
+                            )
+                        })?;
+                        if code > 255 {
+                            return Err(invalid_pdf(
+                                "public source PDF font Encoding dictionary has invalid Differences",
+                            ));
+                        }
+                        next_code = Some(code + 1);
+                        names_after_code = true;
+                    }
+                    _ => {
+                        return Err(invalid_pdf(
+                            "public source PDF font Encoding dictionary has invalid Differences",
+                        ));
+                    }
+                }
+            }
+            if next_code.is_none() || !names_after_code {
+                return Err(invalid_pdf(
+                    "public source PDF font Encoding dictionary has invalid Differences",
+                ));
+            }
+            Ok(ExpectedEncoding::Differences)
+        }
+        _ => Err(invalid_pdf(
+            "public source PDF font Encoding has an invalid object type",
+        )),
+    }
+}
+
+fn strict_font_encoding<'a>(
+    document: &'a Document,
+    font: &'a lopdf::Dictionary,
+    max_decompressed_bytes: usize,
+) -> GeminiInteractionsResult<Encoding<'a>> {
+    if font.get(b"Type").and_then(Object::as_name).ok() != Some(b"Font") {
+        return Err(invalid_pdf(
+            "public source PDF invoked resource is not a Font",
+        ));
+    }
+    let subtype = font
+        .get(b"Subtype")
+        .and_then(Object::as_name)
+        .map_err(|_| invalid_pdf("public source PDF font has an invalid Subtype"))?;
+    if !matches!(subtype, b"Type1" | b"MMType1" | b"TrueType") {
+        return Err(invalid_pdf(
+            "public source PDF font uses an unsupported Subtype",
+        ));
+    }
+    let expected = match font.get(b"Encoding") {
+        Ok(encoding) => expected_font_encoding(document, encoding, &mut HashSet::new(), 0)?,
+        Err(_) if font.get(b"ToUnicode").is_ok() => ExpectedEncoding::Unicode,
+        Err(_) if has_base14_latin_default_encoding(font, subtype) => ExpectedEncoding::OneByte,
+        Err(_) => {
+            return Err(invalid_pdf(
+                "public source PDF font is missing an explicit Encoding or ToUnicode map",
+            ));
+        }
+    };
+
+    if font.get(b"ToUnicode").is_ok() {
+        let to_unicode = font
+            .get_deref(b"ToUnicode", document)
+            .and_then(Object::as_stream)
+            .map_err(|_| invalid_pdf("public source PDF font ToUnicode is not a stream"))?;
+        validate_stream_filters(to_unicode, "font ToUnicode stream")?;
+    }
+
+    if font.get(b"Encoding").is_ok()
+        && font.get(b"ToUnicode").is_ok()
+        && !matches!(expected, ExpectedEncoding::Unicode)
+    {
+        let mut probe = font.clone();
+        probe.remove(b"Encoding");
+        let encoding = probe
+            .get_font_encoding_with_limit(document, max_decompressed_bytes)
+            .map_err(|_| {
+                invalid_pdf("public source PDF font ToUnicode map could not be decoded")
+            })?;
+        if !matches!(encoding, Encoding::UnicodeMapEncoding(_)) {
+            return Err(invalid_pdf(
+                "public source PDF font ToUnicode map is malformed or unsupported",
+            ));
+        }
+    } else if matches!(expected, ExpectedEncoding::Unicode) && font.get(b"ToUnicode").is_err() {
+        return Err(invalid_pdf(
+            "public source PDF identity font Encoding is missing ToUnicode",
+        ));
+    }
+
+    let encoding = font
+        .get_font_encoding_with_limit(document, max_decompressed_bytes)
+        .map_err(|_| invalid_pdf("public source PDF font Encoding could not be decoded"))?;
+    let matches_expected = matches!(
+        (&expected, &encoding),
+        (ExpectedEncoding::OneByte, Encoding::OneByteEncoding(_))
+            | (ExpectedEncoding::Differences, Encoding::Differences(_))
+            | (ExpectedEncoding::Unicode, Encoding::UnicodeMapEncoding(_))
+    );
+    if !matches_expected {
+        return Err(invalid_pdf(
+            "public source PDF font Encoding was malformed or unsupported",
+        ));
+    }
+    Ok(encoding)
+}
+
+fn font_metrics(
+    document: &Document,
+    font: &lopdf::Dictionary,
+) -> GeminiInteractionsResult<FontMetrics> {
+    let mut widths = [None; 256];
+    let mut bounds = None;
+    let descriptor = match font.get(b"FontDescriptor") {
+        Ok(value) => Some(dictionary_object(document, value, "FontDescriptor")?),
+        Err(_) => None,
+    };
+    if let Some(descriptor) = descriptor {
+        let bbox = descriptor
+            .get_deref(b"FontBBox", document)
+            .and_then(Object::as_array)
+            .map_err(|_| invalid_pdf("public source PDF FontDescriptor has an invalid FontBBox"))?;
+        if bbox.len() != 4 {
+            return Err(invalid_pdf(
+                "public source PDF FontDescriptor has an invalid FontBBox",
+            ));
+        }
+        let values = bbox.iter().map(number).collect::<Option<Vec<_>>>();
+        let Some(values) = values.filter(|values| values.iter().copied().all(f64::is_finite))
+        else {
+            return Err(invalid_pdf(
+                "public source PDF FontDescriptor has an invalid FontBBox",
+            ));
+        };
+        let candidate = FormBounds {
+            left: values[0],
+            bottom: values[1],
+            right: values[2],
+            top: values[3],
+        };
+        if candidate.left < candidate.right && candidate.bottom < candidate.top {
+            bounds = Some(candidate);
+        }
+        if let Ok(value) = descriptor.get(b"MissingWidth") {
+            let missing = number(value)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    invalid_pdf("public source PDF FontDescriptor has an invalid MissingWidth")
+                })?;
+            widths.fill(Some(missing));
+        }
+    }
+    if let Ok(width_values) = font.get_deref(b"Widths", document) {
+        let width_values = width_values
+            .as_array()
+            .map_err(|_| invalid_pdf("public source PDF font Widths is not an array"))?;
+        let first = font
+            .get(b"FirstChar")
+            .and_then(Object::as_i64)
+            .map_err(|_| invalid_pdf("public source PDF font FirstChar is invalid"))?;
+        if !(0..=255).contains(&first) || first as usize + width_values.len() > widths.len() {
+            return Err(invalid_pdf(
+                "public source PDF font Widths range is invalid",
+            ));
+        }
+        for (offset, value) in width_values.iter().enumerate() {
+            widths[first as usize + offset] = Some(
+                number(value)
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| {
+                        invalid_pdf("public source PDF font Widths contains an invalid width")
+                    })?,
+            );
+        }
+    }
+    let base_font = font
+        .get(b"BaseFont")
+        .and_then(Object::as_name)
+        .ok()
+        .unwrap_or_default();
+    if base_font == b"Courier"
+        && font.get(b"FontDescriptor").is_err()
+        && font.get(b"Widths").is_err()
+    {
+        for width in &mut widths {
+            *width = Some(600.0);
+        }
+        bounds.get_or_insert(FormBounds {
+            left: -23.0,
+            bottom: -250.0,
+            right: 715.0,
+            top: 805.0,
+        });
+    }
+    Ok(FontMetrics { widths, bounds })
+}
+
+fn ext_gstate_dictionary<'a>(
+    document: &'a Document,
+    resources: &ResourceScope<'a>,
+    name: &[u8],
+) -> GeminiInteractionsResult<&'a lopdf::Dictionary> {
+    dictionary_object(
+        document,
+        named_resource(document, resources, b"ExtGState", name)?,
+        "ExtGState resource",
+    )
+}
+
+fn ext_gstate_font<'a>(
+    document: &'a Document,
+    ext_gstate: &'a lopdf::Dictionary,
+) -> GeminiInteractionsResult<Option<(&'a lopdf::Dictionary, f64)>> {
+    let Ok(value) = ext_gstate.get(b"Font") else {
+        return Ok(None);
+    };
+    let values = value.as_array().map_err(|_| {
+        invalid_pdf("public source PDF ExtGState Font entry is not a font/size array")
+    })?;
+    if values.len() != 2 {
+        return Err(invalid_pdf(
+            "public source PDF ExtGState Font entry is not a font/size array",
+        ));
+    }
+    let font = dictionary_object(document, &values[0], "ExtGState font")?;
+    let size = number(&values[1])
+        .filter(|size| size.is_finite())
+        .ok_or_else(|| invalid_pdf("public source PDF ExtGState Font entry has an invalid size"))?;
+    Ok(Some((font, size)))
+}
+
+fn ext_gstate_proof_visibility_supported(
+    ext_gstate: &lopdf::Dictionary,
+) -> GeminiInteractionsResult<bool> {
+    for key in [b"CA".as_slice(), b"ca".as_slice()] {
+        if let Ok(value) = ext_gstate.get(key) {
+            let alpha = number(value)
+                .filter(|alpha| alpha.is_finite())
+                .ok_or_else(|| {
+                    invalid_pdf("public source PDF ExtGState has an invalid alpha constant")
+                })?;
+            if alpha <= 0.0 {
+                return Ok(false);
+            }
+        }
+    }
+    if let Ok(soft_mask) = ext_gstate.get(b"SMask") {
+        if soft_mask.as_name().ok() != Some(b"None") {
+            return Ok(false);
+        }
+    }
+    if let Ok(blend_mode) = ext_gstate.get(b"BM") {
+        let supported = match blend_mode {
+            Object::Name(name) => matches!(name.as_slice(), b"Normal" | b"Compatible"),
+            Object::Array(values) => values.iter().all(|value| {
+                value
+                    .as_name()
+                    .is_ok_and(|name| matches!(name, b"Normal" | b"Compatible"))
+            }),
+            _ => false,
+        };
+        if !supported {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn resolved_xobject<'a>(
+    document: &'a Document,
+    resources: &ResourceScope<'a>,
+    name: &[u8],
+) -> GeminiInteractionsResult<(FormKey, &'a lopdf::Stream)> {
+    let object = named_resource(document, resources, b"XObject", name)?;
+    match object {
+        Object::Reference(id) => Ok((
+            FormKey::Indirect(*id),
+            document
+                .get_object(*id)
+                .and_then(Object::as_stream)
+                .map_err(|_| invalid_pdf("public source PDF XObject resource is not a stream"))?,
+        )),
+        Object::Stream(stream) => Ok((
+            FormKey::Direct(stream as *const lopdf::Stream as usize),
+            stream,
+        )),
+        _ => Err(invalid_pdf(
+            "public source PDF XObject resource is not a stream",
+        )),
+    }
+}
+
+fn optional_transform(
+    document: &Document,
+    dictionary: &lopdf::Dictionary,
+    name: &[u8],
+) -> GeminiInteractionsResult<Transform> {
+    if dictionary.get(name).is_err() {
+        return Ok(Transform::IDENTITY);
+    }
+    let value = dictionary.get_deref(name, document).map_err(|_| {
+        invalid_pdf(format!(
+            "public source PDF Form {} could not be resolved",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    let operands = value.as_array().map_err(|_| {
+        invalid_pdf(format!(
+            "public source PDF Form {} is not a matrix",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    transform(operands).ok_or_else(|| {
+        invalid_pdf(format!(
+            "public source PDF Form {} is invalid",
+            String::from_utf8_lossy(name)
+        ))
+    })
+}
+
+fn form_bounds(
+    document: &Document,
+    dictionary: &lopdf::Dictionary,
+) -> GeminiInteractionsResult<FormBounds> {
+    let values = dictionary
+        .get_deref(b"BBox", document)
+        .and_then(Object::as_array)
+        .map_err(|_| {
+            invalid_pdf("public source PDF Form XObject BBox is missing or is not an array")
+        })?;
+    if values.len() != 4 {
+        return Err(invalid_pdf(
+            "public source PDF Form XObject BBox does not contain four coordinates",
+        ));
+    }
+    let numbers = values.iter().map(number).collect::<Option<Vec<_>>>();
+    let Some(numbers) = numbers else {
+        return Err(invalid_pdf(
+            "public source PDF Form XObject BBox contains a nonnumeric coordinate",
+        ));
+    };
+    let bounds = FormBounds {
+        left: numbers[0],
+        bottom: numbers[1],
+        right: numbers[2],
+        top: numbers[3],
+    };
+    if !numbers.into_iter().all(f64::is_finite) {
+        return Err(invalid_pdf(
+            "public source PDF Form XObject BBox is non-finite",
+        ));
+    }
+    Ok(bounds)
+}
+
+fn form_resource_scope<'a>(
+    preparation: &Preparation<'a>,
+    stream: &'a lopdf::Stream,
+) -> GeminiInteractionsResult<ResourceScope<'a>> {
+    match stream.dict.get(b"Resources") {
+        Ok(resources) => Ok(ResourceScope {
+            layers: vec![dictionary_object(
+                preparation.document,
+                resources,
+                "Form XObject Resources",
+            )?],
+        }),
+        Err(_) => Ok(preparation.root_resources.clone()),
+    }
+}
+
+fn validate_xobject_type<'a>(
+    document: &'a Document,
+    stream: &'a lopdf::Stream,
+) -> GeminiInteractionsResult<&'a [u8]> {
+    if stream.dict.get(b"Type").is_ok() {
+        let object_type = stream
+            .dict
+            .get_deref(b"Type", document)
+            .map_err(|_| invalid_pdf("public source PDF XObject Type could not be resolved"))?;
+        if object_type.as_name().ok() != Some(b"XObject") {
+            return Err(invalid_pdf("public source PDF XObject has an invalid Type"));
+        }
+    }
+    stream
+        .dict
+        .get_deref(b"Subtype", document)
+        .and_then(Object::as_name)
+        .map_err(|_| invalid_pdf("public source PDF XObject has an invalid Subtype"))
+}
+
+fn validate_text_show_operation(
+    operation: &lopdf::content::Operation,
+) -> GeminiInteractionsResult<()> {
+    let valid_number = |value: &Object| number(value).is_some_and(f64::is_finite);
+    let valid = match operation.operator.as_str() {
+        "Tj" | "'" => {
+            operation.operands.len() == 1
+                && matches!(operation.operands.first(), Some(Object::String(_, _)))
+        }
+        "TJ" => {
+            operation.operands.len() == 1
+                && operation
+                    .operands
+                    .first()
+                    .and_then(|value| value.as_array().ok())
+                    .is_some_and(|values| {
+                        values.iter().all(|value| {
+                            matches!(value, Object::String(_, _)) || valid_number(value)
+                        })
+                    })
+        }
+        "\"" => {
+            operation.operands.len() == 3
+                && valid_number(&operation.operands[0])
+                && valid_number(&operation.operands[1])
+                && matches!(operation.operands[2], Object::String(_, _))
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_pdf(format!(
+            "public source PDF has an invalid {} operation",
+            operation.operator
+        )))
+    }
+}
+
+fn prepare_content<'a>(
+    preparation: &mut Preparation<'a>,
+    content: &Content<Vec<lopdf::content::Operation>>,
+    resources: &ResourceScope<'a>,
+    depth: usize,
+) -> GeminiInteractionsResult<()> {
+    if depth > MAX_FORM_XOBJECT_DEPTH {
+        return Err(invalid_pdf(
+            "public source PDF Form XObject depth exceeded its bound",
+        ));
+    }
+    for operation in &content.operations {
+        match operation.operator.as_str() {
+            "Tf" => {
+                let name = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .ok_or_else(|| invalid_pdf("public source PDF has an invalid Tf operation"))?;
+                let size =
+                    operation.operands.get(1).and_then(number).ok_or_else(|| {
+                        invalid_pdf("public source PDF has an invalid Tf operation")
+                    })?;
+                if operation.operands.len() != 2 || !size.is_finite() {
+                    return Err(invalid_pdf("public source PDF has an invalid Tf operation"));
+                }
+                let font = font_dictionary(preparation.document, resources, name)?;
+                let key = font as *const lopdf::Dictionary as usize;
+                preparation.fonts.entry(key).or_insert(font);
+                if preparation.fonts.len() > MAX_INVOKED_FONTS_PER_PAGE {
+                    return Err(invalid_pdf(
+                        "public source PDF invoked too many fonts on one page",
+                    ));
+                }
+            }
+            "Do" => {
+                let name = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .ok_or_else(|| invalid_pdf("public source PDF has an invalid Do operation"))?;
+                if operation.operands.len() != 1 {
+                    return Err(invalid_pdf("public source PDF has an invalid Do operation"));
+                }
+                let (key, stream) = resolved_xobject(preparation.document, resources, name)?;
+                preparation.invoked_xobjects.insert(key);
+                if preparation.invoked_xobjects.len() > MAX_INVOKED_XOBJECT_NAMES_PER_PAGE {
+                    return Err(invalid_pdf(
+                        "public source PDF invoked too many XObjects on one page",
+                    ));
+                }
+                match validate_xobject_type(preparation.document, stream)? {
+                    b"Image" => {}
+                    b"Form" => prepare_form(preparation, key, stream, depth)?,
+                    _ => {
+                        return Err(invalid_pdf(
+                            "public source PDF invoked an unsupported XObject subtype",
+                        ));
+                    }
+                }
+            }
+            "Tr" => {
+                let mode = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_i64().ok())
+                    .ok_or_else(|| invalid_pdf("public source PDF has an invalid Tr operation"))?;
+                if operation.operands.len() != 1 || !(0..=7).contains(&mode) {
+                    return Err(invalid_pdf("public source PDF has an invalid Tr operation"));
+                }
+            }
+            "Tj" | "TJ" | "'" | "\"" => validate_text_show_operation(operation)?,
+            "Tc" | "Tw" | "Tz" | "Ts" | "TL" => {
+                let value = operation
+                    .operands
+                    .first()
+                    .and_then(number)
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| {
+                        invalid_pdf(format!(
+                            "public source PDF has an invalid {} operation",
+                            operation.operator
+                        ))
+                    })?;
+                if operation.operands.len() != 1
+                    || (operation.operator == "Tz" && value.abs() <= f64::EPSILON)
+                {
+                    return Err(invalid_pdf(format!(
+                        "public source PDF has an invalid {} operation",
+                        operation.operator
+                    )));
+                }
+            }
+            "gs" => {
+                let name = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .ok_or_else(|| invalid_pdf("public source PDF has an invalid gs operation"))?;
+                if operation.operands.len() != 1 {
+                    return Err(invalid_pdf("public source PDF has an invalid gs operation"));
+                }
+                let ext_gstate = ext_gstate_dictionary(preparation.document, resources, name)?;
+                ext_gstate_proof_visibility_supported(ext_gstate)?;
+                if let Some((font, _)) = ext_gstate_font(preparation.document, ext_gstate)? {
+                    let key = font as *const lopdf::Dictionary as usize;
+                    preparation.fonts.entry(key).or_insert(font);
+                    if preparation.fonts.len() > MAX_INVOKED_FONTS_PER_PAGE {
+                        return Err(invalid_pdf(
+                            "public source PDF invoked too many fonts on one page",
+                        ));
+                    }
+                }
+            }
+            "BDC"
+                if operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    == Some(b"OC") =>
+            {
+                if operation.operands.len() != 2 {
+                    return Err(invalid_pdf(
+                        "public source PDF has an invalid BDC operation",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn prepare_form<'a>(
+    preparation: &mut Preparation<'a>,
+    key: FormKey,
+    stream: &'a lopdf::Stream,
+    parent_depth: usize,
+) -> GeminiInteractionsResult<()> {
+    if preparation.active_forms.contains(&key) {
+        return Err(invalid_pdf(
+            "public source PDF Form XObject graph contains a cycle",
+        ));
+    }
+    if preparation.forms.contains_key(&key) {
+        return Ok(());
+    }
+    if preparation.forms.len() >= MAX_INVOKED_FORM_XOBJECTS_PER_PAGE {
+        return Err(invalid_pdf(
+            "public source PDF invoked too many distinct Form XObjects on one page",
+        ));
+    }
+    if stream.dict.get(b"FormType").is_ok() {
+        let form_type = stream
+            .dict
+            .get_deref(b"FormType", preparation.document)
+            .map_err(|_| {
+                invalid_pdf("public source PDF Form XObject FormType could not be resolved")
+            })?;
+        if form_type.as_i64().ok() != Some(1) {
+            return Err(invalid_pdf(
+                "public source PDF Form XObject has an invalid FormType",
+            ));
+        }
+    }
+    if stream.dict.get(b"Ref").is_ok() {
+        return Err(invalid_pdf(
+            "public source PDF reference Form XObjects are unsupported",
+        ));
+    }
+    let matrix = optional_transform(preparation.document, &stream.dict, b"Matrix")?;
+    if matrix.inverse().is_none() {
+        return Err(invalid_pdf(
+            "public source PDF Form XObject Matrix is singular",
+        ));
+    }
+    let bounds = form_bounds(preparation.document, &stream.dict)?;
+    let resources = form_resource_scope(preparation, stream)?;
+    if preparation.remaining_decompressed_bytes == 0 {
+        return Err(invalid_pdf(
+            "public source PDF Form XObjects exceeded the page decompression budget",
+        ));
+    }
+    let data = strict_stream_content(
+        stream,
+        preparation.remaining_decompressed_bytes,
+        "Form XObject content stream",
+    )?;
+    preparation.remaining_decompressed_bytes = preparation
+        .remaining_decompressed_bytes
+        .checked_sub(data.len())
+        .ok_or_else(|| {
+            invalid_pdf("public source PDF Form XObjects exceeded the page decompression budget")
+        })?;
+    let content =
+        Rc::new(Content::decode_strict(&data).map_err(|_| {
+            invalid_pdf("public source PDF Form XObject content could not be decoded")
+        })?);
+    let proof_visibility_supported = bounds.left < bounds.right
+        && bounds.bottom < bounds.top
+        && stream.dict.get(b"OC").is_err()
+        && stream.dict.get(b"Group").is_err();
+    preparation.forms.insert(
+        key,
+        PreparedForm {
+            content: Rc::clone(&content),
+            resources: resources.clone(),
+            matrix,
+            bounds,
+            proof_visibility_supported,
+        },
+    );
+    preparation.active_forms.insert(key);
+    let result = prepare_content(preparation, &content, &resources, parent_depth + 1);
+    preparation.active_forms.remove(&key);
+    result
 }
 
 fn load_page_text<'a>(
@@ -644,35 +1639,631 @@ fn load_page_text<'a>(
     page_id: ObjectId,
     max_decompressed_bytes: usize,
 ) -> GeminiInteractionsResult<PageText<'a>> {
-    let content_data = document
-        .get_page_content_with_limit(page_id, max_decompressed_bytes)
-        .map_err(|_| {
-            GeminiInteractionsError::InvalidResponse(
-                "public source PDF page content exceeded its decompressed byte cap".to_string(),
-            )
-        })?;
-    let content = Content::decode(&content_data).map_err(|_| {
-        GeminiInteractionsError::InvalidResponse(
-            "public source PDF page content could not be decoded".to_string(),
-        )
-    })?;
-    let mut remaining_decompressed_bytes =
-        max_decompressed_bytes.saturating_sub(content_data.len());
-    let xobject_safety = collect_page_xobject_safety(
+    let content_data = strict_page_content(document, page_id, max_decompressed_bytes)?;
+    let content = Content::decode_strict(&content_data)
+        .map_err(|_| invalid_pdf("public source PDF page content could not be decoded"))?;
+    let root_resources = page_resource_scope(document, page_id)?;
+    let mut preparation = Preparation {
         document,
-        page_id,
-        &content,
-        &mut remaining_decompressed_bytes,
-    )?;
-    let encodings =
-        collect_page_font_encodings(document, page_id, &content, remaining_decompressed_bytes)?;
-    let display_transform = page_display_transform(document, page_id)?;
+        root_resources: root_resources.clone(),
+        remaining_decompressed_bytes: max_decompressed_bytes.saturating_sub(content_data.len()),
+        fonts: BTreeMap::new(),
+        forms: HashMap::new(),
+        active_forms: HashSet::new(),
+        invoked_xobjects: HashSet::new(),
+    };
+    prepare_content(&mut preparation, &content, &root_resources, 0)?;
+    let per_font_budget = if preparation.fonts.is_empty() {
+        preparation.remaining_decompressed_bytes
+    } else {
+        preparation.remaining_decompressed_bytes / preparation.fonts.len()
+    };
+    let mut encodings = HashMap::new();
+    let mut metrics = HashMap::new();
+    for (key, font) in preparation.fonts {
+        if per_font_budget == 0 {
+            return Err(invalid_pdf(
+                "public source PDF font decoding exhausted the page decompression budget",
+            ));
+        }
+        if let Ok(encoding) = strict_font_encoding(document, font, per_font_budget) {
+            encodings.insert(key, encoding);
+            metrics.insert(key, font_metrics(document, font)?);
+        }
+    }
     Ok(PageText {
+        document,
+        root_resources,
         encodings,
-        xobject_safety,
+        font_metrics: metrics,
+        forms: preparation.forms,
         content,
-        display_transform,
+        display_transform: page_display_transform(document, page_id)?,
     })
+}
+
+#[derive(Clone)]
+struct GraphicsState {
+    transform: Transform,
+    font_key: Option<usize>,
+    font_size: f64,
+    leading: f64,
+    character_spacing: f64,
+    word_spacing: f64,
+    horizontal_scaling: f64,
+    text_rise: f64,
+    text_rendering_mode: i64,
+    proof_visibility_supported: bool,
+    clip_constraints: Vec<FormClip>,
+}
+
+impl Default for GraphicsState {
+    fn default() -> Self {
+        Self {
+            transform: Transform::IDENTITY,
+            font_key: None,
+            font_size: 0.0,
+            leading: 0.0,
+            character_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scaling: 1.0,
+            text_rise: 0.0,
+            text_rendering_mode: 0,
+            proof_visibility_supported: true,
+            clip_constraints: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FormClip {
+    page_to_form: Transform,
+    bounds: FormBounds,
+}
+
+#[derive(Clone, Copy)]
+struct PageBounds {
+    left: f64,
+    bottom: f64,
+    right: f64,
+    top: f64,
+}
+
+impl PageBounds {
+    fn include(&mut self, x: f64, y: f64) {
+        self.left = self.left.min(x);
+        self.bottom = self.bottom.min(y);
+        self.right = self.right.max(x);
+        self.top = self.top.max(y);
+    }
+
+    fn corners(self) -> [(f64, f64); 4] {
+        [
+            (self.left, self.bottom),
+            (self.left, self.top),
+            (self.right, self.bottom),
+            (self.right, self.top),
+        ]
+    }
+}
+
+struct TextGeometry {
+    painted: PageBounds,
+    advance: f64,
+}
+
+struct VisitState {
+    sequence: usize,
+    decoded_text_bytes: usize,
+    xobject_invocations: usize,
+    graphics_depth: usize,
+}
+
+fn bounds_are_inside_clips(bounds: PageBounds, clips: &[FormClip]) -> bool {
+    clips.iter().all(|clip| {
+        bounds.corners().into_iter().all(|(page_x, page_y)| {
+            let (form_x, form_y) = clip.page_to_form.point(page_x, page_y);
+            clip.bounds.contains(form_x, form_y)
+        })
+    })
+}
+
+fn text_geometry(
+    metrics: &FontMetrics,
+    operands: &[Object],
+    graphics: &GraphicsState,
+    text_to_page: Transform,
+) -> Option<TextGeometry> {
+    let font_bounds = metrics.bounds?;
+    let mut cursor = 0.0;
+    let mut painted = PageBounds {
+        left: f64::INFINITY,
+        bottom: f64::INFINITY,
+        right: f64::NEG_INFINITY,
+        top: f64::NEG_INFINITY,
+    };
+    let mut has_glyph = false;
+    let mut visit_string = |bytes: &[u8], cursor: &mut f64| -> Option<()> {
+        for byte in bytes {
+            let width = metrics.widths[*byte as usize]?;
+            let x_scale = graphics.font_size * graphics.horizontal_scaling / 1_000.0;
+            let y_scale = graphics.font_size / 1_000.0;
+            for (x, y) in [
+                (font_bounds.left, font_bounds.bottom),
+                (font_bounds.left, font_bounds.top),
+                (font_bounds.right, font_bounds.bottom),
+                (font_bounds.right, font_bounds.top),
+            ] {
+                let (page_x, page_y) =
+                    text_to_page.point(*cursor + x * x_scale, graphics.text_rise + y * y_scale);
+                if !page_x.is_finite() || !page_y.is_finite() {
+                    return None;
+                }
+                painted.include(page_x, page_y);
+            }
+            has_glyph = true;
+            let spacing = graphics.character_spacing
+                + if *byte == b' ' {
+                    graphics.word_spacing
+                } else {
+                    0.0
+                };
+            *cursor +=
+                (width * graphics.font_size / 1_000.0 + spacing) * graphics.horizontal_scaling;
+            if !cursor.is_finite() {
+                return None;
+            }
+        }
+        Some(())
+    };
+    for operand in operands {
+        match operand {
+            Object::String(bytes, _) => visit_string(bytes, &mut cursor)?,
+            Object::Array(values) => {
+                for value in values {
+                    match value {
+                        Object::String(bytes, _) => visit_string(bytes, &mut cursor)?,
+                        value => {
+                            let adjustment = number(value)?;
+                            cursor += -adjustment * graphics.font_size / 1_000.0
+                                * graphics.horizontal_scaling;
+                            if !cursor.is_finite() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    has_glyph.then_some(TextGeometry {
+        painted,
+        advance: cursor,
+    })
+}
+
+fn visit_content<F>(
+    page: &PageText<'_>,
+    content: &Content<Vec<lopdf::content::Operation>>,
+    resources: &ResourceScope<'_>,
+    mut graphics: GraphicsState,
+    clips: &[FormClip],
+    inherited_content_visibility: bool,
+    state: &mut VisitState,
+    max_decoded_text_bytes: usize,
+    visitor: &mut F,
+) -> GeminiInteractionsResult<()>
+where
+    F: FnMut(TextFragment),
+{
+    let mut position = TextPosition::default();
+    let mut graphics_stack = Vec::<GraphicsState>::new();
+    let mut marked_visibility_stack = Vec::<bool>::new();
+    let mut content_visibility_supported = inherited_content_visibility;
+    let mut path_rectangles = Vec::<FormClip>::new();
+    let mut path_supported = true;
+    let mut clip_pending = false;
+    let mut in_text_object = false;
+    for operation in &content.operations {
+        match operation.operator.as_str() {
+            "q" => {
+                if in_text_object {
+                    return Err(invalid_pdf(
+                        "public source PDF changes graphics scope inside a text object",
+                    ));
+                }
+                if state.graphics_depth >= MAX_GRAPHICS_STATE_DEPTH {
+                    return Err(invalid_pdf(
+                        "public source PDF graphics-state depth exceeded its bound",
+                    ));
+                }
+                state.graphics_depth += 1;
+                graphics_stack.push(graphics.clone());
+            }
+            "Q" => {
+                if in_text_object {
+                    return Err(invalid_pdf(
+                        "public source PDF changes graphics scope inside a text object",
+                    ));
+                }
+                graphics = graphics_stack.pop().ok_or_else(|| {
+                    invalid_pdf("public source PDF graphics-state stack underflowed")
+                })?;
+                state.graphics_depth = state.graphics_depth.saturating_sub(1);
+            }
+            "cm" => {
+                let next = transform(&operation.operands).ok_or_else(|| {
+                    invalid_pdf("public source PDF contains an invalid coordinate transform")
+                })?;
+                graphics.transform = graphics.transform.concatenate(next);
+            }
+            "BT" => {
+                if in_text_object {
+                    return Err(invalid_pdf(
+                        "public source PDF contains nested text objects",
+                    ));
+                }
+                in_text_object = true;
+                position = TextPosition::default();
+            }
+            "ET" => {
+                if !in_text_object {
+                    return Err(invalid_pdf(
+                        "public source PDF closes a missing text object",
+                    ));
+                }
+                in_text_object = false;
+            }
+            "Tf" => {
+                let name = operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    .ok_or_else(|| invalid_pdf("public source PDF has an invalid Tf operation"))?;
+                let size =
+                    operation.operands.get(1).and_then(number).ok_or_else(|| {
+                        invalid_pdf("public source PDF has an invalid Tf operation")
+                    })?;
+                let font = font_dictionary(page.document, resources, name)?;
+                let font_key = font as *const lopdf::Dictionary as usize;
+                if operation.operands.len() != 2 || !size.is_finite() {
+                    return Err(invalid_pdf("public source PDF has an invalid Tf operation"));
+                }
+                graphics.font_key = Some(font_key);
+                graphics.font_size = size;
+            }
+            "Tm" => {
+                let next = transform(&operation.operands).ok_or_else(|| {
+                    invalid_pdf("public source PDF contains an invalid text matrix")
+                })?;
+                position.current = next;
+                position.line = next;
+                position.known = true;
+                position.line_known = true;
+            }
+            "Td" | "TD" => {
+                let (Some(x), Some(y)) = (
+                    operation.operands.first().and_then(number),
+                    operation.operands.get(1).and_then(number),
+                ) else {
+                    return Err(invalid_pdf(
+                        "public source PDF contains an invalid text-line displacement",
+                    ));
+                };
+                if operation.operands.len() != 2 || !x.is_finite() || !y.is_finite() {
+                    return Err(invalid_pdf(
+                        "public source PDF contains an invalid text-line displacement",
+                    ));
+                }
+                if operation.operator == "TD" {
+                    graphics.leading = -y;
+                }
+                let translation = Transform {
+                    e: x,
+                    f: y,
+                    ..Transform::IDENTITY
+                };
+                position.line = position.line.concatenate(translation);
+                position.current = position.line;
+                position.known = true;
+                position.line_known = true;
+            }
+            "TL" => {
+                let leading = operation.operands.first().and_then(number).ok_or_else(|| {
+                    invalid_pdf("public source PDF contains invalid text leading")
+                })?;
+                if operation.operands.len() != 1 || !leading.is_finite() {
+                    return Err(invalid_pdf(
+                        "public source PDF contains invalid text leading",
+                    ));
+                }
+                graphics.leading = leading;
+            }
+            "T*" => {
+                let translation = Transform {
+                    e: 0.0,
+                    f: -graphics.leading,
+                    ..Transform::IDENTITY
+                };
+                position.line = position.line.concatenate(translation);
+                position.current = position.line;
+                position.known = position.line_known;
+            }
+            "Tc" => {
+                graphics.character_spacing =
+                    number(&operation.operands[0]).expect("Tc was validated during preparation");
+            }
+            "Tw" => {
+                graphics.word_spacing =
+                    number(&operation.operands[0]).expect("Tw was validated during preparation");
+            }
+            "Tz" => {
+                graphics.horizontal_scaling = number(&operation.operands[0])
+                    .expect("Tz was validated during preparation")
+                    / 100.0;
+            }
+            "Ts" => {
+                graphics.text_rise =
+                    number(&operation.operands[0]).expect("Ts was validated during preparation");
+            }
+            "Tr" => {
+                graphics.text_rendering_mode = operation.operands[0]
+                    .as_i64()
+                    .expect("Tr operations were validated during page preparation");
+            }
+            "gs" => {
+                let name = operation.operands[0]
+                    .as_name()
+                    .expect("gs operations were validated during page preparation");
+                let ext_gstate = ext_gstate_dictionary(page.document, resources, name)?;
+                graphics.proof_visibility_supported &=
+                    ext_gstate_proof_visibility_supported(ext_gstate)?;
+                if let Some((font, size)) = ext_gstate_font(page.document, ext_gstate)? {
+                    graphics.font_key = Some(font as *const lopdf::Dictionary as usize);
+                    graphics.font_size = size;
+                }
+            }
+            "re" => {
+                let values = operation
+                    .operands
+                    .iter()
+                    .map(number)
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|values| {
+                        values.len() == 4 && values.iter().copied().all(f64::is_finite)
+                    });
+                let Some(values) = values else {
+                    return Err(invalid_pdf(
+                        "public source PDF contains an invalid rectangle path",
+                    ));
+                };
+                let (x, y, width, height) = (values[0], values[1], values[2], values[3]);
+                let page_to_path = graphics.transform.inverse().ok_or_else(|| {
+                    invalid_pdf("public source PDF clipping transform is singular")
+                })?;
+                path_rectangles.push(FormClip {
+                    page_to_form: page_to_path,
+                    bounds: FormBounds {
+                        left: x.min(x + width),
+                        bottom: y.min(y + height),
+                        right: x.max(x + width),
+                        top: y.max(y + height),
+                    },
+                });
+            }
+            "m" | "l" | "c" | "v" | "y" | "h" => {
+                path_supported = false;
+            }
+            "W" | "W*" => {
+                if !operation.operands.is_empty() {
+                    return Err(invalid_pdf(
+                        "public source PDF contains an invalid clipping operation",
+                    ));
+                }
+                clip_pending = true;
+            }
+            "n" | "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" => {
+                if clip_pending {
+                    if path_supported && path_rectangles.len() == 1 {
+                        graphics.clip_constraints.push(path_rectangles[0]);
+                    } else {
+                        // Arbitrary clipping geometry cannot establish that
+                        // later decoded text is visibly painted.
+                        graphics.proof_visibility_supported = false;
+                    }
+                }
+                path_rectangles.clear();
+                path_supported = true;
+                clip_pending = false;
+            }
+            "BMC" => {
+                marked_visibility_stack.push(content_visibility_supported);
+            }
+            "BDC" => {
+                marked_visibility_stack.push(content_visibility_supported);
+                if operation
+                    .operands
+                    .first()
+                    .and_then(|operand| operand.as_name().ok())
+                    == Some(b"OC")
+                {
+                    content_visibility_supported = false;
+                }
+            }
+            "EMC" => {
+                content_visibility_supported = marked_visibility_stack.pop().ok_or_else(|| {
+                    invalid_pdf("public source PDF marked-content stack underflowed")
+                })?;
+            }
+            "Do" => {
+                if in_text_object {
+                    return Err(invalid_pdf(
+                        "public source PDF invokes an XObject inside a text object",
+                    ));
+                }
+                state.xobject_invocations =
+                    state.xobject_invocations.checked_add(1).ok_or_else(|| {
+                        invalid_pdf("public source PDF XObject invocation count overflowed")
+                    })?;
+                if state.xobject_invocations > MAX_XOBJECT_INVOCATIONS_PER_PAGE {
+                    return Err(invalid_pdf(
+                        "public source PDF invoked too many XObjects on one page",
+                    ));
+                }
+                let name = operation.operands[0]
+                    .as_name()
+                    .expect("Do operations were validated during page preparation");
+                let (key, stream) = resolved_xobject(page.document, resources, name)?;
+                match validate_xobject_type(page.document, stream)? {
+                    b"Image" => {}
+                    b"Form" => {
+                        if state.graphics_depth >= MAX_GRAPHICS_STATE_DEPTH {
+                            return Err(invalid_pdf(
+                                "public source PDF graphics-state depth exceeded its bound",
+                            ));
+                        }
+                        let form = page.forms.get(&key).ok_or_else(|| {
+                            invalid_pdf("public source PDF invoked an unprepared Form XObject")
+                        })?;
+                        let form_to_page = graphics.transform.concatenate(form.matrix);
+                        let page_to_form = form_to_page.inverse().ok_or_else(|| {
+                            invalid_pdf("public source PDF Form XObject Matrix is singular")
+                        })?;
+                        let mut child_graphics = graphics.clone();
+                        child_graphics.transform = form_to_page;
+                        child_graphics.proof_visibility_supported &=
+                            form.proof_visibility_supported;
+                        let mut child_clips = clips.to_vec();
+                        child_clips.push(FormClip {
+                            page_to_form,
+                            bounds: form.bounds,
+                        });
+                        state.graphics_depth += 1;
+                        let result = visit_content(
+                            page,
+                            &form.content,
+                            &form.resources,
+                            child_graphics,
+                            &child_clips,
+                            content_visibility_supported,
+                            state,
+                            max_decoded_text_bytes,
+                            visitor,
+                        );
+                        state.graphics_depth = state.graphics_depth.saturating_sub(1);
+                        result?;
+                    }
+                    _ => unreachable!("XObject subtype was validated during preparation"),
+                }
+            }
+            "Tj" | "TJ" | "'" | "\"" => {
+                if !in_text_object {
+                    return Err(invalid_pdf(
+                        "public source PDF paints text outside a text object",
+                    ));
+                }
+                if operation.operator == "\"" {
+                    graphics.word_spacing = number(&operation.operands[0])
+                        .expect("double-quote operation was validated during preparation");
+                    graphics.character_spacing = number(&operation.operands[1])
+                        .expect("double-quote operation was validated during preparation");
+                }
+                if matches!(operation.operator.as_str(), "'" | "\"") {
+                    let translation = Transform {
+                        e: 0.0,
+                        f: -graphics.leading,
+                        ..Transform::IDENTITY
+                    };
+                    position.line = position.line.concatenate(translation);
+                    position.current = position.line;
+                    position.known = position.line_known;
+                }
+                let font_key = graphics.font_key.ok_or_else(|| {
+                    invalid_pdf(
+                        "public source PDF text uses a missing or undecodable resolved font",
+                    )
+                })?;
+                let Some(encoding) = page.encodings.get(&font_key) else {
+                    position.known = false;
+                    continue;
+                };
+                let operands = if operation.operator == "\"" {
+                    operation.operands.get(2..).unwrap_or_default()
+                } else {
+                    operation.operands.as_slice()
+                };
+                let mut text = String::new();
+                decode_text_operands(encoding, operands, &mut text)
+                    .map_err(|_| invalid_pdf("public source PDF text could not be decoded"))?;
+                let text = normalize_text_row(&text);
+                state.decoded_text_bytes = state
+                    .decoded_text_bytes
+                    .checked_add(text.len())
+                    .ok_or_else(|| {
+                        invalid_pdf("public source PDF decoded layout text exceeded its byte cap")
+                    })?;
+                if state.decoded_text_bytes > max_decoded_text_bytes {
+                    return Err(invalid_pdf(
+                        "public source PDF decoded layout text exceeded its byte cap",
+                    ));
+                }
+                let page_transform = graphics.transform.concatenate(position.current);
+                let visual_transform = page.display_transform.concatenate(page_transform);
+                let geometry = page.font_metrics.get(&font_key).and_then(|metrics| {
+                    text_geometry(metrics, operands, &graphics, page_transform)
+                });
+                let clip_geometry_supported = (clips.is_empty()
+                    && graphics.clip_constraints.is_empty())
+                    || geometry.as_ref().is_some_and(|geometry| {
+                        bounds_are_inside_clips(geometry.painted, clips)
+                            && bounds_are_inside_clips(geometry.painted, &graphics.clip_constraints)
+                    });
+                if !text.is_empty()
+                    && position.known
+                    && visual_transform.has_horizontal_baseline()
+                    && graphics.font_size.abs() > f64::EPSILON
+                    && graphics.proof_visibility_supported
+                    && content_visibility_supported
+                    && graphics.text_rendering_mode == 0
+                    && clip_geometry_supported
+                {
+                    let (page_x, page_y) = page_transform.point(0.0, graphics.text_rise);
+                    let (x, y) = page.display_transform.point(page_x, page_y);
+                    visitor(TextFragment {
+                        x,
+                        y,
+                        sequence: state.sequence,
+                        text,
+                    });
+                    state.sequence = state.sequence.saturating_add(1);
+                }
+                if position.known {
+                    if let Some(geometry) = geometry {
+                        position.current = position.current.concatenate(Transform {
+                            e: geometry.advance,
+                            ..Transform::IDENTITY
+                        });
+                    } else {
+                        position.known = false;
+                    }
+                } else {
+                    position.known = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_text_object
+        || !graphics_stack.is_empty()
+        || !marked_visibility_stack.is_empty()
+        || clip_pending
+    {
+        return Err(invalid_pdf(
+            "public source PDF has an unbalanced text, graphics-state, or marked-content scope",
+        ));
+    }
+    Ok(())
 }
 
 fn visit_text_fragments<F>(
@@ -683,220 +2274,23 @@ fn visit_text_fragments<F>(
 where
     F: FnMut(TextFragment),
 {
-    let mut current_font = None::<Vec<u8>>;
-    let mut position = TextPosition::default();
-    let mut graphics_transform = Transform::IDENTITY;
-    let mut graphics_stack = Vec::<Transform>::new();
-    let mut sequence = 0usize;
-    let mut decoded_text_bytes = 0usize;
-    let mut in_text_object = false;
-
-    for operation in &page.content.operations {
-        match operation.operator.as_str() {
-            "q" => {
-                if in_text_object {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF changes graphics scope inside a text object".to_string(),
-                    ));
-                }
-                if graphics_stack.len() >= MAX_GRAPHICS_STATE_DEPTH {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF graphics-state depth exceeded its bound".to_string(),
-                    ));
-                }
-                graphics_stack.push(graphics_transform);
-            }
-            "Q" => {
-                if in_text_object {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF changes graphics scope inside a text object".to_string(),
-                    ));
-                }
-                let Some(saved_transform) = graphics_stack.pop() else {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF graphics-state stack underflowed".to_string(),
-                    ));
-                };
-                graphics_transform = saved_transform;
-            }
-            "cm" => {
-                let transform = transform(&operation.operands).ok_or_else(|| {
-                    GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains an invalid coordinate transform".to_string(),
-                    )
-                })?;
-                graphics_transform = graphics_transform.concatenate(transform);
-            }
-            "BT" => {
-                if in_text_object {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains nested text objects".to_string(),
-                    ));
-                }
-                in_text_object = true;
-                position = TextPosition::default();
-            }
-            "ET" => {
-                if !in_text_object {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF closes a missing text object".to_string(),
-                    ));
-                }
-                in_text_object = false;
-            }
-            "Tf" => {
-                current_font = operation
-                    .operands
-                    .first()
-                    .and_then(|operand| operand.as_name().ok())
-                    .map(ToOwned::to_owned);
-            }
-            "Tm" => {
-                let transform = transform(&operation.operands).ok_or_else(|| {
-                    GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains an invalid text matrix".to_string(),
-                    )
-                })?;
-                position.current = transform;
-                position.line = transform;
-                position.known = true;
-            }
-            "Td" | "TD" => {
-                let (Some(x), Some(y)) = (
-                    operation.operands.first().and_then(number),
-                    operation.operands.get(1).and_then(number),
-                ) else {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains an invalid text-line displacement".to_string(),
-                    ));
-                };
-                if operation.operands.len() != 2 || !x.is_finite() || !y.is_finite() {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains an invalid text-line displacement".to_string(),
-                    ));
-                }
-                if operation.operator == "TD" {
-                    position.leading = -y;
-                }
-                let translation = Transform {
-                    e: x,
-                    f: y,
-                    ..Transform::IDENTITY
-                };
-                position.line = position.line.concatenate(translation);
-                position.current = position.line;
-                position.known = true;
-            }
-            "TL" => {
-                let Some(leading) = operation.operands.first().and_then(number) else {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains invalid text leading".to_string(),
-                    ));
-                };
-                if operation.operands.len() != 1 || !leading.is_finite() {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF contains invalid text leading".to_string(),
-                    ));
-                }
-                position.leading = leading;
-            }
-            "T*" => {
-                let translation = Transform {
-                    e: 0.0,
-                    f: -position.leading,
-                    ..Transform::IDENTITY
-                };
-                position.line = position.line.concatenate(translation);
-                position.current = position.line;
-            }
-            "Do" => {
-                let name = operation
-                    .operands
-                    .first()
-                    .and_then(|operand| operand.as_name().ok());
-                if !name.is_some_and(|name| page.xobject_safety.get(name).copied() == Some(true)) {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF invokes an unhandled text-bearing or invalid Form XObject"
-                            .to_string(),
-                    ));
-                }
-            }
-            "Tj" | "TJ" | "'" | "\"" => {
-                if matches!(operation.operator.as_str(), "'" | "\"") {
-                    let translation = Transform {
-                        e: 0.0,
-                        f: -position.leading,
-                        ..Transform::IDENTITY
-                    };
-                    position.line = position.line.concatenate(translation);
-                    position.current = position.line;
-                }
-                let encoding = current_font
-                    .as_ref()
-                    .and_then(|font| page.encodings.get(font))
-                    .and_then(|encoding| encoding.as_ref().ok())
-                    .ok_or_else(|| {
-                        GeminiInteractionsError::InvalidResponse(
-                            "public source PDF text uses a missing or undecodable font".to_string(),
-                        )
-                    })?;
-                let operands = if operation.operator == "\"" {
-                    operation.operands.get(2..).unwrap_or_default()
-                } else {
-                    operation.operands.as_slice()
-                };
-                let mut text = String::new();
-                decode_text_operands(encoding, operands, &mut text).map_err(|_| {
-                    GeminiInteractionsError::InvalidResponse(
-                        "public source PDF text could not be decoded".to_string(),
-                    )
-                })?;
-                let text = normalize_text_row(&text);
-                if text.is_empty() {
-                    continue;
-                }
-                let visual_transform = page
-                    .display_transform
-                    .concatenate(graphics_transform)
-                    .concatenate(position.current);
-                if !in_text_object || !position.known || !visual_transform.has_horizontal_baseline()
-                {
-                    // This fragment cannot establish a visual row. It is
-                    // excluded rather than flattened into a horizontal record;
-                    // a document containing only such target text remains
-                    // unresolved because it produces no eligible proof row.
-                    continue;
-                }
-                decoded_text_bytes =
-                    decoded_text_bytes.checked_add(text.len()).ok_or_else(|| {
-                        GeminiInteractionsError::InvalidResponse(
-                            "public source PDF decoded layout text exceeded its byte cap"
-                                .to_string(),
-                        )
-                    })?;
-                if decoded_text_bytes > max_decompressed_bytes {
-                    return Err(GeminiInteractionsError::InvalidResponse(
-                        "public source PDF decoded layout text exceeded its byte cap".to_string(),
-                    ));
-                }
-                let (x, y) = visual_transform.point(0.0, 0.0);
-                visitor(TextFragment {
-                    x,
-                    y,
-                    sequence,
-                    text,
-                });
-                sequence = sequence.saturating_add(1);
-            }
-            _ => {}
-        }
-    }
-    if in_text_object || !graphics_stack.is_empty() {
-        return Err(GeminiInteractionsError::InvalidResponse(
-            "public source PDF has an unbalanced text or graphics-state scope".to_string(),
-        ));
-    }
-    Ok(())
+    let mut state = VisitState {
+        sequence: 0,
+        decoded_text_bytes: 0,
+        xobject_invocations: 0,
+        graphics_depth: 0,
+    };
+    visit_content(
+        page,
+        &page.content,
+        &page.root_resources,
+        GraphicsState::default(),
+        &[],
+        true,
+        &mut state,
+        max_decompressed_bytes,
+        &mut visitor,
+    )
 }
 
 fn target_visual_rows(
@@ -975,716 +2369,5 @@ fn target_visual_rows(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::avionics::source::{exact_oem_product_identity_row, OemProductIdentity};
-    use lopdf::content::Operation;
-    use lopdf::{dictionary, Stream};
-
-    fn source_pdf(pages: &[&[&str]]) -> Vec<u8> {
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let font_id = document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Courier",
-        });
-        let resources_id = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-        });
-        let mut page_ids = Vec::new();
-        for lines in pages {
-            let mut operations = vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), 10.into()]),
-                Operation::new("TL", vec![12.into()]),
-                Operation::new("Td", vec![50.into(), 740.into()]),
-            ];
-            for line in *lines {
-                operations.push(Operation::new("Tj", vec![Object::string_literal(*line)]));
-                operations.push(Operation::new("T*", vec![]));
-            }
-            operations.push(Operation::new("ET", vec![]));
-            let content_id = document.add_object(Stream::new(
-                dictionary! {},
-                Content { operations }.encode().unwrap(),
-            ));
-            page_ids.push(document.add_object(dictionary! {
-                "Type" => "Page",
-                "Parent" => pages_id,
-                "Contents" => content_id,
-            }));
-        }
-        finish_pdf(document, pages_id, resources_id, page_ids)
-    }
-
-    fn source_visual_row_pdf(rows: &[&[(i64, &str)]]) -> Vec<u8> {
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let font_id = document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Courier",
-        });
-        let resources_id = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-        });
-        let mut operations = vec![
-            Operation::new("BT", vec![]),
-            Operation::new("Tf", vec!["F1".into(), 10.into()]),
-        ];
-        for (row_index, row) in rows.iter().enumerate() {
-            let y = 740_i64 - (row_index as i64 * 14);
-            for (x, text) in *row {
-                operations.push(Operation::new(
-                    "Tm",
-                    vec![
-                        1.into(),
-                        0.into(),
-                        0.into(),
-                        1.into(),
-                        (*x).into(),
-                        y.into(),
-                    ],
-                ));
-                operations.push(Operation::new("Tj", vec![Object::string_literal(*text)]));
-            }
-        }
-        operations.push(Operation::new("ET", vec![]));
-        let content_id = document.add_object(Stream::new(
-            dictionary! {},
-            Content { operations }.encode().unwrap(),
-        ));
-        let page_id = document.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        });
-        finish_pdf(document, pages_id, resources_id, vec![page_id])
-    }
-
-    fn source_text_operations_pdf(
-        mut operations: Vec<Operation>,
-        rotation: Option<i64>,
-    ) -> Vec<u8> {
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let font_id = document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Courier",
-        });
-        let resources_id = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-        });
-        operations.insert(0, Operation::new("BT", vec![]));
-        operations.insert(1, Operation::new("Tf", vec!["F1".into(), 10.into()]));
-        operations.push(Operation::new("ET", vec![]));
-        let content_id = document.add_object(Stream::new(
-            dictionary! {},
-            Content { operations }.encode().unwrap(),
-        ));
-        let mut page = dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        };
-        if let Some(rotation) = rotation {
-            page.set("Rotate", rotation);
-        }
-        let page_id = document.add_object(page);
-        finish_pdf(document, pages_id, resources_id, vec![page_id])
-    }
-
-    fn finish_pdf(
-        mut document: Document,
-        pages_id: ObjectId,
-        resources_id: ObjectId,
-        page_ids: Vec<ObjectId>,
-    ) -> Vec<u8> {
-        document.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
-                "Count" => page_ids.len() as i64,
-                "Resources" => resources_id,
-                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            }),
-        );
-        let catalog_id = document.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id,
-        });
-        document.trailer.set("Root", catalog_id);
-        let mut bytes = Vec::new();
-        document.save_to(&mut bytes).unwrap();
-        bytes
-    }
-
-    #[test]
-    fn extracts_bounded_generic_text_and_physical_fragments() {
-        let pdf = source_pdf(&[
-            &[
-                "GEA 71 Unit (011-00831-00) 010-00283-00",
-                "GEA 71 Unit Rack 115-00411-00",
-            ],
-            &["GEA 71 Installation Manual"],
-        ]);
-        let extracted = extract(&pdf, None).unwrap();
-
-        assert!(extracted
-            .publisher_text
-            .contains("GEA 71 Unit (011-00831-00) 010-00283-00"));
-        assert_eq!(extracted.source_text_rows.len(), 3);
-        assert!(extracted.source_text_rows_complete);
-        assert!(extracted
-            .source_text_rows
-            .iter()
-            .all(|row| row.kind == TextRowKind::PdfPhysicalLine));
-    }
-
-    #[test]
-    fn resource_limits_and_encryption_fail_closed() {
-        assert!(extract(b"%PDF-not-a-document", None).is_err());
-        assert!(extract(&source_pdf(&[&[]]), None).is_err());
-
-        let two_pages = source_pdf(&[&["Garmin GIA 63"], &["Garmin GIA 63W"]]);
-        assert!(extract_with_limits(
-            &two_pages,
-            Limits {
-                max_pages: 1,
-                ..LIMITS
-            },
-            None,
-        )
-        .is_err());
-        assert!(extract_with_limits(
-            &two_pages,
-            Limits {
-                max_total_text_bytes: 4,
-                ..LIMITS
-            },
-            None,
-        )
-        .is_err());
-
-        let pdf = source_pdf(&[&["Garmin GIA 63W"]]);
-        let mut document = Document::load_mem(&pdf).unwrap();
-        let encrypt_id = document.add_object(dictionary! {
-            "Filter" => "Standard",
-            "V" => 1,
-            "R" => 2,
-            "Length" => 40,
-            "O" => Object::string_literal("owner"),
-            "U" => Object::string_literal("user"),
-            "P" => -4,
-        });
-        document.trailer.set("Encrypt", encrypt_id);
-        let mut encrypted = Vec::new();
-        document.save_to(&mut encrypted).unwrap();
-        assert!(extract(&encrypted, None).is_err());
-    }
-
-    #[test]
-    fn targeted_projection_ignores_unrelated_noise_but_not_target_overflow() {
-        let target = ProductIdentityTarget::new("GEA 71", "011-00831-00").unwrap();
-        let oversized = "unrelated ".repeat(MAX_TEXT_ROW_CHARACTERS);
-        let mut crowded = vec!["unrelated"; MAX_TEXT_ROWS + 1];
-        crowded.push("GEA 71 Unit (011-00831-00) 010-00283-00");
-        let pdf = source_pdf(&[&[oversized.as_str()], crowded.as_slice()]);
-
-        assert!(!extract(&pdf, None).unwrap().source_text_rows_complete);
-        let targeted = extract(&pdf, Some(&target)).unwrap();
-        assert!(targeted.source_text_rows_complete);
-        assert_eq!(targeted.source_text_rows.len(), 1);
-        assert_eq!(
-            targeted.source_text_rows[0].text,
-            "GEA 71 Unit (011-00831-00) 010-00283-00"
-        );
-
-        let oversized_target = format!(
-            "GEA 71 011-00831-00 {}",
-            "target filler ".repeat(MAX_TEXT_ROW_CHARACTERS)
-        );
-        assert!(extract(&source_pdf(&[&[&oversized_target]]), Some(&target)).is_err());
-    }
-
-    #[test]
-    fn visual_rows_reconstruct_only_one_page_and_baseline() {
-        let target = ProductIdentityTarget::new("ME406", "453-6603").unwrap();
-        let pdf = source_visual_row_pdf(&[
-            &[(40, "ME406 (453-6603),"), (220, "ME406HM (453-6604)")],
-            &[
-                (40, "Emergency Locator Transmitter"),
-                (260, "453-6603"),
-                (380, "ME406"),
-            ],
-            &[
-                (40, "Emergency Locator Transmitter"),
-                (260, "453-6604"),
-                (380, "ME406HM"),
-            ],
-        ]);
-        let extracted = extract(&pdf, Some(&target)).unwrap();
-
-        assert!(extracted.source_text_rows_complete);
-        assert_eq!(extracted.source_text_rows.len(), 2);
-        let target_identity = OemProductIdentity {
-            catalog_id: 125,
-            model: "ME406",
-            manufacturer_identifier: "453-6603",
-        };
-        let neighbor_identity = OemProductIdentity {
-            catalog_id: 126,
-            model: "ME406HM",
-            manufacturer_identifier: "453-6604",
-        };
-        assert_eq!(
-            exact_oem_product_identity_row(
-                &extracted.source_text_rows,
-                extracted.source_text_rows_complete,
-                target_identity,
-                &[target_identity, neighbor_identity],
-            )
-            .unwrap(),
-            "Emergency Locator Transmitter 453-6603 ME406"
-        );
-
-        let split_pdf = source_visual_row_pdf(&[&[(40, "ME406")], &[(260, "453-6603")]]);
-        let split = extract(&split_pdf, Some(&target)).unwrap();
-        assert!(exact_oem_product_identity_row(
-            &split.source_text_rows,
-            split.source_text_rows_complete,
-            target_identity,
-            &[target_identity, neighbor_identity],
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn scaled_rotated_text_displacements_use_the_displayed_page_baseline() {
-        let operations = vec![
-            Operation::new(
-                "Tm",
-                vec![
-                    0.into(),
-                    (-2).into(),
-                    2.into(),
-                    0.into(),
-                    100.into(),
-                    700.into(),
-                ],
-            ),
-            Operation::new("Tj", vec![Object::string_literal("GSU 75")]),
-            Operation::new("Td", vec![100.into(), 0.into()]),
-            Operation::new("Tj", vec![Object::string_literal("010-01127-00")]),
-            Operation::new("Td", vec![(-100).into(), (-7).into()]),
-            Operation::new("Tj", vec![Object::string_literal("GSU 75H")]),
-            Operation::new("Td", vec![100.into(), 0.into()]),
-            Operation::new("Tj", vec![Object::string_literal("010-01127-20")]),
-        ];
-        let target = ProductIdentityTarget::new("GSU 75", "010-01127-00").unwrap();
-        let target_identity = OemProductIdentity {
-            catalog_id: 734,
-            model: "GSU 75",
-            manufacturer_identifier: "010-01127-00",
-        };
-        let neighbor_identity = OemProductIdentity {
-            catalog_id: 735,
-            model: "GSU 75H",
-            manufacturer_identifier: "010-01127-20",
-        };
-
-        let rotated = source_text_operations_pdf(operations.clone(), Some(90));
-        let extracted = extract(&rotated, Some(&target)).unwrap();
-        assert_eq!(
-            exact_oem_product_identity_row(
-                &extracted.source_text_rows,
-                extracted.source_text_rows_complete,
-                target_identity,
-                &[target_identity, neighbor_identity],
-            )
-            .unwrap(),
-            "GSU 75 010-01127-00"
-        );
-        assert!(!extracted
-            .source_text_rows
-            .iter()
-            .any(|row| { row.text.contains("010-01127-00") && row.text.contains("010-01127-20") }));
-
-        let not_display_horizontal = source_text_operations_pdf(operations, None);
-        assert!(extract(&not_display_horizontal, Some(&target)).is_err());
-    }
-
-    #[test]
-    fn missing_fonts_and_text_form_xobjects_fail_closed() {
-        let mut missing_font =
-            Document::load_mem(&source_visual_row_pdf(&[&[(40, "GEA 71 011-00831-00")]])).unwrap();
-        let page_id = *missing_font.get_pages().values().next().unwrap();
-        let pages_id = missing_font
-            .get_dictionary(page_id)
-            .unwrap()
-            .get(b"Parent")
-            .unwrap()
-            .as_reference()
-            .unwrap();
-        missing_font
-            .get_dictionary_mut(pages_id)
-            .unwrap()
-            .set("Resources", Object::Dictionary(dictionary! {}));
-        let mut bytes = Vec::new();
-        missing_font.save_to(&mut bytes).unwrap();
-        let target = ProductIdentityTarget::new("GEA 71", "011-00831-00").unwrap();
-        assert!(extract(&bytes, Some(&target)).is_err());
-
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let form = Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-            },
-            Content {
-                operations: vec![
-                    Operation::new("BT", vec![]),
-                    Operation::new("Tj", vec![Object::string_literal("ME406")]),
-                    Operation::new("ET", vec![]),
-                ],
-            }
-            .encode()
-            .unwrap(),
-        );
-        let form_id = document.add_object(form);
-        let resources_id = document.add_object(dictionary! {
-            "XObject" => dictionary! { "TargetForm" => form_id },
-        });
-        let content_id = document.add_object(Stream::new(
-            dictionary! {},
-            Content {
-                operations: vec![Operation::new(
-                    "Do",
-                    vec![Object::Name(b"TargetForm".to_vec())],
-                )],
-            }
-            .encode()
-            .unwrap(),
-        ));
-        let page_id = document.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        });
-        let bytes = finish_pdf(document, pages_id, resources_id, vec![page_id]);
-        let target = ProductIdentityTarget::new("ME406", "453-6603").unwrap();
-        assert!(extract(&bytes, Some(&target)).is_err());
-    }
-
-    #[test]
-    fn nearest_resource_names_shadow_ancestors_and_unused_entries_are_ignored() {
-        let target = ProductIdentityTarget::new("GEA 71", "011-00831-00").unwrap();
-
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let font_id = document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Courier",
-        });
-        let inherited_image = document.add_object(Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Image",
-                "Width" => 1,
-                "Height" => 1,
-                "ColorSpace" => "DeviceGray",
-                "BitsPerComponent" => 8,
-            },
-            vec![0],
-        ));
-        let direct_text_form = document.add_object(Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-            },
-            Content {
-                operations: vec![
-                    Operation::new("BT", vec![]),
-                    Operation::new("Tj", vec![Object::string_literal("untracked text")]),
-                    Operation::new("ET", vec![]),
-                ],
-            }
-            .encode()
-            .unwrap(),
-        ));
-        let parent_resources = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-            "XObject" => dictionary! { "Proof" => inherited_image },
-        });
-        let direct_resources = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-            "XObject" => dictionary! { "Proof" => direct_text_form },
-        });
-        let content_id = document.add_object(Stream::new(
-            dictionary! {},
-            Content {
-                operations: vec![Operation::new("Do", vec![Object::Name(b"Proof".to_vec())])],
-            }
-            .encode()
-            .unwrap(),
-        ));
-        let page_id = document.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Resources" => direct_resources,
-            "Contents" => content_id,
-        });
-        let bytes = finish_pdf(document, pages_id, parent_resources, vec![page_id]);
-        assert!(extract(&bytes, Some(&target)).is_err());
-
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let valid_font = document.add_object(dictionary! {
-            "Type" => "Font",
-            "Subtype" => "Type1",
-            "BaseFont" => "Courier",
-        });
-        let inherited_invalid_font = document.add_object(dictionary! { "Type" => "NotAFont" });
-        let inherited_text_form = document.add_object(Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-            },
-            Content {
-                operations: vec![Operation::new(
-                    "Tj",
-                    vec![Object::string_literal("untracked text")],
-                )],
-            }
-            .encode()
-            .unwrap(),
-        ));
-        let direct_image = document.add_object(Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Image",
-                "Width" => 1,
-                "Height" => 1,
-                "ColorSpace" => "DeviceGray",
-                "BitsPerComponent" => 8,
-            },
-            vec![0],
-        ));
-        let unused_text_form = document.add_object(Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Form",
-                "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-            },
-            Content {
-                operations: vec![Operation::new(
-                    "Tj",
-                    vec![Object::string_literal("unused text")],
-                )],
-            }
-            .encode()
-            .unwrap(),
-        ));
-        let inherited_resources = document.add_object(dictionary! {
-            "Font" => dictionary! { "F1" => inherited_invalid_font },
-            "XObject" => dictionary! { "Proof" => inherited_text_form },
-        });
-        let direct_resources = document.add_object(dictionary! {
-            "Font" => dictionary! {
-                "F1" => valid_font,
-                "UnusedInvalidFont" => dictionary! { "Type" => "NotAFont" },
-            },
-            "XObject" => dictionary! {
-                "Proof" => direct_image,
-                "UnusedTextForm" => unused_text_form,
-            },
-        });
-        let content_id = document.add_object(Stream::new(
-            dictionary! {},
-            Content {
-                operations: vec![
-                    Operation::new("Do", vec![Object::Name(b"Proof".to_vec())]),
-                    Operation::new("BT", vec![]),
-                    Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), 10.into()]),
-                    Operation::new(
-                        "Tm",
-                        vec![
-                            1.into(),
-                            0.into(),
-                            0.into(),
-                            1.into(),
-                            40.into(),
-                            700.into(),
-                        ],
-                    ),
-                    Operation::new("Tj", vec![Object::string_literal("GEA 71 011-00831-00")]),
-                    Operation::new("ET", vec![]),
-                ],
-            }
-            .encode()
-            .unwrap(),
-        ));
-        let page_id = document.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Resources" => direct_resources,
-            "Contents" => content_id,
-        });
-        let bytes = finish_pdf(document, pages_id, inherited_resources, vec![page_id]);
-        let extracted = extract(&bytes, Some(&target)).unwrap();
-        assert_eq!(extracted.source_text_rows[0].text, "GEA 71 011-00831-00");
-    }
-
-    #[test]
-    fn invoked_font_and_form_count_and_decompression_budgets_fail_closed() {
-        fn resource_heavy_pdf(font_count: usize, form_contents: &[Vec<u8>]) -> Vec<u8> {
-            let mut document = Document::with_version("1.5");
-            let pages_id = document.new_object_id();
-            let font_id = document.add_object(dictionary! {
-                "Type" => "Font",
-                "Subtype" => "Type1",
-                "BaseFont" => "Courier",
-            });
-            let mut fonts = lopdf::Dictionary::new();
-            let mut operations = Vec::new();
-            for index in 0..font_count {
-                let name = format!("F{index}");
-                fonts.set(name.as_bytes(), font_id);
-                operations.push(Operation::new(
-                    "Tf",
-                    vec![Object::Name(name.into_bytes()), 10.into()],
-                ));
-            }
-            let mut xobjects = lopdf::Dictionary::new();
-            for (index, form_content) in form_contents.iter().enumerate() {
-                let name = format!("X{index}");
-                let form_id = document.add_object(Stream::new(
-                    dictionary! {
-                        "Type" => "XObject",
-                        "Subtype" => "Form",
-                        "BBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-                    },
-                    form_content.clone(),
-                ));
-                xobjects.set(name.as_bytes(), form_id);
-                operations.push(Operation::new("Do", vec![Object::Name(name.into_bytes())]));
-            }
-            operations.extend([
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec![Object::Name(b"F0".to_vec()), 10.into()]),
-                Operation::new(
-                    "Tm",
-                    vec![
-                        1.into(),
-                        0.into(),
-                        0.into(),
-                        1.into(),
-                        40.into(),
-                        700.into(),
-                    ],
-                ),
-                Operation::new("Tj", vec![Object::string_literal("ME406 453-6603")]),
-                Operation::new("ET", vec![]),
-            ]);
-            let resources_id = document.add_object(dictionary! {
-                "Font" => fonts,
-                "XObject" => xobjects,
-            });
-            let content_id = document.add_object(Stream::new(
-                dictionary! {},
-                Content { operations }.encode().unwrap(),
-            ));
-            let page_id = document.add_object(dictionary! {
-                "Type" => "Page",
-                "Parent" => pages_id,
-                "Contents" => content_id,
-            });
-            finish_pdf(document, pages_id, resources_id, vec![page_id])
-        }
-
-        let target = ProductIdentityTarget::new("ME406", "453-6603").unwrap();
-        let too_many_fonts = resource_heavy_pdf(MAX_INVOKED_FONTS_PER_PAGE + 1, &[]);
-        assert!(extract(&too_many_fonts, Some(&target)).is_err());
-
-        let empty_form = Content {
-            operations: vec![Operation::new("m", vec![0.into(), 0.into()])],
-        }
-        .encode()
-        .unwrap();
-        let too_many_forms =
-            resource_heavy_pdf(1, &vec![empty_form; MAX_INVOKED_FORM_XOBJECTS_PER_PAGE + 1]);
-        assert!(extract(&too_many_forms, Some(&target)).is_err());
-
-        let large_form = b"0 0 m\n".repeat(100);
-        let cumulative_form_overflow = resource_heavy_pdf(1, &[large_form.clone(), large_form]);
-        assert!(extract_with_limits(
-            &cumulative_form_overflow,
-            Limits {
-                max_page_decompressed_bytes: 1_024,
-                ..LIMITS
-            },
-            Some(&target),
-        )
-        .is_err());
-    }
-
-    #[test]
-    #[ignore = "requires manually downloaded official OEM PDF fixtures"]
-    fn downloaded_official_oem_pdf_regressions() {
-        let directory =
-            std::env::var("AIRCOST_OEM_PDF_FIXTURE_DIR").expect("set AIRCOST_OEM_PDF_FIXTURE_DIR");
-        let cases = [
-            ("gdu1040.pdf", 3, "GDU 1040", "011-00972-00", None),
-            ("gea71.pdf", 30, "GEA 71", "011-00831-00", None),
-            (
-                "me406.pdf",
-                125,
-                "ME406",
-                "453-6603",
-                Some((126, "ME406HM", "453-6604")),
-            ),
-            ("gea71b.pdf", 244, "GEA 71B", "011-03682-00", None),
-            ("gsu75.pdf", 734, "GSU 75", "010-01127-00", None),
-        ];
-        for (file, catalog_id, model, identifier, neighbor) in cases {
-            let pdf = std::fs::read(std::path::Path::new(&directory).join(file))
-                .unwrap_or_else(|error| panic!("could not read {file}: {error}"));
-            let target = ProductIdentityTarget::new(model, identifier).unwrap();
-            let extracted = extract(&pdf, Some(&target))
-                .unwrap_or_else(|error| panic!("{file} extraction failed: {error}"));
-            let target_identity = OemProductIdentity {
-                catalog_id,
-                model,
-                manufacturer_identifier: identifier,
-            };
-            let mut catalog = vec![target_identity];
-            if let Some((catalog_id, model, manufacturer_identifier)) = neighbor {
-                catalog.push(OemProductIdentity {
-                    catalog_id,
-                    model,
-                    manufacturer_identifier,
-                });
-            }
-            exact_oem_product_identity_row(
-                &extracted.source_text_rows,
-                extracted.source_text_rows_complete,
-                target_identity,
-                &catalog,
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{file} did not verify: {error}; retained target rows: {:?}",
-                    extracted.source_text_rows
-                )
-            });
-        }
-    }
-}
+#[path = "pdf/tests.rs"]
+mod tests;
