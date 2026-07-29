@@ -5804,12 +5804,12 @@ mod tests {
         );
         assert_eq!(
             requests[1].get("model").and_then(Value::as_str),
-            Some("gemini-3.6-flash")
+            Some("gemini-3.5-flash-lite")
         );
     }
 
     #[tokio::test]
-    async fn collision_domain_correction_shares_two_call_budget_and_uses_fallback_once() {
+    async fn collision_domain_correction_shares_two_call_budget_and_reuses_lite_once() {
         let source_url = "https://www.garmin.com/manual";
         let valid = json!({
             "source_url": source_url,
@@ -5846,7 +5846,7 @@ mod tests {
 
         // The catalog's domain validator rejects the otherwise structurally
         // valid first result here. Correction must consume the sole remaining
-        // call and must start directly on the configured fallback route.
+        // call and must start directly on the validation retry route.
         let refreshed_dossier = initial.verified_evidence.unwrap();
         let correction = run_grounded_json_pass_reusing(
             &client,
@@ -5870,12 +5870,12 @@ mod tests {
         );
         assert_eq!(
             requests[1].get("model").and_then(Value::as_str),
-            Some("gemini-3.6-flash")
+            Some("gemini-3.5-flash-lite")
         );
     }
 
     #[tokio::test]
-    async fn collision_fallback_correction_never_opens_nested_retry_envelope() {
+    async fn collision_validation_correction_never_opens_nested_retry_envelope() {
         let source_url = "https://www.garmin.com/manual";
         let invalid = json!({
             "source_url": source_url,
@@ -5915,7 +5915,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].get("model").and_then(Value::as_str),
-            Some("gemini-3.6-flash")
+            Some("gemini-3.5-flash-lite")
         );
     }
 
@@ -6642,7 +6642,7 @@ mod tests {
     }
 
     #[test]
-    fn grounded_retry_uses_fallback_only_after_validation_failure() {
+    fn grounded_validation_retry_uses_configured_fallback_or_primary() {
         let config = GeminiRuntimeConfig::default();
         let cheap_first = config.route(GeminiTask::AvionicsSearchGrounding);
 
@@ -6652,11 +6652,11 @@ mod tests {
         );
         assert_eq!(
             AttemptModel::after_validation(true).model(cheap_first),
-            "gemini-3.5-flash"
+            "gemini-3.5-flash-lite"
         );
         assert_eq!(
             AttemptModel::after_validation(true).thinking_level(cheap_first),
-            ConfigThinkingLevel::Medium
+            ConfigThinkingLevel::Low
         );
         assert_eq!(
             AttemptModel::after_validation(false).model(cheap_first),
@@ -6674,35 +6674,40 @@ mod tests {
         );
         assert_eq!(
             AttemptModel::ValidationFallback.model(collision_structure),
-            "gemini-3.6-flash"
+            "gemini-3.5-flash-lite"
         );
         assert_eq!(
             AttemptModel::ValidationFallback.thinking_level(collision_structure),
             ConfigThinkingLevel::Low
         );
 
-        let no_fallback = config.route(GeminiTask::AircraftCatalogAdjudication);
+        let aircraft_search = config.route(GeminiTask::AircraftSearchGrounding);
         assert_eq!(
-            AttemptModel::ValidationFallback.model(no_fallback),
+            AttemptModel::ValidationFallback.model(aircraft_search),
             "gemini-3.5-flash"
         );
+        assert_eq!(
+            AttemptModel::ValidationFallback.thinking_level(aircraft_search),
+            ConfigThinkingLevel::Medium
+        );
 
-        let disabled = GeminiRuntimeConfig::from_toml_str(
+        let explicit_fallback = GeminiRuntimeConfig::from_toml_str(
             r#"
 version = 1
 [tasks.avionics_search_grounding]
-fallback_model = ""
+fallback_model = "gemini-3.5-flash"
+fallback_thinking_level = "medium"
 "#,
         )
         .unwrap();
-        let disabled_route = disabled.route(GeminiTask::AvionicsSearchGrounding);
+        let explicit_route = explicit_fallback.route(GeminiTask::AvionicsSearchGrounding);
         assert_eq!(
-            AttemptModel::ValidationFallback.model(disabled_route),
-            "gemini-3.5-flash-lite"
+            AttemptModel::ValidationFallback.model(explicit_route),
+            "gemini-3.5-flash"
         );
         assert_eq!(
-            AttemptModel::ValidationFallback.thinking_level(disabled_route),
-            ConfigThinkingLevel::Low
+            AttemptModel::ValidationFallback.thinking_level(explicit_route),
+            ConfigThinkingLevel::Medium
         );
     }
 
