@@ -1555,21 +1555,26 @@ mod tests {
         let weak_id = insert_product(&fixture.db, "GMA 340", "GMA340", true).await;
         let accepted_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
         let pool = pool(&fixture.db);
+        let mut preserved_link_id = None;
         for (model_id, confidence) in [(existing_id, "high"), (weak_id, "medium")] {
-            sqlx::query(
+            let link_id: i64 = sqlx::query_scalar(
                 r#"
                 INSERT INTO aircraft_sale_listing_avionics (
                   aircraft_sale_listing_id, avionics_model_id, source,
                   source_confidence, configuration_action
                 ) VALUES (?, ?, 'listing', ?, 'installed')
+                RETURNING id
                 "#,
             )
             .bind(fixture.listing_id)
             .bind(model_id)
             .bind(confidence)
-            .execute(pool)
+            .fetch_one(pool)
             .await
             .unwrap();
+            if model_id == existing_id {
+                preserved_link_id = Some(link_id);
+            }
         }
         let result = apply_automated_avionics_review(
             &fixture.db,
@@ -1586,6 +1591,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ids, vec![existing_id, accepted_id]);
+        let stored_preserved_link_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .bind(existing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(Some(stored_preserved_link_id), preserved_link_id);
     }
 
     #[tokio::test]
