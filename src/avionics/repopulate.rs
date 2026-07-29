@@ -25,7 +25,8 @@ use crate::listing::review::automation::{
     apply_automated_avionics_review, AutomatedAvionicsLink, AutomatedReviewApplyRequest,
 };
 use crate::listing::review::{
-    PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
+    parse_current_pending_review_aspects, PendingReviewAspect, ReviewAction, ReviewAspectId,
+    ReviewProduct, StableIdentifier,
 };
 use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
@@ -193,7 +194,7 @@ pub struct AvionicsProviderRequestPlan {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct AvionicsRepopulationPreflightSummary {
     pub listings_selected: usize,
-    pub listings_ready_with_retained_extraction: usize,
+    pub listings_ready_with_retained_observations: usize,
     pub listings_requiring_legacy_reextraction: usize,
     pub listings_faa_rejected: usize,
     pub listings_blocked: usize,
@@ -334,12 +335,13 @@ struct IdentityAttempt {
 
 /// Automate only listings already waiting in the review queue. The exact
 /// plugin submission attached to the pending bundle is replayed; no newer
-/// same-URL submission may silently replace its evidence. Legacy extraction
-/// payloads are never transformed: when they do not contain capability arrays
-/// and exact listing-evidence fields, the tool runs the current Gemini listing
-/// extractor against the retained, hash-verified HTML and uses that transient
-/// result. Dry-run still makes paid preview calls without domain writes. Apply
-/// mode atomically accepts only grounded products with exact high-confidence
+/// same-URL submission may silently replace its evidence. Current, hash-bound
+/// pending-review observations are reused only while their exact evidence
+/// remains present in that submission. Otherwise, legacy extraction payloads
+/// are never transformed: the tool runs the current Gemini listing extractor
+/// against the retained, hash-verified HTML and uses that transient result.
+/// Dry-run still makes paid preview calls without domain writes. Apply mode
+/// atomically accepts only grounded products with exact high-confidence
 /// listing evidence, safely discards grounded garbage, and leaves every other
 /// aspect pending. Signed plugin payloads are never overwritten.
 pub async fn repopulate_listing_avionics(
@@ -374,10 +376,10 @@ pub async fn repopulate_listing_avionics(
         checkpoint,
         provider_request_plan,
         reextraction_policy_note: if apply {
-            "Apply mode verifies the exact pending-review submission, re-extracts incompatible legacy payloads from retained HTML, then atomically persists high-confidence approved links plus only the residual review aspects; signed plugin payloads are never overwritten."
+            "Apply mode first reuses current hash-bound review observations whose exact excerpts remain in the retained submission, otherwise re-extracts incompatible legacy payloads from retained HTML, then atomically persists high-confidence approved links plus only the residual review aspects; signed plugin payloads are never overwritten."
                 .to_string()
         } else {
-            "Preview mode makes Gemini requests, including legacy re-extraction when required, but neither the generated extraction nor catalog/listing changes are persisted."
+            "Preview mode reuses current exact review observations before making Gemini requests, including legacy re-extraction only when required; neither generated extraction nor catalog/listing changes are persisted."
                 .to_string()
         },
         listings,
@@ -445,8 +447,8 @@ async fn build_preflight_report(
             listing.gemini_conditional_relationship_components;
         summary.invalid_retained_observations += listing.invalid_retained_observations;
         match listing.status.as_str() {
-            "ready_retained_extraction" => {
-                summary.listings_ready_with_retained_extraction += 1;
+            "ready_retained_observations" => {
+                summary.listings_ready_with_retained_observations += 1;
             }
             "ready_legacy_reextraction" => {
                 summary.listings_requiring_legacy_reextraction += 1;
@@ -493,12 +495,10 @@ async fn preflight_listing(
         return report;
     }
     let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
-    let raw_avionics = match retained_avionics_source(
-        row.extracted_listing_json.as_deref(),
-        &listing_context,
-    ) {
-        RetainedAvionicsSource::Current(avionics) => avionics,
-        RetainedAvionicsSource::RequiresReextraction { reason } => {
+    let raw_avionics = match retained_observation_source(row, &listing_context) {
+        Ok(RetainedObservationSource::Review(replay)) => replay.avionics,
+        Ok(RetainedObservationSource::Extraction(avionics)) => avionics,
+        Ok(RetainedObservationSource::RequiresReextraction { reason }) => {
             report.reextraction_required = true;
             let Some(rendered_html) = row.rendered_html.as_deref() else {
                 report.note =
@@ -519,6 +519,10 @@ async fn preflight_listing(
             report.note = format!(
                 "{reason}; one listing-extraction request is planned, but its identity component count is unknowable until extraction completes"
             );
+            return report;
+        }
+        Err(error) => {
+            report.note = error;
             return report;
         }
     };
@@ -592,7 +596,7 @@ async fn preflight_listing(
             report.gemini_conditional_relationship_components += 1;
         }
     }
-    report.status = "ready_retained_extraction".to_string();
+    report.status = "ready_retained_observations".to_string();
     report.note = if report.invalid_retained_observations == 0 {
         "retained current-schema observations are ready".to_string()
     } else {
@@ -735,15 +739,19 @@ async fn process_listing(
         }
     };
     let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
-    let raw_avionics = match retained_avionics_source(
-        row.extracted_listing_json.as_deref(),
+    let (raw_avionics, mut residual_aspects) = match retained_observation_source(
+        row,
         &listing_context,
     ) {
-        RetainedAvionicsSource::Current(avionics) => {
-            listing_report.raw_avionics_source = "retained_extraction".to_string();
-            avionics
+        Ok(RetainedObservationSource::Review(replay)) => {
+            listing_report.raw_avionics_source = "pending_review".to_string();
+            (replay.avionics, replay.preserved_aspects)
         }
-        RetainedAvionicsSource::RequiresReextraction { reason } => {
+        Ok(RetainedObservationSource::Extraction(avionics)) => {
+            listing_report.raw_avionics_source = "retained_extraction".to_string();
+            (avionics, Vec::new())
+        }
+        Ok(RetainedObservationSource::RequiresReextraction { reason }) => {
             listing_report.reextraction_required = true;
             listing_report.reextraction_reason = Some(reason);
             let Some(rendered_html) = row
@@ -784,7 +792,7 @@ async fn process_listing(
                 Ok(avionics) => {
                     listing_report.raw_avionics_source = "gemini_reextraction".to_string();
                     listing_report.reextraction_succeeded = true;
-                    avionics
+                    (avionics, Vec::new())
                 }
                 Err(error) => {
                     listing_report.status = "error".to_string();
@@ -795,6 +803,11 @@ async fn process_listing(
                     return listing_report;
                 }
             }
+        }
+        Err(error) => {
+            listing_report.status = "blocked".to_string();
+            listing_report.error = Some(error);
+            return listing_report;
         }
     };
     if raw_avionics.is_empty() {
@@ -807,7 +820,6 @@ async fn process_listing(
     }
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
     let mut prepared: Vec<PreparedLink> = Vec::new();
-    let mut residual_aspects = Vec::new();
     let mut blocking_reasons = Vec::new();
 
     for (candidate_index, raw) in raw_avionics.iter().enumerate() {
@@ -2232,6 +2244,97 @@ enum RetainedAvionicsSource {
     RequiresReextraction { reason: String },
 }
 
+struct RetainedReviewObservations {
+    avionics: Vec<ParsedAvionics>,
+    preserved_aspects: Vec<PendingReviewAspect>,
+}
+
+enum RetainedObservationSource {
+    Review(RetainedReviewObservations),
+    Extraction(Vec<ParsedAvionics>),
+    RequiresReextraction { reason: String },
+}
+
+fn retained_observation_source(
+    row: &ListingSourceRow,
+    listing_context: &ListingEvidenceContext,
+) -> Result<RetainedObservationSource, String> {
+    if let Some(replay) = retained_review_observations(row, listing_context)? {
+        return Ok(RetainedObservationSource::Review(replay));
+    }
+    Ok(
+        match retained_avionics_source(row.extracted_listing_json.as_deref(), listing_context) {
+            RetainedAvionicsSource::Current(avionics) => {
+                RetainedObservationSource::Extraction(avionics)
+            }
+            RetainedAvionicsSource::RequiresReextraction { reason } => {
+                RetainedObservationSource::RequiresReextraction { reason }
+            }
+        },
+    )
+}
+
+fn retained_review_observations(
+    row: &ListingSourceRow,
+    listing_context: &ListingEvidenceContext,
+) -> Result<Option<RetainedReviewObservations>, String> {
+    let aspects = parse_current_pending_review_aspects(
+        &row.review_payload_json,
+        &row.review_payload_sha256,
+        row.pending_aspect_count,
+    )
+    .map_err(|error| format!("pending review cannot be replayed safely: {error}"))?;
+    let mut avionics = Vec::new();
+    let mut preserved_aspects = Vec::new();
+    for aspect in aspects {
+        if aspect.kind != "avionics" {
+            preserved_aspects.push(aspect);
+            continue;
+        }
+        let Some(product) = aspect.proposed_product.as_ref() else {
+            return Ok(None);
+        };
+        let evidence_is_current = aspect
+            .source_evidence_text
+            .as_deref()
+            .is_some_and(|evidence| !evidence.trim().is_empty())
+            && aspect
+                .source_confidence
+                .as_deref()
+                .is_some_and(|confidence| matches!(confidence, "high" | "medium" | "low"));
+        let independent_installation = aspect.configuration_action == "installed"
+            && aspect.replaces_product_id.is_none()
+            && aspect.replacement_aspect_id.is_none();
+        if !evidence_is_current
+            || !independent_installation
+            || product.capabilities.is_empty()
+            || product
+                .capabilities
+                .iter()
+                .any(|capability| capability.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        avionics.push(ParsedAvionics {
+            manufacturer: product.manufacturer.clone(),
+            model: product.model.clone(),
+            avionics_types: product.capabilities.clone(),
+            quantity: aspect.quantity,
+            configuration_action: aspect.configuration_action.clone(),
+            replaces: None,
+            source_evidence_text: aspect.source_evidence_text.clone(),
+            source_confidence: aspect.source_confidence.clone(),
+        });
+    }
+    if avionics.is_empty() || validate_exact_listing_evidence(&avionics, listing_context).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(RetainedReviewObservations {
+        avionics,
+        preserved_aspects,
+    }))
+}
+
 fn retained_avionics_source(
     raw_json: Option<&str>,
     listing_context: &ListingEvidenceContext,
@@ -3619,6 +3722,76 @@ mod tests {
             validate_pending_source_binding(&rows[0]).unwrap().1,
             "canonical_listing_id"
         );
+    }
+
+    #[tokio::test]
+    async fn current_exact_review_observations_bypass_stale_plugin_extraction() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = seed_listing(&db, "https://example.test/listing/53").await;
+        seed_submission_and_review(
+            &db,
+            listing_id,
+            "https://example.test/listing/53",
+            "<p>Garmin fixture installed</p>",
+            Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"Fixture","types":["GPS"]}]}"#),
+            Some(listing_id),
+            None,
+        )
+        .await;
+
+        let row = load_listing_sources(
+            &db,
+            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let listing_context =
+            ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+        assert!(matches!(
+            retained_avionics_source(row.extracted_listing_json.as_deref(), &listing_context),
+            RetainedAvionicsSource::RequiresReextraction { .. }
+        ));
+
+        let replay = retained_review_observations(&row, &listing_context)
+            .unwrap()
+            .expect("the current exact pending review is the reusable work queue");
+        assert_eq!(replay.avionics.len(), 1);
+        assert_eq!(replay.avionics[0].model, "Fixture");
+        assert!(replay.preserved_aspects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_review_with_non_source_evidence_falls_back_closed() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = seed_listing(&db, "https://example.test/listing/54").await;
+        seed_submission_and_review(
+            &db,
+            listing_id,
+            "https://example.test/listing/54",
+            "<p>No avionics identity appears here</p>",
+            None,
+            Some(listing_id),
+            None,
+        )
+        .await;
+
+        let row = load_listing_sources(
+            &db,
+            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let listing_context =
+            ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+        assert!(retained_review_observations(&row, &listing_context)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
