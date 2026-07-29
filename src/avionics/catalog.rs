@@ -1131,7 +1131,7 @@ fn manufacturer_origin_error(error: ManufacturerIdentityError) -> CatalogError {
     }
 }
 
-async fn validate_grounded_response_origin_state(
+async fn revalidate_direct_source_admission_state(
     db: &AppDb,
     manufacturer: &str,
     plan: &AuthoritativeDirectSourcePlan,
@@ -1157,7 +1157,13 @@ async fn validate_grounded_response_origin_state(
         }
         validate_authorized_direct_source_response(plan, response)?;
     }
+    Ok(())
+}
 
+async fn require_response_evidence_source_urls_not_revoked(
+    db: &AppDb,
+    response: &GroundedJsonResponse,
+) -> CatalogResult<()> {
     let mut source_urls = Vec::new();
     response_evidence_source_urls(&response.value, &mut source_urls);
     source_urls.sort();
@@ -1264,7 +1270,9 @@ async fn resolve_avionics_identity_with_write_mode(
                     "Gemini avionics identity resolution failed: {error:#}"
                 ))
             })?;
-    validate_grounded_response_origin_state(
+    // Recheck only server-owned direct-source admission here. Model-owned
+    // source URL defects belong to the bounded domain-correction pass below.
+    revalidate_direct_source_admission_state(
         db,
         &request.manufacturer,
         &direct_source_plan,
@@ -1320,7 +1328,9 @@ async fn resolve_avionics_identity_with_write_mode(
                 )));
             }
         };
-        validate_grounded_response_origin_state(
+        // A correction is a new model call, so recheck server-owned direct
+        // source admission without preempting corrected response validation.
+        revalidate_direct_source_admission_state(
             db,
             &request.manufacturer,
             &direct_source_plan,
@@ -1352,7 +1362,6 @@ async fn resolve_avionics_identity_with_write_mode(
         )));
     }
 
-    let status = response["status"].as_str().unwrap_or_default();
     if let Some(outcome) = nonpositive_identity_outcome(
         &context,
         &response,
@@ -1362,6 +1371,10 @@ async fn resolve_avionics_identity_with_write_mode(
     ) {
         return Ok(outcome);
     }
+    // Only a positive, domain-valid response may reach origin
+    // canonicalization and revocation checks.
+    require_response_evidence_source_urls_not_revoked(db, &grounded_response).await?;
+    let status = response["status"].as_str().unwrap_or_default();
     match status {
         "existing_match" => {
             let catalog_id = response["catalog_id"].as_i64().unwrap_or_default();
@@ -1462,7 +1475,9 @@ async fn resolve_verified_identity(
             });
         }
     };
-    validate_grounded_response_origin_state(
+    // Preserve fail-closed direct-source admission without parsing
+    // model-owned proposal or candidate URLs before domain correction.
+    revalidate_direct_source_admission_state(
         db,
         &source_context.candidate.manufacturer,
         direct_source_plan,
@@ -1516,7 +1531,7 @@ async fn resolve_verified_identity(
             initial_structure_calls,
             correction_structure_calls,
         )?;
-        validate_grounded_response_origin_state(
+        revalidate_direct_source_admission_state(
             db,
             &source_context.candidate.manufacturer,
             direct_source_plan,
@@ -1547,6 +1562,9 @@ async fn resolve_verified_identity(
             reason: attestation.reason,
         });
     }
+    // The response is confirmed and domain-valid; its final proposal and
+    // candidate URLs can now be canonicalized and checked for revocation.
+    require_response_evidence_source_urls_not_revoked(db, &review_response).await?;
     if !grounded_response_has_verified_evidence(&review_response) {
         return Err(CatalogError::Validation(
             "confirmed Gemini proposal review did not use verified Search + URL Context or authoritative direct-source + URL Context evidence"
@@ -4760,7 +4778,7 @@ mod tests {
         attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
         authoritative_direct_source_plan, canonical_avionics_types_for_label,
         canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
-        collision_reviews_with_direct_source_proofs,
+        collision_response_issues, collision_reviews_with_direct_source_proofs,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
@@ -4769,20 +4787,21 @@ mod tests {
         manufacturer_scoped_catalog_candidates, model_identity_relation_score,
         nonpositive_identity_outcome, persist_approved_capability_enrichment,
         persist_approved_identity, persist_existing_reuse_attestation,
-        proposal_attestation_with_direct_source_proofs, resolution_issues,
+        proposal_attestation_with_direct_source_proofs,
+        require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
-        select_unique_exact_review_candidate, shortlist_avionics_candidates,
-        should_run_listing_only_approved_candidate_adjudication,
+        revalidate_direct_source_admission_state, select_unique_exact_review_candidate,
+        shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
         validate_collision_decision_relation, validate_evidence_values,
-        validate_grounded_response_origin_state, verified_identity_from_response,
-        ApprovedAvionicsIdentity, ApprovedAvionicsProductSourceRequest,
-        ApprovedProductSourceVerification, AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate,
-        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsUnitResolutionCandidate,
-        AvionicsUnitResolutionContext, CollisionCorrectionPlan, GeminiGroundingSource,
-        GeminiGroundingSupport, GroundedJsonResponse, KnownApprovedAvionicsCandidate,
-        PendingProductAttestationCommitGuard, ReviewCatalogCandidate, VerifiedIdentity,
-        COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
+        verified_identity_from_response, ApprovedAvionicsIdentity,
+        ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
+        AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate, AvionicsIdentityOutcome,
+        AvionicsIdentityRequest, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
+        CollisionCorrectionPlan, GeminiGroundingSource, GeminiGroundingSupport,
+        GroundedJsonResponse, KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
+        ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
+        KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -6141,11 +6160,6 @@ mod tests {
             .expect("test database should initialize");
         let source_origin_id = seed_garmin_static_source_authority(&db).await;
         revoke_source_authority(&db, source_origin_id).await;
-        let plan = AuthoritativeDirectSourcePlan {
-            source_urls: Vec::new(),
-            identity_anchors: Vec::new(),
-            admission: None,
-        };
         let mut response = direct_source_response(&["https://static.garmin.com/pumac/GIA63W.pdf"]);
         response.google_search_used = true;
         response.authoritative_direct_source_verified = false;
@@ -6153,7 +6167,7 @@ mod tests {
             "identity_source_url": "https://static.garmin.com/pumac/GIA63W.pdf"
         });
 
-        let error = validate_grounded_response_origin_state(&db, "Garmin", &plan, &response)
+        let error = require_response_evidence_source_urls_not_revoked(&db, &response)
             .await
             .expect_err("ordinary Search evidence must honor append-only origin revocation");
         assert!(error.to_string().contains("has been revoked"));
@@ -6179,10 +6193,39 @@ mod tests {
             .expect("the cached admission alone still appears valid");
 
         revoke_source_authority(&db, source_origin_id).await;
-        let error = validate_grounded_response_origin_state(&db, "Garmin", &plan, &response)
+        let error = revalidate_direct_source_admission_state(&db, "Garmin", &plan, &response)
             .await
             .expect_err("post-model validation must observe in-flight revocation");
         assert!(error.to_string().contains("changed or was revoked"));
+    }
+
+    #[tokio::test]
+    async fn direct_source_revalidation_does_not_preempt_model_url_correction() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_garmin_static_source_authority(&db).await;
+        let mut request = local_request("Garmin GIA 63W installed");
+        request.model = "GIA 63W".to_string();
+        request.authoritative_direct_source_urls =
+            vec!["https://static.garmin.com/pumac/GIA63W.pdf".to_string()];
+        request.authoritative_identity_anchors = vec!["Garmin".to_string(), "GIA 63W".to_string()];
+        let plan = authoritative_direct_source_plan(&db, &request)
+            .await
+            .expect("the direct source should be admitted");
+        let mut response =
+            direct_source_response(&["https://static.garmin.com/pumac/GIA63W-final.pdf"]);
+        response.value = json!({
+            "candidate_source_url": "http://static.garmin.com/pumac/GIA63W-final.pdf"
+        });
+
+        revalidate_direct_source_admission_state(&db, "Garmin", &plan, &response)
+            .await
+            .expect("server-owned direct-source provenance must be checked independently");
+        let error = require_response_evidence_source_urls_not_revoked(&db, &response)
+            .await
+            .expect_err("the model-owned HTTP URL must remain invalid after domain correction");
+        assert!(error.to_string().contains("HTTPS"));
     }
 
     #[tokio::test]
@@ -7263,6 +7306,78 @@ mod tests {
         assert!(resolution_issues(&context, &response, true, &[], &[])
             .iter()
             .any(|issue| issue.contains("combined model label")));
+    }
+
+    #[test]
+    fn collision_source_url_defects_are_correctable_domain_issues() {
+        let proposal_url = "https://static.garmin.com/manuals/gtx345r.pdf";
+        let proposal_evidence =
+            "The manufacturer manual identifies GTX 345R as part number 011-03520-00.";
+        let candidate_url = "https://static.garmin.com/manuals/gtx345.pdf";
+        let candidate_evidence =
+            "The manufacturer manual identifies GTX 345 as part number 011-TEST-1.";
+        let context = context(vec![candidate(1, "GTX 345", "approved")]);
+        let proposed = verified_identity();
+        let mut response = json!({
+            "proposal_decision": "confirmed_same_as_input",
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "GTX 345R",
+            "canonical_types": ["Transponder"],
+            "manufacturer_identifier_kind": "manufacturer_part_number",
+            "manufacturer_identifier": "011-03520-00",
+            "proposal_manufacturer_identifier_scope": "exact_catalog_product",
+            "proposal_confidence": "very_high",
+            "input_evidence_text": "GTX345R",
+            "proposal_source_url": proposal_url,
+            "proposal_source_title": "GTX 345R installation manual",
+            "proposal_evidence": proposal_evidence,
+            "proposal_reason": "The listing and manufacturer manual identify the exact unit.",
+            "reviews": [{
+                "catalog_id": 1,
+                "decision": "different_product",
+                "confidence": "very_high",
+                "candidate_source_url": format!("http://{}", candidate_url.trim_start_matches("https://")),
+                "candidate_source_title": "GTX 345 installation manual",
+                "candidate_evidence": candidate_evidence,
+                "reason": "The panel and remote units have different manufacturer identifiers."
+            }]
+        });
+        let http_candidate_url = format!("http://{}", candidate_url.trim_start_matches("https://"));
+        let initial_proofs = [
+            direct_source_proof(proposal_url, proposal_evidence),
+            direct_source_proof(&http_candidate_url, candidate_evidence),
+        ];
+        let issues = collision_response_issues(&context, &proposed, &response, &initial_proofs);
+        assert!(
+            issues.iter().any(|issue| issue.contains("final HTTPS URL")),
+            "an HTTP candidate URL must enter bounded domain correction: {issues:?}"
+        );
+
+        response["reviews"][0]["candidate_source_url"] = json!(candidate_url);
+        let corrected_proofs = [
+            direct_source_proof(proposal_url, proposal_evidence),
+            direct_source_proof(candidate_url, candidate_evidence),
+        ];
+        assert!(
+            collision_response_issues(&context, &proposed, &response, &corrected_proofs).is_empty(),
+            "a corrected final HTTPS candidate URL with the exact publisher proof must pass"
+        );
+
+        let http_proposal_url = format!("http://{}", proposal_url.trim_start_matches("https://"));
+        response["proposal_source_url"] = json!(http_proposal_url);
+        let http_proposal_proofs = [
+            direct_source_proof(
+                response["proposal_source_url"].as_str().unwrap(),
+                proposal_evidence,
+            ),
+            direct_source_proof(candidate_url, candidate_evidence),
+        ];
+        let issues =
+            collision_response_issues(&context, &proposed, &response, &http_proposal_proofs);
+        assert!(
+            issues.iter().any(|issue| issue.contains("final HTTPS URL")),
+            "an HTTP proposal URL must remain invalid when correction does not repair it: {issues:?}"
+        );
     }
 
     #[test]
