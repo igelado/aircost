@@ -132,6 +132,19 @@ and excerpts are not model input. Aircraft reuse is similarly strict: an exact
 current FAA record and one applicable approved hierarchy may bypass Gemini
 entirely.
 
+When the exact local avionics row is unique and capability-compatible but
+cannot use the deterministic approval fast path, an active
+`manufacturer_primary` source-origin record may be used as a retrieval hint.
+The hint is selected only within the effective manufacturer identity, must
+name the exact maker and model, and is rejected when the catalog or source text
+exposes an unresolved suffix variant or duplicate. The origin is re-authorized
+and the URL is fetched again; stored evidence text never substitutes for the
+fresh publisher document. If that server-side fetch, anchor, or product-proof
+preflight fails, the opportunistic path falls back to ordinary Search before
+any Gemini request is made. After a structure request begins, or when a caller
+explicitly supplied a direct source, failures remain fail-closed and never
+open a second research path.
+
 Existing-product re-attestation can also avoid Gemini after a fresh guarded
 fetch from an origin approved for the effective manufacturer identity. The
 fetched HTML or PDF must contain the complete graph-approved model and stable

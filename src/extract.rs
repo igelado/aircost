@@ -575,12 +575,19 @@ fn effective_avionics_product_identity_requirements(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthorizedDirectSourcePolicy {
+    Required,
+    Opportunistic,
+}
+
 fn configure_avionics_authoritative_direct_sources(
     mut request: GroundedJsonPassRequest,
     urls: &[String],
     identity_anchors: &[String],
     relevance_hints: &[String],
     product_identity_requirements: &[DirectSourceProductIdentityRequirement],
+    direct_source_policy: AuthorizedDirectSourcePolicy,
 ) -> Result<GroundedJsonPassRequest> {
     match (urls.is_empty(), identity_anchors.is_empty()) {
         (true, true) => Ok(request),
@@ -599,8 +606,13 @@ fn configure_avionics_authoritative_direct_sources(
                 .with_direct_source_product_identity_requirements(
                     product_identity_requirements.iter().cloned(),
                 )
-                .with_revalidated_direct_source_urls(urls.iter().cloned())
-                .with_authorized_direct_fetch();
+                .with_revalidated_direct_source_urls(urls.iter().cloned());
+            request = match direct_source_policy {
+                AuthorizedDirectSourcePolicy::Required => request.with_authorized_direct_fetch(),
+                AuthorizedDirectSourcePolicy::Opportunistic => {
+                    request.with_opportunistic_authorized_direct_fetch()
+                }
+            };
             Ok(request)
         }
         (false, true) => {
@@ -843,6 +855,7 @@ impl GeminiListingExtractor {
             &[],
             &[],
             &[],
+            AuthorizedDirectSourcePolicy::Required,
         )
         .await
     }
@@ -875,6 +888,29 @@ impl GeminiListingExtractor {
         &self,
         context: &AvionicsUnitResolutionContext,
     ) -> Result<GroundedJsonResponse> {
+        self.resolve_avionics_unit_with_direct_source_policy(
+            context,
+            AuthorizedDirectSourcePolicy::Required,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_avionics_unit_opportunistically(
+        &self,
+        context: &AvionicsUnitResolutionContext,
+    ) -> Result<GroundedJsonResponse> {
+        self.resolve_avionics_unit_with_direct_source_policy(
+            context,
+            AuthorizedDirectSourcePolicy::Opportunistic,
+        )
+        .await
+    }
+
+    async fn resolve_avionics_unit_with_direct_source_policy(
+        &self,
+        context: &AvionicsUnitResolutionContext,
+        direct_source_policy: AuthorizedDirectSourcePolicy,
+    ) -> Result<GroundedJsonResponse> {
         let evidence_scope = avionics_identity_evidence_scope(context)?;
         let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
@@ -894,6 +930,7 @@ impl GeminiListingExtractor {
             &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
+            direct_source_policy,
         )
         .await
     }
@@ -924,6 +961,7 @@ impl GeminiListingExtractor {
             &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
+            AuthorizedDirectSourcePolicy::Required,
         )
         .await
     }
@@ -967,6 +1005,7 @@ impl GeminiListingExtractor {
             &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
+            AuthorizedDirectSourcePolicy::Required,
         )
         .await
     }
@@ -1006,6 +1045,7 @@ impl GeminiListingExtractor {
             &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
+            AuthorizedDirectSourcePolicy::Required,
         )
         .await
     }
@@ -1039,6 +1079,7 @@ impl GeminiListingExtractor {
             &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
+            AuthorizedDirectSourcePolicy::Required,
         )
         .await
     }
@@ -1073,6 +1114,7 @@ impl GeminiListingExtractor {
             &publisher_anchors,
             &relevance_hints,
             &product_identity_requirements,
+            AuthorizedDirectSourcePolicy::Required,
         )
         .await
     }
@@ -1214,6 +1256,7 @@ impl GeminiListingExtractor {
         authoritative_identity_anchors: &[String],
         authoritative_relevance_hints: &[String],
         direct_source_product_identity_requirements: &[DirectSourceProductIdentityRequirement],
+        direct_source_policy: AuthorizedDirectSourcePolicy,
     ) -> Result<GroundedJsonResponse> {
         let client = self.interactions_client.as_ref().ok_or_else(|| {
             anyhow!("Gemini Interactions client is unavailable for avionics grounding")
@@ -1245,6 +1288,7 @@ impl GeminiListingExtractor {
             authoritative_identity_anchors,
             authoritative_relevance_hints,
             direct_source_product_identity_requirements,
+            direct_source_policy,
         )?;
         if matches!(
             &reused_evidence,
@@ -3877,7 +3921,7 @@ mod tests {
         gemini_default_aircraft_avionics_response_schema, gemini_google_search_was_used,
         gemini_grounding_sources, gemini_grounding_supports, gemini_listing_avionics_item_schema,
         parsed_listing_from_model_output, preview_manual_listing,
-        validate_avionics_approved_candidate_adjudication_context,
+        validate_avionics_approved_candidate_adjudication_context, AuthorizedDirectSourcePolicy,
         AvionicsApprovedCandidateAdjudicationContext, AvionicsApprovedCatalogCandidate,
         AvionicsCatalogCandidate, AvionicsCatalogCollisionReviewContext, AvionicsMetadataContext,
         AvionicsProposedIdentity, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
@@ -4943,14 +4987,33 @@ mod tests {
         let urls = vec!["https://static.garmin.com/manual.pdf".to_string()];
         let anchors = vec!["Garmin".to_string(), "GIA 63W".to_string()];
 
-        configure_avionics_authoritative_direct_sources(request(), &[], &[], &[], &[])
-            .expect("non-identity callers may omit publisher verification");
-        assert!(
-            configure_avionics_authoritative_direct_sources(request(), &urls, &[], &[], &[],)
-                .is_err()
-        );
-        configure_avionics_authoritative_direct_sources(request(), &[], &anchors, &[], &[])
-            .expect("ordinary Search evidence should use exact publisher verification");
+        configure_avionics_authoritative_direct_sources(
+            request(),
+            &[],
+            &[],
+            &[],
+            &[],
+            AuthorizedDirectSourcePolicy::Required,
+        )
+        .expect("non-identity callers may omit publisher verification");
+        assert!(configure_avionics_authoritative_direct_sources(
+            request(),
+            &urls,
+            &[],
+            &[],
+            &[],
+            AuthorizedDirectSourcePolicy::Required,
+        )
+        .is_err());
+        configure_avionics_authoritative_direct_sources(
+            request(),
+            &[],
+            &anchors,
+            &[],
+            &[],
+            AuthorizedDirectSourcePolicy::Required,
+        )
+        .expect("ordinary Search evidence should use exact publisher verification");
 
         configure_avionics_authoritative_direct_sources(
             request(),
@@ -4958,6 +5021,7 @@ mod tests {
             &anchors,
             &["COM".to_string(), "GIA 63 011-00781-00".to_string()],
             &[],
+            AuthorizedDirectSourcePolicy::Required,
         )
         .expect("authorized direct sources should retain exact publisher verification");
     }
