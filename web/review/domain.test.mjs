@@ -5,6 +5,7 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   characterLimitState,
@@ -18,12 +19,16 @@ import {
   preselectedReviewAction,
   productAssociationEvidenceDisplay,
   productAssociationEligibilityOutcome,
+  productAssociationEligibilityOutcomeForAttestation,
+  productAssociationReviewBucket,
   productActionContextIsCurrent,
   productAttestationDraft,
   productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
   runProductAssociationWorkers,
+  summarizeProductAssociations,
+  summarizeProductReviewGroups,
 } from "./domain.mjs";
 
 const PRODUCTION_REASON_CODES = [
@@ -201,12 +206,112 @@ test("describes and filters server-supplied product association eligibility", ()
   assert.deepEqual(productAssociationEligibilityOutcome(associations[1]), {
     kind: "required",
     label: "OEM attestation required",
-    detail: "Attest this product first.",
+    detail: "Attest this product once from an OEM source before validating its listing associations.",
   });
   assert.deepEqual(productAssociationEligibilityOutcome(associations[2]), {
     kind: "manual",
-    label: "Manual review required",
-    detail: "The exact product is ambiguous.",
+    label: "Manual or ambiguous",
+    detail: "The retained listing evidence matches more than one possible product.",
+  });
+});
+
+test("summarizes source recovery separately from ambiguous manual work", () => {
+  const associations = [
+    {
+      listing_id: 1,
+      source_evidence_text: "Garmin GTX 345",
+      verification_eligibility: { status: "auto_verifiable" },
+    },
+    {
+      listing_id: 2,
+      source_evidence_text: null,
+      verification_eligibility: {
+        status: "manual_review_required",
+        reason_code: "source_evidence_missing",
+      },
+    },
+    {
+      listing_id: 3,
+      source_evidence_text: "Garmin GTX 33 ADS-B",
+      verification_eligibility: {
+        status: "manual_review_required",
+        reason_code: "identity_or_capability_qualifier_unresolved",
+      },
+    },
+  ];
+  assert.deepEqual(summarizeProductAssociations(associations, "current"), {
+    total: 3,
+    readyLocal: 1,
+    needsSourceRecovery: 1,
+    productAttestationRequired: 0,
+    manualOrAmbiguous: 1,
+  });
+  assert.deepEqual(associationsNeedingSourceRecovery(associations, "current"), [
+    associations[1],
+  ]);
+  assert.equal(
+    productAssociationEligibilityOutcomeForAttestation(
+      associations[1],
+      "current",
+    ).label,
+    "Needs source recovery",
+  );
+  assert.equal(
+    productAssociationEligibilityOutcomeForAttestation(
+      associations[2],
+      "current",
+    ).detail,
+    "The listing includes a model variant or capability qualifier that may identify a different product.",
+  );
+});
+
+test("requires product attestation before classifying blank source evidence for recovery", () => {
+  const association = {
+    source_evidence_text: null,
+    verification_eligibility: {
+      status: "manual_review_required",
+      reason_code: "source_evidence_missing",
+    },
+  };
+  assert.equal(
+    productAssociationReviewBucket(association, "required"),
+    "product_attestation_required",
+  );
+  assert.deepEqual(summarizeProductAssociations([association], "required"), {
+    total: 1,
+    readyLocal: 0,
+    needsSourceRecovery: 0,
+    productAttestationRequired: 1,
+    manualOrAmbiguous: 0,
+  });
+});
+
+test("sums queue eligibility counts and degrades missing breakdowns safely", () => {
+  assert.deepEqual(summarizeProductReviewGroups([
+    {
+      pending_association_count: 6,
+      attestation_status: "current",
+      eligibility_counts: {
+        ready_local: 1,
+        source_evidence_missing: 2,
+        product_attestation_required: 0,
+        manual_review_required: 3,
+      },
+    },
+    {
+      pending_association_count: 2,
+      attestation_status: "required",
+    },
+    {
+      pending_association_count: 4,
+      attestation_status: "current",
+    },
+  ]), {
+    total: 12,
+    readyLocal: 1,
+    needsSourceRecovery: 2,
+    productAttestationRequired: 2,
+    manualOrAmbiguous: 7,
   });
 });
 

@@ -149,6 +149,41 @@ impl ListingEvidenceContext {
         selected
     }
 
+    /// Recover one exact, unqualified model spelling from retained source.
+    ///
+    /// The catalog, not this text-only helper, must establish that the model
+    /// identifies exactly one authoritative product. This helper establishes
+    /// only the narrower listing-side fact: every normalized occurrence is a
+    /// complete model token and none exposes a distinct suffix variant or an
+    /// unresolved nearby capability/upgrade qualifier.
+    ///
+    /// Repeated unqualified mentions are harmless. Any qualified occurrence
+    /// rejects the complete result so a clean base-model mention elsewhere in
+    /// the capture cannot hide a materially different observation.
+    pub(crate) fn unique_exact_model_slice(&self, model: &str) -> Option<String> {
+        if self.cleaned.is_empty() {
+            return None;
+        }
+        let ranges = self.normalized_spans(model);
+        if ranges.is_empty() {
+            return None;
+        }
+
+        let mut selected = None;
+        for range in ranges {
+            let source_slice = &self.cleaned[range.start..range.end];
+            if source_slice.contains('\n')
+                || range.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
+                || has_distinct_product_suffix(&self.cleaned, range)
+                || has_nearby_ambiguous_semantic_qualifier(&self.cleaned, range, model)
+            {
+                return None;
+            }
+            selected.get_or_insert_with(|| source_slice.to_string());
+        }
+        selected
+    }
+
     /// Confirm that retained occurrence evidence is an exact source slice and
     /// contains the same unique, unqualified product identity as the corpus.
     pub(crate) fn contains_exact_product_evidence(
@@ -345,6 +380,62 @@ fn has_distinct_product_suffix(source: &str, identity: SourceRange) -> bool {
             && suffix
                 .chars()
                 .all(|character| character.is_ascii_uppercase()))
+}
+
+fn has_nearby_ambiguous_semantic_qualifier(
+    source: &str,
+    identity: SourceRange,
+    canonical_model: &str,
+) -> bool {
+    const MAX_QUALIFIER_CONTEXT_BYTES: usize = 128;
+    const QUALIFIERS: [&str; 12] = [
+        "ads-b compliant",
+        "ads-b-compliant",
+        "adsb compliant",
+        "waas upgraded",
+        "waas-upgraded",
+        "waas upgrade",
+        "field upgraded",
+        "field-upgraded",
+        "modified",
+        "compatible",
+        "capable",
+        "compliant",
+    ];
+
+    let context_start = boundary_at_or_before(
+        source,
+        identity.start.saturating_sub(MAX_QUALIFIER_CONTEXT_BYTES),
+    );
+    let context_end = boundary_at_or_before(
+        source,
+        identity
+            .end
+            .saturating_add(MAX_QUALIFIER_CONTEXT_BYTES)
+            .min(source.len()),
+    );
+    let prefix = &source[context_start..identity.start];
+    let tail = &source[identity.end..context_end];
+    let clause_start = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(offset, character)| {
+            matches!(character, '.' | ';' | '|' | '•' | '\n')
+                .then_some(offset + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let clause_end = tail
+        .char_indices()
+        .find_map(|(offset, character)| {
+            matches!(character, '.' | ';' | '|' | '•' | '\n').then_some(offset)
+        })
+        .unwrap_or(tail.len());
+    let clause =
+        format!("{} {}", &prefix[clause_start..], &tail[..clause_end]).to_ascii_lowercase();
+    let canonical_model = canonical_model.to_ascii_lowercase();
+    QUALIFIERS
+        .iter()
+        .any(|qualifier| clause.contains(qualifier) && !canonical_model.contains(qualifier))
 }
 
 pub(crate) fn identity_span_has_boundaries(source: &str, start: usize, end: usize) -> bool {
@@ -614,6 +705,62 @@ mod tests {
                 "{source:?} must not recover a base product"
             );
         }
+    }
+
+    #[test]
+    fn exact_model_recovery_copies_original_spelling_without_a_contiguous_maker() {
+        let recovered = ListingEvidenceContext::from_cleaned_text(
+            "Garmin integrated avionics package. Installed GMA-1347 digital audio panel.",
+        )
+        .unique_exact_model_slice("GMA 1347");
+
+        assert_eq!(recovered.as_deref(), Some("GMA-1347"));
+    }
+
+    #[test]
+    fn exact_model_recovery_allows_repeated_unqualified_mentions() {
+        let recovered = ListingEvidenceContext::from_cleaned_text(
+            "GFC700 autopilot. The installed GFC 700 is operational.",
+        )
+        .unique_exact_model_slice("GFC 700");
+
+        assert_eq!(recovered.as_deref(), Some("GFC700"));
+    }
+
+    #[test]
+    fn exact_model_recovery_rejects_any_variant_or_semantic_qualifier() {
+        for source in [
+            "GTX 33 ES transponder",
+            "GTX 33 / 33ES transponder",
+            "GTX 33 transponder. A second GTX 33 ES is included.",
+            "GTX 33 transponder ADS-B Compliant",
+            "GTX 33 transponder, field upgraded for ADS-B",
+            "ADS-B compliant GTX 33 transponder",
+            "modified GTX 33 transponder",
+            "WAAS-upgraded GNS 430 navigator",
+        ] {
+            let model = if source.contains("GNS") {
+                "GNS 430"
+            } else {
+                "GTX 33"
+            };
+            assert!(
+                ListingEvidenceContext::from_cleaned_text(source)
+                    .unique_exact_model_slice(model)
+                    .is_none(),
+                "{source:?} must not recover an unqualified base product"
+            );
+        }
+
+        assert_eq!(
+            ListingEvidenceContext::from_cleaned_text(
+                "The prior unit was ADS-B compliant. Installed GTX 33 transponder.",
+            )
+            .unique_exact_model_slice("GTX 33")
+            .as_deref(),
+            Some("GTX 33"),
+            "a qualifier from a prior punctuated clause must not poison the model"
+        );
     }
 
     #[test]

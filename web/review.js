@@ -3,6 +3,7 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   characterLimitState,
@@ -14,13 +15,15 @@ import {
   isCompletedReviewMaintenanceResponse,
   preselectedReviewAction,
   productAssociationEvidenceDisplay,
-  productAssociationEligibilityOutcome,
+  productAssociationEligibilityOutcomeForAttestation,
   productActionContextIsCurrent,
   productAttestationDraft,
   productDetailRequestMayCommit,
   reviewAreaForAspect,
   reviewProductIdentitySourceValidation,
   runProductAssociationWorkers,
+  summarizeProductAssociations,
+  summarizeProductReviewGroups,
 } from "/review/domain.mjs";
 
 const REVIEW_LISTING_PARAM = "review_listing";
@@ -123,6 +126,10 @@ function collectElements() {
     reviewAspectLabel: "#review-aspect-label",
     reviewReasonCount: "#review-reason-count",
     reviewReasonLabel: "#review-reason-label",
+    reviewAttestationCount: "#review-attestation-count",
+    reviewAttestationLabel: "#review-attestation-label",
+    reviewManualCount: "#review-manual-count",
+    reviewManualLabel: "#review-manual-label",
     reviewQueueView: "#review-queue-view",
     reviewQueueTitle: "#review-queue-title",
     reviewModeProduct: "#review-mode-product",
@@ -143,9 +150,15 @@ function collectElements() {
     reviewProductTitleCount: "#review-product-title-count",
     reviewProductEvidenceCount: "#review-product-evidence-count",
     reviewProductAttest: "#review-product-attest",
+    reviewProductRecover: "#review-product-recover",
     reviewProductValidate: "#review-product-validate",
     reviewProductActionMessage: "#review-product-action-message",
     reviewProductAssociationBody: "#review-product-association-body",
+    reviewProductTotalCount: "#review-product-total-count",
+    reviewProductReadyCount: "#review-product-ready-count",
+    reviewProductRecoveryCount: "#review-product-recovery-count",
+    reviewProductAttestationCount: "#review-product-attestation-count",
+    reviewProductManualCount: "#review-product-manual-count",
     reviewWorkspace: "#review-workspace",
     reviewWorkspaceTitle: "#review-workspace-title",
     reviewWorkspaceSubtitle: "#review-workspace-subtitle",
@@ -197,6 +210,10 @@ function bindEvents() {
   elements.reviewProductValidate.addEventListener(
     "click",
     validateSelectedProductAssociations,
+  );
+  elements.reviewProductRecover.addEventListener(
+    "click",
+    recoverSelectedProductEvidence,
   );
   for (const [name, counter, limit] of [
     ["identity_source_title", elements.reviewProductTitleCount,
@@ -288,8 +305,17 @@ function setQueueMode(mode, { load = true } = {}) {
     : "Pending listings";
   elements.reviewAspectLabel.textContent = "Pending checks";
   elements.reviewReasonLabel.textContent = productMode
-    ? "Products needing OEM check"
+    ? "Needs source recovery"
     : "Issue types";
+  for (const metric of document.querySelectorAll(".review-product-only-metric")) {
+    metric.classList.toggle("is-hidden", !productMode);
+  }
+  if (productMode) {
+    elements.reviewPendingLabel.textContent = "Total pending";
+    elements.reviewAspectLabel.textContent = "Ready locally";
+    elements.reviewAttestationLabel.textContent = "OEM attestation required";
+    elements.reviewManualLabel.textContent = "Manual or ambiguous";
+  }
   if (!load) {
     return;
   }
@@ -369,20 +395,13 @@ function renderProductQueue() {
     "is-hidden",
     state.productGroups.length > 0,
   );
-  const associationCount = state.productGroups.reduce(
-    (sum, group) => sum + (nonNegativeInteger(group?.pending_association_count) ?? 0),
-    0,
-  );
-  const productListingPairs = state.productGroups.reduce(
-    (sum, group) => sum + (nonNegativeInteger(group?.pending_listing_count) ?? 0),
-    0,
-  );
-  elements.reviewPendingCount.textContent = formatNumber(productListingPairs, 0);
-  elements.reviewAspectCount.textContent = formatNumber(associationCount, 0);
-  elements.reviewReasonCount.textContent = formatNumber(
-    state.productGroups.filter((group) => group?.attestation_status === "required").length,
-    0,
-  );
+  const summary = summarizeProductReviewGroups(state.productGroups);
+  elements.reviewPendingCount.textContent = formatNumber(summary.total, 0);
+  elements.reviewAspectCount.textContent = formatNumber(summary.readyLocal, 0);
+  elements.reviewReasonCount.textContent = formatNumber(summary.needsSourceRecovery, 0);
+  elements.reviewAttestationCount.textContent =
+    formatNumber(summary.productAttestationRequired, 0);
+  elements.reviewManualCount.textContent = formatNumber(summary.manualOrAmbiguous, 0);
 }
 
 function productQueueRow(group) {
@@ -408,8 +427,7 @@ function productQueueRow(group) {
   );
   const pendingCell = queueTextCell(
     "Pending",
-    `${group?.pending_association_count ?? 0} across `
-      + `${group?.pending_listing_count ?? 0} ${pluralize(group?.pending_listing_count ?? 0, "listing")}`,
+    productGroupPendingSummary(group),
   );
   const actionCell = document.createElement("td");
   actionCell.dataset.label = "Actions";
@@ -432,6 +450,21 @@ function productQueueRow(group) {
     name.title = `${displayLabel(identity.kind)}: ${identity.value}`;
   }
   return row;
+}
+
+function productGroupPendingSummary(group) {
+  const summary = summarizeProductReviewGroups([group]);
+  const breakdown = [
+    summary.readyLocal ? `${summary.readyLocal} ready` : null,
+    summary.needsSourceRecovery ? `${summary.needsSourceRecovery} need source text` : null,
+    summary.productAttestationRequired
+      ? `${summary.productAttestationRequired} need OEM attestation`
+      : null,
+    summary.manualOrAmbiguous ? `${summary.manualOrAmbiguous} manual` : null,
+  ].filter(nonBlank).join(" · ");
+  const listings = `${group?.pending_listing_count ?? 0} `
+    + pluralize(group?.pending_listing_count ?? 0, "listing");
+  return `${summary.total} across ${listings}${breakdown ? ` · ${breakdown}` : ""}`;
 }
 
 async function loadAllProductAssociations(productId, sequence) {
@@ -536,8 +569,23 @@ function renderSelectedProduct() {
   elements.reviewProductStatus.classList.toggle("is-current", current);
   elements.reviewProductAttestationForm.classList.toggle("is-hidden", current);
   const autoVerifiable = autoVerifiableProductAssociations(state.productAssociations);
+  const summary = summarizeProductAssociations(
+    state.productAssociations,
+    selected.attestationStatus,
+  );
+  elements.reviewProductTotalCount.textContent = formatNumber(summary.total, 0);
+  elements.reviewProductReadyCount.textContent = formatNumber(summary.readyLocal, 0);
+  elements.reviewProductRecoveryCount.textContent =
+    formatNumber(summary.needsSourceRecovery, 0);
+  elements.reviewProductAttestationCount.textContent =
+    formatNumber(summary.productAttestationRequired, 0);
+  elements.reviewProductManualCount.textContent =
+    formatNumber(summary.manualOrAmbiguous, 0);
   elements.reviewProductValidate.disabled = !current
     || autoVerifiable.length === 0
+    || state.productBusy;
+  elements.reviewProductRecover.disabled = !current
+    || summary.needsSourceRecovery === 0
     || state.productBusy;
   if (!current) {
     const form = elements.reviewProductAttestationForm.elements;
@@ -550,8 +598,17 @@ function renderSelectedProduct() {
   }
   renderProductAssociationRows();
   elements.reviewProductActionMessage.textContent = current
-    ? `${autoVerifiable.length} ${pluralize(autoVerifiable.length, "association")} can be validated locally without Gemini.`
+    ? productAssociationActionSummary(summary)
     : "Attest this product once before validating its listing associations.";
+}
+
+function productAssociationActionSummary(summary) {
+  return [
+    `${summary.total} pending`,
+    `${summary.readyLocal} ready locally`,
+    `${summary.needsSourceRecovery} need source recovery`,
+    `${summary.manualOrAmbiguous} manual or ambiguous`,
+  ].join(" · ");
 }
 
 function associationOutcomeKey(association, productId = state.selectedProduct?.id) {
@@ -581,7 +638,10 @@ function renderProductAssociationRows() {
         "Retained source evidence",
         evidenceDisplay.sourceEvidenceText,
       );
-      const eligibilityOutcome = productAssociationEligibilityOutcome(association);
+      const eligibilityOutcome = productAssociationEligibilityOutcomeForAttestation(
+        association,
+        state.selectedProduct?.attestationStatus,
+      );
       const outcome = state.productOutcomes.get(associationOutcomeKey(association))
         || eligibilityOutcome;
       const result = queueTextCell(
@@ -812,6 +872,70 @@ async function validateSelectedProductAssociations() {
   }
 }
 
+async function recoverSelectedProductEvidence() {
+  const selected = state.selectedProduct;
+  if (!selected || selected.attestationStatus !== "current" || state.productBusy) {
+    return;
+  }
+  const recoverable = associationsNeedingSourceRecovery(
+    state.productAssociations,
+    selected.attestationStatus,
+  );
+  if (recoverable.length === 0) {
+    elements.reviewProductActionMessage.textContent =
+      "No pending association currently needs listing source recovery.";
+    return;
+  }
+  const listingCount = new Set(recoverable.map((association) => association.listing_id)).size;
+  const before = summarizeProductAssociations(
+    state.productAssociations,
+    selected.attestationStatus,
+  );
+  const action = beginProductAction(selected);
+  elements.reviewProductActionMessage.textContent =
+    `Recovering exact source text from ${listingCount} `
+      + `${pluralize(listingCount, "listing")}…`;
+  try {
+    const results = await runProductAssociationWorkers(
+      recoverable,
+      async (listingId) => api(`/api/review/listings/${listingId}/restage`, {
+        method: "POST",
+      }),
+      4,
+    );
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    const failed = results.length - succeeded;
+    await loadProductQueue({
+      quiet: true,
+      commitGuard: () => productActionContextIsCurrent(action, state),
+    });
+    if (!productActionContextIsCurrent(action, state)) {
+      return;
+    }
+    const detailResult = await openProductReview(action.productId);
+    if (detailResult.status !== "loaded" || state.selectedProduct?.id !== action.productId) {
+      return;
+    }
+    const after = summarizeProductAssociations(
+      state.productAssociations,
+      state.selectedProduct.attestationStatus,
+    );
+    const newlyReady = Math.max(0, after.readyLocal - before.readyLocal);
+    const stillNeedsRecovery = after.needsSourceRecovery;
+    elements.reviewProductActionMessage.textContent = [
+      `${succeeded} ${pluralize(succeeded, "listing")} checked`,
+      `${newlyReady} ${pluralize(newlyReady, "association")} newly ready`,
+      `${stillNeedsRecovery} still need source recovery`,
+      failed ? `${failed} ${pluralize(failed, "listing")} could not be refreshed` : null,
+    ].filter(nonBlank).join(" · ");
+  } finally {
+    finishProductAction(action);
+  }
+}
+
 function beginProductAction(selected) {
   const action = {
     productId: selected.id,
@@ -838,7 +962,16 @@ function finishProductAction(action) {
 function setProductBusy(busy) {
   state.productBusy = busy;
   setButtonBusy(elements.reviewProductAttest, busy);
+  setButtonBusy(elements.reviewProductRecover, busy);
   setButtonBusy(elements.reviewProductValidate, busy);
+  const summary = summarizeProductAssociations(
+    state.productAssociations,
+    state.selectedProduct?.attestationStatus,
+  );
+  elements.reviewProductRecover.disabled =
+    busy
+    || state.selectedProduct?.attestationStatus !== "current"
+    || summary.needsSourceRecovery === 0;
   elements.reviewProductValidate.disabled =
     busy
     || state.selectedProduct?.attestationStatus !== "current"

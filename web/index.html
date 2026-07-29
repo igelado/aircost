@@ -135,7 +135,7 @@
       </section>
 
       <section class="view-panel" id="review-panel">
-        <div class="metrics-row review-metrics" aria-label="Listing review summary">
+        <div class="metrics-row review-metrics" aria-label="Review summary">
           <div class="metric">
             <span class="metric-label" id="review-pending-label">Pending listings</span>
             <strong id="review-pending-count">0</strong>
@@ -147,6 +147,14 @@
           <div class="metric">
             <span class="metric-label" id="review-reason-label">Issue types</span>
             <strong id="review-reason-count">0</strong>
+          </div>
+          <div class="metric review-product-only-metric">
+            <span class="metric-label" id="review-attestation-label">OEM attestation required</span>
+            <strong id="review-attestation-count">0</strong>
+          </div>
+          <div class="metric review-product-only-metric">
+            <span class="metric-label" id="review-manual-label">Manual or ambiguous</span>
+            <strong id="review-manual-count">0</strong>
           </div>
         </div>
 
@@ -210,6 +218,13 @@
                 </div>
                 <span class="status-pill" id="review-product-status">Checking identity…</span>
               </header>
+              <div class="review-product-breakdown" aria-label="Selected product association summary">
+                <div><span>Total pending</span><strong id="review-product-total-count">0</strong></div>
+                <div><span>Ready locally</span><strong id="review-product-ready-count">0</strong></div>
+                <div><span>Needs source recovery</span><strong id="review-product-recovery-count">0</strong></div>
+                <div><span>OEM attestation required</span><strong id="review-product-attestation-count">0</strong></div>
+                <div><span>Manual or ambiguous</span><strong id="review-product-manual-count">0</strong></div>
+              </div>
               <form id="review-product-attestation-form">
                 <div class="form-grid review-product-dossier">
                   <label>OEM source URL
@@ -227,6 +242,7 @@
                 <button class="button primary" id="review-product-attest" type="submit">Attest product from OEM source</button>
               </form>
               <div class="review-product-actions">
+                <button class="button" id="review-product-recover" type="button">Recover listing source text</button>
                 <button class="button primary" id="review-product-validate" type="button">Validate pending associations locally</button>
                 <span id="review-product-action-message" role="status" aria-live="polite"></span>
               </div>

@@ -347,30 +347,41 @@ export function productAttestationDraft(product) {
 }
 
 export function productAssociationEligibilityOutcome(association) {
+  return productAssociationEligibilityOutcomeForAttestation(association, null);
+}
+
+export function productAssociationEligibilityOutcomeForAttestation(
+  association,
+  attestationStatus,
+) {
+  const bucket = productAssociationReviewBucket(association, attestationStatus);
   const eligibility = association?.verification_eligibility;
-  if (eligibility?.status === "auto_verifiable") {
+  if (bucket === "ready_local") {
     return {
       kind: "ready",
       label: "Ready for local validation",
       detail: "The retained listing proof uniquely identifies the current approved product.",
     };
   }
-  if (eligibility?.status === "product_attestation_required") {
+  if (bucket === "source_evidence_missing") {
+    return {
+      kind: "recovery",
+      label: "Needs source recovery",
+      detail: "The retained listing does not yet contain an exact source excerpt for this product.",
+    };
+  }
+  if (bucket === "product_attestation_required") {
     return {
       kind: "required",
       label: "OEM attestation required",
-      detail: typeof eligibility.reason === "string" && eligibility.reason.trim()
-        ? eligibility.reason
-        : "Attest the product once before validating this listing association.",
+      detail: "Attest this product once from an OEM source before validating its listing associations.",
     };
   }
-  if (eligibility?.status === "manual_review_required") {
+  if (bucket === "manual_review_required") {
     return {
       kind: "manual",
-      label: "Manual review required",
-      detail: typeof eligibility.reason === "string" && eligibility.reason.trim()
-        ? eligibility.reason
-        : "This association did not pass the complete local verification preflight.",
+      label: "Manual or ambiguous",
+      detail: manualAssociationExplanation(eligibility?.reason_code),
     };
   }
   return {
@@ -378,6 +389,120 @@ export function productAssociationEligibilityOutcome(association) {
     label: "Eligibility unavailable",
     detail: "Reload the product review before attempting this association.",
   };
+}
+
+function manualAssociationExplanation(reasonCode) {
+  if (reasonCode === "identity_or_capability_qualifier_unresolved") {
+    return "The listing includes a model variant or capability qualifier that may identify a different product.";
+  }
+  if (reasonCode === "different_product_detected") {
+    return "The listing evidence appears to identify a different approved product.";
+  }
+  if (reasonCode === "catalog_identity_ambiguous") {
+    return "The retained listing evidence matches more than one possible product.";
+  }
+  if (reasonCode === "listing_restage_required") {
+    return "The listing changed and must be reloaded before it can be checked again.";
+  }
+  return "This association needs a person to confirm the product identity or listing relationship.";
+}
+
+export function productAssociationReviewBucket(association, attestationStatus = null) {
+  if (attestationStatus === "required") {
+    return "product_attestation_required";
+  }
+  const eligibility = association?.verification_eligibility;
+  if (eligibility?.status === "auto_verifiable") {
+    return "ready_local";
+  }
+  if (eligibility?.status === "product_attestation_required") {
+    return "product_attestation_required";
+  }
+  if (
+    eligibility?.status === "manual_review_required"
+    && (
+      eligibility?.reason_code === "source_evidence_missing"
+      || (
+        attestationStatus === "current"
+        && !(typeof association?.source_evidence_text === "string"
+          && association.source_evidence_text.trim())
+      )
+    )
+  ) {
+    return "source_evidence_missing";
+  }
+  if (eligibility?.status === "manual_review_required") {
+    return "manual_review_required";
+  }
+  return "eligibility_unavailable";
+}
+
+export function summarizeProductAssociations(associations, attestationStatus = null) {
+  const summary = emptyProductAssociationSummary();
+  for (const association of Array.isArray(associations) ? associations : []) {
+    summary.total += 1;
+    const bucket = productAssociationReviewBucket(association, attestationStatus);
+    if (bucket === "ready_local") {
+      summary.readyLocal += 1;
+    } else if (bucket === "source_evidence_missing") {
+      summary.needsSourceRecovery += 1;
+    } else if (bucket === "product_attestation_required") {
+      summary.productAttestationRequired += 1;
+    } else {
+      summary.manualOrAmbiguous += 1;
+    }
+  }
+  return summary;
+}
+
+export function summarizeProductReviewGroups(groups) {
+  const summary = emptyProductAssociationSummary();
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const total = nonnegativeCount(group?.pending_association_count);
+    summary.total += total;
+    const counts = group?.eligibility_counts;
+    if (!counts || typeof counts !== "object") {
+      if (group?.attestation_status === "required") {
+        summary.productAttestationRequired += total;
+      } else {
+        summary.manualOrAmbiguous += total;
+      }
+      continue;
+    }
+    const ready = nonnegativeCount(counts.ready_local);
+    const recovery = nonnegativeCount(counts.source_evidence_missing);
+    const attestation = nonnegativeCount(counts.product_attestation_required);
+    const manual = nonnegativeCount(counts.manual_review_required);
+    const classified = ready + recovery + attestation + manual;
+    summary.readyLocal += ready;
+    summary.needsSourceRecovery += recovery;
+    summary.productAttestationRequired += attestation;
+    summary.manualOrAmbiguous += manual + Math.max(0, total - classified);
+  }
+  return summary;
+}
+
+export function associationsNeedingSourceRecovery(associations, attestationStatus = null) {
+  return (Array.isArray(associations) ? associations : []).filter(
+    (association) => (
+      productAssociationReviewBucket(association, attestationStatus)
+      === "source_evidence_missing"
+    ),
+  );
+}
+
+function emptyProductAssociationSummary() {
+  return {
+    total: 0,
+    readyLocal: 0,
+    needsSourceRecovery: 0,
+    productAttestationRequired: 0,
+    manualOrAmbiguous: 0,
+  };
+}
+
+function nonnegativeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 export function productAssociationEvidenceDisplay(association) {

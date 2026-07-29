@@ -525,12 +525,40 @@ pub enum ProductAttestationStatus {
     Required,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ProductAssociationEligibilityCounts {
+    pub ready_local: i64,
+    pub source_evidence_missing: i64,
+    pub product_attestation_required: i64,
+    pub manual_review_required: i64,
+}
+
+impl ProductAssociationEligibilityCounts {
+    fn record(&mut self, eligibility: &ProductAssociationVerificationEligibility) {
+        match eligibility.status {
+            ProductAssociationEligibilityStatus::AutoVerifiable => self.ready_local += 1,
+            ProductAssociationEligibilityStatus::ProductAttestationRequired => {
+                self.product_attestation_required += 1;
+            }
+            ProductAssociationEligibilityStatus::ManualReviewRequired
+                if eligibility.reason_code.as_deref() == Some("source_evidence_missing") =>
+            {
+                self.source_evidence_missing += 1;
+            }
+            ProductAssociationEligibilityStatus::ManualReviewRequired => {
+                self.manual_review_required += 1;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PendingProductReviewGroup {
     pub product: ReviewProduct,
     pub attestation_status: ProductAttestationStatus,
     pub pending_association_count: i64,
     pub pending_listing_count: i64,
+    pub eligibility_counts: ProductAssociationEligibilityCounts,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -3306,25 +3334,26 @@ pub async fn list_pending_product_reviews(
     let associations = pending_product_associations_from_rows(
         load_product_review_source_rows(db, owner_user_id).await?,
     )?;
-    let products = load_all_approved_product_map(db).await?;
-    let current_attestations = current_reuse_attested_product_ids(db).await?;
-    let mut counts = BTreeMap::<i64, (i64, HashSet<i64>)>::new();
+    let snapshot = load_existing_product_association_global_snapshot(db).await?;
+    let mut counts =
+        BTreeMap::<i64, (i64, HashSet<i64>, Vec<PendingProductAssociationSource>)>::new();
     for (product_id, _, association) in associations {
         let count = counts
             .entry(product_id)
-            .or_insert_with(|| (0, HashSet::new()));
+            .or_insert_with(|| (0, HashSet::new(), Vec::new()));
         count.0 += 1;
         count.1.insert(association.listing_id);
+        count.2.push(association);
     }
 
     let mut groups = Vec::new();
-    for (product_id, (pending_association_count, listing_ids)) in counts {
-        let product = products.get(&product_id).cloned().ok_or_else(|| {
+    for (product_id, (pending_association_count, listing_ids, associations)) in counts {
+        let product = snapshot.products.get(&product_id).cloned().ok_or_else(|| {
             ReviewError::Conflict(format!(
                 "pending review targets catalog id {product_id}, which is not a current approved product"
             ))
         })?;
-        let status = if current_attestations.contains(&product_id) {
+        let status = if snapshot.reuse_attested_ids.contains(&product_id) {
             ProductAttestationStatus::Current
         } else {
             ProductAttestationStatus::Required
@@ -3335,6 +3364,25 @@ pub async fn list_pending_product_reviews(
         {
             continue;
         }
+        let mut eligibility_counts = ProductAssociationEligibilityCounts::default();
+        if status == ProductAttestationStatus::Required {
+            eligibility_counts.product_attestation_required = pending_association_count;
+        } else {
+            for association in associations {
+                let eligibility = evaluate_existing_product_association_with_snapshot(
+                    db,
+                    &snapshot,
+                    owner_user_id,
+                    association.listing_id,
+                    &association.aspect_id,
+                    &association.review_payload_sha256,
+                    &snapshot.catalog_revision_sha256,
+                )
+                .await?
+                .eligibility();
+                eligibility_counts.record(&eligibility);
+            }
+        }
         groups.push((
             product_id,
             PendingProductReviewGroup {
@@ -3342,6 +3390,7 @@ pub async fn list_pending_product_reviews(
                 attestation_status: status,
                 pending_association_count,
                 pending_listing_count: listing_ids.len() as i64,
+                eligibility_counts,
             },
         ));
     }
@@ -3360,7 +3409,7 @@ pub async fn list_pending_product_reviews(
         None
     };
     Ok(PendingProductReviewPage {
-        catalog_revision_sha256: approved_catalog_revision_sha256(db).await?,
+        catalog_revision_sha256: snapshot.catalog_revision_sha256,
         items: groups.into_iter().map(|(_, group)| group).collect(),
         next_cursor,
     })
@@ -4280,7 +4329,15 @@ fn plan_pending_association_evidence_repair(
                 approved_product.and_then(|product| {
                     source.and_then(|source| {
                         source
-                            .unique_exact_product_slice(&product.manufacturer, &product.model)
+                            .unique_exact_model_slice(&product.model)
+                            .and_then(|model_evidence| {
+                                source
+                                    .unique_exact_product_slice(
+                                        &product.manufacturer,
+                                        &product.model,
+                                    )
+                                    .or(Some(model_evidence))
+                            })
                             .filter(|evidence| {
                                 rendered_html.is_some_and(|html| {
                                     listing_body_contains_exact_structurally_visible_text_span(
@@ -4961,7 +5018,13 @@ struct ExistingProductAssociationGlobalSnapshot {
 
 enum ExistingProductAssociationPreflight {
     Ready(ExistingProductAssociationTarget),
-    ProductAttestationRequired { product_id: i64 },
+    ProductAttestationRequired {
+        product_id: i64,
+    },
+    ManualReviewRequired {
+        eligibility: ProductAssociationVerificationEligibility,
+        error: ReviewError,
+    },
 }
 
 pub(crate) enum ExistingProductAssociationEvaluation {
@@ -5351,6 +5414,7 @@ async fn preflight_existing_product_association(
                 "approved catalog id {product_id} requires global product attestation before listing associations can be verified"
             )))
         }
+        ExistingProductAssociationPreflight::ManualReviewRequired { error, .. } => Err(error),
     }
 }
 
@@ -5434,16 +5498,23 @@ async fn preflight_existing_product_association_with_snapshot(
             "approved catalog id {target_id} is no longer available for review aspect {aspect_id}"
         ))
     })?;
-    let listing_evidence_text = aspect
+    let Some(listing_evidence_text) = aspect
         .source_evidence_text
         .as_ref()
         .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| {
-            ReviewError::Validation(format!(
-                "review aspect {aspect_id} has no retained raw listing evidence and cannot be corroborated automatically"
-            ))
-        })?
-        .clone();
+        .cloned()
+    else {
+        let error = ReviewError::Validation(format!(
+            "review aspect {aspect_id} has no retained raw listing evidence and cannot be corroborated automatically"
+        ));
+        return Ok(ExistingProductAssociationPreflight::ManualReviewRequired {
+            eligibility: manual_product_association_eligibility(
+                "source_evidence_missing",
+                "No exact visible listing-source excerpt is retained for this association. Recover source evidence from the listing before retrying local validation.",
+            ),
+            error,
+        });
+    };
     if listing_evidence_text.len() > MAX_LISTING_EVIDENCE_CONTEXT_BYTES
         || !exact_compact_listing_identity_is_present(&listing_evidence_text, &product.model)
     {
@@ -5454,9 +5525,16 @@ async fn preflight_existing_product_association_with_snapshot(
     if listing_evidence_has_ambiguous_semantic_qualifier(&listing_evidence_text, &product.model)
         || listing_evidence_has_distinct_variant_suffix(&listing_evidence_text, &product.model)
     {
-        return Err(ReviewError::Validation(format!(
+        let error = ReviewError::Validation(format!(
             "review aspect {aspect_id} contains an unresolved identity or capability qualifier and cannot use the exact local/one-by-one fast path"
-        )));
+        ));
+        return Ok(ExistingProductAssociationPreflight::ManualReviewRequired {
+            eligibility: manual_product_association_eligibility(
+                "identity_or_capability_qualifier_unresolved",
+                "The listing evidence includes a model variant or capability qualifier that may identify a different product.",
+            ),
+            error,
+        });
     }
     let listing_evidence_provenance =
         load_listing_evidence_provenance(db, &row, &listing_evidence_text).await?;
@@ -5588,6 +5666,12 @@ async fn evaluate_existing_product_association_with_snapshot(
                     eligibility: product_attestation_required_eligibility(product_id),
                 },
             );
+        }
+        ExistingProductAssociationPreflight::ManualReviewRequired { eligibility, error } => {
+            return Ok(ExistingProductAssociationEvaluation::ManualReviewRequired {
+                eligibility,
+                error,
+            });
         }
     };
     let target_id = target
@@ -9215,7 +9299,8 @@ mod tests {
             version: REVIEW_PAYLOAD_VERSION,
             aspects: vec![aspect],
         };
-        let source_html = "<body>The listing identifies a Garmin GMA-1347 audio panel.</body>";
+        let source_html =
+            "<body>Garmin integrated avionics. The listing identifies a GMA-1347 audio panel.</body>";
         let source = ListingEvidenceContext::from_publisher_html(Some(source_html));
         let mut assignment = existing_assignment(7, 10, 1, "installed", None);
         assignment.installed_manufacturer = Some("Garmin".to_string());
@@ -9229,7 +9314,7 @@ mod tests {
             Some(&source),
             Some(source_html),
         );
-        assert_eq!(repairs[0].evidence_text.as_deref(), Some("Garmin GMA-1347"));
+        assert_eq!(repairs[0].evidence_text.as_deref(), Some("GMA-1347"));
 
         assignment.quantity = 2;
         payload.aspects[0].quantity = 2;
@@ -9244,7 +9329,7 @@ mod tests {
             )[0]
             .evidence_text
             .as_deref(),
-            Some("Garmin GMA-1347")
+            Some("GMA-1347")
         );
         assignment.quantity = 1;
         payload.aspects[0].quantity = 1;
@@ -9275,7 +9360,7 @@ mod tests {
             None
         );
 
-        let ambiguous_html = "<body>Garmin GMA-1347 and Garmin GMA-1347 NXi</body>";
+        let ambiguous_html = "<body>Garmin GMA-1347 and a spare GMA-1347 NXi</body>";
         let ambiguous = ListingEvidenceContext::from_publisher_html(Some(ambiguous_html));
         assert_eq!(
             plan_pending_association_evidence_repair(
@@ -9285,6 +9370,59 @@ mod tests {
                 &catalog,
                 Some(&ambiguous),
                 Some(ambiguous_html),
+            )[0]
+            .evidence_text,
+            None
+        );
+
+        let hidden_html =
+            "<style>.hidden { display: none }</style><body><div class=hidden>GMA-1347</div></body>";
+        let hidden = ListingEvidenceContext::from_publisher_html(Some(hidden_html));
+        assert_eq!(
+            plan_pending_association_evidence_repair(
+                &payload,
+                std::slice::from_ref(&assignment),
+                &approved,
+                &catalog,
+                Some(&hidden),
+                Some(hidden_html),
+            )[0]
+            .evidence_text,
+            None
+        );
+
+        let script_html = "<body><script>const equipment = 'GMA-1347';</script></body>";
+        let script = ListingEvidenceContext::from_publisher_html(Some(script_html));
+        assert_eq!(
+            plan_pending_association_evidence_repair(
+                &payload,
+                std::slice::from_ref(&assignment),
+                &approved,
+                &catalog,
+                Some(&script),
+                Some(script_html),
+            )[0]
+            .evidence_text,
+            None
+        );
+
+        let competing_catalog = [
+            catalog[0].clone(),
+            RecoverableCatalogIdentityRow {
+                id: 11,
+                model: "GMA 1347B".to_string(),
+                manufacturer_identifier_kind: Some("manufacturer_part_number".to_string()),
+                manufacturer_identifier: Some("011-00809-01".to_string()),
+            },
+        ];
+        assert_eq!(
+            plan_pending_association_evidence_repair(
+                &payload,
+                std::slice::from_ref(&assignment),
+                &approved,
+                &competing_catalog,
+                Some(&source),
+                Some(source_html),
             )[0]
             .evidence_text,
             None
@@ -9850,12 +9988,12 @@ mod tests {
                 "manual",
                 "avionics_identity",
                 "Garmin GNS 430W",
-                "Garmin GNS 430W generated explanation",
+                "Garmin GNS 430W",
                 "catalog_match_requires_review",
                 1,
                 "installed",
-                Some("Garmin GNS 430W generated explanation".to_string()),
-                Some("high".to_string()),
+                None,
+                None,
             )
             .with_reuse_attestation_target(attested_product_id),
             PendingReviewAspect::avionics(
@@ -9881,6 +10019,38 @@ mod tests {
         .fetch_one(sqlite_pool(&db))
         .await
         .unwrap();
+
+        let groups = list_pending_product_reviews(&db, user_id, ProductReviewPageQuery::default())
+            .await
+            .unwrap();
+        let attested_group = groups
+            .items
+            .iter()
+            .find(|group| group.product.id == Some(attested_product_id))
+            .unwrap();
+        assert_eq!(
+            attested_group.eligibility_counts,
+            ProductAssociationEligibilityCounts {
+                ready_local: 1,
+                source_evidence_missing: 1,
+                product_attestation_required: 0,
+                manual_review_required: 0,
+            }
+        );
+        let unattested_group = groups
+            .items
+            .iter()
+            .find(|group| group.product.id == Some(unattested_product_id))
+            .unwrap();
+        assert_eq!(
+            unattested_group.eligibility_counts,
+            ProductAssociationEligibilityCounts {
+                ready_local: 0,
+                source_evidence_missing: 0,
+                product_attestation_required: 1,
+                manual_review_required: 0,
+            }
+        );
 
         let first = list_pending_product_associations(
             &db,
@@ -9930,14 +10100,14 @@ mod tests {
                 .verification_eligibility
                 .reason_code
                 .as_deref(),
-            Some("association_preflight_rejected")
+            Some("source_evidence_missing")
         );
         assert!(second.associations[0]
             .verification_eligibility
             .reason
             .as_deref()
             .is_some_and(|reason| reason
-                == "The retained listing proof or association shape does not meet automatic verification requirements."));
+                == "No exact visible listing-source excerpt is retained for this association. Recover source evidence from the listing before retrying local validation."));
 
         let unattested = list_pending_product_associations(
             &db,
@@ -10170,7 +10340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_restage_replaces_generated_notes_with_exact_evidence_and_is_idempotent() {
+    async fn explicit_restage_recovers_model_only_evidence_for_local_validation() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let product_id = insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
@@ -10179,7 +10349,7 @@ mod tests {
             &db,
             user_id,
             listing_id,
-            "<main><div>Installed Garmin GMA-1347 Digital Audio Panel.</div></main>",
+            "<main><div>Garmin integrated avionics package.</div><div>Installed GMA-1347 Digital Audio Panel.</div></main>",
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
@@ -10233,7 +10403,7 @@ mod tests {
         .fetch_one(sqlite_pool(&db))
         .await
         .unwrap();
-        assert_eq!(link, ("Garmin GMA-1347".to_string(), "high".to_string()));
+        assert_eq!(link, ("GMA-1347".to_string(), "high".to_string()));
         let row = load_review_row(&db, listing_id).await.unwrap();
         let payload = parse_payload(
             &row.review_payload_json,
@@ -10248,10 +10418,21 @@ mod tests {
             recovered.id,
             preserved_review_aspect_id(link_id, ListingAssociationRole::Installed)
         );
-        assert_eq!(
-            recovered.source_evidence_text.as_deref(),
-            Some("Garmin GMA-1347")
-        );
+        assert_eq!(recovered.source_evidence_text.as_deref(), Some("GMA-1347"));
+
+        assert!(matches!(
+            evaluate_existing_product_association(
+                &db,
+                user_id,
+                listing_id,
+                &recovered.id,
+                &restaged.review_payload_sha256,
+                &restaged.catalog_revision_sha256,
+            )
+            .await
+            .unwrap(),
+            ExistingProductAssociationEvaluation::AutoVerifiable(_)
+        ));
 
         let second = restage_unattested_preserved_products(&db, user_id, listing_id)
             .await
