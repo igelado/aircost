@@ -100,15 +100,47 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "standard ifr avionics"
             | "radio"
             | "radios"
+            | "nav"
+            | "com"
             | "nav com"
+            | "gps nav com"
             | "navigation system"
             | "gps"
             | "autopilot"
+            | "flight director"
             | "transponder"
             | "ads b"
             | "weather radar"
             | "audio panel"
             | "display"
+            | "flight display"
+            | "pfd"
+            | "mfd"
+            | "pfd mfd"
+            | "navigation indicator"
+            | "traffic"
+            | "active traffic"
+            | "traffic advisory system"
+            | "datalink"
+            | "xm"
+            | "xm weather"
+            | "xm radio"
+            | "xm weather radio"
+            | "lightning detection"
+            | "terrain awareness"
+            | "terrain awareness system"
+            | "terrain avoidance system"
+            | "taws"
+            | "engine monitor"
+            | "standby instrument"
+            | "elt"
+            | "adf"
+            | "dme"
+            | "ahrs"
+            | "air data computer"
+            | "radar altimeter"
+            | "magnetometer"
+            | "clock timer"
             | "equipment"
     )
 }
@@ -247,6 +279,12 @@ mod tests {
             "Standard Flight Instruments",
             "Integrated Avionics Suite",
             "Glass Panel",
+            "TAWS",
+            "XM Weather & Radio",
+            "Active Traffic",
+            "AHRS",
+            "ADF",
+            "PFD/MFD",
         ] {
             assert!(
                 is_generic_avionics_model_name(label),

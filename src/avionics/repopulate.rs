@@ -28,6 +28,7 @@ use crate::listing::review::{
     PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
 };
 use crate::models::ParsedAvionics;
+use crate::normalize::is_generic_avionics_model_name;
 use crate::plugin::sha256_hex;
 
 #[derive(Debug)]
@@ -2170,6 +2171,12 @@ fn input_error_report(
 }
 
 fn raw_candidate_issue(raw: &ParsedAvionics) -> Option<String> {
+    if is_generic_avionics_model_name(&raw.model) {
+        return Some(format!(
+            "{} is a capability, service, or generic equipment label rather than a specific avionics product",
+            raw.model.trim()
+        ));
+    }
     if raw.avionics_types.is_empty()
         || raw
             .avionics_types
@@ -3073,6 +3080,26 @@ mod tests {
         );
         assert!(aspects[0].reason.contains("could not safely interpret"));
         assert!(aspects[1].reason.contains("could not safely interpret"));
+    }
+
+    #[test]
+    fn generic_capability_or_service_label_never_reaches_identity_grounding() {
+        for model in ["TAWS", "XM Weather & Radio", "Active Traffic", "AHRS"] {
+            let raw = ParsedAvionics {
+                manufacturer: "Garmin".to_string(),
+                model: model.to_string(),
+                avionics_types: vec!["Terrain Awareness".to_string()],
+                quantity: 1,
+                configuration_action: "installed".to_string(),
+                replaces: None,
+                source_evidence_text: Some(model.to_string()),
+                source_confidence: Some("high".to_string()),
+            };
+
+            let issue = raw_candidate_issue(&raw)
+                .expect("a generic label must remain a residual review aspect");
+            assert!(issue.contains("rather than a specific avionics product"));
+        }
     }
 
     #[test]
