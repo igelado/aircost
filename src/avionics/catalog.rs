@@ -3951,11 +3951,8 @@ fn validate_evidence_values(
     issues: &mut Vec<String>,
 ) {
     let parsed = url::Url::parse(source_url).ok();
-    if parsed
-        .as_ref()
-        .is_none_or(|url| !matches!(url.scheme(), "http" | "https"))
-    {
-        issues.push("identity source must be an http(s) URL".to_string());
+    if parsed.as_ref().is_none_or(|url| url.scheme() != "https") {
+        issues.push("identity source must use its final HTTPS URL".to_string());
     }
     let lowered = source_url.to_ascii_lowercase();
     if [
@@ -3997,9 +3994,6 @@ fn validate_evidence_values(
     }
     if source_title.trim().chars().count() < 4 {
         issues.push("identity source title must be specific and non-empty".to_string());
-    }
-    if evidence.trim().chars().count() < 20 {
-        issues.push("identity evidence must contain a specific supporting fact".to_string());
     }
     if !exact_evidence_identity_signal_is_present(
         evidence,
@@ -4860,15 +4854,15 @@ mod tests {
         select_unique_exact_review_candidate, shortlist_avionics_candidates,
         should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
-        validate_collision_decision_relation, validate_grounded_response_origin_state,
-        verified_identity_from_response, ApprovedAvionicsIdentity,
-        ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
-        AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate, AvionicsIdentityOutcome,
-        AvionicsIdentityRequest, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
-        CollisionCorrectionPlan, GeminiGroundingSource, GeminiGroundingSupport,
-        GroundedJsonResponse, KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
-        ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
-        KNOWN_APPROVED_SELECT_SQL,
+        validate_collision_decision_relation, validate_evidence_values,
+        validate_grounded_response_origin_state, verified_identity_from_response,
+        ApprovedAvionicsIdentity, ApprovedAvionicsProductSourceRequest,
+        ApprovedProductSourceVerification, AuthoritativeDirectSourcePlan, AvionicsCatalogCandidate,
+        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsUnitResolutionCandidate,
+        AvionicsUnitResolutionContext, CollisionCorrectionPlan, GeminiGroundingSource,
+        GeminiGroundingSupport, GroundedJsonResponse, KnownApprovedAvionicsCandidate,
+        PendingProductAttestationCommitGuard, ReviewCatalogCandidate, VerifiedIdentity,
+        COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -7090,6 +7084,52 @@ mod tests {
             identity.canonical_types,
             vec!["GPS".to_string(), "Transponder".to_string()]
         );
+    }
+
+    #[test]
+    fn official_model_number_identity_accepts_one_grounded_model_occurrence() {
+        let source_url = "https://static.garmin.com/manuals/gia63w.pdf";
+        let evidence = "Garmin GIA 63W";
+        let (sources, supports) = grounding(source_url, "GIA 63W manual", evidence);
+        let mut issues = Vec::new();
+
+        validate_evidence_values(
+            source_url,
+            "GIA 63W manual",
+            evidence,
+            "GIA 63W",
+            "GIA 63W",
+            "https://listing.example/aircraft/1",
+            &sources,
+            &supports,
+            &[],
+            &mut issues,
+        );
+
+        assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+    }
+
+    #[test]
+    fn identity_evidence_rejects_non_https_source_claims() {
+        let source_url = "http://static.garmin.com/manuals/gia63w.pdf";
+        let evidence = "Garmin GIA 63W";
+        let (sources, supports) = grounding(source_url, "GIA 63W manual", evidence);
+        let mut issues = Vec::new();
+
+        validate_evidence_values(
+            source_url,
+            "GIA 63W manual",
+            evidence,
+            "GIA 63W",
+            "GIA 63W",
+            "https://listing.example/aircraft/1",
+            &sources,
+            &supports,
+            &[],
+            &mut issues,
+        );
+
+        assert!(issues.iter().any(|issue| issue.contains("final HTTPS URL")));
     }
 
     #[test]
