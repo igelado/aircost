@@ -88,6 +88,7 @@ struct FaaRecordRow {
 
 #[derive(Debug, FromRow)]
 struct ExistingLinkRow {
+    id: i64,
     avionics_model_id: i64,
     quantity: i64,
     source: String,
@@ -243,6 +244,16 @@ fn prepared_action(link: &PreparedLink) -> CanonicalAvionicsAction {
     )
 }
 
+fn persisted_values_match(existing: &ExistingLinkRow, assignment: &PreparedLink) -> bool {
+    existing.avionics_model_id == assignment.avionics_model_id
+        && existing.quantity == assignment.quantity
+        && existing.source == assignment.source
+        && existing.source_notes == assignment.source_notes
+        && existing.source_confidence == assignment.source_confidence
+        && existing.configuration_action == assignment.configuration_action
+        && existing.replaces_avionics_model_id == assignment.replaces_avionics_model_id
+}
+
 fn serial_is_compatible(
     listing_serial: Option<&str>,
     faa_serial_raw: Option<&str>,
@@ -384,6 +395,7 @@ pub(crate) async fn apply_automated_avionics_review(
     let select_existing_links = db.sql(
         r#"
         SELECT
+          link.id,
           link.avionics_model_id,
           link.quantity,
           link.source,
@@ -412,8 +424,9 @@ pub(crate) async fn apply_automated_avionics_review(
         ORDER BY link.id
         "#,
     );
-    let delete_links =
-        db.sql("DELETE FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?");
+    let delete_link = db.sql(
+        "DELETE FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND id = ?",
+    );
     let insert_link = db.sql(
         r#"
         INSERT INTO aircraft_sale_listing_avionics (
@@ -718,7 +731,7 @@ pub(crate) async fn apply_automated_avionics_review(
                     .fetch_all(&mut *transaction)
                     .await?;
             let mut preserved = BTreeMap::<String, PreparedLink>::new();
-            for row in existing_rows {
+            for row in &existing_rows {
                 if row.quantity <= 0
                     || row.source_confidence.as_deref() != Some("high")
                     || !matches!(row.source.as_str(), "listing" | "listing_review")
@@ -773,10 +786,10 @@ pub(crate) async fn apply_automated_avionics_review(
                     avionics_model_id: row.avionics_model_id,
                     subject_key: subject_key.clone(),
                     quantity: row.quantity,
-                    source: row.source,
-                    source_notes: row.source_notes,
-                    source_confidence: row.source_confidence,
-                    configuration_action: row.configuration_action,
+                    source: row.source.clone(),
+                    source_notes: row.source_notes.clone(),
+                    source_confidence: row.source_confidence.clone(),
+                    configuration_action: row.configuration_action.clone(),
                     replaces_avionics_model_id: row.replaces_avionics_model_id,
                     replacement_key,
                 };
@@ -796,11 +809,31 @@ pub(crate) async fn apply_automated_avionics_review(
             )
             .map_err(ReviewError::Validation)?;
 
-            sqlx::query(&delete_links)
-                .bind(request.listing_id)
-                .execute(&mut *transaction)
-                .await?;
-            for assignment in assignments.values() {
+            let mut retained_link_ids = BTreeSet::new();
+            let mut retained_assignment_keys = BTreeSet::new();
+            for (subject_key, assignment) in &assignments {
+                if let Some(existing) = existing_rows
+                    .iter()
+                    .find(|existing| persisted_values_match(existing, assignment))
+                {
+                    retained_link_ids.insert(existing.id);
+                    retained_assignment_keys.insert(subject_key.clone());
+                }
+            }
+            for existing in &existing_rows {
+                if retained_link_ids.contains(&existing.id) {
+                    continue;
+                }
+                sqlx::query(&delete_link)
+                    .bind(request.listing_id)
+                    .bind(existing.id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            for (subject_key, assignment) in &assignments {
+                if retained_assignment_keys.contains(subject_key) {
+                    continue;
+                }
                 sqlx::query(&insert_link)
                     .bind(request.listing_id)
                     .bind(assignment.avionics_model_id)
@@ -1314,6 +1347,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_accepted_link_keeps_its_existing_row() {
+        let fixture = fixture().await;
+        let accepted_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        let existing_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Exact model appears in listing equipment',
+                      'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let product_fingerprint: String = sqlx::query_scalar(
+            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_corroborations (
+              listing_link_id, association_role, avionics_model_id,
+              observation_sha256, product_fingerprint, policy_version
+            ) VALUES (?, 'installed', ?, ?, ?, 'listing_avionics_association_v1')
+            "#,
+        )
+        .bind(existing_link_id)
+        .bind(accepted_id)
+        .bind("1".repeat(64))
+        .bind(&product_fingerprint)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes (
+              listing_link_id, association_role, collision_closure_sha256, policy_version
+            ) VALUES (?, 'installed', ?, 'listing_avionics_collision_closure_v1')
+            "#,
+        )
+        .bind(existing_link_id)
+        .bind("2".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let result = apply_automated_avionics_review(
+            &fixture.db,
+            &request(&fixture, vec![accepted(accepted_id)], vec![]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.accepted_link_count, 1);
+        assert_eq!(result.stored_link_count, 1);
+        let stored_link_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_link_id, existing_link_id);
+        let corroboration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        )
+        .bind(existing_link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let scope_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes WHERE listing_link_id = ?",
+        )
+        .bind(existing_link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!((corroboration_count, scope_count), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn changed_accepted_link_replaces_the_row_and_invalidates_corroboration() {
+        let fixture = fixture().await;
+        let accepted_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        let existing_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 2, 'listing', 'Exact model appears in listing equipment',
+                      'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let product_fingerprint: String = sqlx::query_scalar(
+            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_corroborations (
+              listing_link_id, association_role, avionics_model_id,
+              observation_sha256, product_fingerprint, policy_version
+            ) VALUES (?, 'installed', ?, ?, ?, 'listing_avionics_association_v1')
+            "#,
+        )
+        .bind(existing_link_id)
+        .bind(accepted_id)
+        .bind("1".repeat(64))
+        .bind(product_fingerprint)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(&fixture, vec![accepted(accepted_id)], vec![]),
+        )
+        .await
+        .unwrap();
+
+        let stored_link_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_ne!(stored_link_id, existing_link_id);
+        let corroboration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        )
+        .bind(existing_link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(corroboration_count, 0);
+    }
+
+    #[tokio::test]
     async fn stale_review_hash_rolls_back_every_link_change() {
         let fixture = fixture().await;
         let existing_id = insert_product(&fixture.db, "GNS 430W", "GNS430W", true).await;
@@ -1363,21 +1555,26 @@ mod tests {
         let weak_id = insert_product(&fixture.db, "GMA 340", "GMA340", true).await;
         let accepted_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
         let pool = pool(&fixture.db);
+        let mut preserved_link_id = None;
         for (model_id, confidence) in [(existing_id, "high"), (weak_id, "medium")] {
-            sqlx::query(
+            let link_id: i64 = sqlx::query_scalar(
                 r#"
                 INSERT INTO aircraft_sale_listing_avionics (
                   aircraft_sale_listing_id, avionics_model_id, source,
                   source_confidence, configuration_action
                 ) VALUES (?, ?, 'listing', ?, 'installed')
+                RETURNING id
                 "#,
             )
             .bind(fixture.listing_id)
             .bind(model_id)
             .bind(confidence)
-            .execute(pool)
+            .fetch_one(pool)
             .await
             .unwrap();
+            if model_id == existing_id {
+                preserved_link_id = Some(link_id);
+            }
         }
         let result = apply_automated_avionics_review(
             &fixture.db,
@@ -1394,6 +1591,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ids, vec![existing_id, accepted_id]);
+        let stored_preserved_link_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND avionics_model_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .bind(existing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(Some(stored_preserved_link_id), preserved_link_id);
     }
 
     #[tokio::test]
