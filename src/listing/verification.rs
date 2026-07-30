@@ -365,10 +365,15 @@ pub async fn verify_listing(
                 } else {
                     AvionicsVerificationExecutionMode::Preview
                 };
+                let usage_before = listing_gemini_usage_count(db, listing_id).await.ok();
                 let outcome = verify_listing_avionics(db, extractor, execution_mode, listing_id)
                     .await
                     .map_err(|error| ListingVerificationError::Avionics(error.to_string()))?;
-                avionics_stage(outcome)
+                let usage_after = listing_gemini_usage_count(db, listing_id).await.ok();
+                avionics_stage(
+                    outcome,
+                    gemini_used_from_usage_delta(usage_before, usage_after),
+                )
             }
         }
     };
@@ -795,7 +800,10 @@ fn avionics_preflight_stage(
     }
 }
 
-fn avionics_stage(outcome: ListingAvionicsVerification) -> ListingAvionicsVerificationStage {
+fn avionics_stage(
+    outcome: ListingAvionicsVerification,
+    gemini_used: bool,
+) -> ListingAvionicsVerificationStage {
     match outcome {
         ListingAvionicsVerification::NoPendingReview { .. } => {
             ListingAvionicsVerificationStage::no_pending_review()
@@ -811,11 +819,6 @@ fn avionics_stage(outcome: ListingAvionicsVerification) -> ListingAvionicsVerifi
                 }
                 _ => None,
             };
-            let gemini_used = report.reextraction_attempted
-                || report
-                    .candidates
-                    .iter()
-                    .any(|candidate| candidate.resolution_attempted);
             ListingAvionicsVerificationStage {
                 status: report.status,
                 reason_code,
@@ -826,6 +829,13 @@ fn avionics_stage(outcome: ListingAvionicsVerification) -> ListingAvionicsVerifi
                 gemini_used,
             }
         }
+    }
+}
+
+fn gemini_used_from_usage_delta(usage_before: Option<i64>, usage_after: Option<i64>) -> bool {
+    match (usage_before, usage_after) {
+        (Some(before), Some(after)) if after >= before => after > before,
+        _ => true,
     }
 }
 
@@ -1084,5 +1094,19 @@ mod tests {
             listing_outcome_status(&final_state, &finalization, false),
             "pending_review"
         );
+    }
+
+    #[test]
+    fn avionics_gemini_usage_requires_a_new_accounting_row() {
+        assert!(!gemini_used_from_usage_delta(Some(4), Some(4)));
+        assert!(gemini_used_from_usage_delta(Some(4), Some(5)));
+    }
+
+    #[test]
+    fn avionics_gemini_usage_fails_safe_when_accounting_is_unavailable_or_regresses() {
+        assert!(gemini_used_from_usage_delta(None, Some(5)));
+        assert!(gemini_used_from_usage_delta(Some(4), None));
+        assert!(gemini_used_from_usage_delta(None, None));
+        assert!(gemini_used_from_usage_delta(Some(5), Some(4)));
     }
 }
