@@ -5024,18 +5024,17 @@ async fn persist_approved_identity(
                 .bind(manufacturer_id)
                 .execute(&mut *transaction)
                 .await?;
-            let reuse_attested = $refresh_reuse(
+            // Product approval records the independently grounded identity.
+            // Reuse is a separate positive cache and is available only when
+            // the exact evidence origin has also been curated for the
+            // effective manufacturer identity.
+            $refresh_reuse(
                 db,
                 &mut transaction,
                 stored_id,
                 identity.identity_source_url.as_str(),
             )
             .await?;
-            if !reuse_attested {
-                return Err(CatalogError::Validation(format!(
-                    "newly approved catalog id {stored_id} could not be bound to a current active exact manufacturer source origin"
-                )));
-            }
             transaction.commit().await?;
             stored_id
         }};
@@ -8615,6 +8614,106 @@ mod tests {
                 .expect("local lookup should remain available")
                 .is_none(),
             "the local path requires exact server taxonomy values"
+        );
+    }
+
+    #[tokio::test]
+    async fn grounded_legacy_product_without_a_curated_origin_is_approved_but_not_reusable() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let identity = VerifiedIdentity {
+            canonical_manufacturer: "Cessna ARC".to_string(),
+            canonical_model: "RT-385A".to_string(),
+            canonical_types: vec!["COM".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "RT-385A".to_string(),
+            manufacturer_identifier_scope: "exact_catalog_product".to_string(),
+            identity_source_url: "https://archive.example/cessna-arc-rt-385a-service-manual.pdf"
+                .to_string(),
+            identity_source_title: "Cessna ARC RT-385A service manual".to_string(),
+            identity_evidence:
+                "The service manual identifies the Cessna ARC RT-385A communications radio."
+                    .to_string(),
+            reason: "Independent grounded documentation identifies the exact product.".to_string(),
+            grounded_claim_source_urls: vec![
+                "https://archive.example/cessna-arc-rt-385a-service-manual.pdf".to_string(),
+            ],
+        };
+        let legacy_id = seed_unreviewed_legacy_identity(
+            &db,
+            &identity,
+            &identity.manufacturer_identifier,
+            false,
+        )
+        .await;
+        let legacy_catalog = load_catalog_candidates(&db)
+            .await
+            .expect("legacy catalog should load");
+        let stored = persist_approved_identity(
+            &db,
+            Some(legacy_id),
+            &[legacy_id],
+            &identity,
+            &catalog_fingerprint(&legacy_catalog),
+        )
+        .await
+        .expect("grounded legacy promotion must not require a reusable manufacturer origin");
+        assert_eq!(
+            stored.id, legacy_id,
+            "the grounded identity should promote the reviewed legacy row"
+        );
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+
+        let status: String =
+            sqlx::query_scalar("SELECT catalog_status FROM avionics_models WHERE id = ?")
+                .bind(stored.id)
+                .fetch_one(pool)
+                .await
+                .expect("approved product should load");
+        assert_eq!(status, "approved");
+        let source_origins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_authoritative_source_origins WHERE https_origin = 'https://archive.example'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("source origins should remain independently curated");
+        assert_eq!(
+            source_origins, 0,
+            "grounded product evidence must not curate a manufacturer-wide source origin"
+        );
+        let reuse_attestations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(stored.id)
+        .fetch_one(pool)
+        .await
+        .expect("reuse attestations should remain queryable");
+        assert_eq!(
+            reuse_attestations, 0,
+            "approval without an independently curated exact origin must not create reusable trust"
+        );
+        assert!(
+            !load_known_approved_candidates(&db)
+                .await
+                .expect("reuse candidates should load")
+                .iter()
+                .any(|candidate| candidate.id == stored.id),
+            "an unattested approval must stay out of the no-Gemini candidate set"
+        );
+
+        let mut request = local_request("Cessna ARC RT-385A communications radio installed");
+        request.manufacturer = "Cessna ARC".to_string();
+        request.model = "RT-385A".to_string();
+        request.avionics_types = vec!["COM".to_string()];
+        assert!(
+            resolve_verified_local_avionics_identity(&db, &request)
+                .await
+                .expect("local resolver should fail closed")
+                .is_none(),
+            "an unattested approval must not be selected by the local fast path"
         );
     }
 
