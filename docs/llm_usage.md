@@ -514,6 +514,14 @@ Candidates unresolved by that local pass enter the grounded workflow:
 4. Only after all checks pass does one transaction promote the
    confirmed legacy row or create a new `approved` row.
 
+Grounded product approval and cross-run reuse are separate conclusions. A
+verified product is approved even when its evidence URL is outside every
+independently curated, active exact `manufacturer_primary` origin. That
+approval does not create or widen a manufacturer source origin, receives no
+current reuse attestation, and remains ineligible for the no-Gemini local fast
+path. A later origin-specific verification may create the reuse attestation
+without changing the approved product identity.
+
 Approved identities require an official manufacturer part number,
 manufacturer model number, or authoritative manufacturer SKU. A documented
 legacy model number may be identical to the canonical display label; a

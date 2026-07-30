@@ -164,7 +164,11 @@ number may equal the canonical model label; a separate OEM LRU part number is
 not required. Listing association is a separate claim: one current attested
 product may be selected locally from a unique, complete, exact
 manufacturer/model occurrence, while non-exact prefix/suffix similarity remains
-review-only candidate retrieval.
+review-only candidate retrieval. Catalog approval does not itself create
+manufacturer-wide source trust. A grounded product whose exact evidence origin
+is not independently curated may remain approved, but it has no current reuse
+attestation and is excluded from the no-Gemini local path until that exact
+manufacturer origin is separately approved.
 One physical product can expose multiple capabilities through
 `avionics_model_types`; for example, one GNX 375 identity can be both GPS and
 transponder equipment without duplicating the product. Types are not part of
