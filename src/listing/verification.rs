@@ -52,6 +52,40 @@ pub struct ListingVerificationScope {
     pub after_listing_id: Option<i64>,
 }
 
+pub const REVIEWER_PREFLIGHT_DEFAULT_LIMIT: i64 = 100;
+pub const REVIEWER_PREFLIGHT_MAX_LIMIT: i64 = 100;
+
+/// Reviewer-facing preflight scope whose owner is supplied separately by the
+/// authenticated server boundary. Unlike the administrative scope above, this
+/// type has no execution mode or provider services and cannot request writes.
+#[derive(Clone, Debug)]
+pub struct ReviewerListingPreflightScope {
+    pub limit: i64,
+    pub listing_id: Option<i64>,
+    pub after_listing_id: Option<i64>,
+}
+
+impl ReviewerListingPreflightScope {
+    pub fn new(limit: i64, listing_id: Option<i64>, after_listing_id: Option<i64>) -> Self {
+        Self {
+            limit,
+            listing_id,
+            after_listing_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ListingVerificationError> {
+        ListingVerificationScope::new(self.limit, self.listing_id, self.after_listing_id)
+            .validate()?;
+        if self.limit > REVIEWER_PREFLIGHT_MAX_LIMIT {
+            return Err(ListingVerificationError::Validation(format!(
+                "limit must not exceed {REVIEWER_PREFLIGHT_MAX_LIMIT}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl ListingVerificationScope {
     pub fn new(limit: i64, listing_id: Option<i64>, after_listing_id: Option<i64>) -> Self {
         Self {
@@ -236,6 +270,21 @@ pub struct ListingVerificationReport {
     pub provider_request_plan: ListingVerificationProviderPlan,
     pub summary: ListingVerificationSummary,
     pub listings: Vec<ListingVerificationOutcome>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReviewerListingPreflightContext {
+    pub listing_id: i64,
+    pub label: String,
+    pub registration_number: Option<String>,
+    pub model_year: i64,
+    pub has_pending_review: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReviewerListingPreflightReport {
+    pub verification: ListingVerificationReport,
+    pub listing_contexts: Vec<ReviewerListingPreflightContext>,
 }
 
 #[derive(Debug)]
@@ -509,6 +558,72 @@ pub async fn verify_listings(
         ));
     }
 
+    verify_listing_page(
+        db,
+        mode,
+        scope.limit,
+        scope.listing_id,
+        scope.after_listing_id,
+        page,
+        services,
+    )
+    .await
+}
+
+/// Run a provider- and write-free verification preflight over listings owned
+/// by one authenticated reviewer.
+///
+/// Ownership is a required server-supplied argument rather than client query
+/// state. The function deliberately exposes neither a mode nor provider
+/// services, so web callers cannot accidentally widen this into the
+/// administrative preview/apply workflow.
+pub async fn preflight_reviewer_listing_verifications(
+    db: &AppDb,
+    owner_user_id: i64,
+    scope: &ReviewerListingPreflightScope,
+) -> Result<ReviewerListingPreflightReport, ListingVerificationError> {
+    if owner_user_id < 1 {
+        return Err(ListingVerificationError::Validation(
+            "owner_user_id must be a positive integer".to_string(),
+        ));
+    }
+    scope.validate()?;
+    let owner_page = load_reviewer_listing_page(db, owner_user_id, scope).await?;
+    if scope.listing_id.is_some() && owner_page.contexts.is_empty() {
+        return Err(ListingVerificationError::NotFound(
+            scope.listing_id.unwrap_or_default(),
+        ));
+    }
+    let contexts = owner_page.contexts;
+    let page = ListingIdPage {
+        listing_ids: contexts.iter().map(|context| context.listing_id).collect(),
+        has_more: owner_page.has_more,
+    };
+    let verification = verify_listing_page(
+        db,
+        ListingVerificationMode::Preflight,
+        scope.limit,
+        scope.listing_id,
+        scope.after_listing_id,
+        page,
+        ListingVerificationServices::unavailable(),
+    )
+    .await?;
+    Ok(ReviewerListingPreflightReport {
+        verification,
+        listing_contexts: contexts,
+    })
+}
+
+async fn verify_listing_page(
+    db: &AppDb,
+    mode: ListingVerificationMode,
+    requested_limit: i64,
+    requested_listing_id: Option<i64>,
+    requested_after_listing_id: Option<i64>,
+    page: ListingIdPage,
+    services: ListingVerificationServices<'_>,
+) -> Result<ListingVerificationReport, ListingVerificationError> {
     let mut aircraft_grounding_candidates = 0;
     let mut avionics_preflights = Vec::new();
     for &listing_id in &page.listing_ids {
@@ -544,10 +659,10 @@ pub async fn verify_listings(
     let summary = summarize(&listings);
     Ok(ListingVerificationReport {
         mode: mode.label().to_string(),
-        requested_limit: scope.limit,
-        requested_listing_id: scope.listing_id,
-        requested_after_listing_id: scope.after_listing_id,
-        checkpoint: page.checkpoint(scope.after_listing_id),
+        requested_limit,
+        requested_listing_id,
+        requested_after_listing_id,
+        checkpoint: page.checkpoint(requested_after_listing_id),
         provider_request_plan: ListingVerificationProviderPlan {
             aircraft_grounding_candidates,
             avionics: avionics_provider_plan,
@@ -558,6 +673,190 @@ pub async fn verify_listings(
         summary,
         listings,
     })
+}
+
+#[derive(Debug, FromRow)]
+struct ReviewerListingPreflightContextRow {
+    listing_id: i64,
+    registration_number: Option<String>,
+    model_year: i64,
+    has_pending_review: bool,
+    canonical_make: Option<String>,
+    canonical_designation: Option<String>,
+    canonical_generation: Option<String>,
+    canonical_package: Option<String>,
+    legacy_manufacturer: String,
+    legacy_model: String,
+    legacy_variant: String,
+}
+
+impl ReviewerListingPreflightContextRow {
+    fn into_context(self) -> ReviewerListingPreflightContext {
+        let canonical = [
+            self.canonical_make.as_deref(),
+            self.canonical_designation.as_deref(),
+            self.canonical_generation.as_deref(),
+            self.canonical_package.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+        let legacy = [
+            self.legacy_manufacturer.trim(),
+            self.legacy_model.trim(),
+            self.legacy_variant.trim(),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+        let label = if canonical.len() >= 2 {
+            canonical.join(" ")
+        } else if !legacy.is_empty() {
+            legacy.join(" ")
+        } else {
+            format!("Listing {}", self.listing_id)
+        };
+        ReviewerListingPreflightContext {
+            listing_id: self.listing_id,
+            label,
+            registration_number: self.registration_number,
+            model_year: self.model_year,
+            has_pending_review: self.has_pending_review,
+        }
+    }
+}
+
+struct ReviewerListingPage {
+    contexts: Vec<ReviewerListingPreflightContext>,
+    has_more: bool,
+}
+
+async fn load_reviewer_listing_page(
+    db: &AppDb,
+    owner_user_id: i64,
+    scope: &ReviewerListingPreflightScope,
+) -> Result<ReviewerListingPage, ListingVerificationError> {
+    let keyset_predicate = if scope.listing_id.is_some() {
+        "AND listing.id = ?"
+    } else if scope.after_listing_id.is_some() {
+        "AND listing.id > ?"
+    } else {
+        ""
+    };
+    let work_predicate = if scope.listing_id.is_some() {
+        ""
+    } else {
+        r#"
+        AND (
+          listing.ingestion_state <> 'ready'
+          OR listing.is_verified = FALSE
+          OR EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_pending_reviews pending
+            WHERE pending.listing_id = listing.id
+          )
+        )
+        "#
+    };
+    let statement = format!(
+        r#"
+        SELECT
+          listing.id AS listing_id,
+          listing.registration_number,
+          listing.model_year,
+          EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_pending_reviews pending
+            WHERE pending.listing_id = listing.id
+          ) AS has_pending_review,
+          canonical_make.name AS canonical_make,
+          designation.official_designation AS canonical_designation,
+          generation.name AS canonical_generation,
+          package.name AS canonical_package,
+          manufacturer.name AS legacy_manufacturer,
+          model.name AS legacy_model,
+          variant.name AS legacy_variant
+        FROM aircraft_sale_listings listing
+        JOIN aircraft_model_variants variant
+          ON variant.id = listing.aircraft_model_variant_id
+        JOIN aircraft_models model
+          ON model.id = variant.aircraft_model_id
+        JOIN aircraft_manufacturers manufacturer
+          ON manufacturer.id = model.aircraft_manufacturer_id
+        LEFT JOIN aircraft_sale_listing_current_identity_assignments current_assignment
+          ON current_assignment.aircraft_sale_listing_id = listing.id
+        LEFT JOIN aircraft_sale_listing_identity_assignments assignment
+          ON assignment.id = current_assignment.identity_assignment_id
+         AND assignment.aircraft_sale_listing_id = listing.id
+        LEFT JOIN aircraft_makes canonical_make
+          ON canonical_make.id = assignment.aircraft_make_id
+        LEFT JOIN aircraft_designations designation
+          ON designation.id = assignment.aircraft_designation_id
+        LEFT JOIN aircraft_generations generation
+          ON generation.id = assignment.aircraft_generation_id
+        LEFT JOIN aircraft_factory_packages package
+          ON package.id = assignment.aircraft_factory_package_id
+        WHERE listing.created_by_user_id = ?
+          {keyset_predicate}
+          {work_predicate}
+        ORDER BY listing.id
+        LIMIT ?
+        "#
+    );
+    let sql = db.sql(&statement);
+    let fetch_limit = scope.limit.saturating_add(1);
+    let rows = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let query =
+                sqlx::query_as::<_, ReviewerListingPreflightContextRow>(&sql).bind(owner_user_id);
+            if let Some(listing_id) = scope.listing_id {
+                query
+                    .bind(listing_id)
+                    .bind(fetch_limit)
+                    .fetch_all(pool)
+                    .await
+            } else if let Some(after_listing_id) = scope.after_listing_id {
+                query
+                    .bind(after_listing_id)
+                    .bind(fetch_limit)
+                    .fetch_all(pool)
+                    .await
+            } else {
+                query.bind(fetch_limit).fetch_all(pool).await
+            }
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let query =
+                sqlx::query_as::<_, ReviewerListingPreflightContextRow>(&sql).bind(owner_user_id);
+            if let Some(listing_id) = scope.listing_id {
+                query
+                    .bind(listing_id)
+                    .bind(fetch_limit)
+                    .fetch_all(pool)
+                    .await
+            } else if let Some(after_listing_id) = scope.after_listing_id {
+                query
+                    .bind(after_listing_id)
+                    .bind(fetch_limit)
+                    .fetch_all(pool)
+                    .await
+            } else {
+                query.bind(fetch_limit).fetch_all(pool).await
+            }
+        }
+    }
+    .map_err(|error| ListingVerificationError::Database(error.to_string()))?;
+    let mut contexts = rows
+        .into_iter()
+        .map(ReviewerListingPreflightContextRow::into_context)
+        .collect::<Vec<_>>();
+    let has_more = contexts.len() as i64 > scope.limit;
+    if has_more {
+        contexts.truncate(scope.limit as usize);
+    }
+    Ok(ReviewerListingPage { contexts, has_more })
 }
 
 struct ListingIdPage {
@@ -975,6 +1274,92 @@ mod tests {
         .unwrap()
     }
 
+    async fn developer_user_id(db: &AppDb) -> i64 {
+        sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(DEVELOPER_EMAIL)
+            .fetch_one(sqlite_pool(db))
+            .await
+            .unwrap()
+    }
+
+    async fn insert_test_user(db: &AppDb, suffix: &str) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO users (email, display_name, auth_provider, auth_subject)
+            VALUES (?, ?, 'local', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(format!("{suffix}@example.test"))
+        .bind(format!("Test {suffix}"))
+        .bind(format!("test:{suffix}"))
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap()
+    }
+
+    async fn insert_owner_listing(
+        db: &AppDb,
+        owner_user_id: i64,
+        ingestion_state: &str,
+        suffix: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id,
+              created_by_user_id,
+              source_url,
+              model_year,
+              asking_price_usd,
+              ingestion_state,
+              registration_number,
+              airframe_hours
+            )
+            SELECT
+              placeholder.aircraft_model_variant_id,
+              ?,
+              ?,
+              2024,
+              500000,
+              ?,
+              ?,
+              250
+            FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+            WHERE placeholder.singleton_id = 1
+            RETURNING id
+            "#,
+        )
+        .bind(owner_user_id)
+        .bind(format!("https://example.test/{suffix}"))
+        .bind(ingestion_state)
+        .bind(format!("N{suffix}"))
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap()
+    }
+
+    async fn verification_write_counts(db: &AppDb) -> Vec<i64> {
+        let mut counts = Vec::new();
+        for table in [
+            "aircraft_sale_listings",
+            "aircraft_sale_listing_current_identity_assignments",
+            "aircraft_sale_listing_avionics",
+            "aircraft_sale_listing_pending_reviews",
+            "aircraft_identity_decisions",
+            "avionics_models",
+            "gemini_api_usage",
+        ] {
+            counts.push(
+                sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+                    .fetch_one(sqlite_pool(db))
+                    .await
+                    .unwrap(),
+            );
+        }
+        counts
+    }
+
     #[test]
     fn scope_rejects_invalid_or_ambiguous_keysets() {
         assert!(matches!(
@@ -1040,6 +1425,139 @@ mod tests {
         .await
         .unwrap();
         assert!(next.listings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewer_preflight_is_owner_scoped_and_includes_pending_reference_rows() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let owner_user_id = developer_user_id(&db).await;
+        let foreign_user_id = insert_test_user(&db, "foreign-owner").await;
+        let pending_reference_id =
+            insert_owner_listing(&db, owner_user_id, "incomplete", "4242T").await;
+        insert_owner_listing(&db, foreign_user_id, "pending_review", "4243T").await;
+
+        let report = preflight_reviewer_listing_verifications(
+            &db,
+            owner_user_id,
+            &ReviewerListingPreflightScope::new(100, None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.verification.mode, "preflight");
+        assert_eq!(report.verification.listings.len(), 1);
+        assert_eq!(
+            report.verification.listings[0].listing_id,
+            pending_reference_id
+        );
+        assert_eq!(report.listing_contexts.len(), 1);
+        let context = &report.listing_contexts[0];
+        assert_eq!(context.listing_id, pending_reference_id);
+        assert!(!context.label.trim().is_empty());
+        assert_eq!(context.registration_number.as_deref(), Some("N4242T"));
+        assert_eq!(context.model_year, 2024);
+        assert!(!context.has_pending_review);
+    }
+
+    #[tokio::test]
+    async fn reviewer_exact_foreign_listing_is_not_found() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let owner_user_id = developer_user_id(&db).await;
+        let foreign_user_id = insert_test_user(&db, "foreign-exact").await;
+        let foreign_listing_id =
+            insert_owner_listing(&db, foreign_user_id, "incomplete", "4343T").await;
+
+        let error = preflight_reviewer_listing_verifications(
+            &db,
+            owner_user_id,
+            &ReviewerListingPreflightScope::new(100, Some(foreign_listing_id), None),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ListingVerificationError::NotFound(id) if id == foreign_listing_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn reviewer_preflight_is_provider_and_domain_write_free() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let owner_user_id = developer_user_id(&db).await;
+        insert_owner_listing(&db, owner_user_id, "incomplete", "4444T").await;
+        let before = verification_write_counts(&db).await;
+
+        let report = preflight_reviewer_listing_verifications(
+            &db,
+            owner_user_id,
+            &ReviewerListingPreflightScope::new(100, None, None),
+        )
+        .await
+        .unwrap();
+
+        assert!(report
+            .verification
+            .listings
+            .iter()
+            .all(|listing| !listing.aircraft.gemini_used && !listing.avionics.gemini_used));
+        assert_eq!(verification_write_counts(&db).await, before);
+    }
+
+    #[tokio::test]
+    async fn reviewer_keyset_checkpoint_skips_foreign_rows() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let owner_user_id = developer_user_id(&db).await;
+        let foreign_user_id = insert_test_user(&db, "foreign-keyset").await;
+        let first = insert_owner_listing(&db, owner_user_id, "incomplete", "4545T").await;
+        let foreign = insert_owner_listing(&db, foreign_user_id, "incomplete", "4546T").await;
+        let second = insert_owner_listing(&db, owner_user_id, "incomplete", "4547T").await;
+        assert!(first < foreign && foreign < second);
+
+        let first_page = preflight_reviewer_listing_verifications(
+            &db,
+            owner_user_id,
+            &ReviewerListingPreflightScope::new(1, None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page.verification.listings[0].listing_id, first);
+        assert_eq!(
+            first_page.verification.checkpoint.resume_after_listing_id,
+            Some(first)
+        );
+        assert!(first_page.verification.checkpoint.has_more);
+
+        let second_page = preflight_reviewer_listing_verifications(
+            &db,
+            owner_user_id,
+            &ReviewerListingPreflightScope::new(1, None, Some(first)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page.verification.listings[0].listing_id, second);
+        assert_eq!(
+            second_page
+                .verification
+                .checkpoint
+                .requested_after_listing_id,
+            Some(first)
+        );
+        assert!(!second_page.verification.checkpoint.has_more);
+    }
+
+    #[test]
+    fn reviewer_scope_enforces_the_web_page_limit() {
+        assert!(
+            ReviewerListingPreflightScope::new(REVIEWER_PREFLIGHT_MAX_LIMIT, None, None)
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            ReviewerListingPreflightScope::new(REVIEWER_PREFLIGHT_MAX_LIMIT + 1, None, None)
+                .validate(),
+            Err(ListingVerificationError::Validation(_))
+        ));
     }
 
     #[test]

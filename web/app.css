@@ -1360,6 +1360,194 @@ label span,
   width: 140px;
 }
 
+.review-pipeline-overview {
+  display: grid;
+  grid-template-columns: minmax(520px, 1.1fr) minmax(360px, 0.9fr);
+  gap: 12px;
+  margin: 12px;
+}
+
+.review-pipeline-breakdown {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(100px, 1fr));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.review-pipeline-breakdown > div {
+  min-width: 0;
+  padding: 12px;
+  border-right: 1px solid var(--line);
+}
+
+.review-pipeline-breakdown > div:last-child {
+  border-right: 0;
+}
+
+.review-pipeline-breakdown span,
+.review-pipeline-breakdown strong {
+  display: block;
+}
+
+.review-pipeline-breakdown span {
+  min-height: 28px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.review-pipeline-breakdown strong {
+  margin-top: 5px;
+  font-size: 19px;
+}
+
+.review-pipeline-plan {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.review-pipeline-plan > strong {
+  font-size: 13px;
+}
+
+.review-pipeline-plan p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.review-pipeline-plan .review-pipeline-plan-note {
+  color: var(--text);
+}
+
+.review-pipeline-services {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.review-pipeline-service,
+.review-pipeline-stage,
+.review-pipeline-gemini {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 23px;
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.review-pipeline-service.is-ready,
+.review-pipeline-stage.is-complete,
+.review-pipeline-stage.is-ready,
+.review-pipeline-gemini.is-none {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+}
+
+.review-pipeline-service.is-missing,
+.review-pipeline-stage.is-blocked {
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, var(--panel));
+}
+
+.review-pipeline-stage.is-pending,
+.review-pipeline-stage.is-reference,
+.review-pipeline-stage.is-waiting,
+.review-pipeline-gemini.is-required,
+.review-pipeline-gemini.is-possible {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--line));
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 7%, var(--panel));
+}
+
+.review-pipeline-warnings:empty {
+  display: none;
+}
+
+.review-pipeline-warnings p {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.review-pipeline-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.review-pipeline-filters .search-box {
+  flex: 1 1 320px;
+}
+
+.review-pipeline-filters select {
+  min-width: 210px;
+}
+
+.review-pipeline-filters > span {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.review-pipeline-table {
+  min-width: 1180px;
+}
+
+.review-pipeline-table th:nth-child(1) {
+  width: 20%;
+}
+
+.review-pipeline-table th:nth-child(2),
+.review-pipeline-table th:nth-child(3),
+.review-pipeline-table th:nth-child(4),
+.review-pipeline-table th:nth-child(5) {
+  width: 10%;
+}
+
+.review-pipeline-table th:nth-child(6) {
+  width: 28%;
+}
+
+.review-pipeline-table th:nth-child(7) {
+  width: 150px;
+}
+
+.review-pipeline-listing-meta {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-pipeline-reason {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.review-pipeline-no-action {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
 .review-status-current,
 .review-outcome-ready,
 .review-outcome-accepted {
@@ -2244,6 +2432,35 @@ label span,
 
   .workspace {
     padding: 16px;
+  }
+
+  .review-pipeline-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .review-pipeline-breakdown {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+
+  .review-pipeline-breakdown > div {
+    border-bottom: 1px solid var(--line);
+  }
+
+  .review-pipeline-filters {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .review-pipeline-filters .search-box {
+    flex-basis: auto;
+  }
+
+  .review-pipeline-filters select {
+    width: 100%;
+  }
+
+  .review-pipeline-filters > span {
+    margin-left: 0;
   }
 
   .topbar,

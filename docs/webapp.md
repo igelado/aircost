@@ -441,6 +441,7 @@ The corresponding API is:
 ```http
 GET /api/review/listings?limit=25&offset=0
 GET /api/review/listings/{listing_id}
+GET /api/review/verification/preflight?limit=100&after_listing_id={listing_id}
 GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
@@ -482,6 +483,23 @@ reference data is not yet published, the response status is
 unverified, but the result is terminal for the manual review queue and has no
 aircraft or avionics focus tab. Preflight and preview derive this state from
 local reference rows without Gemini.
+
+The Review page opens on a provider-free **Pipeline** view. It follows the
+numeric `resume_after_listing_id` checkpoint from the verification preflight
+endpoint and displays every non-ready listing, including listings whose
+identity review is complete but factory reference data remains pending. The
+table keeps aircraft, avionics, and reference status separate, shows whether
+Gemini is expected or may be needed after local checks, and exposes manual
+review only when the response's listing context explicitly reports a current
+pending review. Reference-only rows therefore remain visible without a
+misleading review action.
+
+Pipeline request counts are estimates from the same verifier plan used by the
+administrative command. Loading or refreshing the view never calls Gemini and
+never writes domain or usage data. The summary also reports whether Gemini and
+FAA DRS are configured; unresolved aircraft grounding is called out when
+`FAA_DRS_API_KEY` is absent. Product and listing review queues remain available
+alongside Pipeline for focused manual work.
 
 Product cursors are opaque keyset tokens ordered by immutable product ID.
 Association cursors are bound to one product and ordered by listing and aspect.

@@ -161,12 +161,13 @@
         <section class="data-panel review-queue" id="review-queue-view" aria-labelledby="review-queue-title">
           <div class="review-toolbar">
             <div>
-              <h2 id="review-queue-title">Avionics needing verification</h2>
-              <p>Attest each product once, then validate its listing associations locally.</p>
+              <h2 id="review-queue-title">Verification pipeline</h2>
+              <p id="review-queue-description">Provider-free status across every non-ready listing.</p>
             </div>
             <div class="review-toolbar-actions">
               <div class="review-mode-switch" role="group" aria-label="Review queue grouping">
-                <button class="button is-active" id="review-mode-product" type="button" aria-pressed="true">By product</button>
+                <button class="button is-active" id="review-mode-pipeline" type="button" aria-pressed="true">Pipeline</button>
+                <button class="button subtle" id="review-mode-product" type="button" aria-pressed="false">By product</button>
                 <button class="button subtle" id="review-mode-listing" type="button" aria-pressed="false">By listing</button>
               </div>
               <button class="icon-button" id="refresh-reviews" type="button" aria-label="Refresh review queue" title="Refresh review queue">
@@ -175,6 +176,69 @@
             </div>
           </div>
           <div class="review-message" id="review-queue-message" role="status" aria-live="polite"></div>
+          <div id="review-pipeline-results" aria-busy="false">
+            <section class="review-pipeline-overview" aria-label="Verification pipeline overview">
+              <div class="review-pipeline-breakdown">
+                <div>
+                  <span>Aircraft verified</span>
+                  <strong id="review-pipeline-aircraft-count">0</strong>
+                </div>
+                <div>
+                  <span>Avionics complete</span>
+                  <strong id="review-pipeline-avionics-count">0</strong>
+                </div>
+                <div>
+                  <span>Manual review available</span>
+                  <strong id="review-pipeline-manual-count">0</strong>
+                </div>
+                <div>
+                  <span>Factory reference pending</span>
+                  <strong id="review-pipeline-reference-count">0</strong>
+                </div>
+                <div>
+                  <span>Gemini expected or possible</span>
+                  <strong id="review-pipeline-gemini-count">0</strong>
+                </div>
+              </div>
+              <div class="review-pipeline-plan" id="review-pipeline-plan"></div>
+            </section>
+            <div class="review-pipeline-filters">
+              <label class="search-box">
+                <span class="sr-only">Search verification pipeline</span>
+                <input id="review-pipeline-search" type="search" placeholder="Search aircraft, tail, year, or blocker">
+              </label>
+              <label>
+                <span class="sr-only">Filter verification pipeline</span>
+                <select id="review-pipeline-filter">
+                  <option value="all">All non-ready listings</option>
+                  <option value="manual">Manual review available</option>
+                  <option value="aircraft">Aircraft incomplete</option>
+                  <option value="avionics">Avionics incomplete</option>
+                  <option value="reference">Factory reference pending</option>
+                  <option value="gemini">Gemini expected or possible</option>
+                </select>
+              </label>
+              <span id="review-pipeline-visible-count" role="status" aria-live="polite">0 listings</span>
+            </div>
+            <div class="table-shell review-table-shell">
+              <table class="review-pipeline-table">
+                <caption class="sr-only">Provider-free verification status for every non-ready listing</caption>
+                <thead>
+                  <tr>
+                    <th>Listing</th>
+                    <th>Aircraft</th>
+                    <th>Avionics</th>
+                    <th>Reference</th>
+                    <th>Gemini</th>
+                    <th>What remains</th>
+                    <th><span class="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody id="review-pipeline-table-body"></tbody>
+              </table>
+              <div class="empty-state is-hidden" id="empty-review-pipeline">No non-ready listings match this filter.</div>
+            </div>
+          </div>
           <div class="table-shell review-table-shell is-hidden" id="review-results" aria-busy="false">
             <table class="review-table">
               <caption class="sr-only">Listings waiting for verification</caption>

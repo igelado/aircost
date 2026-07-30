@@ -58,7 +58,9 @@ use crate::listing::review::{
     ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery, StagedPendingReview,
 };
 use crate::listing::verification::{
-    verify_listing, ListingVerificationError, ListingVerificationMode, ListingVerificationServices,
+    preflight_reviewer_listing_verifications, verify_listing, ListingVerificationError,
+    ListingVerificationMode, ListingVerificationServices, ReviewerListingPreflightScope,
+    REVIEWER_PREFLIGHT_DEFAULT_LIMIT,
 };
 use crate::listings::{
     create_listing, delete_listing, ensure_listing_canonical_aircraft_identity,
@@ -171,6 +173,14 @@ struct AutomaticListingVerificationRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReviewerListingPreflightQuery {
+    limit: Option<i64>,
+    after_listing_id: Option<i64>,
+    listing_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttestReviewAvionicsProductRequest {
     listing_id: i64,
     review_payload_sha256: String,
@@ -236,6 +246,7 @@ fn router(state: AppState) -> Router {
         .route("/avionics.js", get(avionics_javascript))
         .route("/review.js", get(review_javascript))
         .route("/review/domain.mjs", get(review_domain_javascript))
+        .route("/review/automation.mjs", get(review_automation_javascript))
         .route("/health", get(health))
         .route("/api/valuation/status", get(valuation_status_handler))
         .route("/api/users/current", get(current_user_handler))
@@ -263,6 +274,10 @@ fn router(state: AppState) -> Router {
         .route("/api/avionics/options", get(avionics_options_handler))
         .route("/api/avionics/{id}", get(avionics_detail_handler))
         .route("/api/review/listings", get(list_listing_reviews_handler))
+        .route(
+            "/api/review/verification/preflight",
+            get(reviewer_listing_preflight_handler),
+        )
         .route(
             "/api/review/avionics/products",
             get(list_pending_product_reviews_handler),
@@ -363,6 +378,16 @@ async fn review_domain_javascript() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         REVIEW_DOMAIN_JS,
+    )
+}
+
+async fn review_automation_javascript() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        REVIEW_AUTOMATION_JS,
     )
 }
 
@@ -928,6 +953,36 @@ async fn restage_listing_review_handler(
     require_listing_reviewer(&user)?;
     let staged = restage_unattested_preserved_products(&state.db, user.id, listing_id).await?;
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+async fn reviewer_listing_preflight_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ReviewerListingPreflightQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let report = preflight_reviewer_listing_verifications(
+        &state.db,
+        user.id,
+        &ReviewerListingPreflightScope::new(
+            query.limit.unwrap_or(REVIEWER_PREFLIGHT_DEFAULT_LIMIT),
+            query.listing_id,
+            query.after_listing_id,
+        ),
+    )
+    .await
+    .map_err(automatic_verification_api_error)?;
+    Ok(Json(json!({
+        "verification": report.verification,
+        "listing_contexts": report.listing_contexts,
+        "services": {
+            "gemini_configured": state.extractor.is_some()
+                && state.automatic_aircraft_gemini.is_some()
+                && state.automatic_runtime_config.is_some(),
+            "faa_drs_configured": state.automatic_aircraft_drs.is_some(),
+        }
+    })))
 }
 
 async fn verify_listing_automatically_handler(
@@ -1914,6 +1969,7 @@ const APP_JS: &str = include_str!("../web/app.js");
 const AVIONICS_JS: &str = include_str!("../web/avionics.js");
 const REVIEW_JS: &str = include_str!("../web/review.js");
 const REVIEW_DOMAIN_JS: &str = include_str!("../web/review/domain.mjs");
+const REVIEW_AUTOMATION_JS: &str = include_str!("../web/review/automation.mjs");
 
 #[cfg(test)]
 mod tests {
@@ -1937,7 +1993,8 @@ mod tests {
         require_current_review_revisions, start_plugin_submission_job,
         use_existing_review_avionics_handler, verify_existing_review_avionics_handler, AppState,
         AttestReviewAvionicsProductRequest, AutomaticListingVerificationRequest,
-        UseExistingReviewAvionicsRequest, VerifyExistingReviewAvionicsRequest,
+        ReviewerListingPreflightQuery, UseExistingReviewAvionicsRequest,
+        VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
     };
     use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::avionics::manufacturer::{
@@ -2034,6 +2091,22 @@ mod tests {
             serde_json::from_value::<AutomaticListingVerificationRequest>(payload).is_err(),
             "the endpoint is always apply and must reject caller-selected execution flags"
         );
+    }
+
+    #[test]
+    fn reviewer_preflight_query_cannot_accept_an_owner_or_execution_mode() {
+        for payload in [
+            json!({"owner_user_id": 42}),
+            json!({"mode": "apply"}),
+            json!({"limit": 10, "listing_id": 42, "unexpected": true}),
+        ] {
+            assert!(serde_json::from_value::<ReviewerListingPreflightQuery>(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn review_automation_module_is_embedded() {
+        assert!(!REVIEW_AUTOMATION_JS.trim().is_empty());
     }
 
     async fn insert_review_listing(db: &AppDb) -> (i64, i64) {
