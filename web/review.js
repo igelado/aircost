@@ -1,5 +1,13 @@
 import { displayLabel, renderAvionicsChips, safeDetailLink } from "/avionics.js";
 import {
+  filterPipelineRows,
+  pipelineCheckpoint,
+  pipelineProviderPlan,
+  pipelineRowsFromResponse,
+  pipelineServiceStatus,
+  pipelineSummary,
+} from "/review/automation.mjs";
+import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
@@ -55,8 +63,14 @@ const state = {
   limit: QUEUE_LIMIT,
   offset: 0,
   queueLoaded: false,
-  queueMode: "product",
+  queueMode: "pipeline",
   queueRequestSequence: 0,
+  pipelineRequestSequence: 0,
+  pipelineLoaded: false,
+  pipelineResponses: [],
+  pipelineRows: [],
+  pipelineFilter: "all",
+  pipelineSearch: "",
   productRequestSequence: 0,
   productDetailRequestSequence: 0,
   productGroups: [],
@@ -98,6 +112,7 @@ export function initializeReviewWorkspace(shared) {
   } = shared);
   collectElements();
   bindEvents();
+  setQueueMode(state.queueMode, { load: false });
   initialized = true;
 
   return Object.freeze({
@@ -111,7 +126,7 @@ export function initializeReviewWorkspace(shared) {
         return Promise.allSettled([queueLoad, detailLoad]);
       }
       showQueue({ historyMode: "none", discardDraft: true });
-      return state.productGroups.length ? Promise.resolve() : loadProductQueue();
+      return state.pipelineLoaded ? Promise.resolve() : loadPipelineQueue();
     },
     refresh() {
       return refreshActiveQueue();
@@ -139,10 +154,24 @@ function collectElements() {
     reviewManualLabel: "#review-manual-label",
     reviewQueueView: "#review-queue-view",
     reviewQueueTitle: "#review-queue-title",
+    reviewQueueDescription: "#review-queue-description",
+    reviewModePipeline: "#review-mode-pipeline",
     reviewModeProduct: "#review-mode-product",
     reviewModeListing: "#review-mode-listing",
     refreshReviews: "#refresh-reviews",
     reviewQueueMessage: "#review-queue-message",
+    reviewPipelineResults: "#review-pipeline-results",
+    reviewPipelineSearch: "#review-pipeline-search",
+    reviewPipelineFilter: "#review-pipeline-filter",
+    reviewPipelineVisibleCount: "#review-pipeline-visible-count",
+    reviewPipelinePlan: "#review-pipeline-plan",
+    reviewPipelineTableBody: "#review-pipeline-table-body",
+    emptyReviewPipeline: "#empty-review-pipeline",
+    reviewPipelineAircraftCount: "#review-pipeline-aircraft-count",
+    reviewPipelineAvionicsCount: "#review-pipeline-avionics-count",
+    reviewPipelineManualCount: "#review-pipeline-manual-count",
+    reviewPipelineReferenceCount: "#review-pipeline-reference-count",
+    reviewPipelineGeminiCount: "#review-pipeline-gemini-count",
     reviewResults: "#review-results",
     reviewTableBody: "#review-table-body",
     emptyReviews: "#empty-reviews",
@@ -199,8 +228,25 @@ function collectElements() {
 
 function bindEvents() {
   elements.refreshReviews.addEventListener("click", () => refreshActiveQueue());
+  elements.reviewModePipeline.addEventListener("click", () => setQueueMode("pipeline"));
   elements.reviewModeProduct.addEventListener("click", () => setQueueMode("product"));
   elements.reviewModeListing.addEventListener("click", () => setQueueMode("listing"));
+  elements.reviewPipelineSearch.addEventListener("input", () => {
+    state.pipelineSearch = elements.reviewPipelineSearch.value;
+    renderPipelineTable();
+  });
+  elements.reviewPipelineFilter.addEventListener("change", () => {
+    state.pipelineFilter = elements.reviewPipelineFilter.value;
+    renderPipelineTable();
+  });
+  elements.reviewPipelineTableBody.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-review-listing-id]");
+    const listingId = positiveInteger(button?.dataset.reviewListingId);
+    if (listingId !== null) {
+      setQueueMode("listing", { load: false });
+      openReview(listingId, { historyMode: "push" });
+    }
+  });
   elements.reviewProductTableBody.addEventListener("click", (event) => {
     if (state.productBusy) {
       return;
@@ -295,47 +341,303 @@ function bindEvents() {
 }
 
 function refreshActiveQueue() {
+  if (state.queueMode === "pipeline") {
+    return loadPipelineQueue();
+  }
   return state.queueMode === "product" ? loadProductQueue() : loadQueue();
 }
 
 function setQueueMode(mode, { load = true } = {}) {
-  state.queueMode = mode === "listing" ? "listing" : "product";
+  state.queueMode = ["pipeline", "product", "listing"].includes(mode)
+    ? mode
+    : "pipeline";
+  const pipelineMode = state.queueMode === "pipeline";
   const productMode = state.queueMode === "product";
-  elements.reviewModeProduct.classList.toggle("is-active", productMode);
-  elements.reviewModeProduct.classList.toggle("subtle", !productMode);
-  elements.reviewModeProduct.setAttribute("aria-pressed", String(productMode));
-  elements.reviewModeListing.classList.toggle("is-active", !productMode);
-  elements.reviewModeListing.classList.toggle("subtle", productMode);
-  elements.reviewModeListing.setAttribute("aria-pressed", String(!productMode));
+  const listingMode = state.queueMode === "listing";
+  for (const [candidate, button] of [
+    ["pipeline", elements.reviewModePipeline],
+    ["product", elements.reviewModeProduct],
+    ["listing", elements.reviewModeListing],
+  ]) {
+    const active = state.queueMode === candidate;
+    button.classList.toggle("is-active", active);
+    button.classList.toggle("subtle", !active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  elements.reviewPipelineResults.classList.toggle("is-hidden", !pipelineMode);
   elements.reviewProductResults.classList.toggle("is-hidden", !productMode);
-  elements.reviewResults.classList.toggle("is-hidden", productMode);
-  elements.reviewQueueTitle.textContent = productMode
-    ? "Avionics needing verification"
-    : "Listings needing verification";
-  elements.reviewPendingLabel.textContent = productMode
-    ? "Product-listing pairs"
-    : "Pending listings";
-  elements.reviewAspectLabel.textContent = "Pending checks";
-  elements.reviewReasonLabel.textContent = productMode
-    ? "Needs source recovery"
-    : "Issue types";
+  elements.reviewResults.classList.toggle("is-hidden", !listingMode);
+  elements.reviewQueueTitle.textContent = pipelineMode
+    ? "Verification pipeline"
+    : productMode
+      ? "Avionics needing verification"
+      : "Listings needing verification";
+  elements.reviewQueueDescription.textContent = pipelineMode
+    ? "Provider-free status across every non-ready listing."
+    : productMode
+      ? "Attest each product once, then validate its listing associations locally."
+      : "Review every unresolved aspect of one listing at a time.";
   for (const metric of document.querySelectorAll(".review-product-only-metric")) {
     metric.classList.toggle("is-hidden", !productMode);
   }
-  if (productMode) {
+  if (pipelineMode) {
+    elements.reviewPendingLabel.textContent = "Non-ready listings";
+    elements.reviewAspectLabel.textContent = "Manual review";
+    elements.reviewReasonLabel.textContent = "Reference pending";
+    renderPipelineMetrics();
+  } else if (productMode) {
     elements.reviewPendingLabel.textContent = "Total pending";
     elements.reviewAspectLabel.textContent = "Ready locally";
+    elements.reviewReasonLabel.textContent = "Needs source recovery";
     elements.reviewAttestationLabel.textContent = "OEM attestation required";
     elements.reviewManualLabel.textContent = "Manual or ambiguous";
+    if (state.productGroups.length) {
+      renderProductQueue();
+    }
+  } else {
+    elements.reviewPendingLabel.textContent = "Pending listings";
+    elements.reviewAspectLabel.textContent = "Pending checks";
+    elements.reviewReasonLabel.textContent = "Issue types";
+    if (state.queueLoaded) {
+      renderQueue();
+    }
   }
   if (!load) {
     return;
   }
-  if (productMode) {
+  if (pipelineMode) {
+    loadPipelineQueue();
+  } else if (productMode) {
     loadProductQueue();
   } else {
     loadQueue();
   }
+}
+
+async function loadPipelineQueue({ quiet = false } = {}) {
+  const sequence = ++state.pipelineRequestSequence;
+  if (!quiet) {
+    setQueueMessage("Running provider-free verification preflight…");
+  }
+  elements.reviewPipelineResults.setAttribute("aria-busy", "true");
+  setButtonBusy(elements.refreshReviews, true);
+  try {
+    const responses = [];
+    const seenCheckpoints = new Set();
+    let afterListingId = null;
+    do {
+      const params = new URLSearchParams({ limit: String(QUEUE_LIMIT) });
+      if (afterListingId !== null) {
+        params.set("after_listing_id", String(afterListingId));
+      }
+      const payload = await api(
+        `/api/review/verification/preflight?${params}`,
+      );
+      if (sequence !== state.pipelineRequestSequence) {
+        return false;
+      }
+      responses.push(payload);
+      const checkpoint = pipelineCheckpoint(payload);
+      if (!checkpoint.valid) {
+        throw new Error(
+          "The server reported another pipeline page without a usable resume checkpoint.",
+        );
+      }
+      if (!checkpoint.hasMore) {
+        break;
+      }
+      if (seenCheckpoints.has(checkpoint.resumeAfterListingId)) {
+        throw new Error("The server repeated a verification pipeline checkpoint.");
+      }
+      seenCheckpoints.add(checkpoint.resumeAfterListingId);
+      afterListingId = checkpoint.resumeAfterListingId;
+    } while (true);
+
+    if (sequence !== state.pipelineRequestSequence) {
+      return false;
+    }
+    state.pipelineResponses = responses;
+    state.pipelineRows = responses.flatMap(pipelineRowsFromResponse);
+    state.pipelineLoaded = true;
+    renderPipeline();
+    if (!quiet) {
+      setQueueMessage(
+        `${state.pipelineRows.length} non-ready `
+          + `${pluralize(state.pipelineRows.length, "listing")} checked locally. `
+          + "No provider calls or domain writes were made.",
+      );
+    }
+    return true;
+  } catch (error) {
+    if (sequence === state.pipelineRequestSequence) {
+      setQueueMessage(
+        `Could not load verification pipeline: ${error.message}`,
+        true,
+      );
+    }
+    return false;
+  } finally {
+    if (sequence === state.pipelineRequestSequence) {
+      elements.reviewPipelineResults.setAttribute("aria-busy", "false");
+      setButtonBusy(elements.refreshReviews, false);
+    }
+  }
+}
+
+function renderPipeline() {
+  renderPipelineMetrics();
+  renderPipelinePlan();
+  renderPipelineTable();
+}
+
+function renderPipelineMetrics() {
+  const summary = pipelineSummary(state.pipelineRows);
+  elements.reviewPendingCount.textContent = formatNumber(summary.total, 0);
+  elements.reviewAspectCount.textContent = formatNumber(summary.manualReview, 0);
+  elements.reviewReasonCount.textContent =
+    formatNumber(summary.referencePending, 0);
+  elements.reviewPipelineAircraftCount.textContent =
+    formatNumber(summary.aircraftComplete, 0);
+  elements.reviewPipelineAvionicsCount.textContent =
+    formatNumber(summary.avionicsComplete, 0);
+  elements.reviewPipelineManualCount.textContent =
+    formatNumber(summary.manualReview, 0);
+  elements.reviewPipelineReferenceCount.textContent =
+    formatNumber(summary.referencePending, 0);
+  elements.reviewPipelineGeminiCount.textContent = formatNumber(
+    summary.geminiExpected + summary.geminiPossible,
+    0,
+  );
+}
+
+function renderPipelinePlan() {
+  const plan = pipelineProviderPlan(state.pipelineResponses);
+  const services = pipelineServiceStatus(state.pipelineResponses, plan);
+  const heading = document.createElement("strong");
+  heading.textContent = "Automatic verification request plan";
+  const detail = document.createElement("p");
+  detail.textContent = [
+    `${plan.verifiedLocalIdentityComponents} identity `
+      + `${pluralize(plan.verifiedLocalIdentityComponents, "component")} reusable locally`,
+    `${plan.aircraftGroundingCandidates} aircraft grounding `
+      + `${pluralize(plan.aircraftGroundingCandidates, "candidate")}`,
+    `${plan.minimumBaselineRequests} minimum baseline Gemini requests`,
+    `${plan.allPositiveBaselineRequests} if all identities are positive`,
+    `${plan.validationEnvelopeMaximum} maximum validation envelope`,
+  ].join(" · ");
+  const note = document.createElement("p");
+  note.className = "review-pipeline-plan-note";
+  note.textContent = [
+    "This preflight made no Gemini calls and wrote no data.",
+    ...(!plan.includesFinalizationEnrichment
+      ? ["Finalization enrichment is not included in these request counts."]
+      : []),
+  ].join(" ");
+  const serviceList = document.createElement("div");
+  serviceList.className = "review-pipeline-services";
+  serviceList.append(
+    pipelineServiceBadge("Gemini", services.geminiConfigured),
+    pipelineServiceBadge("FAA DRS", services.faaDrsConfigured),
+  );
+  const warnings = document.createElement("div");
+  warnings.className = "review-pipeline-warnings";
+  warnings.replaceChildren(...services.warnings.map((warning) => {
+    const item = document.createElement("p");
+    item.textContent = warning;
+    return item;
+  }));
+  elements.reviewPipelinePlan.replaceChildren(
+    heading,
+    detail,
+    note,
+    serviceList,
+    warnings,
+  );
+}
+
+function pipelineServiceBadge(label, configured) {
+  const badge = document.createElement("span");
+  badge.className = `review-pipeline-service ${configured ? "is-ready" : "is-missing"}`;
+  badge.textContent = `${label}: ${configured ? "configured" : "not configured"}`;
+  return badge;
+}
+
+function renderPipelineTable() {
+  const rows = filterPipelineRows(
+    state.pipelineRows,
+    state.pipelineFilter,
+    state.pipelineSearch,
+  );
+  elements.reviewPipelineTableBody.replaceChildren(
+    ...rows.map(pipelineTableRow),
+  );
+  elements.emptyReviewPipeline.classList.toggle("is-hidden", rows.length > 0);
+  elements.reviewPipelineVisibleCount.textContent =
+    `${rows.length} of ${state.pipelineRows.length} `
+      + pluralize(state.pipelineRows.length, "listing");
+}
+
+function pipelineTableRow(item) {
+  const row = document.createElement("tr");
+  const listing = document.createElement("td");
+  listing.dataset.label = "Listing";
+  const label = document.createElement("strong");
+  label.textContent = item.label;
+  const metadata = document.createElement("span");
+  metadata.className = "review-pipeline-listing-meta";
+  metadata.textContent = [
+    item.registrationNumber,
+    item.modelYear,
+    `#${item.listingId}`,
+  ].filter((value) => value !== null && value !== "").join(" · ");
+  listing.append(label, metadata);
+
+  const aircraft = pipelineStageCell("Aircraft", item.aircraft);
+  const avionics = pipelineStageCell("Avionics", item.avionics);
+  const reference = pipelineStageCell("Reference", item.reference);
+  const gemini = document.createElement("td");
+  gemini.dataset.label = "Gemini";
+  const geminiStatus = document.createElement("span");
+  geminiStatus.className = `review-pipeline-gemini is-${item.gemini.kind}`;
+  geminiStatus.textContent = item.gemini.label;
+  geminiStatus.title = item.gemini.detail;
+  gemini.append(geminiStatus);
+
+  const reason = queueTextCell("What remains", item.reason);
+  reason.classList.add("review-pipeline-reason");
+  const action = document.createElement("td");
+  action.dataset.label = "Actions";
+  if (item.hasPendingReview) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "button review-open-button";
+    open.dataset.reviewListingId = String(item.listingId);
+    open.textContent = "Open manual review";
+    open.setAttribute("aria-label", `Open manual review for ${item.label}`);
+    action.append(open);
+  } else {
+    const unavailable = document.createElement("span");
+    unavailable.className = "review-pipeline-no-action";
+    unavailable.textContent = item.reference.status === "pending_reference"
+      ? "Identity review complete"
+      : "No manual review available";
+    action.append(unavailable);
+  }
+  row.append(listing, aircraft, avionics, reference, gemini, reason, action);
+  return row;
+}
+
+function pipelineStageCell(label, value) {
+  const cell = document.createElement("td");
+  cell.dataset.label = label;
+  const status = document.createElement("span");
+  status.className = `review-pipeline-stage is-${value.tone}`;
+  status.textContent = value.label;
+  if (value.reason) {
+    status.title = value.reason;
+  }
+  cell.append(status);
+  return cell;
 }
 
 async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
@@ -2835,7 +3137,9 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   elements.reviewWorkspace.classList.add("is-hidden");
   elements.reviewQueueView.classList.remove("is-hidden");
   updateReviewLocation(null, historyMode);
-  if (state.queueMode === "product" && !state.productGroups.length) {
+  if (state.queueMode === "pipeline" && !state.pipelineLoaded) {
+    loadPipelineQueue();
+  } else if (state.queueMode === "product" && !state.productGroups.length) {
     loadProductQueue();
   } else if (state.queueMode === "listing" && !state.queueLoaded) {
     loadQueue();
