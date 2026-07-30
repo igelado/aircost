@@ -48,6 +48,13 @@ If none resolve, Search retries normally. URL Context citation resolution
 remains all-or-nothing because its verified output is evidence for the
 structure stage.
 
+Legacy grounded-metadata calls that still use GenerateContent follow the
+provider's Search/structured-output constraint: the Search request sets JSON
+MIME output but omits `responseSchema`. If its grounded JSON needs syntax
+repair, one tools-disabled request receives the schema and the original
+grounding metadata remains the provenance record. The application never sends
+Google Search and `responseSchema` together.
+
 Normal application startup resolves configuration in this order, with each
 later source taking precedence:
 
@@ -123,14 +130,17 @@ canonical product or stable-identifier match under the effective manufacturer
 identity, requires the retained listing text to contain that identity, and
 requires every observed capability to be approved for the product. When that
 strict check cannot decide but the same evidence-backed manufacturer identity
-has a small capability-compatible approved shortlist, one tools-disabled Lite
-call may select only an unchanged supplied catalog ID at `very_high`
-confidence. The caller re-reads the catalog and revalidates exact listing
-evidence, membership, capabilities, and ambiguity before accepting it.
-Anything else falls through to grounded curation. Stored source URLs, titles,
-and excerpts are not model input. Aircraft reuse is similarly strict: an exact
-current FAA record and one applicable approved hierarchy may bypass Gemini
-entirely.
+has a complete bounded collision family, one tools-disabled Lite call may
+select only an unchanged approved and currently attested catalog ID at
+`very_high` confidence. The prompt also includes unreviewed, unattested, and
+capability-incompatible family members as nonselectable blockers. The family
+is bound to the complete current manufacturer-catalog revision. The caller
+re-reads that catalog, rebuilds the family, and revalidates exact listing
+evidence, membership, capabilities, selectability, and ambiguity before
+accepting it. Overflow, missing closure, uncertainty, or stale input falls
+through to grounded curation. Stored source URLs, titles, and excerpts are not
+model input. Aircraft reuse is similarly strict: an exact current FAA record
+and one applicable approved hierarchy may bypass Gemini entirely.
 
 When the exact local avionics row is unique and capability-compatible but
 cannot use the deterministic approval fast path, an active

@@ -444,10 +444,23 @@ GET /api/review/listings/{listing_id}
 GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
+POST /api/review/listings/{listing_id}/verify-automatically
 POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/avionics/approve-replacement
 POST /api/review/listings/{listing_id}/resolve
 ```
+
+The opened-listing **Automatically verify** action runs the same permanent
+aircraft, avionics, and finalization workflow as the administrative
+`verify-listings --apply` command. It submits the current review-payload and
+approved-catalog hashes, discards unsaved manual draft decisions only after
+confirmation, and reloads the queue after completion. The server rejects stale
+hashes before provider work and permits only one automatic run per listing in
+each server process. `GEMINI_API_KEY` enables extraction and curation;
+`FAA_DRS_API_KEY` additionally enables unresolved aircraft grounding.
+Deterministic FAA/catalog reuse still works without paid calls. The response
+reports separate aircraft, avionics, and finalization stages; unresolved or
+uncertain observations remain in review rather than being auto-approved.
 
 Product cursors are opaque keyset tokens ordered by immutable product ID.
 Association cursors are bound to one product and ordered by listing and aspect.

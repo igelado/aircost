@@ -2,9 +2,9 @@ pub mod catalog;
 pub mod consolidation;
 pub mod inspection;
 pub mod manufacturer;
-pub mod repopulate;
 pub(crate) mod reuse;
 pub(crate) mod source;
+pub mod verification;
 
 use std::collections::BTreeMap;
 

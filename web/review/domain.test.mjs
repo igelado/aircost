@@ -6,10 +6,13 @@ import {
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
   associationsNeedingSourceRecovery,
+  automaticListingVerificationRequest,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   characterLimitState,
   describeAircraftIdentity,
+  describeAutomaticListingVerificationError,
+  describeAutomaticListingVerificationOutcome,
   describeProductAssociationOutcome,
   describeReviewReasons,
   existingProductVerificationRequest,
@@ -95,6 +98,181 @@ test("builds one canonical source-free request for every existing-product aspect
     "catalog_revision_sha256",
     "review_payload_sha256",
   ]);
+});
+
+test("builds the exact automatic listing verification request", () => {
+  assert.deepEqual(
+    automaticListingVerificationRequest("a".repeat(64), "b".repeat(64)),
+    {
+      review_payload_sha256: "a".repeat(64),
+      catalog_revision_sha256: "b".repeat(64),
+    },
+  );
+});
+
+test("accepts automatic success only when the listing is reported ready", () => {
+  const verified = {
+    verification: {
+      listing_id: 23,
+      status: "verified",
+      initial_ingestion_state: "pending_review",
+      final_ingestion_state: "ready",
+      aircraft: { status: "reused", gemini_used: false },
+      avionics: {
+        status: "verified",
+        accepted: 2,
+        safely_discarded: 1,
+        remaining_review_aspects: 0,
+        gemini_used: true,
+      },
+      finalization: { status: "verified" },
+    },
+  };
+  assert.deepEqual(
+    describeAutomaticListingVerificationOutcome(verified, 23),
+    {
+      kind: "verified",
+      label: "Listing verified automatically",
+      detail: "The aircraft and avionics checks passed, and the listing is now verified.",
+      listingId: 23,
+      terminal: true,
+      stale: false,
+      focusArea: null,
+    },
+  );
+
+  const incomplete = structuredClone(verified);
+  incomplete.verification.final_ingestion_state = "incomplete";
+  const conservative = describeAutomaticListingVerificationOutcome(incomplete, 23);
+  assert.equal(conservative.terminal, false);
+  assert.equal(conservative.kind, "blocked");
+  assert.match(conservative.detail, /remains unverified/);
+});
+
+test("describes residual automatic aircraft and avionics blockers", () => {
+  const aircraft = describeAutomaticListingVerificationOutcome({
+    verification: {
+      listing_id: 20,
+      status: "blocked",
+      initial_ingestion_state: "pending_review",
+      final_ingestion_state: "pending_review",
+      aircraft: {
+        status: "blocked",
+        reason_code: "canonical_identity_assignment_missing",
+        gemini_used: true,
+      },
+      avionics: {
+        status: "not_run",
+        accepted: 0,
+        safely_discarded: 0,
+        remaining_review_aspects: 3,
+        gemini_used: false,
+      },
+      finalization: { status: "not_run" },
+    },
+  }, 20);
+  assert.equal(aircraft.kind, "blocked");
+  assert.equal(aircraft.focusArea, "aircraft");
+  assert.match(aircraft.detail, /canonical catalog assignment/);
+
+  const avionics = describeAutomaticListingVerificationOutcome({
+    verification: {
+      listing_id: 21,
+      status: "pending_review",
+      initial_ingestion_state: "pending_review",
+      final_ingestion_state: "pending_review",
+      aircraft: { status: "current", gemini_used: false },
+      avionics: {
+        status: "pending_review",
+        reason_code: "source_evidence_missing",
+        accepted: 2,
+        safely_discarded: 1,
+        remaining_review_aspects: 4,
+        gemini_used: true,
+      },
+      finalization: { status: "not_run" },
+    },
+  }, 21);
+  assert.equal(avionics.kind, "pending");
+  assert.equal(avionics.focusArea, "avionics");
+  assert.match(avionics.detail, /exact source evidence/);
+
+  const finalization = describeAutomaticListingVerificationOutcome({
+    verification: {
+      listing_id: 22,
+      status: "failed",
+      initial_ingestion_state: "incomplete",
+      final_ingestion_state: "quarantined",
+      aircraft: { status: "current", gemini_used: false },
+      avionics: {
+        status: "already_complete",
+        accepted: 0,
+        safely_discarded: 0,
+        remaining_review_aspects: 0,
+        gemini_used: false,
+      },
+      finalization: {
+        status: "failed",
+        reason_code: "listing_finalization_failed",
+      },
+    },
+  }, 22);
+  assert.equal(finalization.kind, "failed");
+  assert.match(finalization.detail, /valuation enrichment/);
+});
+
+test("never treats stale, mismatched, or unknown automatic results as success", () => {
+  const stale = describeAutomaticListingVerificationOutcome({
+    verification: {
+      listing_id: 23,
+      status: "stale",
+      initial_ingestion_state: "pending_review",
+      final_ingestion_state: "pending_review",
+      aircraft: { status: "current" },
+      avionics: { status: "stale", remaining_review_aspects: 2 },
+      finalization: { status: "not_run" },
+    },
+  }, 23);
+  assert.equal(stale.stale, true);
+  assert.equal(stale.terminal, false);
+
+  for (const malformed of [
+    null,
+    {},
+    { verification: null },
+    { verification: { listing_id: 23, status: "future_status" } },
+    {
+      verification: {
+        listing_id: 24,
+        status: "verified",
+        final_ingestion_state: "ready",
+      },
+    },
+  ]) {
+    const outcome = describeAutomaticListingVerificationOutcome(malformed, 23);
+    assert.equal(outcome.terminal, false);
+    assert.equal(outcome.kind, "blocked");
+  }
+});
+
+test("maps automatic verification API errors to safe user-facing outcomes", () => {
+  assert.equal(describeAutomaticListingVerificationError({
+    status: 412,
+    payload: { error: { code: "automatic_verification_stale" } },
+  }).kind, "stale");
+  assert.equal(describeAutomaticListingVerificationError({
+    status: 409,
+    payload: { error: { code: "automatic_verification_in_progress" } },
+  }).kind, "in_progress");
+  assert.equal(describeAutomaticListingVerificationError({
+    status: 503,
+    payload: { error: { code: "automatic_verification_unavailable" } },
+  }).kind, "unavailable");
+  const unknown = describeAutomaticListingVerificationError(
+    new Error("internal database secret"),
+  );
+  assert.equal(unknown.detail.includes("secret"), false);
+  assert.match(unknown.detail, /not reported as verified/);
 });
 
 test("publishes the review product identity character limits", () => {

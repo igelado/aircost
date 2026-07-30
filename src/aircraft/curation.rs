@@ -6,6 +6,7 @@
 //! exact identifiers, and an independent verification pass determine whether
 //! a proposal is reviewable.
 
+pub mod application;
 pub mod persistence;
 pub mod profile;
 pub(crate) mod regulator;

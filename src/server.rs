@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     body::{Body, Bytes},
@@ -19,6 +20,7 @@ use crate::aircraft::{
     aircraft_listing_value_with_model, aircraft_options, aircraft_variant_detail_with_model,
     AircraftStoreError,
 };
+use crate::aircraft::{faa::drs::DrsClient, verification::AircraftVerificationServices};
 use crate::avionics::catalog::{
     attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
     preview_avionics_identity, verify_approved_avionics_product_source_without_gemini,
@@ -36,7 +38,10 @@ use crate::avionics::inspection::{
 };
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
+use crate::gemini::config::GeminiRuntimeConfig;
+use crate::gemini::interactions::GeminiInteractionsClient;
 use crate::gemini::source::ProductIdentityTarget;
+use crate::gemini::usage::Store as GeminiUsageStore;
 use crate::listing::review::replacement::{
     approve_replacement_products_and_restage, ApproveReplacementProductsRequest,
 };
@@ -51,6 +56,9 @@ use crate::listing::review::{
     ListingReviewDetail, ListingReviewQueue, PendingProductAssociationPage,
     PendingProductReviewPage, ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse,
     ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery, StagedPendingReview,
+};
+use crate::listing::verification::{
+    verify_listing, ListingVerificationError, ListingVerificationMode, ListingVerificationServices,
 };
 use crate::listings::{
     create_listing, delete_listing, ensure_listing_canonical_aircraft_identity,
@@ -82,8 +90,25 @@ pub struct ServerConfig {
 struct AppState {
     db: AppDb,
     extractor: Option<GeminiListingExtractor>,
+    automatic_aircraft_gemini: Option<GeminiInteractionsClient>,
+    automatic_aircraft_drs: Option<DrsClient>,
+    automatic_runtime_config: Option<GeminiRuntimeConfig>,
+    automatic_verifications_in_flight: Arc<Mutex<HashSet<i64>>>,
     valuation_model: Option<Arc<dyn ValuationModel>>,
     valuation_status: ServingValuationStatus,
+}
+
+struct AutomaticVerificationGuard {
+    listing_id: i64,
+    in_flight: Arc<Mutex<HashSet<i64>>>,
+}
+
+impl Drop for AutomaticVerificationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = self.in_flight.lock() {
+            in_flight.remove(&self.listing_id);
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +147,13 @@ struct VerifyExistingReviewAvionicsRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AutomaticListingVerificationRequest {
+    review_payload_sha256: String,
+    catalog_revision_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AttestReviewAvionicsProductRequest {
     listing_id: i64,
     review_payload_sha256: String,
@@ -149,9 +181,21 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         eprintln!("valuation warning: {warning}");
     }
     let extractor = GeminiListingExtractor::from_environment_with_usage(&db).ok();
+    let automatic_runtime_config = GeminiRuntimeConfig::from_environment().ok();
+    let automatic_aircraft_gemini = std::env::var("GEMINI_API_KEY")
+        .ok()
+        .and_then(|api_key| GeminiInteractionsClient::new(api_key).ok())
+        .map(|client| client.with_usage_store(GeminiUsageStore::new(&db)));
+    let automatic_aircraft_drs = std::env::var("FAA_DRS_API_KEY")
+        .ok()
+        .and_then(|api_key| DrsClient::new(api_key).ok());
     let state = AppState {
         db,
         extractor,
+        automatic_aircraft_gemini,
+        automatic_aircraft_drs,
+        automatic_runtime_config,
+        automatic_verifications_in_flight: Arc::new(Mutex::new(HashSet::new())),
         valuation_model: serving_valuation.model,
         valuation_status: serving_valuation.status,
     };
@@ -222,6 +266,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/avionics/verify-existing",
             post(verify_existing_review_avionics_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/verify-automatically",
+            post(verify_listing_automatically_handler),
         )
         .route(
             "/api/review/listings/{id}/avionics/use-existing",
@@ -863,6 +911,113 @@ async fn restage_listing_review_handler(
     require_listing_reviewer(&user)?;
     let staged = restage_unattested_preserved_products(&state.db, user.id, listing_id).await?;
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+async fn verify_listing_automatically_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<AutomaticListingVerificationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+
+    let detail = get_listing_review(&state.db, user.id, listing_id).await?;
+    if payload.review_payload_sha256 != detail.review.review_payload_sha256 {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "review payload is stale; reload the review",
+        )
+        .with_code("automatic_verification_stale"));
+    }
+    if payload.catalog_revision_sha256 != detail.review.catalog_revision_sha256 {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "approved avionics catalog changed during review; reload and re-evaluate",
+        )
+        .with_code("automatic_verification_stale"));
+    }
+
+    let _guard = begin_automatic_verification(&state, listing_id)?;
+    let aircraft = match (
+        state.automatic_aircraft_gemini.as_ref(),
+        state.automatic_aircraft_drs.as_ref(),
+        state.automatic_runtime_config.as_ref(),
+    ) {
+        (Some(gemini), Some(drs), Some(config)) => Some(AircraftVerificationServices {
+            gemini,
+            drs,
+            config,
+        }),
+        _ => None,
+    };
+    let outcome = verify_listing(
+        &state.db,
+        listing_id,
+        ListingVerificationMode::Apply,
+        ListingVerificationServices {
+            extractor: state.extractor.as_ref(),
+            aircraft,
+        },
+    )
+    .await
+    .map_err(automatic_verification_api_error)?;
+    Ok(Json(json!({ "verification": outcome })))
+}
+
+fn begin_automatic_verification(
+    state: &AppState,
+    listing_id: i64,
+) -> Result<AutomaticVerificationGuard, ApiError> {
+    let mut in_flight = state
+        .automatic_verifications_in_flight
+        .lock()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "automatic verification coordination failed",
+            )
+            .with_code("automatic_verification_failed")
+        })?;
+    if !in_flight.insert(listing_id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "automatic verification is already running for this listing",
+        )
+        .with_code("automatic_verification_in_progress"));
+    }
+    drop(in_flight);
+    Ok(AutomaticVerificationGuard {
+        listing_id,
+        in_flight: Arc::clone(&state.automatic_verifications_in_flight),
+    })
+}
+
+fn automatic_verification_api_error(error: ListingVerificationError) -> ApiError {
+    match error {
+        ListingVerificationError::Validation(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, message)
+                .with_code("automatic_verification_failed")
+        }
+        ListingVerificationError::NotFound(listing_id) => ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("listing {listing_id} was not found"),
+        )
+        .with_code("automatic_verification_failed"),
+        ListingVerificationError::Unavailable(message) => {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message)
+                .with_code("automatic_verification_unavailable")
+        }
+        ListingVerificationError::Database(message) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+                .with_code("automatic_verification_failed")
+        }
+        ListingVerificationError::Aircraft(message)
+        | ListingVerificationError::Avionics(message) => {
+            ApiError::new(StatusCode::BAD_GATEWAY, message)
+                .with_code("automatic_verification_failed")
+        }
+    }
 }
 
 async fn review_maintenance_response(
@@ -1742,6 +1897,9 @@ const REVIEW_DOMAIN_JS: &str = include_str!("../web/review/domain.mjs");
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::Json;
@@ -1754,11 +1912,11 @@ mod tests {
 
     use super::{
         approve_replacement_products_handler, attest_review_avionics_product_handler,
-        avionics_options_handler, get_listing_review, list_avionics_handler,
-        require_current_review_revisions, start_plugin_submission_job,
+        avionics_options_handler, begin_automatic_verification, get_listing_review,
+        list_avionics_handler, require_current_review_revisions, start_plugin_submission_job,
         use_existing_review_avionics_handler, verify_existing_review_avionics_handler, AppState,
-        AttestReviewAvionicsProductRequest, UseExistingReviewAvionicsRequest,
-        VerifyExistingReviewAvionicsRequest,
+        AttestReviewAvionicsProductRequest, AutomaticListingVerificationRequest,
+        UseExistingReviewAvionicsRequest, VerifyExistingReviewAvionicsRequest,
     };
     use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::avionics::manufacturer::{
@@ -1788,6 +1946,10 @@ mod tests {
         AppState {
             db,
             extractor: None,
+            automatic_aircraft_gemini: None,
+            automatic_aircraft_drs: None,
+            automatic_runtime_config: None,
+            automatic_verifications_in_flight: Arc::new(Mutex::new(HashSet::new())),
             valuation_model: None,
             valuation_status: ServingValuationStatus {
                 state: ServingValuationState::Unavailable,
@@ -1806,6 +1968,33 @@ mod tests {
             panic!("server test database is not SQLite");
         };
         pool
+    }
+
+    #[tokio::test]
+    async fn automatic_verification_guard_serializes_each_listing_and_releases_on_drop() {
+        let state = test_state(AppDb::connect("sqlite::memory:").await.unwrap());
+        let guard = begin_automatic_verification(&state, 42).unwrap();
+        let duplicate = begin_automatic_verification(&state, 42)
+            .err()
+            .expect("the same listing must be serialized");
+        assert_eq!(duplicate.status, StatusCode::CONFLICT);
+        assert_eq!(duplicate.code, Some("automatic_verification_in_progress"));
+
+        drop(guard);
+        assert!(begin_automatic_verification(&state, 42).is_ok());
+    }
+
+    #[test]
+    fn automatic_verification_request_rejects_unknown_fields() {
+        let payload = json!({
+            "review_payload_sha256": "review",
+            "catalog_revision_sha256": "catalog",
+            "apply": true
+        });
+        assert!(
+            serde_json::from_value::<AutomaticListingVerificationRequest>(payload).is_err(),
+            "the endpoint is always apply and must reject caller-selected execution flags"
+        );
     }
 
     async fn insert_review_listing(db: &AppDb) -> (i64, i64) {

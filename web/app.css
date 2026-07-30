@@ -2162,6 +2162,18 @@ label span,
   accent-color: var(--accent);
 }
 
+.review-workspace-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-workspace[aria-busy="true"] .review-tabs-shell,
+.review-workspace[aria-busy="true"] .review-source,
+.review-workspace[aria-busy="true"] .review-tab-panel {
+  opacity: 0.72;
+}
+
 .review-workspace-state {
   align-self: center;
   justify-self: center;
@@ -2370,6 +2382,12 @@ label span,
   .review-source .button,
   .review-stale .button,
   .review-workspace-footer .button {
+    width: 100%;
+  }
+
+  .review-workspace-actions {
+    align-items: stretch;
+    flex-direction: column;
     width: 100%;
   }
 

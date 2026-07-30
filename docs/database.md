@@ -497,7 +497,7 @@ are available for the remaining evidence-backed workflows:
 
 ```bash
 cargo run --bin aircost-admin -- curate-avionics --dry-run
-cargo run --bin aircost-admin -- repopulate-avionics --limit 10 --dry-run
+cargo run --bin aircost-admin -- verify-listings --limit 10 --preview
 cargo run --bin aircost-admin -- stage-listing-reviews --limit 100 --dry-run
 cargo run --bin aircost-admin -- enrich-avionics --dry-run
 cargo run --bin aircost-admin -- enrich-model-year-avionics --dry-run
@@ -733,7 +733,7 @@ sqlite3 -bail data/aircost.sqlite3 \
 ```
 
 Run the migration only when the preflight query returns `0`. Then use
-the temporary `repopulate-avionics` workflow below to classify stored listing
+the automatic `verify-listings` workflow below to classify stored listing
 equipment and replace associations safely. The former mechanical
 `normalize-avionics` command was removed: typography-only maker/model matches
 are review signals and can never authorize catalog rewrites or deletion.
@@ -913,10 +913,24 @@ legacy product is rejected if it participates in aircraft defaults, reference
 configurations, or avionics suites; those global relationships require separate
 catalog curation and cannot be adjudicated from one sale listing.
 
-## Temporary Stored-Listing Avionics Rebuild
+## Automatic Listing Verification
 
-`repopulate-avionics` automates only listings that already have a pending
-review. It uses exactly the `plugin_submission_id` attached to that review; it
+`verify-listings` is the reusable aircraft, avionics, and readiness workflow
+used by batch administration and the review API. Its default keyset selects
+listings that are not both `ready` and verified; an exact `--listing-id`
+remains available for an idempotent retry or inspection. Each listing runs
+sequentially so an aircraft or catalog decision made earlier in the listing is
+visible to its later stages. A failure is isolated to that listing and does
+not abort the remaining page.
+
+Aircraft verification starts with mandatory current FAA admission and the
+approved local hierarchy. It assigns a unique approved FAA-backed identity
+without Gemini when possible. Only an unresolved admitted identity uses the
+configured Gemini and FAA DRS clients; missing DRS configuration leaves that
+aircraft pending instead of weakening the admission rule.
+
+The avionics stage runs only when the listing has a pending review. It uses
+exactly the `plugin_submission_id` attached to that review; it
 does not select a newer submission or silently substitute another same-URL
 payload. The listing and submission must have the same owner and the
 submission must either be canonically linked to the listing or have the exact
@@ -941,15 +955,28 @@ ranges are merged, and a fixed word-bearing separator prevents synthetic
 manufacturer/model adjacency across slices. A missing or prefix-only match
 such as `G5` inside `G500` returns no context and therefore fails closed.
 
+The verifier first accepts a unique exact graph-approved, currently attested
+local product with compatible capabilities and exact listing evidence. When
+that strict path cannot decide, it may make one tools-disabled Gemini request
+over a complete bounded manufacturer collision family. The family includes
+approved selectable products together with unreviewed, unattested, and
+capability-incompatible blockers, and is fingerprinted against the complete
+active manufacturer catalog. Only an unchanged approved and currently
+attested ID may be selected. An overflow, missing family, blocker selection,
+uncertain answer, or concurrent catalog change falls through to ordinary
+grounded curation; it never authorizes an association. Search and URL Context
+are therefore reserved for observations that the local catalog and bounded
+comparison cannot resolve.
+
 The default mode is a zero-Gemini preflight. Start with one listing or inspect
 the first ten pending listings:
 
 ```sh
-cargo run --bin aircost-admin -- repopulate-avionics \
+cargo run --bin aircost-admin -- verify-listings \
   --database /absolute/path/to/copy.sqlite3 \
   --listing-id 51
 
-cargo run --bin aircost-admin -- repopulate-avionics \
+cargo run --bin aircost-admin -- verify-listings \
   --database /absolute/path/to/copy.sqlite3 \
   --limit 10
 ```
@@ -960,7 +987,7 @@ provider requests, or write usage/domain data. Its checkpoint contains
 `--after-listing-id` to advance even when low-ID listings remain pending:
 
 ```sh
-cargo run --bin aircost-admin -- repopulate-avionics \
+cargo run --bin aircost-admin -- verify-listings \
   --database /absolute/path/to/copy.sqlite3 \
   --limit 10 \
   --after-listing-id 51
@@ -970,22 +997,30 @@ cargo run --bin aircost-admin -- repopulate-avionics \
 listing ID remains available to retry or inspect a residual item separately.
 
 The request plan counts logical provider requests rather than describing a
-grounded workflow as one "call." One fresh grounded pass has three baseline
-requests: Search, URL Context, and structure. Per-stage model-validation
+grounded workflow as one "call." It reports tools-disabled candidate
+adjudication separately at one request per eligible identity, including the
+maximum grounded fallback if those decisions do not pass their local gates.
+One fresh grounded pass has three baseline requests: Search, URL Context, and
+structure. Per-stage model-validation
 fallback raises the identity pass to at most six requests; one reused-evidence
 identity correction makes that pass envelope eight. A positive identity also
 requires an independent collision pass. Its review and optional domain
 correction share a two-structure-call budget, for six baseline requests and a
-fourteen-request complete validation envelope. The report separates its
-known minimum baseline (conditional relationship targets skipped after primary
-rejection), all-positive baseline, and maximum validation envelope. A legacy
+fourteen-request complete validation envelope. The report separates its known
+minimum baseline (candidate comparison succeeds and conditional relationship
+targets are skipped), all-positive baseline, and maximum validation envelope
+(every candidate falls through to grounding). A legacy
 listing re-extraction is one baseline request and up to two with JSON repair.
 Transport retry attempts are reported separately and are not multiplied into
 these logical counts. Identity counts produced by legacy re-extraction, later
 verified-local reuse, fallback, and correction outcomes remain explicitly
-unknown; the tool does not infer a dollar estimate.
+unknown; the tool does not infer a dollar estimate. The identity envelope does
+not include data-dependent finalization enrichment for aircraft specs,
+installed-product values, or model-year reference configurations. The report
+states that exclusion explicitly, and every request actually made by
+finalization is still written to `gemini_api_usage`.
 
-Use `--dry-run` (or `--preview`) to explicitly enable a paid preview. Preview
+Use `--preview` to explicitly enable a paid preview. Preview
 writes no catalog, listing, review, or plugin domain data; normal Gemini usage
 accounting still applies. Set `GEMINI_API_KEY` and review the per-listing
 source, re-extraction, error, accepted, safely-discarded, and remaining-review
@@ -1013,23 +1048,25 @@ as GPS and transponder labels for one GNX 375 are coalesced only after they
 resolve to the same stable product identity. Quantities use the maximum rather
 than a sum, and the complete accepted action graph is validated before apply.
 
-Apply writes the accepted listing links and residual review bundle through one
+The avionics apply boundary writes the accepted listing links and residual review bundle through one
 transaction. That transaction revalidates the review and HTML hashes,
 submission ownership/binding, current FAA snapshot and source record, and
 approved catalog graph identities. Unrelated existing verified,
 high-confidence links are preserved. A stale source, FAA change, invalid
 accepted graph, conflicting duplicate, or database failure leaves the prior
 links and pending review intact. If residual aspects remain, the listing stays
-`pending_review`; an all-pass result returns it to `incomplete` for the
-ordinary finalizer and never publishes it directly.
+`pending_review`; an all-pass result returns it to `incomplete`. The enclosing
+automatic verifier then finalizes only when the FAA-backed aircraft identity
+is assigned and no review aspects remain. A successful finalizer makes the
+listing `ready` and verified; otherwise the listing remains pending or records
+the ordinary finalization failure.
 
 The workflow also fails closed before apply when retained HTML or its source
 URL is missing, the HTML hash is invalid, the HTML cleans to no usable text,
 the listing lacks current FAA admission, or a re-extraction returns no usable
 equipment observations. An empty equipment array is never treated as evidence
 that all prior observations are garbage. The workflow never writes dollar
-metadata; automated avionics review alone does not make a listing
-valuation-grade.
+metadata; avionics acceptance alone does not make a listing valuation-grade.
 
 ## Aircraft Reference Catalog And FAA Projection Migration
 

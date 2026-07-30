@@ -7,9 +7,9 @@ use sqlx::FromRow;
 
 use crate::aircraft::faa::require_listing_faa_admission;
 use crate::avionics::catalog::{
-    preview_avionics_identity, resolve_avionics_identity, resolve_verified_local_avionics_identity,
-    unique_exact_avionics_review_candidate, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
-    AvionicsIdentityRequest,
+    plan_avionics_identity_verification_route, preview_avionics_identity,
+    resolve_avionics_identity, unique_exact_avionics_review_candidate, ApprovedAvionicsIdentity,
+    AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
 };
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
@@ -33,12 +33,12 @@ use crate::normalize::is_generic_avionics_model_name;
 use crate::plugin::sha256_hex;
 
 #[derive(Debug)]
-pub enum AvionicsRepopulationError {
+pub enum AvionicsVerificationError {
     Validation(String),
     Database(String),
 }
 
-impl fmt::Display for AvionicsRepopulationError {
+impl fmt::Display for AvionicsVerificationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(message) | Self::Database(message) => write!(formatter, "{message}"),
@@ -46,18 +46,18 @@ impl fmt::Display for AvionicsRepopulationError {
     }
 }
 
-impl std::error::Error for AvionicsRepopulationError {}
+impl std::error::Error for AvionicsVerificationError {}
 
-impl From<sqlx::Error> for AvionicsRepopulationError {
+impl From<sqlx::Error> for AvionicsVerificationError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error.to_string())
     }
 }
 
-pub type RepopulationResult<T> = Result<T, AvionicsRepopulationError>;
+pub type VerificationResult<T> = Result<T, AvionicsVerificationError>;
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct AvionicsRepopulationSummary {
+pub struct AvionicsVerificationSummary {
     pub listings_selected: usize,
     pub listings_faa_rejected: usize,
     pub listings_previewed: usize,
@@ -83,25 +83,25 @@ pub struct AvionicsRepopulationSummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AvionicsRepopulationReport {
+pub struct AvionicsVerificationReport {
     pub mode: String,
     pub requested_limit: i64,
     pub requested_listing_id: Option<i64>,
     pub requested_after_listing_id: Option<i64>,
-    pub checkpoint: AvionicsRepopulationCheckpoint,
+    pub checkpoint: AvionicsVerificationCheckpoint,
     pub provider_request_plan: AvionicsProviderRequestPlan,
     pub reextraction_policy_note: String,
-    pub listings: Vec<AvionicsRepopulationListingReport>,
-    pub summary: AvionicsRepopulationSummary,
+    pub listings: Vec<AvionicsVerificationListingReport>,
+    pub summary: AvionicsVerificationSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AvionicsRepopulationExecutionMode {
+pub enum AvionicsVerificationExecutionMode {
     Preview,
     Apply,
 }
 
-impl AvionicsRepopulationExecutionMode {
+impl AvionicsVerificationExecutionMode {
     fn applies(self) -> bool {
         self == Self::Apply
     }
@@ -115,13 +115,13 @@ impl AvionicsRepopulationExecutionMode {
 }
 
 #[derive(Clone, Debug)]
-pub struct AvionicsRepopulationScope {
+pub struct AvionicsVerificationScope {
     pub limit: i64,
     pub listing_id: Option<i64>,
     pub after_listing_id: Option<i64>,
 }
 
-impl AvionicsRepopulationScope {
+impl AvionicsVerificationScope {
     pub fn new(limit: i64, listing_id: Option<i64>, after_listing_id: Option<i64>) -> Self {
         Self {
             limit,
@@ -130,14 +130,14 @@ impl AvionicsRepopulationScope {
         }
     }
 
-    fn validate(&self) -> RepopulationResult<()> {
+    fn validate(&self) -> VerificationResult<()> {
         if self.limit < 1 {
-            return Err(AvionicsRepopulationError::Validation(
+            return Err(AvionicsVerificationError::Validation(
                 "limit must be at least 1".to_string(),
             ));
         }
         if self.listing_id.is_some_and(|listing_id| listing_id < 1) {
-            return Err(AvionicsRepopulationError::Validation(
+            return Err(AvionicsVerificationError::Validation(
                 "listing_id must be a positive integer".to_string(),
             ));
         }
@@ -145,12 +145,12 @@ impl AvionicsRepopulationScope {
             .after_listing_id
             .is_some_and(|listing_id| listing_id < 1)
         {
-            return Err(AvionicsRepopulationError::Validation(
+            return Err(AvionicsVerificationError::Validation(
                 "after_listing_id must be a positive integer".to_string(),
             ));
         }
         if self.listing_id.is_some() && self.after_listing_id.is_some() {
-            return Err(AvionicsRepopulationError::Validation(
+            return Err(AvionicsVerificationError::Validation(
                 "listing_id and after_listing_id are mutually exclusive".to_string(),
             ));
         }
@@ -159,7 +159,7 @@ impl AvionicsRepopulationScope {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AvionicsRepopulationCheckpoint {
+pub struct AvionicsVerificationCheckpoint {
     pub requested_after_listing_id: Option<i64>,
     pub page_first_listing_id: Option<i64>,
     pub page_last_listing_id: Option<i64>,
@@ -174,8 +174,12 @@ pub struct AvionicsProviderRequestPlan {
     pub listing_extraction_provider_requests_validation_envelope: usize,
     pub retained_identity_components: usize,
     pub verified_local_identity_components: usize,
-    pub gemini_initial_identity_components: usize,
-    pub gemini_conditional_relationship_components: usize,
+    pub candidate_adjudication_identity_components: usize,
+    pub candidate_adjudication_conditional_relationship_components: usize,
+    pub candidate_adjudication_provider_requests_baseline: usize,
+    pub candidate_grounded_fallback_provider_requests_baseline_maximum: usize,
+    pub grounded_initial_identity_components: usize,
+    pub grounded_conditional_relationship_components: usize,
     pub initial_grounded_provider_requests_baseline: usize,
     pub initial_grounded_provider_requests_nonpositive_validation_envelope: usize,
     pub positive_identity_provider_requests_baseline: usize,
@@ -192,7 +196,7 @@ pub struct AvionicsProviderRequestPlan {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
-pub struct AvionicsRepopulationPreflightSummary {
+pub struct AvionicsVerificationPreflightSummary {
     pub listings_selected: usize,
     pub listings_ready_with_retained_observations: usize,
     pub listings_requiring_legacy_reextraction: usize,
@@ -200,38 +204,42 @@ pub struct AvionicsRepopulationPreflightSummary {
     pub listings_blocked: usize,
     pub retained_identity_components: usize,
     pub verified_local_identity_components: usize,
-    pub gemini_initial_identity_components: usize,
-    pub gemini_conditional_relationship_components: usize,
+    pub candidate_adjudication_identity_components: usize,
+    pub candidate_adjudication_conditional_relationship_components: usize,
+    pub grounded_initial_identity_components: usize,
+    pub grounded_conditional_relationship_components: usize,
     pub invalid_retained_observations: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AvionicsRepopulationPreflightReport {
+pub struct AvionicsVerificationPreflightReport {
     pub mode: String,
     pub requested_limit: i64,
     pub requested_listing_id: Option<i64>,
     pub requested_after_listing_id: Option<i64>,
-    pub checkpoint: AvionicsRepopulationCheckpoint,
+    pub checkpoint: AvionicsVerificationCheckpoint,
     pub provider_request_plan: AvionicsProviderRequestPlan,
-    pub listings: Vec<AvionicsRepopulationPreflightListingReport>,
-    pub summary: AvionicsRepopulationPreflightSummary,
+    pub listings: Vec<AvionicsVerificationPreflightListingReport>,
+    pub summary: AvionicsVerificationPreflightSummary,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AvionicsRepopulationPreflightListingReport {
+pub struct AvionicsVerificationPreflightListingReport {
     pub listing_id: i64,
     pub status: String,
     pub reextraction_required: bool,
     pub retained_identity_components: usize,
     pub verified_local_identity_components: usize,
-    pub gemini_initial_identity_components: usize,
-    pub gemini_conditional_relationship_components: usize,
+    pub candidate_adjudication_identity_components: usize,
+    pub candidate_adjudication_conditional_relationship_components: usize,
+    pub grounded_initial_identity_components: usize,
+    pub grounded_conditional_relationship_components: usize,
     pub invalid_retained_observations: usize,
     pub note: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AvionicsRepopulationListingReport {
+pub struct AvionicsVerificationListingReport {
     pub listing_id: i64,
     pub submission_id: Option<i64>,
     pub source_match: Option<String>,
@@ -254,12 +262,12 @@ pub struct AvionicsRepopulationListingReport {
     pub remaining_review_aspects: usize,
     pub status: String,
     pub applied: bool,
-    pub candidates: Vec<AvionicsRepopulationCandidateReport>,
+    pub candidates: Vec<AvionicsVerificationCandidateReport>,
     pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct AvionicsRepopulationCandidateReport {
+pub struct AvionicsVerificationCandidateReport {
     pub candidate_index: usize,
     pub role: String,
     pub manufacturer: String,
@@ -276,6 +284,32 @@ pub struct AvionicsRepopulationCandidateReport {
     pub canonical_model: Option<String>,
     pub canonical_types: Vec<String>,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ListingAvionicsVerificationPreflight {
+    NoPendingReview {
+        listing_id: i64,
+        ingestion_state: String,
+        is_verified: bool,
+    },
+    PendingReview {
+        report: AvionicsVerificationPreflightListingReport,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ListingAvionicsVerification {
+    NoPendingReview {
+        listing_id: i64,
+        ingestion_state: String,
+        is_verified: bool,
+    },
+    Processed {
+        report: AvionicsVerificationListingReport,
+    },
 }
 
 #[derive(Debug, FromRow)]
@@ -299,6 +333,12 @@ struct ListingSourceRow {
     rendered_html_sha256: Option<String>,
     extracted_listing_json: Option<String>,
     submission_extraction_error: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct ListingVerificationStateRow {
+    ingestion_state: String,
+    is_verified: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -327,7 +367,7 @@ struct IdentityInput<'a> {
 }
 
 struct IdentityAttempt {
-    report: AvionicsRepopulationCandidateReport,
+    report: AvionicsVerificationCandidateReport,
     approved_id: Option<i64>,
     identity_key: Option<String>,
     suggested_product: Option<ReviewProduct>,
@@ -344,16 +384,16 @@ struct IdentityAttempt {
 /// atomically accepts only grounded products with exact high-confidence
 /// listing evidence, safely discards grounded garbage, and leaves every other
 /// aspect pending. Signed plugin payloads are never overwritten.
-pub async fn repopulate_listing_avionics(
+pub async fn verify_listing_avionics_page(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
-    mode: AvionicsRepopulationExecutionMode,
-    scope: &AvionicsRepopulationScope,
-) -> RepopulationResult<AvionicsRepopulationReport> {
+    mode: AvionicsVerificationExecutionMode,
+    scope: &AvionicsVerificationScope,
+) -> VerificationResult<AvionicsVerificationReport> {
     scope.validate()?;
     let page = load_listing_sources(db, scope).await?;
     if scope.listing_id.is_some() && page.rows.is_empty() {
-        return Err(AvionicsRepopulationError::Validation(format!(
+        return Err(AvionicsVerificationError::Validation(format!(
             "listing {} has no pending review to automate",
             scope.listing_id.unwrap_or_default()
         )));
@@ -368,7 +408,7 @@ pub async fn repopulate_listing_avionics(
         listings.push(process_listing(db, extractor, apply, &row, &mut catalog_statuses).await);
     }
     let summary = summarize(&listings);
-    Ok(AvionicsRepopulationReport {
+    Ok(AvionicsVerificationReport {
         mode: mode.label().to_string(),
         requested_limit: scope.limit,
         requested_listing_id: scope.listing_id,
@@ -387,16 +427,86 @@ pub async fn repopulate_listing_avionics(
     })
 }
 
+/// Inspect one listing without making a provider request.
+///
+/// A listing with no pending avionics review is a typed no-op rather than an
+/// error. This lets ingestion, retry workers, and administrative pages share
+/// one idempotent domain entry point.
+pub async fn preflight_listing_avionics(
+    db: &AppDb,
+    listing_id: i64,
+) -> VerificationResult<ListingAvionicsVerificationPreflight> {
+    if listing_id < 1 {
+        return Err(AvionicsVerificationError::Validation(
+            "listing_id must be a positive integer".to_string(),
+        ));
+    }
+    let scope = AvionicsVerificationScope::new(1, Some(listing_id), None);
+    let page = load_listing_sources(db, &scope).await?;
+    match page.rows.as_slice() {
+        [row] => Ok(ListingAvionicsVerificationPreflight::PendingReview {
+            report: preflight_listing(db, row).await,
+        }),
+        [] => {
+            let state = load_listing_verification_state(db, listing_id).await?;
+            Ok(ListingAvionicsVerificationPreflight::NoPendingReview {
+                listing_id,
+                ingestion_state: state.ingestion_state,
+                is_verified: state.is_verified,
+            })
+        }
+        _ => unreachable!("an exact listing verification scope loads at most one row"),
+    }
+}
+
+/// Verify one pending listing's avionics through the shared local-first
+/// workflow and atomic apply boundary.
+///
+/// Repeating the call after the review has cleared returns `NoPendingReview`
+/// and performs no catalog, link, review, or provider work.
+pub async fn verify_listing_avionics(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    mode: AvionicsVerificationExecutionMode,
+    listing_id: i64,
+) -> VerificationResult<ListingAvionicsVerification> {
+    if listing_id < 1 {
+        return Err(AvionicsVerificationError::Validation(
+            "listing_id must be a positive integer".to_string(),
+        ));
+    }
+    let scope = AvionicsVerificationScope::new(1, Some(listing_id), None);
+    let page = load_listing_sources(db, &scope).await?;
+    match page.rows.as_slice() {
+        [row] => {
+            let mut catalog_statuses = load_catalog_statuses(db).await?;
+            Ok(ListingAvionicsVerification::Processed {
+                report: process_listing(db, extractor, mode.applies(), row, &mut catalog_statuses)
+                    .await,
+            })
+        }
+        [] => {
+            let state = load_listing_verification_state(db, listing_id).await?;
+            Ok(ListingAvionicsVerification::NoPendingReview {
+                listing_id,
+                ingestion_state: state.ingestion_state,
+                is_verified: state.is_verified,
+            })
+        }
+        _ => unreachable!("an exact listing verification scope loads at most one row"),
+    }
+}
+
 /// Inspect the selected page and produce a provider-request plan without
 /// constructing a Gemini client or making any provider request.
-pub async fn preflight_listing_avionics_repopulation(
+pub async fn preflight_listing_avionics_page(
     db: &AppDb,
-    scope: &AvionicsRepopulationScope,
-) -> RepopulationResult<AvionicsRepopulationPreflightReport> {
+    scope: &AvionicsVerificationScope,
+) -> VerificationResult<AvionicsVerificationPreflightReport> {
     scope.validate()?;
     let page = load_listing_sources(db, scope).await?;
     if scope.listing_id.is_some() && page.rows.is_empty() {
-        return Err(AvionicsRepopulationError::Validation(format!(
+        return Err(AvionicsVerificationError::Validation(format!(
             "listing {} has no pending review to automate",
             scope.listing_id.unwrap_or_default()
         )));
@@ -413,10 +523,10 @@ impl ListingSourcePage {
     fn checkpoint(
         &self,
         requested_after_listing_id: Option<i64>,
-    ) -> AvionicsRepopulationCheckpoint {
+    ) -> AvionicsVerificationCheckpoint {
         let page_first_listing_id = self.rows.first().map(|row| row.listing_id);
         let page_last_listing_id = self.rows.last().map(|row| row.listing_id);
-        AvionicsRepopulationCheckpoint {
+        AvionicsVerificationCheckpoint {
             requested_after_listing_id,
             page_first_listing_id,
             page_last_listing_id,
@@ -428,23 +538,45 @@ impl ListingSourcePage {
 
 async fn build_preflight_report(
     db: &AppDb,
-    scope: &AvionicsRepopulationScope,
+    scope: &AvionicsVerificationScope,
     page: &ListingSourcePage,
-) -> AvionicsRepopulationPreflightReport {
+) -> AvionicsVerificationPreflightReport {
     let mut listings = Vec::with_capacity(page.rows.len());
     for row in &page.rows {
         listings.push(preflight_listing(db, row).await);
     }
-    let mut summary = AvionicsRepopulationPreflightSummary {
+    let summary = summarize_preflight(&listings);
+    let provider_request_plan = provider_request_plan(&summary);
+    AvionicsVerificationPreflightReport {
+        mode: "preflight".to_string(),
+        requested_limit: scope.limit,
+        requested_listing_id: scope.listing_id,
+        requested_after_listing_id: scope.after_listing_id,
+        checkpoint: page.checkpoint(scope.after_listing_id),
+        provider_request_plan,
+        listings,
+        summary,
+    }
+}
+
+fn summarize_preflight(
+    listings: &[AvionicsVerificationPreflightListingReport],
+) -> AvionicsVerificationPreflightSummary {
+    let mut summary = AvionicsVerificationPreflightSummary {
         listings_selected: listings.len(),
-        ..AvionicsRepopulationPreflightSummary::default()
+        ..AvionicsVerificationPreflightSummary::default()
     };
-    for listing in &listings {
+    for listing in listings {
         summary.retained_identity_components += listing.retained_identity_components;
         summary.verified_local_identity_components += listing.verified_local_identity_components;
-        summary.gemini_initial_identity_components += listing.gemini_initial_identity_components;
-        summary.gemini_conditional_relationship_components +=
-            listing.gemini_conditional_relationship_components;
+        summary.candidate_adjudication_identity_components +=
+            listing.candidate_adjudication_identity_components;
+        summary.candidate_adjudication_conditional_relationship_components +=
+            listing.candidate_adjudication_conditional_relationship_components;
+        summary.grounded_initial_identity_components +=
+            listing.grounded_initial_identity_components;
+        summary.grounded_conditional_relationship_components +=
+            listing.grounded_conditional_relationship_components;
         summary.invalid_retained_observations += listing.invalid_retained_observations;
         match listing.status.as_str() {
             "ready_retained_observations" => {
@@ -457,31 +589,34 @@ async fn build_preflight_report(
             _ => summary.listings_blocked += 1,
         }
     }
-    let provider_request_plan = provider_request_plan(&summary);
-    AvionicsRepopulationPreflightReport {
-        mode: "preflight".to_string(),
-        requested_limit: scope.limit,
-        requested_listing_id: scope.listing_id,
-        requested_after_listing_id: scope.after_listing_id,
-        checkpoint: page.checkpoint(scope.after_listing_id),
-        provider_request_plan,
-        listings,
-        summary,
-    }
+    summary
+}
+
+/// Aggregate the exact logical provider plan for an arbitrary listing page.
+///
+/// The top-level aircraft-and-avionics verifier owns its own listing
+/// selection, so it uses this boundary instead of approximating costs from a
+/// separately selected avionics page.
+pub fn provider_request_plan_for_listing_preflights(
+    listings: &[AvionicsVerificationPreflightListingReport],
+) -> AvionicsProviderRequestPlan {
+    provider_request_plan(&summarize_preflight(listings))
 }
 
 async fn preflight_listing(
     db: &AppDb,
     row: &ListingSourceRow,
-) -> AvionicsRepopulationPreflightListingReport {
-    let mut report = AvionicsRepopulationPreflightListingReport {
+) -> AvionicsVerificationPreflightListingReport {
+    let mut report = AvionicsVerificationPreflightListingReport {
         listing_id: row.listing_id,
         status: "blocked".to_string(),
         reextraction_required: false,
         retained_identity_components: 0,
         verified_local_identity_components: 0,
-        gemini_initial_identity_components: 0,
-        gemini_conditional_relationship_components: 0,
+        candidate_adjudication_identity_components: 0,
+        candidate_adjudication_conditional_relationship_components: 0,
+        grounded_initial_identity_components: 0,
+        grounded_conditional_relationship_components: 0,
         invalid_retained_observations: 0,
         note: String::new(),
     };
@@ -532,7 +667,7 @@ async fn preflight_listing(
             report.invalid_retained_observations += 1;
             continue;
         }
-        let primary_is_local = match preflight_identity_component(
+        let primary_route = match preflight_identity_component(
             db,
             row,
             row.submission_source_url.as_deref(),
@@ -547,23 +682,29 @@ async fn preflight_listing(
         )
         .await
         {
-            Ok(is_local) => is_local,
+            Ok(route) => route,
             Err(error) => {
                 report.note = format!("verified-local identity preflight failed: {error}");
                 return report;
             }
         };
         report.retained_identity_components += 1;
-        if primary_is_local {
-            report.verified_local_identity_components += 1;
-        } else {
-            report.gemini_initial_identity_components += 1;
+        match primary_route {
+            AvionicsIdentityVerificationRoute::VerifiedLocal => {
+                report.verified_local_identity_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::CandidateAdjudication => {
+                report.candidate_adjudication_identity_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::GroundedCuration => {
+                report.grounded_initial_identity_components += 1;
+            }
         }
 
         let Some(replacement) = raw.replaces.as_ref() else {
             continue;
         };
-        let replacement_is_local = match preflight_identity_component(
+        let replacement_route = match preflight_identity_component(
             db,
             row,
             row.submission_source_url.as_deref(),
@@ -578,22 +719,36 @@ async fn preflight_listing(
         )
         .await
         {
-            Ok(is_local) => is_local,
+            Ok(route) => route,
             Err(error) => {
                 report.note = format!("verified-local replacement preflight failed: {error}");
                 return report;
             }
         };
         report.retained_identity_components += 1;
-        if replacement_is_local {
-            report.verified_local_identity_components += 1;
-        } else if primary_is_local {
-            // A locally approved primary cannot be rejected, so the execution
-            // path will necessarily evaluate its relationship target.
-            report.gemini_initial_identity_components += 1;
-        } else {
-            // A grounded rejection of the primary stops before the target.
-            report.gemini_conditional_relationship_components += 1;
+        match replacement_route {
+            AvionicsIdentityVerificationRoute::VerifiedLocal => {
+                report.verified_local_identity_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::CandidateAdjudication
+                if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
+            {
+                report.candidate_adjudication_identity_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::CandidateAdjudication => {
+                report.candidate_adjudication_conditional_relationship_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::GroundedCuration
+                if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
+            {
+                // A locally approved primary cannot be rejected, so the
+                // execution path necessarily evaluates its relationship.
+                report.grounded_initial_identity_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::GroundedCuration => {
+                // A rejected nonlocal primary stops before its target.
+                report.grounded_conditional_relationship_components += 1;
+            }
         }
     }
     report.status = "ready_retained_observations".to_string();
@@ -615,7 +770,7 @@ async fn preflight_identity_component(
     listing_context: &ListingEvidenceContext,
     identity: IdentityInput<'_>,
     source_evidence_text: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<AvionicsIdentityVerificationRoute, String> {
     let request = identity_request(
         row,
         source_url,
@@ -623,41 +778,54 @@ async fn preflight_identity_component(
         &identity,
         source_evidence_text,
     );
-    resolve_verified_local_avionics_identity(db, &request)
+    plan_avionics_identity_verification_route(db, &request)
         .await
-        .map(|identity| identity.is_some())
         .map_err(|error| error.to_string())
 }
 
 fn provider_request_plan(
-    summary: &AvionicsRepopulationPreflightSummary,
+    summary: &AvionicsVerificationPreflightSummary,
 ) -> AvionicsProviderRequestPlan {
     let reextractions = summary.listings_requiring_legacy_reextraction;
-    let initial = summary.gemini_initial_identity_components;
-    let all_grounded_components =
-        initial.saturating_add(summary.gemini_conditional_relationship_components);
+    let candidate = summary.candidate_adjudication_identity_components;
+    let conditional_candidate = summary.candidate_adjudication_conditional_relationship_components;
+    let all_candidate_components = candidate.saturating_add(conditional_candidate);
+    let grounded = summary.grounded_initial_identity_components;
+    let conditional_grounded = summary.grounded_conditional_relationship_components;
+    let all_grounded_components = grounded.saturating_add(conditional_grounded);
     AvionicsProviderRequestPlan {
         listings_requiring_legacy_reextraction: reextractions,
         listing_extraction_provider_requests_baseline: reextractions,
         listing_extraction_provider_requests_validation_envelope: reextractions.saturating_mul(2),
         retained_identity_components: summary.retained_identity_components,
         verified_local_identity_components: summary.verified_local_identity_components,
-        gemini_initial_identity_components: initial,
-        gemini_conditional_relationship_components: summary
-            .gemini_conditional_relationship_components,
-        initial_grounded_provider_requests_baseline: initial.saturating_mul(3),
-        initial_grounded_provider_requests_nonpositive_validation_envelope: initial
+        candidate_adjudication_identity_components: candidate,
+        candidate_adjudication_conditional_relationship_components: conditional_candidate,
+        candidate_adjudication_provider_requests_baseline: candidate,
+        candidate_grounded_fallback_provider_requests_baseline_maximum: all_candidate_components
+            .saturating_mul(3),
+        grounded_initial_identity_components: grounded,
+        grounded_conditional_relationship_components: conditional_grounded,
+        initial_grounded_provider_requests_baseline: grounded.saturating_mul(3),
+        initial_grounded_provider_requests_nonpositive_validation_envelope: grounded
             .saturating_mul(8),
         positive_identity_provider_requests_baseline: all_grounded_components.saturating_mul(6),
         positive_identity_provider_requests_validation_envelope: all_grounded_components
             .saturating_mul(14),
         known_total_provider_requests_minimum_baseline: reextractions
-            .saturating_add(initial.saturating_mul(3)),
+            .saturating_add(candidate)
+            .saturating_add(grounded.saturating_mul(3)),
         known_total_provider_requests_all_positive_baseline: reextractions
+            .saturating_add(all_candidate_components)
             .saturating_add(all_grounded_components.saturating_mul(6)),
         known_total_provider_requests_validation_envelope_maximum: reextractions
             .saturating_mul(2)
-            .saturating_add(all_grounded_components.saturating_mul(14)),
+            .saturating_add(all_candidate_components)
+            .saturating_add(
+                all_grounded_components
+                    .saturating_add(all_candidate_components)
+                    .saturating_mul(14),
+            ),
         legacy_reextraction_identity_outputs_unknown: reextractions > 0,
         logical_provider_request_counts_include_transport_retries: false,
         default_max_transport_attempts_per_logical_request: usize::from(
@@ -667,7 +835,7 @@ fn provider_request_plan(
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every conditional relationship target is skipped because its primary identity is rejected. The all-positive baseline includes every conditional target and collision pass. Both use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every bounded candidate adjudication succeeds without Search and every conditional relationship target is skipped. Candidate adjudication is one tools-disabled request; an uncertain, negative, invalid, or stale answer falls through to the ordinary grounded pipeline. The all-positive baseline includes every conditional target but assumes candidate adjudication succeeds. The maximum validation envelope includes grounded fallback for every candidate. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -678,9 +846,9 @@ async fn process_listing(
     apply: bool,
     row: &ListingSourceRow,
     catalog_statuses: &mut HashMap<i64, String>,
-) -> AvionicsRepopulationListingReport {
+) -> AvionicsVerificationListingReport {
     let source_url = row.submission_source_url.clone();
-    let mut listing_report = AvionicsRepopulationListingReport {
+    let mut listing_report = AvionicsVerificationListingReport {
         listing_id: row.listing_id,
         submission_id: row.submission_id,
         source_match: None,
@@ -1235,7 +1403,7 @@ fn merge_prepared_link_for_candidate(
     }
 }
 
-fn mark_weak_listing_evidence(report: &mut AvionicsRepopulationCandidateReport) {
+fn mark_weak_listing_evidence(report: &mut AvionicsVerificationCandidateReport) {
     report.status = "unresolved".to_string();
     report.reason = format!(
         "the product identity was verified, but the listing occurrence requires exact high-confidence source evidence; {}",
@@ -2083,7 +2251,7 @@ fn preview_approved_identity_key(approved: &ApprovedAvionicsIdentity) -> Option<
 async fn load_approved_graph_identity_key(
     db: &AppDb,
     avionics_model_id: i64,
-) -> RepopulationResult<String> {
+) -> VerificationResult<String> {
     let sql = db.sql(
         r#"
         SELECT avionics_manufacturer_identity_id, canonical_product_key
@@ -2106,12 +2274,12 @@ async fn load_approved_graph_identity_key(
         }
     };
     let (manufacturer_identity_id, product_key) = identity.ok_or_else(|| {
-        AvionicsRepopulationError::Validation(format!(
+        AvionicsVerificationError::Validation(format!(
             "approved catalog id {avionics_model_id} has no stable product identity"
         ))
     })?;
     approved_avionics_product_key(manufacturer_identity_id, &product_key)
-        .map_err(AvionicsRepopulationError::Validation)
+        .map_err(AvionicsVerificationError::Validation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2128,8 +2296,8 @@ fn outcome_report(
     canonical_model: Option<String>,
     canonical_types: Vec<String>,
     reason: String,
-) -> AvionicsRepopulationCandidateReport {
-    AvionicsRepopulationCandidateReport {
+) -> AvionicsVerificationCandidateReport {
+    AvionicsVerificationCandidateReport {
         candidate_index,
         role: role.to_string(),
         manufacturer: identity.manufacturer.to_string(),
@@ -2161,8 +2329,8 @@ fn input_error_report(
     source_evidence_text: Option<String>,
     source_confidence: Option<String>,
     reason: &str,
-) -> AvionicsRepopulationCandidateReport {
-    AvionicsRepopulationCandidateReport {
+) -> AvionicsVerificationCandidateReport {
+    AvionicsVerificationCandidateReport {
         candidate_index,
         role: role.to_string(),
         manufacturer: manufacturer.to_string(),
@@ -2497,8 +2665,8 @@ fn validate_exact_listing_evidence(
 
 async fn load_listing_sources(
     db: &AppDb,
-    scope: &AvionicsRepopulationScope,
-) -> RepopulationResult<ListingSourcePage> {
+    scope: &AvionicsVerificationScope,
+) -> VerificationResult<ListingSourcePage> {
     let predicate = if scope.listing_id.is_some() {
         "WHERE listing.id = ?"
     } else if scope.after_listing_id.is_some() {
@@ -2594,7 +2762,32 @@ async fn load_listing_sources(
     Ok(ListingSourcePage { rows, has_more })
 }
 
-async fn load_catalog_statuses(db: &AppDb) -> RepopulationResult<HashMap<i64, String>> {
+async fn load_listing_verification_state(
+    db: &AppDb,
+    listing_id: i64,
+) -> VerificationResult<ListingVerificationStateRow> {
+    let sql =
+        db.sql("SELECT ingestion_state, is_verified FROM aircraft_sale_listings WHERE id = ?");
+    let state = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, ListingVerificationStateRow>(&sql)
+                .bind(listing_id)
+                .fetch_optional(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, ListingVerificationStateRow>(&sql)
+                .bind(listing_id)
+                .fetch_optional(pool)
+                .await?
+        }
+    };
+    state.ok_or_else(|| {
+        AvionicsVerificationError::Validation(format!("listing {listing_id} not found"))
+    })
+}
+
+async fn load_catalog_statuses(db: &AppDb) -> VerificationResult<HashMap<i64, String>> {
     let sql = db.sql("SELECT id, catalog_status FROM avionics_models ORDER BY id");
     let rows = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
@@ -2614,7 +2807,7 @@ async fn load_catalog_statuses(db: &AppDb) -> RepopulationResult<HashMap<i64, St
         .collect())
 }
 
-fn validate_prepared_links(links: &[PreparedLink]) -> RepopulationResult<()> {
+fn validate_prepared_links(links: &[PreparedLink]) -> VerificationResult<()> {
     let mut canonical_actions = Vec::with_capacity(links.len());
     for link in links {
         match link.configuration_action.as_str() {
@@ -2640,7 +2833,7 @@ fn validate_prepared_links(links: &[PreparedLink]) -> RepopulationResult<()> {
                         || link.replaces_avionics_model_id == Some(0)
                         || link.replaces_avionics_model_id == Some(link.avionics_model_id)) => {}
             _ => {
-                return Err(AvionicsRepopulationError::Validation(format!(
+                return Err(AvionicsVerificationError::Validation(format!(
                     "catalog id {} has invalid {} subject/target semantics",
                     link.avionics_model_id, link.configuration_action
                 )))
@@ -2653,14 +2846,14 @@ fn validate_prepared_links(links: &[PreparedLink]) -> RepopulationResult<()> {
         ));
     }
     validate_canonical_avionics_actions(&canonical_actions)
-        .map_err(AvionicsRepopulationError::Validation)?;
+        .map_err(AvionicsVerificationError::Validation)?;
     Ok(())
 }
 
-fn summarize(listings: &[AvionicsRepopulationListingReport]) -> AvionicsRepopulationSummary {
-    let mut summary = AvionicsRepopulationSummary {
+fn summarize(listings: &[AvionicsVerificationListingReport]) -> AvionicsVerificationSummary {
+    let mut summary = AvionicsVerificationSummary {
         listings_selected: listings.len(),
-        ..AvionicsRepopulationSummary::default()
+        ..AvionicsVerificationSummary::default()
     };
     for listing in listings {
         summary.accepted += listing.accepted;
@@ -2702,19 +2895,26 @@ mod tests {
 
     #[test]
     fn provider_request_plan_counts_logical_stages_not_transport_attempts() {
-        let plan = provider_request_plan(&AvionicsRepopulationPreflightSummary {
+        let plan = provider_request_plan(&AvionicsVerificationPreflightSummary {
             listings_requiring_legacy_reextraction: 2,
-            retained_identity_components: 5,
+            retained_identity_components: 8,
             verified_local_identity_components: 1,
-            gemini_initial_identity_components: 3,
-            gemini_conditional_relationship_components: 1,
-            ..AvionicsRepopulationPreflightSummary::default()
+            candidate_adjudication_identity_components: 2,
+            candidate_adjudication_conditional_relationship_components: 1,
+            grounded_initial_identity_components: 3,
+            grounded_conditional_relationship_components: 1,
+            ..AvionicsVerificationPreflightSummary::default()
         });
 
         assert_eq!(plan.listing_extraction_provider_requests_baseline, 2);
         assert_eq!(
             plan.listing_extraction_provider_requests_validation_envelope,
             4
+        );
+        assert_eq!(plan.candidate_adjudication_provider_requests_baseline, 2);
+        assert_eq!(
+            plan.candidate_grounded_fallback_provider_requests_baseline_maximum,
+            9
         );
         assert_eq!(plan.initial_grounded_provider_requests_baseline, 9);
         assert_eq!(
@@ -2726,11 +2926,11 @@ mod tests {
             plan.positive_identity_provider_requests_validation_envelope,
             56
         );
-        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 11);
-        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 26);
+        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 13);
+        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 29);
         assert_eq!(
             plan.known_total_provider_requests_validation_envelope_maximum,
-            60
+            105
         );
         assert!(plan.legacy_reextraction_identity_outputs_unknown);
         assert!(!plan.logical_provider_request_counts_include_transport_retries);
@@ -2741,8 +2941,8 @@ mod tests {
     }
 
     #[test]
-    fn repopulation_scope_rejects_ambiguous_cursor() {
-        let error = AvionicsRepopulationScope::new(10, Some(12), Some(11))
+    fn verification_scope_rejects_ambiguous_cursor() {
+        let error = AvionicsVerificationScope::new(10, Some(12), Some(11))
             .validate()
             .expect_err("exact and cursor selection cannot be combined");
         assert!(error.to_string().contains("mutually exclusive"));
@@ -2770,12 +2970,10 @@ mod tests {
             listing_ids.push(listing_id);
         }
 
-        let first = preflight_listing_avionics_repopulation(
-            &db,
-            &AvionicsRepopulationScope::new(1, None, None),
-        )
-        .await
-        .unwrap();
+        let first =
+            preflight_listing_avionics_page(&db, &AvionicsVerificationScope::new(1, None, None))
+                .await
+                .unwrap();
         assert_eq!(first.mode, "preflight");
         assert_eq!(first.checkpoint.page_first_listing_id, Some(listing_ids[0]));
         assert_eq!(first.checkpoint.page_last_listing_id, Some(listing_ids[0]));
@@ -2785,9 +2983,9 @@ mod tests {
         );
         assert!(first.checkpoint.has_more);
 
-        let second = preflight_listing_avionics_repopulation(
+        let second = preflight_listing_avionics_page(
             &db,
-            &AvionicsRepopulationScope::new(1, None, Some(listing_ids[0])),
+            &AvionicsVerificationScope::new(1, None, Some(listing_ids[0])),
         )
         .await
         .unwrap();
@@ -2807,7 +3005,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repopulation_rejects_before_gemini_and_link_replacement() {
+    async fn verification_rejects_before_gemini_and_link_replacement() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let listing_id = seed_listing(&db, "https://example.test/listing/faa-gate").await;
         seed_submission_and_review(
@@ -2824,11 +3022,11 @@ mod tests {
         .await;
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
 
-        let report = repopulate_listing_avionics(
+        let report = verify_listing_avionics_page(
             &db,
             &extractor,
-            AvionicsRepopulationExecutionMode::Apply,
-            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+            AvionicsVerificationExecutionMode::Apply,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
         .await
         .unwrap();
@@ -3661,7 +3859,7 @@ mod tests {
 
         let page = load_listing_sources(
             &db,
-            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
         .await
         .unwrap();
@@ -3698,7 +3896,7 @@ mod tests {
 
         let page = load_listing_sources(
             &db,
-            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
         .await
         .unwrap();
@@ -3741,7 +3939,7 @@ mod tests {
 
         let row = load_listing_sources(
             &db,
-            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
         .await
         .unwrap()
@@ -3780,7 +3978,7 @@ mod tests {
 
         let row = load_listing_sources(
             &db,
-            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
         .await
         .unwrap()
@@ -3810,7 +4008,7 @@ mod tests {
         .await;
         let mut rows = load_listing_sources(
             &db,
-            &AvionicsRepopulationScope::new(1, Some(listing_id), None),
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
         )
         .await
         .unwrap()
@@ -3833,6 +4031,50 @@ mod tests {
         assert!(validate_pending_source_binding(&row)
             .unwrap_err()
             .contains("review payload"));
+    }
+
+    #[tokio::test]
+    async fn per_listing_verification_is_a_provider_free_noop_without_pending_review() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = seed_listing(&db, "https://example.test/listing/no-review").await;
+
+        let preflight = preflight_listing_avionics(&db, listing_id)
+            .await
+            .expect("a listing without review should be a typed no-op");
+        assert!(matches!(
+            preflight,
+            ListingAvionicsVerificationPreflight::NoPendingReview {
+                listing_id: actual,
+                ref ingestion_state,
+                is_verified: false,
+            } if actual == listing_id && ingestion_state == "incomplete"
+        ));
+
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let verification = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("a repeated verifier must not require a provider");
+        assert!(matches!(
+            verification,
+            ListingAvionicsVerification::NoPendingReview {
+                listing_id: actual,
+                ref ingestion_state,
+                is_verified: false,
+            } if actual == listing_id && ingestion_state == "incomplete"
+        ));
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_count, 0);
     }
 
     async fn seed_listing(db: &AppDb, source_url: &str) -> i64 {

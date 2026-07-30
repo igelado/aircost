@@ -4,6 +4,7 @@ pub mod faa;
 pub mod identity;
 pub mod observations;
 pub mod reference;
+pub mod verification;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
