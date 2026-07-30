@@ -47,6 +47,13 @@ allow-list narrows again to the final URLs of publisher documents the server
 actually fetched into its bounded evidence packet. Search-only or failed-fetch
 citation URLs are removed from structure citation records and prompt prose;
 they cannot be emitted as structured source fields.
+Each bounded publisher window receives a transient request-local identifier.
+Evidence fields in the structure schema select one of those identifiers instead
+of asking Gemini to reproduce or count offsets into publisher prose. The server
+binds the selection to its sibling source URL, replaces it with the exact window
+text, and then runs the unchanged document, digest, evidence-proof, and domain
+validators. Unknown, cross-source, or nested/offset-shaped selections fail
+closed, and neither selectors nor evidence packets are persisted.
 An unusable Search-discovery redirect is discarded when another citation
 resolves successfully; the unresolved URL is never forwarded as a fallback.
 If none resolve, Search retries normally. URL Context citation resolution
