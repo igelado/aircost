@@ -1,24 +1,26 @@
 import { displayLabel, renderAvionicsChips, safeDetailLink } from "/avionics.js";
 import {
   filterPipelineRows,
+  pipelineAutomaticEligibility,
   pipelineCheckpoint,
   pipelineProviderPlan,
   pipelineRowsFromResponse,
   pipelineServiceStatus,
   pipelineSummary,
+  verificationRunIdempotencyKey,
+  verificationRunRequest,
+  verificationRunState,
+  verificationRunStatusView,
 } from "/review/automation.mjs";
 import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
   associationsNeedingSourceRecovery,
-  automaticListingVerificationRequest,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   characterLimitState,
   describeAircraftIdentity,
-  describeAutomaticListingVerificationError,
-  describeAutomaticListingVerificationOutcome,
   describeProductAssociationOutcome,
   describeResolvedListingOutcome,
   describeReviewReasons,
@@ -43,6 +45,8 @@ const REVIEW_AREA_PARAM = "review_area";
 const QUEUE_LIMIT = 100;
 const CATALOG_RESULT_LIMIT = 8;
 const CATALOG_SEARCH_DELAY_MS = 250;
+const VERIFICATION_RUN_POLL_MS = 2000;
+const VERIFICATION_RUN_STORAGE_KEY = "aircost.current-verification-run-id";
 const SUPPORTED_ACTIONS = Object.freeze([
   "use_verified_product",
   "create_verified_product",
@@ -71,6 +75,16 @@ const state = {
   pipelineRows: [],
   pipelineFilter: "all",
   pipelineSearch: "",
+  pipelineSelectedListingIds: new Set(),
+  verificationRunRequestSequence: 0,
+  verificationRunPollTimer: null,
+  activeVerificationRunId: null,
+  activeVerificationRun: null,
+  activeVerificationRunItems: [],
+  activeVerificationRunItemByListing: new Map(),
+  reconciledVerificationRunId: null,
+  verificationRunCreating: false,
+  verificationRunCancelling: false,
   productRequestSequence: 0,
   productDetailRequestSequence: 0,
   productGroups: [],
@@ -90,7 +104,6 @@ const state = {
   stale: false,
   resolving: false,
   automating: false,
-  automaticVerificationSequence: 0,
   automationControlStates: new Map(),
 };
 
@@ -113,6 +126,7 @@ export function initializeReviewWorkspace(shared) {
   collectElements();
   bindEvents();
   setQueueMode(state.queueMode, { load: false });
+  state.activeVerificationRunId = storedVerificationRunId();
   initialized = true;
 
   return Object.freeze({
@@ -122,11 +136,23 @@ export function initializeReviewWorkspace(shared) {
         setQueueMode("listing", { load: false });
         state.activeArea = reviewAreaFromLocation() ?? "avionics";
         const queueLoad = state.queueLoaded ? Promise.resolve() : loadQueue({ quiet: true });
+        const pipelineLoad = state.pipelineLoaded
+          ? Promise.resolve()
+          : loadPipelineQueue({ quiet: true });
         const detailLoad = openReview(listingId, { historyMode: "none", discardDraft: true });
-        return Promise.allSettled([queueLoad, detailLoad]);
+        const runLoad = state.activeVerificationRunId === null
+          ? Promise.resolve()
+          : resumeVerificationRun(state.activeVerificationRunId);
+        return Promise.allSettled([queueLoad, pipelineLoad, detailLoad, runLoad]);
       }
       showQueue({ historyMode: "none", discardDraft: true });
-      return state.pipelineLoaded ? Promise.resolve() : loadPipelineQueue();
+      const pipelineLoad = state.pipelineLoaded
+        ? Promise.resolve()
+        : loadPipelineQueue();
+      const runLoad = state.activeVerificationRunId === null
+        ? Promise.resolve()
+        : resumeVerificationRun(state.activeVerificationRunId);
+      return Promise.allSettled([pipelineLoad, runLoad]);
     },
     refresh() {
       return refreshActiveQueue();
@@ -172,6 +198,18 @@ function collectElements() {
     reviewPipelineManualCount: "#review-pipeline-manual-count",
     reviewPipelineReferenceCount: "#review-pipeline-reference-count",
     reviewPipelineGeminiCount: "#review-pipeline-gemini-count",
+    reviewPipelineSelectAll: "#review-pipeline-select-all",
+    reviewPipelineVerify: "#review-pipeline-verify",
+    reviewPipelineSelectionCount: "#review-pipeline-selection-count",
+    reviewRun: "#review-run",
+    reviewRunTitle: "#review-run-title",
+    reviewRunStatus: "#review-run-status",
+    reviewRunCancel: "#review-run-cancel",
+    reviewRunProgress: "#review-run-progress",
+    reviewRunProgressLabel: "#review-run-progress-label",
+    reviewRunCurrent: "#review-run-current",
+    reviewRunCounts: "#review-run-counts",
+    reviewRunItemsBody: "#review-run-items-body",
     reviewResults: "#review-results",
     reviewTableBody: "#review-table-body",
     emptyReviews: "#empty-reviews",
@@ -239,12 +277,37 @@ function bindEvents() {
     state.pipelineFilter = elements.reviewPipelineFilter.value;
     renderPipelineTable();
   });
+  elements.reviewPipelineSelectAll.addEventListener("click", selectAllActionablePipelineRows);
+  elements.reviewPipelineVerify.addEventListener("click", () => {
+    startVerificationRun(Array.from(state.pipelineSelectedListingIds));
+  });
+  elements.reviewRunCancel.addEventListener("click", cancelActiveVerificationRun);
   elements.reviewPipelineTableBody.addEventListener("click", (event) => {
+    const checkbox = event.target.closest("input[data-pipeline-listing-id]");
+    const selectedListingId = positiveInteger(checkbox?.dataset.pipelineListingId);
+    if (selectedListingId !== null) {
+      if (checkbox.checked) {
+        state.pipelineSelectedListingIds.add(selectedListingId);
+      } else {
+        state.pipelineSelectedListingIds.delete(selectedListingId);
+      }
+      renderPipelineSelection();
+      return;
+    }
     const button = event.target.closest("button[data-review-listing-id]");
     const listingId = positiveInteger(button?.dataset.reviewListingId);
     if (listingId !== null) {
       setQueueMode("listing", { load: false });
       openReview(listingId, { historyMode: "push" });
+    }
+  });
+  elements.reviewRunItemsBody.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-review-listing-id]");
+    const listingId = positiveInteger(button?.dataset.reviewListingId);
+    const row = pipelineRowForListing(listingId);
+    if (listingId !== null && row?.hasPendingReview) {
+      setQueueMode("listing", { load: false });
+      openReview(listingId, { historyMode: "push", force: true });
     }
   });
   elements.reviewProductTableBody.addEventListener("click", (event) => {
@@ -458,8 +521,21 @@ async function loadPipelineQueue({ quiet = false } = {}) {
     }
     state.pipelineResponses = responses;
     state.pipelineRows = responses.flatMap(pipelineRowsFromResponse);
+    const actionableIds = new Set(
+      state.pipelineRows
+        .filter((row) => pipelineAutomaticEligibility(row).eligible)
+        .map((row) => row.listingId),
+    );
+    state.pipelineSelectedListingIds = new Set(
+      Array.from(state.pipelineSelectedListingIds)
+        .filter((listingId) => actionableIds.has(listingId)),
+    );
     state.pipelineLoaded = true;
-    renderPipeline();
+    if (state.queueMode === "pipeline") {
+      renderPipeline();
+    } else {
+      updateProgress();
+    }
     if (!quiet) {
       setQueueMessage(
         `${state.pipelineRows.length} non-ready `
@@ -488,6 +564,8 @@ function renderPipeline() {
   renderPipelineMetrics();
   renderPipelinePlan();
   renderPipelineTable();
+  renderPipelineSelection();
+  renderVerificationRun();
 }
 
 function renderPipelineMetrics() {
@@ -579,6 +657,28 @@ function renderPipelineTable() {
 
 function pipelineTableRow(item) {
   const row = document.createElement("tr");
+  const eligibility = pipelineAutomaticEligibility(item);
+  const selection = document.createElement("td");
+  selection.dataset.label = "Select";
+  if (eligibility.eligible) {
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.pipelineListingId = String(item.listingId);
+    checkbox.checked = state.pipelineSelectedListingIds.has(item.listingId);
+    checkbox.disabled = activeVerificationRunIsBusy();
+    checkbox.setAttribute(
+      "aria-label",
+      `Select ${item.label} for automatic verification`,
+    );
+    selection.append(checkbox);
+  } else {
+    const unavailable = document.createElement("span");
+    unavailable.className = "review-pipeline-no-action";
+    unavailable.textContent = "—";
+    unavailable.title = eligibility.reason;
+    unavailable.setAttribute("aria-label", `Not selectable: ${eligibility.reason}`);
+    selection.append(unavailable);
+  }
   const listing = document.createElement("td");
   listing.dataset.label = "Listing";
   const label = document.createElement("strong");
@@ -605,9 +705,28 @@ function pipelineTableRow(item) {
 
   const reason = queueTextCell("What remains", item.reason);
   reason.classList.add("review-pipeline-reason");
+  const runResult = document.createElement("td");
+  runResult.dataset.label = "Run result";
+  const runItem = state.activeVerificationRunItemByListing.get(item.listingId);
+  if (runItem) {
+    const view = verificationRunStatusView(runItem.status);
+    const status = document.createElement("span");
+    status.className = `review-pipeline-stage is-${view.tone}`;
+    status.textContent = view.label;
+    status.title = runItem.reason || view.detail;
+    runResult.append(status);
+  } else {
+    runResult.textContent = "—";
+  }
   const action = document.createElement("td");
   action.dataset.label = "Actions";
-  if (item.hasPendingReview) {
+  if (
+    item.hasPendingReview
+    && !(
+      activeVerificationRunIsBusy()
+      && verificationRunIncludesListing(item.listingId)
+    )
+  ) {
     const open = document.createElement("button");
     open.type = "button";
     open.className = "button review-open-button";
@@ -618,12 +737,25 @@ function pipelineTableRow(item) {
   } else {
     const unavailable = document.createElement("span");
     unavailable.className = "review-pipeline-no-action";
-    unavailable.textContent = item.reference.status === "pending_reference"
-      ? "Identity review complete"
-      : "No manual review available";
+    unavailable.textContent = activeVerificationRunIsBusy()
+      && verificationRunIncludesListing(item.listingId)
+      ? "Automatic verification running"
+      : item.reference.status === "pending_reference"
+        ? "Identity review complete"
+        : "No manual review available";
     action.append(unavailable);
   }
-  row.append(listing, aircraft, avionics, reference, gemini, reason, action);
+  row.append(
+    selection,
+    listing,
+    aircraft,
+    avionics,
+    reference,
+    gemini,
+    reason,
+    runResult,
+    action,
+  );
   return row;
 }
 
@@ -638,6 +770,499 @@ function pipelineStageCell(label, value) {
   }
   cell.append(status);
   return cell;
+}
+
+function pipelineRowForListing(listingId) {
+  return state.pipelineRows.find((row) => row.listingId === listingId) || null;
+}
+
+function selectAllActionablePipelineRows() {
+  if (activeVerificationRunIsBusy()) {
+    return;
+  }
+  const actionable = state.pipelineRows
+    .filter((row) => pipelineAutomaticEligibility(row).eligible)
+    .map((row) => row.listingId);
+  const allSelected = actionable.length > 0
+    && actionable.every((listingId) => (
+      state.pipelineSelectedListingIds.has(listingId)
+    ));
+  state.pipelineSelectedListingIds = new Set(allSelected ? [] : actionable);
+  renderPipelineTable();
+  renderPipelineSelection();
+}
+
+function renderPipelineSelection() {
+  const selectedCount = state.pipelineSelectedListingIds.size;
+  const actionable = state.pipelineRows.filter(
+    (row) => pipelineAutomaticEligibility(row).eligible,
+  );
+  const busy = activeVerificationRunIsBusy();
+  elements.reviewPipelineSelectionCount.textContent =
+    `${selectedCount} ${pluralize(selectedCount, "listing")} selected`;
+  elements.reviewPipelineVerify.textContent = selectedCount > 0
+    ? `Automatically verify ${selectedCount} selected`
+    : "Automatically verify selected";
+  elements.reviewPipelineVerify.disabled = busy || selectedCount === 0;
+  elements.reviewPipelineSelectAll.disabled = busy || actionable.length === 0;
+  const allSelected = actionable.length > 0
+    && actionable.every((row) => (
+      state.pipelineSelectedListingIds.has(row.listingId)
+    ));
+  elements.reviewPipelineSelectAll.textContent = allSelected
+    ? "Clear selection"
+    : "Select all automatic candidates";
+}
+
+function activeVerificationRunIsBusy() {
+  return state.verificationRunCreating
+    || (
+      state.activeVerificationRun !== null
+      && !state.activeVerificationRun.terminal
+    );
+}
+
+function verificationRunIncludesListing(listingId) {
+  return state.activeVerificationRunItems.some(
+    (item) => item.listingId === listingId,
+  );
+}
+
+function synchronizeOpenedListingAutomationBusy(
+  run = state.activeVerificationRun,
+) {
+  const listingId = currentListingId();
+  setAutomaticVerificationBusy(Boolean(
+    state.currentReview
+    && listingId !== null
+    && run
+    && !run.terminal
+    && verificationRunIncludesListing(listingId)
+  ));
+}
+
+async function startVerificationRun(listingIds, { openedListing = false } = {}) {
+  const request = verificationRunRequest(listingIds);
+  if (
+    request.listing_ids.length === 0
+    || state.verificationRunCreating
+    || activeVerificationRunIsBusy()
+  ) {
+    return;
+  }
+  const rows = request.listing_ids
+    .map(pipelineRowForListing)
+    .filter(Boolean);
+  if (
+    rows.length > 0
+    && rows.some((row) => !pipelineAutomaticEligibility(row).eligible)
+  ) {
+    const message = "Refresh the Pipeline before starting automatic verification.";
+    if (openedListing) {
+      setWorkspaceMessage(message, true);
+    } else {
+      setQueueMessage(message, true);
+    }
+    return;
+  }
+  const plan = pipelineProviderPlan(state.pipelineResponses);
+  const unsavedWarning = openedListing && hasDraftDecisions()
+    ? "This will discard the unsaved decisions in this review. "
+    : "";
+  const confirmed = window.confirm(
+    `${unsavedWarning}Automatically verify ${request.listing_ids.length} `
+      + `${pluralize(request.listing_ids.length, "listing")}? `
+      + "Local FAA and catalog checks run first. Unresolved identities may use paid Gemini calls. "
+      + `The current full Pipeline plan includes ${plan.aircraftGroundingCandidates} aircraft `
+      + `grounding ${pluralize(plan.aircraftGroundingCandidates, "candidate")} and estimates `
+      + `${plan.minimumBaselineRequests} minimum avionics baseline requests, `
+      + `${plan.allPositiveBaselineRequests} if all avionics identities are positive, `
+      + `and a ${plan.validationEnvelopeMaximum}-request avionics validation envelope; `
+      + "finalization enrichment is additional. There is no hard budget. Continue?",
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  state.verificationRunCreating = true;
+  if (openedListing) {
+    setAutomaticVerificationBusy(true);
+    setWorkspaceMessage("Creating a durable automatic verification run…");
+  } else {
+    setQueueMessage("Creating a durable automatic verification run…");
+  }
+  renderPipelineSelection();
+  try {
+    const payload = await api("/api/review/verification-runs", {
+      method: "POST",
+      headers: { "Idempotency-Key": verificationRunIdempotencyKey() },
+      body: JSON.stringify(request),
+    });
+    const runId = positiveInteger(payload?.run?.id);
+    if (runId === null) {
+      throw new Error("The server did not return a verification run ID.");
+    }
+    rememberVerificationRunId(runId);
+    state.reconciledVerificationRunId = null;
+    state.pipelineSelectedListingIds.clear();
+    await resumeVerificationRun(runId);
+  } catch (error) {
+    const activeRunId = error?.status === 409
+      ? positiveInteger(error?.payload?.error?.active_run_id)
+      : null;
+    if (activeRunId !== null) {
+      rememberVerificationRunId(activeRunId);
+      await resumeVerificationRun(activeRunId);
+    } else if (openedListing) {
+      setWorkspaceMessage(
+        `Could not start automatic verification: ${error.message}`,
+        true,
+      );
+    } else {
+      setQueueMessage(
+        `Could not start automatic verification: ${error.message}`,
+        true,
+      );
+    }
+  } finally {
+    state.verificationRunCreating = false;
+    if (openedListing) {
+      synchronizeOpenedListingAutomationBusy();
+    }
+    renderPipelineTable();
+    renderPipelineSelection();
+    updateProgress();
+  }
+}
+
+function rememberVerificationRunId(runId) {
+  if (state.activeVerificationRunId !== runId) {
+    state.reconciledVerificationRunId = null;
+  }
+  state.activeVerificationRunId = runId;
+  try {
+    window.localStorage.setItem(
+      VERIFICATION_RUN_STORAGE_KEY,
+      String(runId),
+    );
+  } catch {
+    // A disabled local store only removes reload recovery; server state remains authoritative.
+  }
+}
+
+function storedVerificationRunId() {
+  try {
+    return positiveInteger(
+      Number(window.localStorage.getItem(VERIFICATION_RUN_STORAGE_KEY)),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function forgetVerificationRunId(runId) {
+  if (state.activeVerificationRunId !== runId) {
+    return;
+  }
+  state.activeVerificationRunId = null;
+  state.activeVerificationRun = null;
+  state.activeVerificationRunItems = [];
+  state.activeVerificationRunItemByListing.clear();
+  state.reconciledVerificationRunId = null;
+  try {
+    window.localStorage.removeItem(VERIFICATION_RUN_STORAGE_KEY);
+  } catch {
+    // The server remains authoritative even when local recovery state is unavailable.
+  }
+}
+
+async function resumeVerificationRun(runId) {
+  const normalizedRunId = positiveInteger(runId);
+  if (normalizedRunId === null) {
+    return false;
+  }
+  if (state.verificationRunPollTimer !== null) {
+    window.clearTimeout(state.verificationRunPollTimer);
+    state.verificationRunPollTimer = null;
+  }
+  const sequence = ++state.verificationRunRequestSequence;
+  try {
+    const [runPayload, items] = await Promise.all([
+      api(`/api/review/verification-runs/${normalizedRunId}`),
+      loadVerificationRunItems(normalizedRunId, sequence),
+    ]);
+    if (sequence !== state.verificationRunRequestSequence) {
+      return false;
+    }
+    const view = verificationRunState(runPayload?.run, items);
+    if (view.id !== normalizedRunId || view.status === "unknown") {
+      throw new Error("The server returned an invalid verification run.");
+    }
+    rememberVerificationRunId(normalizedRunId);
+    state.activeVerificationRun = view;
+    state.activeVerificationRunItems = view.items;
+    state.activeVerificationRunItemByListing = new Map(
+      view.items.map((item) => [item.listingId, item]),
+    );
+    if (!view.terminal) {
+      synchronizeOpenedListingAutomationBusy(view);
+    }
+    renderVerificationRun();
+    renderPipelineTable();
+    renderPipelineSelection();
+    updateProgress();
+    updateOpenedListingRunProgress(view);
+
+    if (view.terminal) {
+      await reconcileCompletedVerificationRun(view, sequence);
+      if (sequence === state.verificationRunRequestSequence) {
+        synchronizeOpenedListingAutomationBusy(view);
+      }
+    } else {
+      state.verificationRunPollTimer = window.setTimeout(
+        () => resumeVerificationRun(normalizedRunId),
+        VERIFICATION_RUN_POLL_MS,
+      );
+    }
+    return true;
+  } catch (error) {
+    if (sequence !== state.verificationRunRequestSequence) {
+      return false;
+    }
+    if (error?.status === 404) {
+      forgetVerificationRunId(normalizedRunId);
+      synchronizeOpenedListingAutomationBusy();
+      renderVerificationRun();
+      renderPipelineTable();
+      renderPipelineSelection();
+    }
+    const message = `Could not refresh automatic verification run: ${error.message}`;
+    if (state.currentReview) {
+      setWorkspaceMessage(message, true);
+    } else {
+      setQueueMessage(message, true);
+    }
+    return false;
+  }
+}
+
+async function loadVerificationRunItems(runId, sequence) {
+  const items = [];
+  const seenCheckpoints = new Set();
+  let afterItemId = null;
+  do {
+    const params = new URLSearchParams({ limit: String(QUEUE_LIMIT) });
+    if (afterItemId !== null) {
+      params.set("after_item_id", String(afterItemId));
+    }
+    const payload = await api(
+      `/api/review/verification-runs/${runId}/items?${params}`,
+    );
+    if (sequence !== state.verificationRunRequestSequence) {
+      return [];
+    }
+    items.push(...(Array.isArray(payload?.items) ? payload.items : []));
+    const hasMore = payload?.checkpoint?.has_more === true;
+    if (!hasMore) {
+      break;
+    }
+    const resumeAfterItemId = positiveInteger(
+      payload?.checkpoint?.resume_after_item_id,
+    );
+    if (
+      resumeAfterItemId === null
+      || seenCheckpoints.has(resumeAfterItemId)
+    ) {
+      throw new Error("The server returned an invalid run-item checkpoint.");
+    }
+    seenCheckpoints.add(resumeAfterItemId);
+    afterItemId = resumeAfterItemId;
+  } while (true);
+  return items;
+}
+
+async function cancelActiveVerificationRun() {
+  const runId = state.activeVerificationRun?.id;
+  if (
+    !activeVerificationRunIsBusy()
+    || positiveInteger(runId) === null
+    || state.verificationRunCancelling
+  ) {
+    return;
+  }
+  state.verificationRunCancelling = true;
+  elements.reviewRunCancel.disabled = true;
+  elements.reviewRunStatus.textContent =
+    "Requesting a stop after the current listing…";
+  try {
+    await api(`/api/review/verification-runs/${runId}/cancel`, {
+      method: "POST",
+    });
+    await resumeVerificationRun(runId);
+  } catch (error) {
+    setQueueMessage(`Could not stop verification run: ${error.message}`, true);
+  } finally {
+    state.verificationRunCancelling = false;
+    renderVerificationRun();
+  }
+}
+
+function renderVerificationRun() {
+  const run = state.activeVerificationRun;
+  if (!run) {
+    elements.reviewRun.classList.add("is-hidden");
+    return;
+  }
+  elements.reviewRun.classList.remove("is-hidden");
+  const status = verificationRunStatusView(run.status);
+  elements.reviewRunTitle.textContent = `Verification run #${run.id}`;
+  elements.reviewRunStatus.textContent = run.status === "cancelled"
+    ? "Stopped. The run stopped after its current listing."
+    : `${status.label}. ${status.detail}`;
+  elements.reviewRunProgress.max = Math.max(run.total, 1);
+  elements.reviewRunProgress.value = Math.min(run.completed, run.total);
+  elements.reviewRunProgressLabel.textContent =
+    `${run.completed} of ${run.total} complete`;
+  const current = pipelineRowForListing(run.currentListingId);
+  elements.reviewRunCurrent.textContent = run.currentListingId === null
+    ? ""
+    : `Currently processing ${current?.label || `listing #${run.currentListingId}`}`;
+  elements.reviewRunCancel.classList.toggle(
+    "is-hidden",
+    !["queued", "running"].includes(run.status),
+  );
+  elements.reviewRunCancel.disabled = state.verificationRunCancelling;
+
+  const countViews = [
+    ["Queued", run.counts.queued],
+    ["Running", run.counts.running],
+    ["Verified", run.counts.verified],
+    ["Manual review", run.counts.pendingReview],
+    ["Reference pending", run.counts.pendingReference],
+    ["Blocked", run.counts.blocked],
+    ["Failed", run.counts.failed],
+    ["Cancelled", run.counts.cancelled],
+  ];
+  elements.reviewRunCounts.replaceChildren(...countViews.map(([label, count]) => {
+    const item = document.createElement("span");
+    item.textContent = `${label}: ${count}`;
+    return item;
+  }));
+  elements.reviewRunItemsBody.replaceChildren(
+    ...run.items.map(verificationRunItemRow),
+  );
+}
+
+function verificationRunItemRow(item) {
+  const row = document.createElement("tr");
+  const pipelineRow = pipelineRowForListing(item.listingId);
+  const statusView = verificationRunStatusView(item.status);
+  const listing = queueTextCell(
+    "Listing",
+    pipelineRow?.label || `Listing #${item.listingId}`,
+  );
+  const result = document.createElement("td");
+  result.dataset.label = "Result";
+  const status = document.createElement("span");
+  status.className = `review-pipeline-stage is-${statusView.tone}`;
+  status.textContent = statusView.label;
+  result.append(status);
+  const detail = queueTextCell(
+    "Detail",
+    verificationRunItemDetail(item, statusView.detail),
+  );
+  const action = document.createElement("td");
+  action.dataset.label = "Actions";
+  if (
+    item.status === "pending_review"
+    && state.reconciledVerificationRunId === state.activeVerificationRun?.id
+    && pipelineRow?.hasPendingReview
+  ) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "button";
+    open.dataset.reviewListingId = String(item.listingId);
+    open.textContent = "Open manual review";
+    open.setAttribute(
+      "aria-label",
+      `Open manual review for ${pipelineRow.label}`,
+    );
+    action.append(open);
+  } else {
+    action.textContent = "—";
+  }
+  row.append(listing, result, detail, action);
+  return row;
+}
+
+function verificationRunItemDetail(item, fallback) {
+  return item.reason
+    || optionalText(item.outcome?.finalization?.reason)
+    || optionalText(item.outcome?.avionics?.reason)
+    || optionalText(item.outcome?.aircraft?.reason)
+    || fallback;
+}
+
+function updateOpenedListingRunProgress(run) {
+  const listingId = currentListingId();
+  if (
+    listingId === null
+    || !verificationRunIncludesListing(listingId)
+  ) {
+    return;
+  }
+  const item = state.activeVerificationRunItemByListing.get(listingId);
+  const status = verificationRunStatusView(item?.status || run.status);
+  setWorkspaceMessage(
+    `${status.label}: ${verificationRunItemDetail(item || {}, status.detail)} `
+      + `Run progress: ${run.completed} of ${run.total} complete.`,
+    item?.status === "failed",
+  );
+}
+
+async function reconcileCompletedVerificationRun(run, sequence) {
+  await Promise.allSettled([
+    loadPipelineQueue({ quiet: true }),
+    loadQueue({ quiet: true }),
+    Promise.resolve(refreshListings?.()),
+    Promise.resolve(refreshAvionics?.()),
+  ]);
+  if (sequence !== state.verificationRunRequestSequence) {
+    return;
+  }
+  state.reconciledVerificationRunId = run.id;
+  if (state.queueMode === "pipeline") {
+    renderPipelineMetrics();
+    renderPipelinePlan();
+  }
+  renderVerificationRun();
+  renderPipelineTable();
+  renderPipelineSelection();
+  const listingId = currentListingId();
+  const item = state.activeVerificationRunItemByListing.get(listingId);
+  if (!item) {
+    setQueueMessage(
+      `Verification run #${run.id} ${run.status}. Review the terminal results below.`,
+    );
+    return;
+  }
+  const status = verificationRunStatusView(item.status);
+  if (item.status === "verified" || item.status === "pending_reference") {
+    await leaveAutomaticallyVerifiedReview(listingId, state.reviews.slice(), status.label);
+    return;
+  }
+  const refreshedRow = pipelineRowForListing(listingId);
+  if (refreshedRow?.hasPendingReview) {
+    await openReview(listingId, {
+      historyMode: "none",
+      discardDraft: true,
+      force: true,
+    });
+  }
+  setWorkspaceMessage(
+    `${status.label}: ${verificationRunItemDetail(item, status.detail)}`,
+    item.status === "failed",
+  );
 }
 
 async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
@@ -1604,6 +2229,7 @@ function renderReview() {
   setWorkspaceMessage("");
   updateProgress();
   updateNextButton();
+  synchronizeOpenedListingAutomationBusy();
 }
 
 function renderSource(review) {
@@ -2296,7 +2922,15 @@ function updateProgress() {
     || state.automating
     || state.stale
     || !state.currentReview
-    || !hashesPresent;
+    || !state.pipelineLoaded
+    || pipelineRowForListing(currentListingId()) === null
+    || (
+      activeVerificationRunIsBusy()
+      && verificationRunIncludesListing(currentListingId())
+    )
+    || !pipelineAutomaticEligibility(
+      pipelineRowForListing(currentListingId()),
+    ).eligible;
 }
 
 async function automaticallyVerifyListing() {
@@ -2304,108 +2938,7 @@ async function automaticallyVerifyListing() {
   if (!review || state.stale || state.resolving || state.automating) {
     return;
   }
-  if (
-    !nonBlank(review.review_payload_sha256)
-    || !nonBlank(review.catalog_revision_sha256)
-  ) {
-    setWorkspaceMessage(
-      "Reload this review before starting automatic verification.",
-      true,
-    );
-    return;
-  }
-
-  const draftWarning = hasDraftDecisions()
-    ? "This will discard the unsaved decisions in this review. "
-    : "";
-  const confirmed = window.confirm(
-    `${draftWarning}FAA and local catalog checks run first. `
-      + "If an identity remains unresolved, automatic verification may use paid Gemini API calls. Continue?",
-  );
-  if (!confirmed) {
-    return;
-  }
-
-  const listingId = review.listing_id;
-  const previousQueue = state.reviews.slice();
-  const sequence = ++state.automaticVerificationSequence;
-  setAutomaticVerificationBusy(true);
-  setWorkspaceMessage(
-    "Automatically checking the aircraft, avionics, and listing readiness…",
-  );
-
-  try {
-    const payload = await api(
-      `/api/review/listings/${listingId}/verify-automatically`,
-      {
-        method: "POST",
-        body: JSON.stringify(automaticListingVerificationRequest(
-          review.review_payload_sha256,
-          review.catalog_revision_sha256,
-        )),
-      },
-    );
-    if (
-      sequence !== state.automaticVerificationSequence
-      || currentListingId() !== listingId
-    ) {
-      return;
-    }
-    const outcome = describeAutomaticListingVerificationOutcome(payload, listingId);
-    setAutomaticVerificationBusy(false);
-
-    if (outcome.terminal) {
-      await leaveAutomaticallyVerifiedReview(
-        listingId,
-        previousQueue,
-        outcome.label,
-      );
-      return;
-    }
-    if (outcome.stale) {
-      markStale(outcome.detail);
-      return;
-    }
-    if (outcome.kind === "failed") {
-      setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
-      return;
-    }
-
-    await openReview(listingId, {
-      historyMode: "none",
-      discardDraft: true,
-      force: true,
-    });
-    if (currentListingId() !== listingId || !state.currentReview) {
-      setWorkspaceMessage(
-        "Automatic verification did not report the listing as verified. Reload the review before continuing.",
-        true,
-      );
-      return;
-    }
-    setActiveReviewArea(outcome.focusArea || "avionics", {
-      updateLocation: true,
-    });
-    setWorkspaceMessage(
-      `${outcome.label}: ${outcome.detail} Review the remaining items.`,
-      outcome.kind !== "pending",
-    );
-  } catch (error) {
-    if (sequence !== state.automaticVerificationSequence) {
-      return;
-    }
-    setAutomaticVerificationBusy(false);
-    const outcome = describeAutomaticListingVerificationError(error);
-    if (outcome.kind === "stale") {
-      markStale(outcome.detail);
-    } else {
-      setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
-    }
-  } finally {
-    if (sequence === state.automaticVerificationSequence && state.automating) {
-      setAutomaticVerificationBusy(false);
-    }
-  }
+  await startVerificationRun([review.listing_id], { openedListing: true });
 }
 
 async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label) {
@@ -2443,6 +2976,9 @@ async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label)
 }
 
 function setAutomaticVerificationBusy(busy) {
+  if (state.automating === busy) {
+    return;
+  }
   state.automating = busy;
   elements.reviewWorkspace.setAttribute("aria-busy", String(busy));
   if (busy) {
@@ -3100,10 +3636,8 @@ function markStale(message) {
 }
 
 function isStaleError(error) {
-  return [
-    "review_stale",
-    "automatic_verification_stale",
-  ].includes(error?.payload?.error?.code) || error?.status === 412;
+  return error?.payload?.error?.code === "review_stale"
+    || error?.status === 412;
 }
 
 function isFinalizationError(error) {

@@ -202,6 +202,45 @@
               </div>
               <div class="review-pipeline-plan" id="review-pipeline-plan"></div>
             </section>
+            <section
+              class="review-run is-hidden"
+              id="review-run"
+              aria-labelledby="review-run-title"
+            >
+              <header class="review-run-heading">
+                <div>
+                  <span class="review-eyebrow">Durable automatic verification</span>
+                  <h3 id="review-run-title">Verification run</h3>
+                  <p id="review-run-status" role="status" aria-live="polite">Loading run status…</p>
+                </div>
+                <button class="button subtle is-hidden" id="review-run-cancel" type="button">Stop after current listing</button>
+              </header>
+              <div class="review-run-progress">
+                <progress id="review-run-progress" max="1" value="0" aria-labelledby="review-run-progress-label"></progress>
+                <strong id="review-run-progress-label">0 of 0 complete</strong>
+                <span id="review-run-current"></span>
+              </div>
+              <div class="review-run-counts" id="review-run-counts"></div>
+              <div class="table-shell review-run-items-shell">
+                <table class="review-run-items-table">
+                  <caption class="sr-only">Results for the current automatic verification run</caption>
+                  <thead>
+                    <tr>
+                      <th>Listing</th>
+                      <th>Result</th>
+                      <th>Detail</th>
+                      <th><span class="sr-only">Actions</span></th>
+                    </tr>
+                  </thead>
+                  <tbody id="review-run-items-body"></tbody>
+                </table>
+              </div>
+            </section>
+            <div class="review-pipeline-actions">
+              <button class="button subtle" id="review-pipeline-select-all" type="button">Select all automatic candidates</button>
+              <button class="button primary" id="review-pipeline-verify" type="button" disabled>Automatically verify selected</button>
+              <span id="review-pipeline-selection-count" role="status" aria-live="polite">0 selected</span>
+            </div>
             <div class="review-pipeline-filters">
               <label class="search-box">
                 <span class="sr-only">Search verification pipeline</span>
@@ -225,12 +264,14 @@
                 <caption class="sr-only">Provider-free verification status for every non-ready listing</caption>
                 <thead>
                   <tr>
+                    <th><span class="sr-only">Select</span></th>
                     <th>Listing</th>
                     <th>Aircraft</th>
                     <th>Avionics</th>
                     <th>Reference</th>
                     <th>Gemini</th>
                     <th>What remains</th>
+                    <th>Run result</th>
                     <th><span class="sr-only">Actions</span></th>
                   </tr>
                 </thead>

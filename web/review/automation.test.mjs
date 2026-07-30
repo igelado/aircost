@@ -3,11 +3,16 @@ import test from "node:test";
 
 import {
   filterPipelineRows,
+  pipelineAutomaticEligibility,
   pipelineCheckpoint,
   pipelineProviderPlan,
   pipelineRowsFromResponse,
   pipelineServiceStatus,
   pipelineSummary,
+  verificationRunIdempotencyKey,
+  verificationRunRequest,
+  verificationRunState,
+  verificationRunStatusView,
 } from "./automation.mjs";
 
 function response(listings, contexts = []) {
@@ -260,4 +265,120 @@ test("surfaces missing provider services only when the plan needs them", () => {
   local.verification.provider_request_plan.aircraft_grounding_candidates = 0;
   local.verification.provider_request_plan.avionics.known_total_provider_requests_validation_envelope_maximum = 0;
   assert.deepEqual(pipelineServiceStatus([local]).warnings, []);
+});
+
+test("submits only unique sorted positive listing IDs", () => {
+  assert.deepEqual(verificationRunRequest([73, 10, 73, 0, "20", null]), {
+    listing_ids: [10, 73],
+  });
+});
+
+test("creates a secure idempotency key with an insecure-context fallback", () => {
+  assert.equal(
+    verificationRunIdempotencyKey({
+      randomUUID: () => "00000000-0000-4000-8000-000000000001",
+    }),
+    "00000000-0000-4000-8000-000000000001",
+  );
+  const fallback = verificationRunIdempotencyKey({
+    getRandomValues(bytes) {
+      bytes.fill(0xab);
+      return bytes;
+    },
+  });
+  assert.match(
+    fallback,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  assert.throws(
+    () => verificationRunIdempotencyKey({}),
+    /Secure random values/,
+  );
+});
+
+test("excludes reference-only and deterministically FAA-rejected rows", () => {
+  const base = {
+    status: "pending_review",
+    finalIngestionState: "pending_review",
+    aircraft: { status: "current" },
+    avionics: { status: "ready_retained_observations" },
+    reference: { status: "not_attempted" },
+  };
+  assert.equal(pipelineAutomaticEligibility(base).eligible, true);
+  assert.equal(pipelineAutomaticEligibility({
+    ...base,
+    status: "pending_reference",
+    reference: { status: "pending_reference" },
+  }).eligible, false);
+  assert.equal(pipelineAutomaticEligibility({
+    ...base,
+    aircraft: { status: "rejected" },
+  }).eligible, false);
+});
+
+test("normalizes durable run progress and terminal item outcomes", () => {
+  const view = verificationRunState({
+    id: 9,
+    status: "running",
+    total_items: 4,
+    queued_items: 1,
+    running_items: 1,
+    verified_items: 1,
+    pending_review_items: 1,
+    pending_reference_items: 0,
+    blocked_items: 0,
+    failed_items: 0,
+    cancelled_items: 0,
+    current_listing_id: 21,
+  }, [
+    { id: 1, listing_id: 10, status: "verified", outcome: { status: "verified" } },
+    { id: 2, listing_id: 20, status: "pending_review" },
+    { id: 3, listing_id: 21, status: "running" },
+    { id: 4, listing_id: 22, status: "queued" },
+  ]);
+  assert.equal(view.id, 9);
+  assert.equal(view.terminal, false);
+  assert.equal(view.completed, 2);
+  assert.equal(view.currentListingId, 21);
+  assert.equal(view.counts.pendingReview, 1);
+  assert.equal(view.items[0].outcome.status, "verified");
+});
+
+test("recognizes stopped runs and provides accessible status copy", () => {
+  const view = verificationRunState({
+    id: 11,
+    status: "cancelled",
+    total_items: 2,
+    cancelled_items: 1,
+  }, [
+    { id: 1, listing_id: 10, status: "blocked", reason: "FAA mismatch" },
+    { id: 2, listing_id: 20, status: "cancelled" },
+  ]);
+  assert.equal(view.terminal, true);
+  assert.equal(view.counts.cancelled, 1);
+  assert.equal(verificationRunStatusView("pending_reference").label, "Reference pending");
+  assert.equal(verificationRunStatusView("future").label, "Status unavailable");
+});
+
+test("keeps a cancelling run nonterminal until the current listing finishes", () => {
+  const view = verificationRunState({
+    id: 12,
+    status: "cancelling",
+    total_items: 2,
+    queued_items: 0,
+    running_items: 1,
+    cancelled_items: 1,
+    current_listing_id: 73,
+  }, [
+    { id: 1, listing_id: 73, status: "running" },
+    { id: 2, listing_id: 74, status: "cancelled" },
+  ]);
+
+  assert.equal(view.terminal, false);
+  assert.equal(view.currentListingId, 73);
+  assert.deepEqual(verificationRunStatusView(view.status), {
+    label: "Stopping",
+    detail: "The current listing will finish before the run stops.",
+    tone: "pending",
+  });
 });

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use std::collections::HashSet;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
@@ -13,6 +14,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Notify;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
 
@@ -57,6 +59,12 @@ use crate::listing::review::{
     PendingProductReviewPage, ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse,
     ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery, StagedPendingReview,
 };
+use crate::listing::run::{
+    cancel_verification_run, claim_next_verification_run_item, complete_verification_run_item,
+    create_verification_run, fail_verification_run_item, get_verification_run,
+    list_verification_run_items, CreateVerificationRunRequest, VerificationRun,
+    VerificationRunError, VerificationRunItem, VerificationRunItemsQuery,
+};
 use crate::listing::verification::{
     preflight_reviewer_listing_verifications, verify_listing, ListingVerificationError,
     ListingVerificationMode, ListingVerificationServices, ReviewerListingPreflightScope,
@@ -95,23 +103,16 @@ struct AppState {
     automatic_aircraft_gemini: Option<GeminiInteractionsClient>,
     automatic_aircraft_drs: Option<DrsClient>,
     automatic_runtime_config: Option<GeminiRuntimeConfig>,
-    automatic_verifications_in_flight: Arc<Mutex<HashSet<i64>>>,
+    verification_run_wake: Arc<Notify>,
     valuation_model: Option<Arc<dyn ValuationModel>>,
     valuation_status: ServingValuationStatus,
 }
 
-struct AutomaticVerificationGuard {
-    listing_id: i64,
-    in_flight: Arc<Mutex<HashSet<i64>>>,
-}
-
-impl Drop for AutomaticVerificationGuard {
-    fn drop(&mut self) {
-        if let Ok(mut in_flight) = self.in_flight.lock() {
-            in_flight.remove(&self.listing_id);
-        }
-    }
-}
+const VERIFICATION_RUN_ITEM_DEFAULT_LIMIT: i64 = 100;
+const VERIFICATION_RUN_ITEM_MAX_LIMIT: i64 = 100;
+const VERIFICATION_RUN_LEASE_DURATION: Duration = Duration::from_secs(30 * 60);
+const VERIFICATION_RUN_IDLE_POLL: Duration = Duration::from_secs(10);
+static VERIFICATION_RUN_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 struct AircraftVariantQuery {
@@ -166,9 +167,15 @@ struct VerifyExistingReviewAvionicsRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AutomaticListingVerificationRequest {
-    review_payload_sha256: String,
-    catalog_revision_sha256: String,
+struct CreateVerificationRunHttpRequest {
+    listing_ids: Vec<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationRunItemsHttpQuery {
+    limit: Option<i64>,
+    after_item_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,15 +229,16 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         automatic_aircraft_gemini,
         automatic_aircraft_drs,
         automatic_runtime_config,
-        automatic_verifications_in_flight: Arc::new(Mutex::new(HashSet::new())),
+        verification_run_wake: Arc::new(Notify::new()),
         valuation_model: serving_valuation.model,
         valuation_status: serving_valuation.status,
     };
-    let app = router(state);
+    let app = router(state.clone());
     let address = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .with_context(|| format!("could not bind {address}"))?;
+    start_verification_run_worker(state);
 
     println!("Serving aircost web app on http://{address}");
     axum::serve(listener, app)
@@ -279,6 +287,22 @@ fn router(state: AppState) -> Router {
             get(reviewer_listing_preflight_handler),
         )
         .route(
+            "/api/review/verification-runs",
+            post(create_verification_run_handler),
+        )
+        .route(
+            "/api/review/verification-runs/{run_id}",
+            get(get_verification_run_handler),
+        )
+        .route(
+            "/api/review/verification-runs/{run_id}/items",
+            get(list_verification_run_items_handler),
+        )
+        .route(
+            "/api/review/verification-runs/{run_id}/cancel",
+            post(cancel_verification_run_handler),
+        )
+        .route(
             "/api/review/avionics/products",
             get(list_pending_product_reviews_handler),
         )
@@ -298,10 +322,6 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/avionics/verify-existing",
             post(verify_existing_review_avionics_handler),
-        )
-        .route(
-            "/api/review/listings/{id}/verify-automatically",
-            post(verify_listing_automatically_handler),
         )
         .route(
             "/api/review/listings/{id}/avionics/use-existing",
@@ -972,7 +992,7 @@ async fn reviewer_listing_preflight_handler(
         ),
     )
     .await
-    .map_err(automatic_verification_api_error)?;
+    .map_err(reviewer_preflight_api_error)?;
     Ok(Json(json!({
         "verification": report.verification,
         "listing_contexts": report.listing_contexts,
@@ -985,32 +1005,254 @@ async fn reviewer_listing_preflight_handler(
     })))
 }
 
-async fn verify_listing_automatically_handler(
+async fn create_verification_run_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(listing_id): Path<i64>,
-    Json(payload): Json<AutomaticListingVerificationRequest>,
+    Json(payload): Json<CreateVerificationRunHttpRequest>,
+) -> Result<Response, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let idempotency_key = required_idempotency_key(&headers)?;
+    let result = create_verification_run(
+        &state.db,
+        &CreateVerificationRunRequest {
+            owner_user_id: user.id,
+            idempotency_key,
+            listing_ids: payload.listing_ids,
+        },
+    )
+    .await
+    .map_err(verification_run_api_error)?;
+    if result.created {
+        state.verification_run_wake.notify_one();
+    }
+    let status = if result.created {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let location = format!("/api/review/verification-runs/{}", result.run.id);
+    Ok((
+        status,
+        [(header::LOCATION, location)],
+        Json(json!({ "run": verification_run_json(&result.run) })),
+    )
+        .into_response())
+}
+
+async fn get_verification_run_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
     let user = load_current_user(&state.db, &headers).await?;
     require_listing_reviewer(&user)?;
+    let run = get_verification_run(&state.db, user.id, run_id)
+        .await
+        .map_err(verification_run_api_error)?;
+    Ok(Json(json!({ "run": verification_run_json(&run) })))
+}
 
-    let detail = get_listing_review(&state.db, user.id, listing_id).await?;
-    if payload.review_payload_sha256 != detail.review.review_payload_sha256 {
+async fn list_verification_run_items_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<i64>,
+    Query(query): Query<VerificationRunItemsHttpQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let limit = query.limit.unwrap_or(VERIFICATION_RUN_ITEM_DEFAULT_LIMIT);
+    if !(1..=VERIFICATION_RUN_ITEM_MAX_LIMIT).contains(&limit) {
         return Err(ApiError::new(
-            StatusCode::PRECONDITION_FAILED,
-            "review payload is stale; reload the review",
+            StatusCode::BAD_REQUEST,
+            format!("limit must be between 1 and {VERIFICATION_RUN_ITEM_MAX_LIMIT}"),
         )
-        .with_code("automatic_verification_stale"));
+        .with_code("verification_run_invalid"));
     }
-    if payload.catalog_revision_sha256 != detail.review.catalog_revision_sha256 {
-        return Err(ApiError::new(
-            StatusCode::PRECONDITION_FAILED,
-            "approved avionics catalog changed during review; reload and re-evaluate",
-        )
-        .with_code("automatic_verification_stale"));
-    }
+    let page = list_verification_run_items(
+        &state.db,
+        user.id,
+        run_id,
+        &VerificationRunItemsQuery {
+            limit: Some(limit),
+            after_item_id: query.after_item_id,
+        },
+    )
+    .await
+    .map_err(verification_run_api_error)?;
+    Ok(Json(json!({
+        "items": page.items.iter().map(verification_run_item_json).collect::<Vec<_>>(),
+        "checkpoint": {
+            "has_more": page.checkpoint.has_more,
+            "resume_after_item_id": page.checkpoint.resume_after_item_id,
+        }
+    })))
+}
 
-    let _guard = begin_automatic_verification(&state, listing_id)?;
+async fn cancel_verification_run_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let run = cancel_verification_run(&state.db, user.id, run_id)
+        .await
+        .map_err(verification_run_api_error)?;
+    state.verification_run_wake.notify_one();
+    Ok(Json(json!({ "run": verification_run_json(&run) })))
+}
+
+fn verification_run_json(run: &VerificationRun) -> Value {
+    json!({
+        "id": run.id,
+        "status": run.status,
+        "total_items": run.total_items,
+        "queued_items": run.queued_items,
+        "running_items": run.running_items,
+        "verified_items": run.verified_items,
+        "pending_review_items": run.pending_review_items,
+        "pending_reference_items": run.pending_reference_items,
+        "blocked_items": run.blocked_items,
+        "failed_items": run.failed_items,
+        "cancelled_items": run.cancelled_items,
+        "current_listing_id": run.current_listing_id,
+    })
+}
+
+fn verification_run_item_json(item: &VerificationRunItem) -> Value {
+    json!({
+        "id": item.id,
+        "listing_id": item.listing_id,
+        "status": item.status,
+        "outcome": item.outcome,
+        "reason_code": item.reason_code,
+        "reason": item.reason,
+    })
+}
+
+fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values.next().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key header is required",
+        )
+        .with_code("verification_run_invalid")
+    })?;
+    if values.next().is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "exactly one Idempotency-Key header is required",
+        )
+        .with_code("verification_run_invalid"));
+    }
+    let value = value.to_str().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key must be valid text",
+        )
+        .with_code("verification_run_invalid")
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(
+            ApiError::new(StatusCode::BAD_REQUEST, "Idempotency-Key must not be empty")
+                .with_code("verification_run_invalid"),
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn verification_run_api_error(error: VerificationRunError) -> ApiError {
+    match error {
+        VerificationRunError::Validation(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, message).with_code("verification_run_invalid")
+        }
+        VerificationRunError::NotFound(message) => {
+            ApiError::new(StatusCode::NOT_FOUND, message).with_code("verification_run_not_found")
+        }
+        VerificationRunError::Conflict(message) => {
+            ApiError::new(StatusCode::CONFLICT, message).with_code("verification_run_conflict")
+        }
+        VerificationRunError::IdempotencyConflict { run_id } => ApiError::new(
+            StatusCode::CONFLICT,
+            "Idempotency-Key was already used with a different request",
+        )
+        .with_code("verification_run_idempotency_conflict")
+        .with_details(json!({ "active_run_id": run_id })),
+        VerificationRunError::ActiveListingConflict { run_id, listing_id } => ApiError::new(
+            StatusCode::CONFLICT,
+            format!("listing {listing_id} already belongs to an active verification run"),
+        )
+        .with_code("verification_run_listing_active")
+        .with_details(json!({
+            "listing_id": listing_id,
+            "active_run_id": run_id,
+        })),
+        VerificationRunError::LeaseConflict { item_id } => ApiError::new(
+            StatusCode::CONFLICT,
+            format!("verification run item {item_id} lease is no longer current"),
+        )
+        .with_code("verification_run_lease_conflict"),
+        VerificationRunError::Database(message) => {
+            eprintln!("verification run database operation failed: {message}");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The verification run could not be processed.",
+            )
+            .with_code("verification_run_failed")
+        }
+    }
+}
+
+fn start_verification_run_worker(state: AppState) {
+    state.verification_run_wake.notify_one();
+    tokio::spawn(async move {
+        verification_run_worker(state).await;
+    });
+}
+
+async fn verification_run_worker(state: AppState) {
+    if let Err(error) =
+        crate::listing::run::reclaim_expired_verification_run_leases(&state.db).await
+    {
+        eprintln!("verification run worker could not reclaim startup leases: {error}");
+    }
+    loop {
+        let lease_token = verification_run_lease_token();
+        match claim_next_verification_run_item(
+            &state.db,
+            &lease_token,
+            VERIFICATION_RUN_LEASE_DURATION,
+        )
+        .await
+        {
+            Ok(Some(item)) => {
+                process_claimed_verification_run_item(&state, item, &lease_token).await;
+            }
+            Ok(None) => {
+                tokio::select! {
+                    _ = state.verification_run_wake.notified() => {}
+                    _ = tokio::time::sleep(VERIFICATION_RUN_IDLE_POLL) => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("verification run worker could not claim work: {error}");
+                tokio::select! {
+                    _ = state.verification_run_wake.notified() => {}
+                    _ = tokio::time::sleep(VERIFICATION_RUN_IDLE_POLL) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn process_claimed_verification_run_item(
+    state: &AppState,
+    item: crate::listing::run::ClaimedVerificationRunItem,
+    lease_token: &str,
+) {
     let aircraft = match (
         state.automatic_aircraft_gemini.as_ref(),
         state.automatic_aircraft_drs.as_ref(),
@@ -1023,9 +1265,9 @@ async fn verify_listing_automatically_handler(
         }),
         _ => None,
     };
-    let outcome = verify_listing(
+    match verify_listing(
         &state.db,
-        listing_id,
+        item.listing_id,
         ListingVerificationMode::Apply,
         ListingVerificationServices {
             extractor: state.extractor.as_ref(),
@@ -1033,61 +1275,122 @@ async fn verify_listing_automatically_handler(
         },
     )
     .await
-    .map_err(automatic_verification_api_error)?;
-    Ok(Json(json!({ "verification": outcome })))
-}
-
-fn begin_automatic_verification(
-    state: &AppState,
-    listing_id: i64,
-) -> Result<AutomaticVerificationGuard, ApiError> {
-    let mut in_flight = state
-        .automatic_verifications_in_flight
-        .lock()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "automatic verification coordination failed",
+    {
+        Ok(outcome) => {
+            let persistence = if outcome.status == "failed" {
+                fail_verification_run_item(
+                    &state.db,
+                    item.item_id,
+                    lease_token,
+                    "automatic_verification_failed",
+                    "Automatic verification could not complete this listing.",
+                )
+                .await
+            } else {
+                complete_verification_run_item(&state.db, item.item_id, lease_token, &outcome).await
+            };
+            if let Err(error) = persistence {
+                eprintln!(
+                    "verification run worker could not persist terminal item {}: {error}",
+                    item.item_id
+                );
+            }
+        }
+        Err(error) => {
+            let (reason_code, reason) = verification_run_failure_reason(&error);
+            eprintln!(
+                "verification run item {} failed before terminal persistence: {error}",
+                item.item_id
+            );
+            if let Err(store_error) = fail_verification_run_item(
+                &state.db,
+                item.item_id,
+                lease_token,
+                reason_code,
+                reason,
             )
-            .with_code("automatic_verification_failed")
-        })?;
-    if !in_flight.insert(listing_id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "automatic verification is already running for this listing",
-        )
-        .with_code("automatic_verification_in_progress"));
+            .await
+            {
+                eprintln!(
+                    "verification run worker could not fail item {}: {store_error}",
+                    item.item_id
+                );
+            }
+        }
     }
-    drop(in_flight);
-    Ok(AutomaticVerificationGuard {
-        listing_id,
-        in_flight: Arc::clone(&state.automatic_verifications_in_flight),
-    })
 }
 
-fn automatic_verification_api_error(error: ListingVerificationError) -> ApiError {
+fn verification_run_failure_reason(
+    error: &ListingVerificationError,
+) -> (&'static str, &'static str) {
+    match error {
+        ListingVerificationError::Validation(_) => (
+            "automatic_verification_invalid",
+            "The listing no longer satisfies the automatic verification input contract.",
+        ),
+        ListingVerificationError::NotFound(_) => (
+            "listing_not_found",
+            "The listing no longer exists or is no longer available to this verification run.",
+        ),
+        ListingVerificationError::Unavailable(_) => (
+            "automatic_verification_unavailable",
+            "A required automatic verification service is not configured.",
+        ),
+        ListingVerificationError::Database(_) => (
+            "automatic_verification_failed",
+            "A database operation failed while verifying this listing.",
+        ),
+        ListingVerificationError::Aircraft(_) => (
+            "aircraft_verification_failed",
+            "The FAA-backed aircraft verification step failed.",
+        ),
+        ListingVerificationError::Avionics(_) => (
+            "avionics_verification_failed",
+            "The avionics verification step failed.",
+        ),
+    }
+}
+
+fn verification_run_lease_token() -> String {
+    let sequence = VERIFICATION_RUN_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("aircost-web:{}:{timestamp}:{sequence}", std::process::id())
+}
+
+fn reviewer_preflight_api_error(error: ListingVerificationError) -> ApiError {
     match error {
         ListingVerificationError::Validation(message) => {
             ApiError::new(StatusCode::BAD_REQUEST, message)
-                .with_code("automatic_verification_failed")
+                .with_code("verification_preflight_invalid")
         }
         ListingVerificationError::NotFound(listing_id) => ApiError::new(
             StatusCode::NOT_FOUND,
             format!("listing {listing_id} was not found"),
         )
-        .with_code("automatic_verification_failed"),
+        .with_code("verification_preflight_not_found"),
         ListingVerificationError::Unavailable(message) => {
             ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message)
-                .with_code("automatic_verification_unavailable")
+                .with_code("verification_preflight_unavailable")
         }
         ListingVerificationError::Database(message) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
-                .with_code("automatic_verification_failed")
+            eprintln!("verification preflight database operation failed: {message}");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The verification preflight could not be completed.",
+            )
+            .with_code("verification_preflight_failed")
         }
         ListingVerificationError::Aircraft(message)
         | ListingVerificationError::Avionics(message) => {
-            ApiError::new(StatusCode::BAD_GATEWAY, message)
-                .with_code("automatic_verification_failed")
+            eprintln!("verification preflight stage failed: {message}");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The verification preflight could not inspect every listing stage.",
+            )
+            .with_code("verification_preflight_failed")
         }
     }
 }
@@ -1822,6 +2125,7 @@ struct ApiError {
     status: StatusCode,
     message: String,
     code: Option<&'static str>,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -1830,6 +2134,7 @@ impl ApiError {
             status,
             message: message.into(),
             code: None,
+            details: None,
         }
     }
 
@@ -1837,18 +2142,27 @@ impl ApiError {
         self.code = Some(code);
         self
     }
+
+    fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status;
-        let body = Json(json!({
-            "error": {
-                "message": self.message,
-                "status": status.as_u16(),
-                "code": self.code,
+        let mut error = json!({
+            "message": self.message,
+            "status": status.as_u16(),
+            "code": self.code,
+        });
+        if let Some(Value::Object(details)) = self.details {
+            if let Some(error) = error.as_object_mut() {
+                error.extend(details);
             }
-        }));
+        }
+        let body = Json(json!({ "error": error }));
         (status, body).into_response()
     }
 }
@@ -1973,11 +2287,13 @@ const REVIEW_AUTOMATION_JS: &str = include_str!("../web/review/automation.mjs");
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use axum::body::to_bytes;
     use axum::extract::{Path, Query, State};
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use axum::Json;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
@@ -1985,16 +2301,20 @@ mod tests {
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
     use serde_json::json;
     use sqlx::SqlitePool;
+    use tokio::sync::Notify;
 
     use super::{
         approve_replacement_products_handler, attest_review_avionics_product_handler,
-        avionics_options_handler, begin_automatic_verification, get_listing_review,
-        list_avionics_handler, proposed_identity_matches_consolidation_members,
-        require_current_review_revisions, start_plugin_submission_job,
-        use_existing_review_avionics_handler, verify_existing_review_avionics_handler, AppState,
-        AttestReviewAvionicsProductRequest, AutomaticListingVerificationRequest,
+        avionics_options_handler, cancel_verification_run_handler, create_verification_run_handler,
+        get_listing_review, get_verification_run_handler, list_avionics_handler,
+        list_verification_run_items_handler, process_claimed_verification_run_item,
+        proposed_identity_matches_consolidation_members, require_current_review_revisions,
+        required_idempotency_key, start_plugin_submission_job,
+        use_existing_review_avionics_handler, verification_run_api_error,
+        verification_run_failure_reason, verify_existing_review_avionics_handler, AppState,
+        AttestReviewAvionicsProductRequest, CreateVerificationRunHttpRequest,
         ReviewerListingPreflightQuery, UseExistingReviewAvionicsRequest,
-        VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
+        VerificationRunItemsHttpQuery, VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
     };
     use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::avionics::manufacturer::{
@@ -2010,6 +2330,12 @@ mod tests {
         PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
         ReviewAircraftIdentityStatus, ReviewAircraftSummary, ReviewAspectId,
     };
+    use crate::listing::run::{
+        claim_next_verification_run_item, create_verification_run, get_verification_run,
+        list_verification_run_items, CreateVerificationRunRequest, VerificationRunError,
+        VerificationRunItemStatus, VerificationRunItemsQuery, VerificationRunStatus,
+    };
+    use crate::listing::verification::ListingVerificationError;
     use crate::models::PluginSubmissionRequest;
     use crate::normalize::{
         normalize_avionics_identifier, normalize_avionics_manufacturer_name,
@@ -2027,7 +2353,7 @@ mod tests {
             automatic_aircraft_gemini: None,
             automatic_aircraft_drs: None,
             automatic_runtime_config: None,
-            automatic_verifications_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            verification_run_wake: Arc::new(Notify::new()),
             valuation_model: None,
             valuation_status: ServingValuationStatus {
                 state: ServingValuationState::Unavailable,
@@ -2066,31 +2392,414 @@ mod tests {
         pool
     }
 
-    #[tokio::test]
-    async fn automatic_verification_guard_serializes_each_listing_and_releases_on_drop() {
-        let state = test_state(AppDb::connect("sqlite::memory:").await.unwrap());
-        let guard = begin_automatic_verification(&state, 42).unwrap();
-        let duplicate = begin_automatic_verification(&state, 42)
-            .err()
-            .expect("the same listing must be serialized");
-        assert_eq!(duplicate.status, StatusCode::CONFLICT);
-        assert_eq!(duplicate.code, Some("automatic_verification_in_progress"));
-
-        drop(guard);
-        assert!(begin_automatic_verification(&state, 42).is_ok());
-    }
-
     #[test]
-    fn automatic_verification_request_rejects_unknown_fields() {
+    fn verification_run_requests_reject_unknown_fields() {
         let payload = json!({
-            "review_payload_sha256": "review",
-            "catalog_revision_sha256": "catalog",
+            "listing_ids": [42],
             "apply": true
         });
         assert!(
-            serde_json::from_value::<AutomaticListingVerificationRequest>(payload).is_err(),
-            "the endpoint is always apply and must reject caller-selected execution flags"
+            serde_json::from_value::<CreateVerificationRunHttpRequest>(payload).is_err(),
+            "run creation must reject caller-selected execution flags"
         );
+        assert!(
+            serde_json::from_value::<VerificationRunItemsHttpQuery>(json!({
+                "limit": 10,
+                "owner_user_id": 7
+            }))
+            .is_err(),
+            "item pagination must reject caller-selected ownership"
+        );
+    }
+
+    #[test]
+    fn verification_run_requires_exactly_one_nonempty_idempotency_key() {
+        let missing = HeaderMap::new();
+        assert_eq!(
+            required_idempotency_key(&missing).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut empty = HeaderMap::new();
+        empty.insert("idempotency-key", HeaderValue::from_static("   "));
+        assert_eq!(
+            required_idempotency_key(&empty).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append("idempotency-key", HeaderValue::from_static("first"));
+        duplicate.append("idempotency-key", HeaderValue::from_static("second"));
+        assert_eq!(
+            required_idempotency_key(&duplicate).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            "idempotency-key",
+            HeaderValue::from_static(" browser-request-42 "),
+        );
+        assert_eq!(
+            required_idempotency_key(&valid).unwrap(),
+            "browser-request-42"
+        );
+    }
+
+    #[test]
+    fn verification_run_errors_do_not_expose_provider_or_database_details() {
+        let api_error = verification_run_api_error(VerificationRunError::Database(
+            "database password and raw SQL".to_string(),
+        ));
+        assert_eq!(api_error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!api_error.message.contains("password"));
+        assert!(!api_error.message.contains("SQL"));
+
+        let (reason_code, reason) = verification_run_failure_reason(
+            &ListingVerificationError::Avionics("raw Gemini response".to_string()),
+        );
+        assert_eq!(reason_code, "avionics_verification_failed");
+        assert!(!reason.contains("Gemini"));
+        assert!(!reason.contains("raw"));
+    }
+
+    #[tokio::test]
+    async fn verification_run_http_creation_is_idempotent_and_reports_active_conflicts() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let (_, other_listing_id) = insert_review_listing(&db).await;
+        let state = test_state(db.clone());
+        let headers = verification_run_headers("browser-request-42");
+
+        let first = create_verification_run_handler(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateVerificationRunHttpRequest {
+                listing_ids: vec![listing_id],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let location = first
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let first_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let run_id = first_body["run"]["id"].as_i64().unwrap();
+        assert_eq!(location, format!("/api/review/verification-runs/{run_id}"));
+        let actual_fields = first_body["run"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let expected_fields = [
+            "blocked_items",
+            "cancelled_items",
+            "current_listing_id",
+            "failed_items",
+            "id",
+            "pending_reference_items",
+            "pending_review_items",
+            "queued_items",
+            "running_items",
+            "status",
+            "total_items",
+            "verified_items",
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(actual_fields, expected_fields);
+        assert_eq!(first_body["run"]["total_items"], 1);
+        assert_eq!(first_body["run"]["queued_items"], 1);
+
+        let replay = create_verification_run_handler(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateVerificationRunHttpRequest {
+                listing_ids: vec![listing_id],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.headers().get(header::LOCATION).unwrap(),
+            location.as_str()
+        );
+
+        let idempotency_conflict = create_verification_run_handler(
+            State(state.clone()),
+            headers,
+            Json(CreateVerificationRunHttpRequest {
+                listing_ids: vec![other_listing_id],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(idempotency_conflict.status, StatusCode::CONFLICT);
+        assert_eq!(
+            idempotency_conflict.code,
+            Some("verification_run_idempotency_conflict")
+        );
+        assert_eq!(
+            idempotency_conflict.details.unwrap()["active_run_id"],
+            run_id
+        );
+
+        let active_conflict = create_verification_run_handler(
+            State(state),
+            verification_run_headers("another-browser-request"),
+            Json(CreateVerificationRunHttpRequest {
+                listing_ids: vec![listing_id],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(active_conflict.status, StatusCode::CONFLICT);
+        assert_eq!(
+            active_conflict.code,
+            Some("verification_run_listing_active")
+        );
+        let details = active_conflict.details.unwrap();
+        assert_eq!(details["listing_id"], listing_id);
+        assert_eq!(details["active_run_id"], run_id);
+
+        let stored_run = crate::listing::run::get_verification_run(&db, owner_user_id, run_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_run.total_items, 1);
+    }
+
+    #[tokio::test]
+    async fn verification_run_http_reads_are_owner_scoped_and_keyset_paginated() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (owner_user_id, first_listing_id) = insert_review_listing(&db).await;
+        let (_, second_listing_id) = insert_review_listing(&db).await;
+        let created = create_verification_run(
+            &db,
+            &CreateVerificationRunRequest {
+                owner_user_id,
+                idempotency_key: "pagination-test".to_string(),
+                listing_ids: vec![first_listing_id, second_listing_id],
+            },
+        )
+        .await
+        .unwrap();
+        let state = test_state(db.clone());
+
+        let Json(first_page) = list_verification_run_items_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(created.run.id),
+            Query(VerificationRunItemsHttpQuery {
+                limit: Some(1),
+                after_item_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(first_page["checkpoint"]["has_more"], true);
+        let cursor = first_page["checkpoint"]["resume_after_item_id"]
+            .as_i64()
+            .unwrap();
+        let item_fields = first_page["items"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            item_fields,
+            [
+                "id",
+                "listing_id",
+                "outcome",
+                "reason",
+                "reason_code",
+                "status"
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let Json(second_page) = list_verification_run_items_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(created.run.id),
+            Query(VerificationRunItemsHttpQuery {
+                limit: Some(1),
+                after_item_id: Some(cursor),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(second_page["checkpoint"]["has_more"], false);
+        assert_eq!(
+            second_page["checkpoint"]["resume_after_item_id"],
+            second_page["items"][0]["id"]
+        );
+
+        let pool = sqlite_pool(&db);
+        let foreign_user_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (email, display_name, auth_subject) VALUES ('foreign@example.com', 'Foreign', 'foreign-subject') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let variant_id: i64 = sqlx::query_scalar(
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let foreign_listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            ) VALUES (?, ?, 'https://broker.example/aircraft/foreign-review',
+                      2020, 450000, 900)
+            RETURNING id
+            "#,
+        )
+        .bind(variant_id)
+        .bind(foreign_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let foreign_run = create_verification_run(
+            &db,
+            &CreateVerificationRunRequest {
+                owner_user_id: foreign_user_id,
+                idempotency_key: "foreign-run".to_string(),
+                listing_ids: vec![foreign_listing_id],
+            },
+        )
+        .await
+        .unwrap();
+        let hidden =
+            get_verification_run_handler(State(state), HeaderMap::new(), Path(foreign_run.run.id))
+                .await
+                .unwrap_err();
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn verification_run_worker_persists_a_terminal_sanitized_outcome() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let created = create_verification_run(
+            &db,
+            &CreateVerificationRunRequest {
+                owner_user_id,
+                idempotency_key: "worker-terminal-test".to_string(),
+                listing_ids: vec![listing_id],
+            },
+        )
+        .await
+        .unwrap();
+        let lease_token = "test-worker-terminal-lease";
+        let claim = claim_next_verification_run_item(&db, lease_token, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the queued item should be claimable");
+
+        process_claimed_verification_run_item(&test_state(db.clone()), claim, lease_token).await;
+
+        let run = get_verification_run(&db, owner_user_id, created.run.id)
+            .await
+            .unwrap();
+        assert_eq!(run.status, VerificationRunStatus::Completed);
+        assert_eq!(run.running_items, 0);
+        assert_eq!(run.blocked_items, 1);
+        let page = list_verification_run_items(
+            &db,
+            owner_user_id,
+            run.id,
+            &VerificationRunItemsQuery::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let item = &page.items[0];
+        assert_eq!(item.status, VerificationRunItemStatus::Blocked);
+        assert!(item.outcome.is_some());
+        assert_eq!(
+            item.reason_code.as_deref(),
+            Some("aircraft_verification_remaining")
+        );
+        assert!(item
+            .reason
+            .as_deref()
+            .is_some_and(|reason| !reason.contains("database")));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_stops_queued_work_without_stealing_the_current_lease() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (owner_user_id, first_listing_id) = insert_review_listing(&db).await;
+        let (_, second_listing_id) = insert_review_listing(&db).await;
+        let created = create_verification_run(
+            &db,
+            &CreateVerificationRunRequest {
+                owner_user_id,
+                idempotency_key: "worker-cancellation-test".to_string(),
+                listing_ids: vec![first_listing_id, second_listing_id],
+            },
+        )
+        .await
+        .unwrap();
+        let lease_token = "test-worker-cancellation-lease";
+        let claim = claim_next_verification_run_item(&db, lease_token, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("the first item should be claimable");
+        assert_eq!(claim.listing_id, first_listing_id);
+
+        let Json(cancelled) = cancel_verification_run_handler(
+            State(test_state(db.clone())),
+            HeaderMap::new(),
+            Path(created.run.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled["run"]["status"], "cancelling");
+        assert_eq!(cancelled["run"]["running_items"], 1);
+        assert_eq!(cancelled["run"]["cancelled_items"], 1);
+        assert_eq!(
+            cancelled["run"]["current_listing_id"],
+            serde_json::json!(first_listing_id)
+        );
+
+        process_claimed_verification_run_item(&test_state(db.clone()), claim, lease_token).await;
+        let run = get_verification_run(&db, owner_user_id, created.run.id)
+            .await
+            .unwrap();
+        assert_eq!(run.status, VerificationRunStatus::Cancelled);
+        assert_eq!(run.running_items, 0);
+        assert_eq!(run.cancelled_items, 1);
+        assert_eq!(run.blocked_items, 1);
+        assert!(
+            claim_next_verification_run_item(&db, "no-more-work", Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn verification_run_headers(idempotency_key: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static(idempotency_key));
+        headers
     }
 
     #[test]
