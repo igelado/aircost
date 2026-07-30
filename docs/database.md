@@ -1102,6 +1102,49 @@ equipment observations. An empty equipment array is never treated as evidence
 that all prior observations are garbage. The workflow never writes dollar
 metadata; avionics acceptance alone does not make a listing valuation-grade.
 
+## Durable Listing Verification Runs
+
+The web verifier coordinates automatic work through
+`listing_verification_runs` and `listing_verification_run_items`. These tables
+contain only operational state: the authenticated owner, idempotency
+fingerprint, ordered listing IDs, status, attempts, leases, sanitized terminal
+outcomes, and reviewer-facing failure codes. Gemini prompts, source documents,
+grounding dossiers, provider responses, and raw errors are never stored here.
+Provider accounting remains exclusively in `gemini_api_usage`.
+
+One owner/idempotency key identifies one ordered request. Reusing it with the
+same request returns the existing run; changing the request is a conflict. A
+partial unique index prevents one listing from being queued or running in two
+runs, and a second partial index permits only one running item per run. Expired
+leases are requeued with an incremented attempt count. Cancellation changes
+queued items to `cancelled`; an already-running item finishes under its current
+lease while the run is `cancelling`, after which the run becomes `cancelled`.
+
+Fresh databases receive the tables from the canonical schema. Existing
+databases use the matching additive, idempotent migration:
+
+```text
+migrations/20260809_listing_verification_runs.sqlite.sql
+migrations/20260809_listing_verification_runs.postgres.sql
+```
+
+For SQLite, apply the migration in fail-fast mode and verify its contract and
+integrity:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260809_listing_verification_runs.sqlite.sql"
+sqlite3 -readonly data/aircost.sqlite3 \
+  "SELECT contract_version, contract_fingerprint
+     FROM schema_migration_contracts
+    WHERE migration_name = '20260809_listing_verification_runs';
+   PRAGMA foreign_key_check;
+   PRAGMA integrity_check;"
+```
+
+The migration does not create a run, alter a listing, call a provider, or add
+usage rows.
+
 ## Aircraft Reference Catalog And FAA Projection Migration
 
 The clean aircraft hierarchy, evidence workflow, immutable reference profiles,

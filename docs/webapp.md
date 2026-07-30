@@ -442,10 +442,13 @@ The corresponding API is:
 GET /api/review/listings?limit=25&offset=0
 GET /api/review/listings/{listing_id}
 GET /api/review/verification/preflight?limit=100&after_listing_id={listing_id}
+POST /api/review/verification-runs
+GET /api/review/verification-runs/{run_id}
+GET /api/review/verification-runs/{run_id}/items?limit=100&after_item_id={item_id}
+POST /api/review/verification-runs/{run_id}/cancel
 GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
-POST /api/review/listings/{listing_id}/verify-automatically
 POST /api/review/listings/{listing_id}/avionics/consolidate
 POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/avionics/approve-replacement
@@ -465,16 +468,30 @@ member label. Omitted model-equivalent rows, stale member keys, conflicting
 stable identifiers, or reference claims that cannot be preserved block the
 operation.
 
-The opened-listing **Automatically verify** action runs the same permanent
-aircraft, avionics, and finalization workflow as the administrative
-`verify-listings --apply` command. It submits the current review-payload and
-approved-catalog hashes, discards unsaved manual draft decisions only after
-confirmation, and reloads the queue after completion. The server rejects stale
-hashes before provider work and permits only one automatic run per listing in
-each server process. `GEMINI_API_KEY` enables extraction and curation;
+Pipeline and opened-listing **Automatically verify** actions create the same
+durable server-owned verification run. The browser sends the selected listing
+IDs with a cryptographically random `Idempotency-Key`, stores only the returned
+run ID locally, and reloads the authoritative run and paginated item state
+after navigation or browser restart. A network retry that reports an existing
+active run resumes that run instead of starting parallel work. The browser
+never attempts to execute the aircraft, avionics, or finalization stages
+itself.
+
+One run processes its listings serially while exposing queued, running, and
+terminal item counts. The UI polls with request-sequence guards, shows the
+current listing and terminal result of every item, and can request a stop after
+the current listing. Verified items, residual manual reviews, factory-reference
+work, blocked items, failures, and cancelled items remain distinct. A manual
+review link is shown only after a provider-free refresh confirms that the
+listing still has a current pending review.
+
+Before creating a run, the browser reports the current full-Pipeline Gemini
+request plan and warns that finalization enrichment is additional. This is a
+cost warning, not a hard budget. Deterministically FAA-rejected aircraft and
+reference-only listings remain visible but are not selectable for another
+automatic identity run. `GEMINI_API_KEY` enables extraction and curation;
 `FAA_DRS_API_KEY` additionally enables unresolved aircraft grounding.
-Deterministic FAA/catalog reuse still works without paid calls. The response
-reports separate aircraft, avionics, and finalization stages; unresolved or
+Deterministic FAA/catalog reuse still works without paid calls; unresolved or
 uncertain observations remain in review rather than being auto-approved.
 When aircraft and avionics review is complete but valuation-grade factory
 reference data is not yet published, the response status is

@@ -2529,6 +2529,111 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_pending_reviews (
 CREATE INDEX IF NOT EXISTS idx_aircraft_sale_listing_pending_reviews_submission
   ON aircraft_sale_listing_pending_reviews (plugin_submission_id);
 
+-- Durable operational queue for automatic listing verification. These rows
+-- store scheduling state and sanitized verifier outcomes only; provider
+-- prompts, source dossiers, and grounding evidence are deliberately excluded.
+CREATE TABLE IF NOT EXISTS listing_verification_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  idempotency_key TEXT NOT NULL,
+  request_fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'cancelling', 'completed', 'cancelled')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at TEXT,
+  UNIQUE (owner_user_id, idempotency_key),
+  CHECK (length(trim(idempotency_key)) BETWEEN 1 AND 200),
+  CHECK (length(request_fingerprint) = 64),
+  CHECK (request_fingerprint = lower(request_fingerprint)),
+  CHECK (request_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  CHECK (
+    (status IN ('completed', 'cancelled') AND completed_at IS NOT NULL)
+    OR
+    (status IN ('queued', 'running', 'cancelling') AND completed_at IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS idx_listing_verification_runs_owner
+  ON listing_verification_runs (owner_user_id, id);
+
+CREATE TABLE IF NOT EXISTS listing_verification_run_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL
+    REFERENCES listing_verification_runs(id) ON DELETE CASCADE,
+  listing_id INTEGER NOT NULL
+    REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN (
+      'queued', 'running', 'verified', 'pending_review',
+      'pending_reference', 'blocked', 'failed', 'cancelled'
+    )),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  lease_token TEXT,
+  lease_expires_at_epoch_seconds INTEGER,
+  outcome_json TEXT,
+  reason_code TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  completed_at TEXT,
+  UNIQUE (run_id, position),
+  UNIQUE (run_id, listing_id),
+  CHECK (lease_token IS NULL OR length(trim(lease_token)) BETWEEN 1 AND 200),
+  CHECK (
+    (status = 'running'
+      AND lease_token IS NOT NULL
+      AND lease_expires_at_epoch_seconds IS NOT NULL
+      AND started_at IS NOT NULL
+      AND completed_at IS NULL)
+    OR
+    (status <> 'running'
+      AND lease_token IS NULL
+      AND lease_expires_at_epoch_seconds IS NULL)
+  ),
+  CHECK (
+    (status IN ('queued', 'running') AND completed_at IS NULL)
+    OR
+    (status IN (
+      'verified', 'pending_review', 'pending_reference',
+      'blocked', 'failed', 'cancelled'
+    ) AND completed_at IS NOT NULL)
+  ),
+  CHECK (
+    outcome_json IS NULL
+    OR (
+      length(outcome_json) BETWEEN 2 AND 65536
+      AND json_valid(outcome_json)
+      AND json_type(outcome_json) = 'object'
+    )
+  ),
+  CHECK (
+    status NOT IN (
+      'verified', 'pending_review', 'pending_reference', 'blocked'
+    )
+    OR outcome_json IS NOT NULL
+  ),
+  CHECK (reason_code IS NULL OR length(trim(reason_code)) BETWEEN 1 AND 100),
+  CHECK (reason IS NULL OR length(trim(reason)) BETWEEN 1 AND 2000)
+);
+
+-- A listing may appear in run history many times, but may have only one
+-- queued/running owner at a time across every process and run.
+CREATE UNIQUE INDEX IF NOT EXISTS
+  idx_listing_verification_run_items_one_active_listing
+  ON listing_verification_run_items (listing_id)
+  WHERE status IN ('queued', 'running');
+
+CREATE UNIQUE INDEX IF NOT EXISTS
+  idx_listing_verification_run_items_one_running_per_run
+  ON listing_verification_run_items (run_id)
+  WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_listing_verification_run_items_claim
+  ON listing_verification_run_items (run_id, status, position, id);
+
 CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   aircraft_sale_listing_id INTEGER NOT NULL

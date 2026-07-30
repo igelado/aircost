@@ -18,37 +18,9 @@ export function existingProductVerificationRequest(
   };
 }
 
-export function automaticListingVerificationRequest(
-  reviewPayloadSha256,
-  catalogRevisionSha256,
-) {
-  return {
-    review_payload_sha256: reviewPayloadSha256,
-    catalog_revision_sha256: catalogRevisionSha256,
-  };
-}
-
 const MACHINE_REASON_CODE = /^[a-z0-9_]+$/;
 const UNCLASSIFIED_REASON_CODE = "unclassified_review_reason";
 const AIRCRAFT_IDENTITY_STATES = new Set(["verified", "curation_required"]);
-const AUTOMATIC_VERIFICATION_STATUSES = new Set([
-  "already_verified",
-  "verified",
-  "pending_reference",
-  "pending_review",
-  "blocked",
-  "stale",
-  "failed",
-]);
-const AUTOMATIC_AIRCRAFT_COMPLETE_STATES = new Set([
-  "already_verified",
-  "verified",
-  "current",
-  "reused",
-  "curated",
-  "assigned",
-  "not_required",
-]);
 
 const AIRCRAFT_IDENTITY_REASONS = Object.freeze({
   missing_registration:
@@ -79,29 +51,8 @@ const AIRCRAFT_IDENTITY_REASONS = Object.freeze({
     "The current canonical aircraft assignment no longer matches the FAA record or its valuation identity.",
 });
 
-const AUTOMATIC_VERIFICATION_REASONS = Object.freeze({
-  ...AIRCRAFT_IDENTITY_REASONS,
-  aircraft_curation_required:
-    "The FAA record is valid, but the aircraft still needs a canonical catalog assignment.",
-  faa_rejected:
-    "The aircraft did not pass the mandatory FAA admission check.",
-  source_unavailable:
-    "The retained listing source needed for automatic verification is unavailable.",
-  source_evidence_missing:
-    "The retained listing does not contain exact source evidence for every remaining avionics item.",
-  product_attestation_required:
-    "One or more avionics products need a current manufacturer-source attestation.",
-  catalog_identity_ambiguous:
-    "The retained listing evidence matches more than one possible avionics product.",
-  identity_or_capability_qualifier_unresolved:
-    "A model variant or capability qualifier may identify a different avionics product.",
-  manual_review_required:
-    "One or more observations still require a person to confirm or discard them.",
-  factory_reference_pending:
-    "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.",
-  listing_finalization_failed:
-    "The identities were checked, but required valuation enrichment did not complete.",
-});
+const FACTORY_REFERENCE_PENDING_DETAIL =
+  "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.";
 
 const FALLBACK_REASON = Object.freeze({
   label: "Manual review required",
@@ -692,128 +643,6 @@ export function describeProductAssociationOutcome(error) {
   };
 }
 
-export function describeAutomaticListingVerificationOutcome(
-  payload,
-  expectedListingId = null,
-) {
-  const verification = payload?.verification;
-  const listingId = positiveInteger(verification?.listing_id);
-  const expectedId = expectedListingId == null
-    ? null
-    : positiveInteger(expectedListingId);
-  if (
-    !verification
-    || typeof verification !== "object"
-    || listingId === null
-    || (expectedId !== null && listingId !== expectedId)
-    || !AUTOMATIC_VERIFICATION_STATUSES.has(verification.status)
-  ) {
-    return unknownAutomaticVerificationOutcome();
-  }
-
-  if (
-    (verification.status === "verified" || verification.status === "already_verified")
-    && verification.final_ingestion_state === "ready"
-  ) {
-    return {
-      kind: "verified",
-      label: verification.status === "already_verified"
-        ? "Listing already verified"
-        : "Listing verified automatically",
-      detail: verification.status === "already_verified"
-        ? "The listing was already fully verified; no additional review was applied."
-        : "The aircraft and avionics checks passed, and the listing is now verified.",
-      listingId,
-      terminal: true,
-      stale: false,
-      focusArea: null,
-    };
-  }
-  if (
-    verification.status === "verified"
-    || verification.status === "already_verified"
-  ) {
-    return unknownAutomaticVerificationOutcome(
-      listingId,
-      automaticVerificationFocusArea(verification),
-    );
-  }
-
-  if (
-    verification.status === "pending_reference"
-    && verification.final_ingestion_state === "incomplete"
-    && verification?.finalization?.status === "pending_reference"
-    && verification?.finalization?.reason_code === "factory_reference_pending"
-  ) {
-    return {
-      kind: "pending_reference",
-      label: "Review complete — factory reference pending",
-      detail: AUTOMATIC_VERIFICATION_REASONS.factory_reference_pending,
-      listingId,
-      terminal: true,
-      stale: false,
-      focusArea: null,
-    };
-  }
-
-  if (verification.status === "stale") {
-    return {
-      kind: "stale",
-      label: "Review changed — reload required",
-      detail: "The listing, FAA data, or catalog changed while automatic verification was running.",
-      listingId,
-      terminal: false,
-      stale: true,
-      focusArea: automaticVerificationFocusArea(verification),
-    };
-  }
-
-  const focusArea = automaticVerificationFocusArea(verification);
-  const reasonCode = automaticVerificationReasonCode(verification, focusArea);
-  const knownReason = AUTOMATIC_VERIFICATION_REASONS[reasonCode];
-  const remaining = nonnegativeCount(
-    verification?.avionics?.remaining_review_aspects,
-  );
-  const detail = knownReason || (
-    focusArea === "aircraft"
-      ? "The aircraft identity still needs FAA-backed catalog review."
-      : remaining > 0
-        ? `${remaining} ${pluralize(remaining, "avionics observation")} still need review.`
-        : "The automatic checks could not safely resolve every required listing detail."
-  );
-
-  if (verification.status === "failed") {
-    return {
-      kind: "failed",
-      label: "Automatic verification failed",
-      detail,
-      listingId,
-      terminal: false,
-      stale: false,
-      focusArea,
-    };
-  }
-
-  if (
-    verification.status === "pending_review"
-    || verification.status === "blocked"
-  ) {
-    return {
-      kind: verification.status === "pending_review" ? "pending" : "blocked",
-      label: verification.status === "pending_review"
-        ? "Review still required"
-        : "Automatic verification stopped",
-      detail,
-      listingId,
-      terminal: false,
-      stale: false,
-      focusArea,
-    };
-  }
-
-  return unknownAutomaticVerificationOutcome(listingId, focusArea);
-}
-
 export function describeResolvedListingOutcome(payload, expectedListingId = null) {
   const listing = payload?.listing;
   const listingId = positiveInteger(listing?.id);
@@ -847,7 +676,7 @@ export function describeResolvedListingOutcome(payload, expectedListingId = null
     return {
       kind: "pending_reference",
       label: `Listing ${listingId} review complete; factory reference pending before valuation`,
-      detail: AUTOMATIC_VERIFICATION_REASONS.factory_reference_pending,
+      detail: FACTORY_REFERENCE_PENDING_DETAIL,
       listingId,
       terminal: true,
     };
@@ -858,77 +687,6 @@ export function describeResolvedListingOutcome(payload, expectedListingId = null
     detail: `Listing ${listingId} returned an unexpected verification state.`,
     listingId,
     terminal: false,
-  };
-}
-
-export function describeAutomaticListingVerificationError(error) {
-  const code = typeof error?.payload?.error?.code === "string"
-    ? error.payload.error.code
-    : "";
-  if (
-    code === "automatic_verification_stale"
-    || code === "review_stale"
-    || error?.status === 412
-  ) {
-    return {
-      kind: "stale",
-      label: "Review changed — reload required",
-      detail: "The listing, FAA data, or catalog changed before automatic verification could finish.",
-    };
-  }
-  if (code === "automatic_verification_in_progress") {
-    return {
-      kind: "in_progress",
-      label: "Verification already running",
-      detail: "Another automatic verification is already checking this listing.",
-    };
-  }
-  if (code === "automatic_verification_unavailable" || error?.status === 503) {
-    return {
-      kind: "unavailable",
-      label: "Automatic verification unavailable",
-      detail: "Automatic verification is not configured on this server.",
-    };
-  }
-  return {
-    kind: "failed",
-    label: "Automatic verification failed",
-    detail: "The listing was not reported as verified. Reload it before trying again.",
-  };
-}
-
-function automaticVerificationFocusArea(verification) {
-  const aircraftStatus = typeof verification?.aircraft?.status === "string"
-    ? verification.aircraft.status
-    : "";
-  if (!AUTOMATIC_AIRCRAFT_COMPLETE_STATES.has(aircraftStatus)) {
-    return "aircraft";
-  }
-  return "avionics";
-}
-
-function automaticVerificationReasonCode(verification, focusArea) {
-  const preferred = focusArea === "aircraft"
-    ? verification?.aircraft?.reason_code
-    : verification?.avionics?.reason_code;
-  if (typeof preferred === "string" && MACHINE_REASON_CODE.test(preferred)) {
-    return preferred;
-  }
-  const fallback = verification?.finalization?.reason_code;
-  return typeof fallback === "string" && MACHINE_REASON_CODE.test(fallback)
-    ? fallback
-    : "";
-}
-
-function unknownAutomaticVerificationOutcome(listingId = null, focusArea = "avionics") {
-  return {
-    kind: "blocked",
-    label: "Verification result unavailable",
-    detail: "The server did not return a complete automatic verification result. The listing remains unverified.",
-    listingId,
-    terminal: false,
-    stale: false,
-    focusArea,
   };
 }
 

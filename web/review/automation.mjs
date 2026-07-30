@@ -19,6 +19,25 @@ const AVIONICS_COMPLETE = new Set([
   "verified",
 ]);
 
+const RUN_STATUSES = new Set([
+  "queued",
+  "running",
+  "cancelling",
+  "completed",
+  "cancelled",
+]);
+
+const RUN_ITEM_STATUSES = new Set([
+  "queued",
+  "running",
+  "verified",
+  "pending_review",
+  "pending_reference",
+  "blocked",
+  "failed",
+  "cancelled",
+]);
+
 const REASON_COPY = Object.freeze({
   aircraft_assignment_ready:
     "The FAA-backed aircraft identity can be assigned from the local catalog.",
@@ -235,6 +254,177 @@ export function filterPipelineRows(rows, filter = "all", query = "") {
       row?.gemini?.label,
     ].some((value) => String(value ?? "").toLocaleLowerCase().includes(search));
   });
+}
+
+export function pipelineAutomaticEligibility(row) {
+  if (!row || typeof row !== "object") {
+    return { eligible: false, reason: "Listing status is unavailable." };
+  }
+  if (
+    row.status === "verified"
+    || row.status === "already_verified"
+    || row.finalIngestionState === "ready"
+  ) {
+    return { eligible: false, reason: "The listing is already verified." };
+  }
+  if (
+    row.reference?.status === "pending_reference"
+    || row.status === "pending_reference"
+  ) {
+    return {
+      eligible: false,
+      reason: "Identity review is complete; factory reference publication is the remaining work.",
+    };
+  }
+  if (
+    row.aircraft?.status === "rejected"
+    || row.avionics?.status === "faa_rejected"
+  ) {
+    return {
+      eligible: false,
+      reason: "The aircraft was deterministically rejected by mandatory FAA admission.",
+    };
+  }
+  return {
+    eligible: true,
+    reason: "The listing has automatic identity or readiness work available.",
+  };
+}
+
+export function verificationRunRequest(listingIds) {
+  const normalized = Array.from(new Set(
+    (Array.isArray(listingIds) ? listingIds : [])
+      .map(positiveInteger)
+      .filter((value) => value !== null),
+  )).sort((left, right) => left - right);
+  return { listing_ids: normalized };
+}
+
+export function verificationRunIdempotencyKey(cryptoApi = globalThis.crypto) {
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+  if (typeof cryptoApi?.getRandomValues !== "function") {
+    throw new Error("Secure random values are unavailable in this browser.");
+  }
+  const bytes = new Uint8Array(16);
+  cryptoApi.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+  return [
+    hex.slice(0, 4).join(""),
+    hex.slice(4, 6).join(""),
+    hex.slice(6, 8).join(""),
+    hex.slice(8, 10).join(""),
+    hex.slice(10).join(""),
+  ].join("-");
+}
+
+export function verificationRunState(run, items = []) {
+  const runId = positiveInteger(run?.id);
+  const status = RUN_STATUSES.has(run?.status) ? run.status : "unknown";
+  const normalizedItems = (Array.isArray(items) ? items : []).flatMap((item) => {
+    const id = positiveInteger(item?.id);
+    const listingId = positiveInteger(item?.listing_id);
+    if (
+      id === null
+      || listingId === null
+      || !RUN_ITEM_STATUSES.has(item?.status)
+    ) {
+      return [];
+    }
+    return [{
+      id,
+      listingId,
+      status: item.status,
+      outcome: item?.outcome && typeof item.outcome === "object"
+        ? item.outcome
+        : null,
+      reason: nonBlank(item?.reason),
+    }];
+  });
+  const derived = Object.fromEntries(
+    Array.from(RUN_ITEM_STATUSES, (itemStatus) => [
+      itemStatus,
+      normalizedItems.filter((item) => item.status === itemStatus).length,
+    ]),
+  );
+  const total = nonnegativeInteger(run?.total_items) || normalizedItems.length;
+  const counts = {
+    queued: runCount(run, "queued_items", derived.queued),
+    running: runCount(run, "running_items", derived.running),
+    verified: runCount(run, "verified_items", derived.verified),
+    pendingReview: runCount(
+      run,
+      "pending_review_items",
+      derived.pending_review,
+    ),
+    pendingReference: runCount(
+      run,
+      "pending_reference_items",
+      derived.pending_reference,
+    ),
+    blocked: runCount(run, "blocked_items", derived.blocked),
+    failed: runCount(run, "failed_items", derived.failed),
+    cancelled: runCount(run, "cancelled_items", derived.cancelled),
+  };
+  const completed = counts.verified
+    + counts.pendingReview
+    + counts.pendingReference
+    + counts.blocked
+    + counts.failed
+    + counts.cancelled;
+  const currentListingId = positiveInteger(run?.current_listing_id)
+    ?? normalizedItems.find((item) => item.status === "running")?.listingId
+    ?? null;
+  return {
+    id: runId,
+    status,
+    terminal: status === "completed"
+      || (
+        status === "cancelled"
+        && counts.running === 0
+        && counts.queued === 0
+      ),
+    total,
+    completed,
+    currentListingId,
+    counts,
+    items: normalizedItems,
+  };
+}
+
+export function verificationRunStatusView(status) {
+  const views = {
+    queued: ["Queued", "The run is waiting to start.", "pending"],
+    running: ["Running", "Automatic verification is processing listings.", "running"],
+    cancelling: [
+      "Stopping",
+      "The current listing will finish before the run stops.",
+      "pending",
+    ],
+    completed: ["Completed", "Every selected listing reached a terminal result.", "complete"],
+    cancelled: ["Cancelled", "The work was not started because the run was stopped.", "cancelled"],
+    verified: ["Verified", "The listing passed identity and readiness checks.", "complete"],
+    pending_review: ["Manual review", "Automatic checks left a current manual review.", "pending"],
+    pending_reference: [
+      "Reference pending",
+      "Identity review is complete; factory reference publication remains.",
+      "reference",
+    ],
+    blocked: ["Blocked", "Automatic verification could not safely advance this listing.", "blocked"],
+    failed: ["Failed", "Automatic verification failed for this listing.", "blocked"],
+  };
+  const [label, detail, tone] = views[status]
+    || ["Status unavailable", "Reload this verification run.", "blocked"];
+  return { label, detail, tone };
+}
+
+function runCount(run, key, fallback) {
+  return Number.isSafeInteger(run?.[key]) && run[key] >= 0
+    ? run[key]
+    : fallback;
 }
 
 function stageView(area, value) {
