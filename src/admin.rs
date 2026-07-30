@@ -1,39 +1,25 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::File;
 use std::path::PathBuf;
 
-use aircost_rs::aircraft::catalog::AircraftHierarchy;
-use aircost_rs::aircraft::curation::persistence::{
-    persist_reviewable_aircraft_hierarchy, PersistReviewableAircraftHierarchy,
+use aircost_rs::aircraft::curation::application::{
+    apply_aircraft_hierarchy_curation_report, AircraftHierarchyApplicationReport,
 };
 use aircost_rs::aircraft::curation::workflow::{
     curate_aircraft_hierarchy_observations_with_config,
-    curate_aircraft_hierarchy_observations_with_operator_tcds, AircraftHierarchyCurationCaseReport,
-    AircraftHierarchyCurationReport,
+    curate_aircraft_hierarchy_observations_with_operator_tcds,
 };
 use aircost_rs::aircraft::enrich_aircraft_specs_from_plugin_submissions;
 use aircost_rs::aircraft::faa::{
-    drs::{parse_operator_supplied_current_tcds, CurrentTcdsMetadata, TcdsDocument},
+    drs::{parse_operator_supplied_current_tcds, CurrentTcdsMetadata, DrsClient, TcdsDocument},
     listing_targets, parse_release, require_listing_faa_admission, store_release,
-    AircraftGrounding, Eligibility, ExplicitNNumberTargets, FaaImportTargets, ReleaseMetadata,
-    ReleaseReaders,
+    ExplicitNNumberTargets, FaaImportTargets, ReleaseMetadata, ReleaseReaders,
 };
-use aircost_rs::aircraft::identity::{
-    ensure_listing_identity_assignment_from_approved_catalog,
-    CanonicalAircraftCompatibilityIdentity, CanonicalAircraftIdentityAssignment,
-    EnsureIdentityAssignmentOutcome,
-};
-use aircost_rs::aircraft::observations::{
-    load_aircraft_identity_observations, AircraftIdentityObservation,
-};
+use aircost_rs::aircraft::verification::AircraftVerificationServices;
 use aircost_rs::avionics::consolidation::{
     audit_avionics_catalog_duplicates, consolidate_avionics_models,
     plan_canonical_legacy_duplicates, preview_avionics_model_consolidation,
-};
-use aircost_rs::avionics::repopulate::{
-    preflight_listing_avionics_repopulation, repopulate_listing_avionics,
-    AvionicsRepopulationExecutionMode, AvionicsRepopulationScope,
 };
 use aircost_rs::avionics::{
     curate_avionics_models_with_gemini, enrich_listing_avionics_metadata,
@@ -52,6 +38,9 @@ use aircost_rs::gemini::interactions::GeminiInteractionsClient;
 use aircost_rs::gemini::live_benchmark::LiveBenchmarkRunner;
 use aircost_rs::gemini::usage::Store as GeminiUsageStore;
 use aircost_rs::listing::backfill::{default_stage_limit, stage_legacy_listing_reviews};
+use aircost_rs::listing::verification::{
+    verify_listings, ListingVerificationMode, ListingVerificationScope, ListingVerificationServices,
+};
 #[cfg(feature = "dnn")]
 use aircost_rs::valuation::dataset::load_snapshot;
 use aircost_rs::valuation::dataset::{create_snapshot, SnapshotPolicy};
@@ -158,6 +147,13 @@ async fn main() -> Result<()> {
                 Some(input) => Some(load_operator_tcds(&db, listing_id, input).await?),
                 None => None,
             };
+            let drs_client = if supplied_tcds.is_none() {
+                let api_key = env::var("FAA_DRS_API_KEY")
+                    .context("FAA_DRS_API_KEY is required for unknown aircraft identities")?;
+                Some(DrsClient::new(api_key)?)
+            } else {
+                None
+            };
             let mut report = match (listing_id, supplied_tcds.as_ref()) {
                 (Some(listing_id), Some(document)) => {
                     curate_aircraft_hierarchy_observations_with_operator_tcds(
@@ -173,6 +169,9 @@ async fn main() -> Result<()> {
                     curate_aircraft_hierarchy_observations_with_config(
                         &db,
                         &client,
+                        drs_client
+                            .as_ref()
+                            .expect("normal curation path constructs an FAA DRS client"),
                         listing_limit,
                         listing_id,
                         cluster_limit,
@@ -183,7 +182,7 @@ async fn main() -> Result<()> {
                 (None, Some(_)) => unreachable!("operator TCDS parser requires listing id"),
             };
             let application = if apply {
-                apply_reviewable_aircraft_hierarchies(&db, &report, listing_limit, listing_id)
+                apply_aircraft_hierarchy_curation_report(&db, &report, listing_limit, listing_id)
                     .await?
             } else {
                 AircraftHierarchyApplicationReport::dry_run()
@@ -257,7 +256,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        AdminCommand::RepopulateAvionics {
+        AdminCommand::VerifyListings {
             database,
             mode,
             limit,
@@ -265,27 +264,51 @@ async fn main() -> Result<()> {
             after_listing_id,
         } => {
             let db = aircost_rs::db::AppDb::connect(&database).await?;
-            let scope = AvionicsRepopulationScope::new(limit, listing_id, after_listing_id);
+            let scope = ListingVerificationScope::new(limit, listing_id, after_listing_id);
             match mode {
-                AvionicsRepopulationCommandMode::Preflight => {
-                    let report = preflight_listing_avionics_repopulation(&db, &scope).await?;
+                ListingVerificationCommandMode::Preflight => {
+                    let report = verify_listings(
+                        &db,
+                        ListingVerificationMode::Preflight,
+                        &scope,
+                        ListingVerificationServices::unavailable(),
+                    )
+                    .await?;
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
-                AvionicsRepopulationCommandMode::Preview
-                | AvionicsRepopulationCommandMode::Apply => {
+                ListingVerificationCommandMode::Preview | ListingVerificationCommandMode::Apply => {
                     let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
-                    let execution_mode = match mode {
-                        AvionicsRepopulationCommandMode::Preview => {
-                            AvionicsRepopulationExecutionMode::Preview
-                        }
-                        AvionicsRepopulationCommandMode::Apply => {
-                            AvionicsRepopulationExecutionMode::Apply
-                        }
-                        AvionicsRepopulationCommandMode::Preflight => unreachable!(),
+                    let runtime_config = GeminiRuntimeConfig::from_environment()?;
+                    let gemini_api_key = env::var("GEMINI_API_KEY")
+                        .context("GEMINI_API_KEY is required for automatic verification")?;
+                    let aircraft_gemini = GeminiInteractionsClient::new(gemini_api_key)?
+                        .with_usage_store(GeminiUsageStore::new(&db));
+                    let aircraft_drs = env::var("FAA_DRS_API_KEY")
+                        .ok()
+                        .map(DrsClient::new)
+                        .transpose()?;
+                    let aircraft = aircraft_drs
+                        .as_ref()
+                        .map(|drs| AircraftVerificationServices {
+                            gemini: &aircraft_gemini,
+                            drs,
+                            config: &runtime_config,
+                        });
+                    let verification_mode = match mode {
+                        ListingVerificationCommandMode::Preview => ListingVerificationMode::Preview,
+                        ListingVerificationCommandMode::Apply => ListingVerificationMode::Apply,
+                        ListingVerificationCommandMode::Preflight => unreachable!(),
                     };
-                    let report =
-                        repopulate_listing_avionics(&db, &extractor, execution_mode, &scope)
-                            .await?;
+                    let report = verify_listings(
+                        &db,
+                        verification_mode,
+                        &scope,
+                        ListingVerificationServices {
+                            extractor: Some(&extractor),
+                            aircraft,
+                        },
+                    )
+                    .await?;
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
             }
@@ -579,9 +602,9 @@ enum AdminCommand {
         submission_ids: Vec<i64>,
         execute: bool,
     },
-    RepopulateAvionics {
+    VerifyListings {
         database: String,
-        mode: AvionicsRepopulationCommandMode,
+        mode: ListingVerificationCommandMode,
         limit: i64,
         listing_id: Option<i64>,
         after_listing_id: Option<i64>,
@@ -669,7 +692,7 @@ struct OperatorTcdsInput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AvionicsRepopulationCommandMode {
+enum ListingVerificationCommandMode {
     Preflight,
     Preview,
     Apply,
@@ -736,599 +759,6 @@ async fn load_operator_tcds(
         .context("operator-supplied FAA TCDS failed bounded provenance/PDF validation")
 }
 
-#[derive(Debug, serde::Serialize)]
-struct AircraftHierarchyApplicationOutcome {
-    cluster_key: String,
-    listing_id: Option<i64>,
-    observation_sha256: Option<String>,
-    status: &'static str,
-    catalog_writes: usize,
-    assignment_id: Option<i64>,
-    assignment_status: Option<&'static str>,
-    approval_fingerprint: Option<String>,
-    reason: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AircraftHierarchyApplicationReport {
-    requested: bool,
-    attempted_observations: usize,
-    applied_observations: usize,
-    idempotent_observations: usize,
-    catalog_reused_observations: usize,
-    blocked_outcomes: usize,
-    canonical_catalog_writes: usize,
-    outcomes: Vec<AircraftHierarchyApplicationOutcome>,
-}
-
-impl AircraftHierarchyApplicationReport {
-    fn dry_run() -> Self {
-        Self {
-            requested: false,
-            attempted_observations: 0,
-            applied_observations: 0,
-            idempotent_observations: 0,
-            catalog_reused_observations: 0,
-            blocked_outcomes: 0,
-            canonical_catalog_writes: 0,
-            outcomes: Vec::new(),
-        }
-    }
-
-    fn block_case(
-        &mut self,
-        case: &AircraftHierarchyCurationCaseReport,
-        reason: impl Into<String>,
-    ) {
-        self.blocked_outcomes += 1;
-        self.outcomes.push(AircraftHierarchyApplicationOutcome {
-            cluster_key: case.cluster_key.clone(),
-            listing_id: None,
-            observation_sha256: None,
-            status: "blocked",
-            catalog_writes: 0,
-            assignment_id: None,
-            assignment_status: None,
-            approval_fingerprint: None,
-            reason: Some(reason.into()),
-        });
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct AircraftApplyGrounding<'a> {
-    listing_id: i64,
-    observation_sha256: &'a str,
-    grounding: &'a AircraftGrounding,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AircraftObservationApplyPolicy {
-    /// A paid/reviewable result may create canonical catalog state. It must
-    /// therefore remain bound to literal hierarchy labels in retained source.
-    ReviewableCatalogWrite,
-    /// This path can only assign an already-approved catalog identity. The
-    /// exact FAA record and catalog relationship are re-resolved immediately
-    /// before assignment, so listing hierarchy prose is not identity evidence.
-    ApprovedCatalogReuse,
-}
-
-fn require_reviewable_apply_trace(
-    case: &AircraftHierarchyCurationCaseReport,
-) -> std::result::Result<(&str, Vec<AircraftApplyGrounding<'_>>), String> {
-    if !case.validation_errors.is_empty() {
-        return Err(format!(
-            "reviewable payload was accompanied by validation errors: {}",
-            case.validation_errors.join("; ")
-        ));
-    }
-    let catalog_revision = case
-        .catalog_revision
-        .as_deref()
-        .filter(|revision| !revision.trim().is_empty())
-        .ok_or_else(|| "reviewable case has no exact catalog revision".to_string())?;
-    if case.catalog_function_results.len() != 1
-        || case.catalog_function_results[0].catalog_revision != catalog_revision
-    {
-        return Err("reviewable case has missing or ambiguous catalog grounding".to_string());
-    }
-    if case.faa_function_call_count != 1
-        || case.faa_function_result_count != 1
-        || case.faa_function_results.len() != 1
-    {
-        return Err("reviewable case has missing or ambiguous FAA function grounding".to_string());
-    }
-    let groundings = case.faa_function_results[0]
-        .observations
-        .iter()
-        .map(|grounded| AircraftApplyGrounding {
-            listing_id: grounded.listing_id,
-            observation_sha256: &grounded.observation_sha256,
-            grounding: &grounded.grounding,
-        })
-        .collect();
-    Ok((catalog_revision, groundings))
-}
-
-fn approved_catalog_apply_groundings(
-    case: &AircraftHierarchyCurationCaseReport,
-) -> std::result::Result<Vec<AircraftApplyGrounding<'_>>, String> {
-    if !case.validation_errors.is_empty() {
-        return Err(format!(
-            "approved-catalog case was accompanied by validation errors: {}",
-            case.validation_errors.join("; ")
-        ));
-    }
-    let mut groundings = Vec::new();
-    for audit in &case.faa_observations {
-        if !audit.faa_eligible || !audit.included_in_curation {
-            continue;
-        }
-        let Some(Eligibility::Eligible { grounding }) = audit.eligibility.as_ref() else {
-            return Err(format!(
-                "included FAA audit has no exact eligible grounding for listing {} observation {}",
-                audit.listing_id, audit.observation_sha256
-            ));
-        };
-        groundings.push(AircraftApplyGrounding {
-            listing_id: audit.listing_id,
-            observation_sha256: &audit.observation_sha256,
-            grounding,
-        });
-    }
-    if groundings.is_empty() {
-        return Err(
-            "approved-catalog case has no exact FAA-eligible observation grounding".to_string(),
-        );
-    }
-    Ok(groundings)
-}
-
-fn plan_case_observations<'observation, 'grounding>(
-    case: &AircraftHierarchyCurationCaseReport,
-    fresh_observations: &'observation [AircraftIdentityObservation],
-    groundings: &[AircraftApplyGrounding<'grounding>],
-    policy: AircraftObservationApplyPolicy,
-) -> std::result::Result<
-    Vec<(
-        &'observation AircraftIdentityObservation,
-        &'grounding AircraftGrounding,
-    )>,
-    String,
-> {
-    if policy == AircraftObservationApplyPolicy::ApprovedCatalogReuse {
-        if case.approved_catalog_identity.is_none() {
-            return Err(
-                "non-mutating catalog reuse requires an approved exact catalog identity"
-                    .to_string(),
-            );
-        }
-        if !case.validation_errors.is_empty() {
-            return Err(format!(
-                "approved catalog reuse was accompanied by validation errors: {}",
-                case.validation_errors.join("; ")
-            ));
-        }
-    }
-
-    let mut observations_by_key = BTreeMap::new();
-    let mut ambiguous_observation_keys = BTreeSet::new();
-    for (index, observation) in fresh_observations.iter().enumerate() {
-        let key = (
-            observation.listing_id,
-            observation.observation_sha256.clone(),
-        );
-        if observations_by_key.insert(key.clone(), index).is_some() {
-            ambiguous_observation_keys.insert(key);
-        }
-    }
-
-    let expected_listing_ids = case
-        .curation_listing_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if expected_listing_ids.len() != case.curation_listing_ids.len() {
-        return Err("curation case repeats an eligible listing id".to_string());
-    }
-    let mut grounding_keys = BTreeSet::new();
-    let mut planned = Vec::new();
-    for grounded in groundings {
-        let key = (grounded.listing_id, grounded.observation_sha256.to_string());
-        if !grounding_keys.insert(key.clone()) {
-            return Err(format!(
-                "FAA grounding repeats listing {} observation {}",
-                key.0, key.1
-            ));
-        }
-        if !expected_listing_ids.contains(&grounded.listing_id)
-            || !case.listing_ids.contains(&grounded.listing_id)
-            || !case
-                .observation_sha256s
-                .iter()
-                .any(|hash| hash == grounded.observation_sha256)
-        {
-            return Err(format!(
-                "FAA grounding is not bound to the reported curation observation for listing {}",
-                grounded.listing_id
-            ));
-        }
-        if ambiguous_observation_keys.contains(&key) {
-            return Err(format!(
-                "fresh observation lookup is ambiguous for listing {} observation {}",
-                key.0, key.1
-            ));
-        }
-        let Some(index) = observations_by_key.get(&key).copied() else {
-            return Err(format!(
-                "fresh observation is missing for listing {} observation {}",
-                key.0, key.1
-            ));
-        };
-        let observation = &fresh_observations[index];
-        if observation.cluster_key != case.cluster_key {
-            return Err(format!(
-                "fresh observation no longer has the cluster binding used for listing {}",
-                grounded.listing_id
-            ));
-        }
-        let has_exact_listing_source = observation.source_excerpt_is_exact
-            && observation
-                .source_excerpt
-                .as_deref()
-                .is_some_and(|excerpt| !excerpt.trim().is_empty());
-        if policy == AircraftObservationApplyPolicy::ReviewableCatalogWrite
-            && !has_exact_listing_source
-        {
-            return Err(format!(
-                "fresh observation no longer has the exact listing source used for catalog curation for listing {}",
-                grounded.listing_id
-            ));
-        }
-        let audit_matches = case.faa_observations.iter().filter(|audit| {
-            audit.listing_id == grounded.listing_id
-                && audit.observation_sha256 == grounded.observation_sha256
-                && audit.faa_eligible
-                && audit.included_in_curation
-        });
-        if audit_matches.count() != 1 {
-            return Err(format!(
-                "FAA eligibility audit is missing or ambiguous for listing {} observation {}",
-                grounded.listing_id, grounded.observation_sha256
-            ));
-        }
-        planned.push((observation, grounded.grounding));
-    }
-    let grounded_listing_ids = grounding_keys
-        .iter()
-        .map(|(listing_id, _)| *listing_id)
-        .collect::<BTreeSet<_>>();
-    if planned.is_empty()
-        || grounded_listing_ids != expected_listing_ids
-        || planned.len() != expected_listing_ids.len()
-    {
-        return Err(
-            "FAA grounding does not map one-to-one to every eligible curation listing".to_string(),
-        );
-    }
-    Ok(planned)
-}
-
-async fn ensure_exact_catalog_assignment(
-    db: &aircost_rs::db::AppDb,
-    listing_id: i64,
-    grounding: &AircraftGrounding,
-    expected: &CanonicalAircraftCompatibilityIdentity,
-) -> std::result::Result<(&'static str, CanonicalAircraftIdentityAssignment), String> {
-    let ensured =
-        ensure_listing_identity_assignment_from_approved_catalog(db, listing_id, grounding)
-            .await
-            .map_err(|error| error.to_string())?;
-    let (assignment_status, assignment) = match ensured {
-        EnsureIdentityAssignmentOutcome::Current { assignment } => ("current", assignment),
-        EnsureIdentityAssignmentOutcome::Assigned { assignment } => ("assigned", assignment),
-        EnsureIdentityAssignmentOutcome::PendingCuration {
-            reason,
-            candidate_count,
-        } => {
-            return Err(format!(
-                "approved catalog identity could not be assigned: {reason} (exact candidate count: {candidate_count})"
-            ));
-        }
-    };
-    let actual = CanonicalAircraftCompatibilityIdentity::from(&assignment);
-    if &actual != expected {
-        return Err(
-            "ensured assignment differs from the exact approved catalog identity returned by curation"
-                .to_string(),
-        );
-    }
-    Ok((assignment_status, assignment))
-}
-
-fn assignment_matches_hierarchy(
-    assignment: &CanonicalAircraftIdentityAssignment,
-    hierarchy: &AircraftHierarchy,
-) -> bool {
-    assignment.aircraft_make_id == hierarchy.manufacturer_id
-        && assignment.aircraft_model_family_id == hierarchy.model_family_id
-        && assignment.aircraft_designation_id == hierarchy.certified_variant_id
-        && assignment.aircraft_generation_id == hierarchy.generation_id
-        && assignment.aircraft_factory_package_id == hierarchy.tier_id
-}
-
-async fn apply_reviewable_aircraft_hierarchies(
-    db: &aircost_rs::db::AppDb,
-    report: &AircraftHierarchyCurationReport,
-    listing_limit: i64,
-    listing_id: Option<i64>,
-) -> Result<AircraftHierarchyApplicationReport> {
-    // Do not trust an observation retained in memory across paid model calls.
-    // Persistence receives only a freshly derived observation that still has
-    // the exact listing id + fingerprint returned by the curation case.
-    let fresh = load_aircraft_identity_observations(db, listing_limit, listing_id)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))
-        .context("could not reload aircraft observations before apply")?;
-
-    let mut application = AircraftHierarchyApplicationReport {
-        requested: true,
-        ..AircraftHierarchyApplicationReport::dry_run()
-    };
-    for case in &report.cases {
-        let Some(reviewable) = case.reviewable.as_ref() else {
-            let Some(approved_identity) = case.approved_catalog_identity.as_ref() else {
-                let reason = if case.validation_errors.is_empty() {
-                    "case did not produce a fully reviewable hierarchy".to_string()
-                } else {
-                    format!(
-                        "case did not pass curation gates: {}",
-                        case.validation_errors.join("; ")
-                    )
-                };
-                application.block_case(case, reason);
-                continue;
-            };
-            let fast_path_groundings = match approved_catalog_apply_groundings(case) {
-                Ok(groundings) => groundings,
-                Err(error) => {
-                    application.block_case(case, error);
-                    continue;
-                }
-            };
-            let planned = match plan_case_observations(
-                case,
-                &fresh.observations,
-                &fast_path_groundings,
-                AircraftObservationApplyPolicy::ApprovedCatalogReuse,
-            ) {
-                Ok(planned) => planned,
-                Err(error) => {
-                    application.block_case(case, error);
-                    continue;
-                }
-            };
-            for (observation, grounding) in planned {
-                application.attempted_observations += 1;
-                let (assignment_status, assignment) = match ensure_exact_catalog_assignment(
-                    db,
-                    observation.listing_id,
-                    grounding,
-                    approved_identity,
-                )
-                .await
-                {
-                    Ok(assignment) => assignment,
-                    Err(error) => {
-                        application.blocked_outcomes += 1;
-                        application
-                            .outcomes
-                            .push(AircraftHierarchyApplicationOutcome {
-                                cluster_key: case.cluster_key.clone(),
-                                listing_id: Some(observation.listing_id),
-                                observation_sha256: Some(observation.observation_sha256.clone()),
-                                status: "blocked",
-                                catalog_writes: 0,
-                                assignment_id: None,
-                                assignment_status: None,
-                                approval_fingerprint: None,
-                                reason: Some(error),
-                            });
-                        continue;
-                    }
-                };
-                application.catalog_reused_observations += 1;
-                application
-                    .outcomes
-                    .push(AircraftHierarchyApplicationOutcome {
-                        cluster_key: case.cluster_key.clone(),
-                        listing_id: Some(observation.listing_id),
-                        observation_sha256: Some(observation.observation_sha256.clone()),
-                        status: match assignment_status {
-                            "assigned" => "catalog_reused_assigned",
-                            "current" => "catalog_reused_current",
-                            _ => "catalog_reused",
-                        },
-                        catalog_writes: 0,
-                        assignment_id: Some(assignment.assignment_id),
-                        assignment_status: Some(assignment_status),
-                        approval_fingerprint: None,
-                        reason: None,
-                    });
-            }
-            continue;
-        };
-        let (catalog_revision, case_groundings) = match require_reviewable_apply_trace(case) {
-            Ok(trace) => trace,
-            Err(error) => {
-                application.block_case(case, error);
-                continue;
-            }
-        };
-        let mut planned = match plan_case_observations(
-            case,
-            &fresh.observations,
-            &case_groundings,
-            AircraftObservationApplyPolicy::ReviewableCatalogWrite,
-        ) {
-            Ok(planned) => planned,
-            Err(error) => {
-                application.block_case(case, error);
-                continue;
-            }
-        };
-        planned.sort_by(|(left, _), (right, _)| {
-            (left.listing_id, left.observation_sha256.as_str())
-                .cmp(&(right.listing_id, right.observation_sha256.as_str()))
-        });
-        let ((representative, representative_grounding), remaining) = planned
-            .split_first()
-            .expect("non-empty plan was validated before apply");
-        application.attempted_observations += 1;
-        let persisted = match persist_reviewable_aircraft_hierarchy(
-            db,
-            PersistReviewableAircraftHierarchy {
-                listing_id: representative.listing_id,
-                observation: representative,
-                expected_catalog_revision: catalog_revision,
-                reviewable,
-                grounding: representative_grounding,
-            },
-        )
-        .await
-        {
-            Ok(persisted) => persisted,
-            Err(error) => {
-                let reason = error.to_string();
-                for (index, (observation, _)) in planned.iter().enumerate() {
-                    application.blocked_outcomes += 1;
-                    application
-                        .outcomes
-                        .push(AircraftHierarchyApplicationOutcome {
-                            cluster_key: case.cluster_key.clone(),
-                            listing_id: Some(observation.listing_id),
-                            observation_sha256: Some(observation.observation_sha256.clone()),
-                            status: "blocked",
-                            catalog_writes: 0,
-                            assignment_id: None,
-                            assignment_status: None,
-                            approval_fingerprint: None,
-                            reason: Some(if index == 0 {
-                                reason.clone()
-                            } else {
-                                format!(
-                                    "representative hierarchy persistence was blocked: {reason}"
-                                )
-                            }),
-                        });
-                }
-                continue;
-            }
-        };
-        let status = if persisted.idempotent_replay {
-            application.idempotent_observations += 1;
-            "idempotent"
-        } else {
-            application.applied_observations += 1;
-            "applied"
-        };
-        application.canonical_catalog_writes += persisted.catalog_writes;
-        let expected_identity = CanonicalAircraftCompatibilityIdentity::from(&persisted.assignment);
-        let approval_fingerprint = persisted.approval_fingerprint.clone();
-        application
-            .outcomes
-            .push(AircraftHierarchyApplicationOutcome {
-                cluster_key: case.cluster_key.clone(),
-                listing_id: Some(representative.listing_id),
-                observation_sha256: Some(representative.observation_sha256.clone()),
-                status,
-                catalog_writes: persisted.catalog_writes,
-                assignment_id: Some(persisted.assignment.assignment_id),
-                assignment_status: Some("persisted"),
-                approval_fingerprint: Some(approval_fingerprint.clone()),
-                reason: None,
-            });
-
-        // The approval decision is cluster-scoped. Reusing the persistence API
-        // with another observation would collide with its per-listing
-        // validation provenance, so remaining listings use only the exact
-        // approved-catalog assignment path.
-        for (observation, grounding) in remaining {
-            application.attempted_observations += 1;
-            match ensure_exact_catalog_assignment(
-                db,
-                observation.listing_id,
-                grounding,
-                &expected_identity,
-            )
-            .await
-            {
-                Ok((assignment_status, assignment)) => {
-                    if !assignment_matches_hierarchy(&assignment, &persisted.hierarchy) {
-                        application.blocked_outcomes += 1;
-                        application
-                            .outcomes
-                            .push(AircraftHierarchyApplicationOutcome {
-                                cluster_key: case.cluster_key.clone(),
-                                listing_id: Some(observation.listing_id),
-                                observation_sha256: Some(
-                                    observation.observation_sha256.clone(),
-                                ),
-                                status: "blocked",
-                                catalog_writes: 0,
-                                assignment_id: Some(assignment.assignment_id),
-                                assignment_status: Some(assignment_status),
-                                approval_fingerprint: Some(
-                                    approval_fingerprint.clone(),
-                                ),
-                                reason: Some(
-                                    "catalog-reused assignment differs from the representative persisted hierarchy"
-                                        .to_string(),
-                                ),
-                            });
-                        continue;
-                    }
-                    application.catalog_reused_observations += 1;
-                    application
-                        .outcomes
-                        .push(AircraftHierarchyApplicationOutcome {
-                            cluster_key: case.cluster_key.clone(),
-                            listing_id: Some(observation.listing_id),
-                            observation_sha256: Some(observation.observation_sha256.clone()),
-                            status: match assignment_status {
-                                "assigned" => "catalog_reused_assigned",
-                                "current" => "catalog_reused_current",
-                                _ => "catalog_reused",
-                            },
-                            catalog_writes: 0,
-                            assignment_id: Some(assignment.assignment_id),
-                            assignment_status: Some(assignment_status),
-                            approval_fingerprint: Some(approval_fingerprint.clone()),
-                            reason: None,
-                        });
-                }
-                Err(error) => {
-                    application.blocked_outcomes += 1;
-                    application
-                        .outcomes
-                        .push(AircraftHierarchyApplicationOutcome {
-                            cluster_key: case.cluster_key.clone(),
-                            listing_id: Some(observation.listing_id),
-                            observation_sha256: Some(observation.observation_sha256.clone()),
-                            status: "blocked",
-                            catalog_writes: 0,
-                            assignment_id: None,
-                            assignment_status: None,
-                            approval_fingerprint: Some(approval_fingerprint.clone()),
-                            reason: Some(error),
-                        });
-                }
-            }
-        }
-    }
-    Ok(application)
-}
-
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
@@ -1340,7 +770,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         "import-faa-registry" => parse_import_faa_registry_args(args),
         "curate-aircraft-hierarchy" => parse_curate_aircraft_hierarchy_args(args),
         "benchmark-gemini" => parse_benchmark_gemini_args(args),
-        "repopulate-avionics" => parse_repopulate_avionics_args(args),
+        "verify-listings" => parse_verify_listings_args(args),
         "stage-listing-reviews" => parse_stage_listing_reviews_args(args),
         "audit-avionics-duplicates" => parse_audit_avionics_duplicates_args(args),
         "consolidate-legacy-avionics" => parse_consolidate_legacy_avionics_args(args),
@@ -1769,7 +1199,7 @@ fn benchmark_models_for_task(
     Ok(models)
 }
 
-fn parse_repopulate_avionics_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
+fn parse_verify_listings_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     let mut database = None;
     let mut requested_mode = None;
     let mut limit = 10_i64;
@@ -1782,19 +1212,19 @@ fn parse_repopulate_avionics_args(args: impl IntoIterator<Item = String>) -> Res
             "--database" | "--database-url" => {
                 database = Some(args.next().context("--database requires a value")?);
             }
-            "--preflight" => set_repopulation_mode(
+            "--preflight" => set_listing_verification_mode(
                 &mut requested_mode,
-                AvionicsRepopulationCommandMode::Preflight,
+                ListingVerificationCommandMode::Preflight,
                 "--preflight",
             )?,
-            "--dry-run" | "--preview" => set_repopulation_mode(
+            "--preview" => set_listing_verification_mode(
                 &mut requested_mode,
-                AvionicsRepopulationCommandMode::Preview,
-                arg.as_str(),
+                ListingVerificationCommandMode::Preview,
+                "--preview",
             )?,
-            "--apply" => set_repopulation_mode(
+            "--apply" => set_listing_verification_mode(
                 &mut requested_mode,
-                AvionicsRepopulationCommandMode::Apply,
+                ListingVerificationCommandMode::Apply,
                 "--apply",
             )?,
             "--limit" => {
@@ -1823,7 +1253,7 @@ fn parse_repopulate_avionics_args(args: impl IntoIterator<Item = String>) -> Res
                 print_usage();
                 std::process::exit(0);
             }
-            _ => bail!("unknown repopulate-avionics argument: {arg}"),
+            _ => bail!("unknown verify-listings argument: {arg}"),
         }
     }
 
@@ -1840,25 +1270,23 @@ fn parse_repopulate_avionics_args(args: impl IntoIterator<Item = String>) -> Res
         bail!("--listing-id and --after-listing-id are mutually exclusive");
     }
 
-    Ok(AdminCommand::RepopulateAvionics {
+    Ok(AdminCommand::VerifyListings {
         database: database_url_from_arg(database),
-        mode: requested_mode.unwrap_or(AvionicsRepopulationCommandMode::Preflight),
+        mode: requested_mode.unwrap_or(ListingVerificationCommandMode::Preflight),
         limit,
         listing_id,
         after_listing_id,
     })
 }
 
-fn set_repopulation_mode(
-    requested: &mut Option<AvionicsRepopulationCommandMode>,
-    mode: AvionicsRepopulationCommandMode,
+fn set_listing_verification_mode(
+    requested: &mut Option<ListingVerificationCommandMode>,
+    mode: ListingVerificationCommandMode,
     flag: &str,
 ) -> Result<()> {
     if let Some(previous) = requested {
         if *previous != mode {
-            bail!(
-                "{flag} conflicts with the previously selected repopulate-avionics execution mode"
-            );
+            bail!("{flag} conflicts with the previously selected verify-listings execution mode");
         }
     }
     *requested = Some(mode);
@@ -2347,7 +1775,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin import-faa-registry --master MASTER.txt --aircraft-reference ACFTREF.txt --engine-reference ENGINE.txt --snapshot-date YYYY-MM-DD --archive-sha256 HEX [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Scans the official files and stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin repopulate-avionics [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --dry-run | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Zero-Gemini preflight is the default and reports a resumable checkpoint plus logical provider-request baseline/envelope. --dry-run explicitly enables paid preview requests; --apply enables paid requests and per-listing atomic writes.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin import-faa-registry --master MASTER.txt --aircraft-reference ACFTREF.txt --engine-reference ENGINE.txt --snapshot-date YYYY-MM-DD --archive-sha256 HEX [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Scans the official files and stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -2790,321 +2218,11 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         }
     }
 
-    fn aircraft_apply_grounding() -> AircraftGrounding {
-        use aircost_rs::aircraft::faa::{AircraftReference, SerialMatch, Snapshot};
-
-        AircraftGrounding {
-            snapshot: Snapshot {
-                id: 2,
-                evidence_source_id: 3,
-                snapshot_date: "2026-07-23".to_string(),
-                source_url: "https://www.faa.gov/registry".to_string(),
-                archive_sha256: "a".repeat(64),
-                source_manifest_sha256: "b".repeat(64),
-                target_set_sha256: "c".repeat(64),
-            },
-            n_number: "N89225".to_string(),
-            manufacturer_serial_raw: Some("SERIAL".to_string()),
-            manufacturer_serial_key: Some("SERIAL".to_string()),
-            aircraft_code: "2072723".to_string(),
-            engine_code: None,
-            source_record_sha256: "d".repeat(64),
-            year_manufactured: Some(2022),
-            aircraft: Some(AircraftReference {
-                aircraft_code: "2072723".to_string(),
-                manufacturer_name: Some("TEXTRON AVIATION INC".to_string()),
-                model_name: Some("182T".to_string()),
-                aircraft_type_code: None,
-                engine_type_code: None,
-                category_code: None,
-                certification_indicator_code: None,
-                engine_count: Some(1),
-                seat_count: Some(4),
-                weight_class_code: None,
-                cruise_speed_mph: None,
-                type_certificate_data_sheet: None,
-                type_certificate_holder: None,
-            }),
-            engine: None,
-            serial_match: SerialMatch::RawExact,
-        }
-    }
-
-    fn aircraft_apply_observation() -> AircraftIdentityObservation {
-        AircraftIdentityObservation {
-            listing_id: 23,
-            submission_id: Some(7),
-            source_url: Some("https://example.test/listing/23".to_string()),
-            rendered_html_sha256: Some("e".repeat(64)),
-            manufacturer: "Cessna".to_string(),
-            model: "182".to_string(),
-            variant: "182T".to_string(),
-            model_year: 2022,
-            serial_number: Some("SERIAL".to_string()),
-            registration_number: Some("N89225".to_string()),
-            source_excerpt: Some("2022 Cessna 182T".to_string()),
-            source_excerpt_is_exact: true,
-            source_kind: "retained_submission".to_string(),
-            observation_sha256: "f".repeat(64),
-            cluster_key: "cluster-182t".to_string(),
-            requires_human_review: false,
-            review_reasons: Vec::new(),
-        }
-    }
-
-    fn aircraft_apply_case() -> AircraftHierarchyCurationCaseReport {
-        use aircost_rs::aircraft::curation::workflow::{
-            FaaObservationAudit, FaaRegistryFunctionResult, FaaRegistryObservationGrounding,
-        };
-        use aircost_rs::aircraft::curation::AircraftCatalogSearchResponse;
-
-        let grounding = aircraft_apply_grounding();
-        let observation = aircraft_apply_observation();
-        let grounded = FaaRegistryObservationGrounding {
-            listing_id: observation.listing_id,
-            observation_sha256: observation.observation_sha256.clone(),
-            observed_make: observation.manufacturer.clone(),
-            observed_model: observation.model.clone(),
-            observed_variant: observation.variant.clone(),
-            listing_model_year: observation.model_year,
-            model_year_differs_from_year_manufactured: false,
-            grounding: grounding.clone(),
-        };
-        AircraftHierarchyCurationCaseReport {
-            cluster_key: observation.cluster_key.clone(),
-            listing_ids: vec![observation.listing_id],
-            curation_listing_ids: vec![observation.listing_id],
-            observation_sha256s: vec![observation.observation_sha256.clone()],
-            source_observation_count: 1,
-            skipped_non_exact_observation_count: 0,
-            faa_eligible_observation_count: 1,
-            faa_rejected_observation_count: 0,
-            faa_snapshot: Some(grounding.snapshot.clone()),
-            faa_observations: vec![FaaObservationAudit {
-                listing_id: observation.listing_id,
-                observation_sha256: observation.observation_sha256,
-                supplied_registration: observation.registration_number,
-                supplied_serial_number: observation.serial_number,
-                listing_model_year: observation.model_year,
-                faa_year_manufactured: grounding.year_manufactured,
-                model_year_differs_from_year_manufactured: false,
-                faa_eligible: true,
-                included_in_curation: true,
-                lookup_outcome: None,
-                eligibility: Some(Eligibility::Eligible {
-                    grounding: grounding.clone(),
-                }),
-                lookup_error: None,
-            }],
-            faa_function_call_count: 1,
-            faa_function_result_count: 1,
-            faa_function_results: vec![FaaRegistryFunctionResult {
-                case_token: "case-token".to_string(),
-                cluster_key: "cluster-182t".to_string(),
-                snapshot: grounding.snapshot,
-                year_manufactured_is_model_year: false,
-                observations: vec![grounded],
-            }],
-            catalog_revision: Some("catalog-revision".to_string()),
-            research: None,
-            adjudication: None,
-            verification: None,
-            reviewable: None,
-            approved_catalog_identity: None,
-            approved_catalog_fallback_reasons: Vec::new(),
-            validation_errors: Vec::new(),
-            interactions: Vec::new(),
-            evidence_reuse_audits: Vec::new(),
-            catalog_function_results: vec![AircraftCatalogSearchResponse {
-                catalog_revision: "catalog-revision".to_string(),
-                catalog_is_empty: true,
-                search_request: aircost_rs::aircraft::curation::AircraftCatalogSearchRequest {
-                    observed_make: observation.manufacturer,
-                    observed_family: observation.model,
-                    observed_designation: observation.variant,
-                    observed_generation: None,
-                    observed_package: None,
-                    model_year: observation.model_year,
-                },
-                allowed_existing_ids_by_kind: BTreeMap::new(),
-                candidates: Vec::new(),
-                generation_designations: Vec::new(),
-                package_applicability: Vec::new(),
-                warning: String::new(),
-            }],
-        }
-    }
-
     #[test]
-    fn aircraft_apply_trace_rejects_validation_errors_before_planning() {
-        let mut case = aircraft_apply_case();
-        case.validation_errors
-            .push("not independently verified".to_string());
-
-        let error = require_reviewable_apply_trace(&case).unwrap_err();
-        assert!(error.contains("validation errors"));
-    }
-
-    #[test]
-    fn aircraft_apply_trace_rejects_catalog_revision_mismatch() {
-        let mut case = aircraft_apply_case();
-        case.catalog_function_results[0].catalog_revision = "stale-revision".to_string();
-
-        let error = require_reviewable_apply_trace(&case).unwrap_err();
-        assert!(error.contains("catalog"));
-    }
-
-    #[test]
-    fn aircraft_apply_trace_rejects_ambiguous_faa_result() {
-        let mut case = aircraft_apply_case();
-        case.faa_function_result_count = 2;
-
-        let error = require_reviewable_apply_trace(&case).unwrap_err();
-        assert!(error.contains("FAA"));
-    }
-
-    #[test]
-    fn aircraft_apply_planning_rejects_missing_and_duplicate_observation_hashes() {
-        let case = aircraft_apply_case();
-        let (_, groundings) = require_reviewable_apply_trace(&case).unwrap();
-        let observation = aircraft_apply_observation();
-        let mut stale_observation = observation.clone();
-        stale_observation.observation_sha256 = "0".repeat(64);
-
-        let missing = plan_case_observations(
-            &case,
-            &[stale_observation],
-            &groundings,
-            AircraftObservationApplyPolicy::ReviewableCatalogWrite,
-        )
-        .unwrap_err();
-        assert!(missing.contains("missing"));
-
-        let duplicate = plan_case_observations(
-            &case,
-            &[observation.clone(), observation],
-            &groundings,
-            AircraftObservationApplyPolicy::ReviewableCatalogWrite,
-        )
-        .unwrap_err();
-        assert!(duplicate.contains("ambiguous"));
-    }
-
-    #[test]
-    fn aircraft_apply_planning_rejects_faa_observation_mismatch_as_one_case() {
-        let mut case = aircraft_apply_case();
-        case.faa_function_results[0].observations[0].observation_sha256 = "0".repeat(64);
-        let (_, groundings) = require_reviewable_apply_trace(&case).unwrap();
-
-        let error = plan_case_observations(
-            &case,
-            &[aircraft_apply_observation()],
-            &groundings,
-            AircraftObservationApplyPolicy::ReviewableCatalogWrite,
-        )
-        .unwrap_err();
-        assert!(error.contains("not bound"));
-    }
-
-    #[test]
-    fn aircraft_catalog_writes_reject_non_exact_listing_source() {
-        let case = aircraft_apply_case();
-        let (_, groundings) = require_reviewable_apply_trace(&case).unwrap();
-        let mut observation = aircraft_apply_observation();
-        observation.source_excerpt = Some("fallback values assembled from fields".to_string());
-        observation.source_excerpt_is_exact = false;
-
-        let error = plan_case_observations(
-            &case,
-            &[observation],
-            &groundings,
-            AircraftObservationApplyPolicy::ReviewableCatalogWrite,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("exact listing source"));
-    }
-
-    #[test]
-    fn approved_catalog_reuse_accepts_non_exact_listing_source_without_model_trace() {
-        let mut case = aircraft_apply_case();
-        case.approved_catalog_identity = Some(CanonicalAircraftCompatibilityIdentity {
-            aircraft_make_id: 1,
-            make_name: "TEXTRON AVIATION INC".to_string(),
-            aircraft_model_family_id: 2,
-            family_name: "Skylane".to_string(),
-            aircraft_designation_id: 3,
-            official_designation: "182T".to_string(),
-            aircraft_generation_id: None,
-            aircraft_factory_package_id: None,
-        });
-        case.catalog_revision = None;
-        case.catalog_function_results.clear();
-        case.faa_function_call_count = 0;
-        case.faa_function_result_count = 0;
-        case.faa_function_results.clear();
-        assert!(case.interactions.is_empty());
-
-        let groundings = approved_catalog_apply_groundings(&case).unwrap();
-        let mut observation = aircraft_apply_observation();
-        observation.source_excerpt = None;
-        observation.source_excerpt_is_exact = false;
-        let fresh_observations = [observation];
-
-        let planned = plan_case_observations(
-            &case,
-            &fresh_observations,
-            &groundings,
-            AircraftObservationApplyPolicy::ApprovedCatalogReuse,
-        )
-        .expect("exact FAA-backed approved catalog reuse does not depend on listing prose");
-
-        assert_eq!(planned.len(), 1);
-        assert!(!planned[0].0.source_excerpt_is_exact);
-    }
-
-    #[test]
-    fn non_exact_observation_cannot_claim_unapproved_or_unverified_catalog_reuse() {
-        let mut case = aircraft_apply_case();
-        let groundings = approved_catalog_apply_groundings(&case).unwrap();
-        let mut observation = aircraft_apply_observation();
-        observation.source_excerpt = Some("unverified fallback".to_string());
-        observation.source_excerpt_is_exact = false;
-
-        let missing_approval = plan_case_observations(
-            &case,
-            &[observation],
-            &groundings,
-            AircraftObservationApplyPolicy::ApprovedCatalogReuse,
-        )
-        .unwrap_err();
-        assert!(missing_approval.contains("approved exact catalog identity"));
-
-        case.approved_catalog_identity = Some(CanonicalAircraftCompatibilityIdentity {
-            aircraft_make_id: 1,
-            make_name: "TEXTRON AVIATION INC".to_string(),
-            aircraft_model_family_id: 2,
-            family_name: "Skylane".to_string(),
-            aircraft_designation_id: 3,
-            official_designation: "182T".to_string(),
-            aircraft_generation_id: None,
-            aircraft_factory_package_id: None,
-        });
-        case.faa_observations[0].eligibility = None;
-        let unverified = approved_catalog_apply_groundings(&case).unwrap_err();
-        assert!(unverified.contains("no exact eligible grounding"));
-
-        case.faa_observations[0].faa_eligible = false;
-        case.faa_observations[0].included_in_curation = false;
-        let garbage = approved_catalog_apply_groundings(&case).unwrap_err();
-        assert!(garbage.contains("no exact FAA-eligible observation grounding"));
-    }
-
-    #[test]
-    fn repopulate_avionics_cli_is_zero_call_preflight_by_default() {
+    fn verify_listings_cli_is_zero_call_preflight_by_default() {
         let command = parse_args(
             [
-                "repopulate-avionics",
+                "verify-listings",
                 "--database",
                 "sqlite::memory:",
                 "--listing-id",
@@ -3115,7 +2233,7 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         )
         .unwrap();
 
-        let AdminCommand::RepopulateAvionics {
+        let AdminCommand::VerifyListings {
             database,
             mode,
             limit,
@@ -3123,20 +2241,20 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
             after_listing_id,
         } = command
         else {
-            panic!("expected repopulate-avionics command")
+            panic!("expected verify-listings command")
         };
         assert_eq!(database, "sqlite::memory:");
-        assert_eq!(mode, AvionicsRepopulationCommandMode::Preflight);
+        assert_eq!(mode, ListingVerificationCommandMode::Preflight);
         assert_eq!(limit, 10);
         assert_eq!(listing_id, Some(29));
         assert_eq!(after_listing_id, None);
     }
 
     #[test]
-    fn repopulate_avionics_cli_parses_apply_limit_and_cursor() {
+    fn verify_listings_cli_parses_apply_limit_and_cursor() {
         let command = parse_args(
             [
-                "repopulate-avionics",
+                "verify-listings",
                 "--apply",
                 "--limit",
                 "7",
@@ -3148,7 +2266,7 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         )
         .unwrap();
 
-        let AdminCommand::RepopulateAvionics {
+        let AdminCommand::VerifyListings {
             mode,
             limit,
             listing_id,
@@ -3156,37 +2274,37 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
             ..
         } = command
         else {
-            panic!("expected repopulate-avionics command")
+            panic!("expected verify-listings command")
         };
-        assert_eq!(mode, AvionicsRepopulationCommandMode::Apply);
+        assert_eq!(mode, ListingVerificationCommandMode::Apply);
         assert_eq!(limit, 7);
         assert_eq!(listing_id, None);
         assert_eq!(after_listing_id, Some(29));
     }
 
     #[test]
-    fn repopulate_avionics_cli_requires_explicit_paid_preview() {
+    fn verify_listings_cli_requires_explicit_paid_preview() {
         let command = parse_args(
-            ["repopulate-avionics", "--dry-run"]
+            ["verify-listings", "--preview"]
                 .into_iter()
                 .map(str::to_string),
         )
         .unwrap();
         assert!(matches!(
             command,
-            AdminCommand::RepopulateAvionics {
-                mode: AvionicsRepopulationCommandMode::Preview,
+            AdminCommand::VerifyListings {
+                mode: ListingVerificationCommandMode::Preview,
                 ..
             }
         ));
     }
 
     #[test]
-    fn repopulate_avionics_cli_rejects_conflicting_mode_and_scope_flags() {
+    fn verify_listings_cli_rejects_conflicting_mode_and_scope_flags() {
         for arguments in [
-            vec!["repopulate-avionics", "--preflight", "--apply"],
+            vec!["verify-listings", "--preflight", "--apply"],
             vec![
-                "repopulate-avionics",
+                "verify-listings",
                 "--listing-id",
                 "29",
                 "--after-listing-id",

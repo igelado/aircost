@@ -4,10 +4,13 @@ import {
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
   associationsNeedingSourceRecovery,
+  automaticListingVerificationRequest,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
   characterLimitState,
   describeAircraftIdentity,
+  describeAutomaticListingVerificationError,
+  describeAutomaticListingVerificationOutcome,
   describeProductAssociationOutcome,
   describeReviewReasons,
   existingProductVerificationRequest,
@@ -71,6 +74,9 @@ const state = {
   activeArea: "avionics",
   stale: false,
   resolving: false,
+  automating: false,
+  automaticVerificationSequence: 0,
+  automationControlStates: new Map(),
 };
 
 const elements = {};
@@ -180,6 +186,7 @@ function collectElements() {
     reviewAvionicsAspects: "#review-avionics-aspects",
     reviewProgress: "#review-progress",
     reviewProgressLabel: "#review-progress-label",
+    automaticallyVerifyListing: "#automatically-verify-listing",
     verifyListing: "#verify-listing",
   })) {
     elements[key] = document.querySelector(selector);
@@ -262,6 +269,10 @@ function bindEvents() {
     });
     tab.addEventListener("keydown", (event) => handleReviewTabKeydown(event, area));
   }
+  elements.automaticallyVerifyListing.addEventListener(
+    "click",
+    automaticallyVerifyListing,
+  );
   elements.verifyListing.addEventListener("click", resolveReview);
   window.addEventListener("popstate", () => {
     if (!elements.reviewPanel.classList.contains("is-active")) {
@@ -1972,16 +1983,188 @@ function updateProgress() {
   const hashesPresent = nonBlank(state.currentReview?.review_payload_sha256)
     && nonBlank(state.currentReview?.catalog_revision_sha256);
   elements.verifyListing.disabled = state.resolving
+    || state.automating
     || state.stale
     || !state.currentReview
     || decided !== total
     || !hashesPresent
     || !aircraftVerified;
+  elements.automaticallyVerifyListing.disabled = state.resolving
+    || state.automating
+    || state.stale
+    || !state.currentReview
+    || !hashesPresent;
+}
+
+async function automaticallyVerifyListing() {
+  const review = state.currentReview;
+  if (!review || state.stale || state.resolving || state.automating) {
+    return;
+  }
+  if (
+    !nonBlank(review.review_payload_sha256)
+    || !nonBlank(review.catalog_revision_sha256)
+  ) {
+    setWorkspaceMessage(
+      "Reload this review before starting automatic verification.",
+      true,
+    );
+    return;
+  }
+
+  const draftWarning = hasDraftDecisions()
+    ? "This will discard the unsaved decisions in this review. "
+    : "";
+  const confirmed = window.confirm(
+    `${draftWarning}FAA and local catalog checks run first. `
+      + "If an identity remains unresolved, automatic verification may use paid Gemini API calls. Continue?",
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  const listingId = review.listing_id;
+  const previousQueue = state.reviews.slice();
+  const sequence = ++state.automaticVerificationSequence;
+  setAutomaticVerificationBusy(true);
+  setWorkspaceMessage(
+    "Automatically checking the aircraft, avionics, and listing readiness…",
+  );
+
+  try {
+    const payload = await api(
+      `/api/review/listings/${listingId}/verify-automatically`,
+      {
+        method: "POST",
+        body: JSON.stringify(automaticListingVerificationRequest(
+          review.review_payload_sha256,
+          review.catalog_revision_sha256,
+        )),
+      },
+    );
+    if (
+      sequence !== state.automaticVerificationSequence
+      || currentListingId() !== listingId
+    ) {
+      return;
+    }
+    const outcome = describeAutomaticListingVerificationOutcome(payload, listingId);
+    setAutomaticVerificationBusy(false);
+
+    if (outcome.terminal) {
+      await leaveAutomaticallyVerifiedReview(
+        listingId,
+        previousQueue,
+        outcome.label,
+      );
+      return;
+    }
+    if (outcome.stale) {
+      markStale(outcome.detail);
+      return;
+    }
+    if (outcome.kind === "failed") {
+      setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
+      return;
+    }
+
+    await openReview(listingId, {
+      historyMode: "none",
+      discardDraft: true,
+      force: true,
+    });
+    if (currentListingId() !== listingId || !state.currentReview) {
+      setWorkspaceMessage(
+        "Automatic verification did not report the listing as verified. Reload the review before continuing.",
+        true,
+      );
+      return;
+    }
+    setActiveReviewArea(outcome.focusArea || "avionics", {
+      updateLocation: true,
+    });
+    setWorkspaceMessage(
+      `${outcome.label}: ${outcome.detail} Review the remaining items.`,
+      outcome.kind !== "pending",
+    );
+  } catch (error) {
+    if (sequence !== state.automaticVerificationSequence) {
+      return;
+    }
+    setAutomaticVerificationBusy(false);
+    const outcome = describeAutomaticListingVerificationError(error);
+    if (outcome.kind === "stale") {
+      markStale(outcome.detail);
+    } else {
+      setWorkspaceMessage(`${outcome.label}: ${outcome.detail}`, true);
+    }
+  } finally {
+    if (sequence === state.automaticVerificationSequence && state.automating) {
+      setAutomaticVerificationBusy(false);
+    }
+  }
+}
+
+async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label) {
+  state.currentReview = null;
+  state.drafts.clear();
+  state.aspectViews.clear();
+  const queueRefreshed = await loadQueue({ quiet: true });
+  if (!queueRefreshed) {
+    state.reviews = previousQueue.filter(
+      (item) => positiveInteger(item?.listing_id) !== listingId,
+    );
+    state.total = Math.max(0, state.total - 1);
+    renderQueue();
+  }
+  await Promise.allSettled([
+    Promise.resolve(refreshListings?.()),
+    Promise.resolve(refreshAvionics?.()),
+  ]);
+  const nextId = nextAfterResolved(previousQueue, listingId);
+  if (nextId !== null) {
+    await openReview(nextId, {
+      historyMode: "replace",
+      discardDraft: true,
+      force: true,
+    });
+    setWorkspaceMessage(`${label}. Loaded the next pending review.`);
+    return;
+  }
+  showQueue({ historyMode: "replace", discardDraft: true });
+  setQueueMessage(
+    state.total === 0
+      ? `${label}. The review queue is clear.`
+      : `${label}.`,
+  );
+}
+
+function setAutomaticVerificationBusy(busy) {
+  state.automating = busy;
+  elements.reviewWorkspace.setAttribute("aria-busy", String(busy));
+  if (busy) {
+    state.automationControlStates.clear();
+    for (const control of elements.reviewWorkspace.querySelectorAll(
+      "button, input, select, textarea",
+    )) {
+      state.automationControlStates.set(control, control.disabled);
+      control.disabled = true;
+    }
+    return;
+  }
+  for (const [control, disabled] of state.automationControlStates) {
+    if (control.isConnected) {
+      control.disabled = disabled;
+    }
+  }
+  state.automationControlStates.clear();
+  updateProgress();
+  updateNextButton();
 }
 
 async function resolveReview() {
   const review = state.currentReview;
-  if (!review || state.stale || state.resolving) {
+  if (!review || state.stale || state.resolving || state.automating) {
     return;
   }
   if (!aircraftIdentityIsVerified(review.aircraft_identity)) {
@@ -2555,6 +2738,7 @@ function setWorkspaceLoading(listingId) {
   elements.reviewProgress.max = 1;
   elements.reviewProgress.value = 0;
   elements.reviewProgressLabel.textContent = "Loading decisions";
+  elements.automaticallyVerifyListing.disabled = true;
   elements.verifyListing.disabled = true;
   updateNextButton(listingId);
 }
@@ -2579,6 +2763,7 @@ function renderReviewLoadError(listingId, error) {
   elements.reviewAircraftTabCount.textContent = "0";
   elements.reviewAvionicsTabCount.textContent = "0";
   setActiveReviewArea("avionics", { updateLocation: true });
+  elements.automaticallyVerifyListing.disabled = true;
   elements.verifyListing.disabled = true;
   elements.reviewProgressLabel.textContent = "Review unavailable";
   setWorkspaceMessage("Review details could not be loaded.", true);
@@ -2608,7 +2793,10 @@ function markStale(message) {
 }
 
 function isStaleError(error) {
-  return error?.payload?.error?.code === "review_stale" || error?.status === 412;
+  return [
+    "review_stale",
+    "automatic_verification_stale",
+  ].includes(error?.payload?.error?.code) || error?.status === 412;
 }
 
 function isFinalizationError(error) {
@@ -2635,6 +2823,10 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   state.aspectViews.clear();
   state.stale = false;
   state.resolving = false;
+  state.automating = false;
+  state.automationControlStates.clear();
+  elements.reviewWorkspace.setAttribute("aria-busy", "false");
+  elements.automaticallyVerifyListing.disabled = true;
   elements.reviewWorkspace.classList.add("is-hidden");
   elements.reviewQueueView.classList.remove("is-hidden");
   updateReviewLocation(null, historyMode);

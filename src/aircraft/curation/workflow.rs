@@ -73,7 +73,6 @@ const AIRCRAFT_IDENTITY_MAX_SOURCE_URLS: usize = 8;
 const AIRCRAFT_DIRECT_SOURCE_MAX_RELEVANCE_ANCHORS: usize = 24;
 const AIRCRAFT_REVALIDATED_DIRECT_SOURCE_URL_LIMIT: usize = 2;
 const SERVER_PUBLISHER_EXACT_EVIDENCE_ID_PREFIX: &str = "server_publisher_exact.";
-const FAA_DRS_API_KEY_ENV: &str = "FAA_DRS_API_KEY";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AircraftDirectSourceContract {
@@ -592,6 +591,7 @@ pub struct AircraftHierarchyCurationReport {
 pub async fn curate_aircraft_hierarchy_observations(
     db: &AppDb,
     client: &GeminiInteractionsClient,
+    drs_client: &DrsClient,
     listing_limit: i64,
     listing_id: Option<i64>,
     cluster_limit: usize,
@@ -601,6 +601,7 @@ pub async fn curate_aircraft_hierarchy_observations(
     curate_aircraft_hierarchy_observations_with_config(
         db,
         client,
+        drs_client,
         listing_limit,
         listing_id,
         cluster_limit,
@@ -612,6 +613,7 @@ pub async fn curate_aircraft_hierarchy_observations(
 pub async fn curate_aircraft_hierarchy_observations_with_config(
     db: &AppDb,
     client: &GeminiInteractionsClient,
+    drs_client: &DrsClient,
     listing_limit: i64,
     listing_id: Option<i64>,
     cluster_limit: usize,
@@ -620,6 +622,7 @@ pub async fn curate_aircraft_hierarchy_observations_with_config(
     curate_aircraft_hierarchy_observations_with_config_and_tcds_document(
         db,
         client,
+        Some(drs_client),
         listing_limit,
         listing_id,
         cluster_limit,
@@ -649,6 +652,7 @@ pub async fn curate_aircraft_hierarchy_observations_with_operator_tcds(
     curate_aircraft_hierarchy_observations_with_config_and_tcds_document(
         db,
         client,
+        None,
         1,
         Some(listing_id),
         1,
@@ -661,6 +665,7 @@ pub async fn curate_aircraft_hierarchy_observations_with_operator_tcds(
 async fn curate_aircraft_hierarchy_observations_with_config_and_tcds_document(
     db: &AppDb,
     client: &GeminiInteractionsClient,
+    drs_client: Option<&DrsClient>,
     listing_limit: i64,
     listing_id: Option<i64>,
     cluster_limit: usize,
@@ -683,6 +688,7 @@ async fn curate_aircraft_hierarchy_observations_with_config_and_tcds_document(
             curate_cluster(
                 db,
                 client,
+                drs_client,
                 cluster_key,
                 &observations,
                 config,
@@ -729,6 +735,7 @@ async fn curate_aircraft_hierarchy_observations_with_config_and_tcds_document(
 async fn curate_cluster(
     db: &AppDb,
     client: &GeminiInteractionsClient,
+    drs_client: Option<&DrsClient>,
     cluster_key: &str,
     observations: &[&AircraftIdentityObservation],
     config: &GeminiRuntimeConfig,
@@ -879,6 +886,7 @@ async fn curate_cluster(
     let result = curate_exact_cluster(
         db,
         client,
+        drs_client,
         &eligible,
         &faa_case,
         &mut report,
@@ -1296,6 +1304,7 @@ fn faa_drs_family_request(faa_case: &FaaRegistryFunctionResult) -> Result<FaaDrs
 async fn attach_current_faa_tcds_binding(
     server_faa_evidence: &mut ServerFaaIdentityEvidence,
     faa_case: &FaaRegistryFunctionResult,
+    drs_client: Option<&DrsClient>,
     operator_document: Option<&TcdsDocument>,
 ) -> Result<()> {
     let request = faa_drs_family_request(faa_case)?;
@@ -1321,17 +1330,11 @@ async fn attach_current_faa_tcds_binding(
             "faa_drs_operator_document_rejected: supplied current FAA TCDS did not bind the exact case",
         );
     }
-    let api_key = std::env::var(FAA_DRS_API_KEY_ENV).map_err(|error| match error {
-        std::env::VarError::NotPresent => anyhow!(
-            "faa_drs_api_key_missing: {FAA_DRS_API_KEY_ENV} is required to validate an unknown aircraft identity against the current FAA TCDS"
-        ),
-        std::env::VarError::NotUnicode(_) => anyhow!(
-            "faa_drs_api_key_invalid: {FAA_DRS_API_KEY_ENV} must contain valid Unicode"
-        ),
+    let client = drs_client.ok_or_else(|| {
+        anyhow!(
+            "faa_drs_client_missing: an injected FAA DRS client is required to validate an unknown aircraft identity"
+        )
     })?;
-    let client = DrsClient::new(api_key)
-        .map_err(|error| anyhow!(error))
-        .context("faa_drs_client_invalid: could not initialize the official FAA DRS client")?;
     let (document, basis) = match request.tcds_number.as_deref() {
         Some(tcds_number) => (
             client
@@ -1973,6 +1976,7 @@ fn record_server_faa_only_verification_run(
 async fn curate_exact_cluster(
     db: &AppDb,
     client: &GeminiInteractionsClient,
+    drs_client: Option<&DrsClient>,
     observations: &[&AircraftIdentityObservation],
     faa_case: &FaaRegistryFunctionResult,
     report: &mut AircraftHierarchyCurationCaseReport,
@@ -1983,9 +1987,14 @@ async fn curate_exact_cluster(
     let evidence_scope = aircraft_identity_evidence_scope(faa_case)?;
     let mut server_faa_evidence = server_faa_identity_evidence(faa_case)
         .context("could not construct case-bound server FAA identity evidence")?;
-    attach_current_faa_tcds_binding(&mut server_faa_evidence, faa_case, tcds_document)
-        .await
-        .context("mandatory FAA TCDS identity grounding failed")?;
+    attach_current_faa_tcds_binding(
+        &mut server_faa_evidence,
+        faa_case,
+        drs_client,
+        tcds_document,
+    )
+    .await
+    .context("mandatory FAA TCDS identity grounding failed")?;
     let revalidated_direct_source_urls =
         load_revalidated_aircraft_direct_source_urls(db, observations, &server_faa_evidence)
             .await

@@ -337,6 +337,13 @@ pub enum AvionicsIdentityOutcome {
     Unresolved { reason: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AvionicsIdentityVerificationRoute {
+    VerifiedLocal,
+    CandidateAdjudication,
+    GroundedCuration,
+}
+
 #[derive(Clone, Debug, FromRow)]
 struct CatalogRow {
     id: i64,
@@ -1014,6 +1021,71 @@ pub async fn resolve_verified_local_avionics_identity(
     ))
 }
 
+/// Classify the cheapest safe identity route without invoking Gemini.
+///
+/// Candidate adjudication is available only when the current manufacturer
+/// catalog yields one bounded, revision-fingerprinted collision family with
+/// at least one selectable approved and reuse-attested product. The caller
+/// must still treat that route as opportunistic because an uncertain or stale
+/// model decision falls through to grounded curation.
+pub(crate) async fn plan_avionics_identity_verification_route(
+    db: &AppDb,
+    request: &AvionicsIdentityRequest,
+) -> CatalogResult<AvionicsIdentityVerificationRoute> {
+    if resolve_verified_local_avionics_identity(db, request)
+        .await?
+        .is_some()
+    {
+        return Ok(AvionicsIdentityVerificationRoute::VerifiedLocal);
+    }
+    if !request.authoritative_direct_source_urls.is_empty()
+        || !request.authoritative_identity_anchors.is_empty()
+        || !request.requires_listing_evidence
+        || request.listing_context.trim().is_empty()
+        || !is_usable_avionics_label(&request.manufacturer, &request.model)
+        || !exact_token_phrase_is_present(&request.listing_context, &request.manufacturer)
+    {
+        return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
+    }
+    let input_types = request
+        .avionics_types
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if input_types.is_empty() {
+        return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
+    }
+    let Some(manufacturer_identity_id) =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
+    else {
+        return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
+    };
+    let review_catalog = load_review_catalog_candidates(db).await?;
+    let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
+        &request.manufacturer,
+        Some(manufacturer_identity_id),
+        &review_catalog,
+    );
+    let approved_candidates = load_known_approved_candidates(db).await?;
+    Ok(
+        if approved_candidate_adjudication_plan(
+            request,
+            &input_types,
+            manufacturer_identity_id,
+            &approved_candidates,
+            &manufacturer_catalog,
+        )
+        .is_some()
+        {
+            AvionicsIdentityVerificationRoute::CandidateAdjudication
+        } else {
+            AvionicsIdentityVerificationRoute::GroundedCuration
+        },
+    )
+}
+
 async fn explicit_authoritative_direct_source_plan(
     db: &AppDb,
     request: &AvionicsIdentityRequest,
@@ -1208,12 +1280,13 @@ fn select_opportunistic_authoritative_source_urls(
 }
 
 fn should_run_listing_only_approved_candidate_adjudication(_plan: &IdentityGroundingPlan) -> bool {
-    // A bounded list of currently approved products is not a closed product
-    // family: an OEM sibling may be absent or still unreviewed (for example,
-    // GDL 69A versus GDL 69A SXM). Until the adjudicator consumes a complete,
-    // revision-bound OEM family set containing both selectable and blocking
-    // members, it must never authorize a listing association.
-    false
+    !matches!(
+        _plan,
+        IdentityGroundingPlan::Direct(AuthoritativeDirectSourcePlan {
+            requirement: DirectSourceRequirement::Explicit,
+            ..
+        })
+    )
 }
 
 fn validate_authorized_direct_source_response(
@@ -1408,7 +1481,7 @@ async fn resolve_avionics_identity_with_write_mode(
             request,
             &input_types,
             &approved_candidates,
-            &catalog,
+            &manufacturer_catalog,
         )
         .await?
         {
@@ -2177,7 +2250,7 @@ async fn resolve_approved_catalog_candidate_with_gemini(
     request: &AvionicsIdentityRequest,
     input_types: &[String],
     approved_candidates: &[KnownApprovedAvionicsCandidate],
-    catalog: &[AvionicsCatalogCandidate],
+    manufacturer_catalog: &[AvionicsCatalogCandidate],
 ) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
     if !request.requires_listing_evidence
         || request.listing_context.trim().is_empty()
@@ -2208,7 +2281,7 @@ async fn resolve_approved_catalog_candidate_with_gemini(
         input_types,
         manufacturer_identity_id,
         approved_candidates,
-        catalog,
+        manufacturer_catalog,
     ) else {
         return Ok(None);
     };
@@ -2231,19 +2304,24 @@ async fn resolve_approved_catalog_candidate_with_gemini(
     // The model compared a snapshot. Re-read the graph and rebuild the plan
     // before accepting so concurrent catalog curation cannot make its answer
     // refer to stale identity or capability data.
-    let refreshed_catalog = load_catalog_candidates(db).await?;
+    let refreshed_review_catalog = load_review_catalog_candidates(db).await?;
     let refreshed_candidates = load_known_approved_candidates(db).await?;
     let Some(refreshed_manufacturer_identity_id) =
         resolve_input_manufacturer_identity(db, &request.manufacturer).await?
     else {
         return Ok(None);
     };
+    let refreshed_manufacturer_catalog = manufacturer_scoped_catalog_candidates(
+        &request.manufacturer,
+        Some(refreshed_manufacturer_identity_id),
+        &refreshed_review_catalog,
+    );
     let Some(refreshed_plan) = approved_candidate_adjudication_plan(
         request,
         input_types,
         refreshed_manufacturer_identity_id,
         &refreshed_candidates,
-        &refreshed_catalog,
+        &refreshed_manufacturer_catalog,
     ) else {
         return Ok(None);
     };
@@ -2282,107 +2360,46 @@ fn approved_candidate_adjudication_plan(
     input_types: &[String],
     manufacturer_identity_id: i64,
     approved_candidates: &[KnownApprovedAvionicsCandidate],
-    catalog: &[AvionicsCatalogCandidate],
+    manufacturer_catalog: &[AvionicsCatalogCandidate],
 ) -> Option<ApprovedCandidateAdjudicationPlan> {
     let observed_types = canonicalize_avionics_types(input_types);
     if observed_types.is_empty() || observed_types.len() != input_types.len() {
         return None;
     }
     let observed_product_key = normalize_avionics_identifier(&request.model);
-    let exact_matches = approved_candidates
+    if observed_product_key.is_empty()
+        || !exact_compact_identity_is_present(&request.listing_context, &observed_product_key)
+    {
+        return None;
+    }
+
+    let collision_family =
+        complete_manufacturer_collision_family(&request.model, manufacturer_catalog)?;
+    if collision_family.is_empty()
+        || collision_family.len() > AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT
+    {
+        return None;
+    }
+
+    let approved_by_id = approved_candidates
         .iter()
-        .filter(|candidate| {
-            if candidate.avionics_manufacturer_identity_id != manufacturer_identity_id
-                || !observed_types
-                    .iter()
-                    .all(|capability| candidate.avionics_types.contains(capability))
-            {
-                return false;
-            }
-            let product_match = observed_product_key == candidate.canonical_product_key;
-            let identifier_match = observed_product_key == candidate.canonical_identifier_key
-                && exact_stable_identifier_is_present(
-                    &request.listing_context,
-                    &candidate.manufacturer_identifier_kind,
-                    &candidate.canonical_identifier_key,
-                );
-            product_match || identifier_match
-        })
-        .collect::<Vec<_>>();
-    let [selected] = exact_matches.as_slice() else {
-        return None;
-    };
-    if approved_candidate_has_identity_collision(selected, catalog) {
-        return None;
-    }
-
-    // If the retained listing contains a longer/shorter colliding catalog
-    // label, the extracted observation may have lost a discriminating suffix.
-    // That case belongs in the grounded pipeline.
-    if catalog.iter().any(|candidate| {
-        candidate.id != selected.id
-            && strict_product_prefix_collision(
-                &selected.canonical_product_key,
-                &normalize_avionics_identifier(&candidate.model),
-            )
-            && exact_compact_identity_is_present(
-                &request.listing_context,
-                &normalize_avionics_identifier(&candidate.model),
-            )
-    }) {
-        return None;
-    }
-
-    // Prefix/suffix neighbors are identity-critical collision alternatives.
-    // Supply the complete graph-approved closure or skip this bounded route;
-    // never silently truncate it.
-    let mut prompt_candidates = vec![(*selected).clone()];
-    let mut seen_ids = HashSet::from([selected.id]);
-    for candidate in approved_candidates.iter().filter(|candidate| {
-        candidate.avionics_manufacturer_identity_id == manufacturer_identity_id
-            && candidate.id != selected.id
-            && strict_product_prefix_collision(
-                &selected.canonical_product_key,
-                &candidate.canonical_product_key,
-            )
-    }) {
-        if seen_ids.insert(candidate.id) {
-            prompt_candidates.push(candidate.clone());
-        }
-    }
-    if prompt_candidates.len() > AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT {
-        return None;
-    }
-
-    // Fill the remaining bounded context with graph-approved local similarity
-    // candidates. These help the model distinguish nearby products, but only
-    // the exact server-scoped identity above is eligible for acceptance.
-    let approved_catalog = approved_candidates
+        .filter(|candidate| candidate.avionics_manufacturer_identity_id == manufacturer_identity_id)
+        .map(|candidate| (candidate.id, candidate))
+        .collect::<HashMap<_, _>>();
+    let selectable_catalog_ids = collision_family
         .iter()
-        .filter(|candidate| {
-            candidate.avionics_manufacturer_identity_id == manufacturer_identity_id
-                && observed_types
-                    .iter()
-                    .all(|capability| candidate.avionics_types.contains(capability))
-        })
-        .map(known_approved_catalog_candidate)
-        .collect::<Vec<_>>();
-    for candidate in shortlist_avionics_candidates(
-        &request.manufacturer,
-        &request.model,
-        &observed_types,
-        None,
-        &approved_catalog,
-    ) {
-        if prompt_candidates.len() >= AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT {
-            break;
-        }
-        if seen_ids.insert(candidate.id) {
-            let known = approved_candidates
+        .filter_map(|candidate| {
+            let approved = approved_by_id.get(&candidate.id)?;
+            let capability_compatible = observed_types
                 .iter()
-                .find(|known| known.id == candidate.id)?;
-            prompt_candidates.push(known.clone());
-        }
+                .all(|capability| approved.avionics_types.contains(capability));
+            let collision_free =
+                !approved_candidate_has_identity_collision(approved, manufacturer_catalog);
+            (capability_compatible && collision_free).then_some(candidate.id)
+        })
+        .collect::<HashSet<_>>();
+    if selectable_catalog_ids.is_empty() {
+        return None;
     }
 
     let context = AvionicsApprovedCandidateAdjudicationContext {
@@ -2393,34 +2410,89 @@ fn approved_candidate_adjudication_plan(
             quantity: request.quantity.max(1),
         },
         listing_evidence_text: request.listing_context.clone(),
-        approved_candidates: prompt_candidates
+        catalog_revision_sha256: catalog_fingerprint(manufacturer_catalog),
+        catalog_candidates: collision_family
             .iter()
-            .map(known_approved_prompt_candidate)
+            .map(|candidate| {
+                catalog_adjudication_prompt_candidate(
+                    candidate,
+                    selectable_catalog_ids.contains(&candidate.id),
+                )
+            })
             .collect(),
     };
     Some(ApprovedCandidateAdjudicationPlan {
         context,
-        selectable_catalog_ids: HashSet::from([selected.id]),
+        selectable_catalog_ids,
         manufacturer_identity_id,
     })
 }
 
-fn known_approved_catalog_candidate(
-    candidate: &KnownApprovedAvionicsCandidate,
-) -> AvionicsCatalogCandidate {
-    AvionicsCatalogCandidate {
-        id: candidate.id,
-        manufacturer: candidate.manufacturer.clone(),
-        model: candidate.model.clone(),
-        avionics_types: candidate.avionics_types.clone(),
-        manufacturer_identifier_kind: candidate.manufacturer_identifier_kind.clone(),
-        manufacturer_identifier: candidate.manufacturer_identifier.clone(),
-        catalog_status: "approved".to_string(),
+fn complete_manufacturer_collision_family<'a>(
+    observed_model: &str,
+    manufacturer_catalog: &'a [AvionicsCatalogCandidate],
+) -> Option<Vec<&'a AvionicsCatalogCandidate>> {
+    let mut included = manufacturer_catalog
+        .iter()
+        .map(|candidate| model_identity_relation_score(observed_model, &candidate.model).is_some())
+        .collect::<Vec<_>>();
+    if !included.iter().any(|included| *included) {
+        return None;
     }
+
+    loop {
+        let mut changed = false;
+        for candidate_index in 0..manufacturer_catalog.len() {
+            if included[candidate_index] {
+                continue;
+            }
+            let candidate = &manufacturer_catalog[candidate_index];
+            let connected = manufacturer_catalog
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| included[*index])
+                .any(|(_, member)| catalog_candidates_share_collision_family(candidate, member));
+            if connected {
+                included[candidate_index] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        if included.iter().filter(|included| **included).count()
+            > AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT
+        {
+            return None;
+        }
+    }
+
+    Some(
+        manufacturer_catalog
+            .iter()
+            .zip(included)
+            .filter_map(|(candidate, included)| included.then_some(candidate))
+            .collect(),
+    )
 }
 
-fn known_approved_prompt_candidate(
-    candidate: &KnownApprovedAvionicsCandidate,
+fn catalog_candidates_share_collision_family(
+    left: &AvionicsCatalogCandidate,
+    right: &AvionicsCatalogCandidate,
+) -> bool {
+    if model_identity_relation_score(&left.model, &right.model).is_some() {
+        return true;
+    }
+    let left_identifier = normalize_avionics_identifier(&left.manufacturer_identifier);
+    let right_identifier = normalize_avionics_identifier(&right.manufacturer_identifier);
+    !left_identifier.is_empty()
+        && left.manufacturer_identifier_kind == right.manufacturer_identifier_kind
+        && left_identifier == right_identifier
+}
+
+fn catalog_adjudication_prompt_candidate(
+    candidate: &AvionicsCatalogCandidate,
+    selectable: bool,
 ) -> AvionicsApprovedCatalogCandidate {
     AvionicsApprovedCatalogCandidate {
         id: candidate.id,
@@ -2429,6 +2501,7 @@ fn known_approved_prompt_candidate(
         avionics_types: candidate.avionics_types.clone(),
         manufacturer_identifier_kind: candidate.manufacturer_identifier_kind.clone(),
         manufacturer_identifier: candidate.manufacturer_identifier.clone(),
+        selectable,
     }
 }
 
@@ -2467,9 +2540,9 @@ fn approved_candidate_adjudication_selection(
     if !plan.selectable_catalog_ids.contains(&selected_id)
         || !plan
             .context
-            .approved_candidates
+            .catalog_candidates
             .iter()
-            .any(|candidate| candidate.id == selected_id)
+            .any(|candidate| candidate.id == selected_id && candidate.selectable)
     {
         return None;
     }
@@ -2498,12 +2571,13 @@ fn approved_candidate_adjudication_plan_is_unchanged(
             == after.context.observed_candidate.avionics_types
         && before.context.observed_candidate.quantity == after.context.observed_candidate.quantity
         && before.context.listing_evidence_text == after.context.listing_evidence_text
-        && before.context.approved_candidates.len() == after.context.approved_candidates.len()
+        && before.context.catalog_revision_sha256 == after.context.catalog_revision_sha256
+        && before.context.catalog_candidates.len() == after.context.catalog_candidates.len()
         && before
             .context
-            .approved_candidates
+            .catalog_candidates
             .iter()
-            .zip(&after.context.approved_candidates)
+            .zip(&after.context.catalog_candidates)
             .all(|(left, right)| {
                 left.id == right.id
                     && left.manufacturer == right.manufacturer
@@ -2511,6 +2585,7 @@ fn approved_candidate_adjudication_plan_is_unchanged(
                     && left.avionics_types == right.avionics_types
                     && left.manufacturer_identifier_kind == right.manufacturer_identifier_kind
                     && left.manufacturer_identifier == right.manufacturer_identifier
+                    && left.selectable == right.selectable
             })
 }
 
@@ -2726,10 +2801,6 @@ fn has_distinct_exact_oem_part_or_sku(kind: &str, identifier: &str, product_key:
     }
     let identifier_key = normalize_avionics_identifier(identifier);
     !identifier_key.is_empty() && identifier_key != product_key
-}
-
-fn strict_product_prefix_collision(left: &str, right: &str) -> bool {
-    left != right && (left.starts_with(right) || right.starts_with(left))
 }
 
 fn exact_token_phrase_is_present(text: &str, phrase: &str) -> bool {
@@ -5014,11 +5085,11 @@ mod tests {
     use url::Url;
 
     use super::{
-        approved_candidate_adjudication_plan, approved_candidate_adjudication_selection,
-        attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
-        canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
-        collision_correction_plan, collision_response_issues,
-        collision_reviews_with_direct_source_proofs,
+        approved_candidate_adjudication_plan, approved_candidate_adjudication_plan_is_unchanged,
+        approved_candidate_adjudication_selection, attest_grounded_existing_avionics_identity,
+        attest_pending_review_product_identity, canonical_avionics_types_for_label,
+        canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
+        collision_response_issues, collision_reviews_with_direct_source_proofs,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
@@ -5028,7 +5099,7 @@ mod tests {
         model_identity_relation_score, nonpositive_identity_outcome,
         opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
         persist_approved_identity, persist_existing_reuse_attestation,
-        proposal_attestation_with_direct_source_proofs,
+        plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
         revalidate_direct_source_admission_state, select_opportunistic_authoritative_source_urls,
@@ -5039,18 +5110,19 @@ mod tests {
         verified_identity_from_response, ApprovedAvionicsIdentity,
         ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
         AuthoritativeDirectSourcePlan, AuthoritativeSourceHintRow, AvionicsCatalogCandidate,
-        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsUnitResolutionCandidate,
-        AvionicsUnitResolutionContext, CollisionCorrectionPlan, DirectSourceRequirement,
-        GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
-        KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
-        ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
-        KNOWN_APPROVED_SELECT_SQL,
+        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
+        AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext, CollisionCorrectionPlan,
+        DirectSourceRequirement, GeminiGroundingSource, GeminiGroundingSupport,
+        GroundedJsonResponse, IdentityGroundingPlan, KnownApprovedAvionicsCandidate,
+        PendingProductAttestationCommitGuard, ReviewCatalogCandidate, VerifiedIdentity,
+        COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
         ManufacturerSourceOriginAdmission,
     };
     use crate::db::{AppDb, DatabaseBackend};
+    use crate::extract::AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT;
     use crate::gemini::curation::workflow::{
         SourceEvidenceProof, SourceEvidenceSpanProof, MAX_EXACT_PRODUCT_SIGNAL_TOKEN_SPAN,
     };
@@ -6079,7 +6151,7 @@ mod tests {
     }
 
     #[test]
-    fn listing_only_gemini_adjudication_requires_a_curated_oem_family_gate() {
+    fn listing_only_gemini_adjudication_precedes_search_but_honors_explicit_sources() {
         let direct = IdentityGroundingPlan::Direct(AuthoritativeDirectSourcePlan {
             source_urls: vec!["https://static.garmin.com/pumac/catalog.pdf".to_string()],
             identity_anchors: vec!["Garmin".to_string(), "G1000 NXi".to_string()],
@@ -6095,8 +6167,22 @@ mod tests {
         assert!(!should_run_listing_only_approved_candidate_adjudication(
             &direct
         ));
-        assert!(!should_run_listing_only_approved_candidate_adjudication(
+        assert!(should_run_listing_only_approved_candidate_adjudication(
             &search
+        ));
+
+        let opportunistic = IdentityGroundingPlan::Direct(AuthoritativeDirectSourcePlan {
+            source_urls: vec!["https://static.garmin.com/pumac/catalog.pdf".to_string()],
+            identity_anchors: vec!["Garmin".to_string(), "G1000 NXi".to_string()],
+            admission: ManufacturerSourceOriginAdmission {
+                avionics_manufacturer_id: 1,
+                effective_manufacturer_identity_id: 2,
+                canonical_origins: vec!["https://static.garmin.com".to_string()],
+            },
+            requirement: DirectSourceRequirement::Opportunistic,
+        });
+        assert!(should_run_listing_only_approved_candidate_adjudication(
+            &opportunistic
         ));
     }
 
@@ -7075,11 +7161,16 @@ mod tests {
         .expect("the graph-approved exact product should reach bounded adjudication");
         assert_eq!(
             plan.context
-                .approved_candidates
+                .catalog_candidates
                 .iter()
                 .map(|candidate| candidate.id)
                 .collect::<Vec<_>>(),
-            vec![2]
+            vec![2, 99]
+        );
+        assert!(plan.context.catalog_candidates[0].selectable);
+        assert!(
+            !plan.context.catalog_candidates[1].selectable,
+            "the unreviewed suffix sibling must remain visible as a blocker"
         );
         let response = json!({
             "decision": "same",
@@ -7092,8 +7183,20 @@ mod tests {
             approved_candidate_adjudication_selection(&request, &plan, &response),
             Some(2)
         );
+        let blocking_selection = json!({
+            "decision": "same",
+            "selected_catalog_id": 99,
+            "confidence": "very_high",
+            "evidence_text": "GMA-1347 Digital Audio Panel w/ Intercom",
+            "reason": "The response attempted to select a legacy sibling."
+        });
         assert_eq!(
-            plan.context.approved_candidates[0].avionics_types,
+            approved_candidate_adjudication_selection(&request, &plan, &blocking_selection),
+            None,
+            "an unreviewed collision blocker can never be selected"
+        );
+        assert_eq!(
+            plan.context.catalog_candidates[0].avionics_types,
             vec!["Audio Panel"]
         );
     }
@@ -7202,6 +7305,85 @@ mod tests {
             )
             .is_none(),
             "an active exact catalog collision must block cheap acceptance"
+        );
+    }
+
+    #[test]
+    fn bounded_adjudication_is_bound_to_the_complete_manufacturer_catalog_revision() {
+        let request = gma_1347_model_only_request();
+        let known = vec![gma_1347_known_candidate()];
+        let mut sibling = gma_1347_catalog_candidate("unreviewed");
+        sibling.id = 99;
+        sibling.model = "GMA 1347D".to_string();
+        sibling.manufacturer_identifier = "011-BLOCKER-99".to_string();
+        let before_catalog = vec![gma_1347_catalog_candidate("approved"), sibling];
+        let before = approved_candidate_adjudication_plan(
+            &request,
+            &["Audio Panel".to_string()],
+            1,
+            &known,
+            &before_catalog,
+        )
+        .expect("one selectable product and its blocking sibling should form a plan");
+
+        let mut after_catalog = before_catalog.clone();
+        after_catalog.push(candidate(100, "GTN 750Xi", "unreviewed"));
+        let after = approved_candidate_adjudication_plan(
+            &request,
+            &["Audio Panel".to_string()],
+            1,
+            &known,
+            &after_catalog,
+        )
+        .expect("an unrelated manufacturer product does not change the bounded family");
+
+        assert_ne!(
+            before.context.catalog_revision_sha256,
+            after.context.catalog_revision_sha256
+        );
+        assert!(
+            !approved_candidate_adjudication_plan_is_unchanged(&before, &after),
+            "any manufacturer-scoped catalog revision must invalidate an in-flight answer"
+        );
+    }
+
+    #[test]
+    fn bounded_adjudication_overflow_or_capability_mismatch_falls_back_to_grounding() {
+        let request = gma_1347_model_only_request();
+        let known = vec![gma_1347_known_candidate()];
+        let mut overflowing = vec![gma_1347_catalog_candidate("approved")];
+        for index in 0..AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT {
+            let mut sibling = gma_1347_catalog_candidate("unreviewed");
+            sibling.id = 100 + index as i64;
+            sibling.model = format!("GMA 1347{}", (b'A' + index as u8) as char);
+            sibling.manufacturer_identifier = format!("011-BLOCKER-{index}");
+            overflowing.push(sibling);
+        }
+        assert!(
+            approved_candidate_adjudication_plan(
+                &request,
+                &["Audio Panel".to_string()],
+                1,
+                &known,
+                &overflowing,
+            )
+            .is_none(),
+            "a truncated collision family must never reach closed-context adjudication"
+        );
+
+        assert!(
+            approved_candidate_adjudication_plan(
+                &AvionicsIdentityRequest {
+                    avionics_types: vec!["Audio Panel".to_string(), "COM".to_string()],
+                    ..request
+                },
+                &["Audio Panel".to_string(), "COM".to_string()],
+                1,
+                &known,
+                &[gma_1347_catalog_candidate("approved")],
+            )
+            .is_none(),
+            "a candidate lacking an observed capability is a blocker, not a selectable product"
         );
     }
 
@@ -8389,6 +8571,40 @@ mod tests {
         .expect("exact retained evidence should resolve the approved graph identity");
         assert_eq!(local.id, stored.id);
         assert_eq!(local.model, "GTX 345R");
+        assert_eq!(
+            plan_avionics_identity_verification_route(
+                &db,
+                &local_request("Garmin GTX345R P/N 011-03520-00 installed"),
+            )
+            .await
+            .expect("the route planner should use the same local catalog"),
+            AvionicsIdentityVerificationRoute::VerifiedLocal
+        );
+
+        let suffix_ambiguous = AvionicsIdentityRequest {
+            model: "GTX 345".to_string(),
+            listing_context: "Garmin GTX 345 transponder installed".to_string(),
+            ..local_request("")
+        };
+        assert_eq!(
+            plan_avionics_identity_verification_route(&db, &suffix_ambiguous)
+                .await
+                .expect("the bounded catalog family should plan without Gemini"),
+            AvionicsIdentityVerificationRoute::CandidateAdjudication,
+            "a meaningful suffix difference must be adjudicated before any Search call"
+        );
+
+        let capability_mismatch = AvionicsIdentityRequest {
+            avionics_types: vec!["Transponder".to_string(), "Traffic".to_string()],
+            ..suffix_ambiguous
+        };
+        assert_eq!(
+            plan_avionics_identity_verification_route(&db, &capability_mismatch)
+                .await
+                .expect("the mismatch should fail closed"),
+            AvionicsIdentityVerificationRoute::GroundedCuration,
+            "candidate adjudication cannot expand an approved product's capabilities"
+        );
 
         let mut mechanically_normalized_capability =
             local_request("Garmin GTX345R P/N 011-03520-00 installed");

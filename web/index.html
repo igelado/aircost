@@ -347,7 +347,18 @@
               <progress id="review-progress" max="1" value="0"></progress>
               <span id="review-progress-label">0 of 0 decided</span>
             </div>
-            <button class="button primary" id="verify-listing" type="button" disabled>Verify listing</button>
+            <div class="review-workspace-actions">
+              <button
+                class="button"
+                id="automatically-verify-listing"
+                type="button"
+                title="Try FAA and local catalog checks first, then use Gemini only for unresolved identities"
+                disabled
+              >
+                Automatically verify
+              </button>
+              <button class="button primary" id="verify-listing" type="button" disabled>Verify listing</button>
+            </div>
           </footer>
         </section>
       </section>
