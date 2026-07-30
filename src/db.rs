@@ -53,6 +53,11 @@ const AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_MIGRATION: &str =
 const AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_FINGERPRINT: &str =
     "93a641a0f653eacf0c8413bdb697a35c588fe34efc1419d30bf65146c8b2d55a";
+const AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION: &str =
+    "20260808_avionics_descriptive_consolidation";
+const AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION: i64 = 1;
+const AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT: &str =
+    "3aacf958efa7fb5e24c5897cf0369d40cb506b2a22444d629ea0a76462ce1a70";
 const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION: &str =
     "20260801_avionics_authoritative_source_origins";
 const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION: i64 = 2;
@@ -1573,6 +1578,17 @@ impl AppDb {
                 .await?;
         if missing_human_consolidation {
             bail!(avionics_human_reviewed_consolidation_migration_required_message(self.kind()));
+        }
+        let missing_descriptive_consolidation = self
+            .migration_contract_missing(
+                "avionics_catalog_valid_human_consolidation_pairs",
+                AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
+                AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
+                AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT,
+            )
+            .await?;
+        if missing_descriptive_consolidation {
+            bail!(avionics_descriptive_consolidation_migration_required_message(self.kind()));
         }
 
         let missing_avionics_source_origin_objects = match self.backend() {
@@ -3205,6 +3221,19 @@ fn avionics_human_reviewed_consolidation_migration_required_message(kind: Databa
     )
 }
 
+fn avionics_descriptive_consolidation_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: the avionics catalog is missing the \
+         complete descriptive-equivalent human-consolidation contract; back up the database, \
+         apply `migrations/{AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION}.{backend}.sql`, then \
+         restart aircost"
+    )
+}
+
 fn avionics_authoritative_source_origins_migration_required_message(kind: DatabaseKind) -> String {
     let backend = match kind {
         DatabaseKind::Sqlite => "sqlite",
@@ -3307,6 +3336,7 @@ mod tests {
         aircraft_reference_catalog_migration_required_message,
         aircraft_tcds_make_lineage_migration_required_message,
         avionics_authoritative_source_origins_migration_required_message,
+        avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
         avionics_product_reuse_attestations_migration_required_message,
         identity_deduplication_postconditions_migration_required_message,
@@ -3321,6 +3351,9 @@ mod tests {
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_FINGERPRINT,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION, AVIONICS_CATALOG_CURATION_MIGRATION,
+        AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT,
+        AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
+        AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
         AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_FINGERPRINT,
         AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_VERSION,
         AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_MIGRATION,
@@ -3356,6 +3389,10 @@ mod tests {
         include_str!("../migrations/20260731_avionics_human_reviewed_consolidation.sqlite.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260731_avionics_human_reviewed_consolidation.postgres.sql");
+    const AVIONICS_DESCRIPTIVE_CONSOLIDATION_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260808_avionics_descriptive_consolidation.sqlite.sql");
+    const AVIONICS_DESCRIPTIVE_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260808_avionics_descriptive_consolidation.postgres.sql");
     const AVIONICS_SOURCE_ORIGINS_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260801_avionics_authoritative_source_origins.sqlite.sql");
     const AVIONICS_SOURCE_ORIGINS_POSTGRES_MIGRATION_SQL: &str =
@@ -4130,6 +4167,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_descriptive_consolidation_contract_fails_migration_preflight() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"
+            DELETE FROM schema_migration_contracts
+            WHERE migration_name = '20260808_avionics_descriptive_consolidation'
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("a missing descriptive-consolidation contract must fail preflight")
+            .to_string();
+        assert!(error.contains("descriptive-equivalent human-consolidation contract"));
+        assert!(error.contains("20260808_avionics_descriptive_consolidation.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn descriptive_consolidation_migration_repairs_and_reapplies_on_sqlite() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("DROP TRIGGER avionics_catalog_human_consolidation_members_validate_insert")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP VIEW avionics_catalog_valid_human_consolidation_pairs")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            DELETE FROM schema_migration_contracts
+            WHERE migration_name = '20260808_avionics_descriptive_consolidation'
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            let mut connection = pool.acquire().await.unwrap();
+            for statement in
+                split_sql_statements(AVIONICS_DESCRIPTIVE_CONSOLIDATION_SQLITE_MIGRATION_SQL)
+            {
+                connection.execute(statement).await.unwrap();
+            }
+        }
+        db.ensure_required_migrations()
+            .await
+            .expect("the descriptive-consolidation migration must repair and reapply");
+    }
+
+    #[tokio::test]
     async fn missing_avionics_source_origin_contract_fails_migration_preflight() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -4641,6 +4740,50 @@ mod tests {
     }
 
     #[test]
+    fn descriptive_consolidation_contract_has_backend_parity() {
+        assert_eq!(AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION, 1);
+        for contract_value in [
+            AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
+            AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT,
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(contract_value));
+            assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
+            assert!(
+                AVIONICS_DESCRIPTIVE_CONSOLIDATION_SQLITE_MIGRATION_SQL.contains(contract_value)
+            );
+            assert!(
+                AVIONICS_DESCRIPTIVE_CONSOLIDATION_POSTGRES_MIGRATION_SQL.contains(contract_value)
+            );
+        }
+        for required_semantic in [
+            "NEW.member_role <> 'survivor'",
+            "selected_member.canonical_model_key_snapshot",
+            "member.canonical_model_key_snapshot",
+            "authorization_sha256",
+            "normalized_manufacturer_identifier",
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(required_semantic));
+            assert!(POSTGRES_SCHEMA_SQL.contains(required_semantic));
+            assert!(
+                AVIONICS_DESCRIPTIVE_CONSOLIDATION_SQLITE_MIGRATION_SQL.contains(required_semantic)
+            );
+            assert!(AVIONICS_DESCRIPTIVE_CONSOLIDATION_POSTGRES_MIGRATION_SQL
+                .contains(required_semantic));
+        }
+        for migration in [
+            AVIONICS_DESCRIPTIVE_CONSOLIDATION_SQLITE_MIGRATION_SQL,
+            AVIONICS_DESCRIPTIVE_CONSOLIDATION_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(!migration.contains(
+                "NEW.canonical_model_key_snapshot = authorization.canonical_model_key_snapshot"
+            ));
+            assert!(!migration.contains(
+                "NEW.canonical_model_key_snapshot = authorization_row.canonical_model_key_snapshot"
+            ));
+        }
+    }
+
+    #[test]
     fn avionics_source_origin_tables_and_contract_have_backend_parity() {
         for table in [
             "avionics_authoritative_source_origins",
@@ -4836,5 +4979,10 @@ mod tests {
         let reuse_attestations =
             avionics_product_reuse_attestations_migration_required_message(DatabaseKind::Sqlite);
         assert!(reuse_attestations.contains("20260807_avionics_product_reuse_v2.sqlite.sql"));
+
+        let descriptive_consolidation =
+            avionics_descriptive_consolidation_migration_required_message(DatabaseKind::Postgres);
+        assert!(descriptive_consolidation
+            .contains("20260808_avionics_descriptive_consolidation.postgres.sql"));
     }
 }

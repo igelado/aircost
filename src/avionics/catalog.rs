@@ -13,6 +13,9 @@ use super::manufacturer::{
     ManufacturerProductAdmission, ManufacturerProductAdmissionOutcome,
     ManufacturerSourceOriginAdmission,
 };
+use super::model::{
+    avionics_model_identity_relation, model_numeric_runs, AvionicsModelIdentityRelation,
+};
 use super::reuse::{
     current_reuse_attested_product_ids, refresh_grounded_evidence_and_reuse_attestation_postgres,
     refresh_grounded_evidence_and_reuse_attestation_sqlite, refresh_reuse_attestation_postgres,
@@ -40,7 +43,6 @@ use crate::normalize::{
 const CANDIDATE_LIMIT: usize = 16;
 const COLLISION_CANDIDATE_LIMIT: usize = 32;
 const COLLISION_STRUCTURE_CALL_BUDGET: usize = 2;
-const MINIMUM_PREFIX_MODEL_KEY_LENGTH: usize = 4;
 const EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE: &str = "exact_catalog_product";
 const NO_IDENTIFIER_SCOPE: &str = "none";
 const NO_REJECTION_BASIS: &str = "none";
@@ -407,13 +409,6 @@ struct ApprovedCandidateAdjudicationPlan {
     context: AvionicsApprovedCandidateAdjudicationContext,
     selectable_catalog_ids: HashSet<i64>,
     manufacturer_identity_id: i64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AvionicsModelIdentityRelation {
-    TypographyExact,
-    DescriptiveExpansion,
-    MeaningfulVariant,
 }
 
 #[derive(Clone, Debug)]
@@ -3250,113 +3245,6 @@ fn catalog_fingerprint(catalog: &[AvionicsCatalogCandidate]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Classify the structural relationship between two same-manufacturer model
-/// labels without authorizing either identity.
-///
-/// Exact manufacturer prefixes are redundant retrieval syntax. A trailing
-/// descriptive expansion is harmless only when it is one complete
-/// server-owned capability already attached to the compared products. Every
-/// other prefix/suffix delta is a meaningful variant by default; no suffix
-/// vocabulary can safely enumerate future hardware revisions.
-fn avionics_model_identity_relation(
-    left_manufacturer: &str,
-    left_model: &str,
-    left_types: &[String],
-    right_manufacturer: &str,
-    right_model: &str,
-    right_types: &[String],
-) -> Option<AvionicsModelIdentityRelation> {
-    let left_label = model_label_without_exact_manufacturer_prefix(left_manufacturer, left_model);
-    let right_label =
-        model_label_without_exact_manufacturer_prefix(right_manufacturer, right_model);
-    let left_key = normalize_avionics_identifier(&left_label);
-    let right_key = normalize_avionics_identifier(&right_label);
-    if left_key.is_empty() || right_key.is_empty() {
-        return None;
-    }
-    if left_key == right_key {
-        return Some(AvionicsModelIdentityRelation::TypographyExact);
-    }
-
-    let mut descriptive_phrases = left_types
-        .iter()
-        .chain(right_types)
-        .filter(|capability| CURATED_AVIONICS_TYPES.contains(&capability.as_str()))
-        .map(|capability| normalize_name(capability))
-        .filter(|capability| !capability.is_empty())
-        .collect::<Vec<_>>();
-    descriptive_phrases.sort_by(|left, right| {
-        right
-            .split_whitespace()
-            .count()
-            .cmp(&left.split_whitespace().count())
-            .then_with(|| right.len().cmp(&left.len()))
-            .then_with(|| left.cmp(right))
-    });
-    descriptive_phrases.dedup();
-
-    let (left_core, left_description) =
-        strip_exact_capability_description(&left_label, &descriptive_phrases);
-    let (right_core, right_description) =
-        strip_exact_capability_description(&right_label, &descriptive_phrases);
-    let left_core_key = normalize_avionics_identifier(&left_core);
-    let right_core_key = normalize_avionics_identifier(&right_core);
-    if left_core_key.is_empty() || right_core_key.is_empty() {
-        return None;
-    }
-    if left_core_key == right_core_key {
-        let one_side_is_descriptive = left_description.is_some() ^ right_description.is_some();
-        let matching_descriptions =
-            left_description.is_some() && left_description == right_description;
-        return Some(if one_side_is_descriptive || matching_descriptions {
-            AvionicsModelIdentityRelation::DescriptiveExpansion
-        } else {
-            AvionicsModelIdentityRelation::MeaningfulVariant
-        });
-    }
-
-    let left_numbers = model_numeric_runs(&left_core_key);
-    let right_numbers = model_numeric_runs(&right_core_key);
-    if left_numbers != right_numbers {
-        return None;
-    }
-
-    let shorter_key_length = left_core_key.len().min(right_core_key.len());
-    (shorter_key_length >= MINIMUM_PREFIX_MODEL_KEY_LENGTH
-        && (left_core_key.starts_with(&right_core_key)
-            || right_core_key.starts_with(&left_core_key)))
-    .then_some(AvionicsModelIdentityRelation::MeaningfulVariant)
-}
-
-fn model_label_without_exact_manufacturer_prefix(manufacturer: &str, model: &str) -> String {
-    let model = normalize_name(model);
-    let manufacturer = normalize_name(manufacturer);
-    if manufacturer.is_empty() {
-        return model;
-    }
-    model
-        .strip_prefix(&format!("{manufacturer} "))
-        .unwrap_or(&model)
-        .to_string()
-}
-
-fn strip_exact_capability_description(
-    model: &str,
-    descriptive_phrases: &[String],
-) -> (String, Option<String>) {
-    for description in descriptive_phrases {
-        let Some(core) = model.strip_suffix(&format!(" {description}")) else {
-            continue;
-        };
-        if core.chars().any(|character| character.is_ascii_digit())
-            && normalize_avionics_identifier(core).len() >= MINIMUM_PREFIX_MODEL_KEY_LENGTH
-        {
-            return (core.to_string(), Some(description.clone()));
-        }
-    }
-    (model.to_string(), None)
-}
-
 /// Return a model-only retrieval score when two labels carry a possible
 /// product-identity relationship.
 ///
@@ -3399,22 +3287,6 @@ fn model_identity_relation_score_for_candidate(
             &normalize_avionics_model_name(&candidate.model),
         ),
     })
-}
-
-fn model_numeric_runs(model_key: &str) -> Vec<&str> {
-    let mut runs = Vec::new();
-    let mut start = None;
-    for (index, character) in model_key.char_indices() {
-        if character.is_ascii_digit() {
-            start.get_or_insert(index);
-        } else if let Some(start) = start.take() {
-            runs.push(&model_key[start..index]);
-        }
-    }
-    if let Some(start) = start {
-        runs.push(&model_key[start..]);
-    }
-    runs
 }
 
 fn shortlist_avionics_candidates(
@@ -4318,14 +4190,34 @@ fn validate_collision_decision_relation(
     candidate: &AvionicsCatalogCandidate,
     decision: &str,
 ) -> CatalogResult<()> {
-    let proposal_manufacturer_key =
-        normalize_avionics_manufacturer_name(string_field(response, "canonical_manufacturer"));
+    let proposal_manufacturer = string_field(response, "canonical_manufacturer");
+    let proposal_manufacturer_key = normalize_avionics_manufacturer_name(proposal_manufacturer);
     let candidate_manufacturer_key = normalize_avionics_manufacturer_name(&candidate.manufacturer);
     let exact_manufacturer_match = !proposal_manufacturer_key.is_empty()
         && proposal_manufacturer_key == candidate_manufacturer_key;
-    let proposal_model_key =
-        normalize_avionics_identifier(string_field(response, "canonical_model"));
+    let proposal_model = string_field(response, "canonical_model");
+    let proposal_model_key = normalize_avionics_identifier(proposal_model);
     let candidate_model_key = normalize_avionics_identifier(&candidate.model);
+    let proposal_types = response
+        .get("canonical_types")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let legacy_model_relation = exact_manufacturer_match
+        .then(|| {
+            avionics_model_identity_relation(
+                proposal_manufacturer,
+                proposal_model,
+                &proposal_types,
+                &candidate.manufacturer,
+                &candidate.model,
+                &[],
+            )
+        })
+        .flatten();
     let proposal_identifier_key =
         normalize_avionics_identifier(string_field(response, "manufacturer_identifier"));
     let candidate_identifier_key =
@@ -4339,13 +4231,19 @@ fn validate_collision_decision_relation(
         "same_product" => {
             let supported = exact_manufacturer_match
                 && if candidate_identifier_key.is_empty() {
-                    !proposal_model_key.is_empty() && proposal_model_key == candidate_model_key
+                    matches!(
+                        legacy_model_relation,
+                        Some(
+                            AvionicsModelIdentityRelation::TypographyExact
+                                | AvionicsModelIdentityRelation::DescriptiveExpansion
+                        )
+                    )
                 } else {
                     exact_identifier_match
                 };
             if !supported {
                 return Err(CatalogError::Validation(format!(
-                    "collision review {} cannot claim same_product without the same manufacturer and an exact stable-identifier match, or an exact normalized model match for a legacy candidate without an identifier",
+                    "collision review {} cannot claim same_product without the same manufacturer and an exact stable-identifier match, or an exact/description-only model relation for a legacy candidate without an identifier",
                     candidate.id
                 )));
             }
@@ -8577,6 +8475,82 @@ mod tests {
             .expect("one exact signal may prove harmless typography variants of one product");
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].decision, "same_product");
+    }
+
+    #[test]
+    fn collision_review_accepts_authoritative_description_only_legacy_label() {
+        let mut descriptive_legacy = candidate(24, "G1000 Integrated Flight Deck", "unreviewed");
+        descriptive_legacy.avionics_types = vec!["Integrated Flight Deck".to_string()];
+        descriptive_legacy.manufacturer_identifier_kind = "none".to_string();
+        descriptive_legacy.manufacturer_identifier.clear();
+        let context = context(vec![descriptive_legacy]);
+        let evidence =
+            "Garmin G1000 Integrated Flight Deck is an electronic flight instrument system.";
+        let response = json!({
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "G1000",
+            "canonical_types": ["Integrated Flight Deck", "GPS", "NAV", "COM"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "G1000",
+            "reviews": [{
+                "catalog_id": 24,
+                "decision": "same_product",
+                "confidence": "very_high",
+                "candidate_source_url": "https://static.garmin.com/manuals/g1000.pdf",
+                "candidate_source_title": "G1000 Integrated Flight Deck guide",
+                "candidate_evidence": evidence,
+                "reason": "Integrated Flight Deck is a complete supplied capability used as a trailing description of G1000."
+            }]
+        });
+        let proofs = [direct_source_proof(
+            "https://static.garmin.com/manuals/g1000.pdf",
+            evidence,
+        )];
+
+        let reviews = collision_reviews_with_direct_source_proofs(&context, &response, &proofs)
+            .expect("authoritative evidence may join a description-only legacy label");
+        assert_eq!(reviews[0].decision, "same_product");
+    }
+
+    #[test]
+    fn collision_review_does_not_treat_meaningful_suffix_as_description_only() {
+        let mut nxi = candidate(15, "G1000 NXi", "unreviewed");
+        nxi.avionics_types = vec!["Integrated Flight Deck".to_string()];
+        nxi.manufacturer_identifier_kind = "none".to_string();
+        nxi.manufacturer_identifier.clear();
+        let response = json!({
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "G1000",
+            "canonical_types": ["Integrated Flight Deck", "GPS", "NAV", "COM"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "G1000"
+        });
+
+        let error = validate_collision_decision_relation(&response, &nxi, "same_product")
+            .expect_err("NXi is a meaningful product variant, not a description");
+        assert!(error
+            .to_string()
+            .contains("exact/description-only model relation"));
+        validate_collision_decision_relation(&response, &nxi, "different_product")
+            .expect("meaningful variants remain valid different-product decisions");
+    }
+
+    #[test]
+    fn collision_review_requires_description_to_be_a_proposed_canonical_capability() {
+        let mut descriptive_legacy = candidate(24, "G1000 Integrated Flight Deck", "unreviewed");
+        descriptive_legacy.avionics_types = vec!["Integrated Flight Deck".to_string()];
+        descriptive_legacy.manufacturer_identifier_kind = "none".to_string();
+        descriptive_legacy.manufacturer_identifier.clear();
+        let response = json!({
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "G1000",
+            "canonical_types": ["GPS"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "G1000"
+        });
+
+        validate_collision_decision_relation(&response, &descriptive_legacy, "same_product")
+            .expect_err("stored candidate metadata cannot invent a missing proposed capability");
     }
 
     #[test]

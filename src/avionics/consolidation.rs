@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
+use crate::avionics::model::{avionics_model_identity_relation, AvionicsModelIdentityRelation};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::listing::review::{
     fingerprint_approved_catalog_rows, serialize_review_payload, CatalogFingerprintRow,
@@ -70,9 +71,9 @@ pub struct HumanReviewedConsolidationProvenance {
     pub expected_review_payload_sha256: String,
 }
 
-/// An explicit, evidence-backed authorization to consolidate exact catalog
-/// IDs that share one current manufacturer/model identity but lack a common
-/// stable manufacturer identifier.
+/// An explicit, evidence-backed authorization to consolidate catalog IDs that
+/// represent one model-equivalent product but lack a common stable
+/// manufacturer identifier.
 ///
 /// This is deliberately separate from [`AvionicsConsolidationRequest`].
 /// Automatic consolidation remains identifier-only.
@@ -156,6 +157,7 @@ pub struct HumanReviewedAvionicsConsolidationReport {
 pub enum IdentityMatchBasis {
     CanonicalManufacturerAndModel,
     StableManufacturerIdentifier,
+    HumanReviewedModelEquivalence,
     Both,
 }
 
@@ -183,6 +185,8 @@ pub struct ConsolidationChangeCounts {
     pub listing_link_conflicts_coalesced: usize,
     pub default_links_remapped: usize,
     pub default_link_conflicts_coalesced: usize,
+    pub default_candidate_links_remapped: usize,
+    pub default_candidate_link_conflicts_coalesced: usize,
     pub reference_links_remapped: usize,
     pub reference_link_conflicts_coalesced: usize,
     pub suite_links_remapped: usize,
@@ -363,6 +367,24 @@ struct DefaultLinkRow {
 }
 
 #[derive(Clone, Debug, FromRow)]
+struct DefaultCandidateLinkRow {
+    id: i64,
+    quarantined_default_avionics_id: Option<i64>,
+    aircraft_model_variant_id: i64,
+    model_year: i64,
+    avionics_model_id: i64,
+    quantity: i64,
+    source_url: String,
+    source_title: String,
+    source_notes: String,
+    source_confidence: String,
+    pending_reason: String,
+    quarantined_created_at: Option<String>,
+    quarantined_updated_at: Option<String>,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
 struct ReferenceLinkRow {
     id: i64,
     aircraft_reference_configuration_version_id: i64,
@@ -411,6 +433,7 @@ struct CatalogState {
     model_types: Vec<ModelTypeRow>,
     listing_links: Vec<ListingLinkRow>,
     default_links: Vec<DefaultLinkRow>,
+    default_candidate_links: Vec<DefaultCandidateLinkRow>,
     reference_links: Vec<ReferenceLinkRow>,
     suite_links: Vec<SuiteLinkRow>,
     pending_reviews: Vec<PendingReviewRow>,
@@ -427,6 +450,12 @@ struct ListingLinkPlan {
 #[derive(Clone, Debug)]
 struct DefaultLinkPlan {
     keeper: DefaultLinkRow,
+    deleted_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct DefaultCandidateLinkPlan {
+    keeper: DefaultCandidateLinkRow,
     deleted_ids: Vec<i64>,
 }
 
@@ -463,6 +492,7 @@ struct ConsolidationPlan {
     type_ids_to_add: Vec<i64>,
     listing_links: Vec<ListingLinkPlan>,
     default_links: Vec<DefaultLinkPlan>,
+    default_candidate_links: Vec<DefaultCandidateLinkPlan>,
     reference_links: Vec<ReferenceLinkPlan>,
     suite_original_rows_to_delete: Vec<(i64, i64)>,
     suite_links_to_upsert: Vec<SuiteLinkPlan>,
@@ -528,6 +558,15 @@ macro_rules! load_catalog_state {
                       quantity, source_url, source_title, source_notes, source_confidence
                FROM aircraft_model_variant_default_avionics ORDER BY id"#,
         );
+        let default_candidates_sql = $db.sql(
+            r#"SELECT id, quarantined_default_avionics_id,
+                      aircraft_model_variant_id, model_year, avionics_model_id,
+                      quantity, source_url, source_title, source_notes,
+                      source_confidence, pending_reason,
+                      quarantined_created_at, quarantined_updated_at, created_at
+               FROM aircraft_model_variant_default_avionics_candidates
+               ORDER BY id"#,
+        );
         let references_sql = $db.sql(
             r#"SELECT link.id, link.aircraft_reference_configuration_version_id,
                       link.avionics_model_id, link.quantity, link.equipment_role,
@@ -582,6 +621,10 @@ macro_rules! load_catalog_state {
             default_links: sqlx::query_as::<_, DefaultLinkRow>(&defaults_sql)
                 .fetch_all($executor)
                 .await?,
+            default_candidate_links:
+                sqlx::query_as::<_, DefaultCandidateLinkRow>(&default_candidates_sql)
+                    .fetch_all($executor)
+                    .await?,
             reference_links: sqlx::query_as::<_, ReferenceLinkRow>(&references_sql)
                 .fetch_all($executor)
                 .await?,
@@ -848,6 +891,12 @@ fn exact_identity_graph_blockers(state: &CatalogState, models: &[&ModelRow]) -> 
                 Some(IdentityMatchBasis::CanonicalManufacturerAndModel) => {
                     blockers.push(format!(
                         "catalog ids {} and {} share only a mechanically normalized maker/model label; grounded same-product evidence is required before destructive consolidation",
+                        left.id, right.id
+                    ));
+                }
+                Some(IdentityMatchBasis::HumanReviewedModelEquivalence) => {
+                    blockers.push(format!(
+                        "catalog ids {} and {} require an explicit human-reviewed model-equivalence authorization",
                         left.id, right.id
                     ));
                 }
@@ -1243,6 +1292,84 @@ fn plan_default_links(
     plans
 }
 
+fn default_candidate_claims_are_identical(
+    left: &DefaultCandidateLinkRow,
+    right: &DefaultCandidateLinkRow,
+) -> bool {
+    left.quarantined_default_avionics_id == right.quarantined_default_avionics_id
+        && left.aircraft_model_variant_id == right.aircraft_model_variant_id
+        && left.model_year == right.model_year
+        && left.quantity == right.quantity
+        && left.source_url == right.source_url
+        && left.source_title == right.source_title
+        && left.source_notes == right.source_notes
+        && left.source_confidence == right.source_confidence
+        && left.pending_reason == right.pending_reason
+        && left.quarantined_created_at == right.quarantined_created_at
+        && left.quarantined_updated_at == right.quarantined_updated_at
+}
+
+fn plan_default_candidate_links(
+    rows: &[DefaultCandidateLinkRow],
+    canonical_rows: &[DefaultLinkRow],
+    survivor_id: i64,
+    duplicate_ids: &BTreeSet<i64>,
+    blockers: &mut Vec<String>,
+) -> Vec<DefaultCandidateLinkPlan> {
+    let mut grouped = BTreeMap::<(i64, i64, i64), Vec<DefaultCandidateLinkRow>>::new();
+    for row in rows {
+        grouped
+            .entry((
+                row.aircraft_model_variant_id,
+                row.model_year,
+                remap_model_id(row.avionics_model_id, survivor_id, duplicate_ids),
+            ))
+            .or_default()
+            .push(row.clone());
+    }
+
+    let mut plans = Vec::new();
+    for ((variant_id, model_year, mapped_model_id), mut group) in grouped {
+        if !group
+            .iter()
+            .any(|row| duplicate_ids.contains(&row.avionics_model_id))
+        {
+            continue;
+        }
+        if canonical_rows.iter().any(|row| {
+            row.aircraft_model_variant_id == variant_id
+                && row.model_year == model_year
+                && row.avionics_model_id == mapped_model_id
+        }) {
+            blockers.push(format!(
+                "pending default avionics candidate would collide with canonical default for aircraft variant {variant_id}, year {model_year}, model {mapped_model_id}"
+            ));
+            continue;
+        }
+
+        group.sort_by_key(|row| (usize::from(row.avionics_model_id != survivor_id), row.id));
+        let keeper = &group[0];
+        if group
+            .iter()
+            .skip(1)
+            .any(|candidate| !default_candidate_claims_are_identical(keeper, candidate))
+        {
+            blockers.push(format!(
+                "pending default avionics candidates for aircraft variant {variant_id}, year {model_year}, model {mapped_model_id} contain conflicting claims and cannot be coalesced"
+            ));
+            continue;
+        }
+
+        let mut remapped_keeper = keeper.clone();
+        remapped_keeper.avionics_model_id = mapped_model_id;
+        plans.push(DefaultCandidateLinkPlan {
+            keeper: remapped_keeper,
+            deleted_ids: group.iter().map(|row| row.id).collect(),
+        });
+    }
+    plans
+}
+
 fn plan_reference_links(
     rows: &[ReferenceLinkRow],
     survivor_id: i64,
@@ -1393,14 +1520,14 @@ fn review_product_references_duplicates(
 #[derive(Clone, Debug)]
 struct HumanConsolidationScope {
     effective_manufacturer_identity_id: i64,
-    canonical_model_key: String,
+    member_model_keys: BTreeSet<String>,
 }
 
 fn canonical_model_key(value: &str) -> String {
     normalize_avionics_model_name(value)
 }
 
-fn exact_idless_review_product_matches_scope(
+fn idless_review_product_matches_equivalence_scope(
     state: &CatalogState,
     product: Option<&ReviewProduct>,
     scope: Option<&HumanConsolidationScope>,
@@ -1408,7 +1535,11 @@ fn exact_idless_review_product_matches_scope(
     let (Some(product), Some(scope)) = (product, scope) else {
         return false;
     };
-    if product.id.is_some() || canonical_model_key(&product.model) != scope.canonical_model_key {
+    if product.id.is_some()
+        || !scope
+            .member_model_keys
+            .contains(&canonical_model_key(&product.model))
+    {
         return false;
     }
     let proposed_manufacturer_key = normalize_avionics_manufacturer_name(&product.manufacturer);
@@ -1434,7 +1565,7 @@ fn pending_review_references_duplicates(
     payload.aspects.iter().any(|aspect| {
         review_product_references_duplicates(aspect.suggested_product.as_ref(), duplicate_ids)
             || review_product_references_duplicates(aspect.proposed_product.as_ref(), duplicate_ids)
-            || exact_idless_review_product_matches_scope(
+            || idless_review_product_matches_equivalence_scope(
                 state,
                 aspect.proposed_product.as_ref(),
                 scope,
@@ -1460,10 +1591,10 @@ const CONSOLIDATED_PENDING_IDENTITY_REASON: &str =
 
 fn rewrite_consolidated_pending_identity_reason(
     aspect: &mut PendingReviewAspect,
-    exact_identity_remapped: bool,
+    model_equivalence_remapped: bool,
 ) {
     let reason = aspect.reason.trim();
-    if exact_identity_remapped
+    if model_equivalence_remapped
         && reason.starts_with(LEGACY_DUPLICATE_CONSOLIDATION_REASON_PREFIX)
         && reason.ends_with(LEGACY_DUPLICATE_CONSOLIDATION_REASON_SUFFIX)
     {
@@ -1492,18 +1623,19 @@ fn remap_pending_review(
     }
 
     for aspect in &mut payload.aspects {
-        let mut exact_identity_remapped = false;
+        let mut model_equivalence_remapped = false;
         if let Some(product) = &mut aspect.suggested_product {
             if product.id.is_some_and(|id| duplicate_ids.contains(&id)) {
                 product.id = Some(survivor.id);
-                exact_identity_remapped = true;
+                model_equivalence_remapped = true;
             }
         }
         if let Some(product) = &mut aspect.proposed_product {
-            let exact_idless_match =
-                exact_idless_review_product_matches_scope(state, Some(product), scope);
-            if product.id.is_some_and(|id| duplicate_ids.contains(&id)) || exact_idless_match {
-                exact_identity_remapped = true;
+            let idless_equivalence_match =
+                idless_review_product_matches_equivalence_scope(state, Some(product), scope);
+            if product.id.is_some_and(|id| duplicate_ids.contains(&id)) || idless_equivalence_match
+            {
+                model_equivalence_remapped = true;
                 if survivor.catalog_status == "approved" {
                     if aspect
                         .suggested_product
@@ -1528,7 +1660,7 @@ fn remap_pending_review(
             }
         }
         if scope.is_some() {
-            rewrite_consolidated_pending_identity_reason(aspect, exact_identity_remapped);
+            rewrite_consolidated_pending_identity_reason(aspect, model_equivalence_remapped);
         }
         aspect.replaces_product_id =
             remap_optional_model_id(aspect.replaces_product_id, survivor.id, duplicate_ids);
@@ -1560,7 +1692,7 @@ fn remap_pending_review(
 #[derive(Clone, Copy)]
 enum ConsolidationIdentityAuthority<'a> {
     StableIdentifier,
-    HumanReviewedExactModel(&'a HumanConsolidationScope),
+    HumanReviewedModelEquivalence(&'a HumanConsolidationScope),
 }
 
 fn build_plan_with_authority(
@@ -1588,7 +1720,21 @@ fn build_plan_with_authority(
                 "duplicate avionics catalog id {duplicate_id} does not exist"
             ))
         })?;
-        match identity_match(state, survivor, duplicate) {
+        let identity_basis = identity_match(state, survivor, duplicate).or_else(|| {
+            let ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(scope) = authority
+            else {
+                return None;
+            };
+            (duplicate.avionics_manufacturer_identity_id
+                == Some(scope.effective_manufacturer_identity_id)
+                && matches!(
+                    current_model_identity_relation(state, survivor, duplicate),
+                    Some(AvionicsModelIdentityRelation::TypographyExact)
+                        | Some(AvionicsModelIdentityRelation::DescriptiveExpansion)
+                ))
+            .then_some(IdentityMatchBasis::HumanReviewedModelEquivalence)
+        });
+        match identity_basis {
             Some(basis) => matches.push(ConsolidationIdentityMatch {
                 duplicate: duplicate.summary(),
                 basis,
@@ -1627,13 +1773,13 @@ fn build_plan_with_authority(
 
     if matches!(
         authority,
-        ConsolidationIdentityAuthority::HumanReviewedExactModel(_)
+        ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(_)
     ) && selected_models
         .iter()
         .any(|model| model.catalog_status != "unreviewed")
     {
         blockers.push(
-            "human-reviewed same-name consolidation permits only unreviewed catalog rows"
+            "human-reviewed model-equivalence consolidation permits only unreviewed catalog rows"
                 .to_string(),
         );
     }
@@ -1693,6 +1839,13 @@ fn build_plan_with_authority(
         &mut blockers,
     );
     let default_links = plan_default_links(&state.default_links, survivor_id, &duplicate_ids);
+    let default_candidate_links = plan_default_candidate_links(
+        &state.default_candidate_links,
+        &state.default_links,
+        survivor_id,
+        &duplicate_ids,
+        &mut blockers,
+    );
     let reference_links = plan_reference_links(
         &state.reference_links,
         survivor_id,
@@ -1724,7 +1877,7 @@ fn build_plan_with_authority(
     let mut pending_reviews = Vec::new();
     let human_scope = match authority {
         ConsolidationIdentityAuthority::StableIdentifier => None,
-        ConsolidationIdentityAuthority::HumanReviewedExactModel(scope) => Some(scope),
+        ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(scope) => Some(scope),
     };
     for row in &state.pending_reviews {
         match remap_pending_review(
@@ -1767,6 +1920,15 @@ fn build_plan_with_authority(
             .iter()
             .map(|plan| plan.deleted_ids.len())
             .sum(),
+        default_candidate_links_remapped: state
+            .default_candidate_links
+            .iter()
+            .filter(|row| duplicate_ids.contains(&row.avionics_model_id))
+            .count(),
+        default_candidate_link_conflicts_coalesced: default_candidate_links
+            .iter()
+            .map(|plan| plan.deleted_ids.len().saturating_sub(1))
+            .sum(),
         reference_links_remapped: state
             .reference_links
             .iter()
@@ -1808,6 +1970,7 @@ fn build_plan_with_authority(
         type_ids_to_add,
         listing_links,
         default_links,
+        default_candidate_links,
         reference_links,
         suite_original_rows_to_delete,
         suite_links_to_upsert,
@@ -1847,10 +2010,11 @@ fn row_identity_sha256(
     model: &ModelRow,
     effective_manufacturer_identity_id: i64,
     canonical_model_key: &str,
+    capabilities: &[String],
 ) -> String {
     let mut hasher = Sha256::new();
     for value in [
-        "aircost:human-reviewed-avionics-consolidation-row:v1",
+        "aircost:human-reviewed-avionics-consolidation-row:v2",
         &model.id.to_string(),
         &model.avionics_manufacturer_id.to_string(),
         &effective_manufacturer_identity_id.to_string(),
@@ -1875,6 +2039,13 @@ fn row_identity_sha256(
         model.catalog_reviewed_at.as_deref(),
     ] {
         feed_optional_fingerprint(&mut hasher, value);
+    }
+    let mut capabilities = capabilities.to_vec();
+    capabilities.sort();
+    capabilities.dedup();
+    feed_fingerprint(&mut hasher, &capabilities.len().to_string());
+    for capability in capabilities {
+        feed_fingerprint(&mut hasher, &capability);
     }
     format!("{:x}", hasher.finalize())
 }
@@ -1973,6 +2144,30 @@ fn human_request_base(
     Ok(base)
 }
 
+fn current_model_capabilities(state: &CatalogState, model_id: i64) -> Vec<String> {
+    state
+        .model_types
+        .iter()
+        .filter(|membership| membership.avionics_model_id == model_id)
+        .map(|membership| membership.capability.clone())
+        .collect()
+}
+
+fn current_model_identity_relation(
+    state: &CatalogState,
+    left: &ModelRow,
+    right: &ModelRow,
+) -> Option<AvionicsModelIdentityRelation> {
+    avionics_model_identity_relation(
+        &left.manufacturer,
+        &left.model,
+        &current_model_capabilities(state, left.id),
+        &right.manufacturer,
+        &right.model,
+        &current_model_capabilities(state, right.id),
+    )
+}
+
 fn snapshot_human_authorization(
     state: &CatalogState,
     request: &HumanReviewedAvionicsConsolidationRequest,
@@ -2013,37 +2208,57 @@ fn snapshot_human_authorization(
                 "survivor catalog id {survivor_id} has no evidence-backed effective manufacturer identity"
             ))
         })?;
-    let model_key = canonical_model_key(&survivor.model);
-    if model_key.is_empty() || survivor.stored_model_key != model_key {
+    let survivor_model_key = canonical_model_key(&survivor.model);
+    if survivor_model_key.is_empty() || survivor.stored_model_key != survivor_model_key {
         return Err(ConsolidationError::Validation(format!(
             "survivor catalog id {survivor_id} has a stale or invalid canonical model key"
         )));
     }
 
-    let exact_collision_ids = state
+    let equivalence_ids = state
         .models
         .iter()
         .filter(|model| {
             model.avionics_manufacturer_identity_id == Some(manufacturer_identity_id)
-                && canonical_model_key(&model.model) == model_key
+                && matches!(
+                    current_model_identity_relation(state, survivor, model),
+                    Some(AvionicsModelIdentityRelation::TypographyExact)
+                        | Some(AvionicsModelIdentityRelation::DescriptiveExpansion)
+                )
         })
         .map(|model| model.id)
         .collect::<BTreeSet<_>>();
-    if exact_collision_ids != selected_ids {
-        let omitted = exact_collision_ids
+    if equivalence_ids != selected_ids {
+        let omitted = equivalence_ids
             .difference(&selected_ids)
             .copied()
             .collect::<Vec<_>>();
         let unrelated = selected_ids
-            .difference(&exact_collision_ids)
+            .difference(&equivalence_ids)
             .copied()
             .collect::<Vec<_>>();
+        for model_id in &unrelated {
+            let model = by_id.get(model_id).copied().ok_or_else(|| {
+                ConsolidationError::Validation(format!(
+                    "avionics catalog id {model_id} does not exist"
+                ))
+            })?;
+            if model.avionics_manufacturer_identity_id == Some(manufacturer_identity_id)
+                && current_model_identity_relation(state, survivor, model)
+                    == Some(AvionicsModelIdentityRelation::MeaningfulVariant)
+            {
+                return Err(ConsolidationError::Validation(format!(
+                    "catalog id {model_id} is a meaningful product variant of survivor {survivor_id}, not a model-equivalent label; variants such as G1000 NXi must remain distinct"
+                )));
+            }
+        }
         return Err(ConsolidationError::Validation(format!(
-            "human-reviewed consolidation must name the complete exact manufacturer/model collision set; omitted={omitted:?}, nonmatching={unrelated:?}"
+            "human-reviewed consolidation must name the complete manufacturer-scoped model-equivalence set; omitted={omitted:?}, nonmatching={unrelated:?}"
         )));
     }
 
     let mut identifiers = BTreeSet::new();
+    let mut member_model_keys = BTreeSet::new();
     let mut members = Vec::with_capacity(selected_ids.len());
     for model_id in &selected_ids {
         let model = by_id.get(model_id).copied().ok_or_else(|| {
@@ -2051,7 +2266,7 @@ fn snapshot_human_authorization(
         })?;
         if model.catalog_status != "unreviewed" {
             return Err(ConsolidationError::Validation(format!(
-                "human-reviewed same-name consolidation permits only unreviewed rows; catalog id {model_id} is {}",
+                "human-reviewed model-equivalence consolidation permits only unreviewed rows; catalog id {model_id} is {}",
                 model.catalog_status
             )));
         }
@@ -2067,11 +2282,13 @@ fn snapshot_human_authorization(
                 "catalog id {model_id} has a stale or non-exact manufacturer identity key"
             )));
         }
-        if canonical_model_key(&model.model) != model_key || model.stored_model_key != model_key {
+        let member_model_key = canonical_model_key(&model.model);
+        if member_model_key.is_empty() || model.stored_model_key != member_model_key {
             return Err(ConsolidationError::Validation(format!(
-                "catalog id {model_id} does not share the exact current canonical model key {model_key:?}"
+                "catalog id {model_id} has a stale or invalid current canonical model key"
             )));
         }
+        member_model_keys.insert(member_model_key.clone());
         if let Some(identifier) = stable_identifier_key(model) {
             identifiers.insert(identifier);
         }
@@ -2080,17 +2297,23 @@ fn snapshot_human_authorization(
         } else {
             HumanReviewedConsolidationMemberRole::Duplicate
         };
+        let capabilities = current_model_capabilities(state, *model_id);
         members.push(HumanReviewedConsolidationMemberSnapshot {
             avionics_model_id: *model_id,
             role,
-            row_identity_sha256: row_identity_sha256(model, manufacturer_identity_id, &model_key),
+            row_identity_sha256: row_identity_sha256(
+                model,
+                manufacturer_identity_id,
+                &member_model_key,
+                &capabilities,
+            ),
             avionics_manufacturer_id: model.avionics_manufacturer_id,
             avionics_manufacturer_identity_id: manufacturer_identity_id,
             manufacturer: model.manufacturer.clone(),
             model: model.model.clone(),
             stored_manufacturer_key: model.stored_manufacturer_key.clone(),
             stored_model_key: model.stored_model_key.clone(),
-            canonical_model_key: model_key.clone(),
+            canonical_model_key: member_model_key,
             catalog_status: model.catalog_status.clone(),
             manufacturer_identifier_kind: model.manufacturer_identifier_kind.clone(),
             manufacturer_identifier: model.manufacturer_identifier.clone(),
@@ -2105,7 +2328,7 @@ fn snapshot_human_authorization(
     }
     if identifiers.len() > 1 {
         return Err(ConsolidationError::Validation(format!(
-            "human-reviewed exact-name set has conflicting nonblank stable identifiers: {identifiers:?}"
+            "human-reviewed model-equivalence set has conflicting nonblank stable identifiers: {identifiers:?}"
         )));
     }
     members.sort_by_key(|member| member.avionics_model_id);
@@ -2161,11 +2384,11 @@ fn snapshot_human_authorization(
 
     let mut authorization_hasher = Sha256::new();
     for value in [
-        "aircost:human-reviewed-avionics-consolidation:v1",
+        "aircost:human-reviewed-avionics-consolidation:v2",
         &request.reviewer_user_id.to_string(),
         &survivor_id.to_string(),
         &manufacturer_identity_id.to_string(),
-        model_key.as_str(),
+        survivor_model_key.as_str(),
         request.authoritative_source_url.as_str(),
         request.authoritative_source_title.as_str(),
         request.exact_evidence_text.as_str(),
@@ -2200,7 +2423,7 @@ fn snapshot_human_authorization(
         reviewer_user_id: request.reviewer_user_id,
         survivor_model_id: survivor_id,
         effective_manufacturer_identity_id: manufacturer_identity_id,
-        canonical_model_key: model_key.clone(),
+        canonical_model_key: survivor_model_key,
         authoritative_source_url: request.authoritative_source_url.clone(),
         authoritative_source_title: request.authoritative_source_title.clone(),
         exact_evidence_text: request.exact_evidence_text.clone(),
@@ -2214,7 +2437,7 @@ fn snapshot_human_authorization(
         base,
         HumanConsolidationScope {
             effective_manufacturer_identity_id: manufacturer_identity_id,
-            canonical_model_key: model_key,
+            member_model_keys,
         },
         authorization,
     ))
@@ -2228,8 +2451,8 @@ pub async fn preview_avionics_model_consolidation(
     Ok(build_plan(&load_state(db).await?, request)?.report)
 }
 
-/// Preview a human-reviewed exact-name consolidation without storing its
-/// authorization or touching the catalog.
+/// Preview a human-reviewed model-equivalence consolidation without storing
+/// its authorization or touching the catalog.
 pub async fn preview_human_reviewed_avionics_model_consolidation(
     db: &AppDb,
     request: &HumanReviewedAvionicsConsolidationRequest,
@@ -2239,7 +2462,7 @@ pub async fn preview_human_reviewed_avionics_model_consolidation(
     let consolidation = build_plan_with_authority(
         &state,
         &base,
-        ConsolidationIdentityAuthority::HumanReviewedExactModel(&scope),
+        ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(&scope),
     )?
     .report;
     Ok(HumanReviewedAvionicsConsolidationReport {
@@ -2261,6 +2484,11 @@ fn reference_strength(state: &CatalogState, model_id: i64) -> CanonicalLegacyRef
         .iter()
         .filter(|row| row.avionics_model_id == model_id)
         .count();
+    let default_candidate_count = state
+        .default_candidate_links
+        .iter()
+        .filter(|row| row.avionics_model_id == model_id)
+        .count();
     let reference_count = state
         .reference_links
         .iter()
@@ -2271,7 +2499,8 @@ fn reference_strength(state: &CatalogState, model_id: i64) -> CanonicalLegacyRef
         .iter()
         .filter(|row| row.suite_model_id == model_id || row.component_model_id == model_id)
         .count();
-    let global_reference_count = default_count + reference_count + suite_count;
+    let global_reference_count =
+        default_count + default_candidate_count + reference_count + suite_count;
     CanonicalLegacyReferenceStrength {
         global_reference_count,
         reviewer_confirmed_listing_reference_count: listing_rows
@@ -2428,9 +2657,9 @@ fn plan_conflict(plan: &ConsolidationPlan) -> ConsolidationError {
     ))
 }
 
-/// Shared locked mutation path. Human-reviewed same-name consolidation is kept
-/// out of the automatic API by accepting its authorization only from the
-/// explicit public wrapper below.
+/// Shared locked mutation path. Human-reviewed model-equivalence consolidation
+/// is kept out of the automatic API by accepting its authorization only from
+/// the explicit public wrapper below.
 async fn consolidate_avionics_models_internal(
     db: &AppDb,
     request: &AvionicsConsolidationRequest,
@@ -2454,7 +2683,7 @@ async fn consolidate_avionics_models_internal(
             "UPDATE avionics_models SET updated_at = updated_at WHERE id = ?",
         ),
         DatabaseBackend::Postgres(_) => db.sql(
-            "LOCK TABLE avionics_models, avionics_manufacturers, avionics_manufacturer_canonical_keys, avionics_approved_product_identities, avionics_model_types, aircraft_sale_listings, aircraft_sale_listing_avionics, aircraft_model_variant_default_avionics, aircraft_reference_configuration_versions, aircraft_reference_avionics, avionics_suite_components, aircraft_sale_listing_pending_reviews, avionics_catalog_consolidation_guard, avionics_catalog_human_consolidation_authorizations, avionics_catalog_human_consolidation_members, avionics_catalog_human_consolidation_guard, avionics_catalog_human_consolidation_claim IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK TABLE avionics_models, avionics_manufacturers, avionics_manufacturer_canonical_keys, avionics_approved_product_identities, avionics_model_types, aircraft_sale_listings, aircraft_sale_listing_avionics, aircraft_model_variant_default_avionics, aircraft_model_variant_default_avionics_candidates, aircraft_reference_configuration_versions, aircraft_reference_avionics, avionics_suite_components, aircraft_sale_listing_pending_reviews, avionics_catalog_consolidation_guard, avionics_catalog_human_consolidation_authorizations, avionics_catalog_human_consolidation_members, avionics_catalog_human_consolidation_guard, avionics_catalog_human_consolidation_claim IN SHARE ROW EXCLUSIVE MODE",
         ),
     };
     let insert_guard = db.sql(
@@ -2523,6 +2752,16 @@ async fn consolidate_avionics_models_internal(
            SET avionics_model_id = ?, quantity = ?, source_notes = ?,
                source_confidence = ?, updated_at = CURRENT_TIMESTAMP
            WHERE id = ?"#,
+    );
+    let delete_default_candidate =
+        db.sql("DELETE FROM aircraft_model_variant_default_avionics_candidates WHERE id = ?");
+    let insert_default_candidate = db.sql(
+        r#"INSERT INTO aircraft_model_variant_default_avionics_candidates (
+             id, quarantined_default_avionics_id, aircraft_model_variant_id,
+             model_year, avionics_model_id, quantity, source_url, source_title,
+             source_notes, source_confidence, pending_reason,
+             quarantined_created_at, quarantined_updated_at, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     );
     let delete_reference = db.sql("DELETE FROM aircraft_reference_avionics WHERE id = ?");
     let update_reference =
@@ -2636,7 +2875,7 @@ async fn consolidate_avionics_models_internal(
                     build_plan_with_authority(
                         &state,
                         request,
-                        ConsolidationIdentityAuthority::HumanReviewedExactModel(&scope),
+                        ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(&scope),
                     )?,
                     Some(authorization),
                 )
@@ -2815,6 +3054,44 @@ async fn consolidate_avionics_models_internal(
                 if changed != 1 {
                     return Err(ConsolidationError::Conflict(format!(
                         "default avionics link {} changed during consolidation",
+                        link.keeper.id
+                    )));
+                }
+            }
+            for link in &plan.default_candidate_links {
+                for deleted_id in &link.deleted_ids {
+                    let deleted = sqlx::query(&delete_default_candidate)
+                        .bind(*deleted_id)
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected();
+                    if deleted != 1 {
+                        return Err(ConsolidationError::Conflict(format!(
+                            "pending default avionics candidate {deleted_id} changed during consolidation"
+                        )));
+                    }
+                }
+                let inserted = sqlx::query(&insert_default_candidate)
+                    .bind(link.keeper.id)
+                    .bind(link.keeper.quarantined_default_avionics_id)
+                    .bind(link.keeper.aircraft_model_variant_id)
+                    .bind(link.keeper.model_year)
+                    .bind(link.keeper.avionics_model_id)
+                    .bind(link.keeper.quantity)
+                    .bind(link.keeper.source_url.as_str())
+                    .bind(link.keeper.source_title.as_str())
+                    .bind(link.keeper.source_notes.as_str())
+                    .bind(link.keeper.source_confidence.as_str())
+                    .bind(link.keeper.pending_reason.as_str())
+                    .bind(link.keeper.quarantined_created_at.as_deref())
+                    .bind(link.keeper.quarantined_updated_at.as_deref())
+                    .bind(link.keeper.created_at.as_str())
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ConsolidationError::Conflict(format!(
+                        "pending default avionics candidate {} could not be remapped",
                         link.keeper.id
                     )));
                 }
@@ -3015,7 +3292,7 @@ pub async fn consolidate_avionics_models(
 }
 
 /// Apply a separately authorized, evidence-backed human decision for one
-/// complete exact manufacturer/model collision set.
+/// complete manufacturer-scoped model-equivalence set.
 pub async fn consolidate_avionics_models_with_human_review(
     db: &AppDb,
     request: &HumanReviewedAvionicsConsolidationRequest,
@@ -3116,6 +3393,7 @@ mod tests {
             model_types: Vec::new(),
             listing_links: Vec::new(),
             default_links: Vec::new(),
+            default_candidate_links: Vec::new(),
             reference_links: Vec::new(),
             suite_links: Vec::new(),
             pending_reviews: Vec::new(),
@@ -3125,7 +3403,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_human_consolidation_replaces_only_the_obsolete_collision_instruction() {
+    fn model_equivalence_consolidation_replaces_only_the_obsolete_collision_instruction() {
         let stale_reason = format!(
             "{LEGACY_DUPLICATE_CONSOLIDATION_REASON_PREFIX} ([4, 239]); \
              {LEGACY_DUPLICATE_CONSOLIDATION_REASON_SUFFIX}"
@@ -3435,6 +3713,333 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    async fn human_consolidation_request(
+        db: &AppDb,
+        survivor_id: i64,
+        duplicate_ids: Vec<i64>,
+    ) -> HumanReviewedAvionicsConsolidationRequest {
+        HumanReviewedAvionicsConsolidationRequest {
+            survivor_id,
+            duplicate_ids,
+            reviewer_user_id: sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+                .fetch_one(pool(db))
+                .await
+                .unwrap(),
+            authoritative_source_url: "https://static.garmin.com/product-manual.pdf".to_string(),
+            authoritative_source_title: "Garmin product manual".to_string(),
+            exact_evidence_text:
+                "Garmin identifies Integrated Flight Deck as a description of the G1000 product."
+                    .to_string(),
+            provenance: None,
+            expected_authorization_sha256: None,
+            expected_catalog_revision_sha256: Some(
+                crate::listing::review::approved_catalog_revision_sha256(db)
+                    .await
+                    .unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn human_reviewed_descriptive_model_equivalence_applies() {
+        let db = test_db().await;
+        let (manufacturer_id, survivor_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        let (_, duplicate_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000 Integrated Flight Deck",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+
+        let listing_id = insert_listing(&db).await;
+        let aspect = PendingReviewAspect::avionics(
+            "g1000",
+            "avionics",
+            "G1000 Integrated Flight Deck",
+            "Garmin G1000 Integrated Flight Deck",
+            "model-equivalence review required",
+            1,
+            "installed",
+            Some("Garmin G1000 Integrated Flight Deck".to_string()),
+            Some("high".to_string()),
+        )
+        .with_proposed_product(ReviewProduct::proposed(
+            "Garmin",
+            "G1000 Integrated Flight Deck",
+            vec!["Integrated Flight Deck".to_string()],
+        ));
+        stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+
+        let mut request = human_consolidation_request(&db, survivor_id, vec![duplicate_id]).await;
+        let preview = preview_human_reviewed_avionics_model_consolidation(&db, &request)
+            .await
+            .unwrap();
+        assert!(preview.consolidation.can_apply, "{preview:?}");
+        assert_eq!(preview.consolidation.matches.len(), 1);
+        assert_eq!(preview.consolidation.matches[0].duplicate.id, duplicate_id);
+        assert_eq!(
+            preview.consolidation.matches[0].basis,
+            IdentityMatchBasis::HumanReviewedModelEquivalence
+        );
+        assert_eq!(preview.authorization.canonical_model_key, "g1000");
+        assert_eq!(
+            preview
+                .authorization
+                .members
+                .iter()
+                .map(|member| member.canonical_model_key.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["g1000", "g1000 integrated flight deck"])
+        );
+        request.expected_authorization_sha256 =
+            Some(preview.authorization.authorization_sha256.clone());
+
+        let report = consolidate_avionics_models_with_human_review(&db, &request)
+            .await
+            .unwrap();
+        assert!(report.consolidation.applied);
+        assert_eq!(report.consolidation.changes.model_rows_deleted, 1);
+        let review_json: String = sqlx::query_scalar(
+            "SELECT review_payload_json FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        let review: Value = serde_json::from_str(&review_json).unwrap();
+        assert_eq!(
+            review["aspects"][0]["proposed_product"]["id"].as_i64(),
+            Some(survivor_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn human_reviewed_meaningful_variant_is_rejected() {
+        let db = test_db().await;
+        let (manufacturer_id, survivor_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        let (_, nxi_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+
+        let request = human_consolidation_request(&db, survivor_id, vec![nxi_id]).await;
+        let error = preview_human_reviewed_avionics_model_consolidation(&db, &request)
+            .await
+            .expect_err("G1000 NXi must remain a distinct product");
+        assert!(
+            error.to_string().contains("meaningful product variant"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn human_reviewed_model_equivalence_requires_complete_closure() {
+        let db = test_db().await;
+        let (manufacturer_id, survivor_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        let (_, typography_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "Garmin G1000",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        let (_, omitted_descriptive_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000 Integrated Flight Deck",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+
+        let request = human_consolidation_request(&db, survivor_id, vec![typography_id]).await;
+        let error = preview_human_reviewed_avionics_model_consolidation(&db, &request)
+            .await
+            .expect_err("an omitted descriptive member must block consolidation");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("omitted=[{omitted_descriptive_id}]")),
+            "{error}"
+        );
+    }
+
+    async fn insert_default_candidate(
+        db: &AppDb,
+        id: i64,
+        avionics_model_id: i64,
+        source_notes: &str,
+    ) {
+        let variant_id: i64 = sqlx::query_scalar(
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+        )
+        .fetch_one(pool(db))
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO aircraft_model_variant_default_avionics_candidates (
+                 id, aircraft_model_variant_id, model_year, avionics_model_id,
+                 quantity, source_url, source_title, source_notes,
+                 source_confidence, pending_reason, created_at
+               ) VALUES (?, ?, 2004, ?, 1, 'https://oem.example/manual',
+                         'OEM manual', ?, 'high',
+                         'factory_default_claim_unverified',
+                         '2026-07-30 12:00:00')"#,
+        )
+        .bind(id)
+        .bind(variant_id)
+        .bind(avionics_model_id)
+        .bind(source_notes)
+        .execute(pool(db))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn consolidation_remaps_default_candidate_without_mutating_its_claim() {
+        let db = test_db().await;
+        let (manufacturer_id, survivor_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        let (_, duplicate_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000 Integrated Flight Deck",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+        insert_default_candidate(&db, 137, duplicate_id, "exact retained claim").await;
+
+        let mut request = human_consolidation_request(&db, survivor_id, vec![duplicate_id]).await;
+        let preview = preview_human_reviewed_avionics_model_consolidation(&db, &request)
+            .await
+            .unwrap();
+        assert!(preview.consolidation.can_apply, "{preview:?}");
+        assert_eq!(
+            preview
+                .consolidation
+                .changes
+                .default_candidate_links_remapped,
+            1
+        );
+        assert_eq!(
+            preview
+                .consolidation
+                .changes
+                .default_candidate_link_conflicts_coalesced,
+            0
+        );
+        request.expected_authorization_sha256 = Some(preview.authorization.authorization_sha256);
+
+        consolidate_avionics_models_with_human_review(&db, &request)
+            .await
+            .unwrap();
+        let preserved: (i64, i64, String, String) = sqlx::query_as(
+            r#"SELECT id, avionics_model_id, source_notes, created_at
+               FROM aircraft_model_variant_default_avionics_candidates
+               WHERE id = 137"#,
+        )
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                137,
+                survivor_id,
+                "exact retained claim".to_string(),
+                "2026-07-30 12:00:00".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_rejects_conflicting_default_candidates() {
+        let db = test_db().await;
+        let (manufacturer_id, survivor_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        let (_, duplicate_id) = insert_legacy_model(
+            &db,
+            "Garmin",
+            "garmin",
+            "G1000 Integrated Flight Deck",
+            &["Integrated Flight Deck"],
+        )
+        .await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+        insert_default_candidate(&db, 136, survivor_id, "survivor claim").await;
+        insert_default_candidate(&db, 137, duplicate_id, "conflicting duplicate claim").await;
+
+        let mut request = human_consolidation_request(&db, survivor_id, vec![duplicate_id]).await;
+        let preview = preview_human_reviewed_avionics_model_consolidation(&db, &request)
+            .await
+            .unwrap();
+        assert!(!preview.consolidation.can_apply);
+        assert_eq!(
+            preview
+                .consolidation
+                .changes
+                .default_candidate_links_remapped,
+            1
+        );
+        assert!(preview
+            .consolidation
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("conflicting claims")));
+        request.expected_authorization_sha256 = Some(preview.authorization.authorization_sha256);
+        assert!(matches!(
+            consolidate_avionics_models_with_human_review(&db, &request).await,
+            Err(ConsolidationError::Conflict(_))
+        ));
     }
 
     #[tokio::test]
