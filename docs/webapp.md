@@ -461,6 +461,13 @@ each server process. `GEMINI_API_KEY` enables extraction and curation;
 Deterministic FAA/catalog reuse still works without paid calls. The response
 reports separate aircraft, avionics, and finalization stages; unresolved or
 uncertain observations remain in review rather than being auto-approved.
+When aircraft and avionics review is complete but valuation-grade factory
+reference data is not yet published, the response status is
+`pending_reference`. Its finalization stage uses
+`reason_code: factory_reference_pending`; the listing remains `incomplete` and
+unverified, but the result is terminal for the manual review queue and has no
+aircraft or avionics focus tab. Preflight and preview derive this state from
+local reference rows without Gemini.
 
 Product cursors are opaque keyset tokens ordered by immutable product ID.
 Association cursors are bound to one product and ordered by listing and aspect.
@@ -548,7 +555,11 @@ admission, enrichment, and readiness checks publish it as `ready` and
 verified. Accepted associations receive `listing_review`
 provenance and high installation confidence and participate in valuation under
 the same evidence rule as high-confidence `listing` associations. A completion
-failure is stored as `quarantined`; an unresolved bundle remains
+failure is stored as `quarantined`. Missing factory reference data is not a
+completion failure: the API returns the resolved listing as `incomplete` and
+unverified, the browser removes it from the manual queue, and the workspace
+reports that factory reference curation remains pending before valuation. An
+unresolved bundle remains
 `pending_review` and is not treated as an ingestion failure. A bundle staged
 concurrently with post-review enrichment takes precedence over quarantine and
 stays visible in the review queue.

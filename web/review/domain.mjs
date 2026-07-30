@@ -34,6 +34,7 @@ const AIRCRAFT_IDENTITY_STATES = new Set(["verified", "curation_required"]);
 const AUTOMATIC_VERIFICATION_STATUSES = new Set([
   "already_verified",
   "verified",
+  "pending_reference",
   "pending_review",
   "blocked",
   "stale",
@@ -96,6 +97,8 @@ const AUTOMATIC_VERIFICATION_REASONS = Object.freeze({
     "A model variant or capability qualifier may identify a different avionics product.",
   manual_review_required:
     "One or more observations still require a person to confirm or discard them.",
+  factory_reference_pending:
+    "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.",
   listing_finalization_failed:
     "The identities were checked, but required valuation enrichment did not complete.",
 });
@@ -736,6 +739,23 @@ export function describeAutomaticListingVerificationOutcome(
     );
   }
 
+  if (
+    verification.status === "pending_reference"
+    && verification.final_ingestion_state === "incomplete"
+    && verification?.finalization?.status === "pending_reference"
+    && verification?.finalization?.reason_code === "factory_reference_pending"
+  ) {
+    return {
+      kind: "pending_reference",
+      label: "Review complete — factory reference pending",
+      detail: AUTOMATIC_VERIFICATION_REASONS.factory_reference_pending,
+      listingId,
+      terminal: true,
+      stale: false,
+      focusArea: null,
+    };
+  }
+
   if (verification.status === "stale") {
     return {
       kind: "stale",
@@ -792,6 +812,53 @@ export function describeAutomaticListingVerificationOutcome(
   }
 
   return unknownAutomaticVerificationOutcome(listingId, focusArea);
+}
+
+export function describeResolvedListingOutcome(payload, expectedListingId = null) {
+  const listing = payload?.listing;
+  const listingId = positiveInteger(listing?.id);
+  const expectedId = expectedListingId == null
+    ? null
+    : positiveInteger(expectedListingId);
+  if (
+    !listing
+    || typeof listing !== "object"
+    || listingId === null
+    || (expectedId !== null && listingId !== expectedId)
+  ) {
+    return {
+      kind: "invalid",
+      label: "Review result unavailable",
+      detail: "The server did not return the resolved listing state.",
+      listingId,
+      terminal: false,
+    };
+  }
+  if (listing.ingestion_state === "ready" && listing.is_verified === true) {
+    return {
+      kind: "verified",
+      label: `Listing ${listingId} verified`,
+      detail: "The review and valuation-readiness checks are complete.",
+      listingId,
+      terminal: true,
+    };
+  }
+  if (listing.ingestion_state === "incomplete" && listing.is_verified === false) {
+    return {
+      kind: "pending_reference",
+      label: `Listing ${listingId} review complete; factory reference pending before valuation`,
+      detail: AUTOMATIC_VERIFICATION_REASONS.factory_reference_pending,
+      listingId,
+      terminal: true,
+    };
+  }
+  return {
+    kind: "invalid",
+    label: "Review result unavailable",
+    detail: `Listing ${listingId} returned an unexpected verification state.`,
+    listingId,
+    terminal: false,
+  };
 }
 
 export function describeAutomaticListingVerificationError(error) {

@@ -12,6 +12,7 @@ import {
   describeAutomaticListingVerificationError,
   describeAutomaticListingVerificationOutcome,
   describeProductAssociationOutcome,
+  describeResolvedListingOutcome,
   describeReviewReasons,
   existingProductVerificationRequest,
   isAircraftIdentityStatus,
@@ -2202,10 +2203,14 @@ async function resolveReview() {
   setWorkspaceMessage("Saving review decisions and completing final enrichment…");
   setButtonBusy(elements.verifyListing, true);
   try {
-    await api(`/api/review/listings/${resolvedListingId}/resolve`, {
+    const payload = await api(`/api/review/listings/${resolvedListingId}/resolve`, {
       method: "POST",
       body: JSON.stringify(request),
     });
+    const outcome = describeResolvedListingOutcome(payload, resolvedListingId);
+    if (!outcome.terminal) {
+      throw new Error(outcome.detail);
+    }
     state.currentReview = null;
     state.drafts.clear();
     state.aspectViews.clear();
@@ -2228,13 +2233,13 @@ async function resolveReview() {
         discardDraft: true,
         force: true,
       });
-      setWorkspaceMessage(`Listing ${resolvedListingId} verified. Loaded the next pending review.`);
+      setWorkspaceMessage(`${outcome.label}. Loaded the next pending review.`);
     } else {
       showQueue({ historyMode: "replace", discardDraft: true });
       setQueueMessage(
         state.total === 0
-          ? `Listing ${resolvedListingId} verified. The review queue is clear.`
-          : `Listing ${resolvedListingId} verified.`,
+          ? `${outcome.label}. The review queue is clear.`
+          : `${outcome.label}.`,
       );
     }
   } catch (error) {

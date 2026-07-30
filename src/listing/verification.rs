@@ -23,7 +23,10 @@ use crate::avionics::verification::{
 };
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
-use crate::listings::finalize_reviewed_listing_ingestion;
+use crate::listings::{
+    finalize_reviewed_listing_ingestion, listing_factory_reference_is_pending,
+    ListingFinalizationOutcome,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListingVerificationMode {
@@ -136,6 +139,10 @@ impl ListingVerificationStage {
             catalog_writes: 0,
         }
     }
+
+    fn pending_reference(reason: impl Into<String>) -> Self {
+        Self::blocked("pending_reference", "factory_reference_pending", reason)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -197,6 +204,7 @@ pub struct ListingVerificationSummary {
     pub listings_selected: usize,
     pub already_verified: usize,
     pub verified: usize,
+    pub pending_reference: usize,
     pub pending_review: usize,
     pub blocked: usize,
     pub stale: usize,
@@ -365,14 +373,11 @@ pub async fn verify_listing(
         }
     };
 
+    let state_after_avionics = load_listing_state(db, listing_id).await?;
+    let review_work_complete =
+        aircraft_verified && state_after_avionics.pending_aspect_count.is_none();
     let mut finalization = ListingVerificationStage::new("not_attempted");
-    if mode == ListingVerificationMode::Apply
-        && aircraft_verified
-        && load_listing_state(db, listing_id)
-            .await?
-            .pending_aspect_count
-            .is_none()
-    {
+    if mode == ListingVerificationMode::Apply && review_work_complete {
         let usage_before = listing_gemini_usage_count(db, listing_id).await.ok();
         let finalization_extractor = services.extractor.map(|extractor| {
             extractor.clone().with_usage_scope(
@@ -389,7 +394,12 @@ pub async fn verify_listing(
         )
         .await
         {
-            Ok(()) => finalization = ListingVerificationStage::new("ready"),
+            Ok(ListingFinalizationOutcome::Ready) => {
+                finalization = ListingVerificationStage::new("ready");
+            }
+            Ok(ListingFinalizationOutcome::PendingReference { reason }) => {
+                finalization = ListingVerificationStage::pending_reference(reason);
+            }
             Err(error) => {
                 finalization = ListingVerificationStage::blocked(
                     "failed",
@@ -401,6 +411,15 @@ pub async fn verify_listing(
         let usage_after = listing_gemini_usage_count(db, listing_id).await.ok();
         finalization.gemini_used =
             matches!((usage_before, usage_after), (Some(before), Some(after)) if after > before);
+    } else if mode != ListingVerificationMode::Apply
+        && review_work_complete
+        && listing_factory_reference_is_pending(db, listing_id)
+            .await
+            .map_err(|error| ListingVerificationError::Database(error.to_string()))?
+    {
+        finalization = ListingVerificationStage::pending_reference(
+            "Valuation-grade factory specification, installed-avionics metadata, or model-year reference data remains pending.",
+        );
     } else if mode == ListingVerificationMode::Apply {
         finalization = ListingVerificationStage::blocked(
             "pending",
@@ -418,15 +437,8 @@ pub async fn verify_listing(
     }
 
     let final_state = load_listing_state(db, listing_id).await?;
-    let status = if final_state.ingestion_state == "ready" && final_state.is_verified {
-        "verified"
-    } else if finalization.status == "failed" {
-        "failed"
-    } else if aircraft_rejected {
-        "blocked"
-    } else {
-        "pending_review"
-    };
+    preserve_pending_review_over_reference(&final_state, &mut finalization);
+    let status = listing_outcome_status(&final_state, &finalization, aircraft_rejected);
     Ok(ListingVerificationOutcome {
         listing_id,
         status: status.to_string(),
@@ -436,6 +448,43 @@ pub async fn verify_listing(
         avionics,
         finalization,
     })
+}
+
+fn preserve_pending_review_over_reference(
+    final_state: &ListingVerificationState,
+    finalization: &mut ListingVerificationStage,
+) {
+    if finalization.status != "pending_reference"
+        || (final_state.ingestion_state != "pending_review"
+            && final_state.pending_aspect_count.is_none())
+    {
+        return;
+    }
+    let gemini_used = finalization.gemini_used;
+    *finalization = ListingVerificationStage::blocked(
+        "pending",
+        "avionics_review_remaining",
+        "A pending avionics review appeared while factory reference work was running.",
+    );
+    finalization.gemini_used = gemini_used;
+}
+
+fn listing_outcome_status(
+    final_state: &ListingVerificationState,
+    finalization: &ListingVerificationStage,
+    aircraft_rejected: bool,
+) -> &'static str {
+    if final_state.ingestion_state == "ready" && final_state.is_verified {
+        "verified"
+    } else if finalization.status == "failed" {
+        "failed"
+    } else if finalization.status == "pending_reference" {
+        "pending_reference"
+    } else if aircraft_rejected {
+        "blocked"
+    } else {
+        "pending_review"
+    }
 }
 
 /// Verify a keyset page sequentially. Preflight is provider- and write-free;
@@ -789,6 +838,7 @@ fn summarize(listings: &[ListingVerificationOutcome]) -> ListingVerificationSumm
         match listing.status.as_str() {
             "already_verified" => summary.already_verified += 1,
             "verified" => summary.verified += 1,
+            "pending_reference" => summary.pending_reference += 1,
             "pending_review" => summary.pending_review += 1,
             "blocked" => summary.blocked += 1,
             "stale" => summary.stale += 1,
@@ -980,5 +1030,59 @@ mod tests {
         .await
         .unwrap();
         assert!(next.listings.is_empty());
+    }
+
+    #[test]
+    fn pending_reference_is_reported_separately_from_review_and_failure() {
+        let finalization = ListingVerificationStage::pending_reference(
+            "Model-year factory reference data remains pending.",
+        );
+        assert_eq!(finalization.status, "pending_reference");
+        assert_eq!(
+            finalization.reason_code.as_deref(),
+            Some("factory_reference_pending")
+        );
+        let listings = [ListingVerificationOutcome {
+            listing_id: 42,
+            status: "pending_reference".to_string(),
+            initial_ingestion_state: "incomplete".to_string(),
+            final_ingestion_state: "incomplete".to_string(),
+            aircraft: ListingVerificationStage::new("current"),
+            avionics: ListingAvionicsVerificationStage::no_pending_review(),
+            finalization,
+        }];
+
+        let summary = summarize(&listings);
+        assert_eq!(summary.listings_selected, 1);
+        assert_eq!(summary.pending_reference, 1);
+        assert_eq!(summary.pending_review, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.finalized, 0);
+    }
+
+    #[test]
+    fn a_concurrent_pending_review_wins_over_pending_reference() {
+        let final_state = ListingVerificationState {
+            ingestion_state: "pending_review".to_string(),
+            is_verified: false,
+            pending_aspect_count: Some(1),
+        };
+        let mut finalization = ListingVerificationStage::pending_reference(
+            "Model-year factory reference data remains pending.",
+        );
+        finalization.gemini_used = true;
+
+        preserve_pending_review_over_reference(&final_state, &mut finalization);
+
+        assert_eq!(finalization.status, "pending");
+        assert_eq!(
+            finalization.reason_code.as_deref(),
+            Some("avionics_review_remaining")
+        );
+        assert!(finalization.gemini_used);
+        assert_eq!(
+            listing_outcome_status(&final_state, &finalization, false),
+            "pending_review"
+        );
     }
 }

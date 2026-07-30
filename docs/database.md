@@ -93,6 +93,24 @@ text, and confidence; a missing time is not converted to zero or copied from
 the airframe. High-confidence installed engine and propeller identities are
 linked separately from the factory configuration.
 
+`incomplete` also represents a successful listing-specific verification whose
+shared factory-reference data is not yet valuation-ready. In that case the
+finalizer returns a typed, derived `PendingReference` outcome: FAA/listing
+identity and installed-component checks are complete, but an applicable
+aircraft specification, model-year price, or factory-configuration reference
+still needs independent curation. The row remains unverified because the
+schema requires `is_verified` only for `ready` rows, and it remains excluded
+from serving, snapshots, and training. This is retryable reference work, not a
+listing failure, so it does not set `ingestion_error` or move the listing to
+`quarantined`.
+
+`PendingReference` is not another persistent status and has no companion
+table. It is derived by finalization from the current listing and shared
+reference catalog on every attempt. The database stores only the ordinary
+`incomplete` state and any independently useful approved reference facts; it
+does not store a Gemini prompt, response, URL-context dossier, or duplicate
+pending-reference record.
+
 `aircraft_sale_listing_facts`
 
 Stores source-backed condition, restoration, damage/log, and material
@@ -343,10 +361,13 @@ Listings are created through either the web API or plugin submission path:
 13. Otherwise, enrich and validate missing authoritative factory specs,
    exact-model-year price evidence, factory avionics, and listing avionics
    metadata.
-14. Mark the listing `ready` only after every readiness query passes. A failed
-   persistence or enrichment completion remains stored as `quarantined` with
-   the error for inspection or reprocessing; expected identity uncertainty
-   remains `pending_review` instead.
+14. Mark the listing `ready` only after every readiness query passes. When all
+   listing-specific checks pass but shared factory-reference data is not yet
+   valuation-ready, return `PendingReference` and leave the row `incomplete`
+   for an independent retry. A failed listing/FAA admission, listing-specific
+   persistence, or listing-specific enrichment completion remains stored as
+   `quarantined` with the error for inspection or reprocessing; expected
+   identity uncertainty remains `pending_review` instead.
 15. Mark valuation snapshots stale and remove orphaned lookup rows.
 
 Review resolution is a separate lifecycle. Every ordinary extracted avionics
@@ -423,11 +444,15 @@ all catalog decisions and only the exact covered listing-link ID/role pairs,
 removes the bundle, and returns the listing to `incomplete`. After commit, the
 server rechecks FAA admission before ordinary grounded enrichment and final
 publication. Successful source-backed completion becomes `ready` and verified
-only after all readiness checks pass; an admission or enrichment failure
-becomes `quarantined`. If a new pending bundle appears while post-review
-enrichment is running, that bundle wins: the listing remains `pending_review`
-instead of becoming a stranded quarantined review. Reviewer-accepted listing
-associations are stored with
+only after all readiness checks pass. Missing or not-yet-approved shared
+factory-reference data returns the derived `PendingReference` outcome and
+leaves the listing `incomplete`, so reference curation can be retried without
+repeating completed listing identity/component review. Actual FAA admission,
+listing evidence, listing-specific persistence, and listing-specific
+enrichment failures become `quarantined`. If a new pending bundle appears
+while post-review enrichment is running, that bundle wins: the listing remains
+`pending_review` instead of becoming a stranded quarantined review.
+Reviewer-accepted listing associations are stored with
 high installation confidence and a `listing_review` source, which is eligible
 where valuation reads otherwise accept high-confidence `listing` evidence.
 Network enrichment is intentionally not held inside the review transaction.
@@ -1062,8 +1087,13 @@ links and pending review intact. If residual aspects remain, the listing stays
 `pending_review`; an all-pass result returns it to `incomplete`. The enclosing
 automatic verifier then finalizes only when the FAA-backed aircraft identity
 is assigned and no review aspects remain. A successful finalizer makes the
-listing `ready` and verified; otherwise the listing remains pending or records
-the ordinary finalization failure.
+listing `ready` and verified. A `PendingReference` finalization leaves it
+`incomplete` and reports which shared reference prerequisite is missing; a
+later automatic run retries that reference work independently. The outcome is
+derived rather than persisted, so retry does not replay or retrieve a stored
+Gemini dossier. Residual listing review remains `pending_review`, while actual
+listing, FAA, or listing-specific finalization failures follow the quarantine
+path.
 
 The workflow also fails closed before apply when retained HTML or its source
 URL is missing, the HTML hash is invalid, the HTML cleans to no usable text,
