@@ -137,6 +137,23 @@ struct HumanAvionicsConsolidationApiRequest {
     apply: bool,
 }
 
+fn proposed_identity_matches_consolidation_members<'a>(
+    proposed_manufacturer: &str,
+    proposed_model: &str,
+    members: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    let proposed_manufacturer_key = normalize_avionics_manufacturer_name(proposed_manufacturer);
+    let proposed_model_key = normalize_avionics_model_name(proposed_model);
+    let mut manufacturer_matches = false;
+    let mut model_matches = false;
+    for (manufacturer, model_key) in members {
+        manufacturer_matches |=
+            normalize_avionics_manufacturer_name(manufacturer) == proposed_manufacturer_key;
+        model_matches |= model_key == proposed_model_key;
+    }
+    manufacturer_matches && model_matches
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerifyExistingReviewAvionicsRequest {
@@ -1183,8 +1200,8 @@ async fn verify_existing_review_avionics_handler(
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
 }
 
-/// Preview or apply an explicit, evidence-backed consolidation of the exact
-/// unreviewed catalog collision blocking one listing-review aspect.
+/// Preview or apply an explicit, evidence-backed consolidation of the complete
+/// unreviewed model-equivalence set blocking one listing-review aspect.
 ///
 /// This endpoint never calls Gemini. The core function re-snapshots the
 /// pending-review digest and every selected catalog row under its write lock
@@ -1271,13 +1288,16 @@ async fn consolidate_review_avionics_handler(
         expected_catalog_revision_sha256: Some(payload.expected_catalog_revision_sha256.clone()),
     };
     let preview = preview_human_reviewed_avionics_model_consolidation(&state.db, &request).await?;
-    let proposed_manufacturer_key = normalize_avionics_manufacturer_name(&proposed.manufacturer);
-    let proposed_model_key = normalize_avionics_model_name(&proposed.model);
-    if proposed_model_key != preview.authorization.canonical_model_key
-        || preview.authorization.members.iter().all(|member| {
-            normalize_avionics_manufacturer_name(&member.manufacturer) != proposed_manufacturer_key
-        })
-    {
+    if !proposed_identity_matches_consolidation_members(
+        &proposed.manufacturer,
+        &proposed.model,
+        preview.authorization.members.iter().map(|member| {
+            (
+                member.manufacturer.as_str(),
+                member.canonical_model_key.as_str(),
+            )
+        }),
+    ) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             format!(
@@ -1913,7 +1933,8 @@ mod tests {
     use super::{
         approve_replacement_products_handler, attest_review_avionics_product_handler,
         avionics_options_handler, begin_automatic_verification, get_listing_review,
-        list_avionics_handler, require_current_review_revisions, start_plugin_submission_job,
+        list_avionics_handler, proposed_identity_matches_consolidation_members,
+        require_current_review_revisions, start_plugin_submission_job,
         use_existing_review_avionics_handler, verify_existing_review_avionics_handler, AppState,
         AttestReviewAvionicsProductRequest, AutomaticListingVerificationRequest,
         UseExistingReviewAvionicsRequest, VerifyExistingReviewAvionicsRequest,
@@ -1961,6 +1982,24 @@ mod tests {
                 warnings: vec![],
             },
         }
+    }
+
+    #[test]
+    fn consolidation_endpoint_accepts_any_authorized_member_model_key() {
+        let members = [
+            ("Garmin", "g1000"),
+            ("Garmin", "g1000 integrated flight deck"),
+        ];
+        assert!(proposed_identity_matches_consolidation_members(
+            "Garmin",
+            "G1000 Integrated Flight Deck",
+            members
+        ));
+        assert!(!proposed_identity_matches_consolidation_members(
+            "Garmin",
+            "G1000 NXi",
+            members
+        ));
     }
 
     fn sqlite_pool(db: &AppDb) -> &SqlitePool {

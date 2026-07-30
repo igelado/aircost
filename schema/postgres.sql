@@ -1514,8 +1514,11 @@ BEGIN
       ) < authorization_row.expected_member_count
       AND NEW.effective_manufacturer_identity_id_snapshot
         = authorization_row.effective_manufacturer_identity_id_snapshot
-      AND NEW.canonical_model_key_snapshot
-        = authorization_row.canonical_model_key_snapshot
+      AND (
+        NEW.member_role <> 'survivor'
+        OR NEW.canonical_model_key_snapshot
+          = authorization_row.canonical_model_key_snapshot
+      )
       AND model.catalog_status = 'unreviewed'
       AND NEW.avionics_manufacturer_id_snapshot = model.avionics_manufacturer_id
       AND NEW.effective_manufacturer_identity_id_snapshot
@@ -1583,6 +1586,8 @@ WHERE (
       AND member.member_role = 'survivor'
       AND member.avionics_model_id_snapshot
         = authorization_row.survivor_model_id_snapshot
+      AND member.canonical_model_key_snapshot
+        = authorization_row.canonical_model_key_snapshot
   ) = 1
   AND (
     SELECT COUNT(*)
@@ -1614,8 +1619,6 @@ WHERE (
         OR member.model_name_snapshot <> model.name
         OR member.stored_model_key_snapshot <> model.normalized_name
         OR member.canonical_model_key_snapshot <> model.normalized_name
-        OR member.canonical_model_key_snapshot
-          <> authorization_row.canonical_model_key_snapshot
         OR member.catalog_status_snapshot <> model.catalog_status
         OR member.manufacturer_identifier_kind_snapshot
           IS DISTINCT FROM model.manufacturer_identifier_kind
@@ -1644,8 +1647,14 @@ WHERE (
         = current_model.avionics_manufacturer_id
     WHERE current_identity.avionics_manufacturer_identity_id
         = authorization_row.effective_manufacturer_identity_id_snapshot
-      AND current_model.normalized_name
-        = authorization_row.canonical_model_key_snapshot
+      AND EXISTS (
+        SELECT 1
+        FROM avionics_catalog_human_consolidation_members selected_member
+        WHERE selected_member.authorization_sha256
+            = authorization_row.authorization_sha256
+          AND selected_member.canonical_model_key_snapshot
+            = current_model.normalized_name
+      )
   ) = authorization_row.expected_member_count
   AND NOT EXISTS (
     SELECT 1
@@ -1655,8 +1664,14 @@ WHERE (
         = current_model.avionics_manufacturer_id
     WHERE current_identity.avionics_manufacturer_identity_id
         = authorization_row.effective_manufacturer_identity_id_snapshot
-      AND current_model.normalized_name
-        = authorization_row.canonical_model_key_snapshot
+      AND EXISTS (
+        SELECT 1
+        FROM avionics_catalog_human_consolidation_members selected_member
+        WHERE selected_member.authorization_sha256
+            = authorization_row.authorization_sha256
+          AND selected_member.canonical_model_key_snapshot
+            = current_model.normalized_name
+      )
       AND NOT EXISTS (
         SELECT 1
         FROM avionics_catalog_human_consolidation_members member
@@ -2657,6 +2672,22 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = EXCLUDED.contract_version,
   contract_fingerprint = EXCLUDED.contract_fingerprint,
   installed_at = EXCLUDED.installed_at;
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260808_avionics_descriptive_consolidation',
+  1,
+  '3aacf958efa7fb5e24c5897cf0369d40cb506b2a22444d629ea0a76462ce1a70',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = EXCLUDED.contract_version,
+  contract_fingerprint = EXCLUDED.contract_fingerprint,
+  installed_at = EXCLUDED.installed_at
+WHERE schema_migration_contracts.contract_version = EXCLUDED.contract_version
+  AND schema_migration_contracts.contract_fingerprint =
+      EXCLUDED.contract_fingerprint;
 
 -- Approved catalog truth is broader than no-grounding reuse eligibility.
 -- This positive-only cache is populated only by the current curation policy;

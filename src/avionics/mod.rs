@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod consolidation;
 pub mod inspection;
 pub mod manufacturer;
+pub(crate) mod model;
 pub(crate) mod reuse;
 pub(crate) mod source;
 pub mod verification;

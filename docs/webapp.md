@@ -445,10 +445,24 @@ GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
 POST /api/review/listings/{listing_id}/verify-automatically
+POST /api/review/listings/{listing_id}/avionics/consolidate
 POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/avionics/approve-replacement
 POST /api/review/listings/{listing_id}/resolve
 ```
+
+The aspect-scoped consolidation endpoint never calls Gemini. A reviewer cites
+authoritative evidence and names one survivor plus the complete set of
+unreviewed catalog rows that represent the same product. The server accepts
+typography-only labels and a complete curated-capability description, such as
+`G1000` and `G1000 Integrated Flight Deck`, while treating meaningful hardware
+variants such as `G1000 NXi` as categorically distinct. Preview returns a
+hash-bound authorization snapshot; apply rechecks every member, its current
+capabilities, the approved-catalog revision, and the pending-review provenance
+under the mutation lock. The proposed review product may use any selected
+member label. Omitted model-equivalent rows, stale member keys, conflicting
+stable identifiers, or reference claims that cannot be preserved block the
+operation.
 
 The opened-listing **Automatically verify** action runs the same permanent
 aircraft, avionics, and finalization workflow as the administrative
