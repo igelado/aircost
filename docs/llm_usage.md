@@ -150,7 +150,12 @@ is bound to the complete current manufacturer-catalog revision. The caller
 re-reads that catalog, rebuilds the family, and revalidates exact listing
 evidence, membership, capabilities, selectability, and ambiguity before
 accepting it. Overflow, missing closure, uncertainty, or stale input falls
-through to grounded curation. Stored source URLs, titles, and excerpts are not
+through to grounded curation. Typography-equivalent labels and a trailing
+server-owned capability description may be selectable; every other suffix or
+generation difference is treated as a meaningful variant by default. Such
+variants remain visible as collision blockers but cannot be selected for one
+another, and a family containing no structurally compatible approved product
+skips the Lite call entirely. Stored source URLs, titles, and excerpts are not
 model input. Aircraft reuse is similarly strict: an exact current FAA record
 and one applicable approved hierarchy may bypass Gemini entirely.
 

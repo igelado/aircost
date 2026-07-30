@@ -409,6 +409,13 @@ struct ApprovedCandidateAdjudicationPlan {
     manufacturer_identity_id: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AvionicsModelIdentityRelation {
+    TypographyExact,
+    DescriptiveExpansion,
+    MeaningfulVariant,
+}
+
 #[derive(Clone, Debug)]
 struct AuthoritativeDirectSourcePlan {
     source_urls: Vec<String>,
@@ -2373,8 +2380,12 @@ fn approved_candidate_adjudication_plan(
         return None;
     }
 
-    let collision_family =
-        complete_manufacturer_collision_family(&request.model, manufacturer_catalog)?;
+    let collision_family = complete_manufacturer_collision_family(
+        &request.manufacturer,
+        &request.model,
+        &observed_types,
+        manufacturer_catalog,
+    )?;
     if collision_family.is_empty()
         || collision_family.len() > AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT
     {
@@ -2395,7 +2406,21 @@ fn approved_candidate_adjudication_plan(
                 .all(|capability| approved.avionics_types.contains(capability));
             let collision_free =
                 !approved_candidate_has_identity_collision(approved, manufacturer_catalog);
-            (capability_compatible && collision_free).then_some(candidate.id)
+            let model_compatible = matches!(
+                avionics_model_identity_relation(
+                    &request.manufacturer,
+                    &request.model,
+                    &observed_types,
+                    &approved.manufacturer,
+                    &approved.model,
+                    &approved.avionics_types,
+                ),
+                Some(
+                    AvionicsModelIdentityRelation::TypographyExact
+                        | AvionicsModelIdentityRelation::DescriptiveExpansion
+                )
+            );
+            (model_compatible && capability_compatible && collision_free).then_some(candidate.id)
         })
         .collect::<HashSet<_>>();
     if selectable_catalog_ids.is_empty() {
@@ -2429,12 +2454,24 @@ fn approved_candidate_adjudication_plan(
 }
 
 fn complete_manufacturer_collision_family<'a>(
+    observed_manufacturer: &str,
     observed_model: &str,
+    observed_types: &[String],
     manufacturer_catalog: &'a [AvionicsCatalogCandidate],
 ) -> Option<Vec<&'a AvionicsCatalogCandidate>> {
     let mut included = manufacturer_catalog
         .iter()
-        .map(|candidate| model_identity_relation_score(observed_model, &candidate.model).is_some())
+        .map(|candidate| {
+            avionics_model_identity_relation(
+                observed_manufacturer,
+                observed_model,
+                observed_types,
+                &candidate.manufacturer,
+                &candidate.model,
+                &candidate.avionics_types,
+            )
+            .is_some()
+        })
         .collect::<Vec<_>>();
     if !included.iter().any(|included| *included) {
         return None;
@@ -2480,7 +2517,16 @@ fn catalog_candidates_share_collision_family(
     left: &AvionicsCatalogCandidate,
     right: &AvionicsCatalogCandidate,
 ) -> bool {
-    if model_identity_relation_score(&left.model, &right.model).is_some() {
+    if avionics_model_identity_relation(
+        &left.manufacturer,
+        &left.model,
+        &left.avionics_types,
+        &right.manufacturer,
+        &right.model,
+        &right.avionics_types,
+    )
+    .is_some()
+    {
         return true;
     }
     let left_identifier = normalize_avionics_identifier(&left.manufacturer_identifier);
@@ -3204,39 +3250,155 @@ fn catalog_fingerprint(catalog: &[AvionicsCatalogCandidate]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Return a model-only retrieval score when two labels carry the same product
-/// identity signal.
+/// Classify the structural relationship between two same-manufacturer model
+/// labels without authorizing either identity.
 ///
-/// Manufacturer and capability overlap must not admit a catalog row: those
-/// broad signals made unrelated products from a large manufacturer look like
-/// collision candidates. Typography-only equality is exact identity. A
-/// family/variant relation is admitted only when the compact labels share a
-/// real code prefix and every numeric run is identical. This retains `GIA 63`
-/// beside `GIA 63W`, while keeping `GIA 64W` out of a `GIA 63W` review unless
-/// an exact stable identifier independently connects it.
+/// Exact manufacturer prefixes are redundant retrieval syntax. A trailing
+/// descriptive expansion is harmless only when it is one complete
+/// server-owned capability already attached to the compared products. Every
+/// other prefix/suffix delta is a meaningful variant by default; no suffix
+/// vocabulary can safely enumerate future hardware revisions.
+fn avionics_model_identity_relation(
+    left_manufacturer: &str,
+    left_model: &str,
+    left_types: &[String],
+    right_manufacturer: &str,
+    right_model: &str,
+    right_types: &[String],
+) -> Option<AvionicsModelIdentityRelation> {
+    let left_label = model_label_without_exact_manufacturer_prefix(left_manufacturer, left_model);
+    let right_label =
+        model_label_without_exact_manufacturer_prefix(right_manufacturer, right_model);
+    let left_key = normalize_avionics_identifier(&left_label);
+    let right_key = normalize_avionics_identifier(&right_label);
+    if left_key.is_empty() || right_key.is_empty() {
+        return None;
+    }
+    if left_key == right_key {
+        return Some(AvionicsModelIdentityRelation::TypographyExact);
+    }
+
+    let mut descriptive_phrases = left_types
+        .iter()
+        .chain(right_types)
+        .filter(|capability| CURATED_AVIONICS_TYPES.contains(&capability.as_str()))
+        .map(|capability| normalize_name(capability))
+        .filter(|capability| !capability.is_empty())
+        .collect::<Vec<_>>();
+    descriptive_phrases.sort_by(|left, right| {
+        right
+            .split_whitespace()
+            .count()
+            .cmp(&left.split_whitespace().count())
+            .then_with(|| right.len().cmp(&left.len()))
+            .then_with(|| left.cmp(right))
+    });
+    descriptive_phrases.dedup();
+
+    let (left_core, left_description) =
+        strip_exact_capability_description(&left_label, &descriptive_phrases);
+    let (right_core, right_description) =
+        strip_exact_capability_description(&right_label, &descriptive_phrases);
+    let left_core_key = normalize_avionics_identifier(&left_core);
+    let right_core_key = normalize_avionics_identifier(&right_core);
+    if left_core_key.is_empty() || right_core_key.is_empty() {
+        return None;
+    }
+    if left_core_key == right_core_key {
+        let one_side_is_descriptive = left_description.is_some() ^ right_description.is_some();
+        let matching_descriptions =
+            left_description.is_some() && left_description == right_description;
+        return Some(if one_side_is_descriptive || matching_descriptions {
+            AvionicsModelIdentityRelation::DescriptiveExpansion
+        } else {
+            AvionicsModelIdentityRelation::MeaningfulVariant
+        });
+    }
+
+    let left_numbers = model_numeric_runs(&left_core_key);
+    let right_numbers = model_numeric_runs(&right_core_key);
+    if left_numbers != right_numbers {
+        return None;
+    }
+
+    let shorter_key_length = left_core_key.len().min(right_core_key.len());
+    (shorter_key_length >= MINIMUM_PREFIX_MODEL_KEY_LENGTH
+        && (left_core_key.starts_with(&right_core_key)
+            || right_core_key.starts_with(&left_core_key)))
+    .then_some(AvionicsModelIdentityRelation::MeaningfulVariant)
+}
+
+fn model_label_without_exact_manufacturer_prefix(manufacturer: &str, model: &str) -> String {
+    let model = normalize_name(model);
+    let manufacturer = normalize_name(manufacturer);
+    if manufacturer.is_empty() {
+        return model;
+    }
+    model
+        .strip_prefix(&format!("{manufacturer} "))
+        .unwrap_or(&model)
+        .to_string()
+}
+
+fn strip_exact_capability_description(
+    model: &str,
+    descriptive_phrases: &[String],
+) -> (String, Option<String>) {
+    for description in descriptive_phrases {
+        let Some(core) = model.strip_suffix(&format!(" {description}")) else {
+            continue;
+        };
+        if core.chars().any(|character| character.is_ascii_digit())
+            && normalize_avionics_identifier(core).len() >= MINIMUM_PREFIX_MODEL_KEY_LENGTH
+        {
+            return (core.to_string(), Some(description.clone()));
+        }
+    }
+    (model.to_string(), None)
+}
+
+/// Return a model-only retrieval score when two labels carry a possible
+/// product-identity relationship.
+///
+/// This remains deliberately broader than automatic selection. Meaningful
+/// variants stay in grounded and collision shortlists, while the approved
+/// candidate adjudication gate above can mark them nonselectable.
+#[cfg(test)]
 fn model_identity_relation_score(observed_model: &str, catalog_model: &str) -> Option<f64> {
-    let observed_model = normalize_avionics_model_name(observed_model);
-    let catalog_model = normalize_avionics_model_name(catalog_model);
-    if observed_model.is_empty() || catalog_model.is_empty() {
-        return None;
-    }
+    let relation =
+        avionics_model_identity_relation("", observed_model, &[], "", catalog_model, &[])?;
+    Some(match relation {
+        AvionicsModelIdentityRelation::TypographyExact => 1.0,
+        AvionicsModelIdentityRelation::DescriptiveExpansion
+        | AvionicsModelIdentityRelation::MeaningfulVariant => string_similarity(
+            &normalize_avionics_model_name(observed_model),
+            &normalize_avionics_model_name(catalog_model),
+        ),
+    })
+}
 
-    let observed_key = normalize_avionics_identifier(&observed_model);
-    let catalog_key = normalize_avionics_identifier(&catalog_model);
-    if observed_key == catalog_key {
-        return Some(1.0);
-    }
-
-    let observed_numbers = model_numeric_runs(&observed_key);
-    let catalog_numbers = model_numeric_runs(&catalog_key);
-    if observed_numbers != catalog_numbers {
-        return None;
-    }
-
-    let shorter_key_length = observed_key.len().min(catalog_key.len());
-    let prefix_relation = shorter_key_length >= MINIMUM_PREFIX_MODEL_KEY_LENGTH
-        && (observed_key.starts_with(&catalog_key) || catalog_key.starts_with(&observed_key));
-    prefix_relation.then(|| string_similarity(&observed_model, &catalog_model))
+fn model_identity_relation_score_for_candidate(
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+    candidate: &AvionicsCatalogCandidate,
+) -> Option<f64> {
+    let relation = avionics_model_identity_relation(
+        manufacturer,
+        model,
+        avionics_types,
+        &candidate.manufacturer,
+        &candidate.model,
+        &candidate.avionics_types,
+    )?;
+    Some(match relation {
+        AvionicsModelIdentityRelation::TypographyExact => 1.0,
+        AvionicsModelIdentityRelation::DescriptiveExpansion
+        | AvionicsModelIdentityRelation::MeaningfulVariant => string_similarity(
+            &normalize_avionics_model_name(model),
+            &normalize_avionics_model_name(&candidate.model),
+        ),
+    })
 }
 
 fn model_numeric_runs(model_key: &str) -> Vec<&str> {
@@ -3298,7 +3460,12 @@ fn shortlist_avionics_candidates_with_limit(
                     "manufacturer_part_number" | "manufacturer_model_number" | "sku"
                 )
                 && observed_identifier == identifier;
-            let model_score = model_identity_relation_score(model, &candidate.model);
+            let model_score = model_identity_relation_score_for_candidate(
+                manufacturer,
+                model,
+                avionics_types,
+                candidate,
+            );
             if model_score.is_none() && !identifier_match {
                 return None;
             }
@@ -5079,6 +5246,8 @@ fn required_field(value: &Value, field: &str) -> CatalogResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use url::Url;
@@ -5086,9 +5255,10 @@ mod tests {
     use super::{
         approved_candidate_adjudication_plan, approved_candidate_adjudication_plan_is_unchanged,
         approved_candidate_adjudication_selection, attest_grounded_existing_avionics_identity,
-        attest_pending_review_product_identity, canonical_avionics_types_for_label,
-        canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
-        collision_response_issues, collision_reviews_with_direct_source_proofs,
+        attest_pending_review_product_identity, avionics_model_identity_relation,
+        canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
+        collision_correction_plan, collision_response_issues,
+        collision_reviews_with_direct_source_proofs, complete_manufacturer_collision_family,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
@@ -5110,11 +5280,12 @@ mod tests {
         ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
         AuthoritativeDirectSourcePlan, AuthoritativeSourceHintRow, AvionicsCatalogCandidate,
         AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
-        AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext, CollisionCorrectionPlan,
-        DirectSourceRequirement, GeminiGroundingSource, GeminiGroundingSupport,
-        GroundedJsonResponse, IdentityGroundingPlan, KnownApprovedAvionicsCandidate,
-        PendingProductAttestationCommitGuard, ReviewCatalogCandidate, VerifiedIdentity,
-        COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
+        AvionicsModelIdentityRelation, AvionicsUnitResolutionCandidate,
+        AvionicsUnitResolutionContext, CollisionCorrectionPlan, DirectSourceRequirement,
+        GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
+        KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
+        ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
+        KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -6098,6 +6269,109 @@ mod tests {
         assert_eq!(
             shortlist.iter().map(|item| item.id).collect::<Vec<_>>(),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn model_relation_separates_descriptions_from_every_meaningful_suffix() {
+        let integrated_flight_deck = vec!["Integrated Flight Deck".to_string()];
+        assert_eq!(
+            avionics_model_identity_relation(
+                "Garmin",
+                "Garmin G1000",
+                &integrated_flight_deck,
+                "Garmin",
+                "G1000",
+                &integrated_flight_deck,
+            ),
+            Some(AvionicsModelIdentityRelation::TypographyExact),
+            "an exact resolved manufacturer prefix is redundant routing syntax"
+        );
+        assert_eq!(
+            avionics_model_identity_relation(
+                "Garmin",
+                "G1000 Integrated Flight Deck",
+                &integrated_flight_deck,
+                "Garmin",
+                "G1000",
+                &integrated_flight_deck,
+            ),
+            Some(AvionicsModelIdentityRelation::DescriptiveExpansion)
+        );
+        assert_eq!(
+            avionics_model_identity_relation(
+                "Garmin",
+                "G1000 NXi Integrated Flight Deck",
+                &integrated_flight_deck,
+                "Garmin",
+                "G1000 NXi",
+                &integrated_flight_deck,
+            ),
+            Some(AvionicsModelIdentityRelation::DescriptiveExpansion)
+        );
+        assert_eq!(
+            avionics_model_identity_relation(
+                "Garmin",
+                "G1000 Advanced Flight Deck",
+                &integrated_flight_deck,
+                "Garmin",
+                "G1000",
+                &integrated_flight_deck,
+            ),
+            Some(AvionicsModelIdentityRelation::MeaningfulVariant),
+            "arbitrary marketing words must not be stripped as descriptions"
+        );
+
+        for (base, variant) in [
+            ("G1000", "G1000 NXi"),
+            ("GIA 63", "GIA 63W"),
+            ("KX 155", "KX 155A"),
+            ("GTX 345", "GTX 345R"),
+            ("GTN 650", "GTN 650Xi"),
+            ("GTX 33", "GTX 33ES"),
+            ("GNS 430", "GNS 430WAAS"),
+            ("G1000", "G1000 Qz"),
+        ] {
+            assert_eq!(
+                avionics_model_identity_relation("Garmin", base, &[], "Garmin", variant, &[],),
+                Some(AvionicsModelIdentityRelation::MeaningfulVariant),
+                "{base:?} and {variant:?} must remain distinct without a suffix whitelist"
+            );
+            assert_eq!(
+                avionics_model_identity_relation("Garmin", variant, &[], "Garmin", base, &[],),
+                Some(AvionicsModelIdentityRelation::MeaningfulVariant),
+                "variant comparison must be symmetric"
+            );
+        }
+
+        assert_eq!(
+            avionics_model_identity_relation("Garmin", "GIA 63W", &[], "Garmin", "GIA 64W", &[],),
+            None,
+            "different numeric runs are unrelated"
+        );
+        assert_eq!(
+            avionics_model_identity_relation("Garmin", "G1000", &[], "Garmin", "G2000", &[],),
+            None
+        );
+    }
+
+    #[test]
+    fn grounded_retrieval_keeps_meaningful_variants_as_collision_candidates() {
+        let catalog = vec![
+            candidate(1, "G1000 NXi", "approved"),
+            candidate(2, "G2000", "approved"),
+        ];
+        let shortlist = shortlist_avionics_candidates(
+            "Garmin",
+            "G1000",
+            &["Transponder".to_string()],
+            None,
+            &catalog,
+        );
+        assert_eq!(
+            shortlist.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![1],
+            "variant gating must not narrow grounded collision research"
         );
     }
 
@@ -7198,6 +7472,135 @@ mod tests {
             plan.context.catalog_candidates[0].avionics_types,
             vec!["Audio Panel"]
         );
+    }
+
+    #[test]
+    fn bounded_adjudication_keeps_variants_as_nonselectable_blockers() {
+        let request = AvionicsIdentityRequest {
+            model: "G1000".to_string(),
+            avionics_types: vec!["Transponder".to_string()],
+            listing_context: "Garmin G1000 installed".to_string(),
+            ..local_request("")
+        };
+        let known = vec![known_candidate(7, "G1000"), known_candidate(8, "G1000 NXi")];
+        let catalog = vec![
+            candidate(7, "G1000", "approved"),
+            candidate(8, "G1000 NXi", "approved"),
+        ];
+        let plan = approved_candidate_adjudication_plan(
+            &request,
+            &request.avionics_types,
+            1,
+            &known,
+            &catalog,
+        )
+        .expect("the exact base product remains selectable");
+
+        assert_eq!(plan.selectable_catalog_ids, HashSet::from([7]));
+        assert_eq!(
+            plan.context
+                .catalog_candidates
+                .iter()
+                .map(|candidate| (candidate.id, candidate.selectable))
+                .collect::<Vec<_>>(),
+            vec![(7, true), (8, false)],
+            "the complete collision family must retain the meaningful generation as a blocker"
+        );
+        let invalid_variant_selection = json!({
+            "decision": "same",
+            "selected_catalog_id": 8,
+            "confidence": "very_high",
+            "evidence_text": "G1000",
+            "reason": "The response ignored the catalog generation suffix."
+        });
+        assert_eq!(
+            approved_candidate_adjudication_selection(&request, &plan, &invalid_variant_selection,),
+            None,
+            "the server must reject a model answer that collapses the base product into NXi"
+        );
+    }
+
+    #[test]
+    fn bounded_adjudication_skips_when_only_meaningful_variants_exist() {
+        for (observed, catalog_model) in [
+            ("G1000", "G1000 NXi"),
+            ("G1000 NXi", "G1000"),
+            ("GIA 63", "GIA 63W"),
+            ("GIA 63W", "GIA 63"),
+            ("GTX 345", "GTX 345R"),
+            ("GTX 345R", "GTX 345"),
+            ("G1000", "G1000 Qz"),
+        ] {
+            let request = AvionicsIdentityRequest {
+                model: observed.to_string(),
+                avionics_types: vec!["Transponder".to_string()],
+                listing_context: format!("Garmin {observed} installed"),
+                ..local_request("")
+            };
+            let known = vec![known_candidate(7, catalog_model)];
+            let catalog = vec![candidate(7, catalog_model, "approved")];
+            let family = complete_manufacturer_collision_family(
+                &request.manufacturer,
+                &request.model,
+                &request.avionics_types,
+                &catalog,
+            )
+            .expect("meaningful variants must remain in the collision family");
+            assert_eq!(family.len(), 1);
+            assert!(
+                approved_candidate_adjudication_plan(
+                    &request,
+                    &request.avionics_types,
+                    1,
+                    &known,
+                    &catalog,
+                )
+                .is_none(),
+                "{observed:?} must not select the distinct approved product {catalog_model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptive_official_name_expansion_uses_adjudication_not_local_assignment() {
+        let integrated_flight_deck = vec!["Integrated Flight Deck".to_string()];
+        for (observed, catalog_model) in [
+            ("Garmin G1000 Integrated Flight Deck", "G1000"),
+            ("G1000", "G1000 Integrated Flight Deck"),
+            ("G1000 NXi Integrated Flight Deck", "G1000 NXi"),
+        ] {
+            let request = AvionicsIdentityRequest {
+                model: observed.to_string(),
+                avionics_types: integrated_flight_deck.clone(),
+                listing_context: format!("{observed} installed"),
+                ..local_request("")
+            };
+            let mut approved = known_candidate(7, catalog_model);
+            approved.avionics_types = integrated_flight_deck.clone();
+            let mut catalog = candidate(7, catalog_model, "approved");
+            catalog.avionics_types = integrated_flight_deck.clone();
+
+            assert!(
+                known_approved_local_match(
+                    &request,
+                    &integrated_flight_deck,
+                    1,
+                    std::slice::from_ref(&approved),
+                    std::slice::from_ref(&catalog),
+                )
+                .is_none(),
+                "descriptive expansion is a routing aid, never a mechanical product assignment"
+            );
+            let plan = approved_candidate_adjudication_plan(
+                &request,
+                &request.avionics_types,
+                1,
+                std::slice::from_ref(&approved),
+                std::slice::from_ref(&catalog),
+            )
+            .expect("a tightly bounded description may use closed-context adjudication");
+            assert_eq!(plan.selectable_catalog_ids, HashSet::from([7]));
+        }
     }
 
     #[test]
@@ -8589,8 +8992,8 @@ mod tests {
             plan_avionics_identity_verification_route(&db, &suffix_ambiguous)
                 .await
                 .expect("the bounded catalog family should plan without Gemini"),
-            AvionicsIdentityVerificationRoute::CandidateAdjudication,
-            "a meaningful suffix difference must be adjudicated before any Search call"
+            AvionicsIdentityVerificationRoute::GroundedCuration,
+            "closed-context adjudication cannot select a product whose meaningful suffix is absent"
         );
 
         let capability_mismatch = AvionicsIdentityRequest {
