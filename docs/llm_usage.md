@@ -568,8 +568,12 @@ reject; if it remains unsafe or correction fails, the outcome becomes
 `unresolved` rather than an automatic discard. An ordinary `unresolved`
 result—including unavailable classification, incomplete evidence, or an
 uncertain candidate—is a durable `pending_review` outcome rather than a
-quarantine. Provider, persistence, and enrichment failures remain real
-ingestion errors and can still quarantine a stored listing.
+quarantine. Provider, persistence, and enrichment failures tied to the
+listing, its FAA admission, or its listing-specific evidence remain real
+ingestion errors and can still quarantine a stored listing. A missing shared
+factory-reference prerequisite is different: after listing identity and
+component checks succeed, finalization returns the typed, derived
+`PendingReference` outcome and leaves the listing `incomplete`.
 
 Catalog approvals take an optimistic fingerprint of the active catalog before
 the model calls, serialize the final write, and compare the fingerprint again
@@ -652,8 +656,12 @@ Mandatory FAA admission is checked before any review-driven catalog write. It
 is checked again after that transaction and before grounded metadata enrichment
 and final publication, closing the race around network calls. A source-backed
 listing becomes `ready` and verified only if FAA admission, full enrichment,
-and the readiness pass all succeed. A failure at that stage is persisted as
-`quarantined`; it does not roll back or hold a network request inside the
+and the readiness pass all succeed. A missing, incomplete, or not-yet-approved
+shared factory specification, model-year price, or factory configuration
+returns `PendingReference`: the listing remains `incomplete`, excluded from
+serving and training, and eligible for an independent automatic retry. An
+actual listing, FAA, or listing-specific enrichment failure is persisted as
+`quarantined`; neither path rolls back or holds a network request inside the
 catalog/link transaction. Associations explicitly corroborated by a reviewer
 use `listing_review` provenance with high installation confidence and are
 valuation-eligible wherever equivalent high-confidence `listing` associations
@@ -699,9 +707,16 @@ classify provenance and purpose:
 LLM completion does not make a listing ready by itself. The database row starts
 `incomplete`; deterministic readiness queries recheck all evidence. Expected
 avionics uncertainty is persisted as `pending_review` and skips enrichment.
-Failed enrichment or another actual completion error is persisted as
-`quarantined`. Both states are excluded from snapshots and serving until the
-review is resolved or the failure is reprocessed.
+When those listing-specific checks are complete but the shared reference
+catalog cannot yet supply valuation-ready factory data, finalization returns
+`PendingReference` and leaves the row `incomplete`. That outcome is recomputed
+from current listing/reference state on retry; it is not stored in a second
+status column or table, and no Gemini prompt, response, or complete URL-context
+dossier is retained for it. Failed FAA/listing admission, invalid listing
+evidence, or another actual listing-specific completion error is persisted as
+`quarantined`. `incomplete`, `pending_review`, and `quarantined` rows all remain
+excluded from snapshots, training, and serving until their respective
+reference, review, or repair path succeeds.
 
 ## Normalization Philosophy
 

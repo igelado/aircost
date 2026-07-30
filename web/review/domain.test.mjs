@@ -14,6 +14,7 @@ import {
   describeAutomaticListingVerificationError,
   describeAutomaticListingVerificationOutcome,
   describeProductAssociationOutcome,
+  describeResolvedListingOutcome,
   describeReviewReasons,
   existingProductVerificationRequest,
   groupProductAssociationsByListing,
@@ -219,6 +220,76 @@ test("describes residual automatic aircraft and avionics blockers", () => {
   }, 22);
   assert.equal(finalization.kind, "failed");
   assert.match(finalization.detail, /valuation enrichment/);
+});
+
+test("treats pending factory reference work as terminal for the manual review queue", () => {
+  const outcome = describeAutomaticListingVerificationOutcome({
+    verification: {
+      listing_id: 22,
+      status: "pending_reference",
+      initial_ingestion_state: "pending_review",
+      final_ingestion_state: "incomplete",
+      aircraft: { status: "current", gemini_used: false },
+      avionics: {
+        status: "already_complete",
+        accepted: 2,
+        safely_discarded: 1,
+        remaining_review_aspects: 0,
+        gemini_used: false,
+      },
+      finalization: {
+        status: "pending_reference",
+        reason_code: "factory_reference_pending",
+        reason: "No published model-year factory configuration is available.",
+      },
+    },
+  }, 22);
+
+  assert.deepEqual(outcome, {
+    kind: "pending_reference",
+    label: "Review complete — factory reference pending",
+    detail: "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.",
+    listingId: 22,
+    terminal: true,
+    stale: false,
+    focusArea: null,
+  });
+});
+
+test("describes manual resolution from the returned listing state", () => {
+  assert.deepEqual(
+    describeResolvedListingOutcome({
+      listing: { id: 23, ingestion_state: "ready", is_verified: true },
+    }, 23),
+    {
+      kind: "verified",
+      label: "Listing 23 verified",
+      detail: "The review and valuation-readiness checks are complete.",
+      listingId: 23,
+      terminal: true,
+    },
+  );
+  assert.deepEqual(
+    describeResolvedListingOutcome({
+      listing: { id: 24, ingestion_state: "incomplete", is_verified: false },
+    }, 24),
+    {
+      kind: "pending_reference",
+      label: "Listing 24 review complete; factory reference pending before valuation",
+      detail: "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.",
+      listingId: 24,
+      terminal: true,
+    },
+  );
+  for (const payload of [
+    {},
+    { listing: { id: 24, ingestion_state: "quarantined", is_verified: false } },
+    { listing: { id: 25, ingestion_state: "ready", is_verified: true } },
+  ]) {
+    const outcome = describeResolvedListingOutcome(payload, 24);
+    assert.equal(outcome.kind, "invalid");
+    assert.equal(outcome.terminal, false);
+  }
 });
 
 test("never treats stale, mismatched, or unknown automatic results as success", () => {
