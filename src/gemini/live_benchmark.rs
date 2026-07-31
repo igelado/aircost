@@ -203,6 +203,7 @@ impl LiveBenchmarkRunner {
             requires_listing_evidence: true,
             authoritative_direct_source_urls: Vec::new(),
             authoritative_identity_anchors: Vec::new(),
+            candidate_triage_hint: None,
             candidate: AvionicsUnitResolutionCandidate {
                 manufacturer: candidate.manufacturer.clone(),
                 model: candidate.model.clone(),

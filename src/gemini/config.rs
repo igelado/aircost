@@ -44,6 +44,7 @@ pub enum GeminiTask {
     AvionicsStructure,
     AvionicsCollisionStructure,
     AvionicsApprovedCandidateAdjudication,
+    AvionicsCandidateTriage,
     AircraftVisualIdentity,
     AircraftSearchGrounding,
     AircraftUrlVerification,
@@ -53,7 +54,7 @@ pub enum GeminiTask {
 }
 
 impl GeminiTask {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::ListingExtraction,
         Self::GroundedMetadata,
         Self::AvionicsIdentity,
@@ -63,6 +64,7 @@ impl GeminiTask {
         Self::AvionicsStructure,
         Self::AvionicsCollisionStructure,
         Self::AvionicsApprovedCandidateAdjudication,
+        Self::AvionicsCandidateTriage,
         Self::AircraftVisualIdentity,
         Self::AircraftSearchGrounding,
         Self::AircraftUrlVerification,
@@ -84,6 +86,7 @@ impl GeminiTask {
             Self::AvionicsApprovedCandidateAdjudication => {
                 "AIRCOST_GEMINI_AVIONICS_APPROVED_CANDIDATE_ADJUDICATION"
             }
+            Self::AvionicsCandidateTriage => "AIRCOST_GEMINI_AVIONICS_CANDIDATE_TRIAGE",
             Self::AircraftVisualIdentity => "AIRCOST_GEMINI_AIRCRAFT_VISUAL_IDENTITY",
             Self::AircraftSearchGrounding => "AIRCOST_GEMINI_AIRCRAFT_SEARCH_GROUNDING",
             Self::AircraftUrlVerification => "AIRCOST_GEMINI_AIRCRAFT_URL_VERIFICATION",
@@ -106,6 +109,7 @@ impl GeminiTask {
             Self::AvionicsApprovedCandidateAdjudication => {
                 "avionics_approved_candidate_adjudication"
             }
+            Self::AvionicsCandidateTriage => "avionics_candidate_triage",
             Self::AircraftVisualIdentity => "aircraft_visual_identity",
             Self::AircraftSearchGrounding => "aircraft_search_grounding",
             Self::AircraftUrlVerification => "aircraft_url_verification",
@@ -375,6 +379,13 @@ impl Default for GeminiRuntimeConfig {
         // URL Context, or function tools.
         tasks.insert(
             GeminiTask::AvionicsApprovedCandidateAdjudication,
+            TaskRoute::new(DEFAULT_CURATION_MODEL, ThinkingLevel::Low, 2_048),
+        );
+        // Candidate triage is a retrieval-only, tools-disabled comparison.
+        // Its output can narrow ordinary grounded research but cannot approve
+        // or mutate a catalog row.
+        tasks.insert(
+            GeminiTask::AvionicsCandidateTriage,
             TaskRoute::new(DEFAULT_CURATION_MODEL, ThinkingLevel::Low, 2_048),
         );
         let mut aircraft_catalog_adjudication = TaskRoute::new(
@@ -858,6 +869,11 @@ mod tests {
         assert_eq!(approved_adjudication.thinking_level, ThinkingLevel::Low);
         assert_eq!(approved_adjudication.fallback_model, None);
         assert_eq!(approved_adjudication.max_output_tokens, 2_048);
+        let candidate_triage = config.route(GeminiTask::AvionicsCandidateTriage);
+        assert_eq!(candidate_triage.model, "gemini-3.5-flash-lite");
+        assert_eq!(candidate_triage.thinking_level, ThinkingLevel::Low);
+        assert_eq!(candidate_triage.fallback_model, None);
+        assert_eq!(candidate_triage.max_output_tokens, 2_048);
         assert_eq!(
             config.route(GeminiTask::AircraftSearchGrounding).model,
             "gemini-3.5-flash-lite"
@@ -947,6 +963,11 @@ mod tests {
         assert_eq!(approved_adjudication.thinking_level, ThinkingLevel::Low);
         assert_eq!(approved_adjudication.fallback_model, None);
         assert_eq!(approved_adjudication.max_output_tokens, 2_048);
+        let candidate_triage = config.route(GeminiTask::AvionicsCandidateTriage);
+        assert_eq!(candidate_triage.model, "gemini-3.5-flash-lite");
+        assert_eq!(candidate_triage.thinking_level, ThinkingLevel::Low);
+        assert_eq!(candidate_triage.fallback_model, None);
+        assert_eq!(candidate_triage.max_output_tokens, 2_048);
     }
 
     #[test]
@@ -976,6 +997,11 @@ mod tests {
                 GeminiTask::AvionicsApprovedCandidateAdjudication,
                 "avionics_approved_candidate_adjudication",
                 "AIRCOST_GEMINI_AVIONICS_APPROVED_CANDIDATE_ADJUDICATION",
+            ),
+            (
+                GeminiTask::AvionicsCandidateTriage,
+                "avionics_candidate_triage",
+                "AIRCOST_GEMINI_AVIONICS_CANDIDATE_TRIAGE",
             ),
         ];
         let mut environment = BTreeMap::new();

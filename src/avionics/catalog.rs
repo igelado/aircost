@@ -29,11 +29,12 @@ use super::source::{exact_oem_product_identity_row, OemProductIdentity};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
     AvionicsApprovedCandidateAdjudicationContext, AvionicsApprovedCatalogCandidate,
-    AvionicsCatalogCandidate, AvionicsCatalogCollisionReviewContext, AvionicsProposedIdentity,
-    AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
+    AvionicsCandidateTriageCatalogCandidate, AvionicsCandidateTriageContext,
+    AvionicsCandidateTriageHint, AvionicsCatalogCandidate, AvionicsCatalogCollisionReviewContext,
+    AvionicsProposedIdentity, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
     AvionicsUnitResolutionCorrectionContext, GeminiGroundingSource, GeminiGroundingSupport,
     GeminiListingExtractor, GroundedJsonResponse, AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT,
-    CURATED_AVIONICS_TYPES,
+    AVIONICS_CANDIDATE_TRIAGE_LIMIT, CURATED_AVIONICS_TYPES,
 };
 use crate::gemini::curation::workflow::{
     direct_source_product_identity_signal_is_present, SourceEvidenceProof,
@@ -539,6 +540,7 @@ struct AvionicsConcretenessReview {
 pub(crate) enum AvionicsIdentityVerificationRoute {
     VerifiedLocal,
     CandidateAdjudication,
+    CandidateTriage,
     GroundedCuration,
 }
 
@@ -605,6 +607,19 @@ struct ApprovedCandidateAdjudicationPlan {
     context: AvionicsApprovedCandidateAdjudicationContext,
     selectable_catalog_ids: HashSet<i64>,
     manufacturer_identity_id: i64,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateTriagePlan {
+    context: AvionicsCandidateTriageContext,
+    exact_candidate_ids: BTreeSet<i64>,
+    family: Vec<ReviewCatalogCandidate>,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateTriageResult {
+    hint: AvionicsCandidateTriageHint,
+    family: Vec<AvionicsCatalogCandidate>,
 }
 
 #[derive(Clone, Debug)]
@@ -772,6 +787,7 @@ pub(crate) async fn classify_invalid_generic_avionics_observation(
         requires_listing_evidence: request.requires_listing_evidence,
         authoritative_direct_source_urls: Vec::new(),
         authoritative_identity_anchors: Vec::new(),
+        candidate_triage_hint: None,
         candidate: AvionicsUnitResolutionCandidate {
             manufacturer: request.manufacturer.clone(),
             model: request.model.clone(),
@@ -1403,19 +1419,16 @@ pub(crate) async fn plan_avionics_identity_verification_route(
     if input_types.is_empty() {
         return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
     }
-    let Some(manufacturer_identity_id) =
-        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
-    else {
-        return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
-    };
+    let manufacturer_identity_id =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?;
     let review_catalog = load_review_catalog_candidates(db).await?;
-    let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
-        &request.manufacturer,
-        Some(manufacturer_identity_id),
-        &review_catalog,
-    );
-    let approved_candidates = load_known_approved_candidates(db).await?;
-    Ok(
+    if let Some(manufacturer_identity_id) = manufacturer_identity_id {
+        let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
+            &request.manufacturer,
+            Some(manufacturer_identity_id),
+            &review_catalog,
+        );
+        let approved_candidates = load_known_approved_candidates(db).await?;
         if approved_candidate_adjudication_plan(
             request,
             &input_types,
@@ -1425,7 +1438,12 @@ pub(crate) async fn plan_avionics_identity_verification_route(
         )
         .is_some()
         {
-            AvionicsIdentityVerificationRoute::CandidateAdjudication
+            return Ok(AvionicsIdentityVerificationRoute::CandidateAdjudication);
+        }
+    }
+    Ok(
+        if candidate_triage_plan(request, &review_catalog, &HashSet::new()).is_some() {
+            AvionicsIdentityVerificationRoute::CandidateTriage
         } else {
             AvionicsIdentityVerificationRoute::GroundedCuration
         },
@@ -1845,14 +1863,49 @@ async fn resolve_avionics_identity_with_write_mode(
         }
     }
 
+    let candidate_triage = if matches!(grounding_plan, IdentityGroundingPlan::Search) {
+        resolve_candidate_triage_with_gemini(db, extractor, request, &review_catalog).await?
+    } else {
+        None
+    };
+    if let Some(triage) = &candidate_triage {
+        if let Some(approved) =
+            resolve_triaged_current_candidate_through_reuse(db, request, triage).await?
+        {
+            return Ok(AvionicsIdentityOutcome::Approved(approved));
+        }
+    }
+
     let catalog_snapshot = catalog_fingerprint(&catalog);
-    let shortlist = shortlist_avionics_candidates(
+    let mut collision_catalog = manufacturer_catalog.clone();
+    if let Some(triage) = &candidate_triage {
+        for candidate in &triage.family {
+            if collision_catalog
+                .iter()
+                .all(|existing| existing.id != candidate.id)
+            {
+                collision_catalog.push(candidate.clone());
+            }
+        }
+        collision_catalog.sort_by_key(|candidate| candidate.id);
+    }
+    let ordinary_shortlist = shortlist_avionics_candidates(
         &request.manufacturer,
         &request.model,
         &input_types,
         None,
-        &manufacturer_catalog,
+        &collision_catalog,
     );
+    let mut shortlist = candidate_triage
+        .as_ref()
+        .map(|triage| triage.family.clone())
+        .unwrap_or_default();
+    for candidate in ordinary_shortlist {
+        if shortlist.iter().all(|existing| existing.id != candidate.id) {
+            shortlist.push(candidate);
+        }
+    }
+    shortlist.truncate(CANDIDATE_LIMIT);
     let (direct_source_urls, direct_source_anchors) = match &grounding_plan {
         IdentityGroundingPlan::Search => (Vec::new(), Vec::new()),
         IdentityGroundingPlan::Direct(plan) => {
@@ -1869,6 +1922,7 @@ async fn resolve_avionics_identity_with_write_mode(
         requires_listing_evidence: request.requires_listing_evidence,
         authoritative_direct_source_urls: direct_source_urls,
         authoritative_identity_anchors: direct_source_anchors,
+        candidate_triage_hint: candidate_triage.as_ref().map(|triage| triage.hint.clone()),
         candidate: AvionicsUnitResolutionCandidate {
             manufacturer: request.manufacturer.clone(),
             model: request.model.clone(),
@@ -2045,8 +2099,19 @@ async fn resolve_avionics_identity_with_write_mode(
                     ))
                 })?;
             let proposed = verified_identity_from_response(&response)?;
-            let collision_context =
-                expanded_collision_context(&context, &proposed, &manufacturer_catalog);
+            let collision_context = if candidate_triage.is_some() {
+                match expanded_complete_triage_collision_context(&context, &proposed, &catalog) {
+                    Ok(context) => context,
+                    Err(reason) => return Ok(AvionicsIdentityOutcome::Unresolved { reason }),
+                }
+            } else {
+                expanded_collision_context(&context, &proposed, &collision_catalog)
+            };
+            let reviewed_collision_catalog = if candidate_triage.is_some() {
+                catalog.as_slice()
+            } else {
+                collision_catalog.as_slice()
+            };
             resolve_verified_identity(
                 db,
                 extractor,
@@ -2057,7 +2122,7 @@ async fn resolve_avionics_identity_with_write_mode(
                 grounded_response.verified_evidence.as_ref(),
                 &grounding_plan,
                 &catalog_snapshot,
-                &manufacturer_catalog,
+                reviewed_collision_catalog,
                 input_manufacturer_identity_id,
                 reviewed_manufacturer_collision_snapshot.as_deref(),
                 execution,
@@ -2066,8 +2131,19 @@ async fn resolve_avionics_identity_with_write_mode(
         }
         "propose_new" => {
             let proposed = verified_identity_from_response(&response)?;
-            let collision_context =
-                expanded_collision_context(&context, &proposed, &manufacturer_catalog);
+            let collision_context = if candidate_triage.is_some() {
+                match expanded_complete_triage_collision_context(&context, &proposed, &catalog) {
+                    Ok(context) => context,
+                    Err(reason) => return Ok(AvionicsIdentityOutcome::Unresolved { reason }),
+                }
+            } else {
+                expanded_collision_context(&context, &proposed, &collision_catalog)
+            };
+            let reviewed_collision_catalog = if candidate_triage.is_some() {
+                catalog.as_slice()
+            } else {
+                collision_catalog.as_slice()
+            };
             resolve_verified_identity(
                 db,
                 extractor,
@@ -2078,7 +2154,7 @@ async fn resolve_avionics_identity_with_write_mode(
                 grounded_response.verified_evidence.as_ref(),
                 &grounding_plan,
                 &catalog_snapshot,
-                &manufacturer_catalog,
+                reviewed_collision_catalog,
                 input_manufacturer_identity_id,
                 reviewed_manufacturer_collision_snapshot.as_deref(),
                 execution,
@@ -2930,6 +3006,303 @@ async fn resolve_approved_catalog_candidate_with_gemini(
                 .to_string(),
         grounded_claim_source_urls: Vec::new(),
     }))
+}
+
+/// Build a globally-scoped, exact-key retrieval family for noisy labels such
+/// as `manufacturer=WX, model=500`. The catalog supplies possible spelling
+/// and maker corrections, but no row becomes an identity fact here.
+fn candidate_triage_plan(
+    request: &AvionicsIdentityRequest,
+    catalog: &[ReviewCatalogCandidate],
+    current_reuse_attested_ids: &HashSet<i64>,
+) -> Option<CandidateTriagePlan> {
+    if !request.requires_listing_evidence
+        || !request.authoritative_direct_source_urls.is_empty()
+        || !request.authoritative_identity_anchors.is_empty()
+        || request.listing_context.trim().is_empty()
+        || !is_usable_avionics_label(&request.manufacturer, &request.model)
+    {
+        return None;
+    }
+    let observed_types = canonicalize_avionics_types(&request.avionics_types);
+    if observed_types.is_empty() || observed_types.len() != request.avionics_types.len() {
+        return None;
+    }
+
+    let observed_model_key = normalize_avionics_identifier(&request.model);
+    let split_model_key =
+        normalize_avionics_identifier(&format!("{} {}", request.manufacturer, request.model));
+    let catalog_model_keys = catalog
+        .iter()
+        .map(|candidate| normalize_avionics_identifier(&candidate.candidate.model))
+        .filter(|key| !key.is_empty())
+        .collect::<HashSet<_>>();
+    let mut exact_keys = [observed_model_key.as_str(), split_model_key.as_str()]
+        .into_iter()
+        .filter(|key| {
+            key.len() >= 4
+                && key.chars().any(|character| character.is_ascii_digit())
+                && catalog_model_keys.contains(*key)
+                && exact_compact_identity_is_present(&request.listing_context, key)
+        })
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if exact_keys.len() != 1 {
+        return None;
+    }
+    let exact_model_key = exact_keys.pop_first()?;
+    let exact_numbers = model_numeric_runs(&exact_model_key);
+    let mut family = catalog
+        .iter()
+        .filter(|candidate| {
+            let key = normalize_avionics_identifier(&candidate.candidate.model);
+            key == exact_model_key
+                || (key.len().min(exact_model_key.len()) >= 4
+                    && model_numeric_runs(&key) == exact_numbers
+                    && (key.starts_with(&exact_model_key) || exact_model_key.starts_with(&key)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    family.sort_by_key(|candidate| candidate.candidate.id);
+    if family.is_empty() || family.len() > AVIONICS_CANDIDATE_TRIAGE_LIMIT {
+        return None;
+    }
+    let exact_candidate_ids = family
+        .iter()
+        .filter(|candidate| {
+            normalize_avionics_identifier(&candidate.candidate.model) == exact_model_key
+        })
+        .map(|candidate| candidate.candidate.id)
+        .collect::<BTreeSet<_>>();
+    if exact_candidate_ids.is_empty() {
+        return None;
+    }
+
+    // A single exact row already reached by the normal manufacturer-scoped
+    // shortlist needs no extra model call. Triage is useful only when it
+    // repairs a split label, exposes duplicates/cross-maker rows, or carries
+    // meaningful suffix blockers that ordinary extraction might conflate.
+    let observed_manufacturer_key = normalize_avionics_manufacturer_name(&request.manufacturer);
+    let exact_same_maker = family.iter().filter(|candidate| {
+        exact_candidate_ids.contains(&candidate.candidate.id)
+            && normalize_avionics_manufacturer_name(&candidate.candidate.manufacturer)
+                == observed_manufacturer_key
+    });
+    let normal_route_is_unique = exact_candidate_ids.len() == 1
+        && exact_same_maker.count() == 1
+        && family.len() == 1
+        && observed_model_key == exact_model_key;
+    if normal_route_is_unique {
+        return None;
+    }
+
+    let complete_catalog = catalog
+        .iter()
+        .map(|candidate| candidate.candidate.clone())
+        .collect::<Vec<_>>();
+    let context = AvionicsCandidateTriageContext {
+        observed_candidate: AvionicsUnitResolutionCandidate {
+            manufacturer: request.manufacturer.clone(),
+            model: request.model.clone(),
+            avionics_types: observed_types,
+            quantity: request.quantity.max(1),
+        },
+        listing_evidence_text: request.listing_context.clone(),
+        catalog_revision_sha256: catalog_fingerprint(&complete_catalog),
+        catalog_candidates: family
+            .iter()
+            .map(|candidate| {
+                let candidate = &candidate.candidate;
+                AvionicsCandidateTriageCatalogCandidate {
+                    id: candidate.id,
+                    manufacturer: candidate.manufacturer.clone(),
+                    model: candidate.model.clone(),
+                    avionics_types: candidate.avionics_types.clone(),
+                    manufacturer_identifier_kind: candidate.manufacturer_identifier_kind.clone(),
+                    manufacturer_identifier: candidate.manufacturer_identifier.clone(),
+                    catalog_status: candidate.catalog_status.clone(),
+                    exact_model_candidate: exact_candidate_ids.contains(&candidate.id),
+                    reuse_eligible: candidate.catalog_status == "approved"
+                        && current_reuse_attested_ids.contains(&candidate.id),
+                }
+            })
+            .collect(),
+    };
+    Some(CandidateTriagePlan {
+        context,
+        exact_candidate_ids,
+        family,
+    })
+}
+
+fn candidate_triage_selection(
+    request: &AvionicsIdentityRequest,
+    plan: &CandidateTriagePlan,
+    response: &Value,
+) -> Option<AvionicsCandidateTriageHint> {
+    let object = response.as_object()?;
+    if object.len() != 7
+        || string_field(response, "decision") != "candidate"
+        || string_field(response, "confidence") != "very_high"
+        || string_field(response, "reason").trim().is_empty()
+    {
+        return None;
+    }
+    let candidate_id_values = response.get("candidate_ids")?.as_array()?;
+    let candidate_ids = candidate_id_values
+        .iter()
+        .map(Value::as_i64)
+        .collect::<Option<BTreeSet<_>>>()?;
+    if candidate_ids.len() != candidate_id_values.len() || candidate_ids != plan.exact_candidate_ids
+    {
+        return None;
+    }
+    let corrected_model = string_field(response, "corrected_model_hint");
+    let corrected_model_key = normalize_avionics_identifier(corrected_model);
+    if corrected_model.is_empty()
+        || !plan.context.catalog_candidates.iter().any(|candidate| {
+            plan.exact_candidate_ids.contains(&candidate.id) && candidate.model == corrected_model
+        })
+        || plan
+            .context
+            .catalog_candidates
+            .iter()
+            .filter(|candidate| plan.exact_candidate_ids.contains(&candidate.id))
+            .any(|candidate| normalize_avionics_identifier(&candidate.model) != corrected_model_key)
+    {
+        return None;
+    }
+    let corrected_manufacturer = string_field(response, "corrected_manufacturer_hint");
+    let exact_manufacturers = plan
+        .context
+        .catalog_candidates
+        .iter()
+        .filter(|candidate| plan.exact_candidate_ids.contains(&candidate.id))
+        .map(|candidate| normalize_avionics_manufacturer_name(&candidate.manufacturer))
+        .collect::<BTreeSet<_>>();
+    if exact_manufacturers.len() > 1 {
+        if !corrected_manufacturer.is_empty() {
+            return None;
+        }
+    } else if corrected_manufacturer.is_empty()
+        || !plan.context.catalog_candidates.iter().any(|candidate| {
+            plan.exact_candidate_ids.contains(&candidate.id)
+                && candidate.manufacturer == corrected_manufacturer
+        })
+    {
+        return None;
+    }
+    let evidence = string_field(response, "evidence_text");
+    if evidence.is_empty()
+        || evidence != evidence.trim()
+        || !request.listing_context.contains(evidence)
+        || !exact_compact_identity_is_present(evidence, &corrected_model_key)
+    {
+        return None;
+    }
+    Some(AvionicsCandidateTriageHint {
+        candidate_ids: candidate_ids.into_iter().collect(),
+        corrected_manufacturer_hint: corrected_manufacturer.to_string(),
+        corrected_model_hint: corrected_model.to_string(),
+        reason: string_field(response, "reason").to_string(),
+    })
+}
+
+fn candidate_triage_plan_is_unchanged(
+    before: &CandidateTriagePlan,
+    after: &CandidateTriagePlan,
+) -> bool {
+    before.exact_candidate_ids == after.exact_candidate_ids
+        && matches!(
+            (
+                serde_json::to_vec(&before.context),
+                serde_json::to_vec(&after.context),
+            ),
+            (Ok(before), Ok(after)) if before == after
+        )
+}
+
+async fn resolve_candidate_triage_with_gemini(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    request: &AvionicsIdentityRequest,
+    review_catalog: &[ReviewCatalogCandidate],
+) -> CatalogResult<Option<CandidateTriageResult>> {
+    let current_reuse = current_reuse_attested_product_ids(db).await?;
+    let Some(plan) = candidate_triage_plan(request, review_catalog, &current_reuse) else {
+        return Ok(None);
+    };
+    let response = match extractor
+        .triage_avionics_catalog_candidates(&plan.context)
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    let Some(hint) = candidate_triage_selection(request, &plan, &response) else {
+        return Ok(None);
+    };
+
+    let refreshed_catalog = load_review_catalog_candidates(db).await?;
+    let refreshed_reuse = current_reuse_attested_product_ids(db).await?;
+    let Some(refreshed_plan) = candidate_triage_plan(request, &refreshed_catalog, &refreshed_reuse)
+    else {
+        return Ok(None);
+    };
+    if !candidate_triage_plan_is_unchanged(&plan, &refreshed_plan)
+        || candidate_triage_selection(request, &refreshed_plan, &response).as_ref() != Some(&hint)
+    {
+        return Ok(None);
+    }
+    Ok(Some(CandidateTriageResult {
+        hint,
+        family: refreshed_plan
+            .family
+            .into_iter()
+            .map(|candidate| candidate.candidate)
+            .collect(),
+    }))
+}
+
+async fn resolve_triaged_current_candidate_through_reuse(
+    db: &AppDb,
+    request: &AvionicsIdentityRequest,
+    triage: &CandidateTriageResult,
+) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
+    let [selected_id] = triage.hint.candidate_ids.as_slice() else {
+        return Ok(None);
+    };
+    let Some(selected) = triage
+        .family
+        .iter()
+        .find(|candidate| candidate.id == *selected_id && candidate.catalog_status == "approved")
+    else {
+        return Ok(None);
+    };
+    if !current_reuse_attested_product_ids(db)
+        .await?
+        .contains(selected_id)
+    {
+        return Ok(None);
+    }
+    let observed_manufacturer_identity =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?;
+    let selected_manufacturer_identity =
+        resolve_input_manufacturer_identity(db, &selected.manufacturer).await?;
+    if observed_manufacturer_identity.is_none()
+        || observed_manufacturer_identity != selected_manufacturer_identity
+    {
+        return Ok(None);
+    }
+
+    // The triage model may only repair typography or extraction shape inside
+    // an already-established manufacturer identity. The unchanged local
+    // resolver still rechecks current approval, attestation, exact listing
+    // occurrence, suffix ambiguity, and catalog duplicates.
+    let mut corrected = request.clone();
+    corrected.manufacturer = selected.manufacturer.clone();
+    corrected.model = triage.hint.corrected_model_hint.clone();
+    resolve_verified_local_avionics_identity(db, &corrected).await
 }
 
 fn approved_candidate_adjudication_plan(
@@ -3962,6 +4335,43 @@ fn expanded_collision_context(
     let mut context = classification_context.clone();
     context.catalog_candidates = candidates;
     context
+}
+
+/// Rebuild collision retrieval from the complete catalog after a triaged
+/// observation has been corrected by grounded evidence.
+///
+/// The pre-grounding family is tied to noisy input and therefore cannot be a
+/// completeness boundary for the authoritative manufacturer/model/identifier
+/// returned later. Every globally related row is included, including rows
+/// outside the original maker scope. Overflow fails closed instead of
+/// truncating the closure that the independent collision pass must review.
+fn expanded_complete_triage_collision_context(
+    classification_context: &AvionicsUnitResolutionContext,
+    proposed: &VerifiedIdentity,
+    complete_catalog: &[AvionicsCatalogCandidate],
+) -> Result<AvionicsUnitResolutionContext, String> {
+    let mut candidates = shortlist_avionics_candidates_with_limit(
+        &proposed.canonical_manufacturer,
+        &proposed.canonical_model,
+        &proposed.canonical_types,
+        Some(&proposed.manufacturer_identifier),
+        complete_catalog,
+        usize::MAX,
+    );
+    for candidate in &classification_context.catalog_candidates {
+        if candidates.iter().all(|item| item.id != candidate.id) {
+            candidates.push(candidate.clone());
+        }
+    }
+    if candidates.len() > COLLISION_CANDIDATE_LIMIT {
+        return Err(format!(
+            "grounded triage correction has {} globally related catalog collisions, exceeding the complete review limit of {COLLISION_CANDIDATE_LIMIT}; manual catalog cleanup is required",
+            candidates.len()
+        ));
+    }
+    let mut context = classification_context.clone();
+    context.catalog_candidates = candidates;
+    Ok(context)
 }
 
 fn grounded_response_has_verified_evidence(response: &GroundedJsonResponse) -> bool {
@@ -5770,20 +6180,22 @@ mod tests {
         approved_candidate_adjudication_plan, approved_candidate_adjudication_plan_is_unchanged,
         approved_candidate_adjudication_selection, approved_identity_from_verified,
         attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
-        avionics_model_identity_relation, canonical_avionics_types_for_label,
-        canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
-        collision_response_issues, collision_reviews_with_direct_source_proofs,
-        complete_manufacturer_collision_family, deterministic_graph_approved_identity_from_source,
+        avionics_model_identity_relation, candidate_triage_plan, candidate_triage_selection,
+        canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
+        collision_correction_plan, collision_response_issues,
+        collision_reviews_with_direct_source_proofs, complete_manufacturer_collision_family,
+        deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
-        explicit_authoritative_direct_source_plan, generic_concreteness_rejection_reason,
-        grounded_consolidation_preview_block, known_approved_local_match, load_catalog_candidates,
-        load_known_approved_candidates, load_review_catalog_candidates,
-        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
-        model_identity_relation_score, nonpositive_identity_outcome,
-        opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
-        persist_approved_identity, persist_existing_reuse_attestation,
-        plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
+        expanded_complete_triage_collision_context, explicit_authoritative_direct_source_plan,
+        generic_concreteness_rejection_reason, grounded_consolidation_preview_block,
+        known_approved_local_match, load_catalog_candidates, load_known_approved_candidates,
+        load_review_catalog_candidates, manufacturer_collision_snapshot_sha256,
+        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
+        nonpositive_identity_outcome, opportunistic_authoritative_direct_source_plan,
+        persist_approved_capability_enrichment, persist_approved_identity,
+        persist_existing_reuse_attestation, plan_avionics_identity_verification_route,
+        proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_avionics_identity,
         resolve_verified_catalog_avionics_identity, resolve_verified_local_avionics_identity,
@@ -5801,8 +6213,8 @@ mod tests {
         GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
         IdentityPersistenceMode, IdentityResolutionExecution, KnownApprovedAvionicsCandidate,
         PendingProductAttestationCommitGuard, ReviewCatalogCandidate,
-        ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
-        KNOWN_APPROVED_SELECT_SQL,
+        ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, COLLISION_CANDIDATE_LIMIT,
+        COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -6032,6 +6444,7 @@ mod tests {
             requires_listing_evidence: true,
             authoritative_direct_source_urls: Vec::new(),
             authoritative_identity_anchors: Vec::new(),
+            candidate_triage_hint: None,
             candidate: AvionicsUnitResolutionCandidate {
                 manufacturer: "Garmin".to_string(),
                 model: "GTX345R".to_string(),
@@ -8128,6 +8541,206 @@ mod tests {
         )
         .expect("exact identity may reuse the curated product despite noisy metadata");
         assert_eq!(approved.avionics_types, vec!["Audio Panel"]);
+    }
+
+    fn wx_500_triage_fixture() -> (AvionicsIdentityRequest, Vec<ReviewCatalogCandidate>) {
+        let request = AvionicsIdentityRequest {
+            manufacturer: "WX".to_string(),
+            model: "500".to_string(),
+            avionics_types: vec!["Lightning Detection".to_string()],
+            listing_context: "WX 500 Stormscope installed".to_string(),
+            ..local_request("")
+        };
+        let rows = [
+            (8, "L3Harris", "WX-500", "Unknown"),
+            (201, "BFGoodrich", "WX-500", "Unknown"),
+            (228, "L3Harris", "WX 500", "Traffic"),
+            (283, "L-3 Communications", "WX 500", "Unknown"),
+            (733, "L3 Harris", "WX-500", "Unknown"),
+            (734, "L3Harris", "WX-500W", "Lightning Detection"),
+        ]
+        .into_iter()
+        .map(|(id, manufacturer, model, capability)| {
+            let mut product = candidate(id, model, "unreviewed");
+            product.manufacturer = manufacturer.to_string();
+            product.avionics_types = vec![capability.to_string()];
+            product.manufacturer_identifier_kind.clear();
+            product.manufacturer_identifier.clear();
+            review_candidate(product, None)
+        })
+        .collect();
+        (request, rows)
+    }
+
+    #[test]
+    fn candidate_triage_retrieves_the_complete_real_wx_set_globally() {
+        let (request, catalog) = wx_500_triage_fixture();
+        let plan = candidate_triage_plan(&request, &catalog, &HashSet::new())
+            .expect("split WX/500 input should project one useful global family");
+        assert_eq!(
+            plan.exact_candidate_ids.into_iter().collect::<Vec<_>>(),
+            vec![8, 201, 228, 283, 733]
+        );
+        assert_eq!(
+            plan.context
+                .catalog_candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            vec![8, 201, 228, 283, 733, 734]
+        );
+        assert!(plan.context.catalog_candidates[..5]
+            .iter()
+            .all(|candidate| candidate.exact_model_candidate && !candidate.reuse_eligible));
+        assert!(
+            !plan.context.catalog_candidates[5].exact_model_candidate,
+            "a meaningful W suffix must be retained only as a blocker"
+        );
+    }
+
+    #[test]
+    fn candidate_triage_skips_a_unique_normal_shortlist() {
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Garmin".to_string(),
+            model: "GTX 327".to_string(),
+            avionics_types: vec!["Transponder".to_string()],
+            listing_context: "Garmin GTX 327 transponder".to_string(),
+            ..local_request("")
+        };
+        let catalog = vec![review_candidate_with_types(
+            327,
+            "GTX 327",
+            &["Transponder"],
+        )];
+        assert!(candidate_triage_plan(&request, &catalog, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn candidate_triage_does_not_invent_a_maker_across_cross_maker_rows() {
+        let (request, catalog) = wx_500_triage_fixture();
+        let plan = candidate_triage_plan(&request, &catalog, &HashSet::new()).unwrap();
+        let unsafe_maker = json!({
+            "decision": "candidate",
+            "candidate_ids": [8, 201, 228, 283, 733],
+            "corrected_manufacturer_hint": "L3Harris",
+            "corrected_model_hint": "WX-500",
+            "confidence": "very_high",
+            "evidence_text": "WX 500",
+            "reason": "Use the exact model family as a search lead"
+        });
+        assert!(candidate_triage_selection(&request, &plan, &unsafe_maker).is_none());
+
+        let mut model_only_hint = unsafe_maker.clone();
+        model_only_hint["corrected_manufacturer_hint"] = json!("");
+        let hint = candidate_triage_selection(&request, &plan, &model_only_hint)
+            .expect("cross-maker ambiguity may retain only a model/candidate-set research hint");
+        assert!(hint.corrected_manufacturer_hint.is_empty());
+        assert_eq!(hint.candidate_ids, vec![8, 201, 228, 283, 733]);
+    }
+
+    #[test]
+    fn candidate_triage_never_conflates_an_omitted_w_suffix() {
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Garmin".to_string(),
+            model: "GIA 63".to_string(),
+            avionics_types: vec!["NAV".to_string(), "COM".to_string()],
+            listing_context: "Garmin GIA 63 NAV/COM installed".to_string(),
+            ..local_request("")
+        };
+        let catalog = vec![
+            review_candidate_with_types(63, "GIA 63", &["NAV", "COM"]),
+            review_candidate_with_types(64, "GIA 63W", &["NAV", "COM"]),
+        ];
+        let plan = candidate_triage_plan(&request, &catalog, &HashSet::new())
+            .expect("the exact base plus W neighbor is a useful bounded family");
+        assert_eq!(plan.exact_candidate_ids, [63].into_iter().collect());
+        let conflated = json!({
+            "decision": "candidate",
+            "candidate_ids": [64],
+            "corrected_manufacturer_hint": "Garmin",
+            "corrected_model_hint": "GIA 63W",
+            "confidence": "very_high",
+            "evidence_text": "GIA 63",
+            "reason": "Assume the W suffix"
+        });
+        assert!(candidate_triage_selection(&request, &plan, &conflated).is_none());
+    }
+
+    #[test]
+    fn unreviewed_candidate_triage_is_only_a_grounding_hint() {
+        let (request, catalog) = wx_500_triage_fixture();
+        let plan = candidate_triage_plan(&request, &catalog, &HashSet::new()).unwrap();
+        let response = json!({
+            "decision": "candidate",
+            "candidate_ids": [8, 201, 228, 283, 733],
+            "corrected_manufacturer_hint": "",
+            "corrected_model_hint": "WX-500",
+            "confidence": "very_high",
+            "evidence_text": "WX 500",
+            "reason": "Research the complete exact-model family"
+        });
+        let hint =
+            candidate_triage_selection(&request, &plan, &response).expect("valid retrieval hint");
+        assert_eq!(hint.corrected_model_hint, "WX-500");
+        assert!(plan
+            .context
+            .catalog_candidates
+            .iter()
+            .filter(|candidate| hint.candidate_ids.contains(&candidate.id))
+            .all(|candidate| {
+                candidate.catalog_status == "unreviewed" && !candidate.reuse_eligible
+            }));
+    }
+
+    #[test]
+    fn grounded_triage_correction_rebuilds_collision_closure_from_the_global_catalog() {
+        let mut initial = candidate(8, "WX-500", "unreviewed");
+        initial.manufacturer = "L3Harris".to_string();
+        initial.avionics_types = vec!["Lightning Detection".to_string()];
+        initial.manufacturer_identifier.clear();
+        initial.manufacturer_identifier_kind.clear();
+        let mut context = context(vec![initial.clone()]);
+        context.candidate.manufacturer = "WX".to_string();
+        context.candidate.model = "500".to_string();
+        context.candidate.avionics_types = vec!["Lightning Detection".to_string()];
+        context.listing_context = "WX 500 Stormscope installed".to_string();
+
+        let mut identifier_only_collision = candidate(900, "Stormscope Series II", "unreviewed");
+        identifier_only_collision.manufacturer = "BFGoodrich".to_string();
+        identifier_only_collision.avionics_types = vec!["Lightning Detection".to_string()];
+        identifier_only_collision.manufacturer_identifier = "011-WX-500".to_string();
+        let mut proposed = verified_identity();
+        proposed.canonical_manufacturer = "L3Harris".to_string();
+        proposed.canonical_model = "WX-500".to_string();
+        proposed.canonical_types = vec!["Lightning Detection".to_string()];
+        proposed.manufacturer_identifier = "011-WX-500".to_string();
+
+        let expanded = expanded_complete_triage_collision_context(
+            &context,
+            &proposed,
+            &[initial, identifier_only_collision],
+        )
+        .expect("the globally discovered identifier collision must fit the bounded closure");
+        assert_eq!(
+            expanded
+                .catalog_candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            vec![8, 900]
+        );
+    }
+
+    #[test]
+    fn grounded_triage_collision_closure_never_truncates_overflow() {
+        let context = context(Vec::new());
+        let proposed = verified_identity();
+        let catalog = (1..=COLLISION_CANDIDATE_LIMIT + 1)
+            .map(|id| candidate(id as i64, "GTX 345R", "unreviewed"))
+            .collect::<Vec<_>>();
+        let error =
+            expanded_complete_triage_collision_context(&context, &proposed, &catalog).unwrap_err();
+        assert!(error.contains("exceeding the complete review limit"));
     }
 
     #[test]
