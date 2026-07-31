@@ -76,8 +76,12 @@ const REASON_DESCRIPTIONS = Object.freeze({
     "The matched catalog product has not been verified yet.",
   ),
   catalog_product_reuse_attestation_missing: reason(
-    "One-time source check required",
-    "This verified product needs one current manufacturer-source check before it can be kept on the listing.",
+    "Reusable product source required",
+    "The catalog identity is verified, but this product needs one current manufacturer-source check before its listing associations can be validated.",
+  ),
+  catalog_product_or_listing_corroboration_missing: reason(
+    "Product source or listing match pending",
+    "The catalog identity is verified. Complete its reusable-source check, then validate the exact product occurrence in this listing.",
   ),
   catalog_collision_consolidated_pending_identity_verification: reason(
     "Product identity still needs verification",
@@ -376,8 +380,8 @@ export function productAssociationEligibilityOutcomeForAttestation(
   if (bucket === "product_attestation_required") {
     return {
       kind: "required",
-      label: "OEM attestation required",
-      detail: "Attest this product once from an OEM source before validating its listing associations.",
+      label: "Ready after product source check",
+      detail: "The listing match passed local checks, but the verified catalog product still needs one reusable manufacturer-source check.",
     };
   }
   if (bucket === "manual_review_required") {
@@ -411,9 +415,6 @@ function manualAssociationExplanation(reasonCode) {
 }
 
 export function productAssociationReviewBucket(association, attestationStatus = null) {
-  if (attestationStatus === "required") {
-    return "product_attestation_required";
-  }
   const eligibility = association?.verification_eligibility;
   if (eligibility?.status === "auto_verifiable") {
     return "ready_local";
@@ -460,7 +461,11 @@ export function summarizeProductAssociations(associations, attestationStatus = n
 
 export function summarizeProductReviewGroups(groups) {
   const summary = emptyProductAssociationSummary();
+  summary.productsNeedingSourceCheck = 0;
   for (const group of Array.isArray(groups) ? groups : []) {
+    if (group?.attestation_status === "required") {
+      summary.productsNeedingSourceCheck += 1;
+    }
     const total = nonnegativeCount(group?.pending_association_count);
     summary.total += total;
     const counts = group?.eligibility_counts;
@@ -520,10 +525,19 @@ export function productAssociationEvidenceDisplay(association) {
   return { observedText, sourceEvidenceText };
 }
 
-export function autoVerifiableProductAssociations(associations) {
+export function autoVerifiableProductAssociations(associations, attestationStatus = "current") {
+  if (attestationStatus !== "current") {
+    return [];
+  }
   return (Array.isArray(associations) ? associations : []).filter(
     (association) => association?.verification_eligibility?.status === "auto_verifiable",
   );
+}
+
+export function listingAssociationCanValidateLocally(aspect) {
+  return Number.isSafeInteger(aspect?.reuse_attestation_target?.id)
+    && aspect.reuse_attestation_target.id > 0
+    && aspect.reuse_attestation_status === "current";
 }
 
 export function groupProductAssociationsByListing(associations) {

@@ -53,12 +53,13 @@ use crate::listing::review::{
     corroborate_existing_product_association_and_restage, evaluate_existing_product_association,
     get_listing_review, list_listing_reviews, list_pending_product_associations,
     list_pending_product_reviews, preflight_listing_review_resolution,
-    preflight_pending_product_attestation, resolve_listing_review, resolved_review_response,
-    restage_unattested_preserved_products, use_existing_product_for_aspect_and_restage,
-    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingReview,
-    ListingReviewDetail, ListingReviewQueue, PendingProductAssociationPage,
-    PendingProductReviewPage, ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse,
-    ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery, StagedPendingReview,
+    preflight_pending_product_attestation, prepare_pending_product_reviews, resolve_listing_review,
+    resolved_review_response, restage_unattested_preserved_products,
+    use_existing_product_for_aspect_and_restage, ExistingProductAssociationCommit,
+    ExistingProductAssociationEvaluation, ListingReview, ListingReviewDetail, ListingReviewQueue,
+    PendingProductAssociationPage, PendingProductReviewPage, ProductReviewPageQuery,
+    ResolveReviewRequest, ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError,
+    ReviewQueueQuery, StagedPendingReview,
 };
 use crate::listing::run::{
     cancel_verification_run, claim_next_verification_run_item, complete_verification_run_item,
@@ -306,6 +307,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/avionics/products",
             get(list_pending_product_reviews_handler),
+        )
+        .route(
+            "/api/review/avionics/products/prepare",
+            post(prepare_pending_product_reviews_handler),
         )
         .route(
             "/api/review/avionics/products/{id}/associations",
@@ -788,6 +793,17 @@ async fn list_pending_product_reviews_handler(
     Ok(Json(
         list_pending_product_reviews(&state.db, user.id, query).await?,
     ))
+}
+
+async fn prepare_pending_product_reviews_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    Ok(Json(json!(
+        prepare_pending_product_reviews(&state.db, user.id).await?
+    )))
 }
 
 async fn list_pending_product_associations_handler(

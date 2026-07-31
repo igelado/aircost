@@ -17,6 +17,7 @@ import {
   groupProductAssociationsByListing,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
+  listingAssociationCanValidateLocally,
   preselectedReviewAction,
   productAssociationEvidenceDisplay,
   productAssociationEligibilityOutcome,
@@ -36,6 +37,8 @@ const PRODUCTION_REASON_CODES = [
   "listing_action_graph_invalid",
   "raw_observation_unlinked",
   "catalog_product_unverified",
+  "catalog_product_reuse_attestation_missing",
+  "catalog_product_or_listing_corroboration_missing",
   "catalog_collision_consolidated_pending_identity_verification",
   "listing_link_confidence_not_high",
   "configuration_action_mismatch",
@@ -242,8 +245,8 @@ test("describes and filters server-supplied product association eligibility", ()
   });
   assert.deepEqual(productAssociationEligibilityOutcome(associations[1]), {
     kind: "required",
-    label: "OEM attestation required",
-    detail: "Attest this product once from an OEM source before validating its listing associations.",
+    label: "Ready after product source check",
+    detail: "The listing match passed local checks, but the verified catalog product still needs one reusable manufacturer-source check.",
   });
   assert.deepEqual(productAssociationEligibilityOutcome(associations[2]), {
     kind: "manual",
@@ -302,7 +305,7 @@ test("summarizes source recovery separately from ambiguous manual work", () => {
   );
 });
 
-test("requires product attestation before classifying blank source evidence for recovery", () => {
+test("keeps listing eligibility visible while the product source check is pending", () => {
   const association = {
     source_evidence_text: null,
     verification_eligibility: {
@@ -312,15 +315,28 @@ test("requires product attestation before classifying blank source evidence for 
   };
   assert.equal(
     productAssociationReviewBucket(association, "required"),
-    "product_attestation_required",
+    "source_evidence_missing",
   );
   assert.deepEqual(summarizeProductAssociations([association], "required"), {
     total: 1,
     readyLocal: 0,
-    needsSourceRecovery: 0,
-    productAttestationRequired: 1,
+    needsSourceRecovery: 1,
+    productAttestationRequired: 0,
     manualOrAmbiguous: 0,
   });
+});
+
+test("prevents listing-local validation until the reusable product source is current", () => {
+  const aspect = {
+    reuse_attestation_target: { id: 28 },
+    reuse_attestation_status: "required",
+  };
+  assert.equal(listingAssociationCanValidateLocally(aspect), false);
+  assert.equal(autoVerifiableProductAssociations([
+    { verification_eligibility: { status: "auto_verifiable" } },
+  ], "required").length, 0);
+  aspect.reuse_attestation_status = "current";
+  assert.equal(listingAssociationCanValidateLocally(aspect), true);
 });
 
 test("sums queue eligibility counts and degrades missing breakdowns safely", () => {
@@ -349,6 +365,7 @@ test("sums queue eligibility counts and degrades missing breakdowns safely", () 
     needsSourceRecovery: 2,
     productAttestationRequired: 2,
     manualOrAmbiguous: 7,
+    productsNeedingSourceCheck: 1,
   });
 });
 

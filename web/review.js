@@ -28,6 +28,7 @@ import {
   existingProductVerificationRequest,
   isAircraftIdentityStatus,
   isCompletedReviewMaintenanceResponse,
+  listingAssociationCanValidateLocally,
   preselectedReviewAction,
   productAssociationEvidenceDisplay,
   productAssociationEligibilityOutcomeForAttestation,
@@ -435,7 +436,7 @@ function setQueueMode(mode, { load = true } = {}) {
   elements.reviewQueueDescription.textContent = pipelineMode
     ? "Provider-free status across every non-ready listing."
     : productMode
-      ? "Attest each product once, then validate its listing associations locally."
+      ? "Verify each catalog identity and reusable source independently, then validate eligible listing associations locally."
       : "Review every unresolved aspect of one listing at a time.";
   for (const metric of document.querySelectorAll(".review-product-only-metric")) {
     metric.classList.toggle("is-hidden", !productMode);
@@ -449,7 +450,7 @@ function setQueueMode(mode, { load = true } = {}) {
     elements.reviewPendingLabel.textContent = "Total pending";
     elements.reviewAspectLabel.textContent = "Ready locally";
     elements.reviewReasonLabel.textContent = "Needs source recovery";
-    elements.reviewAttestationLabel.textContent = "OEM attestation required";
+    elements.reviewAttestationLabel.textContent = "Products needing source check";
     elements.reviewManualLabel.textContent = "Manual or ambiguous";
     if (state.productGroups.length) {
       renderProductQueue();
@@ -1287,6 +1288,18 @@ async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
   elements.reviewProductResults.setAttribute("aria-busy", "true");
   setButtonBusy(elements.refreshReviews, true);
   try {
+    const prepared = await api("/api/review/avionics/products/prepare", {
+      method: "POST",
+    });
+    if (!mayCommit()) {
+      return false;
+    }
+    const preparedRevision = nonBlank(prepared?.catalog_revision_sha256)
+      ? prepared.catalog_revision_sha256
+      : null;
+    if (preparedRevision === null) {
+      throw new Error("The server returned an invalid product preparation result.");
+    }
     const groups = [];
     let cursor = null;
     let catalogRevision = null;
@@ -1299,7 +1312,10 @@ async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
       if (!mayCommit()) {
         return false;
       }
-      if (catalogRevision !== null && page.catalog_revision_sha256 !== catalogRevision) {
+      if (
+        page.catalog_revision_sha256 !== preparedRevision
+        || catalogRevision !== null && page.catalog_revision_sha256 !== catalogRevision
+      ) {
         throw new Error("The avionics catalog changed while the product queue was loading.");
       }
       catalogRevision = page.catalog_revision_sha256;
@@ -1319,7 +1335,9 @@ async function loadProductQueue({ quiet = false, commitGuard = null } = {}) {
     renderProductQueue();
     if (!quiet) {
       setQueueMessage(
-        `${groups.length} ${pluralize(groups.length, "product")} with pending associations.`,
+        `${groups.length} ${pluralize(groups.length, "product")} with pending associations. `
+          + `Prepared ${prepared.restaged_listing_count ?? 0} of `
+          + `${prepared.inspected_listing_count ?? 0} inspected listings.`,
       );
     }
     return true;
@@ -1349,7 +1367,7 @@ function renderProductQueue() {
   elements.reviewAspectCount.textContent = formatNumber(summary.readyLocal, 0);
   elements.reviewReasonCount.textContent = formatNumber(summary.needsSourceRecovery, 0);
   elements.reviewAttestationCount.textContent =
-    formatNumber(summary.productAttestationRequired, 0);
+    formatNumber(summary.productsNeedingSourceCheck, 0);
   elements.reviewManualCount.textContent = formatNumber(summary.manualOrAmbiguous, 0);
 }
 
@@ -1365,13 +1383,15 @@ function productQueueRow(group) {
   const name = document.createElement("strong");
   name.textContent = title;
   productCell.append(name, renderAvionicsChips(product.capabilities || []));
-  const identityCell = queueTextCell(
-    "Identity",
+  const identityCell = queueTextCell("Catalog identity", "Verified");
+  identityCell.classList.add("review-status-current");
+  const sourceCell = queueTextCell(
+    "Reusable source",
     group?.attestation_status === "current"
-      ? "Current — ready for local checks"
-      : "OEM attestation required",
+      ? "Current"
+      : "Source check required",
   );
-  identityCell.classList.add(
+  sourceCell.classList.add(
     group?.attestation_status === "current" ? "review-status-current" : "review-status-required",
   );
   const pendingCell = queueTextCell(
@@ -1392,6 +1412,7 @@ function productQueueRow(group) {
   row.append(
     productCell,
     identityCell,
+    sourceCell,
     pendingCell,
     actionCell,
   );
@@ -1407,7 +1428,7 @@ function productGroupPendingSummary(group) {
     summary.readyLocal ? `${summary.readyLocal} ready` : null,
     summary.needsSourceRecovery ? `${summary.needsSourceRecovery} need source text` : null,
     summary.productAttestationRequired
-      ? `${summary.productAttestationRequired} need OEM attestation`
+      ? `${summary.productAttestationRequired} ready after source check`
       : null,
     summary.manualOrAmbiguous ? `${summary.manualOrAmbiguous} manual` : null,
   ].filter(nonBlank).join(" · ");
@@ -1507,17 +1528,21 @@ function renderSelectedProduct() {
       || `Catalog product ${selected.id}`;
   elements.reviewProductSummary.textContent = [
     `Catalog ID ${selected.id}`,
+    "Catalog identity verified",
     product.stable_identifier?.value,
     `${state.productAssociations.length} pending `
       + pluralize(state.productAssociations.length, "association"),
   ].filter(nonBlank).join(" · ");
   const current = selected.attestationStatus === "current";
   elements.reviewProductStatus.textContent = current
-    ? "Product identity current"
-    : "OEM attestation required";
+    ? "Reusable source current"
+    : "Reusable source check required";
   elements.reviewProductStatus.classList.toggle("is-current", current);
   elements.reviewProductAttestationForm.classList.toggle("is-hidden", current);
-  const autoVerifiable = autoVerifiableProductAssociations(state.productAssociations);
+  const autoVerifiable = autoVerifiableProductAssociations(
+    state.productAssociations,
+    selected.attestationStatus,
+  );
   const summary = summarizeProductAssociations(
     state.productAssociations,
     selected.attestationStatus,
@@ -1548,7 +1573,7 @@ function renderSelectedProduct() {
   renderProductAssociationRows();
   elements.reviewProductActionMessage.textContent = current
     ? productAssociationActionSummary(summary)
-    : "Attest this product once before validating its listing associations.";
+    : "The catalog identity is verified. Complete one reusable manufacturer-source check before validating ready associations.";
 }
 
 function productAssociationActionSummary(summary) {
@@ -1656,8 +1681,8 @@ async function attestSelectedProduct(event) {
     }
     state.selectedProduct.attestationStatus = "current";
     elements.reviewProductActionMessage.textContent = result?.reused
-      ? "The product attestation was already current; no source fetch was needed."
-      : "Product identity attested from the guarded OEM source without Gemini.";
+      ? "The reusable product source was already current; no source fetch was needed."
+      : "Reusable product source verified from the guarded manufacturer source without Gemini.";
     await loadProductQueue({
       quiet: true,
       commitGuard: () => productActionContextIsCurrent(action, state),
@@ -1683,7 +1708,10 @@ async function validateSelectedProductAssociations() {
   if (!selected || selected.attestationStatus !== "current" || state.productBusy) {
     return;
   }
-  const initialAssociations = autoVerifiableProductAssociations(state.productAssociations);
+  const initialAssociations = autoVerifiableProductAssociations(
+    state.productAssociations,
+    selected.attestationStatus,
+  );
   const manualAssociationsBeforeRun = state.productAssociations.length
     - initialAssociations.length;
   if (initialAssociations.length === 0) {
@@ -1924,7 +1952,10 @@ function setProductBusy(busy) {
   elements.reviewProductValidate.disabled =
     busy
     || state.selectedProduct?.attestationStatus !== "current"
-    || autoVerifiableProductAssociations(state.productAssociations).length === 0;
+    || autoVerifiableProductAssociations(
+      state.productAssociations,
+      state.selectedProduct?.attestationStatus,
+    ).length === 0;
   renderProductQueue();
 }
 
@@ -2467,22 +2498,30 @@ function renderAspect(aspect, index, total) {
   if (aspect.reuse_attestation_target) {
     const target = productSummary(
       aspect.reuse_attestation_target,
-      "Existing product requiring fresh verification",
+      "Catalog identity verified",
     );
     target.classList.add("review-suggested-product");
     context.append(target);
+    const sourceCurrent = listingAssociationCanValidateLocally(aspect);
+    const sourceStatus = document.createElement("p");
+    sourceStatus.className = `review-catalog-message ${sourceCurrent ? "review-status-current" : "review-status-required"}`;
+    sourceStatus.textContent = sourceCurrent
+      ? "Reusable manufacturer source is current."
+      : "Reusable manufacturer source check is still required in By product.";
     const associationAction = document.createElement("button");
     associationAction.type = "button";
     associationAction.className = "button";
     associationAction.textContent = "Validate this listing association locally";
+    associationAction.disabled = !sourceCurrent;
     associationAction.addEventListener("click", () => {
       validateExistingAssociation(key, associationAction);
     });
     const associationHint = document.createElement("p");
     associationHint.className = "review-catalog-message";
-    associationHint.textContent =
-      "Product identity is managed once in By product. This operation uses only retained listing text and the local catalog.";
-    context.append(associationAction, associationHint);
+    associationHint.textContent = sourceCurrent
+      ? "This operation uses only retained listing text and the verified local catalog."
+      : "Local association validation stays unavailable until the product source check is complete.";
+    context.append(sourceStatus, associationAction, associationHint);
   }
   const suggestedId = positiveInteger(aspect.suggested_product?.id);
   const candidateId = positiveInteger(aspect.proposed_product?.id);
@@ -3141,7 +3180,13 @@ async function validateExistingAssociation(key, button) {
   const review = state.currentReview;
   const draft = state.drafts.get(key);
   const targetId = positiveInteger(draft?.aspect?.reuse_attestation_target?.id);
-  if (!review || !draft || targetId === null || state.stale) {
+  if (
+    !review
+    || !draft
+    || targetId === null
+    || !listingAssociationCanValidateLocally(draft.aspect)
+    || state.stale
+  ) {
     return;
   }
   button.disabled = true;
