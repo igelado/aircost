@@ -7,9 +7,10 @@ use sqlx::FromRow;
 
 use crate::aircraft::faa::require_listing_faa_admission;
 use crate::avionics::catalog::{
-    plan_avionics_identity_verification_route, preview_avionics_identity,
-    resolve_avionics_identity, unique_exact_avionics_review_candidate, ApprovedAvionicsIdentity,
-    AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
+    classify_invalid_generic_avionics_observation, plan_avionics_identity_verification_route,
+    preview_avionics_identity, resolve_avionics_identity, unique_exact_avionics_review_candidate,
+    ApprovedAvionicsIdentity, AvionicsIdentityOutcome, AvionicsIdentityRequest,
+    AvionicsIdentityVerificationRoute,
 };
 use crate::avionics::reuse::product_reuse_attestation_is_current;
 use crate::db::{AppDb, DatabaseBackend};
@@ -181,6 +182,8 @@ pub struct AvionicsProviderRequestPlan {
     pub candidate_grounded_fallback_provider_requests_baseline_maximum: usize,
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
+    pub generic_invalid_identity_components: usize,
+    pub generic_invalid_classifier_provider_requests: usize,
     pub initial_grounded_provider_requests_baseline: usize,
     pub initial_grounded_provider_requests_nonpositive_validation_envelope: usize,
     pub positive_identity_provider_requests_baseline: usize,
@@ -209,6 +212,7 @@ pub struct AvionicsVerificationPreflightSummary {
     pub candidate_adjudication_conditional_relationship_components: usize,
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
+    pub generic_invalid_identity_components: usize,
     pub invalid_retained_observations: usize,
 }
 
@@ -235,6 +239,7 @@ pub struct AvionicsVerificationPreflightListingReport {
     pub candidate_adjudication_conditional_relationship_components: usize,
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
+    pub generic_invalid_identity_components: usize,
     pub invalid_retained_observations: usize,
     pub note: String,
 }
@@ -578,6 +583,7 @@ fn summarize_preflight(
             listing.grounded_initial_identity_components;
         summary.grounded_conditional_relationship_components +=
             listing.grounded_conditional_relationship_components;
+        summary.generic_invalid_identity_components += listing.generic_invalid_identity_components;
         summary.invalid_retained_observations += listing.invalid_retained_observations;
         match listing.status.as_str() {
             "ready_retained_observations" => {
@@ -618,6 +624,7 @@ async fn preflight_listing(
         candidate_adjudication_conditional_relationship_components: 0,
         grounded_initial_identity_components: 0,
         grounded_conditional_relationship_components: 0,
+        generic_invalid_identity_components: 0,
         invalid_retained_observations: 0,
         note: String::new(),
     };
@@ -664,8 +671,13 @@ async fn preflight_listing(
     };
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
     for raw in &raw_avionics {
-        if raw_candidate_issue(raw).is_some() {
+        if raw_candidate_structure_issue(raw).is_some() {
             report.invalid_retained_observations += 1;
+            continue;
+        }
+        if generic_model_issue(raw).is_some() {
+            report.invalid_retained_observations += 1;
+            report.generic_invalid_identity_components += 1;
             continue;
         }
         let primary_route = match preflight_identity_component(
@@ -755,6 +767,11 @@ async fn preflight_listing(
     report.status = "ready_retained_observations".to_string();
     report.note = if report.invalid_retained_observations == 0 {
         "retained current-schema observations are ready".to_string()
+    } else if report.generic_invalid_identity_components > 0 {
+        format!(
+            "{} retained observation(s) are invalid; {} structurally valid generic-label observation(s) will receive one tools-disabled discard-classifier request, while every non-rejected or otherwise invalid observation remains for review",
+            report.invalid_retained_observations, report.generic_invalid_identity_components
+        )
     } else {
         format!(
             "{} retained observation(s) are invalid and will remain for review without a Gemini identity request",
@@ -794,6 +811,7 @@ fn provider_request_plan(
     let grounded = summary.grounded_initial_identity_components;
     let conditional_grounded = summary.grounded_conditional_relationship_components;
     let all_grounded_components = grounded.saturating_add(conditional_grounded);
+    let generic_invalid = summary.generic_invalid_identity_components;
     AvionicsProviderRequestPlan {
         listings_requiring_legacy_reextraction: reextractions,
         listing_extraction_provider_requests_baseline: reextractions,
@@ -807,6 +825,8 @@ fn provider_request_plan(
             .saturating_mul(4),
         grounded_initial_identity_components: grounded,
         grounded_conditional_relationship_components: conditional_grounded,
+        generic_invalid_identity_components: generic_invalid,
+        generic_invalid_classifier_provider_requests: generic_invalid,
         initial_grounded_provider_requests_baseline: grounded.saturating_mul(4),
         initial_grounded_provider_requests_nonpositive_validation_envelope: grounded
             .saturating_mul(9),
@@ -815,13 +835,16 @@ fn provider_request_plan(
             .saturating_mul(15),
         known_total_provider_requests_minimum_baseline: reextractions
             .saturating_add(candidate)
+            .saturating_add(generic_invalid)
             .saturating_add(grounded.saturating_mul(4)),
         known_total_provider_requests_all_positive_baseline: reextractions
             .saturating_add(all_candidate_components)
+            .saturating_add(generic_invalid)
             .saturating_add(all_grounded_components.saturating_mul(7)),
         known_total_provider_requests_validation_envelope_maximum: reextractions
             .saturating_mul(2)
             .saturating_add(all_candidate_components)
+            .saturating_add(generic_invalid)
             .saturating_add(
                 all_grounded_components
                     .saturating_add(all_candidate_components)
@@ -832,11 +855,11 @@ fn provider_request_plan(
         default_max_transport_attempts_per_logical_request: usize::from(
             RetryPolicy::default().max_attempts(),
         ),
-        grounded_pass_note: "Every identity that reaches the grounded route first uses exactly one tools-disabled concreteness-classifier request. A strict very-high-confidence generic result stops there; malformed, ambiguous, weaker, or concrete results continue. The fresh grounded identity pass then has three logical provider requests at baseline (Search, URL Context, structure) and at most six after per-stage validation fallbacks. One reused-evidence identity correction can raise the grounded portion to eight. Including the classifier, a positive identity and its independent collision pass use seven requests at baseline and up to fifteen in the complete validation envelope. A nonpositive grounded identity does not run collision review."
+        grounded_pass_note: "Every identity that reaches the grounded route first uses exactly one tools-disabled concreteness-classifier request. A structurally valid current-schema observation rejected locally only because its model is a generic label uses that same one-call classifier without entering the grounded route. A strict very-high-confidence generic result stops there; malformed, ambiguous, weaker, or concrete results on the invalid-observation path remain for review. The fresh grounded identity pass has three logical provider requests at baseline (Search, URL Context, structure) and at most six after per-stage validation fallbacks. One reused-evidence identity correction can raise the grounded portion to eight. Including the classifier, a positive identity and its independent collision pass use seven requests at baseline and up to fifteen in the complete validation envelope. A nonpositive grounded identity does not run collision review."
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every bounded candidate adjudication succeeds without Search and every conditional relationship target is skipped. Candidate adjudication is one tools-disabled request; a successful candidate decision does not run the concreteness classifier. An uncertain, negative, invalid, or stale answer falls through to the ordinary grounded route and then incurs exactly one classifier request before grounded research. The all-positive baseline includes every conditional target but assumes candidate adjudication succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every bounded candidate adjudication succeeds without Search and every conditional relationship target is skipped. Candidate adjudication is one tools-disabled request; a successful candidate decision does not run the concreteness classifier. An uncertain, negative, invalid, or stale answer falls through to the ordinary grounded route and then incurs exactly one classifier request before grounded research. Structurally valid generic-label observations contribute exactly one classifier request to every plan total and never continue to grounding from the invalid-observation path. The all-positive baseline includes every conditional target but assumes candidate adjudication succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -992,7 +1015,56 @@ async fn process_listing(
     let mut blocking_reasons = Vec::new();
 
     for (candidate_index, raw) in raw_avionics.iter().enumerate() {
-        if let Some(issue) = raw_candidate_issue(raw) {
+        if let Some(issue) = raw_candidate_structure_issue(raw) {
+            listing_report.candidates.push(input_error_report(
+                candidate_index,
+                "primary",
+                &raw.manufacturer,
+                &raw.model,
+                &raw.avionics_types,
+                raw.quantity,
+                &raw.configuration_action,
+                raw.source_evidence_text.clone(),
+                raw.source_confidence.clone(),
+                &issue,
+            ));
+            residual_aspects.extend(input_error_aspects(candidate_index, raw, &issue));
+            continue;
+        }
+        if let Some(issue) = generic_model_issue(raw) {
+            let identity = IdentityInput {
+                manufacturer: &raw.manufacturer,
+                model: &raw.model,
+                avionics_types: &raw.avionics_types,
+                quantity: raw.quantity,
+            };
+            let request = identity_request(
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                &identity,
+                raw.source_evidence_text.as_deref(),
+            );
+            if let Some(reason) =
+                classify_invalid_generic_avionics_observation(&scoped_extractor, &request).await
+            {
+                listing_report.candidates.push(outcome_report(
+                    candidate_index,
+                    "primary",
+                    &identity,
+                    &raw.configuration_action,
+                    raw.source_evidence_text.as_deref(),
+                    raw.source_confidence.as_deref(),
+                    "rejected",
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    reason,
+                ));
+                listing_report.safely_discarded += 1;
+                continue;
+            }
             listing_report.candidates.push(input_error_report(
                 candidate_index,
                 "primary",
@@ -2406,12 +2478,19 @@ fn input_error_report(
     }
 }
 
-fn raw_candidate_issue(raw: &ParsedAvionics) -> Option<String> {
+fn generic_model_issue(raw: &ParsedAvionics) -> Option<String> {
     if is_generic_avionics_model_name(&raw.model) {
         return Some(format!(
             "{} is a capability, service, or generic equipment label rather than a specific avionics product",
             raw.model.trim()
         ));
+    }
+    None
+}
+
+fn raw_candidate_structure_issue(raw: &ParsedAvionics) -> Option<String> {
+    if raw.manufacturer.trim().is_empty() || raw.model.trim().is_empty() {
+        return Some("manufacturer and model must both be non-empty identity labels".to_string());
     }
     if raw.avionics_types.is_empty()
         || raw
@@ -2448,6 +2527,15 @@ fn raw_candidate_issue(raw: &ParsedAvionics) -> Option<String> {
             "{} candidate requires a concrete replacement identity",
             raw.configuration_action
         )),
+        "replaces" | "removes"
+            if raw.replaces.as_ref().is_some_and(|replacement| {
+                replacement.manufacturer.trim().is_empty() || replacement.model.trim().is_empty()
+            }) =>
+        {
+            Some(
+                "replacement identity requires non-empty manufacturer and model labels".to_string(),
+            )
+        }
         "replaces" | "removes"
             if raw.replaces.as_ref().is_some_and(|replacement| {
                 replacement.avionics_types.is_empty()
@@ -2947,7 +3035,75 @@ fn summarize(listings: &[AvionicsVerificationListingReport]) -> AvionicsVerifica
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    use axum::{extract::State, routing::post, Json, Router};
+    use serde_json::json;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct ClassifierEndpointState {
+        confidence: &'static str,
+        request_count: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn classifier_endpoint_response(
+        State(state): State<ClassifierEndpointState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        state.request_count.fetch_add(1, Ordering::SeqCst);
+        state.requests.lock().unwrap().push(request);
+        let content = json!({
+            "classification": "generic",
+            "manufacturer_is_avionics_maker": true,
+            "model_identifies_single_unit": false,
+            "confidence": state.confidence,
+            "generic_indicators": ["GPS is an equipment capability rather than one model designation"],
+            "notes": "The observation does not name one product."
+        })
+        .to_string();
+        Json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": content}]}
+            }]
+        }))
+    }
+
+    async fn spawn_classifier_endpoint(
+        confidence: &'static str,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = ClassifierEndpointState {
+            confidence,
+            request_count: request_count.clone(),
+            requests: requests.clone(),
+        };
+        let app = Router::new()
+            .route("/", post(classifier_endpoint_response))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            format!("http://{address}/"),
+            request_count,
+            requests,
+            server,
+        )
+    }
 
     #[test]
     fn provider_request_plan_counts_logical_stages_not_transport_attempts() {
@@ -2959,6 +3115,7 @@ mod tests {
             candidate_adjudication_conditional_relationship_components: 1,
             grounded_initial_identity_components: 3,
             grounded_conditional_relationship_components: 1,
+            generic_invalid_identity_components: 2,
             ..AvionicsVerificationPreflightSummary::default()
         });
 
@@ -2982,11 +3139,13 @@ mod tests {
             plan.positive_identity_provider_requests_validation_envelope,
             60
         );
-        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 16);
-        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 33);
+        assert_eq!(plan.generic_invalid_identity_components, 2);
+        assert_eq!(plan.generic_invalid_classifier_provider_requests, 2);
+        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 18);
+        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 35);
         assert_eq!(
             plan.known_total_provider_requests_validation_envelope_maximum,
-            112
+            114
         );
         assert!(plan.legacy_reextraction_identity_outputs_unknown);
         assert!(!plan.logical_provider_request_counts_include_transport_retries);
@@ -3433,7 +3592,11 @@ mod tests {
             source_confidence: Some("medium".to_string()),
         };
 
-        let aspects = input_error_aspects(3, &raw, raw_candidate_issue(&raw).as_deref().unwrap());
+        let aspects = input_error_aspects(
+            3,
+            &raw,
+            raw_candidate_structure_issue(&raw).as_deref().unwrap(),
+        );
 
         assert_eq!(aspects.len(), 2);
         assert_eq!(aspects[0].quantity, 1);
@@ -3446,7 +3609,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_capability_or_service_label_never_reaches_identity_grounding() {
+    fn structurally_valid_generic_labels_are_eligible_for_the_discard_classifier() {
         for model in ["TAWS", "XM Weather & Radio", "Active Traffic", "AHRS"] {
             let raw = ParsedAvionics {
                 manufacturer: "Garmin".to_string(),
@@ -3459,10 +3622,157 @@ mod tests {
                 source_confidence: Some("high".to_string()),
             };
 
-            let issue = raw_candidate_issue(&raw)
-                .expect("a generic label must remain a residual review aspect");
+            assert!(raw_candidate_structure_issue(&raw).is_none());
+            let issue = generic_model_issue(&raw)
+                .expect("a generic label must be eligible for classifier review");
             assert!(issue.contains("rather than a specific avionics product"));
         }
+    }
+
+    #[test]
+    fn malformed_generic_labels_bypass_the_classifier_and_remain_for_review() {
+        let raw = ParsedAvionics {
+            manufacturer: "Garmin".to_string(),
+            model: "GPS".to_string(),
+            avionics_types: vec!["GPS".to_string()],
+            quantity: 0,
+            configuration_action: "replaces".to_string(),
+            replaces: None,
+            source_evidence_text: Some("Garmin GPS".to_string()),
+            source_confidence: Some("high".to_string()),
+        };
+
+        assert!(generic_model_issue(&raw).is_some());
+        assert_eq!(
+            raw_candidate_structure_issue(&raw).as_deref(),
+            Some("quantity must be at least 1")
+        );
+
+        let malformed_target = ParsedAvionics {
+            quantity: 1,
+            replaces: Some(crate::models::ParsedAvionicsReference {
+                manufacturer: "".to_string(),
+                model: "".to_string(),
+                avionics_types: vec!["GPS".to_string()],
+            }),
+            ..raw
+        };
+        assert_eq!(
+            raw_candidate_structure_issue(&malformed_target).as_deref(),
+            Some("replacement identity requires non-empty manufacturer and model labels")
+        );
+    }
+
+    #[tokio::test]
+    async fn very_high_generic_current_observation_is_discarded_by_one_classifier_request() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = seed_generic_listing(&db, "very-high-generic").await;
+        let preflight = preflight_listing_avionics_page(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(preflight.listings[0].invalid_retained_observations, 1);
+        assert_eq!(preflight.listings[0].generic_invalid_identity_components, 1);
+        assert_eq!(
+            preflight
+                .provider_request_plan
+                .generic_invalid_classifier_provider_requests,
+            1
+        );
+        assert_eq!(
+            preflight
+                .provider_request_plan
+                .known_total_provider_requests_minimum_baseline,
+            1
+        );
+
+        let (endpoint, request_count, requests, server) =
+            spawn_classifier_endpoint("very_high").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let report = verify_listing_avionics_page(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Preview,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let listing = &report.listings[0];
+        assert_eq!(listing.status, "previewed");
+        assert_eq!(listing.safely_discarded, 1);
+        assert_eq!(listing.remaining_review_aspects, 0);
+        assert_eq!(listing.candidates.len(), 1);
+        assert_eq!(listing.candidates[0].status, "rejected");
+        assert!(listing.candidates[0].resolution_attempted);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].get("tools").is_none());
+        let prompt = requests[0]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.contains("GARMIN"));
+        assert!(prompt.contains("GPS"));
+    }
+
+    #[tokio::test]
+    async fn weaker_generic_classification_stays_in_review_without_grounding() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = seed_generic_listing(&db, "high-generic").await;
+        let (endpoint, request_count, _requests, server) = spawn_classifier_endpoint("high").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let report = verify_listing_avionics_page(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Preview,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        let listing = &report.listings[0];
+        assert_eq!(listing.status, "previewed");
+        assert_eq!(listing.safely_discarded, 0);
+        assert_eq!(listing.remaining_review_aspects, 1);
+        assert_eq!(listing.candidates.len(), 1);
+        assert_eq!(listing.candidates[0].status, "error");
+        assert!(!listing.candidates[0].resolution_attempted);
+        assert!(listing.candidates[0]
+            .reason
+            .contains("rather than a specific avionics product"));
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "a non-terminal classifier answer must remain pending without opening grounded calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_generic_classifier_request_stays_in_review() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id = seed_generic_listing(&db, "failed-generic-classifier").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let report = verify_listing_avionics_page(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Preview,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap();
+
+        let listing = &report.listings[0];
+        assert_eq!(listing.status, "previewed");
+        assert_eq!(listing.safely_discarded, 0);
+        assert_eq!(listing.remaining_review_aspects, 1);
+        assert_eq!(listing.candidates.len(), 1);
+        assert_eq!(listing.candidates[0].status, "error");
+        assert!(!listing.candidates[0].resolution_attempted);
     }
 
     #[test]
@@ -4137,6 +4447,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(usage_count, 0);
+    }
+
+    async fn seed_generic_listing(db: &AppDb, suffix: &str) -> i64 {
+        let source_url = format!("https://example.test/listing/{suffix}");
+        let listing_id = seed_listing(db, &source_url).await;
+        seed_faa_admission(db, listing_id).await;
+        seed_submission_and_review(
+            db,
+            listing_id,
+            &source_url,
+            "<p>GARMIN GPS installed</p>",
+            Some(
+                r#"{"avionics":[{"manufacturer":"GARMIN","model":"GPS","types":["GPS"],"quantity":1,"configuration_action":"installed","source_evidence_text":"GARMIN GPS","source_confidence":"high"}]}"#,
+            ),
+            Some(listing_id),
+            None,
+        )
+        .await;
+        listing_id
+    }
+
+    async fn seed_faa_admission(db: &AppDb, listing_id: i64) {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::query(
+            "UPDATE aircraft_sale_listings SET registration_number = 'N123AB', serial_number = NULL WHERE id = ?",
+        )
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let archive_sha256 = "a".repeat(64);
+        let evidence_source_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, resolved_url, source_title, publisher, source_domain,
+              source_tier, content_sha256, retrieved_at
+            ) VALUES (
+              'https://www.faa.gov/aircraft-registry/test-release.zip',
+              'https://www.faa.gov/aircraft-registry/test-release.zip',
+              'FAA registry fixture', 'Federal Aviation Administration',
+              'faa.gov', 'regulator_primary', ?, CURRENT_TIMESTAMP
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(&archive_sha256)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let snapshot_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO faa_registry_snapshots (
+              evidence_source_id, snapshot_date, source_url, archive_sha256,
+              source_manifest_sha256, target_set_sha256,
+              master_member_name, master_member_sha256,
+              aircraft_member_name, aircraft_member_sha256,
+              engine_member_name, engine_member_sha256
+            ) VALUES (
+              ?, '2026-07-31',
+              'https://www.faa.gov/aircraft-registry/test-release.zip',
+              ?, ?, ?, 'MASTER.txt', ?, 'ACFTREF.txt', ?, 'ENGINE.txt', ?
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(evidence_source_id)
+        .bind(&archive_sha256)
+        .bind("b".repeat(64))
+        .bind("c".repeat(64))
+        .bind("d".repeat(64))
+        .bind("e".repeat(64))
+        .bind("f".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO faa_registry_aircraft (
+              snapshot_id, n_number, aircraft_code, year_manufactured,
+              source_record_sha256
+            ) VALUES (?, 'N123AB', 'TEST-1', 2020, ?)
+            "#,
+        )
+        .bind(snapshot_id)
+        .bind("0".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO faa_registry_coverage (snapshot_id, n_number, lookup_status) VALUES (?, 'N123AB', 'matched')",
+        )
+        .bind(snapshot_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn seed_listing(db: &AppDb, source_url: &str) -> i64 {

@@ -530,6 +530,17 @@ blank indicators, `ambiguous`, and every weaker-confidence answer continue into
 ordinary grounding. All supplied context is explicitly labeled untrusted; the
 classifier cannot approve or create a catalog identity.
 
+Automatic review applies the same classifier policy to a narrower terminal
+validation case. A retained current-schema observation whose capability array,
+quantity, source confidence, installation action, and replacement graph are
+structurally valid, but whose model is deterministically a generic label, gets
+exactly the one tools-disabled classifier request before it is retained as
+invalid. Only the same exact-shape `generic` + `very_high` +
+`model_identifies_single_unit=false` decision with non-empty indicators may
+discard it. Every other response or provider failure remains pending review and
+does not enter grounded catalog resolution. Structurally malformed observations
+remain pending without a classifier request.
+
 1. Gemini returns `existing_match`, `propose_new`, `reject`, or `unresolved`
    with authoritative identity evidence. Existing IDs are schema-constrained
    to the supplied shortlist.
