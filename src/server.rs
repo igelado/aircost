@@ -25,10 +25,11 @@ use crate::aircraft::{
 use crate::aircraft::{faa::drs::DrsClient, verification::AircraftVerificationServices};
 use crate::avionics::catalog::{
     attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
-    resolve_avionics_identity_for_review_preflight,
-    verify_approved_avionics_product_source_without_gemini, ApprovedAvionicsProductSourceRequest,
-    ApprovedProductSourceVerificationOutcome, AvionicsIdentityOutcome, AvionicsIdentityRequest,
-    CatalogError, ReviewPreflightAvionicsIdentityOutcome,
+    exact_product_identity_signal_is_present, resolve_avionics_identity_for_review_preflight,
+    verify_approved_avionics_product_source_without_gemini, ApprovedAvionicsIdentity,
+    ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerificationOutcome,
+    AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError, ReviewDirectSourceVerification,
+    ReviewPreflightAvionicsIdentityOutcome,
 };
 use crate::avionics::consolidation::{
     consolidate_avionics_models_with_human_review,
@@ -42,6 +43,7 @@ use crate::avionics::inspection::{
 use crate::db::AppDb;
 use crate::extract::{preview_listing_url, preview_manual_listing, GeminiListingExtractor};
 use crate::gemini::config::GeminiRuntimeConfig;
+use crate::gemini::curation::workflow::MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS;
 use crate::gemini::interactions::GeminiInteractionsClient;
 use crate::gemini::source::ProductIdentityTarget;
 use crate::gemini::usage::Store as GeminiUsageStore;
@@ -1785,6 +1787,41 @@ fn require_current_review_revisions(
     Ok(())
 }
 
+fn grounded_review_identity_evidence(
+    reviewer_excerpt: &str,
+    approved: &ApprovedAvionicsIdentity,
+    direct_source_verification: Option<&ReviewDirectSourceVerification>,
+) -> Result<String, ApiError> {
+    let grounded_evidence = approved.evidence.trim();
+    if grounded_evidence.chars().count() <= MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS {
+        return Ok(grounded_evidence.to_string());
+    }
+
+    let reviewer_excerpt = reviewer_excerpt.trim();
+    let reviewer_excerpt_is_eligible = reviewer_excerpt.chars().count()
+        <= MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS
+        && exact_product_identity_signal_is_present(
+            reviewer_excerpt,
+            &approved.model,
+            &approved.manufacturer_identifier,
+        )
+        && direct_source_verification.is_some_and(|verification| {
+            verification.verifies_exact_anchor(&approved.evidence_url, reviewer_excerpt)
+        });
+    if !reviewer_excerpt_is_eligible {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "grounded identity evidence for {} {} exceeded the review excerpt limit, and the submitted bounded excerpt was not verified against that admitted final source",
+                approved.manufacturer, approved.model
+            ),
+        )
+        .with_code("avionics_grounding_failed"));
+    }
+
+    Ok(reviewer_excerpt.to_string())
+}
+
 /// A human corroboration can authorize a catalog write, but it cannot bypass
 /// the same grounded identity and collision checks used by automatic
 /// ingestion. The preflight is deliberately outside the write transaction:
@@ -1861,6 +1898,7 @@ async fn ground_review_product_creations(
         let promotion_candidate_id = (*unreviewed_avionics_model_id).or(staged_candidate_id);
         let submitted_identifier_kind = manufacturer_identifier_kind.trim().to_string();
         let submitted_identifier = normalize_avionics_identifier(manufacturer_identifier);
+        let submitted_identity_evidence = identity_evidence_text.trim().to_string();
         let request = AvionicsIdentityRequest {
             aircraft_manufacturer: listing.aircraft.manufacturer.clone(),
             aircraft_model: listing.aircraft.model.clone(),
@@ -1891,7 +1929,7 @@ async fn ground_review_product_creations(
                 manufacturer.clone(),
                 model.clone(),
                 manufacturer_identifier.clone(),
-                identity_evidence_text.clone(),
+                submitted_identity_evidence.clone(),
             ],
             manufacturer: manufacturer.clone(),
             model: model.clone(),
@@ -1908,7 +1946,7 @@ async fn ground_review_product_creations(
                     )
                     .with_code("avionics_grounding_failed")
                 })?;
-        let approved = match outcome {
+        let (approved, direct_source_verification) = match outcome {
             ReviewPreflightAvionicsIdentityOutcome::CatalogConsolidated(approved) => {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
@@ -1919,8 +1957,13 @@ async fn ground_review_product_creations(
                 )
                 .with_code("avionics_catalog_consolidated"));
             }
-            ReviewPreflightAvionicsIdentityOutcome::Preview(outcome) => match outcome {
-                AvionicsIdentityOutcome::Approved(approved) => approved,
+            ReviewPreflightAvionicsIdentityOutcome::Preview {
+                outcome,
+                direct_source_verification,
+            } => match outcome {
+                AvionicsIdentityOutcome::Approved(approved) => {
+                    (approved, direct_source_verification)
+                }
                 AvionicsIdentityOutcome::Rejected { reason } => {
                     return Err(ApiError::new(
                         StatusCode::UNPROCESSABLE_ENTITY,
@@ -1992,8 +2035,15 @@ async fn ground_review_product_creations(
             }));
         }
 
+        let identity_evidence = grounded_review_identity_evidence(
+            &submitted_identity_evidence,
+            &approved,
+            direct_source_verification.as_ref(),
+        )?;
+
         // Persist exactly the independently grounded canonical identity and
-        // evidence, never unchecked reviewer-entered catalog fields.
+        // source metadata. The reviewer excerpt is retained only when the
+        // admitted direct fetch proved that exact bounded anchor.
         *manufacturer = approved.manufacturer;
         *model = approved.model;
         *capabilities = approved.avionics_types;
@@ -2001,7 +2051,7 @@ async fn ground_review_product_creations(
         *manufacturer_identifier = approved.manufacturer_identifier;
         *identity_source_url = approved.evidence_url;
         *identity_source_title = approved.evidence_title;
-        *identity_evidence_text = approved.evidence;
+        *identity_evidence_text = identity_evidence;
         *grounded_claim_source_urls = approved.grounded_claim_source_urls;
     }
     Ok(())
@@ -2336,16 +2386,17 @@ mod tests {
     use super::{
         approve_replacement_products_handler, attest_review_avionics_product_handler,
         avionics_options_handler, cancel_verification_run_handler, create_verification_run_handler,
-        get_listing_review, get_verification_run_handler, list_avionics_handler,
-        list_verification_run_items_handler, process_claimed_verification_run_item,
-        proposed_identity_matches_consolidation_members, require_current_review_revisions,
-        required_idempotency_key, start_plugin_submission_job,
+        get_listing_review, get_verification_run_handler, grounded_review_identity_evidence,
+        list_avionics_handler, list_verification_run_items_handler,
+        process_claimed_verification_run_item, proposed_identity_matches_consolidation_members,
+        require_current_review_revisions, required_idempotency_key, start_plugin_submission_job,
         use_existing_review_avionics_handler, verification_run_api_error,
         verification_run_failure_reason, verify_existing_review_avionics_handler, AppState,
         AttestReviewAvionicsProductRequest, CreateVerificationRunHttpRequest,
         ReviewerListingPreflightQuery, UseExistingReviewAvionicsRequest,
         VerificationRunItemsHttpQuery, VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
     };
+    use crate::avionics::catalog::{ApprovedAvionicsIdentity, ReviewDirectSourceVerification};
     use crate::avionics::inspection::AvionicsCatalogQuery;
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -2376,6 +2427,59 @@ mod tests {
     };
     use crate::valuation::store::{ServingValuationState, ServingValuationStatus};
 
+    #[test]
+    fn oversized_grounded_review_evidence_uses_only_the_verified_bounded_anchor() {
+        let final_source_url = "https://static.garmin.com/manuals/gdc74a.pdf";
+        let reviewer_excerpt = "Garmin identifies GDC 74A by manufacturer model number GDC 74A.";
+        let approved = ApprovedAvionicsIdentity {
+            id: 0,
+            manufacturer: "Garmin".to_string(),
+            model: "GDC 74A".to_string(),
+            avionics_types: vec!["Air data computer".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "GDC 74A".to_string(),
+            evidence_url: final_source_url.to_string(),
+            evidence_title: "Garmin GDC 74A installation manual".to_string(),
+            evidence: format!(
+                "Garmin identifies GDC 74A by manufacturer model number GDC 74A. {}",
+                "Publisher details. ".repeat(8)
+            ),
+            reason: "The admitted manufacturer source confirms the exact identity.".to_string(),
+            grounded_claim_source_urls: vec![final_source_url.to_string()],
+        };
+        assert!(approved.evidence.chars().count() > 128);
+
+        let verified = ReviewDirectSourceVerification::for_test(final_source_url, reviewer_excerpt);
+        assert_eq!(
+            grounded_review_identity_evidence(reviewer_excerpt, &approved, Some(&verified),)
+                .expect("the exact freshly verified publisher anchor remains eligible"),
+            reviewer_excerpt
+        );
+
+        let unverified =
+            grounded_review_identity_evidence(reviewer_excerpt, &approved, None).unwrap_err();
+        assert_eq!(unverified.code, Some("avionics_grounding_failed"));
+
+        let wrong_anchor = ReviewDirectSourceVerification::for_test(
+            final_source_url,
+            "Garmin identifies GMU 44 by manufacturer model number GMU 44.",
+        );
+        let mismatched =
+            grounded_review_identity_evidence(reviewer_excerpt, &approved, Some(&wrong_anchor))
+                .unwrap_err();
+        assert_eq!(mismatched.code, Some("avionics_grounding_failed"));
+
+        let wrong_source = ReviewDirectSourceVerification::for_test(
+            "https://attacker.example/gdc74a.pdf",
+            reviewer_excerpt,
+        );
+        assert!(grounded_review_identity_evidence(
+            reviewer_excerpt,
+            &approved,
+            Some(&wrong_source),
+        )
+        .is_err());
+    }
     fn test_state(db: AppDb) -> AppState {
         AppState {
             db,

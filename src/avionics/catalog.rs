@@ -349,8 +349,43 @@ pub enum AvionicsIdentityOutcome {
 /// catalog-only transaction and tells the caller to reload the rewritten
 /// review before submitting a listing decision.
 pub(crate) enum ReviewPreflightAvionicsIdentityOutcome {
-    Preview(AvionicsIdentityOutcome),
+    Preview {
+        outcome: AvionicsIdentityOutcome,
+        direct_source_verification: Option<ReviewDirectSourceVerification>,
+    },
     CatalogConsolidated(ApprovedAvionicsIdentity),
+}
+
+/// Server-owned receipt proving which immutable review anchors were matched
+/// against a fresh fetch from the admitted authoritative source.
+///
+/// This is intentionally transient. It authorizes retaining one exact,
+/// bounded reviewer excerpt for the current review request; it is not durable
+/// catalog evidence and cannot be populated from client JSON.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewDirectSourceVerification {
+    final_source_urls: Vec<String>,
+    verified_identity_anchors: Vec<String>,
+}
+
+impl ReviewDirectSourceVerification {
+    pub(crate) fn verifies_exact_anchor(&self, final_source_url: &str, anchor: &str) -> bool {
+        self.final_source_urls
+            .iter()
+            .any(|source_url| source_url == final_source_url)
+            && self
+                .verified_identity_anchors
+                .iter()
+                .any(|verified| verified == anchor)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(final_source_url: &str, verified_identity_anchor: &str) -> Self {
+        Self {
+            final_source_urls: vec![final_source_url.to_string()],
+            verified_identity_anchors: vec![verified_identity_anchor.to_string()],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,6 +409,8 @@ struct IdentityResolutionExecution {
     mode: IdentityPersistenceMode,
     grounded_exact_model_consolidated: bool,
     pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
+    review_direct_source_verification: Option<ReviewDirectSourceVerification>,
+    review_direct_source_verification_conflicted: bool,
 }
 
 impl IdentityResolutionExecution {
@@ -382,7 +419,52 @@ impl IdentityResolutionExecution {
             mode,
             grounded_exact_model_consolidated: false,
             pending_review_revision_receipts: Vec::new(),
+            review_direct_source_verification: None,
+            review_direct_source_verification_conflicted: false,
         }
+    }
+
+    fn record_review_direct_source_verification(
+        &mut self,
+        plan: &IdentityGroundingPlan,
+        response: &GroundedJsonResponse,
+    ) {
+        let IdentityGroundingPlan::Direct(plan) = plan else {
+            return;
+        };
+        if self.review_direct_source_verification_conflicted
+            || plan.requirement != DirectSourceRequirement::Explicit
+            || !response.authoritative_direct_source_verified
+            || response.authoritative_direct_source_final_urls.is_empty()
+        {
+            return;
+        }
+
+        if self
+            .review_direct_source_verification
+            .as_ref()
+            .is_some_and(|verification| {
+                verification.verified_identity_anchors != plan.identity_anchors
+            })
+        {
+            self.review_direct_source_verification = None;
+            self.review_direct_source_verification_conflicted = true;
+            return;
+        }
+        let verification = self
+            .review_direct_source_verification
+            .get_or_insert_with(|| ReviewDirectSourceVerification {
+                final_source_urls: Vec::new(),
+                verified_identity_anchors: plan.identity_anchors.clone(),
+            });
+        verification.final_source_urls.extend(
+            response
+                .authoritative_direct_source_final_urls
+                .iter()
+                .cloned(),
+        );
+        verification.final_source_urls.sort();
+        verification.final_source_urls.dedup();
     }
 }
 
@@ -403,9 +485,13 @@ fn grounded_consolidation_preview_block(
 fn review_preflight_outcome(
     outcome: AvionicsIdentityOutcome,
     grounded_exact_model_consolidated: bool,
+    direct_source_verification: Option<ReviewDirectSourceVerification>,
 ) -> CatalogResult<ReviewPreflightAvionicsIdentityOutcome> {
     if !grounded_exact_model_consolidated {
-        return Ok(ReviewPreflightAvionicsIdentityOutcome::Preview(outcome));
+        return Ok(ReviewPreflightAvionicsIdentityOutcome::Preview {
+            outcome,
+            direct_source_verification,
+        });
     }
     let AvionicsIdentityOutcome::Approved(approved) = outcome else {
         return Err(CatalogError::Validation(
@@ -646,7 +732,11 @@ pub(crate) async fn resolve_avionics_identity_for_review_preflight(
         IdentityResolutionExecution::new(IdentityPersistenceMode::ApplyGroundedConsolidationOnly);
     let outcome =
         resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
-    review_preflight_outcome(outcome, execution.grounded_exact_model_consolidated)
+    review_preflight_outcome(
+        outcome,
+        execution.grounded_exact_model_consolidated,
+        execution.review_direct_source_verification,
+    )
 }
 
 /// Run only the single tools-disabled generic-label discard gate for a raw
@@ -1845,6 +1935,7 @@ async fn resolve_avionics_identity_with_write_mode(
         &grounded_response,
     )
     .await?;
+    execution.record_review_direct_source_verification(&grounding_plan, &grounded_response);
     let verified_evidence = grounded_response.verified_evidence.clone();
     let mut response = grounded_response.value.clone();
     let mut issues = resolution_issues_with_direct_source_proofs(
@@ -1903,6 +1994,7 @@ async fn resolve_avionics_identity_with_write_mode(
             &grounded_response,
         )
         .await?;
+        execution.record_review_direct_source_verification(&grounding_plan, &grounded_response);
         response = grounded_response.value.clone();
         issues = resolution_issues_with_direct_source_proofs(
             &context,
@@ -2059,6 +2151,7 @@ async fn resolve_verified_identity(
         &review_response,
     )
     .await?;
+    execution.record_review_direct_source_verification(grounding_plan, &review_response);
     let mut domain_issues = collision_response_issues(
         context,
         &proposed,
@@ -2113,6 +2206,7 @@ async fn resolve_verified_identity(
             &review_response,
         )
         .await?;
+        execution.record_review_direct_source_verification(grounding_plan, &review_response);
         domain_issues = collision_response_issues(
             context,
             &proposed,
@@ -5705,7 +5799,7 @@ mod tests {
         AvionicsModelIdentityRelation, AvionicsUnitResolutionCandidate,
         AvionicsUnitResolutionContext, CollisionCorrectionPlan, DirectSourceRequirement,
         GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
-        IdentityPersistenceMode, KnownApprovedAvionicsCandidate,
+        IdentityPersistenceMode, IdentityResolutionExecution, KnownApprovedAvionicsCandidate,
         PendingProductAttestationCommitGuard, ReviewCatalogCandidate,
         ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
         KNOWN_APPROVED_SELECT_SQL,
@@ -6084,20 +6178,25 @@ mod tests {
     #[test]
     fn manual_preflight_distinguishes_preview_from_committed_catalog_consolidation() {
         let preview_identity = approved_identity_from_verified(0, &verified_identity());
-        let preview =
-            review_preflight_outcome(AvionicsIdentityOutcome::Approved(preview_identity), false)
-                .unwrap();
+        let preview = review_preflight_outcome(
+            AvionicsIdentityOutcome::Approved(preview_identity),
+            false,
+            None,
+        )
+        .unwrap();
         assert!(matches!(
             preview,
-            ReviewPreflightAvionicsIdentityOutcome::Preview(AvionicsIdentityOutcome::Approved(
-                ApprovedAvionicsIdentity { id: 0, .. }
-            ))
+            ReviewPreflightAvionicsIdentityOutcome::Preview {
+                outcome: AvionicsIdentityOutcome::Approved(ApprovedAvionicsIdentity { id: 0, .. }),
+                direct_source_verification: None,
+            }
         ));
 
         let consolidated_identity = approved_identity_from_verified(42, &verified_identity());
         let consolidated = review_preflight_outcome(
             AvionicsIdentityOutcome::Approved(consolidated_identity),
             true,
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -6112,8 +6211,64 @@ mod tests {
                 reason: "unexpected".to_string(),
             },
             true,
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn conflicting_direct_source_anchor_receipts_fail_closed_per_execution() {
+        let direct_plan = |anchors: &[&str]| {
+            IdentityGroundingPlan::Direct(AuthoritativeDirectSourcePlan {
+                source_urls: vec![
+                    "https://static.garmin.com/pumac/GDC74A_InstallationManual.pdf".to_string(),
+                ],
+                identity_anchors: anchors.iter().map(|anchor| (*anchor).to_string()).collect(),
+                admission: ManufacturerSourceOriginAdmission {
+                    avionics_manufacturer_id: 1,
+                    effective_manufacturer_identity_id: 2,
+                    canonical_origins: vec!["https://static.garmin.com".to_string()],
+                },
+                requirement: DirectSourceRequirement::Explicit,
+            })
+        };
+        let final_url = "https://static.garmin.com/pumac/GDC74A_InstallationManual.pdf";
+        let first_anchor = "Garmin identifies GDC 74A by manufacturer model number GDC 74A.";
+        let first_plan = direct_plan(&["Garmin", "GDC 74A", first_anchor]);
+        let mut execution = IdentityResolutionExecution::new(
+            IdentityPersistenceMode::ApplyGroundedConsolidationOnly,
+        );
+        execution.record_review_direct_source_verification(
+            &first_plan,
+            &direct_source_response(&[final_url]),
+        );
+        assert!(execution
+            .review_direct_source_verification
+            .as_ref()
+            .is_some_and(|verification| {
+                verification.verifies_exact_anchor(final_url, first_anchor)
+            }));
+
+        let conflicting_plan = direct_plan(&[
+            "Garmin",
+            "GMU 44",
+            "Garmin identifies GMU 44 by manufacturer model number GMU 44.",
+        ]);
+        execution.record_review_direct_source_verification(
+            &conflicting_plan,
+            &direct_source_response(&[final_url]),
+        );
+        assert!(execution.review_direct_source_verification.is_none());
+        assert!(execution.review_direct_source_verification_conflicted);
+
+        execution.record_review_direct_source_verification(
+            &first_plan,
+            &direct_source_response(&[final_url]),
+        );
+        assert!(
+            execution.review_direct_source_verification.is_none(),
+            "a later matching response cannot repopulate a receipt after conflicting anchors"
+        );
     }
 
     fn known_candidate(id: i64, model: &str) -> KnownApprovedAvionicsCandidate {
