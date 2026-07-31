@@ -378,6 +378,29 @@ fn avionics_identity_evidence_scope(
     )
 }
 
+fn avionics_metadata_evidence_scope(
+    context: &AvionicsMetadataContext<'_>,
+) -> Result<EvidenceScope> {
+    let mut avionics_types = context.avionics_types.to_vec();
+    avionics_types.sort_by(|left, right| {
+        normalize_name(left)
+            .cmp(&normalize_name(right))
+            .then_with(|| left.cmp(right))
+    });
+    let subject = json!({
+        "manufacturer": context.manufacturer,
+        "model": context.model,
+        "avionics_types": avionics_types,
+    });
+    let value_scope = json!({
+        "value_reference_year": context.value_reference_year,
+    });
+    EvidenceScope::new(
+        format!("avionics-metadata:{}", json_sha256(&subject)?),
+        format!("avionics-metadata-values:{}", json_sha256(&value_scope)?),
+    )
+}
+
 fn avionics_collision_evidence_scope(
     context: &AvionicsCatalogCollisionReviewContext,
 ) -> Result<EvidenceScope> {
@@ -848,6 +871,7 @@ impl GeminiListingExtractor {
         &self,
         context: &AvionicsMetadataContext<'_>,
     ) -> Result<GroundedJsonResponse> {
+        let evidence_scope = avionics_metadata_evidence_scope(context)?;
         self.generate_avionics_grounded_json(
             "avionics_metadata",
             build_avionics_metadata_prompt(context),
@@ -856,8 +880,41 @@ impl GeminiListingExtractor {
             Some(AVIONICS_SINGLE_PRODUCT_MAX_GOOGLE_SEARCH_QUERIES),
             gemini_avionics_metadata_response_schema(),
             GeminiTask::AvionicsStructure,
+            Some(evidence_scope),
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            AuthorizedDirectSourcePolicy::Required,
+        )
+        .await
+    }
+
+    pub(crate) async fn correct_avionics_metadata_reusing(
+        &self,
+        context: &AvionicsMetadataContext<'_>,
+        previous_response: &Value,
+        validation_failure: &str,
+        evidence: &VerifiedEvidenceDossier,
+    ) -> Result<GroundedJsonResponse> {
+        let evidence_scope = avionics_metadata_evidence_scope(context)?;
+        self.generate_avionics_grounded_json(
+            "avionics_metadata_correction",
+            build_avionics_metadata_correction_prompt(
+                context,
+                previous_response,
+                validation_failure,
+            ),
             None,
             None,
+            None,
+            gemini_avionics_metadata_response_schema(),
+            GeminiTask::AvionicsStructure,
+            Some(evidence_scope),
+            Some(AvionicsEvidenceReuse::ExactSingleValidationFallback(
+                evidence,
+            )),
             &[],
             &[],
             &[],
@@ -2033,6 +2090,29 @@ value_reference_year: {}",
         serde_json::to_string(context.avionics_types).unwrap(),
         serde_json::to_string(CURATED_AVIONICS_TYPES).unwrap(),
         context.value_reference_year,
+    )
+}
+
+fn build_avionics_metadata_correction_prompt(
+    context: &AvionicsMetadataContext<'_>,
+    previous_response: &Value,
+    validation_failure: &str,
+) -> String {
+    format!(
+        "Correct one rejected avionics metadata response using only the already-verified evidence dossier. This is a tools-disabled structure correction: do not search, retrieve, infer a new source, or add a fact absent from that dossier. Return one complete replacement object under the response schema.\n\n\
+Original metadata request (authoritative):\n{}\n\n\
+Rejected response (untrusted model output):\n{}\n\n\
+Exact local validation failure:\n{}\n\n\
+Correction requirements:\n\
+- Fix the stated failure, then recheck every field against the original request.\n\
+- introduced_year, installed_value_contribution_usd, and replacement_cost_usd must each be stated literally as the same number in its matching exact publisher evidence span. Never edit, paraphrase, or invent evidence text to make a returned number appear supported.\n\
+- estimated_unit_value_usd must repeat installed_value_contribution_usd, and replacement_cost_usd cannot be below installed_value_contribution_usd.\n\
+- Keep every source URL within the verified dossier allow-list and keep every evidence field bound to one exact verified source span. The existing source-URL and exact-span validators remain mandatory.\n\
+- If the verified dossier cannot support a valid complete object, do not guess or cite a different source.",
+        build_avionics_metadata_prompt(context),
+        serde_json::to_string_pretty(previous_response)
+            .expect("avionics metadata response must serialize"),
+        validation_failure.trim(),
     )
 }
 
@@ -4002,13 +4082,14 @@ mod tests {
         avionics_collision_direct_source_relevance_hints, avionics_collision_evidence_scope,
         avionics_direct_source_chain_scopes, avionics_direct_source_product_identity_requirements,
         avionics_identity_direct_source_relevance_hints, avionics_identity_evidence_scope,
-        build_avionics_approved_candidate_adjudication_prompt,
+        avionics_metadata_evidence_scope, build_avionics_approved_candidate_adjudication_prompt,
         build_avionics_catalog_collision_research_prompt,
         build_avionics_catalog_collision_review_correction_prompt,
-        build_avionics_catalog_collision_review_prompt, build_avionics_metadata_prompt,
-        build_avionics_unit_concreteness_prompt, build_avionics_unit_resolution_correction_prompt,
-        build_avionics_unit_resolution_prompt, build_avionics_unit_resolution_research_prompt,
-        build_extraction_prompt, configure_avionics_authoritative_direct_sources,
+        build_avionics_catalog_collision_review_prompt, build_avionics_metadata_correction_prompt,
+        build_avionics_metadata_prompt, build_avionics_unit_concreteness_prompt,
+        build_avionics_unit_resolution_correction_prompt, build_avionics_unit_resolution_prompt,
+        build_avionics_unit_resolution_research_prompt, build_extraction_prompt,
+        configure_avionics_authoritative_direct_sources,
         effective_avionics_product_identity_requirements, effective_avionics_publisher_anchors,
         gemini_aircraft_spec_metadata_response_schema,
         gemini_avionics_approved_candidate_adjudication_response_schema,
@@ -4641,6 +4722,79 @@ mod tests {
         });
         assert!(metadata_prompt.contains("A TSO/ETSO authorization"));
         assert!(metadata_prompt.contains("not a complete avionics catalog"));
+    }
+
+    #[test]
+    fn avionics_metadata_evidence_scope_is_exact_and_capability_order_stable() {
+        let first_types = vec!["Transponder".to_string(), "GPS".to_string()];
+        let reordered_types = vec!["GPS".to_string(), "Transponder".to_string()];
+        let first = avionics_metadata_evidence_scope(&AvionicsMetadataContext {
+            manufacturer: "Garmin",
+            model: "GTX 345R",
+            avionics_types: &first_types,
+            value_reference_year: 2026,
+        })
+        .unwrap();
+        let reordered = avionics_metadata_evidence_scope(&AvionicsMetadataContext {
+            manufacturer: "Garmin",
+            model: "GTX 345R",
+            avionics_types: &reordered_types,
+            value_reference_year: 2026,
+        })
+        .unwrap();
+        assert_eq!(first, reordered);
+
+        let different_year = avionics_metadata_evidence_scope(&AvionicsMetadataContext {
+            manufacturer: "Garmin",
+            model: "GTX 345R",
+            avionics_types: &first_types,
+            value_reference_year: 2027,
+        })
+        .unwrap();
+        assert_eq!(first.subject_key(), different_year.subject_key());
+        assert_ne!(first.scope_key(), different_year.scope_key());
+
+        let different_model = avionics_metadata_evidence_scope(&AvionicsMetadataContext {
+            manufacturer: "Garmin",
+            model: "GTX 345",
+            avionics_types: &first_types,
+            value_reference_year: 2026,
+        })
+        .unwrap();
+        assert_ne!(first.subject_key(), different_model.subject_key());
+    }
+
+    #[test]
+    fn avionics_metadata_correction_prompt_preserves_contract_and_exact_evidence_gates() {
+        let observed_types = vec!["Transponder".to_string()];
+        let context = AvionicsMetadataContext {
+            manufacturer: "Garmin",
+            model: "GTX 345R",
+            avionics_types: &observed_types,
+            value_reference_year: 2026,
+        };
+        let previous = json!({
+            "installed_value_contribution_usd": 5000,
+            "installed_value_evidence": "Working units sell for $4,500."
+        });
+        let failure = "Gemini avionics installed_value_contribution_usd evidence does not state the returned value 5000";
+        let prompt = build_avionics_metadata_correction_prompt(&context, &previous, failure);
+
+        for required in [
+            "Original metadata request (authoritative)",
+            "manufacturer: Garmin",
+            "model: GTX 345R",
+            "Rejected response (untrusted model output)",
+            failure,
+            "tools-disabled structure correction",
+            "do not search",
+            "same number in its matching exact publisher evidence span",
+            "Never edit, paraphrase, or invent evidence text",
+            "exact-span validators remain mandatory",
+        ] {
+            assert!(prompt.contains(required), "missing {required:?}");
+        }
+        assert!(prompt.contains("4500") || prompt.contains("4,500"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub(crate) mod source;
 pub mod verification;
 
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -433,15 +434,8 @@ pub async fn enrich_missing_avionics_metadata(
     let mut items = Vec::with_capacity(rows.len());
 
     for row in rows {
-        let response = extractor
-            .estimate_avionics_metadata(&AvionicsMetadataContext {
-                manufacturer: &row.manufacturer,
-                model: &row.model,
-                avionics_types: &row.avionics_types,
-                value_reference_year,
-            })
-            .await?;
-        let mut item = enrichment_item_from_response(&row, &response.value)?;
+        let mut item =
+            estimate_avionics_enrichment_item(extractor, &row, value_reference_year).await?;
         resolve_enrichment_item_identities(
             db,
             extractor,
@@ -485,15 +479,8 @@ pub async fn enrich_listing_avionics_metadata(
 
     for row in rows {
         let source_model_id = row.id;
-        let response = extractor
-            .estimate_avionics_metadata(&AvionicsMetadataContext {
-                manufacturer: &row.manufacturer,
-                model: &row.model,
-                avionics_types: &row.avionics_types,
-                value_reference_year,
-            })
-            .await?;
-        let mut item = enrichment_item_from_response(&row, &response.value)?;
+        let mut item =
+            estimate_avionics_enrichment_item(extractor, &row, value_reference_year).await?;
         resolve_enrichment_item_identities(
             db,
             extractor,
@@ -520,6 +507,61 @@ pub async fn enrich_listing_avionics_metadata(
         value_reference_year,
         items,
     })
+}
+
+async fn estimate_avionics_enrichment_item(
+    extractor: &GeminiListingExtractor,
+    row: &AvionicsModelReferenceRow,
+    value_reference_year: i64,
+) -> StoreResult<AvionicsEnrichmentItem> {
+    let context = AvionicsMetadataContext {
+        manufacturer: &row.manufacturer,
+        model: &row.model,
+        avionics_types: &row.avionics_types,
+        value_reference_year,
+    };
+    let response = extractor.estimate_avionics_metadata(&context).await?;
+    let evidence = response.verified_evidence.map(|verified| verified.dossier);
+    parse_with_one_evidence_correction(
+        response.value,
+        evidence,
+        |value| enrichment_item_from_response(row, value),
+        |previous_response, evidence, validation_error| async move {
+            let corrected = extractor
+                .correct_avionics_metadata_reusing(
+                    &context,
+                    &previous_response,
+                    &validation_error.to_string(),
+                    &evidence,
+                )
+                .await?;
+            Ok::<Value, AvionicsStoreError>(corrected.value)
+        },
+    )
+    .await
+}
+
+async fn parse_with_one_evidence_correction<T, E, Parse, Correct, Correction>(
+    initial_value: Value,
+    evidence: Option<E>,
+    parse: Parse,
+    correct: Correct,
+) -> StoreResult<T>
+where
+    Parse: Fn(&Value) -> StoreResult<T>,
+    Correct: FnOnce(Value, E, AvionicsStoreError) -> Correction,
+    Correction: Future<Output = StoreResult<Value>>,
+{
+    match parse(&initial_value) {
+        Ok(value) => Ok(value),
+        Err(validation_error) => {
+            let Some(evidence) = evidence else {
+                return Err(validation_error);
+            };
+            let corrected_value = correct(initial_value, evidence, validation_error).await?;
+            parse(&corrected_value)
+        }
+    }
 }
 
 pub async fn curate_avionics_models_with_gemini(
@@ -2528,12 +2570,14 @@ mod tests {
         default_avionics_item_from_response, enrich_listing_avionics_metadata,
         enrich_model_year_avionics_and_price_point_for_listing, enrichment_item_from_response,
         has_material_price_discontinuity, included_components_from_response,
-        model_year_profile_item_from_response, price_evidence_is_stronger,
-        validate_avionics_values, AircraftModelYearProfileRow, AvionicsModelReferenceRow,
+        model_year_profile_item_from_response, parse_with_one_evidence_correction,
+        price_evidence_is_stronger, validate_avionics_values, AircraftModelYearProfileRow,
+        AvionicsModelReferenceRow, AvionicsStoreError,
     };
     use crate::db::{AppDb, DatabaseBackend};
     use crate::extract::{AircraftPricePointContext, GeminiListingExtractor};
     use serde_json::json;
+    use std::cell::Cell;
 
     #[tokio::test]
     async fn listing_enrichment_paths_reject_before_gemini_and_persistence() {
@@ -2614,6 +2658,88 @@ mod tests {
         assert!(validate_avionics_values(12_000.0, 12_000.0, 25_000.0).is_ok());
         assert!(validate_avionics_values(25_000.0, 12_000.0, 25_000.0).is_err());
         assert!(validate_avionics_values(12_000.0, 12_000.0, 10_000.0).is_err());
+    }
+
+    #[tokio::test]
+    async fn metadata_semantic_correction_accepts_one_corrected_response() {
+        let correction_calls = Cell::new(0);
+        let parsed = parse_with_one_evidence_correction(
+            json!({"supported_value": 5000}),
+            Some(()),
+            |value| {
+                (value["supported_value"] == 4500)
+                    .then_some(4500)
+                    .ok_or_else(|| {
+                        AvionicsStoreError::Model(
+                            "numeric evidence does not state the returned value".to_string(),
+                        )
+                    })
+            },
+            |previous, (), validation_error| {
+                correction_calls.set(correction_calls.get() + 1);
+                assert_eq!(previous["supported_value"], 5000);
+                assert!(validation_error
+                    .to_string()
+                    .contains("numeric evidence does not state"));
+                std::future::ready(Ok(json!({"supported_value": 4500})))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parsed, 4500);
+        assert_eq!(correction_calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_semantic_correction_never_opens_a_second_retry() {
+        let correction_calls = Cell::new(0);
+        let error = parse_with_one_evidence_correction(
+            json!({"supported_value": 5000}),
+            Some(()),
+            |value| {
+                (value["supported_value"] == 4500)
+                    .then_some(4500)
+                    .ok_or_else(|| {
+                        AvionicsStoreError::Model(format!(
+                            "unsupported value {}",
+                            value["supported_value"]
+                        ))
+                    })
+            },
+            |_, (), _| {
+                correction_calls.set(correction_calls.get() + 1);
+                std::future::ready(Ok(json!({"supported_value": 4000})))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported value 4000"));
+        assert_eq!(correction_calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn valid_metadata_spends_no_correction_budget() {
+        let correction_calls = Cell::new(0);
+        let parsed = parse_with_one_evidence_correction(
+            json!({"supported_value": 4500}),
+            Some(()),
+            |value| {
+                (value["supported_value"] == 4500)
+                    .then_some(4500)
+                    .ok_or_else(|| AvionicsStoreError::Model("invalid metadata".to_string()))
+            },
+            |_, (), _| {
+                correction_calls.set(correction_calls.get() + 1);
+                std::future::ready(Ok(json!({"supported_value": 4500})))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(parsed, 4500);
+        assert_eq!(correction_calls.get(), 0);
     }
 
     #[test]
