@@ -511,6 +511,24 @@ review only when the response's listing context explicitly reports a current
 pending review. Reference-only rows therefore remain visible without a
 misleading review action.
 
+The Pipeline overview translates the current preflight stages into four
+operator-facing backlog categories without making provider calls:
+
+- **Current avionics review** has retained current-schema observations ready
+  for local catalog checks, with Gemini used only if those checks cannot decide.
+- **One-time avionics re-extraction** identifies legacy retained captures that
+  must be extracted once into the current observation shape.
+- **FAA admission blocked** identifies aircraft rejected by mandatory FAA
+  admission; their avionics checks remain paused until the registration or
+  serial identity is corrected.
+- **Factory reference pending** identifies listings whose aircraft and avionics
+  review is complete but whose model-year reference configuration is not yet
+  available for valuation.
+
+These counts use only the existing aircraft, avionics, and finalization statuses.
+Rows with other blocked or transitional states remain visible in the Pipeline
+table and are not forced into an inaccurate category.
+
 Pipeline request counts are estimates from the same verifier plan used by the
 administrative command. Loading or refreshing the view never calls Gemini and
 never writes domain or usage data. The summary also reports whether Gemini and

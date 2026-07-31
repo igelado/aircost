@@ -178,28 +178,11 @@
           <div class="review-message" id="review-queue-message" role="status" aria-live="polite"></div>
           <div id="review-pipeline-results" aria-busy="false">
             <section class="review-pipeline-overview" aria-label="Verification pipeline overview">
-              <div class="review-pipeline-breakdown">
-                <div>
-                  <span>Aircraft verified</span>
-                  <strong id="review-pipeline-aircraft-count">0</strong>
-                </div>
-                <div>
-                  <span>Avionics complete</span>
-                  <strong id="review-pipeline-avionics-count">0</strong>
-                </div>
-                <div>
-                  <span>Manual review available</span>
-                  <strong id="review-pipeline-manual-count">0</strong>
-                </div>
-                <div>
-                  <span>Factory reference pending</span>
-                  <strong id="review-pipeline-reference-count">0</strong>
-                </div>
-                <div>
-                  <span>Gemini expected or possible</span>
-                  <strong id="review-pipeline-gemini-count">0</strong>
-                </div>
-              </div>
+              <div
+                class="review-pipeline-categories"
+                id="review-pipeline-categories"
+                aria-label="Verification backlog categories"
+              ></div>
               <div class="review-pipeline-plan" id="review-pipeline-plan"></div>
             </section>
             <section
