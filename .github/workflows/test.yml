@@ -42,5 +42,8 @@ jobs:
       - name: Check avionics reuse-v2 migration
         run: bash tests/schema/test_avionics_product_reuse_v2.sh
 
+      - name: Check grounded avionics consolidation migration
+        run: bash tests/schema/test_avionics_grounded_exact_consolidation.sh
+
       - name: Check build
         run: cargo check

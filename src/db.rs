@@ -58,6 +58,11 @@ const AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION: &str =
 const AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT: &str =
     "3aacf958efa7fb5e24c5897cf0369d40cb506b2a22444d629ea0a76462ce1a70";
+const AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION: &str =
+    "20260810_avionics_grounded_exact_model_consolidation";
+const AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION: i64 = 1;
+const AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT: &str =
+    "36f9ff06bf42fc769508ecfe578f4b4a11f2e0072b81efebed1dee8958654f2a";
 const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION: &str =
     "20260801_avionics_authoritative_source_origins";
 const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION: i64 = 2;
@@ -1589,6 +1594,105 @@ impl AppDb {
             .await?;
         if missing_descriptive_consolidation {
             bail!(avionics_descriptive_consolidation_migration_required_message(self.kind()));
+        }
+        let missing_grounded_exact_model_consolidation_objects = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    WITH required_objects(object_type, object_name) AS (
+                      VALUES
+                        ('table', 'avionics_catalog_grounded_consolidation_authorizations'),
+                        ('table', 'avionics_catalog_grounded_consolidation_guard'),
+                        ('table', 'avionics_catalog_grounded_consolidation_claim'),
+                        ('view', 'avionics_catalog_valid_grounded_consolidation_pairs'),
+                        ('trigger', 'avionics_catalog_grounded_consolidation_authorization_validate_insert'),
+                        ('trigger', 'avionics_catalog_grounded_consolidation_authorization_immutable'),
+                        ('trigger', 'avionics_catalog_grounded_consolidation_guard_validate_insert'),
+                        ('trigger', 'avionics_catalog_grounded_consolidation_guard_immutable'),
+                        ('trigger', 'avionics_catalog_grounded_consolidation_claim_validate_insert'),
+                        ('trigger', 'avionics_catalog_grounded_consolidation_claim_immutable')
+                    )
+                    SELECT
+                      EXISTS (
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table' AND name = 'avionics_models'
+                      )
+                      AND EXISTS (
+                        SELECT 1 FROM required_objects required
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema actual
+                          WHERE actual.type = required.object_type
+                            AND actual.name = required.object_name
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    WITH required_relations(object_name) AS (
+                      VALUES
+                        ('avionics_catalog_grounded_consolidation_authorizations'),
+                        ('avionics_catalog_grounded_consolidation_guard'),
+                        ('avionics_catalog_grounded_consolidation_claim'),
+                        ('avionics_catalog_valid_grounded_consolidation_pairs')
+                    ),
+                    required_triggers(parent_name, trigger_name) AS (
+                      VALUES
+                        ('avionics_catalog_grounded_consolidation_authorizations',
+                          'avionics_catalog_grounded_consolidation_authorization_validate_insert'),
+                        ('avionics_catalog_grounded_consolidation_authorizations',
+                          'avionics_catalog_grounded_consolidation_authorization_immutable'),
+                        ('avionics_catalog_grounded_consolidation_guard',
+                          'avionics_catalog_grounded_consolidation_guard_validate_insert'),
+                        ('avionics_catalog_grounded_consolidation_guard',
+                          'avionics_catalog_grounded_consolidation_guard_immutable'),
+                        ('avionics_catalog_grounded_consolidation_claim',
+                          'avionics_catalog_grounded_consolidation_claim_validate_insert'),
+                        ('avionics_catalog_grounded_consolidation_claim',
+                          'avionics_catalog_grounded_consolidation_claim_immutable')
+                    )
+                    SELECT
+                      to_regclass('avionics_models') IS NOT NULL
+                      AND (
+                        EXISTS (
+                          SELECT 1 FROM required_relations required
+                          WHERE to_regclass(required.object_name) IS NULL
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_triggers required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_trigger actual
+                            WHERE actual.tgrelid = to_regclass(required.parent_name)
+                              AND actual.tgname = required.trigger_name
+                              AND NOT actual.tgisinternal
+                          )
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        let missing_grounded_exact_model_consolidation =
+            missing_grounded_exact_model_consolidation_objects
+                || self
+                    .migration_contract_missing(
+                        "avionics_models",
+                        AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
+                        AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
+                        AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT,
+                    )
+                    .await?;
+        if missing_grounded_exact_model_consolidation {
+            bail!(
+                avionics_grounded_exact_model_consolidation_migration_required_message(self.kind())
+            );
         }
 
         let missing_avionics_source_origin_objects = match self.backend() {
@@ -3234,6 +3338,21 @@ fn avionics_descriptive_consolidation_migration_required_message(kind: DatabaseK
     )
 }
 
+fn avionics_grounded_exact_model_consolidation_migration_required_message(
+    kind: DatabaseKind,
+) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: the avionics catalog is missing the \
+         grounded exact-model duplicate consolidation contract; back up the database, apply \
+         `migrations/{AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION}.{backend}.sql`, \
+         then restart aircost"
+    )
+}
+
 fn avionics_authoritative_source_origins_migration_required_message(kind: DatabaseKind) -> String {
     let backend = match kind {
         DatabaseKind::Sqlite => "sqlite",
@@ -3354,6 +3473,9 @@ mod tests {
         AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT,
         AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
         AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
+        AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT,
+        AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
+        AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
         AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_FINGERPRINT,
         AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_VERSION,
         AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_MIGRATION,
@@ -3393,6 +3515,12 @@ mod tests {
         include_str!("../migrations/20260808_avionics_descriptive_consolidation.sqlite.sql");
     const AVIONICS_DESCRIPTIVE_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260808_avionics_descriptive_consolidation.postgres.sql");
+    const AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_SQLITE_MIGRATION_SQL: &str = include_str!(
+        "../migrations/20260810_avionics_grounded_exact_model_consolidation.sqlite.sql"
+    );
+    const AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str = include_str!(
+        "../migrations/20260810_avionics_grounded_exact_model_consolidation.postgres.sql"
+    );
     const AVIONICS_SOURCE_ORIGINS_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260801_avionics_authoritative_source_origins.sqlite.sql");
     const AVIONICS_SOURCE_ORIGINS_POSTGRES_MIGRATION_SQL: &str =
@@ -4229,6 +4357,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_grounded_exact_model_consolidation_contract_fails_migration_preflight() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"
+            DELETE FROM schema_migration_contracts
+            WHERE migration_name =
+                  '20260810_avionics_grounded_exact_model_consolidation'
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("a missing grounded exact-model contract must fail preflight")
+            .to_string();
+        assert!(error.contains("grounded exact-model duplicate consolidation contract"));
+        assert!(error.contains("20260810_avionics_grounded_exact_model_consolidation.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn missing_grounded_exact_model_consolidation_view_fails_migration_preflight() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("DROP VIEW avionics_catalog_valid_grounded_consolidation_pairs")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("a missing grounded exact-model view must fail preflight")
+            .to_string();
+        assert!(error.contains("grounded exact-model duplicate consolidation contract"));
+        assert!(error.contains("20260810_avionics_grounded_exact_model_consolidation.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn grounded_exact_model_consolidation_migration_repairs_and_reapplies_on_sqlite() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("DROP VIEW avionics_catalog_valid_grounded_consolidation_pairs")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            DELETE FROM schema_migration_contracts
+            WHERE migration_name =
+                  '20260810_avionics_grounded_exact_model_consolidation'
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            let mut connection = pool.acquire().await.unwrap();
+            for statement in split_sql_statements(
+                AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_SQLITE_MIGRATION_SQL,
+            ) {
+                connection.execute(statement).await.unwrap();
+            }
+        }
+        db.ensure_required_migrations()
+            .await
+            .expect("the grounded exact-model migration must repair and reapply");
+    }
+
+    #[tokio::test]
     async fn missing_avionics_source_origin_contract_fails_migration_preflight() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -4780,6 +4988,49 @@ mod tests {
             assert!(!migration.contains(
                 "NEW.canonical_model_key_snapshot = authorization_row.canonical_model_key_snapshot"
             ));
+        }
+    }
+
+    #[test]
+    fn grounded_exact_model_consolidation_contract_has_backend_parity() {
+        assert_eq!(
+            AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
+            1
+        );
+        for contract_value in [
+            AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
+            AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT,
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(contract_value));
+            assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
+            assert!(
+                AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_SQLITE_MIGRATION_SQL
+                    .contains(contract_value)
+            );
+            assert!(
+                AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_POSTGRES_MIGRATION_SQL
+                    .contains(contract_value)
+            );
+        }
+        for required_semantic in [
+            "avionics_catalog_grounded_consolidation_authorizations",
+            "avionics_catalog_grounded_consolidation_guard",
+            "avionics_catalog_grounded_consolidation_claim",
+            "avionics_catalog_valid_grounded_consolidation_pairs",
+            "expected_member_count - 1",
+            "member.normalized_name",
+            "normalized_model_key",
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(required_semantic));
+            assert!(POSTGRES_SCHEMA_SQL.contains(required_semantic));
+            assert!(
+                AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_SQLITE_MIGRATION_SQL
+                    .contains(required_semantic)
+            );
+            assert!(
+                AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_POSTGRES_MIGRATION_SQL
+                    .contains(required_semantic)
+            );
         }
     }
 

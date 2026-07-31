@@ -25,9 +25,10 @@ use crate::aircraft::{
 use crate::aircraft::{faa::drs::DrsClient, verification::AircraftVerificationServices};
 use crate::avionics::catalog::{
     attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
-    preview_avionics_identity, verify_approved_avionics_product_source_without_gemini,
-    ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerificationOutcome,
-    AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
+    resolve_avionics_identity_for_review_preflight,
+    verify_approved_avionics_product_source_without_gemini, ApprovedAvionicsProductSourceRequest,
+    ApprovedProductSourceVerificationOutcome, AvionicsIdentityOutcome, AvionicsIdentityRequest,
+    CatalogError, ReviewPreflightAvionicsIdentityOutcome,
 };
 use crate::avionics::consolidation::{
     consolidate_avionics_models_with_human_review,
@@ -1881,31 +1882,44 @@ async fn ground_review_product_creations(
             avionics_types: capabilities.clone(),
             quantity: aspect.quantity.max(1),
         };
-        let outcome = preview_avionics_identity(&state.db, extractor, &request)
-            .await
-            .map_err(|error| {
-                ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    format!("could not ground proposed avionics identity: {error}"),
-                )
-                .with_code("avionics_grounding_failed")
-            })?;
+        let outcome =
+            resolve_avionics_identity_for_review_preflight(&state.db, extractor, &request)
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("could not ground proposed avionics identity: {error}"),
+                    )
+                    .with_code("avionics_grounding_failed")
+                })?;
         let approved = match outcome {
-            AvionicsIdentityOutcome::Approved(approved) => approved,
-            AvionicsIdentityOutcome::Rejected { reason } => {
-                return Err(ApiError::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("proposed avionics product was rejected: {reason}"),
-                )
-                .with_code("avionics_identity_rejected"));
-            }
-            AvionicsIdentityOutcome::Unresolved { reason } => {
+            ReviewPreflightAvionicsIdentityOutcome::CatalogConsolidated(approved) => {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
-                    format!("proposed avionics identity remains unresolved: {reason}"),
+                    format!(
+                        "grounded review consolidated duplicate catalog rows into verified product {} {}; reload the review and select catalog id {}",
+                        approved.manufacturer, approved.model, approved.id
+                    ),
                 )
-                .with_code("avionics_identity_unresolved"));
+                .with_code("avionics_catalog_consolidated"));
             }
+            ReviewPreflightAvionicsIdentityOutcome::Preview(outcome) => match outcome {
+                AvionicsIdentityOutcome::Approved(approved) => approved,
+                AvionicsIdentityOutcome::Rejected { reason } => {
+                    return Err(ApiError::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("proposed avionics product was rejected: {reason}"),
+                    )
+                    .with_code("avionics_identity_rejected"));
+                }
+                AvionicsIdentityOutcome::Unresolved { reason } => {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!("proposed avionics identity remains unresolved: {reason}"),
+                    )
+                    .with_code("avionics_identity_unresolved"));
+                }
+            },
         };
 
         if approved.manufacturer_identifier_kind != submitted_identifier_kind

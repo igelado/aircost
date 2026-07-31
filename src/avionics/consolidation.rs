@@ -15,7 +15,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
+use crate::avionics::catalog::{
+    current_catalog_review_fingerprints_postgres, current_catalog_review_fingerprints_sqlite,
+};
+use crate::avionics::manufacturer::{
+    admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
+    ManufacturerIdentityError, ManufacturerIdentityEvidence, ManufacturerProductAdmission,
+    ManufacturerProductAdmissionOutcome,
+};
 use crate::avionics::model::{avionics_model_identity_relation, AvionicsModelIdentityRelation};
+use crate::avionics::reuse::{
+    refresh_reuse_attestation_postgres, refresh_reuse_attestation_sqlite,
+};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::listing::review::{
     fingerprint_approved_catalog_rows, serialize_review_payload, CatalogFingerprintRow,
@@ -23,8 +34,10 @@ use crate::listing::review::{
 };
 use crate::normalize::{
     normalize_avionics_identifier, normalize_avionics_manufacturer_name,
-    normalize_avionics_model_name,
+    normalize_avionics_model_name, normalize_name,
 };
+
+const MAX_GROUNDED_EXACT_MODEL_MEMBERS: usize = 32;
 
 #[derive(Debug)]
 pub enum ConsolidationError {
@@ -57,6 +70,41 @@ pub type ConsolidationResult<T> = Result<T, ConsolidationError>;
 pub struct AvionicsConsolidationRequest {
     pub survivor_id: i64,
     pub duplicate_ids: Vec<i64>,
+}
+
+/// One candidate row covered by the current independent grounded collision
+/// pass. This bounded snapshot is transaction input, not a durable Gemini
+/// response or URL-context dossier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GroundedExactModelMember {
+    pub id: i64,
+    pub manufacturer: String,
+    pub model: String,
+    pub avionics_types: Vec<String>,
+    pub manufacturer_identifier_kind: String,
+    pub manufacturer_identifier: String,
+    pub catalog_status: String,
+}
+
+/// Complete, already validated grounded authorization for one exact legacy
+/// duplicate group. Only `avionics::catalog` constructs this after the
+/// independent collision response has passed its very-high-confidence and
+/// authoritative-evidence gates.
+#[derive(Clone, Debug)]
+pub(crate) struct GroundedExactModelConsolidationRequest {
+    pub members: Vec<GroundedExactModelMember>,
+    pub effective_manufacturer_identity_id: i64,
+    pub reviewed_catalog_fingerprint: String,
+    pub manufacturer_collision_snapshot_sha256: String,
+    pub canonical_manufacturer: String,
+    pub canonical_model: String,
+    pub canonical_types: Vec<String>,
+    pub manufacturer_identifier_kind: String,
+    pub manufacturer_identifier: String,
+    pub identity_source_url: String,
+    pub identity_source_title: String,
+    pub identity_evidence: String,
+    pub grounded_claim_source_urls: Vec<String>,
 }
 
 /// Optional listing-review provenance for a human duplicate adjudication.
@@ -158,6 +206,7 @@ pub enum IdentityMatchBasis {
     CanonicalManufacturerAndModel,
     StableManufacturerIdentifier,
     HumanReviewedModelEquivalence,
+    GroundedExactModel,
     Both,
 }
 
@@ -900,6 +949,12 @@ fn exact_identity_graph_blockers(state: &CatalogState, models: &[&ModelRow]) -> 
                         left.id, right.id
                     ));
                 }
+                Some(IdentityMatchBasis::GroundedExactModel) => {
+                    blockers.push(format!(
+                        "catalog ids {} and {} require a current grounded exact-model authorization",
+                        left.id, right.id
+                    ));
+                }
                 None => {
                     blockers.push(format!(
                         "catalog ids {} and {} are only transitively connected and share no direct exact maker-scoped stable identifier kind/value pair",
@@ -1523,6 +1578,24 @@ struct HumanConsolidationScope {
     member_model_keys: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug)]
+struct GroundedExactModelScope {
+    effective_manufacturer_identity_id: i64,
+    stored_model_key: String,
+    projected_approved_survivor: ReviewProduct,
+}
+
+#[derive(Clone, Debug)]
+struct GroundedExactModelAuthorization {
+    authorization_sha256: String,
+    survivor_model_id: i64,
+    effective_manufacturer_identity_id: i64,
+    normalized_model_key: String,
+    expected_member_count: i64,
+    reviewed_catalog_fingerprint: String,
+    manufacturer_collision_snapshot_sha256: String,
+}
+
 fn canonical_model_key(value: &str) -> String {
     normalize_avionics_model_name(value)
 }
@@ -1609,6 +1682,7 @@ fn remap_pending_review(
     duplicate_ids: &BTreeSet<i64>,
     link_mapping: &HashMap<i64, i64>,
     scope: Option<&HumanConsolidationScope>,
+    projected_approved_survivor: Option<&ReviewProduct>,
 ) -> Result<Option<PendingReviewPlan>, String> {
     let mut payload: StoredReviewPayload = serde_json::from_str(&row.review_payload_json)
         .map_err(|error| format!("pending review {} contains invalid JSON: {error}", row.id))?;
@@ -1618,23 +1692,65 @@ fn remap_pending_review(
             row.id, payload.version
         ));
     }
-    if !pending_review_references_duplicates(state, &payload, duplicate_ids, link_mapping, scope) {
+    let references_projected_survivor = projected_approved_survivor.is_some()
+        && payload.aspects.iter().any(|aspect| {
+            [
+                aspect.suggested_product.as_ref(),
+                aspect.proposed_product.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|product| product.id == Some(survivor.id))
+        });
+    if !references_projected_survivor
+        && !pending_review_references_duplicates(
+            state,
+            &payload,
+            duplicate_ids,
+            link_mapping,
+            scope,
+        )
+    {
         return Ok(None);
     }
 
     for aspect in &mut payload.aspects {
         let mut model_equivalence_remapped = false;
         if let Some(product) = &mut aspect.suggested_product {
-            if product.id.is_some_and(|id| duplicate_ids.contains(&id)) {
-                product.id = Some(survivor.id);
+            if product.id.is_some_and(|id| {
+                duplicate_ids.contains(&id)
+                    || (projected_approved_survivor.is_some() && id == survivor.id)
+            }) {
+                if let Some(projected) = projected_approved_survivor {
+                    *product = projected.clone();
+                } else {
+                    product.id = Some(survivor.id);
+                }
                 model_equivalence_remapped = true;
             }
         }
-        if let Some(product) = &mut aspect.proposed_product {
-            let idless_equivalence_match =
-                idless_review_product_matches_equivalence_scope(state, Some(product), scope);
-            if product.id.is_some_and(|id| duplicate_ids.contains(&id)) || idless_equivalence_match
-            {
+        let proposed_matches = aspect.proposed_product.as_ref().is_some_and(|product| {
+            product.id.is_some_and(|id| {
+                duplicate_ids.contains(&id)
+                    || (projected_approved_survivor.is_some() && id == survivor.id)
+            }) || idless_review_product_matches_equivalence_scope(state, Some(product), scope)
+        });
+        if proposed_matches {
+            if let Some(projected) = projected_approved_survivor {
+                model_equivalence_remapped = true;
+                if aspect
+                    .suggested_product
+                    .as_ref()
+                    .is_some_and(|suggested| suggested.id.is_some_and(|id| id != survivor.id))
+                {
+                    return Err(format!(
+                        "pending review {} aspect {} already suggests a different approved product",
+                        row.id, aspect.id
+                    ));
+                }
+                aspect.suggested_product = Some(projected.clone());
+                aspect.proposed_product = None;
+            } else if let Some(product) = &mut aspect.proposed_product {
                 model_equivalence_remapped = true;
                 if survivor.catalog_status == "approved" {
                     if aspect
@@ -1659,7 +1775,9 @@ fn remap_pending_review(
                 }
             }
         }
-        if scope.is_some() {
+        if projected_approved_survivor.is_some() && model_equivalence_remapped {
+            aspect.reason = "catalog_collision_consolidated_verified_product_available".to_string();
+        } else if scope.is_some() {
             rewrite_consolidated_pending_identity_reason(aspect, model_equivalence_remapped);
         }
         aspect.replaces_product_id =
@@ -1693,6 +1811,7 @@ fn remap_pending_review(
 enum ConsolidationIdentityAuthority<'a> {
     StableIdentifier,
     HumanReviewedModelEquivalence(&'a HumanConsolidationScope),
+    GroundedExactModel(&'a GroundedExactModelScope),
 }
 
 fn build_plan_with_authority(
@@ -1720,20 +1839,31 @@ fn build_plan_with_authority(
                 "duplicate avionics catalog id {duplicate_id} does not exist"
             ))
         })?;
-        let identity_basis = identity_match(state, survivor, duplicate).or_else(|| {
-            let ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(scope) = authority
-            else {
-                return None;
-            };
-            (duplicate.avionics_manufacturer_identity_id
+        let identity_basis = match authority {
+            ConsolidationIdentityAuthority::StableIdentifier => {
+                identity_match(state, survivor, duplicate)
+            }
+            ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(scope) => {
+                identity_match(state, survivor, duplicate).or_else(|| {
+                    (duplicate.avionics_manufacturer_identity_id
+                        == Some(scope.effective_manufacturer_identity_id)
+                        && matches!(
+                            current_model_identity_relation(state, survivor, duplicate),
+                            Some(AvionicsModelIdentityRelation::TypographyExact)
+                                | Some(AvionicsModelIdentityRelation::DescriptiveExpansion)
+                        ))
+                    .then_some(IdentityMatchBasis::HumanReviewedModelEquivalence)
+                })
+            }
+            ConsolidationIdentityAuthority::GroundedExactModel(scope) => (survivor
+                .avionics_manufacturer_identity_id
                 == Some(scope.effective_manufacturer_identity_id)
-                && matches!(
-                    current_model_identity_relation(state, survivor, duplicate),
-                    Some(AvionicsModelIdentityRelation::TypographyExact)
-                        | Some(AvionicsModelIdentityRelation::DescriptiveExpansion)
-                ))
-            .then_some(IdentityMatchBasis::HumanReviewedModelEquivalence)
-        });
+                && duplicate.avionics_manufacturer_identity_id
+                    == Some(scope.effective_manufacturer_identity_id)
+                && survivor.stored_model_key == scope.stored_model_key
+                && duplicate.stored_model_key == scope.stored_model_key)
+                .then_some(IdentityMatchBasis::GroundedExactModel),
+        };
         match identity_basis {
             Some(basis) => matches.push(ConsolidationIdentityMatch {
                 duplicate: duplicate.summary(),
@@ -1774,13 +1904,13 @@ fn build_plan_with_authority(
     if matches!(
         authority,
         ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(_)
+            | ConsolidationIdentityAuthority::GroundedExactModel(_)
     ) && selected_models
         .iter()
         .any(|model| model.catalog_status != "unreviewed")
     {
         blockers.push(
-            "human-reviewed model-equivalence consolidation permits only unreviewed catalog rows"
-                .to_string(),
+            "model-equivalence consolidation permits only unreviewed catalog rows".to_string(),
         );
     }
     if survivor.catalog_status == "rejected" {
@@ -1875,9 +2005,25 @@ fn build_plan_with_authority(
     }
 
     let mut pending_reviews = Vec::new();
+    let grounded_pending_scope = match authority {
+        ConsolidationIdentityAuthority::GroundedExactModel(scope) => {
+            Some(HumanConsolidationScope {
+                effective_manufacturer_identity_id: scope.effective_manufacturer_identity_id,
+                member_model_keys: BTreeSet::from([scope.stored_model_key.clone()]),
+            })
+        }
+        _ => None,
+    };
     let human_scope = match authority {
         ConsolidationIdentityAuthority::StableIdentifier => None,
         ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(scope) => Some(scope),
+        ConsolidationIdentityAuthority::GroundedExactModel(_) => grounded_pending_scope.as_ref(),
+    };
+    let projected_approved_survivor = match authority {
+        ConsolidationIdentityAuthority::GroundedExactModel(scope) => {
+            Some(&scope.projected_approved_survivor)
+        }
+        _ => None,
     };
     for row in &state.pending_reviews {
         match remap_pending_review(
@@ -1887,6 +2033,7 @@ fn build_plan_with_authority(
             &duplicate_ids,
             &link_mapping,
             human_scope,
+            projected_approved_survivor,
         ) {
             Ok(Some(plan)) => pending_reviews.push(plan),
             Ok(None) => {}
@@ -2166,6 +2313,295 @@ fn current_model_identity_relation(
         &right.model,
         &current_model_capabilities(state, right.id),
     )
+}
+
+fn grounded_exact_model_request(
+    state: &CatalogState,
+    request: &GroundedExactModelConsolidationRequest,
+) -> ConsolidationResult<(AvionicsConsolidationRequest, GroundedExactModelScope)> {
+    if request.members.len() < 2 || request.members.len() > MAX_GROUNDED_EXACT_MODEL_MEMBERS {
+        return Err(ConsolidationError::Validation(format!(
+            "grounded exact-model consolidation requires 2..={MAX_GROUNDED_EXACT_MODEL_MEMBERS} reviewed members"
+        )));
+    }
+    if request.effective_manufacturer_identity_id <= 0 {
+        return Err(ConsolidationError::Validation(
+            "grounded exact-model consolidation requires an evidence-backed manufacturer identity"
+                .to_string(),
+        ));
+    }
+    if request.canonical_manufacturer.trim().is_empty()
+        || request.canonical_model.trim().is_empty()
+        || request.canonical_types.is_empty()
+        || request.manufacturer_identifier_kind.trim().is_empty()
+        || request.manufacturer_identifier.trim().is_empty()
+        || request.identity_source_url.trim().is_empty()
+        || request.identity_source_title.trim().is_empty()
+        || request.identity_evidence.trim().is_empty()
+    {
+        return Err(ConsolidationError::Validation(
+            "grounded exact-model consolidation requires a complete verified canonical identity"
+                .to_string(),
+        ));
+    }
+
+    let by_id = state
+        .models
+        .iter()
+        .map(|model| (model.id, model))
+        .collect::<HashMap<_, _>>();
+    let mut member_ids = BTreeSet::new();
+    let mut stored_model_key = None::<String>;
+    for reviewed in &request.members {
+        if reviewed.id <= 0 || !member_ids.insert(reviewed.id) {
+            return Err(ConsolidationError::Validation(
+                "grounded exact-model member IDs must be unique and positive".to_string(),
+            ));
+        }
+        let current = by_id.get(&reviewed.id).copied().ok_or_else(|| {
+            ConsolidationError::Conflict(format!(
+                "grounded collision member {} disappeared before consolidation",
+                reviewed.id
+            ))
+        })?;
+        if current.catalog_status != "unreviewed"
+            || reviewed.catalog_status != "unreviewed"
+            || current.avionics_manufacturer_identity_id
+                != Some(request.effective_manufacturer_identity_id)
+            || current.manufacturer != reviewed.manufacturer
+            || current.model != reviewed.model
+            || current
+                .manufacturer_identifier_kind
+                .as_deref()
+                .unwrap_or_default()
+                != reviewed.manufacturer_identifier_kind
+            || current
+                .manufacturer_identifier
+                .as_deref()
+                .unwrap_or_default()
+                != reviewed.manufacturer_identifier
+        {
+            return Err(ConsolidationError::Conflict(format!(
+                "grounded collision member {} changed after the current independent review",
+                reviewed.id
+            )));
+        }
+        let current_key = canonical_model_key(&current.model);
+        if current_key.is_empty() || current.stored_model_key != current_key {
+            return Err(ConsolidationError::Conflict(format!(
+                "grounded collision member {} has a stale or invalid normalized model key",
+                reviewed.id
+            )));
+        }
+        if stored_model_key
+            .as_ref()
+            .is_some_and(|expected| expected != &current.stored_model_key)
+        {
+            return Err(ConsolidationError::Validation(
+                "grounded collision members are not one exact normalized-model group".to_string(),
+            ));
+        }
+        stored_model_key.get_or_insert_with(|| current.stored_model_key.clone());
+
+        let current_types = current_model_capabilities(state, current.id)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let reviewed_types = reviewed
+            .avionics_types
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if current_types != reviewed_types {
+            return Err(ConsolidationError::Conflict(format!(
+                "grounded collision member {} capabilities changed after review",
+                reviewed.id
+            )));
+        }
+    }
+    let stored_model_key = stored_model_key.expect("two reviewed members set a model key");
+    let complete_group = state
+        .models
+        .iter()
+        .filter(|model| {
+            model.avionics_manufacturer_identity_id
+                == Some(request.effective_manufacturer_identity_id)
+                && model.stored_model_key == stored_model_key
+        })
+        .map(|model| model.id)
+        .collect::<BTreeSet<_>>();
+    if complete_group != member_ids {
+        let omitted = complete_group
+            .difference(&member_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        let stale = member_ids
+            .difference(&complete_group)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(ConsolidationError::Conflict(format!(
+            "grounded collision pass did not cover the complete current exact-model group; omitted={omitted:?}, stale={stale:?}"
+        )));
+    }
+
+    let selected = member_ids
+        .iter()
+        .filter_map(|id| by_id.get(id).copied())
+        .collect::<Vec<_>>();
+    for (index, left) in selected.iter().enumerate() {
+        for right in selected.iter().skip(index + 1) {
+            if matches!(
+                (stable_identifier_key(left), stable_identifier_key(right)),
+                (Some(left), Some(right)) if left != right
+            ) {
+                return Err(ConsolidationError::Validation(format!(
+                    "grounded exact-model members {} and {} have conflicting stable identifiers",
+                    left.id, right.id
+                )));
+            }
+        }
+    }
+
+    let canonical_manufacturer_key =
+        normalize_avionics_manufacturer_name(&request.canonical_manufacturer);
+    let canonical_identifier_key = normalize_avionics_identifier(&request.manufacturer_identifier);
+    let mut candidates = selected;
+    candidates.sort_by(|left, right| {
+        let rank = |model: &ModelRow| {
+            let strength = reference_strength(state, model.id);
+            (
+                normalize_avionics_manufacturer_name(&model.manufacturer)
+                    == canonical_manufacturer_key,
+                stable_identifier_key(model).is_some_and(|identifier| {
+                    identifier.kind == request.manufacturer_identifier_kind
+                        && identifier.value == canonical_identifier_key
+                }),
+                strength.global_reference_count,
+                strength.reviewer_confirmed_listing_reference_count,
+                strength.high_confidence_listing_reference_count,
+                strength.total_reference_count,
+                strength.capability_count,
+            )
+        };
+        rank(right)
+            .cmp(&rank(left))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let survivor_id = candidates
+        .first()
+        .expect("two reviewed members produce a survivor")
+        .id;
+    Ok((
+        AvionicsConsolidationRequest {
+            survivor_id,
+            duplicate_ids: member_ids
+                .into_iter()
+                .filter(|id| *id != survivor_id)
+                .collect(),
+        },
+        GroundedExactModelScope {
+            effective_manufacturer_identity_id: request.effective_manufacturer_identity_id,
+            stored_model_key,
+            projected_approved_survivor: ReviewProduct::verified(
+                survivor_id,
+                request.canonical_manufacturer.clone(),
+                request.canonical_model.clone(),
+                request.canonical_types.clone(),
+            )
+            .with_stable_identifier(
+                request.manufacturer_identifier_kind.clone(),
+                request.manufacturer_identifier.clone(),
+            )
+            .with_identity_evidence(
+                request.identity_source_url.clone(),
+                request.identity_source_title.clone(),
+                request.identity_evidence.clone(),
+            ),
+        },
+    ))
+}
+
+fn grounded_exact_model_authorization(
+    state: &CatalogState,
+    request: &GroundedExactModelConsolidationRequest,
+    base: &AvionicsConsolidationRequest,
+    scope: &GroundedExactModelScope,
+) -> ConsolidationResult<GroundedExactModelAuthorization> {
+    let expected_member_count = i64::try_from(request.members.len()).map_err(|_| {
+        ConsolidationError::Validation(
+            "grounded exact-model member count exceeds database range".to_string(),
+        )
+    })?;
+    let by_id = state
+        .models
+        .iter()
+        .map(|model| (model.id, model))
+        .collect::<HashMap<_, _>>();
+    let mut member_ids = std::iter::once(base.survivor_id)
+        .chain(base.duplicate_ids.iter().copied())
+        .collect::<Vec<_>>();
+    member_ids.sort_unstable();
+    member_ids.dedup();
+
+    let mut hasher = Sha256::new();
+    for value in [
+        "aircost:grounded-exact-model-consolidation:v1",
+        &base.survivor_id.to_string(),
+        &scope.effective_manufacturer_identity_id.to_string(),
+        scope.stored_model_key.as_str(),
+        &expected_member_count.to_string(),
+        request.reviewed_catalog_fingerprint.as_str(),
+        request.manufacturer_collision_snapshot_sha256.as_str(),
+        request.canonical_manufacturer.as_str(),
+        request.canonical_model.as_str(),
+        request.manufacturer_identifier_kind.as_str(),
+        request.manufacturer_identifier.as_str(),
+        request.identity_source_url.as_str(),
+        request.identity_source_title.as_str(),
+        request.identity_evidence.as_str(),
+    ] {
+        feed_fingerprint(&mut hasher, value);
+    }
+    let mut canonical_types = request.canonical_types.clone();
+    canonical_types.sort();
+    canonical_types.dedup();
+    feed_fingerprint(&mut hasher, &canonical_types.len().to_string());
+    for capability in canonical_types {
+        feed_fingerprint(&mut hasher, &capability);
+    }
+    let mut grounded_claim_source_urls = request.grounded_claim_source_urls.clone();
+    grounded_claim_source_urls.sort();
+    grounded_claim_source_urls.dedup();
+    feed_fingerprint(&mut hasher, &grounded_claim_source_urls.len().to_string());
+    for source_url in grounded_claim_source_urls {
+        feed_fingerprint(&mut hasher, &source_url);
+    }
+    for member_id in member_ids {
+        let model = by_id.get(&member_id).copied().ok_or_else(|| {
+            ConsolidationError::Conflict(format!(
+                "grounded exact-model member {member_id} disappeared before authorization"
+            ))
+        })?;
+        let row_snapshot = row_identity_sha256(
+            model,
+            scope.effective_manufacturer_identity_id,
+            &scope.stored_model_key,
+            &current_model_capabilities(state, member_id),
+        );
+        feed_fingerprint(&mut hasher, &member_id.to_string());
+        feed_fingerprint(&mut hasher, &row_snapshot);
+    }
+
+    Ok(GroundedExactModelAuthorization {
+        authorization_sha256: format!("{:x}", hasher.finalize()),
+        survivor_model_id: base.survivor_id,
+        effective_manufacturer_identity_id: scope.effective_manufacturer_identity_id,
+        normalized_model_key: scope.stored_model_key.clone(),
+        expected_member_count,
+        reviewed_catalog_fingerprint: request.reviewed_catalog_fingerprint.clone(),
+        manufacturer_collision_snapshot_sha256: request
+            .manufacturer_collision_snapshot_sha256
+            .clone(),
+    })
 }
 
 fn snapshot_human_authorization(
@@ -2664,12 +3100,18 @@ async fn consolidate_avionics_models_internal(
     db: &AppDb,
     request: &AvionicsConsolidationRequest,
     human_review: Option<&HumanReviewedAvionicsConsolidationRequest>,
+    grounded_review: Option<&GroundedExactModelConsolidationRequest>,
 ) -> ConsolidationResult<(
     AvionicsConsolidationReport,
     Option<HumanReviewedConsolidationAuthorization>,
 )> {
     // Validate cheap request-shape errors before opening a write transaction.
     normalized_request(request)?;
+    if human_review.is_some() && grounded_review.is_some() {
+        return Err(ConsolidationError::Validation(
+            "one consolidation cannot have both human and grounded authority".to_string(),
+        ));
+    }
     if let Some(human_review) = human_review {
         let base = human_request_base(human_review)?;
         if base != *request {
@@ -2683,11 +3125,35 @@ async fn consolidate_avionics_models_internal(
             "UPDATE avionics_models SET updated_at = updated_at WHERE id = ?",
         ),
         DatabaseBackend::Postgres(_) => db.sql(
-            "LOCK TABLE avionics_models, avionics_manufacturers, avionics_manufacturer_canonical_keys, avionics_approved_product_identities, avionics_model_types, aircraft_sale_listings, aircraft_sale_listing_avionics, aircraft_model_variant_default_avionics, aircraft_model_variant_default_avionics_candidates, aircraft_reference_configuration_versions, aircraft_reference_avionics, avionics_suite_components, aircraft_sale_listing_pending_reviews, avionics_catalog_consolidation_guard, avionics_catalog_human_consolidation_authorizations, avionics_catalog_human_consolidation_members, avionics_catalog_human_consolidation_guard, avionics_catalog_human_consolidation_claim IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK TABLE avionics_models, avionics_manufacturers, avionics_manufacturer_canonical_keys, avionics_manufacturer_identities, avionics_manufacturer_identity_memberships, avionics_manufacturer_identity_merges, avionics_manufacturer_alias_candidates, avionics_approved_product_identities, avionics_model_types, avionics_types, avionics_product_reuse_attestations, avionics_authoritative_source_origins, avionics_authoritative_source_origin_revocations, aircraft_sale_listings, aircraft_sale_listing_avionics, aircraft_model_variant_default_avionics, aircraft_model_variant_default_avionics_candidates, aircraft_reference_configuration_versions, aircraft_reference_avionics, avionics_suite_components, aircraft_sale_listing_pending_reviews, avionics_catalog_consolidation_guard, avionics_catalog_grounded_consolidation_authorizations, avionics_catalog_grounded_consolidation_guard, avionics_catalog_grounded_consolidation_claim, avionics_catalog_human_consolidation_authorizations, avionics_catalog_human_consolidation_members, avionics_catalog_human_consolidation_guard, avionics_catalog_human_consolidation_claim IN SHARE ROW EXCLUSIVE MODE",
         ),
     };
     let insert_guard = db.sql(
-        "INSERT INTO avionics_catalog_consolidation_guard (duplicate_model_id, survivor_model_id) VALUES (?, ?)",
+        "INSERT INTO avionics_catalog_consolidation_guard (duplicate_model_id, survivor_model_id, purpose) VALUES (?, ?, ?)",
+    );
+    let insert_grounded_authorization = db.sql(
+        r#"INSERT INTO avionics_catalog_grounded_consolidation_authorizations (
+             authorization_sha256, survivor_model_id,
+             effective_manufacturer_identity_id, normalized_model_key,
+             expected_member_count, reviewed_catalog_fingerprint,
+             manufacturer_collision_snapshot_sha256
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+    );
+    let insert_grounded_guard = db.sql(
+        r#"INSERT INTO avionics_catalog_grounded_consolidation_guard (
+             duplicate_model_id, survivor_model_id, authorization_sha256
+           ) VALUES (?, ?, ?)"#,
+    );
+    let insert_grounded_claim = db.sql(
+        r#"INSERT INTO avionics_catalog_grounded_consolidation_claim (
+             authorization_sha256, survivor_model_id
+           ) VALUES (?, ?)"#,
+    );
+    let delete_grounded_claim = db.sql(
+        "DELETE FROM avionics_catalog_grounded_consolidation_claim WHERE authorization_sha256 = ?",
+    );
+    let delete_grounded_authorization = db.sql(
+        "DELETE FROM avionics_catalog_grounded_consolidation_authorizations WHERE authorization_sha256 = ?",
     );
     let insert_human_authorization = db.sql(
         r#"INSERT INTO avionics_catalog_human_consolidation_authorizations (
@@ -2732,6 +3198,9 @@ async fn consolidate_avionics_models_internal(
     let count_all_guards = db.sql(
         r#"SELECT
              (SELECT COUNT(*) FROM avionics_catalog_consolidation_guard)
+             + (SELECT COUNT(*) FROM avionics_catalog_grounded_consolidation_authorizations)
+             + (SELECT COUNT(*) FROM avionics_catalog_grounded_consolidation_guard)
+             + (SELECT COUNT(*) FROM avionics_catalog_grounded_consolidation_claim)
              + (SELECT COUNT(*) FROM avionics_catalog_human_consolidation_guard)
              + (SELECT COUNT(*) FROM avionics_catalog_human_consolidation_claim)"#,
     );
@@ -2816,8 +3285,89 @@ async fn consolidate_avionics_models_internal(
              )"#,
     );
 
+    let promote_survivor = db.sql(
+        r#"UPDATE avionics_models
+           SET avionics_manufacturer_id = ?, name = ?, normalized_name = ?,
+               manufacturer_identifier_kind = ?, manufacturer_identifier = ?,
+               normalized_manufacturer_identifier = ?, identity_source_url = ?,
+               identity_source_title = ?, identity_evidence_text = ?,
+               identity_evidence_kind = 'authoritative_reference',
+               identity_confidence = 'very_high',
+               catalog_reviewed_at = CURRENT_TIMESTAMP,
+               introduced_year = NULL, discontinued_year = NULL,
+               estimated_unit_value_usd = NULL, value_basis = 'unreviewed',
+               replacement_cost_usd = NULL, value_reference_year = NULL,
+               value_source = NULL, valuation_scope = 'unit',
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND catalog_status = 'unreviewed'"#,
+    );
+    let delete_survivor_suites = db.sql(
+        "DELETE FROM avionics_suite_components WHERE suite_model_id = ? OR component_model_id = ?",
+    );
+    let insert_capability = db.sql(
+        "INSERT INTO avionics_types (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+    );
+    let select_capability = db.sql("SELECT id FROM avionics_types WHERE normalized_name = ?");
+    let insert_capability_membership = db.sql(
+        "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?) ON CONFLICT (avionics_model_id, avionics_type_id) DO NOTHING",
+    );
+    let select_capability_memberships =
+        db.sql("SELECT avionics_type_id FROM avionics_model_types WHERE avionics_model_id = ?");
+    let delete_capability_membership = db.sql(
+        "DELETE FROM avionics_model_types WHERE avionics_model_id = ? AND avionics_type_id = ?",
+    );
+    let approve_survivor = db.sql(
+        r#"UPDATE avionics_models
+           SET catalog_status = 'approved', catalog_reviewed_at = CURRENT_TIMESTAMP,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND catalog_status = 'unreviewed'
+             AND EXISTS (
+               SELECT 1 FROM avionics_model_types membership
+               WHERE membership.avionics_model_id = avionics_models.id
+             )"#,
+    );
+    let select_identifier_collision = db.sql(
+        "SELECT id FROM avionics_models WHERE avionics_manufacturer_id = ? AND manufacturer_identifier_kind = ? AND normalized_manufacturer_identifier = ? ORDER BY id LIMIT 1",
+    );
+    let select_name_collision = db.sql(
+        "SELECT id FROM avionics_models WHERE avionics_manufacturer_id = ? AND normalized_name = ? ORDER BY id LIMIT 1",
+    );
+    let stage_exact_aliases = db.sql(
+        r#"INSERT INTO avionics_manufacturer_alias_candidates (
+             avionics_manufacturer_id, candidate_manufacturer_identity_id,
+             candidate_basis, matched_avionics_model_id, reason, confidence
+           )
+           SELECT DISTINCT signal.right_avionics_manufacturer_id,
+             current_identity.avionics_manufacturer_identity_id,
+             signal.candidate_basis, signal.left_avionics_model_id,
+             CASE signal.candidate_basis
+               WHEN 'exact_stable_identifier' THEN
+                 'A catalog product under this unassigned raw maker shares an exact nonblank manufacturer identifier kind and value with a product belonging to the evidence-backed candidate identity.'
+               ELSE
+                 'A catalog product under this unassigned raw maker shares an exact canonical product name with a product belonging to the evidence-backed candidate identity.'
+             END,
+             CASE signal.candidate_basis
+               WHEN 'exact_stable_identifier' THEN 'high' ELSE 'medium'
+             END
+           FROM avionics_manufacturer_effective_memberships current_identity
+           JOIN avionics_legacy_manufacturer_alias_signals signal
+             ON signal.left_avionics_manufacturer_id
+               = current_identity.avionics_manufacturer_id
+           LEFT JOIN avionics_manufacturer_identity_memberships other_membership
+             ON other_membership.avionics_manufacturer_id
+               = signal.right_avionics_manufacturer_id
+           WHERE current_identity.avionics_manufacturer_id = ?
+             AND other_membership.avionics_manufacturer_id IS NULL
+           ON CONFLICT DO NOTHING"#,
+    );
+
     macro_rules! apply_in_transaction {
-        ($pool:expr) => {{
+        (
+            $pool:expr,
+            $admit_manufacturer:path,
+            $refresh_reuse:path,
+            $review_fingerprints:path
+        ) => {{
             let mut transaction = $pool.begin().await?;
             if matches!(db.backend(), DatabaseBackend::Sqlite(_)) {
                 sqlx::query(&lock_sql)
@@ -2830,6 +3380,30 @@ async fn consolidate_avionics_models_internal(
                     .await?;
             }
             let state = load_catalog_state!(db, &mut *transaction);
+            if let Some(grounded) = grounded_review {
+                let current = $review_fingerprints(
+                    db,
+                    &mut transaction,
+                    grounded.effective_manufacturer_identity_id,
+                )
+                .await
+                .map_err(|error| ConsolidationError::Database(error.to_string()))?;
+                if current.catalog_fingerprint != grounded.reviewed_catalog_fingerprint {
+                    return Err(ConsolidationError::Conflict(
+                        "avionics catalog changed after the current grounded collision pass"
+                            .to_string(),
+                    ));
+                }
+                if current.manufacturer_collision_snapshot_sha256
+                    != grounded.manufacturer_collision_snapshot_sha256
+                {
+                    return Err(ConsolidationError::Conflict(
+                        "manufacturer-scoped avionics collision family changed after review"
+                            .to_string(),
+                    ));
+                }
+            }
+            let mut grounded_authorization = None;
             let (mut plan, mut authorization) = if let Some(human_review) = human_review {
                 // Re-snapshot the exact pending-review digest and catalog rows
                 // under the same lock used for mutation. This is the apply-side
@@ -2878,6 +3452,28 @@ async fn consolidate_avionics_models_internal(
                         ConsolidationIdentityAuthority::HumanReviewedModelEquivalence(&scope),
                     )?,
                     Some(authorization),
+                )
+            } else if let Some(grounded_review) = grounded_review {
+                let (locked_base, scope) =
+                    grounded_exact_model_request(&state, grounded_review)?;
+                if locked_base != *request {
+                    return Err(ConsolidationError::Conflict(
+                        "grounded exact-model group changed before apply".to_string(),
+                    ));
+                }
+                grounded_authorization = Some(grounded_exact_model_authorization(
+                    &state,
+                    grounded_review,
+                    &locked_base,
+                    &scope,
+                )?);
+                (
+                    build_plan_with_authority(
+                        &state,
+                        request,
+                        ConsolidationIdentityAuthority::GroundedExactModel(&scope),
+                    )?,
+                    None,
                 )
             } else {
                 (build_plan(&state, request)?, None)
@@ -2985,11 +3581,65 @@ async fn consolidate_avionics_models_internal(
                         authorization.authorization_sha256
                     )));
                 }
+            } else if let Some(grounded_authorization) = grounded_authorization.as_ref() {
+                let inserted = sqlx::query(&insert_grounded_authorization)
+                    .bind(grounded_authorization.authorization_sha256.as_str())
+                    .bind(grounded_authorization.survivor_model_id)
+                    .bind(grounded_authorization.effective_manufacturer_identity_id)
+                    .bind(grounded_authorization.normalized_model_key.as_str())
+                    .bind(grounded_authorization.expected_member_count)
+                    .bind(
+                        grounded_authorization
+                            .reviewed_catalog_fingerprint
+                            .as_str(),
+                    )
+                    .bind(
+                        grounded_authorization
+                            .manufacturer_collision_snapshot_sha256
+                            .as_str(),
+                    )
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ConsolidationError::Conflict(format!(
+                        "grounded consolidation authorization {} could not be installed",
+                        grounded_authorization.authorization_sha256
+                    )));
+                }
+                for duplicate_id in &plan.duplicate_ids {
+                    let inserted = sqlx::query(&insert_grounded_guard)
+                        .bind(*duplicate_id)
+                        .bind(request.survivor_id)
+                        .bind(grounded_authorization.authorization_sha256.as_str())
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected();
+                    if inserted != 1 {
+                        return Err(ConsolidationError::Conflict(format!(
+                            "grounded catalog authorization pair {duplicate_id}->{} could not be installed",
+                            request.survivor_id
+                        )));
+                    }
+                }
+                let inserted = sqlx::query(&insert_grounded_claim)
+                    .bind(grounded_authorization.authorization_sha256.as_str())
+                    .bind(request.survivor_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ConsolidationError::Conflict(format!(
+                        "complete grounded consolidation claim {} could not be activated",
+                        grounded_authorization.authorization_sha256
+                    )));
+                }
             } else {
                 for duplicate_id in &plan.duplicate_ids {
                     let inserted = sqlx::query(&insert_guard)
                         .bind(*duplicate_id)
                         .bind(request.survivor_id)
+                        .bind("legacy_identity_consolidation")
                         .execute(&mut *transaction)
                         .await?
                         .rows_affected();
@@ -3200,6 +3850,30 @@ async fn consolidate_avionics_models_internal(
                     )));
                 }
             }
+            if let Some(grounded_authorization) = grounded_authorization.as_ref() {
+                let deleted = sqlx::query(&delete_grounded_claim)
+                    .bind(grounded_authorization.authorization_sha256.as_str())
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if deleted != 1 {
+                    return Err(ConsolidationError::Conflict(format!(
+                        "grounded consolidation claim {} was not released",
+                        grounded_authorization.authorization_sha256
+                    )));
+                }
+                let deleted = sqlx::query(&delete_grounded_authorization)
+                    .bind(grounded_authorization.authorization_sha256.as_str())
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if deleted != 1 {
+                    return Err(ConsolidationError::Conflict(format!(
+                        "grounded consolidation authorization {} was not released",
+                        grounded_authorization.authorization_sha256
+                    )));
+                }
+            }
             let guard_count: i64 = sqlx::query_scalar(&count_all_guards)
                 .fetch_one(&mut *transaction)
                 .await?;
@@ -3220,6 +3894,157 @@ async fn consolidate_avionics_models_internal(
                     )));
                 }
             }
+            if let Some(grounded) = grounded_review {
+                let manufacturer_admission = ManufacturerProductAdmission {
+                    manufacturer: grounded.canonical_manufacturer.as_str(),
+                    model: grounded.canonical_model.as_str(),
+                    manufacturer_identifier_kind: grounded
+                        .manufacturer_identifier_kind
+                        .as_str(),
+                    manufacturer_identifier: grounded.manufacturer_identifier.as_str(),
+                    evidence: ManufacturerIdentityEvidence {
+                        source_url: grounded.identity_source_url.clone(),
+                        source_title: grounded.identity_source_title.clone(),
+                        evidence_text: grounded.identity_evidence.clone(),
+                    },
+                    additional_evidence_source_urls: &grounded.grounded_claim_source_urls,
+                };
+                let manufacturer_scope = match $admit_manufacturer(
+                    db,
+                    &mut transaction,
+                    &manufacturer_admission,
+                )
+                .await
+                .map_err(|error| match error {
+                    ManufacturerIdentityError::Database(message) => {
+                        ConsolidationError::Database(message)
+                    }
+                    ManufacturerIdentityError::Validation(message)
+                    | ManufacturerIdentityError::Conflict(message) => {
+                        ConsolidationError::Validation(message)
+                    }
+                })? {
+                    ManufacturerProductAdmissionOutcome::Admitted(scope) => scope,
+                    ManufacturerProductAdmissionOutcome::PendingAliasReview => {
+                        return Err(ConsolidationError::Conflict(
+                            "manufacturer identity requires human alias review before the consolidated product can be approved"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let manufacturer_id = manufacturer_scope.avionics_manufacturer_id;
+                let model_key = normalize_avionics_model_name(&grounded.canonical_model);
+                let identifier_key =
+                    normalize_avionics_identifier(&grounded.manufacturer_identifier);
+                for (field, collision) in [
+                    (
+                        "manufacturer identifier",
+                        sqlx::query_scalar::<_, i64>(&select_identifier_collision)
+                            .bind(manufacturer_id)
+                            .bind(grounded.manufacturer_identifier_kind.as_str())
+                            .bind(identifier_key.as_str())
+                            .fetch_optional(&mut *transaction)
+                            .await?,
+                    ),
+                    (
+                        "canonical model",
+                        sqlx::query_scalar::<_, i64>(&select_name_collision)
+                            .bind(manufacturer_id)
+                            .bind(model_key.as_str())
+                            .fetch_optional(&mut *transaction)
+                            .await?,
+                    ),
+                ] {
+                    if collision.is_some_and(|id| id != request.survivor_id) {
+                        return Err(ConsolidationError::Conflict(format!(
+                            "grounded {field} collides with catalog id {}; retry the independent collision pass",
+                            collision.expect("the collision predicate proved a value")
+                        )));
+                    }
+                }
+                let promoted = sqlx::query(&promote_survivor)
+                    .bind(manufacturer_id)
+                    .bind(grounded.canonical_model.trim())
+                    .bind(model_key.as_str())
+                    .bind(grounded.manufacturer_identifier_kind.as_str())
+                    .bind(grounded.manufacturer_identifier.trim())
+                    .bind(identifier_key.as_str())
+                    .bind(grounded.identity_source_url.as_str())
+                    .bind(grounded.identity_source_title.as_str())
+                    .bind(grounded.identity_evidence.as_str())
+                    .bind(request.survivor_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if promoted != 1 {
+                    return Err(ConsolidationError::Conflict(
+                        "grounded consolidation survivor changed before approval".to_string(),
+                    ));
+                }
+                sqlx::query(&delete_survivor_suites)
+                    .bind(request.survivor_id)
+                    .bind(request.survivor_id)
+                    .execute(&mut *transaction)
+                    .await?;
+
+                let mut desired_type_ids = BTreeSet::new();
+                for capability in &grounded.canonical_types {
+                    let capability_key = normalize_name(capability);
+                    sqlx::query(&insert_capability)
+                        .bind(capability.trim())
+                        .bind(capability_key.as_str())
+                        .execute(&mut *transaction)
+                        .await?;
+                    let capability_id: i64 = sqlx::query_scalar(&select_capability)
+                        .bind(capability_key.as_str())
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                    desired_type_ids.insert(capability_id);
+                    sqlx::query(&insert_capability_membership)
+                        .bind(request.survivor_id)
+                        .bind(capability_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                let current_type_ids: Vec<i64> =
+                    sqlx::query_scalar(&select_capability_memberships)
+                        .bind(request.survivor_id)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                for stale_type_id in current_type_ids
+                    .into_iter()
+                    .filter(|type_id| !desired_type_ids.contains(type_id))
+                {
+                    sqlx::query(&delete_capability_membership)
+                        .bind(request.survivor_id)
+                        .bind(stale_type_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                let approved = sqlx::query(&approve_survivor)
+                    .bind(request.survivor_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if approved != 1 {
+                    return Err(ConsolidationError::Conflict(
+                        "grounded consolidation survivor could not be approved with its verified capabilities"
+                            .to_string(),
+                    ));
+                }
+                sqlx::query(&stage_exact_aliases)
+                    .bind(manufacturer_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                $refresh_reuse(
+                    db,
+                    &mut transaction,
+                    request.survivor_id,
+                    grounded.identity_source_url.as_str(),
+                )
+                .await
+                .map_err(|error| ConsolidationError::Database(error.to_string()))?;
+            }
             let invalid_ready: i64 = sqlx::query_scalar(&invalid_ready_links)
                 .fetch_one(&mut *transaction)
                 .await?;
@@ -3238,12 +4063,15 @@ async fn consolidate_avionics_models_internal(
                         "consolidation survivor disappeared before commit".to_string(),
                     )
                 })?;
-            if final_survivor.catalog_status != plan.report.survivor.catalog_status {
+            let expected_final_status = if grounded_review.is_some() {
+                "approved"
+            } else {
+                plan.report.survivor.catalog_status.as_str()
+            };
+            if final_survivor.catalog_status != expected_final_status {
                 return Err(ConsolidationError::Conflict(format!(
                     "consolidation changed survivor {} catalog status from {} to {}",
-                    final_survivor.id,
-                    plan.report.survivor.catalog_status,
-                    final_survivor.catalog_status
+                    final_survivor.id, expected_final_status, final_survivor.catalog_status
                 )));
             }
             if let Some(collision) = final_state.models.iter().find(|model| {
@@ -3272,8 +4100,18 @@ async fn consolidate_avionics_models_internal(
     }
 
     match db.backend() {
-        DatabaseBackend::Sqlite(pool) => apply_in_transaction!(pool),
-        DatabaseBackend::Postgres(pool) => apply_in_transaction!(pool),
+        DatabaseBackend::Sqlite(pool) => apply_in_transaction!(
+            pool,
+            admit_manufacturer_product_scope_sqlite,
+            refresh_reuse_attestation_sqlite,
+            current_catalog_review_fingerprints_sqlite
+        ),
+        DatabaseBackend::Postgres(pool) => apply_in_transaction!(
+            pool,
+            admit_manufacturer_product_scope_postgres,
+            refresh_reuse_attestation_postgres,
+            current_catalog_review_fingerprints_postgres
+        ),
     }
 }
 
@@ -3286,7 +4124,8 @@ pub async fn consolidate_avionics_models(
     db: &AppDb,
     request: &AvionicsConsolidationRequest,
 ) -> ConsolidationResult<AvionicsConsolidationReport> {
-    let (report, authorization) = consolidate_avionics_models_internal(db, request, None).await?;
+    let (report, authorization) =
+        consolidate_avionics_models_internal(db, request, None, None).await?;
     debug_assert!(authorization.is_none());
     Ok(report)
 }
@@ -3299,7 +4138,7 @@ pub async fn consolidate_avionics_models_with_human_review(
 ) -> ConsolidationResult<HumanReviewedAvionicsConsolidationReport> {
     let base = human_request_base(request)?;
     let (consolidation, authorization) =
-        consolidate_avionics_models_internal(db, &base, Some(request)).await?;
+        consolidate_avionics_models_internal(db, &base, Some(request), None).await?;
     let authorization = authorization.ok_or_else(|| {
         ConsolidationError::Conflict(
             "human-reviewed consolidation completed without an authorization audit".to_string(),
@@ -3309,6 +4148,22 @@ pub async fn consolidate_avionics_models_with_human_review(
         consolidation,
         authorization,
     })
+}
+
+/// Atomically consume one complete, current grounded exact-model collision
+/// decision, remap every supported reference, and approve the surviving
+/// canonical product. No Gemini request or dossier is accepted or persisted by
+/// this transaction boundary.
+pub(crate) async fn consolidate_and_approve_grounded_exact_model(
+    db: &AppDb,
+    grounded: &GroundedExactModelConsolidationRequest,
+) -> ConsolidationResult<AvionicsConsolidationReport> {
+    let state = load_state(db).await?;
+    let (base, _) = grounded_exact_model_request(&state, grounded)?;
+    let (report, authorization) =
+        consolidate_avionics_models_internal(db, &base, None, Some(grounded)).await?;
+    debug_assert!(authorization.is_none());
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -3740,6 +4595,565 @@ mod tests {
                     .unwrap(),
             ),
         }
+    }
+
+    async fn grounded_exact_request(
+        db: &AppDb,
+        member_ids: &[i64],
+        canonical_manufacturer: &str,
+        canonical_model: &str,
+        canonical_types: &[&str],
+        source_url: &str,
+    ) -> GroundedExactModelConsolidationRequest {
+        let state = load_state(db).await.unwrap();
+        let members = member_ids
+            .iter()
+            .map(|member_id| {
+                let model = state
+                    .models
+                    .iter()
+                    .find(|model| model.id == *member_id)
+                    .unwrap();
+                GroundedExactModelMember {
+                    id: model.id,
+                    manufacturer: model.manufacturer.clone(),
+                    model: model.model.clone(),
+                    avionics_types: current_model_capabilities(&state, model.id),
+                    manufacturer_identifier_kind: model
+                        .manufacturer_identifier_kind
+                        .clone()
+                        .unwrap_or_default(),
+                    manufacturer_identifier: model
+                        .manufacturer_identifier
+                        .clone()
+                        .unwrap_or_default(),
+                    catalog_status: model.catalog_status.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let manufacturer_identity_id = state
+            .models
+            .iter()
+            .find(|model| model.id == member_ids[0])
+            .and_then(|model| model.avionics_manufacturer_identity_id)
+            .unwrap();
+        let mut transaction = pool(db).begin().await.unwrap();
+        let fingerprints = current_catalog_review_fingerprints_sqlite(
+            db,
+            &mut transaction,
+            manufacturer_identity_id,
+        )
+        .await
+        .unwrap();
+        transaction.rollback().await.unwrap();
+        GroundedExactModelConsolidationRequest {
+            members,
+            effective_manufacturer_identity_id: manufacturer_identity_id,
+            reviewed_catalog_fingerprint: fingerprints.catalog_fingerprint,
+            manufacturer_collision_snapshot_sha256: fingerprints
+                .manufacturer_collision_snapshot_sha256,
+            canonical_manufacturer: canonical_manufacturer.to_string(),
+            canonical_model: canonical_model.to_string(),
+            canonical_types: canonical_types
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: canonical_model.to_string(),
+            identity_source_url: source_url.to_string(),
+            identity_source_title: format!("{canonical_model} official product manual"),
+            identity_evidence: format!(
+                "{canonical_manufacturer} identifies {canonical_model} as its exact autopilot model."
+            ),
+            grounded_claim_source_urls: vec![source_url.to_string()],
+        }
+    }
+
+    async fn approve_manufacturer_origin(db: &AppDb, manufacturer_identity_id: i64, origin: &str) {
+        let reviewer_id: i64 = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(pool(db))
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO avionics_authoritative_source_origins (
+                 authority_kind, avionics_manufacturer_identity_id,
+                 regulator_key, https_origin, evidence_source_url,
+                 evidence_source_title, evidence_text, approval_basis,
+                 approved_by_user_id, approval_reason
+               ) VALUES (
+                 'manufacturer_primary', ?, NULL, ?, ? || '/products',
+                 'Official manufacturer catalog',
+                 'The official catalog identifies this manufacturer product family.',
+                 'human_review', ?,
+                 'Reviewer confirmed this exact first-party manufacturer origin.'
+               )"#,
+        )
+        .bind(manufacturer_identity_id)
+        .bind(origin)
+        .bind(origin)
+        .bind(reviewer_id)
+        .execute(pool(db))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grounded_kap140_exact_group_consolidates_and_approves_atomically() {
+        let db = test_db().await;
+        let (manufacturer_id, first_id) = insert_legacy_model(
+            &db,
+            "BendixKing",
+            "bendixking",
+            "KAP 140",
+            &["Autopilot", "NAV"],
+        )
+        .await;
+        let (_, second_id) =
+            insert_legacy_model(&db, "Bendix King", "bendix king", "KAP-140", &["Autopilot"]).await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+        let state = load_state(&db).await.unwrap();
+        let manufacturer_identity_id = state
+            .models
+            .iter()
+            .find(|model| model.id == first_id)
+            .and_then(|model| model.avionics_manufacturer_identity_id)
+            .unwrap();
+        assert_eq!(
+            state
+                .models
+                .iter()
+                .find(|model| model.id == second_id)
+                .and_then(|model| model.avionics_manufacturer_identity_id),
+            Some(manufacturer_identity_id),
+            "the BendixKing/Bendix King spellings must share one curated maker identity"
+        );
+        approve_manufacturer_origin(
+            &db,
+            manufacturer_identity_id,
+            "https://manufacturer.example",
+        )
+        .await;
+
+        let listing_id = insert_listing(&db).await;
+        let pending_listing_id = insert_listing(&db).await;
+        allow_legacy_fixture_inserts(&db).await;
+        sqlx::query(
+            r#"INSERT INTO aircraft_sale_listing_avionics (
+                 aircraft_sale_listing_id, avionics_model_id, source,
+                 source_confidence, configuration_action
+               ) VALUES (?, ?, 'listing_review', 'high', 'installed')"#,
+        )
+        .bind(listing_id)
+        .bind(second_id)
+        .execute(pool(&db))
+        .await
+        .unwrap();
+
+        let variant_id: i64 = sqlx::query_scalar(
+            r#"SELECT variant.id
+               FROM aircraft_model_variants variant
+               JOIN aircraft_models model ON model.id = variant.aircraft_model_id
+               JOIN aircraft_manufacturers manufacturer
+                 ON manufacturer.id = model.aircraft_manufacturer_id
+               WHERE manufacturer.normalized_name = 'cessna'
+                 AND model.normalized_name = '182t'
+                 AND variant.normalized_name = 'standard'"#,
+        )
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO aircraft_model_variant_default_avionics (
+                 aircraft_model_variant_id, model_year, avionics_model_id,
+                 quantity, source_url, source_title, source_notes,
+                 source_confidence
+               ) VALUES (?, 2004, ?, 1, 'https://factory.example/kap140',
+                         'Factory equipment list', 'KAP 140 standard', 'high')"#,
+        )
+        .bind(variant_id)
+        .bind(second_id)
+        .execute(pool(&db))
+        .await
+        .unwrap();
+        insert_default_candidate(&db, 9137, second_id, "retained KAP 140 claim").await;
+
+        let (_, component_id) = insert_legacy_model(
+            &db,
+            "Legacy Component",
+            "legacy component",
+            "KI 209",
+            &["Navigation Indicator"],
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, 1)",
+        )
+        .bind(second_id)
+        .bind(component_id)
+        .execute(pool(&db))
+        .await
+        .unwrap();
+
+        let mut connection = pool(&db).acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO aircraft_reference_configuration_versions (
+                 id, aircraft_reference_configuration_id, model_year, revision,
+                 publication_state, approval_decision_id
+               ) VALUES (9911, 9911, 2004, 1, 'building', 9911)"#,
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO aircraft_reference_avionics (
+                 aircraft_reference_configuration_version_id,
+                 avionics_model_id, quantity, equipment_role, evidence_claim_id
+               ) VALUES (9911, ?, 1, 'standard', 9911)"#,
+        )
+        .bind(second_id)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let mut pending_product =
+            ReviewProduct::proposed("Bendix King", "KAP-140", vec!["Autopilot".to_string()]);
+        pending_product.id = Some(second_id);
+        let pending_aspect = PendingReviewAspect::avionics(
+            "kap-140",
+            "avionics",
+            "KAP-140",
+            "Bendix King KAP-140",
+            "independent collision review confirmed multiple legacy catalog rows as the same product ([7, 67]); explicitly consolidate them before approving the identity",
+            1,
+            "installed",
+            Some("The listing identifies a Bendix King KAP-140.".to_string()),
+            Some("high".to_string()),
+        )
+        .with_proposed_product(pending_product);
+        stage_pending_review(&db, pending_listing_id, None, &[pending_aspect])
+            .await
+            .unwrap();
+        let foreign_key_errors_before: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(pool(&db))
+                .await
+                .unwrap();
+
+        let grounded = grounded_exact_request(
+            &db,
+            &[first_id, second_id],
+            "BendixKing",
+            "KAP 140",
+            &["Autopilot"],
+            "https://manufacturer.example/manuals/kap140",
+        )
+        .await;
+        let report = consolidate_and_approve_grounded_exact_model(&db, &grounded)
+            .await
+            .unwrap();
+        assert!(report
+            .matches
+            .iter()
+            .all(|identity_match| identity_match.basis == IdentityMatchBasis::GroundedExactModel));
+        let survivor_id = report.survivor.id;
+        let duplicate_id = if survivor_id == first_id {
+            second_id
+        } else {
+            first_id
+        };
+
+        let duplicate_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models WHERE id = ?")
+                .bind(duplicate_id)
+                .fetch_one(pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(duplicate_count, 0);
+        let survivor: (String, String, String) = sqlx::query_as(
+            "SELECT catalog_status, name, normalized_name FROM avionics_models WHERE id = ?",
+        )
+        .bind(survivor_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            survivor,
+            (
+                "approved".to_string(),
+                "KAP 140".to_string(),
+                "kap140".to_string()
+            )
+        );
+        let capabilities: Vec<String> = sqlx::query_scalar(
+            r#"SELECT capability.name
+               FROM avionics_model_types membership
+               JOIN avionics_types capability ON capability.id = membership.avionics_type_id
+               WHERE membership.avionics_model_id = ?
+               ORDER BY capability.normalized_name"#,
+        )
+        .bind(survivor_id)
+        .fetch_all(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(capabilities, vec!["Autopilot"]);
+        for table in [
+            "aircraft_sale_listing_avionics",
+            "aircraft_model_variant_default_avionics",
+            "aircraft_model_variant_default_avionics_candidates",
+            "aircraft_reference_avionics",
+        ] {
+            let remapped: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE avionics_model_id = ?"
+            ))
+            .bind(survivor_id)
+            .fetch_one(pool(&db))
+            .await
+            .unwrap();
+            assert!(remapped > 0, "{table} was not remapped");
+        }
+        let suite_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_suite_components WHERE suite_model_id = ? OR component_model_id = ?",
+        )
+        .bind(survivor_id)
+        .bind(survivor_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            suite_count, 0,
+            "unverified suite metadata must be removed at approval"
+        );
+        let pending_json: String = sqlx::query_scalar(
+            "SELECT review_payload_json FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(pending_listing_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        let pending: StoredReviewPayload = serde_json::from_str(&pending_json).unwrap();
+        let pending_aspect = &pending.aspects[0];
+        assert_eq!(
+            pending_aspect.reason,
+            "catalog_collision_consolidated_verified_product_available"
+        );
+        assert_eq!(pending_aspect.proposed_product, None);
+        let suggested = pending_aspect
+            .suggested_product
+            .as_ref()
+            .expect("the consolidated identity must become a verified suggestion");
+        assert_eq!(suggested.id, Some(survivor_id));
+        assert_eq!(suggested.manufacturer, "BendixKing");
+        assert_eq!(suggested.model, "KAP 140");
+        assert_eq!(suggested.capabilities, vec!["Autopilot"]);
+        assert_eq!(
+            suggested.stable_identifier.as_ref(),
+            Some(&crate::listing::review::StableIdentifier {
+                kind: "manufacturer_model_number".to_string(),
+                value: "KAP 140".to_string(),
+            })
+        );
+        assert_eq!(
+            suggested.identity_source_url.as_deref(),
+            Some("https://manufacturer.example/manuals/kap140")
+        );
+        let graph_identity_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_approved_product_identities WHERE avionics_model_id = ?",
+        )
+        .bind(survivor_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(graph_identity_count, 1);
+        let reuse_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ? AND policy_version = 'avionics_reuse_v2'",
+        )
+        .bind(survivor_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(reuse_count, 1);
+        let guard_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_catalog_consolidation_guard")
+                .fetch_one(pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(guard_count, 0);
+        let foreign_key_errors: Vec<(String, i64, String, i64)> =
+            sqlx::query_as("PRAGMA foreign_key_check")
+                .fetch_all(pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(foreign_key_errors, foreign_key_errors_before);
+    }
+
+    #[tokio::test]
+    async fn grounded_exact_group_rejects_a_stale_full_catalog_snapshot_without_writes() {
+        let db = test_db().await;
+        let (manufacturer_id, first_id) =
+            insert_legacy_model(&db, "BendixKing", "bendixking", "KAP 140", &["Autopilot"]).await;
+        let (_, second_id) =
+            insert_legacy_model(&db, "Bendix King", "bendix king", "KAP-140", &["Autopilot"]).await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+        let request = grounded_exact_request(
+            &db,
+            &[first_id, second_id],
+            "BendixKing",
+            "KAP 140",
+            &["Autopilot"],
+            "https://manufacturer.example/manuals/kap140",
+        )
+        .await;
+        insert_legacy_model(&db, "Unrelated", "unrelated", "New catalog row", &["NAV"]).await;
+
+        let error = consolidate_and_approve_grounded_exact_model(&db, &request)
+            .await
+            .expect_err("a stale full catalog fingerprint must abort before remapping");
+        assert!(error.to_string().contains("catalog changed"));
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_models WHERE id IN (?, ?) AND catalog_status = 'unreviewed'",
+        )
+        .bind(first_id)
+        .bind(second_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(remaining, 2);
+    }
+
+    #[tokio::test]
+    async fn grounded_exact_group_rejects_an_omitted_current_member_and_a_variant() {
+        let db = test_db().await;
+        let (manufacturer_id, first_id) =
+            insert_legacy_model(&db, "BendixKing", "bendixking", "KAP 140", &["Autopilot"]).await;
+        let (_, second_id) =
+            insert_legacy_model(&db, "Bendix King", "bendix king", "KAP-140", &["Autopilot"]).await;
+        let (_, third_id) =
+            insert_legacy_model(&db, "BendixKing", "bendixking", "KAP140", &["Autopilot"]).await;
+        let (_, variant_id) =
+            insert_legacy_model(&db, "BendixKing", "bendixking", "KAP 140A", &["Autopilot"]).await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+
+        let omitted = grounded_exact_request(
+            &db,
+            &[first_id, second_id],
+            "BendixKing",
+            "KAP 140",
+            &["Autopilot"],
+            "https://manufacturer.example/manuals/kap140",
+        )
+        .await;
+        let error = consolidate_and_approve_grounded_exact_model(&db, &omitted)
+            .await
+            .expect_err("an omitted exact member must block the destructive path");
+        assert!(error
+            .to_string()
+            .contains("complete current exact-model group"));
+
+        let variant = grounded_exact_request(
+            &db,
+            &[first_id, variant_id],
+            "BendixKing",
+            "KAP 140",
+            &["Autopilot"],
+            "https://manufacturer.example/manuals/kap140",
+        )
+        .await;
+        let error = consolidate_and_approve_grounded_exact_model(&db, &variant)
+            .await
+            .expect_err("a meaningful model suffix must never enter exact consolidation");
+        assert!(error
+            .to_string()
+            .contains("not one exact normalized-model group"));
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models WHERE id IN (?, ?, ?, ?)")
+                .bind(first_id)
+                .bind(second_id)
+                .bind(third_id)
+                .bind(variant_id)
+                .fetch_one(pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(remaining, 4);
+    }
+
+    #[tokio::test]
+    async fn grounded_exact_group_rolls_back_when_a_ready_listing_blocks_remap() {
+        let db = test_db().await;
+        let (manufacturer_id, first_id) =
+            insert_legacy_model(&db, "BendixKing", "bendixking", "KAP 140", &["Autopilot"]).await;
+        let (_, second_id) =
+            insert_legacy_model(&db, "Bendix King", "bendix king", "KAP-140", &["Autopilot"]).await;
+        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
+        let request = grounded_exact_request(
+            &db,
+            &[first_id, second_id],
+            "BendixKing",
+            "KAP 140",
+            &["Autopilot"],
+            "https://manufacturer.example/manuals/kap140",
+        )
+        .await;
+        let listing_id = insert_listing(&db).await;
+        let second_listing_id = insert_listing(&db).await;
+        allow_legacy_fixture_inserts(&db).await;
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id) VALUES (?, ?)",
+        )
+        .bind(listing_id)
+        .bind(second_id)
+        .execute(pool(&db))
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id) VALUES (?, ?)",
+        )
+        .bind(second_listing_id)
+        .bind(first_id)
+        .execute(pool(&db))
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER listing_verified_requires_ready_update")
+            .execute(pool(&db))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE aircraft_sale_listings SET is_verified = TRUE WHERE id = ?")
+            .bind(listing_id)
+            .execute(pool(&db))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE aircraft_sale_listings SET is_verified = TRUE WHERE id = ?")
+            .bind(second_listing_id)
+            .execute(pool(&db))
+            .await
+            .unwrap();
+
+        let error = consolidate_and_approve_grounded_exact_model(&db, &request)
+            .await
+            .expect_err("ready listing associations must preserve the existing blocker");
+        assert!(error.to_string().contains("ready or verified"));
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models WHERE id IN (?, ?)")
+                .bind(first_id)
+                .bind(second_id)
+                .fetch_one(pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(remaining, 2);
+        let guards: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM avionics_catalog_consolidation_guard")
+                .fetch_one(pool(&db))
+                .await
+                .unwrap();
+        assert_eq!(guards, 0);
     }
 
     #[tokio::test]
