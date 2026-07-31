@@ -1804,6 +1804,7 @@ fn primary_residual_aspect(
         replaces_product_id: None,
         replacement_aspect_id,
         covered_associations: Vec::new(),
+        reviewer_correction_association_binding: None,
         reuse_attestation_target_id: None,
     }
 }
@@ -1849,6 +1850,7 @@ fn replacement_residual_aspect(
         replaces_product_id: None,
         replacement_aspect_id: None,
         covered_associations: Vec::new(),
+        reviewer_correction_association_binding: None,
         reuse_attestation_target_id: None,
     }
 }

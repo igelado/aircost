@@ -57,11 +57,12 @@ use crate::listing::review::{
     list_pending_product_reviews, preflight_listing_review_resolution,
     preflight_pending_product_attestation, prepare_pending_product_reviews, resolve_listing_review,
     resolved_review_response, restage_unattested_preserved_products,
-    use_existing_product_for_aspect_and_restage, ExistingProductAssociationCommit,
-    ExistingProductAssociationEvaluation, ListingReview, ListingReviewDetail, ListingReviewQueue,
-    PendingProductAssociationPage, PendingProductReviewPage, ProductReviewPageQuery,
-    ResolveReviewRequest, ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError,
-    ReviewQueueQuery, StagedPendingReview,
+    revise_avionics_observation_and_restage, use_existing_product_for_aspect_and_restage,
+    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingReview,
+    ListingReviewDetail, ListingReviewQueue, PendingProductAssociationPage,
+    PendingProductReviewPage, ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse,
+    ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery,
+    ReviseAvionicsObservationRequest, StagedPendingReview,
 };
 use crate::listing::run::{
     cancel_verification_run, claim_next_verification_run_item, complete_verification_run_item,
@@ -334,6 +335,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/avionics/use-existing",
             post(use_existing_review_avionics_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/avionics/revise",
+            post(revise_review_avionics_handler),
         )
         .route(
             "/api/review/listings/{id}/avionics/approve-replacement",
@@ -1470,6 +1475,22 @@ async fn use_existing_review_avionics_handler(
     )
     .await?;
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+/// Save reviewer-corrected occurrence values into the guarded pending bundle.
+/// Product selection, product creation, evidence grounding, and final listing
+/// mutation remain exclusively owned by the existing review resolution paths.
+async fn revise_review_avionics_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<ReviseAvionicsObservationRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let staged =
+        revise_avionics_observation_and_restage(&state.db, user.id, listing_id, &payload).await?;
+    review_maintenance_response(&state.db, user.id, listing_id, Some(staged)).await
 }
 
 /// Apply both identities of one staged replacement relationship atomically.
