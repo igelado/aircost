@@ -3811,14 +3811,11 @@ pub(super) fn validate_exact_listing_product_evidence(
     model: &str,
 ) -> Result<(), String> {
     validate_exact_listing_evidence_span(rendered_html, evidence_text)?;
-    let source = ListingEvidenceContext::from_publisher_html(Some(rendered_html));
     let evidence = ListingEvidenceContext::from_cleaned_text(evidence_text);
-    let exact_product = source.contains_exact_product_evidence(evidence_text, manufacturer, model);
-    let exact_model = source
-        .unique_exact_model_slice(model)
-        .is_some_and(|identity| {
-            evidence.unique_exact_model_slice(model).as_deref() == Some(identity.as_str())
-        });
+    let exact_product = evidence
+        .unique_exact_product_slice(manufacturer, model)
+        .is_some();
+    let exact_model = evidence.unique_exact_model_slice(model).is_some();
     if !exact_product && !exact_model {
         return Err(
             "source_evidence_text does not itself contain the exact unique catalog product model"
@@ -8315,6 +8312,38 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn exact_association_evidence_is_scoped_to_the_bound_source_span() {
+        let rendered_html = r#"
+            <html><body>
+              <p>Dual GDU-1044B PFD/MFD</p>
+              <p>Garmin GI 275 Standby Instrument</p>
+              <p>A separate GDU-1044B NXi package appears in comparison text.</p>
+            </body></html>
+        "#;
+        validate_exact_listing_product_evidence(
+            rendered_html,
+            "Dual GDU-1044B PFD/MFD",
+            "Garmin",
+            "GDU-1044B",
+        )
+        .expect("an exact bound listing span is not poisoned by another page occurrence");
+        validate_exact_listing_product_evidence(
+            rendered_html,
+            "Garmin GI 275 Standby Instrument",
+            "Garmin",
+            "GI 275",
+        )
+        .expect("the complete product spelling is exact listing evidence");
+        assert!(validate_exact_listing_product_evidence(
+            rendered_html,
+            "A separate GDU-1044B NXi package appears in comparison text.",
+            "Garmin",
+            "GDU-1044B",
+        )
+        .is_err());
+    }
 
     fn pending_aspect(id: &str, suggested_id: i64) -> PendingReviewAspect {
         PendingReviewAspect::avionics(
