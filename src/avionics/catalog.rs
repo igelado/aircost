@@ -533,6 +533,50 @@ pub async fn preview_avionics_identity(
     resolve_avionics_identity_with_write_mode(db, extractor, request, false).await
 }
 
+/// Run only the single tools-disabled generic-label discard gate for a raw
+/// current-schema observation that failed deterministic product-label
+/// validation.
+///
+/// This boundary deliberately has no database, local-match, Search, or catalog
+/// write path. The caller retains every result except the same exact-shape,
+/// very-high-confidence generic rejection accepted by ordinary identity
+/// resolution.
+pub(crate) async fn classify_invalid_generic_avionics_observation(
+    extractor: &GeminiListingExtractor,
+    request: &AvionicsIdentityRequest,
+) -> Option<String> {
+    if request.manufacturer.trim().is_empty()
+        || request.model.trim().is_empty()
+        || request.avionics_types.is_empty()
+        || request
+            .avionics_types
+            .iter()
+            .any(|avionics_type| avionics_type.trim().is_empty())
+        || request.quantity < 1
+    {
+        return None;
+    }
+    let context = AvionicsUnitResolutionContext {
+        aircraft_manufacturer: request.aircraft_manufacturer.clone(),
+        aircraft_model: request.aircraft_model.clone(),
+        aircraft_variant: request.aircraft_variant.clone(),
+        model_year: request.model_year,
+        source_url: request.source_url.clone(),
+        listing_context: request.listing_context.clone(),
+        requires_listing_evidence: request.requires_listing_evidence,
+        authoritative_direct_source_urls: Vec::new(),
+        authoritative_identity_anchors: Vec::new(),
+        candidate: AvionicsUnitResolutionCandidate {
+            manufacturer: request.manufacturer.clone(),
+            model: request.model.clone(),
+            avionics_types: request.avionics_types.clone(),
+            quantity: request.quantity,
+        },
+        catalog_candidates: Vec::new(),
+    };
+    classify_generic_concreteness_rejection(extractor, &context).await
+}
+
 /// Persist a current-policy reuse attestation for an already-approved product
 /// after a fresh preview completed the full grounded identity and collision
 /// review.
@@ -1556,13 +1600,8 @@ async fn resolve_avionics_identity_with_write_mode(
     // grounded research. Any call failure, response-shape drift, ambiguity,
     // or confidence below very_high deliberately falls through to the
     // ordinary evidence-backed workflow.
-    if let Ok(classification) = extractor
-        .classify_avionics_unit_concreteness(&context)
-        .await
-    {
-        if let Some(reason) = generic_concreteness_rejection_reason(&context, classification) {
-            return Ok(AvionicsIdentityOutcome::Rejected { reason });
-        }
+    if let Some(reason) = classify_generic_concreteness_rejection(extractor, &context).await {
+        return Ok(AvionicsIdentityOutcome::Rejected { reason });
     }
 
     let initial_response = match &grounding_plan {
@@ -3922,6 +3961,17 @@ fn generic_concreteness_rejection_reason(
     Some(format!(
         "pre-grounding concreteness review classified observed avionics {observed_identity:?} as a generic non-product label with very high confidence: {indicators}"
     ))
+}
+
+async fn classify_generic_concreteness_rejection(
+    extractor: &GeminiListingExtractor,
+    context: &AvionicsUnitResolutionContext,
+) -> Option<String> {
+    let classification = extractor
+        .classify_avionics_unit_concreteness(context)
+        .await
+        .ok()?;
+    generic_concreteness_rejection_reason(context, classification)
 }
 
 fn verified_identity_from_response(response: &Value) -> CatalogResult<VerifiedIdentity> {

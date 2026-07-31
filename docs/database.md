@@ -1045,6 +1045,12 @@ minimum baseline (candidate comparison succeeds and conditional relationship
 targets are skipped), all-positive baseline, and maximum validation envelope
 (every candidate falls through to classifier plus grounding). A legacy
 listing re-extraction is one baseline request and up to two with JSON repair.
+In addition, each structurally valid current-schema observation rejected by
+local validation only because its model is a generic label contributes exactly
+one tools-disabled classifier request to every plan total. A strict
+`very_high` generic/non-single-unit result discards it; every other result stays
+in review without grounding. Other invalid observations make no provider
+request.
 Transport retry attempts are reported separately and are not multiplied into
 these logical counts. Identity counts produced by legacy re-extraction, later
 verified-local reuse, fallback, and correction outcomes remain explicitly

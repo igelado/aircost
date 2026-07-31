@@ -241,7 +241,13 @@ fast path may discard an observation before grounded research: the classifier
 must return the exact response shape, classify it as `generic` with
 `very_high` confidence, set `model_identifies_single_unit=false`, and provide
 concrete non-empty indicators. Invalid, ambiguous, weaker, or failed answers
-continue normally. The grounded resolver has a separate discard path for a
+continue normally. Automatic review also uses that one-call gate for retained
+current-schema observations whose product label is generic but whose
+capabilities, quantity, source evidence, action, and replacement graph are
+otherwise structurally valid. Only the same strict decision discards them;
+every other answer stays in manual review without grounded catalog calls.
+Structurally malformed observations bypass the classifier and remain pending.
+The grounded resolver has a separate discard path for a
 high-confidence structured `rejection_basis` and a basis-consistent,
 candidate-specific negative reason. For that path, the entire normalized
 reason must appear in one linked Google Search citation support span. A
@@ -495,7 +501,10 @@ request plan and warns that finalization enrichment is additional. This is a
 cost warning, not a hard budget. The avionics totals include one tools-disabled
 concreteness-classifier request for every identity that reaches grounded
 curation; verified-local identities and successful closed-context candidate
-adjudications do not incur that request. Deterministically FAA-rejected
+adjudications do not incur that request. They also include one request for each
+otherwise-valid current-schema generic label evaluated before terminal invalid
+retention; those observations never proceed to grounding from that path.
+Deterministically FAA-rejected
 aircraft and reference-only listings remain visible but are not selectable for
 another automatic identity run. `GEMINI_API_KEY` enables extraction and
 curation; `FAA_DRS_API_KEY` additionally enables unresolved aircraft grounding.
