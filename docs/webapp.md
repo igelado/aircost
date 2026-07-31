@@ -404,6 +404,16 @@ exactly one before the Verify Listing button is enabled:
 - **Discard observation** requires a reason and creates neither a catalog row
   nor a listing association.
 
+Each avionics card also allows the reviewer to correct the extracted
+manufacturer, model, canonical capabilities, and quantity. A fresh unlinked
+observation may additionally correct its installation action and replacement
+target; an aspect already bound to a listing link keeps that relationship
+locked. Saving a correction creates a new hash-bound pending-review revision,
+clears any prior product suggestion, and leaves the publisher's observed text,
+source evidence, and retained submission immutable. It does not write an
+avionics catalog row or listing association. The corrected aspect must still be
+resolved through one of the normal review decisions above.
+
 A hash-bound approved-product target is not a fourth decision type. Product
 attestation and retained-source occurrence verification are separate
 operations.
@@ -460,11 +470,21 @@ POST /api/review/verification-runs/{run_id}/cancel
 GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
+POST /api/review/listings/{listing_id}/restage
 POST /api/review/listings/{listing_id}/avionics/consolidate
+POST /api/review/listings/{listing_id}/avionics/use-existing
+POST /api/review/listings/{listing_id}/avionics/revise
 POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/avionics/approve-replacement
 POST /api/review/listings/{listing_id}/resolve
 ```
+
+Explicit restaging is the recovery boundary for a synthetic preserved-link
+card whose covered listing association has changed since staging. It removes
+only the stale relationship component, recreates cards from the current link
+set, and retains independent raw observations. Correction and final resolution
+remain strict: they reject stale covered links instead of repairing them
+implicitly.
 
 The aspect-scoped consolidation endpoint never calls Gemini. A reviewer cites
 authoritative evidence and names one survivor plus the complete set of

@@ -17,6 +17,8 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  avionicsObservationCorrectionDraft,
+  avionicsObservationRevisionRequest,
   associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
@@ -40,6 +42,7 @@ import {
   runProductAssociationWorkers,
   summarizeProductAssociations,
   summarizeProductReviewGroups,
+  validateAvionicsObservationCorrection,
 } from "/review/domain.mjs";
 
 const REVIEW_LISTING_PARAM = "review_listing";
@@ -100,6 +103,7 @@ const state = {
   currentReview: null,
   drafts: new Map(),
   aspectViews: new Map(),
+  correctionViews: new Map(),
   catalogSearchTimers: new Map(),
   catalogSearchSequences: new Map(),
   activeArea: "avionics",
@@ -2142,6 +2146,7 @@ async function openReview(
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
+  state.correctionViews.clear();
   state.stale = false;
   state.resolving = false;
   showWorkspace();
@@ -2210,6 +2215,7 @@ function initializeDrafts(review) {
       // This is only a local draft default. Resolution still requires the
       // reviewer to submit the complete decision set to the server.
       action: preselectedReviewAction(aspect),
+      correction: avionicsObservationCorrectionDraft(aspect),
       catalogProduct: normalizedProduct(aspect.suggested_product),
       create: {
         manufacturer: proposed?.manufacturer || "",
@@ -2248,6 +2254,7 @@ function renderReview() {
   renderSource(review);
   renderAircraftSummary(review);
   state.aspectViews.clear();
+  state.correctionViews.clear();
   const avionicsAspects = review.aspects.filter(
     (aspect) => reviewAreaForAspect(aspect) === "avionics",
   );
@@ -2489,6 +2496,7 @@ function renderAspect(aspect, index, total) {
   }
   observation.append(observationLabel, observationText, observationMetadata, evidence);
   context.append(observation);
+  context.append(observationCorrectionControls(aspect, draft, key));
 
   if (aspect.suggested_product) {
     const suggestion = productSummary(aspect.suggested_product, "Suggested verified match");
@@ -2597,6 +2605,293 @@ function renderAspect(aspect, index, total) {
   state.aspectViews.set(key, { article, status, panels, validation });
   syncAspectView(key);
   return article;
+}
+
+function observationCorrectionControls(aspect, draft, key) {
+  const correction = draft.correction;
+  const details = document.createElement("details");
+  details.className = "review-observation-correction";
+  details.open = aspect.reviewer_corrected === true;
+  const summary = document.createElement("summary");
+  summary.textContent = aspect.reviewer_corrected
+    ? "Corrected avionics values"
+    : "Correct extracted values";
+  const intro = document.createElement("p");
+  intro.className = "review-correction-intro";
+  intro.textContent = aspect.configuration_action_editable
+    ? "Correct the product and listing occurrence. Saving creates a new review revision; catalog verification still happens below."
+    : "Correct the product, avionics types, or quantity. This item is bound to an existing listing relationship, so its installation action and target stay locked.";
+  const grid = document.createElement("div");
+  grid.className = "review-correction-grid";
+  grid.append(
+    draftInput("Manufacturer", correction.manufacturer, (value) => {
+      correction.manufacturer = value;
+      correctionChanged(key);
+    }),
+    draftInput("Model", correction.model, (value) => {
+      correction.model = value;
+      correctionChanged(key);
+    }),
+  );
+
+  const quantity = draftInput("Quantity", String(correction.quantity), (value) => {
+    correction.quantity = /^\d+$/.test(value) ? Number(value) : null;
+    correctionChanged(key);
+  }, "number");
+  const quantityInput = quantity.querySelector("input");
+  quantityInput.min = "1";
+  quantityInput.step = "1";
+  grid.append(quantity);
+
+  const actionLabel = document.createElement("label");
+  const actionCaption = document.createElement("span");
+  actionCaption.textContent = "Installation action";
+  const action = document.createElement("select");
+  for (const [value, label] of [
+    ["installed", "Installed"],
+    ["replaces", "Replaces another unit"],
+    ["removes", "Removed from this aircraft"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = correction.configurationAction === value;
+    action.append(option);
+  }
+  action.disabled = !correction.actionEditable;
+  action.addEventListener("change", () => {
+    correction.configurationAction = action.value;
+    if (action.value === "installed") {
+      correction.replacementTargetKind = "none";
+      correction.replacementProduct = null;
+      correction.replacementAspectId = null;
+    } else if (correction.replacementTargetKind === "none") {
+      correction.replacementTargetKind = "catalog_product";
+    }
+    correctionChanged(key);
+    renderReview();
+  });
+  actionLabel.append(actionCaption, action);
+  grid.append(actionLabel);
+
+  const types = document.createElement("fieldset");
+  types.className = "review-correction-types review-control-wide";
+  const typesLegend = document.createElement("legend");
+  typesLegend.textContent = "Avionics types";
+  const typeOptions = document.createElement("div");
+  typeOptions.className = "review-correction-type-options";
+  for (const capability of allowedCapabilities()) {
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = correction.capabilities.includes(capability);
+    checkbox.addEventListener("change", () => {
+      const selected = new Set(correction.capabilities);
+      if (checkbox.checked) {
+        selected.add(capability);
+      } else {
+        selected.delete(capability);
+      }
+      correction.capabilities = allowedCapabilities().filter((item) => selected.has(item));
+      correctionChanged(key);
+    });
+    label.append(checkbox, document.createTextNode(capability));
+    typeOptions.append(label);
+  }
+  types.append(typesLegend, typeOptions);
+  grid.append(types);
+
+  if (correction.configurationAction !== "installed") {
+    grid.append(...replacementTargetCorrectionControls(aspect, draft, key));
+  }
+
+  const validation = document.createElement("p");
+  validation.className = "review-correction-validation";
+  const save = document.createElement("button");
+  save.type = "button";
+  save.className = "button primary";
+  save.textContent = correction.saving ? "Saving correction…" : "Save corrected values";
+  save.addEventListener("click", () => saveObservationCorrection(key, save));
+  const actions = document.createElement("div");
+  actions.className = "review-correction-actions";
+  actions.append(validation, save);
+  details.append(summary, intro, grid, actions);
+  state.correctionViews.set(key, { validation, save, aspect });
+  syncCorrectionView(key);
+  return details;
+}
+
+function replacementTargetCorrectionControls(aspect, draft, key) {
+  const correction = draft.correction;
+  const kindLabel = document.createElement("label");
+  const caption = document.createElement("span");
+  caption.textContent = "Affected product source";
+  const kind = document.createElement("select");
+  for (const [value, label] of [
+    ["catalog_product", "Approved catalog product"],
+    ["review_aspect", "Another pending observation"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = correction.replacementTargetKind === value;
+    kind.append(option);
+  }
+  kind.disabled = !correction.actionEditable;
+  kind.addEventListener("change", () => {
+    correction.replacementTargetKind = kind.value;
+    correction.replacementProduct = null;
+    correction.replacementAspectId = null;
+    correctionChanged(key);
+    renderReview();
+  });
+  kindLabel.append(caption, kind);
+
+  if (correction.replacementTargetKind === "review_aspect") {
+    const targetLabel = document.createElement("label");
+    const targetCaption = document.createElement("span");
+    targetCaption.textContent = "Affected pending observation";
+    const target = document.createElement("select");
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Select an observation";
+    target.append(placeholder);
+    for (const candidate of state.currentReview.aspects) {
+      if (aspectKey(candidate.id) === key) {
+        continue;
+      }
+      const option = document.createElement("option");
+      option.value = aspectKey(candidate.id);
+      option.textContent = candidate.label || `Aspect ${aspectKey(candidate.id)}`;
+      option.selected = aspectKey(correction.replacementAspectId) === option.value;
+      target.append(option);
+    }
+    target.disabled = !correction.actionEditable;
+    target.addEventListener("change", () => {
+      correction.replacementAspectId = target.value || null;
+      correctionChanged(key);
+    });
+    targetLabel.append(targetCaption, target);
+    return [kindLabel, targetLabel];
+  }
+
+  const selected = document.createElement("div");
+  selected.className = "review-selected-product review-control-wide";
+  renderSelectedCatalogProduct(selected, normalizedProduct(correction.replacementProduct));
+  const searchLabel = document.createElement("label");
+  searchLabel.className = "review-control-wide";
+  const searchCaption = document.createElement("span");
+  searchCaption.textContent = "Search affected approved product";
+  const search = document.createElement("input");
+  search.type = "search";
+  search.autocomplete = "off";
+  search.placeholder = "Manufacturer, model, or identifier";
+  search.disabled = !correction.actionEditable;
+  searchLabel.append(searchCaption, search);
+  const message = document.createElement("p");
+  message.className = "review-catalog-message review-control-wide";
+  message.textContent = correction.replacementProduct
+    ? "The affected approved product is selected."
+    : "Search for the approved product affected by this action.";
+  const results = document.createElement("div");
+  results.className = "review-catalog-results review-control-wide";
+  search.addEventListener("input", () => {
+    scheduleCatalogSearch(key, search.value, results, selected, message, {
+      scope: "replacement-correction",
+      onSelect(product) {
+        correction.replacementProduct = product;
+        renderSelectedCatalogProduct(selected, product);
+        message.textContent = `${product.displayName} selected as the affected product.`;
+        results.replaceChildren();
+        correctionChanged(key);
+      },
+    });
+  });
+  return [kindLabel, selected, searchLabel, message, results];
+}
+
+function correctionChanged(key) {
+  const draft = state.drafts.get(key);
+  if (!draft) {
+    return;
+  }
+  draft.correction.dirty = true;
+  syncCorrectionView(key);
+  syncAllAspectViews();
+  updateProgress();
+}
+
+function syncCorrectionView(key) {
+  const draft = state.drafts.get(key);
+  const view = state.correctionViews.get(key);
+  if (!draft || !view) {
+    return;
+  }
+  const validation = validateAvionicsObservationCorrection(
+    draft.correction,
+    allowedCapabilities(),
+  );
+  view.validation.textContent = draft.correction.dirty
+    ? validation.message
+    : (view.aspect.reviewer_corrected
+      ? "These corrected values are part of the current review revision."
+      : "The original extracted values are unchanged until you save a correction.");
+  view.validation.classList.toggle(
+    "error",
+    draft.correction.dirty && !validation.valid,
+  );
+  view.save.disabled = !draft.correction.dirty
+    || !validation.valid
+    || draft.correction.saving;
+  view.save.textContent = draft.correction.saving
+    ? "Saving correction…"
+    : "Save corrected values";
+}
+
+async function saveObservationCorrection(key, button) {
+  const review = state.currentReview;
+  const draft = state.drafts.get(key);
+  if (!review || !draft || draft.correction.saving || state.stale) {
+    return;
+  }
+  let request;
+  try {
+    request = avionicsObservationRevisionRequest(review, draft.aspect, draft.correction);
+  } catch (error) {
+    setWorkspaceMessage(error.message, true);
+    return;
+  }
+  draft.correction.saving = true;
+  button.disabled = true;
+  button.textContent = "Saving correction…";
+  setWorkspaceMessage("Saving corrected avionics values into a new review revision…");
+  try {
+    const payload = await api(
+      `/api/review/listings/${review.listing_id}/avionics/revise`,
+      { method: "POST", body: JSON.stringify(request) },
+    );
+    const refreshed = payload?.review;
+    if (!isReviewDetail(refreshed, review.listing_id)) {
+      throw new Error("The server returned an invalid refreshed listing review.");
+    }
+    state.currentReview = refreshed;
+    state.drafts.clear();
+    state.aspectViews.clear();
+    state.correctionViews.clear();
+    initializeDrafts(refreshed);
+    renderReview();
+    setWorkspaceMessage(
+      "Corrected values saved. Select or verify the product using the refreshed review.",
+    );
+  } catch (error) {
+    draft.correction.saving = false;
+    if (isStaleError(error)) {
+      markStale(error.message);
+    } else {
+      setWorkspaceMessage(`Could not save corrected avionics: ${error.message}`, true);
+      renderReview();
+    }
+  }
 }
 
 function actionOption(aspect, action, key) {
@@ -2965,6 +3260,7 @@ function updateProgress() {
     || state.stale
     || !state.currentReview
     || decided !== total
+    || drafts.some((draft) => draft.correction.dirty || draft.correction.saving)
     || !hashesPresent
     || !aircraftVerified;
   elements.automaticallyVerifyListing.disabled = state.resolving
@@ -2994,6 +3290,7 @@ async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label)
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
+  state.correctionViews.clear();
   const queueRefreshed = await loadQueue({ quiet: true });
   if (!queueRefreshed) {
     state.reviews = previousQueue.filter(
@@ -3101,6 +3398,7 @@ async function resolveReview() {
     state.currentReview = null;
     state.drafts.clear();
     state.aspectViews.clear();
+    state.correctionViews.clear();
     const queueRefreshed = await loadQueue({ quiet: true });
     if (!queueRefreshed) {
       state.reviews = previousQueue.filter(
@@ -3214,6 +3512,7 @@ async function validateExistingAssociation(key, button) {
     state.currentReview = refreshed;
     state.drafts.clear();
     state.aspectViews.clear();
+    state.correctionViews.clear();
     initializeDrafts(refreshed);
     renderReview();
     setWorkspaceMessage(
@@ -3234,6 +3533,7 @@ async function leaveCompletedOneByOneReview(listingId) {
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
+  state.correctionViews.clear();
   state.reviews = state.reviews.filter(
     (item) => positiveInteger(item?.listing_id) !== listingId,
   );
@@ -3268,6 +3568,7 @@ async function recoverCommittedResolution(listingId, message) {
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
+  state.correctionViews.clear();
   state.reviews = state.reviews.filter(
     (item) => positiveInteger(item?.listing_id) !== listingId,
   );
@@ -3312,8 +3613,16 @@ function decisionFromDraft(draft) {
   };
 }
 
-function scheduleCatalogSearch(key, query, results, selected, message) {
-  const previous = state.catalogSearchTimers.get(key);
+function scheduleCatalogSearch(
+  key,
+  query,
+  results,
+  selected,
+  message,
+  { scope = "decision", onSelect = null } = {},
+) {
+  const searchKey = `${scope}:${key}`;
+  const previous = state.catalogSearchTimers.get(searchKey);
   if (previous) {
     window.clearTimeout(previous);
   }
@@ -3321,25 +3630,25 @@ function scheduleCatalogSearch(key, query, results, selected, message) {
   message.classList.remove("error");
   if (normalized.length < 2) {
     state.catalogSearchSequences.set(
-      key,
-      (state.catalogSearchSequences.get(key) || 0) + 1,
+      searchKey,
+      (state.catalogSearchSequences.get(searchKey) || 0) + 1,
     );
     results.replaceChildren();
     message.textContent = "Enter at least two characters to search the approved catalog.";
-    state.catalogSearchTimers.delete(key);
+    state.catalogSearchTimers.delete(searchKey);
     return;
   }
   message.textContent = "Waiting to search…";
   const timer = window.setTimeout(() => {
-    state.catalogSearchTimers.delete(key);
-    searchCatalog(key, normalized, results, selected, message);
+    state.catalogSearchTimers.delete(searchKey);
+    searchCatalog(searchKey, key, normalized, results, selected, message, onSelect);
   }, CATALOG_SEARCH_DELAY_MS);
-  state.catalogSearchTimers.set(key, timer);
+  state.catalogSearchTimers.set(searchKey, timer);
 }
 
-async function searchCatalog(key, query, results, selected, message) {
-  const sequence = (state.catalogSearchSequences.get(key) || 0) + 1;
-  state.catalogSearchSequences.set(key, sequence);
+async function searchCatalog(searchKey, key, query, results, selected, message, onSelect) {
+  const sequence = (state.catalogSearchSequences.get(searchKey) || 0) + 1;
+  state.catalogSearchSequences.set(searchKey, sequence);
   message.textContent = "Searching approved avionics…";
   results.setAttribute("aria-busy", "true");
   try {
@@ -3350,12 +3659,16 @@ async function searchCatalog(key, query, results, selected, message) {
       offset: "0",
     });
     const payload = await api(`/api/avionics?${params}`);
-    if (state.catalogSearchSequences.get(key) !== sequence || !state.drafts.has(key)) {
+    if (state.catalogSearchSequences.get(searchKey) !== sequence || !state.drafts.has(key)) {
       return;
     }
     const items = Array.isArray(payload?.catalog?.items) ? payload.catalog.items : [];
     results.replaceChildren(
       ...items.map((item) => catalogResult(item, () => {
+        if (typeof onSelect === "function") {
+          onSelect(normalizedProduct(item));
+          return;
+        }
         const draft = state.drafts.get(key);
         if (!draft) {
           return;
@@ -3374,13 +3687,13 @@ async function searchCatalog(key, query, results, selected, message) {
       ? `${items.length} approved ${pluralize(items.length, "match")} found.`
       : "No approved avionics matched this search.";
   } catch (error) {
-    if (state.catalogSearchSequences.get(key) === sequence) {
+    if (state.catalogSearchSequences.get(searchKey) === sequence) {
       results.replaceChildren();
       message.textContent = `Catalog search failed: ${error.message}`;
       message.classList.add("error");
     }
   } finally {
-    if (state.catalogSearchSequences.get(key) === sequence) {
+    if (state.catalogSearchSequences.get(searchKey) === sequence) {
       results.setAttribute("aria-busy", "false");
     }
   }
@@ -3740,6 +4053,7 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   state.currentReview = null;
   state.drafts.clear();
   state.aspectViews.clear();
+  state.correctionViews.clear();
   state.stale = false;
   state.resolving = false;
   state.automating = false;
@@ -3840,7 +4154,9 @@ function nextAfterResolved(previousQueue, resolvedListingId) {
 }
 
 function hasDraftDecisions() {
-  return Array.from(state.drafts.values()).some((draft) => draft.action !== null);
+  return Array.from(state.drafts.values()).some(
+    (draft) => draft.action !== null || draft.correction.dirty,
+  );
 }
 
 function confirmDiscardDraft() {

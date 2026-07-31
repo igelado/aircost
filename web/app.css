@@ -2245,6 +2245,88 @@ label span,
   font-style: italic;
 }
 
+.review-observation-correction {
+  min-width: 0;
+  border: 1px solid #b8d8d4;
+  border-radius: 8px;
+  background: #f7fbfa;
+}
+
+.review-observation-correction > summary {
+  padding: 10px;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.review-correction-intro {
+  margin: 0;
+  padding: 0 10px 10px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.review-correction-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 0 10px 10px;
+}
+
+.review-correction-grid > label > span,
+.review-correction-types > legend {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.review-correction-types {
+  margin: 0;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.review-correction-type-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 10px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.review-correction-type-options label {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.review-correction-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px;
+  border-top: 1px solid #b8d8d4;
+}
+
+.review-correction-validation {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.review-correction-validation.error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
 .review-product-summary strong,
 .review-product-summary > span:not(.review-eyebrow),
 .review-selected-product strong,
@@ -2619,7 +2701,9 @@ label span,
   .aircraft-toolbar,
   .avionics-toolbar,
   .review-action-list,
-  .review-create-product-grid {
+  .review-create-product-grid,
+  .review-correction-grid,
+  .review-correction-type-options {
     grid-template-columns: 1fr;
   }
 

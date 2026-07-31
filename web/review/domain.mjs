@@ -227,6 +227,119 @@ export function preselectedReviewAction(aspect) {
     : null;
 }
 
+export function avionicsObservationCorrectionDraft(aspect) {
+  const product = aspect?.proposed_product
+    ?? aspect?.reuse_attestation_target
+    ?? aspect?.suggested_product
+    ?? null;
+  const replacementProduct = aspect?.replacement_product ?? null;
+  return {
+    manufacturer: typeof product?.manufacturer === "string" ? product.manufacturer : "",
+    model: typeof product?.model === "string" ? product.model : "",
+    capabilities: Array.isArray(product?.capabilities) ? product.capabilities.slice() : [],
+    quantity: Number.isSafeInteger(aspect?.quantity) ? aspect.quantity : 1,
+    configurationAction: typeof aspect?.configuration_action === "string"
+      ? aspect.configuration_action
+      : "installed",
+    actionEditable: aspect?.configuration_action_editable === true,
+    replacementTargetKind: replacementProduct?.id ? "catalog_product" : (
+      aspect?.replacement_aspect_id == null ? "none" : "review_aspect"
+    ),
+    replacementProduct,
+    replacementAspectId: aspect?.replacement_aspect_id ?? null,
+    dirty: false,
+    saving: false,
+  };
+}
+
+export function validateAvionicsObservationCorrection(correction, allowedCapabilities) {
+  if (!correction || typeof correction !== "object") {
+    return { valid: false, message: "Corrected avionics values are unavailable." };
+  }
+  if (
+    typeof correction.manufacturer !== "string"
+    || !correction.manufacturer.trim()
+    || typeof correction.model !== "string"
+    || !correction.model.trim()
+  ) {
+    return { valid: false, message: "Corrected manufacturer and model are required." };
+  }
+  if (!Number.isSafeInteger(correction.quantity) || correction.quantity <= 0) {
+    return { valid: false, message: "Corrected quantity must be a positive whole number." };
+  }
+  const capabilities = Array.isArray(correction.capabilities)
+    ? correction.capabilities
+    : [];
+  if (!capabilities.length) {
+    return { valid: false, message: "Select at least one corrected avionics type." };
+  }
+  const allowed = new Set(Array.isArray(allowedCapabilities) ? allowedCapabilities : []);
+  const unsupported = capabilities.filter((capability) => !allowed.has(capability));
+  if (unsupported.length) {
+    return {
+      valid: false,
+      message: `Use canonical avionics types; unsupported: ${unsupported.join(", ")}.`,
+    };
+  }
+  if (!["installed", "replaces", "removes"].includes(correction.configurationAction)) {
+    return { valid: false, message: "Choose a valid installation action." };
+  }
+  if (correction.configurationAction === "installed") {
+    return { valid: true, message: "Corrected observation values are ready to save." };
+  }
+  if (
+    correction.replacementTargetKind === "catalog_product"
+    && Number.isSafeInteger(correction.replacementProduct?.id)
+    && correction.replacementProduct.id > 0
+  ) {
+    return { valid: true, message: "Corrected replacement relationship is ready to save." };
+  }
+  if (
+    correction.replacementTargetKind === "review_aspect"
+    && (typeof correction.replacementAspectId === "string"
+      || Number.isSafeInteger(correction.replacementAspectId))
+  ) {
+    return { valid: true, message: "Corrected replacement relationship is ready to save." };
+  }
+  return {
+    valid: false,
+    message: "Select the approved product or pending observation affected by this action.",
+  };
+}
+
+export function avionicsObservationRevisionRequest(review, aspect, correction) {
+  const validation = validateAvionicsObservationCorrection(
+    correction,
+    review?.allowed_capabilities,
+  );
+  if (!validation.valid) {
+    throw new TypeError(validation.message);
+  }
+  let replacementTarget = null;
+  if (correction.configurationAction !== "installed") {
+    replacementTarget = correction.replacementTargetKind === "catalog_product"
+      ? {
+        kind: "catalog_product",
+        avionics_model_id: correction.replacementProduct.id,
+      }
+      : {
+        kind: "review_aspect",
+        aspect_id: correction.replacementAspectId,
+      };
+  }
+  return {
+    review_payload_sha256: review.review_payload_sha256,
+    catalog_revision_sha256: review.catalog_revision_sha256,
+    aspect_id: aspect.id,
+    manufacturer: correction.manufacturer.trim(),
+    model: correction.model.trim(),
+    capabilities: correction.capabilities.slice(),
+    quantity: correction.quantity,
+    configuration_action: correction.configurationAction,
+    replacement_target: replacementTarget,
+  };
+}
+
 export function isAircraftIdentityStatus(value) {
   if (
     !value

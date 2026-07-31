@@ -1324,6 +1324,7 @@ fn pending_avionics_aspect(
         replaces_product_id,
         replacement_aspect_id,
         covered_associations: Vec::new(),
+        reviewer_correction_association_binding: None,
         reuse_attestation_target_id: None,
     }
 }
@@ -1367,6 +1368,7 @@ fn pending_replacement_aspect(
         replaces_product_id: None,
         replacement_aspect_id: None,
         covered_associations: Vec::new(),
+        reviewer_correction_association_binding: None,
         reuse_attestation_target_id: None,
     }
 }

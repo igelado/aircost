@@ -28,3 +28,29 @@ test("prepares preserved product references before reading the product queue", (
   assert.ok(prepareCall >= 0);
   assert.ok(queueCall > prepareCall);
 });
+
+test("renders guarded avionics correction controls and uses the revision endpoint", () => {
+  assert.match(reviewJs, /Correct extracted values/);
+  assert.match(reviewJs, /Manufacturer/);
+  assert.match(reviewJs, /Avionics types/);
+  assert.match(reviewJs, /Installation action/);
+  assert.match(reviewJs, /Save corrected values/);
+  assert.match(
+    reviewJs,
+    /\/api\/review\/listings\/\$\{review\.listing_id\}\/avionics\/revise/,
+  );
+  assert.match(reviewJs, /avionicsObservationRevisionRequest/);
+  assert.doesNotMatch(
+    reviewJs,
+    /api\(`\/api\/avionics\/\$\{[^}]+\}`[^]*method:\s*"(?:PATCH|PUT|DELETE)"/,
+  );
+});
+
+test("keeps listing verification disabled while a correction is unsaved", () => {
+  assert.match(
+    reviewJs,
+    /drafts\.some\(\(draft\) => draft\.correction\.dirty \|\| draft\.correction\.saving\)/,
+  );
+  assert.match(reviewJs, /review_payload_sha256: review\.review_payload_sha256/);
+  assert.match(reviewJs, /catalog_revision_sha256: review\.catalog_revision_sha256/);
+});

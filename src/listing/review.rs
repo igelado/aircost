@@ -70,6 +70,7 @@ const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
 const PRESERVED_ASSOCIATION_REVIEW_REASON: &str =
     "catalog_product_or_listing_corroboration_missing";
+const REVIEWER_CORRECTED_AVIONICS_KIND: &str = "avionics_reviewer_correction";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
     LOCK TABLE aircraft_sale_listing_avionics,
                aircraft_sale_listing_avionics_corroborations,
@@ -212,6 +213,18 @@ pub struct CoveredListingAssociation {
     pub avionics_model_id: i64,
 }
 
+/// Exact listing-link state against which a reviewer correction was made.
+/// The corrected quantity and identity live on the aspect; this snapshot keeps
+/// concurrent listing mutations detectable until ordinary review resolution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewerCorrectionAssociationBinding {
+    pub listing_link_id: i64,
+    pub avionics_model_id: i64,
+    pub quantity: i64,
+    pub configuration_action: String,
+    pub replaces_avionics_model_id: Option<i64>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ReviewProduct {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,6 +358,8 @@ pub struct PendingReviewAspect {
     /// including associations to the same product on a different link.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub covered_associations: Vec<CoveredListingAssociation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_correction_association_binding: Option<ReviewerCorrectionAssociationBinding>,
     /// Approved catalog product whose hash-bound listing aspect must be
     /// freshly verified before its occurrence is eligible for reuse.
     ///
@@ -386,6 +401,7 @@ impl PendingReviewAspect {
             replaces_product_id: None,
             replacement_aspect_id: None,
             covered_associations: Vec::new(),
+            reviewer_correction_association_binding: None,
             reuse_attestation_target_id: None,
         }
     }
@@ -677,6 +693,13 @@ pub struct ReviewAspectView {
     pub reason: String,
     pub quantity: i64,
     pub configuration_action: String,
+    /// True when a reviewer has saved corrected occurrence values while the
+    /// publisher observation and its evidence remain immutable below.
+    pub reviewer_corrected: bool,
+    /// Existing listing-link graphs stay bound to their staged action and
+    /// target. Fresh, unlinked observations may correct the complete action
+    /// graph before ordinary product review.
+    pub configuration_action_editable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_evidence_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -714,6 +737,30 @@ pub struct ListingReview {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ListingReviewDetail {
     pub review: ListingReview,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewReplacementTarget {
+    CatalogProduct { avionics_model_id: i64 },
+    ReviewAspect { aspect_id: ReviewAspectId },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviseAvionicsObservationRequest {
+    #[serde(rename = "review_payload_sha256")]
+    pub expected_review_payload_sha256: String,
+    #[serde(rename = "catalog_revision_sha256")]
+    pub expected_catalog_revision_sha256: String,
+    pub aspect_id: ReviewAspectId,
+    pub manufacturer: String,
+    pub model: String,
+    pub capabilities: Vec<String>,
+    pub quantity: i64,
+    pub configuration_action: String,
+    #[serde(default)]
+    pub replacement_target: Option<ReviewReplacementTarget>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1310,6 +1357,7 @@ struct ExtractionFingerprintAspect<'a> {
     replaces_product_id: Option<i64>,
     replacement_aspect_id: Option<&'a ReviewAspectId>,
     covered_associations: &'a [CoveredListingAssociation],
+    reviewer_correction_association_binding: Option<&'a ReviewerCorrectionAssociationBinding>,
     reuse_attestation_target_id: Option<i64>,
 }
 
@@ -1326,6 +1374,9 @@ impl<'a> From<&'a PendingReviewAspect> for ExtractionFingerprintAspect<'a> {
             replaces_product_id: aspect.replaces_product_id,
             replacement_aspect_id: aspect.replacement_aspect_id.as_ref(),
             covered_associations: &aspect.covered_associations,
+            reviewer_correction_association_binding: aspect
+                .reviewer_correction_association_binding
+                .as_ref(),
             reuse_attestation_target_id: aspect.reuse_attestation_target_id,
         }
     }
@@ -1375,6 +1426,47 @@ fn validated_aspects(aspects: &[PendingReviewAspect]) -> ReviewResult<Vec<Pendin
                 "review aspect {} contains an invalid covered listing association",
                 aspect.id
             )));
+        }
+        match aspect.reviewer_correction_association_binding.as_ref() {
+            Some(binding)
+                if aspect.kind != REVIEWER_CORRECTED_AVIONICS_KIND
+                    || binding.listing_link_id <= 0
+                    || binding.avionics_model_id <= 0
+                    || binding.quantity <= 0
+                    || !matches!(
+                        binding.configuration_action.as_str(),
+                        "installed" | "replaces" | "removes"
+                    )
+                    || ((binding.configuration_action == "installed")
+                        != binding.replaces_avionics_model_id.is_none())
+                    || aspect.covered_associations.len() != 1
+                    || aspect.covered_associations[0].listing_link_id
+                        != binding.listing_link_id
+                    || match aspect.covered_associations[0].role {
+                        ListingAssociationRole::Installed => {
+                            aspect.covered_associations[0].avionics_model_id
+                                != binding.avionics_model_id
+                        }
+                        ListingAssociationRole::Replacement => {
+                            binding.replaces_avionics_model_id
+                                != Some(aspect.covered_associations[0].avionics_model_id)
+                        }
+                    } =>
+            {
+                return Err(ReviewError::Validation(format!(
+                    "review aspect {} contains an invalid reviewer-correction association binding",
+                    aspect.id
+                )));
+            }
+            None if aspect.kind == REVIEWER_CORRECTED_AVIONICS_KIND
+                && !aspect.covered_associations.is_empty() =>
+            {
+                return Err(ReviewError::Validation(format!(
+                    "covered reviewer correction {} is missing its exact association binding",
+                    aspect.id
+                )));
+            }
+            _ => {}
         }
         if aspect
             .proposed_product
@@ -2173,6 +2265,12 @@ async fn restage_pending_review_if_current_with_commit(
                 )
                 .fetch_all(&mut *transaction)
                 .await?;
+            if maintenance_commit.is_none() {
+                repaired_evidence |= remove_stale_covered_relationships(
+                    &mut payload.aspects,
+                    &assignments,
+                );
+            }
             validate_current_covered_associations(&payload.aspects, &assignments)?;
             let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
                 .fetch_all(&mut *transaction)
@@ -2310,7 +2408,7 @@ async fn restage_pending_review_if_current_with_commit(
                             );
                     }
                 }
-                if repaired_evidence {
+                if repaired_evidence && !payload.aspects.is_empty() {
                     payload.aspects = validated_aspects(&payload.aspects)?;
                     validate_current_covered_associations(&payload.aspects, &assignments)?;
                 }
@@ -2804,6 +2902,407 @@ async fn restage_pending_review_if_current(
         None,
     )
     .await
+}
+
+fn configuration_action_is_editable(
+    aspect: &PendingReviewAspect,
+    aspects: &[PendingReviewAspect],
+) -> bool {
+    aspect.covered_associations.is_empty()
+        && !aspects
+            .iter()
+            .any(|candidate| candidate.replacement_aspect_id.as_ref() == Some(&aspect.id))
+}
+
+fn replacement_target_matches_aspect(
+    target: Option<&ReviewReplacementTarget>,
+    aspect: &PendingReviewAspect,
+) -> bool {
+    match target {
+        None => aspect.replaces_product_id.is_none() && aspect.replacement_aspect_id.is_none(),
+        Some(ReviewReplacementTarget::CatalogProduct { avionics_model_id }) => {
+            aspect.replaces_product_id == Some(*avionics_model_id)
+                && aspect.replacement_aspect_id.is_none()
+        }
+        Some(ReviewReplacementTarget::ReviewAspect { aspect_id }) => {
+            aspect.replaces_product_id.is_none()
+                && aspect.replacement_aspect_id.as_ref() == Some(aspect_id)
+        }
+    }
+}
+
+fn reviewer_correction_association_binding(
+    aspect: &PendingReviewAspect,
+    assignments: &[ExistingAssignmentRow],
+) -> ReviewResult<Option<ReviewerCorrectionAssociationBinding>> {
+    if let Some(binding) = aspect.reviewer_correction_association_binding.as_ref() {
+        return Ok(Some(binding.clone()));
+    }
+    let Some(association) = aspect.covered_associations.first() else {
+        return Ok(None);
+    };
+    if aspect.covered_associations.len() != 1 {
+        return Err(ReviewError::Validation(format!(
+            "review aspect {} covers multiple listing associations and cannot be corrected as one occurrence",
+            aspect.id
+        )));
+    }
+    let assignment = assignments
+        .iter()
+        .find(|assignment| assignment.listing_link_id == association.listing_link_id)
+        .ok_or_else(|| {
+            ReviewError::Stale(format!(
+                "listing link {} covered by review aspect {} no longer exists; reload",
+                association.listing_link_id, aspect.id
+            ))
+        })?;
+    Ok(Some(ReviewerCorrectionAssociationBinding {
+        listing_link_id: assignment.listing_link_id,
+        avionics_model_id: assignment.avionics_model_id,
+        quantity: assignment.quantity,
+        configuration_action: assignment.configuration_action.clone(),
+        replaces_avionics_model_id: assignment.replaces_avionics_model_id,
+    }))
+}
+
+fn prepare_observation_revision(
+    request: &ReviseAvionicsObservationRequest,
+) -> ReviewResult<(String, String, Vec<String>, String)> {
+    request.aspect_id.validate()?;
+    if !valid_sha256(&request.expected_review_payload_sha256)
+        || !valid_sha256(&request.expected_catalog_revision_sha256)
+    {
+        return Err(ReviewError::Validation(
+            "review and catalog revisions must be lowercase SHA-256 hex values".to_string(),
+        ));
+    }
+    let manufacturer = request.manufacturer.trim();
+    let model = request.model.trim();
+    if manufacturer.chars().count() > MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS
+        || model.chars().count() > MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS
+    {
+        return Err(ReviewError::Validation(format!(
+            "corrected avionics manufacturer and model must each contain at most {MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS} characters"
+        )));
+    }
+    if !is_usable_avionics_label(manufacturer, model) {
+        return Err(ReviewError::Validation(format!(
+            "corrected avionics requires a concrete manufacturer and model: {manufacturer} {model}"
+        )));
+    }
+    if request.quantity <= 0 {
+        return Err(ReviewError::Validation(
+            "corrected avionics quantity must be positive".to_string(),
+        ));
+    }
+    let configuration_action = request.configuration_action.trim();
+    if !matches!(configuration_action, "installed" | "replaces" | "removes") {
+        return Err(ReviewError::Validation(format!(
+            "unsupported corrected configuration_action {configuration_action:?}"
+        )));
+    }
+    if (configuration_action == "installed") != request.replacement_target.is_none() {
+        return Err(ReviewError::Validation(
+            "installed avionics cannot have a replacement target, while replaces/removes requires exactly one target"
+                .to_string(),
+        ));
+    }
+    if let Some(ReviewReplacementTarget::CatalogProduct { avionics_model_id }) =
+        request.replacement_target.as_ref()
+    {
+        if *avionics_model_id <= 0 {
+            return Err(ReviewError::Validation(
+                "replacement avionics_model_id must be positive".to_string(),
+            ));
+        }
+    }
+    if let Some(ReviewReplacementTarget::ReviewAspect { aspect_id }) =
+        request.replacement_target.as_ref()
+    {
+        aspect_id.validate()?;
+        if aspect_id == &request.aspect_id {
+            return Err(ReviewError::Validation(
+                "an avionics observation cannot use itself as a replacement target".to_string(),
+            ));
+        }
+    }
+    Ok((
+        manufacturer.to_string(),
+        model.to_string(),
+        canonical_capabilities(&request.capabilities)?,
+        configuration_action.to_string(),
+    ))
+}
+
+/// Saves corrected reviewer values into the hash-addressed pending bundle.
+///
+/// Publisher text and evidence are intentionally immutable. The correction
+/// only changes the product proposal and occurrence semantics consumed by the
+/// existing guarded resolve workflow; it never mutates a catalog row or a
+/// listing association directly.
+pub async fn revise_avionics_observation_and_restage(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    request: &ReviseAvionicsObservationRequest,
+) -> ReviewResult<StagedPendingReview> {
+    if listing_id <= 0 || owner_user_id <= 0 {
+        return Err(ReviewError::Validation(
+            "listing and owner IDs must be positive".to_string(),
+        ));
+    }
+    let (manufacturer, model, capabilities, configuration_action) =
+        prepare_observation_revision(request)?;
+    let lock_catalog = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            "UPDATE avionics_models SET updated_at = updated_at WHERE id = (SELECT id FROM avionics_models WHERE catalog_status = 'approved' ORDER BY id LIMIT 1)",
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(POSTGRES_RESTAGE_CATALOG_LOCK_SQL),
+    };
+    let lock_listing_children = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql("SELECT 1"),
+        DatabaseBackend::Postgres(_) => db.sql(POSTGRES_LISTING_CHILD_LOCK_SQL),
+    };
+    let postgres_review_select = format!("{REVIEW_SELECT_SQL} FOR UPDATE OF listing, review");
+    let select_review = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(REVIEW_SELECT_SQL),
+        DatabaseBackend::Postgres(_) => db.sql(&postgres_review_select),
+    };
+    let catalog_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
+    let approved_products_sql = db.sql(APPROVED_PRODUCT_ROWS_SQL);
+    let assignments_sql = db.sql(EXISTING_ASSIGNMENT_ROWS_SQL);
+    let update_review = db.sql(
+        r#"
+        UPDATE aircraft_sale_listing_pending_reviews
+        SET extraction_sha256 = ?,
+            catalog_revision_sha256 = ?,
+            pending_aspect_count = ?,
+            review_payload_json = ?,
+            review_payload_sha256 = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE listing_id = ?
+          AND review_payload_sha256 = ?
+        "#,
+    );
+
+    macro_rules! revise_in_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            sqlx::query(&lock_catalog)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(&lock_listing_children)
+                .execute(&mut *transaction)
+                .await?;
+            let row = sqlx::query_as::<_, ReviewRow>(&select_review)
+                .bind(listing_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    ReviewError::Stale(format!(
+                        "pending review for listing {listing_id} changed or was resolved"
+                    ))
+                })?;
+            if row.owner_user_id != owner_user_id {
+                return Err(ReviewError::Permission(
+                    "reviewers may only revise reviews for listings they own".to_string(),
+                ));
+            }
+            if row.ingestion_state != "pending_review"
+                || row.is_verified
+                || row.review_payload_sha256 != request.expected_review_payload_sha256
+            {
+                return Err(ReviewError::Stale(
+                    "review payload is stale; reload before saving corrected avionics".to_string(),
+                ));
+            }
+            let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let catalog_revision_sha256 =
+                fingerprint_catalog_products(&catalog_products(catalog_rows));
+            if catalog_revision_sha256 != request.expected_catalog_revision_sha256 {
+                return Err(ReviewError::Stale(
+                    "approved avionics catalog changed; reload before saving corrected avionics"
+                        .to_string(),
+                ));
+            }
+            let approved_rows = sqlx::query_as::<_, ApprovedProductRow>(&approved_products_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let approved = approved_product_map(approved_rows);
+            if let Some(ReviewReplacementTarget::CatalogProduct { avionics_model_id }) =
+                request.replacement_target.as_ref()
+            {
+                if !approved.contains_key(avionics_model_id) {
+                    return Err(ReviewError::Stale(format!(
+                        "replacement catalog id {avionics_model_id} is missing or no longer approved"
+                    )));
+                }
+            }
+            let assignments = sqlx::query_as::<_, ExistingAssignmentRow>(&assignments_sql)
+                .bind(listing_id)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let mut payload = parse_payload(
+                &row.review_payload_json,
+                Some(&row.review_payload_sha256),
+                row.pending_aspect_count,
+            )?;
+            validate_current_covered_associations(&payload.aspects, &assignments)?;
+            let aspect_index = payload
+                .aspects
+                .iter()
+                .position(|aspect| aspect.id == request.aspect_id)
+                .ok_or_else(|| {
+                    ReviewError::Stale(format!(
+                        "review aspect {} changed before its correction was saved",
+                        request.aspect_id
+                    ))
+                })?;
+            let original = payload.aspects[aspect_index].clone();
+            if !original.kind.starts_with("avionics") {
+                return Err(ReviewError::Validation(format!(
+                    "review aspect {} is not an avionics observation",
+                    request.aspect_id
+                )));
+            }
+            let configuration_editable =
+                configuration_action_is_editable(&original, &payload.aspects);
+            let association_binding =
+                reviewer_correction_association_binding(&original, &assignments)?;
+            if !configuration_editable
+                && (configuration_action != original.configuration_action
+                    || !replacement_target_matches_aspect(
+                        request.replacement_target.as_ref(),
+                        &original,
+                    ))
+            {
+                return Err(ReviewError::Validation(format!(
+                    "review aspect {} is bound to an existing listing relationship; correct its identity, capabilities, or quantity, but keep the staged action and replacement target",
+                    request.aspect_id
+                )));
+            }
+            if payload.aspects.iter().any(|candidate| {
+                candidate.replacement_aspect_id.as_ref() == Some(&original.id)
+            }) && request.quantity != 1
+            {
+                return Err(ReviewError::Validation(format!(
+                    "replacement target aspect {} must retain quantity 1",
+                    request.aspect_id
+                )));
+            }
+            if let Some(ReviewReplacementTarget::ReviewAspect { aspect_id }) =
+                request.replacement_target.as_ref()
+            {
+                let target = payload
+                    .aspects
+                    .iter()
+                    .find(|candidate| &candidate.id == aspect_id)
+                    .ok_or_else(|| {
+                        ReviewError::Validation(format!(
+                            "replacement review aspect {aspect_id} does not exist"
+                        ))
+                    })?;
+                if target.configuration_action != "installed"
+                    || target.replaces_product_id.is_some()
+                    || target.replacement_aspect_id.is_some()
+                {
+                    return Err(ReviewError::Validation(format!(
+                        "replacement review aspect {aspect_id} is not a standalone product identity"
+                    )));
+                }
+                if payload.aspects.iter().any(|candidate| {
+                    candidate.id != original.id
+                        && candidate.replacement_aspect_id.as_ref() == Some(aspect_id)
+                }) {
+                    return Err(ReviewError::Validation(format!(
+                        "replacement review aspect {aspect_id} is already used by another observation"
+                    )));
+                }
+            }
+
+            let old_replacement_aspect_id = original.replacement_aspect_id.clone();
+            let aspect = &mut payload.aspects[aspect_index];
+            aspect.kind = REVIEWER_CORRECTED_AVIONICS_KIND.to_string();
+            aspect.proposed_product = Some(ReviewProduct::proposed(
+                manufacturer.clone(),
+                model.clone(),
+                capabilities.clone(),
+            ));
+            // A reviewer correction invalidates staged candidate IDs and
+            // automatic suggestions. The ordinary live catalog search or the
+            // grounded create path must prove the corrected identity again.
+            aspect.suggested_product = None;
+            aspect.reuse_attestation_target_id = None;
+            aspect.reviewer_correction_association_binding = association_binding;
+            aspect.quantity = request.quantity;
+            aspect.configuration_action = configuration_action.clone();
+            match request.replacement_target.as_ref() {
+                None => {
+                    aspect.replaces_product_id = None;
+                    aspect.replacement_aspect_id = None;
+                }
+                Some(ReviewReplacementTarget::CatalogProduct { avionics_model_id }) => {
+                    aspect.replaces_product_id = Some(*avionics_model_id);
+                    aspect.replacement_aspect_id = None;
+                }
+                Some(ReviewReplacementTarget::ReviewAspect { aspect_id }) => {
+                    aspect.replaces_product_id = None;
+                    aspect.replacement_aspect_id = Some(aspect_id.clone());
+                }
+            }
+            if configuration_editable {
+                if let Some(old_target_id) = old_replacement_aspect_id {
+                    let still_referenced = payload.aspects.iter().any(|candidate| {
+                        candidate.replacement_aspect_id.as_ref() == Some(&old_target_id)
+                    });
+                    if !still_referenced {
+                        if let Some(old_target_index) = payload
+                            .aspects
+                            .iter()
+                            .position(|candidate| candidate.id == old_target_id)
+                        {
+                            if payload.aspects[old_target_index].covered_associations.is_empty() {
+                                payload.aspects.remove(old_target_index);
+                            }
+                        }
+                    }
+                }
+            }
+            payload.aspects = validated_aspects(&payload.aspects)?;
+            let serialized = serialize_review_payload(&payload.aspects)?;
+            let changed = sqlx::query(&update_review)
+                .bind(serialized.extraction_sha256.as_str())
+                .bind(catalog_revision_sha256.as_str())
+                .bind(serialized.pending_aspect_count)
+                .bind(serialized.review_payload_json.as_str())
+                .bind(serialized.review_payload_sha256.as_str())
+                .bind(listing_id)
+                .bind(request.expected_review_payload_sha256.as_str())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            if changed != 1 {
+                return Err(ReviewError::Stale(
+                    "pending review changed while corrected avionics were being saved; reload"
+                        .to_string(),
+                ));
+            }
+            transaction.commit().await?;
+            Ok::<StagedPendingReview, ReviewError>(StagedPendingReview {
+                listing_id,
+                review_payload_sha256: serialized.review_payload_sha256,
+                catalog_revision_sha256,
+                pending_aspect_count: serialized.pending_aspect_count,
+            })
+        }};
+    }
+
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => revise_in_transaction!(pool),
+        DatabaseBackend::Postgres(pool) => revise_in_transaction!(pool),
+    }
 }
 
 /// Atomically records one exact installed-association corroboration and
@@ -4811,6 +5310,30 @@ fn hidden_preserved_blockers(
     blockers
 }
 
+fn reviewer_correction_binding_matches_assignment(
+    aspect: &PendingReviewAspect,
+    association: &CoveredListingAssociation,
+    assignment: &ExistingAssignmentRow,
+) -> bool {
+    let Some(binding) = aspect.reviewer_correction_association_binding.as_ref() else {
+        return false;
+    };
+    binding.listing_link_id == assignment.listing_link_id
+        && binding.avionics_model_id == assignment.avionics_model_id
+        && binding.quantity == assignment.quantity
+        && binding.configuration_action == assignment.configuration_action
+        && binding.replaces_avionics_model_id == assignment.replaces_avionics_model_id
+        && association.listing_link_id == binding.listing_link_id
+        && match association.role {
+            ListingAssociationRole::Installed => {
+                association.avionics_model_id == binding.avionics_model_id
+            }
+            ListingAssociationRole::Replacement => {
+                binding.replaces_avionics_model_id == Some(association.avionics_model_id)
+            }
+        }
+}
+
 fn validate_current_covered_associations(
     aspects: &[PendingReviewAspect],
     assignments: &[ExistingAssignmentRow],
@@ -4831,20 +5354,26 @@ fn validate_current_covered_associations(
                     association.listing_link_id, aspect.id
                 )));
             };
-            let matches = match association.role {
-                ListingAssociationRole::Installed => exact_installed_aspect_matches_assignment(
-                    aspect,
-                    &aspects_by_id,
-                    association,
-                    assignment,
-                ),
-                ListingAssociationRole::Replacement => exact_replacement_aspect_matches_assignment(
-                    aspect,
-                    aspects,
-                    association,
-                    assignment,
-                ),
-            };
+            let reviewer_correction_binding_matches = aspect.kind
+                == REVIEWER_CORRECTED_AVIONICS_KIND
+                && reviewer_correction_binding_matches_assignment(aspect, association, assignment);
+            let matches = reviewer_correction_binding_matches
+                || match association.role {
+                    ListingAssociationRole::Installed => exact_installed_aspect_matches_assignment(
+                        aspect,
+                        &aspects_by_id,
+                        association,
+                        assignment,
+                    ),
+                    ListingAssociationRole::Replacement => {
+                        exact_replacement_aspect_matches_assignment(
+                            aspect,
+                            aspects,
+                            association,
+                            assignment,
+                        )
+                    }
+                };
             if !matches {
                 return Err(ReviewError::Stale(format!(
                     "listing link {} covered by review aspect {} changed; reload",
@@ -4854,6 +5383,92 @@ fn validate_current_covered_associations(
         }
     }
     Ok(())
+}
+
+/// The explicit restage operation is the sole recovery boundary for stale
+/// covered-link IDs. It discards the complete stale relationship component;
+/// the normal preserved-association projection then recreates current aspects
+/// from the locked listing links. Independent raw extraction aspects remain
+/// untouched. Revision and resolution never call this helper and therefore
+/// continue to fail closed on stale coverage.
+fn remove_stale_covered_relationships(
+    aspects: &mut Vec<PendingReviewAspect>,
+    assignments: &[ExistingAssignmentRow],
+) -> bool {
+    let aspects_by_id = aspects
+        .iter()
+        .map(|aspect| (aspect.id.clone(), aspect))
+        .collect::<HashMap<_, _>>();
+    let assignments_by_link = assignments
+        .iter()
+        .map(|assignment| (assignment.listing_link_id, assignment))
+        .collect::<HashMap<_, _>>();
+    let mut stale = aspects
+        .iter()
+        .filter(|aspect| {
+            if !is_synthetic_preserved_attestation_aspect(aspect) {
+                return false;
+            }
+            aspect.covered_associations.iter().any(|association| {
+                let Some(assignment) = assignments_by_link.get(&association.listing_link_id) else {
+                    return true;
+                };
+                let exact = match association.role {
+                    ListingAssociationRole::Installed => exact_installed_aspect_matches_assignment(
+                        aspect,
+                        &aspects_by_id,
+                        association,
+                        assignment,
+                    ),
+                    ListingAssociationRole::Replacement => {
+                        exact_replacement_aspect_matches_assignment(
+                            aspect,
+                            aspects,
+                            association,
+                            assignment,
+                        )
+                    }
+                };
+                !exact
+            })
+        })
+        .map(|aspect| aspect.id.clone())
+        .collect::<HashSet<_>>();
+    if stale.is_empty() {
+        return false;
+    }
+    loop {
+        let before = stale.len();
+        for aspect in aspects.iter() {
+            let aspect_is_stale = stale.contains(&aspect.id);
+            let targets_stale = aspect
+                .replacement_aspect_id
+                .as_ref()
+                .is_some_and(|target| stale.contains(target));
+            if !aspect_is_stale && !targets_stale {
+                continue;
+            }
+            if !is_synthetic_preserved_attestation_aspect(aspect) {
+                return false;
+            }
+            if let Some(target) = aspect.replacement_aspect_id.as_ref() {
+                let Some(target_aspect) = aspects.iter().find(|candidate| &candidate.id == target)
+                else {
+                    return false;
+                };
+                if !is_synthetic_preserved_attestation_aspect(target_aspect) {
+                    return false;
+                }
+                stale.insert(target.clone());
+            }
+            stale.insert(aspect.id.clone());
+        }
+        if stale.len() == before {
+            break;
+        }
+    }
+    aspects.retain(|aspect| !stale.contains(&aspect.id));
+    true
 }
 
 /// Add an explicit, hash-bound aspect for every preserved approved listing
@@ -5917,10 +6532,25 @@ pub async fn get_listing_review(
             .map(|product_id| (aspect.id.clone(), product_id))
         })
         .collect::<HashMap<_, _>>();
+    let configuration_action_editability = payload
+        .aspects
+        .iter()
+        .map(|aspect| {
+            (
+                aspect.id.clone(),
+                configuration_action_is_editable(aspect, &payload.aspects),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let aspects = payload
         .aspects
         .into_iter()
         .map(|aspect| {
+            let reviewer_corrected = aspect.kind == REVIEWER_CORRECTED_AVIONICS_KIND;
+            let configuration_action_editable = configuration_action_editability
+                .get(&aspect.id)
+                .copied()
+                .unwrap_or(false);
             let suggested_product = projected_suggestions
                 .get(&aspect.id)
                 .and_then(|id| approved.get(id))
@@ -5947,6 +6577,8 @@ pub async fn get_listing_review(
                 reason: aspect.reason,
                 quantity: aspect.quantity,
                 configuration_action: aspect.configuration_action,
+                reviewer_corrected,
+                configuration_action_editable,
                 source_evidence_text: aspect.source_evidence_text,
                 source_confidence: aspect.source_confidence,
                 replacement_aspect_id: aspect.replacement_aspect_id,
@@ -7333,6 +7965,7 @@ pub async fn resolve_listing_review(
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
+            validate_current_covered_associations(&payload.aspects, &existing_links)?;
             let mut current_reuse_attested_ids = HashSet::new();
             let attested_product_ids =
                 sqlx::query_scalar::<_, i64>(&attested_product_ids_sql)
@@ -11009,7 +11642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restage_transaction_rejects_covered_link_change_after_optimistic_token_read() {
+    async fn explicit_restage_rebuilds_a_stale_synthetic_preserved_link_card() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let original_product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
@@ -11049,17 +11682,77 @@ mod tests {
             .execute(sqlite_pool(&db))
             .await
             .unwrap();
-        let stale = restage_pending_review_if_current(
+        let refreshed = restage_pending_review_if_current(
             &db,
             user_id,
             listing_id,
             &restaged.review_payload_sha256,
         )
         .await
-        .expect_err("a covered link mutation must not be overwritten by restaging");
-        assert!(matches!(stale, ReviewError::Stale(_)));
+        .expect("explicit restage may recover a synthetic preserved-link card")
+        .expect("the independent reviewed aspect remains pending");
+        assert_ne!(
+            refreshed.review_payload_sha256,
+            restaged.review_payload_sha256
+        );
         let row = load_review_row(&db, listing_id).await.unwrap();
-        assert_eq!(row.review_payload_sha256, restaged.review_payload_sha256);
+        let payload = parse_payload(
+            &row.review_payload_json,
+            Some(&row.review_payload_sha256),
+            row.pending_aspect_count,
+        )
+        .unwrap();
+        assert!(payload.aspects.iter().any(|aspect| {
+            aspect.id == preserved_review_aspect_id(link_id, ListingAssociationRole::Installed)
+                && aspect.reuse_attestation_target_id == Some(changed_product_id)
+        }));
+        assert!(payload
+            .aspects
+            .iter()
+            .any(|aspect| aspect.id == ReviewAspectId::from("reviewed-unit")));
+    }
+
+    #[tokio::test]
+    async fn explicit_restage_rejects_a_stale_ordinary_covered_observation() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let original_product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let changed_product_id = insert_approved_product(&db, "GNS 530W", "GNS530W", "GPS").await;
+        let link_id: i64 = sqlx::query_scalar(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id, configuration_action) VALUES (?, ?, 'installed') RETURNING id",
+        )
+        .bind(listing_id)
+        .bind(original_product_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let ordinary = pending_aspect("ordinary-covered", original_product_id)
+            .with_covered_association(
+                link_id,
+                ListingAssociationRole::Installed,
+                original_product_id,
+            );
+        let staged = stage_pending_review(&db, listing_id, None, &[ordinary])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE aircraft_sale_listing_avionics SET avionics_model_id = ? WHERE id = ?")
+            .bind(changed_product_id)
+            .bind(link_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+        assert!(matches!(
+            restage_pending_review_if_current(
+                &db,
+                user_id,
+                listing_id,
+                &staged.review_payload_sha256,
+            )
+            .await,
+            Err(ReviewError::Stale(_))
+        ));
+        let row = load_review_row(&db, listing_id).await.unwrap();
+        assert_eq!(row.review_payload_sha256, staged.review_payload_sha256);
     }
 
     #[test]
@@ -15147,6 +15840,411 @@ mod tests {
             association,
             ("listing_review".to_string(), Some("high".to_string()))
         );
+    }
+
+    fn observation_revision(
+        staged: &StagedPendingReview,
+        aspect_id: &str,
+        manufacturer: &str,
+        model: &str,
+        capability: &str,
+        quantity: i64,
+    ) -> ReviseAvionicsObservationRequest {
+        ReviseAvionicsObservationRequest {
+            expected_review_payload_sha256: staged.review_payload_sha256.clone(),
+            expected_catalog_revision_sha256: staged.catalog_revision_sha256.clone(),
+            aspect_id: aspect_id.into(),
+            manufacturer: manufacturer.to_string(),
+            model: model.to_string(),
+            capabilities: vec![capability.to_string()],
+            quantity,
+            configuration_action: "installed".to_string(),
+            replacement_target: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_observation_correction_rehashes_complete_replacement_semantics() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let target_id = insert_approved_product(&db, "KX 170B", "KX170B", "NAV").await;
+        attest_approved_product_for_current_policy_reuse(&db, target_id).await;
+        let aspect = PendingReviewAspect::avionics(
+            "ordinary",
+            "avionics_identity",
+            "King radio",
+            "King radio listed in the panel",
+            "raw_observation_identity_unusable",
+            1,
+            "installed",
+            Some("King radio listed in the panel".to_string()),
+            Some("medium".to_string()),
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+        let mut request =
+            observation_revision(&staged, "ordinary", "Garmin", "GI 275", "Flight Display", 2);
+        request.configuration_action = "replaces".to_string();
+        request.replacement_target = Some(ReviewReplacementTarget::CatalogProduct {
+            avionics_model_id: target_id,
+        });
+        let revised = revise_avionics_observation_and_restage(&db, user_id, listing_id, &request)
+            .await
+            .unwrap();
+        assert_ne!(revised.review_payload_sha256, staged.review_payload_sha256);
+
+        let detail = get_listing_review(&db, user_id, listing_id).await.unwrap();
+        let corrected = &detail.review.aspects[0];
+        assert!(corrected.reviewer_corrected);
+        assert!(corrected.configuration_action_editable);
+        assert_eq!(corrected.quantity, 2);
+        assert_eq!(corrected.configuration_action, "replaces");
+        assert_eq!(
+            corrected.replacement_product.as_ref().unwrap().id,
+            Some(target_id)
+        );
+        assert_eq!(corrected.proposed_product.as_ref().unwrap().model, "GI 275");
+        assert_eq!(
+            corrected.proposed_product.as_ref().unwrap().capabilities,
+            vec!["Flight Display".to_string()]
+        );
+        assert_eq!(
+            corrected.source_evidence_text.as_deref(),
+            Some("King radio listed in the panel")
+        );
+
+        let stale = revise_avionics_observation_and_restage(&db, user_id, listing_id, &request)
+            .await
+            .expect_err("the previous payload hash cannot be replayed");
+        assert!(matches!(stale, ReviewError::Stale(_)));
+    }
+
+    #[tokio::test]
+    async fn covered_observation_correction_updates_the_link_only_during_normal_resolve() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let original_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let corrected_id = insert_approved_product(&db, "GI 275", "GI275", "Flight Display").await;
+        attest_approved_product_for_current_policy_reuse(&db, original_id).await;
+        attest_approved_product_for_current_policy_reuse(&db, corrected_id).await;
+        let pool = sqlite_pool(&db);
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'legacy_import', 'Garmin GI 275 shown in panel',
+                      'low', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(original_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let aspect = PendingReviewAspect::avionics(
+            "covered",
+            "avionics_identity",
+            "Garmin GNS 430W",
+            "Garmin GI 275 shown in panel",
+            "catalog_product_unverified",
+            1,
+            "installed",
+            Some("Garmin GI 275 shown in panel".to_string()),
+            Some("low".to_string()),
+        )
+        .with_proposed_product(ReviewProduct::proposed(
+            "Garmin",
+            "GNS 430W",
+            vec!["GPS".to_string()],
+        ))
+        .with_covered_association(link_id, ListingAssociationRole::Installed, original_id);
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+        let request =
+            observation_revision(&staged, "covered", "Garmin", "GI 275", "Flight Display", 3);
+        let revised = revise_avionics_observation_and_restage(&db, user_id, listing_id, &request)
+            .await
+            .unwrap();
+        let unchanged: (i64, i64, String) = sqlx::query_as(
+            "SELECT avionics_model_id, quantity, source FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, (original_id, 1, "legacy_import".to_string()));
+
+        resolve_listing_review(
+            &db,
+            user_id,
+            listing_id,
+            &ResolveReviewRequest {
+                expected_review_payload_sha256: revised.review_payload_sha256,
+                expected_catalog_revision_sha256: revised.catalog_revision_sha256,
+                finalize_listing: false,
+                decisions: vec![ReviewDecision::UseVerifiedProduct {
+                    aspect_id: "covered".into(),
+                    avionics_model_id: corrected_id,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let corrected: (i64, i64, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, quantity, source, source_confidence
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            corrected,
+            (
+                corrected_id,
+                3,
+                "listing_review".to_string(),
+                Some("high".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn covered_correction_rejects_quantity_and_action_mutations_before_resolve() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let original_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let corrected_id = insert_approved_product(&db, "GI 275", "GI275", "Flight Display").await;
+        let replacement_id = insert_approved_product(&db, "KX 170B", "KX170B", "NAV").await;
+        attest_approved_product_for_current_policy_reuse(&db, original_id).await;
+        attest_approved_product_for_current_policy_reuse(&db, corrected_id).await;
+        attest_approved_product_for_current_policy_reuse(&db, replacement_id).await;
+        let pool = sqlite_pool(&db);
+        let link_id: i64 = sqlx::query_scalar(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id, quantity, configuration_action) VALUES (?, ?, 1, 'installed') RETURNING id",
+        )
+        .bind(listing_id)
+        .bind(original_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let aspect = pending_aspect("covered-concurrency", original_id).with_covered_association(
+            link_id,
+            ListingAssociationRole::Installed,
+            original_id,
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+        let corrected = revise_avionics_observation_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &observation_revision(
+                &staged,
+                "covered-concurrency",
+                "Garmin",
+                "GI 275",
+                "Flight Display",
+                2,
+            ),
+        )
+        .await
+        .unwrap();
+        let resolve_request = ResolveReviewRequest {
+            expected_review_payload_sha256: corrected.review_payload_sha256,
+            expected_catalog_revision_sha256: corrected.catalog_revision_sha256,
+            finalize_listing: false,
+            decisions: vec![ReviewDecision::UseVerifiedProduct {
+                aspect_id: "covered-concurrency".into(),
+                avionics_model_id: corrected_id,
+            }],
+        };
+
+        sqlx::query("UPDATE aircraft_sale_listing_avionics SET quantity = 4 WHERE id = ?")
+            .bind(link_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            restage_pending_review_if_current(
+                &db,
+                user_id,
+                listing_id,
+                &resolve_request.expected_review_payload_sha256,
+            )
+            .await,
+            Err(ReviewError::Stale(_))
+        ));
+        let quantity_error = resolve_listing_review(&db, user_id, listing_id, &resolve_request)
+            .await
+            .expect_err("a concurrent quantity mutation must be rejected");
+        assert!(
+            matches!(quantity_error, ReviewError::Stale(_)),
+            "{quantity_error:?}"
+        );
+
+        sqlx::query(
+            "UPDATE aircraft_sale_listing_avionics SET quantity = 1, configuration_action = 'replaces', replaces_avionics_model_id = ? WHERE id = ?",
+        )
+        .bind(replacement_id)
+        .bind(link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let action_error = resolve_listing_review(&db, user_id, listing_id, &resolve_request)
+            .await
+            .expect_err("a concurrent action mutation must be rejected");
+        assert!(
+            matches!(action_error, ReviewError::Stale(_)),
+            "{action_error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn covered_corrections_reject_stale_catalog_link_and_action_changes() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let replacement_id = insert_approved_product(&db, "KX 170B", "KX170B", "NAV").await;
+        let pool = sqlite_pool(&db);
+        let link_id: i64 = sqlx::query_scalar(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id, configuration_action) VALUES (?, ?, 'installed') RETURNING id",
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let aspect = pending_aspect("covered-lock", product_id).with_covered_association(
+            link_id,
+            ListingAssociationRole::Installed,
+            product_id,
+        );
+        let staged = stage_pending_review(&db, listing_id, None, &[aspect])
+            .await
+            .unwrap();
+
+        let mut stale_catalog =
+            observation_revision(&staged, "covered-lock", "Garmin", "GNS 430W", "GPS", 2);
+        stale_catalog.expected_catalog_revision_sha256 = "f".repeat(64);
+        assert!(matches!(
+            revise_avionics_observation_and_restage(&db, user_id, listing_id, &stale_catalog).await,
+            Err(ReviewError::Stale(_))
+        ));
+
+        let mut changed_action =
+            observation_revision(&staged, "covered-lock", "Garmin", "GNS 430W", "GPS", 2);
+        changed_action.configuration_action = "replaces".to_string();
+        changed_action.replacement_target = Some(ReviewReplacementTarget::CatalogProduct {
+            avionics_model_id: replacement_id,
+        });
+        assert!(matches!(
+            revise_avionics_observation_and_restage(
+                &db,
+                user_id,
+                listing_id,
+                &changed_action
+            )
+            .await,
+            Err(ReviewError::Validation(message)) if message.contains("keep the staged action")
+        ));
+
+        sqlx::query("DELETE FROM aircraft_sale_listing_avionics WHERE id = ?")
+            .bind(link_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let current = observation_revision(&staged, "covered-lock", "Garmin", "GNS 430W", "GPS", 2);
+        assert!(matches!(
+            revise_avionics_observation_and_restage(&db, user_id, listing_id, &current).await,
+            Err(ReviewError::Stale(message)) if message.contains("no longer exists")
+        ));
+    }
+
+    #[tokio::test]
+    async fn restage_replaces_stale_covered_cards_with_current_link_cards() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let old_product_id =
+            insert_approved_product(&db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        let current_product_id =
+            insert_approved_product(&db, "GDL 69A", "GDL69A", "Datalink").await;
+        let pool = sqlite_pool(&db);
+        let old_link_id: i64 = sqlx::query_scalar(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id, configuration_action) VALUES (?, ?, 'installed') RETURNING id",
+        )
+        .bind(listing_id)
+        .bind(old_product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let preserved = PendingReviewAspect::avionics(
+            format!("avionics:preserved:{old_link_id}:installed"),
+            "avionics_reuse_attestation",
+            "Garmin GMA 1347",
+            "Garmin GMA 1347",
+            PRESERVED_ASSOCIATION_REVIEW_REASON,
+            1,
+            "installed",
+            None,
+            None,
+        )
+        .with_covered_association(
+            old_link_id,
+            ListingAssociationRole::Installed,
+            old_product_id,
+        )
+        .with_reuse_attestation_target(old_product_id);
+        let raw = PendingReviewAspect::avionics(
+            "raw-wx",
+            "avionics_identity",
+            "L3 WX 500",
+            "L3 WX 500",
+            "raw_observation_unlinked",
+            1,
+            "installed",
+            Some("L3 WX 500".to_string()),
+            Some("medium".to_string()),
+        );
+        stage_pending_review(&db, listing_id, None, &[preserved, raw])
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM aircraft_sale_listing_avionics WHERE id = ?")
+            .bind(old_link_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let current_link_id: i64 = sqlx::query_scalar(
+            "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id, avionics_model_id, configuration_action) VALUES (?, ?, 'installed') RETURNING id",
+        )
+        .bind(listing_id)
+        .bind(current_product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        restage_unattested_preserved_products(&db, user_id, listing_id)
+            .await
+            .expect("restage is the stale covered-link recovery boundary")
+            .expect("the current listing still requires review");
+        let detail = get_listing_review(&db, user_id, listing_id).await.unwrap();
+        let ids = detail
+            .review
+            .aspects
+            .iter()
+            .map(|aspect| aspect.id.to_string())
+            .collect::<HashSet<_>>();
+        assert!(ids.contains("raw-wx"));
+        assert!(ids.contains(&format!("avionics:preserved:{current_link_id}:installed")));
+        assert!(!ids.contains(&format!("avionics:preserved:{old_link_id}:installed")));
     }
 
     #[tokio::test]

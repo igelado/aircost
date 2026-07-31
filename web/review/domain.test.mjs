@@ -5,6 +5,8 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  avionicsObservationCorrectionDraft,
+  avionicsObservationRevisionRequest,
   associationsNeedingSourceRecovery,
   authoritativeIdentityUrl,
   autoVerifiableProductAssociations,
@@ -31,6 +33,7 @@ import {
   runProductAssociationWorkers,
   summarizeProductAssociations,
   summarizeProductReviewGroups,
+  validateAvionicsObservationCorrection,
 } from "./domain.mjs";
 
 const PRODUCTION_REASON_CODES = [
@@ -99,6 +102,96 @@ test("builds one canonical source-free request for every existing-product aspect
     "catalog_revision_sha256",
     "review_payload_sha256",
   ]);
+});
+
+test("builds a hash-bound avionics correction without replacing source evidence", () => {
+  const aspect = {
+    id: "avionics:2:primary",
+    quantity: 1,
+    configuration_action: "installed",
+    configuration_action_editable: true,
+    observed_text: "Garmin standby display",
+    source_evidence_text: "Garmin standby display",
+    proposed_product: {
+      manufacturer: "Garmin",
+      model: "GI 275",
+      capabilities: ["Flight Display"],
+    },
+  };
+  const correction = avionicsObservationCorrectionDraft(aspect);
+  correction.quantity = 2;
+  correction.configurationAction = "replaces";
+  correction.replacementTargetKind = "catalog_product";
+  correction.replacementProduct = { id: 17, manufacturer: "King", model: "KI 208" };
+  const review = {
+    review_payload_sha256: "a".repeat(64),
+    catalog_revision_sha256: "b".repeat(64),
+    allowed_capabilities: ["Flight Display", "NAV"],
+  };
+  assert.deepEqual(
+    avionicsObservationRevisionRequest(review, aspect, correction),
+    {
+      review_payload_sha256: "a".repeat(64),
+      catalog_revision_sha256: "b".repeat(64),
+      aspect_id: "avionics:2:primary",
+      manufacturer: "Garmin",
+      model: "GI 275",
+      capabilities: ["Flight Display"],
+      quantity: 2,
+      configuration_action: "replaces",
+      replacement_target: {
+        kind: "catalog_product",
+        avionics_model_id: 17,
+      },
+    },
+  );
+  assert.equal("observed_text" in correction, false);
+  assert.equal("source_evidence_text" in correction, false);
+});
+
+test("validates canonical correction values and requires complete replacement semantics", () => {
+  const allowed = ["GPS", "NAV"];
+  const valid = {
+    manufacturer: "Garmin",
+    model: "GNS 430W",
+    capabilities: ["GPS", "NAV"],
+    quantity: 1,
+    configurationAction: "installed",
+    replacementTargetKind: "none",
+    replacementProduct: null,
+    replacementAspectId: null,
+  };
+  assert.equal(validateAvionicsObservationCorrection(valid, allowed).valid, true);
+  assert.match(
+    validateAvionicsObservationCorrection(
+      { ...valid, capabilities: ["Mystery"] },
+      allowed,
+    ).message,
+    /unsupported: Mystery/,
+  );
+  assert.match(
+    validateAvionicsObservationCorrection(
+      {
+        ...valid,
+        configurationAction: "replaces",
+        replacementTargetKind: "catalog_product",
+      },
+      allowed,
+    ).message,
+    /Select the approved product/,
+  );
+  assert.equal(
+    validateAvionicsObservationCorrection(
+      {
+        ...valid,
+        configurationAction: "removes",
+        replacementTargetKind: "review_aspect",
+        replacementAspectId: "avionics:2:replacement",
+      },
+      allowed,
+    ).valid,
+    true,
+  );
 });
 
 test("describes manual resolution from the returned listing state", () => {
