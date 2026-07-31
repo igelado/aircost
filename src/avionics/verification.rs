@@ -11,6 +11,7 @@ use crate::avionics::catalog::{
     resolve_avionics_identity, unique_exact_avionics_review_candidate, ApprovedAvionicsIdentity,
     AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
 };
+use crate::avionics::reuse::product_reuse_attestation_is_current;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
 use crate::gemini::interactions::RetryPolicy;
@@ -2012,6 +2013,61 @@ async fn resolve_identity_attempt(
     match outcome {
         Ok(AvionicsIdentityOutcome::Approved(approved)) => {
             let suggested_product = Some(review_product_from_approved(&approved));
+            if apply && approved.id > 0 {
+                let reuse_is_current = match product_reuse_attestation_is_current(db, approved.id)
+                    .await
+                {
+                    Ok(reuse_is_current) => reuse_is_current,
+                    Err(error) => {
+                        return IdentityAttempt {
+                                report: outcome_report(
+                                    candidate_index,
+                                    role,
+                                    &identity,
+                                    configuration_action,
+                                    source_evidence_text,
+                                    source_confidence,
+                                    "error",
+                                    Some(approved.id),
+                                    Some(approved.manufacturer),
+                                    Some(approved.model),
+                                    approved.avionics_types,
+                                    format!(
+                                        "approved product reuse eligibility could not be checked: {error}"
+                                    ),
+                                ),
+                                approved_id: None,
+                                identity_key: None,
+                                suggested_product,
+                            };
+                    }
+                };
+                if !reuse_is_current {
+                    if approved.id > 0 {
+                        catalog_statuses.insert(approved.id, "approved".to_string());
+                    }
+                    return IdentityAttempt {
+                        report: outcome_report(
+                            candidate_index,
+                            role,
+                            &identity,
+                            configuration_action,
+                            source_evidence_text,
+                            source_confidence,
+                            "unresolved",
+                            Some(approved.id),
+                            Some(approved.manufacturer),
+                            Some(approved.model),
+                            approved.avionics_types,
+                            "the product identity is approved, but it needs a current manufacturer-primary source attestation before automatic listing reuse"
+                                .to_string(),
+                        ),
+                        approved_id: None,
+                        identity_key: None,
+                        suggested_product,
+                    };
+                }
+            }
             let stored_status = catalog_statuses.get(&approved.id).map(String::as_str);
             let identity_key =
                 if requires_persisted_graph_identity(apply, approved.id, stored_status) {
