@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   filterPipelineRows,
   pipelineAutomaticEligibility,
+  pipelineBacklogCategories,
   pipelineCheckpoint,
   pipelineProviderPlan,
   pipelineRowsFromResponse,
@@ -170,6 +171,95 @@ test("does not claim Gemini work for an FAA-rejected aircraft", () => {
 
   assert.equal(rows[0].gemini.kind, "none");
   assert.equal(rows[0].gemini.label, "Not applicable");
+});
+
+test("groups preflight rows into four exclusive operator backlog categories", () => {
+  const rows = pipelineRowsFromResponse(response([
+    {
+      listing_id: 31,
+      status: "pending_review",
+      final_ingestion_state: "pending_review",
+      aircraft: currentAircraft,
+      avionics: {
+        ...completeAvionics,
+        status: "ready_retained_observations",
+        remaining_review_aspects: 2,
+      },
+      finalization: { ...currentAircraft, status: "not_attempted" },
+    },
+    {
+      listing_id: 32,
+      status: "pending_review",
+      final_ingestion_state: "pending_review",
+      aircraft: currentAircraft,
+      avionics: {
+        ...completeAvionics,
+        status: "ready_legacy_reextraction",
+        remaining_review_aspects: 1,
+      },
+      finalization: { ...currentAircraft, status: "not_attempted" },
+    },
+    {
+      listing_id: 33,
+      status: "blocked",
+      final_ingestion_state: "pending_review",
+      aircraft: { ...currentAircraft, status: "rejected" },
+      avionics: {
+        ...completeAvionics,
+        status: "ready_retained_observations",
+        remaining_review_aspects: 3,
+      },
+      finalization: { ...currentAircraft, status: "not_attempted" },
+    },
+    {
+      listing_id: 34,
+      status: "pending_reference",
+      final_ingestion_state: "incomplete",
+      aircraft: currentAircraft,
+      avionics: completeAvionics,
+      finalization: { ...currentAircraft, status: "pending_reference" },
+    },
+    {
+      listing_id: 35,
+      status: "blocked",
+      final_ingestion_state: "pending_review",
+      aircraft: currentAircraft,
+      avionics: { ...completeAvionics, status: "skipped" },
+      finalization: { ...currentAircraft, status: "not_attempted" },
+    },
+    {
+      listing_id: 36,
+      status: "pending_reference",
+      final_ingestion_state: "incomplete",
+      aircraft: currentAircraft,
+      avionics: { ...completeAvionics, status: "already_verified" },
+      finalization: { ...currentAircraft, status: "pending_reference" },
+    },
+  ]));
+
+  assert.deepEqual(
+    pipelineBacklogCategories(rows).map(({ key, count }) => ({ key, count })),
+    [
+      { key: "currentAvionicsReview", count: 1 },
+      { key: "legacyReextraction", count: 1 },
+      { key: "faaBlocked", count: 2 },
+      { key: "referencePending", count: 1 },
+    ],
+  );
+});
+
+test("provides plain-language next steps for every backlog category", () => {
+  const categories = pipelineBacklogCategories([]);
+  assert.deepEqual(categories.map(({ label }) => label), [
+    "Current avionics review",
+    "One-time avionics re-extraction",
+    "FAA admission blocked",
+    "Factory reference pending",
+  ]);
+  for (const category of categories) {
+    assert.ok(category.description.length > 40);
+    assert.doesNotMatch(category.description, /[_`]/);
+  }
 });
 
 test("filters by stage, Gemini expectation, and free text", () => {

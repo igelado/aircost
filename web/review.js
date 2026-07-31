@@ -2,6 +2,7 @@ import { displayLabel, renderAvionicsChips, safeDetailLink } from "/avionics.js"
 import {
   filterPipelineRows,
   pipelineAutomaticEligibility,
+  pipelineBacklogCategories,
   pipelineCheckpoint,
   pipelineProviderPlan,
   pipelineRowsFromResponse,
@@ -193,11 +194,7 @@ function collectElements() {
     reviewPipelinePlan: "#review-pipeline-plan",
     reviewPipelineTableBody: "#review-pipeline-table-body",
     emptyReviewPipeline: "#empty-review-pipeline",
-    reviewPipelineAircraftCount: "#review-pipeline-aircraft-count",
-    reviewPipelineAvionicsCount: "#review-pipeline-avionics-count",
-    reviewPipelineManualCount: "#review-pipeline-manual-count",
-    reviewPipelineReferenceCount: "#review-pipeline-reference-count",
-    reviewPipelineGeminiCount: "#review-pipeline-gemini-count",
+    reviewPipelineCategories: "#review-pipeline-categories",
     reviewPipelineSelectAll: "#review-pipeline-select-all",
     reviewPipelineVerify: "#review-pipeline-verify",
     reviewPipelineSelectionCount: "#review-pipeline-selection-count",
@@ -574,18 +571,31 @@ function renderPipelineMetrics() {
   elements.reviewAspectCount.textContent = formatNumber(summary.manualReview, 0);
   elements.reviewReasonCount.textContent =
     formatNumber(summary.referencePending, 0);
-  elements.reviewPipelineAircraftCount.textContent =
-    formatNumber(summary.aircraftComplete, 0);
-  elements.reviewPipelineAvionicsCount.textContent =
-    formatNumber(summary.avionicsComplete, 0);
-  elements.reviewPipelineManualCount.textContent =
-    formatNumber(summary.manualReview, 0);
-  elements.reviewPipelineReferenceCount.textContent =
-    formatNumber(summary.referencePending, 0);
-  elements.reviewPipelineGeminiCount.textContent = formatNumber(
-    summary.geminiExpected + summary.geminiPossible,
-    0,
+  elements.reviewPipelineCategories.replaceChildren(
+    ...pipelineBacklogCategories(state.pipelineRows).map(
+      pipelineBacklogCategoryCard,
+    ),
   );
+}
+
+function pipelineBacklogCategoryCard(category) {
+  const card = document.createElement("article");
+  card.className = "review-pipeline-category";
+  card.dataset.category = category.key;
+  const heading = document.createElement("div");
+  const label = document.createElement("h3");
+  label.textContent = category.label;
+  const count = document.createElement("strong");
+  count.textContent = formatNumber(category.count, 0);
+  count.setAttribute(
+    "aria-label",
+    `${category.count} ${pluralize(category.count, "listing")}`,
+  );
+  heading.append(label, count);
+  const description = document.createElement("p");
+  description.textContent = category.description;
+  card.append(heading, description);
+  return card;
 }
 
 function renderPipelinePlan() {

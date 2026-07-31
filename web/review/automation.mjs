@@ -77,6 +77,33 @@ const REASON_COPY = Object.freeze({
     "The retained listing source is unavailable.",
 });
 
+const PIPELINE_BACKLOG_CATEGORY_COPY = Object.freeze([
+  Object.freeze({
+    key: "currentAvionicsReview",
+    label: "Current avionics review",
+    description:
+      "Retained listing text is ready for local catalog matching. Gemini is used only when local checks cannot decide.",
+  }),
+  Object.freeze({
+    key: "legacyReextraction",
+    label: "One-time avionics re-extraction",
+    description:
+      "Legacy listing data must be extracted once into the current observation shape before verification can continue.",
+  }),
+  Object.freeze({
+    key: "faaBlocked",
+    label: "FAA admission blocked",
+    description:
+      "Aircraft identity did not pass mandatory FAA admission, so avionics checks wait for registration or serial correction.",
+  }),
+  Object.freeze({
+    key: "referencePending",
+    label: "Factory reference pending",
+    description:
+      "Aircraft and avionics review is complete. Valuation waits for the model-year factory reference configuration.",
+  }),
+]);
+
 export const PIPELINE_FILTERS = Object.freeze([
   "all",
   "manual",
@@ -154,6 +181,48 @@ export function pipelineSummary(rows) {
       (row) => row?.gemini?.kind === "possible",
     ).length,
   };
+}
+
+export function pipelineBacklogCategories(rows) {
+  const counts = Object.fromEntries(
+    PIPELINE_BACKLOG_CATEGORY_COPY.map(({ key }) => [key, 0]),
+  );
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const category = pipelineBacklogCategory(row);
+    if (category !== null) {
+      counts[category] += 1;
+    }
+  }
+  return PIPELINE_BACKLOG_CATEGORY_COPY.map((category) => ({
+    ...category,
+    count: counts[category.key],
+  }));
+}
+
+function pipelineBacklogCategory(row) {
+  const aircraftStatus = nonBlank(row?.aircraft?.status);
+  const avionicsStatus = nonBlank(row?.avionics?.status);
+  const referenceStatus = nonBlank(row?.reference?.status);
+  if (
+    aircraftStatus === "rejected"
+    || avionicsStatus === "skipped"
+    || avionicsStatus === "faa_rejected"
+  ) {
+    return "faaBlocked";
+  }
+  if (avionicsStatus === "ready_retained_observations") {
+    return "currentAvionicsReview";
+  }
+  if (avionicsStatus === "ready_legacy_reextraction") {
+    return "legacyReextraction";
+  }
+  if (
+    avionicsStatus === "already_complete"
+    && referenceStatus === "pending_reference"
+  ) {
+    return "referencePending";
+  }
+  return null;
 }
 
 export function pipelineProviderPlan(responses) {
