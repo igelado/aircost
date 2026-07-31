@@ -169,6 +169,20 @@ skips the Lite call entirely. Stored source URLs, titles, and excerpts are not
 model input. Aircraft reuse is similarly strict: an exact current FAA record
 and one applicable approved hierarchy may bypass Gemini entirely.
 
+When a noisy listing splits a high-signal model label across manufacturer and
+model fields, or the global catalog exposes exact duplicates and meaningful
+suffix neighbors that a manufacturer-scoped shortlist would hide, a distinct
+tools-disabled Lite triage may run once. The server supplies the complete
+bounded global exact-model family, every unreviewed row, and its suffix
+blockers, then rechecks the full catalog fingerprint after the response. A
+current approved singleton can proceed only through the unchanged local reuse
+and listing-occurrence gates. An unreviewed or multi-row result is merely a
+request-scoped Search hint: it cannot approve a row, establish product
+existence, or turn listing prose into authoritative evidence, and ordinary
+Search, URL Context, structure validation, and complete collision review still
+run. Uncertain, negative, invalid, incomplete, overflowed, or stale triage
+falls through without changing the observed candidate.
+
 When the exact local avionics row is unique and capability-compatible but
 cannot use the deterministic approval fast path, an active
 `manufacturer_primary` source-origin record may be used as a retrieval hint.

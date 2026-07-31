@@ -182,6 +182,10 @@ pub struct AvionicsProviderRequestPlan {
     pub candidate_adjudication_conditional_relationship_components: usize,
     pub candidate_adjudication_provider_requests_baseline: usize,
     pub candidate_grounded_fallback_provider_requests_baseline_maximum: usize,
+    pub candidate_triage_identity_components: usize,
+    pub candidate_triage_conditional_relationship_components: usize,
+    pub candidate_triage_provider_requests_baseline: usize,
+    pub candidate_triage_grounded_fallback_provider_requests_baseline_maximum: usize,
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
     pub generic_invalid_identity_components: usize,
@@ -212,6 +216,8 @@ pub struct AvionicsVerificationPreflightSummary {
     pub verified_local_identity_components: usize,
     pub candidate_adjudication_identity_components: usize,
     pub candidate_adjudication_conditional_relationship_components: usize,
+    pub candidate_triage_identity_components: usize,
+    pub candidate_triage_conditional_relationship_components: usize,
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
     pub generic_invalid_identity_components: usize,
@@ -239,6 +245,8 @@ pub struct AvionicsVerificationPreflightListingReport {
     pub verified_local_identity_components: usize,
     pub candidate_adjudication_identity_components: usize,
     pub candidate_adjudication_conditional_relationship_components: usize,
+    pub candidate_triage_identity_components: usize,
+    pub candidate_triage_conditional_relationship_components: usize,
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
     pub generic_invalid_identity_components: usize,
@@ -633,6 +641,10 @@ fn summarize_preflight(
             listing.candidate_adjudication_identity_components;
         summary.candidate_adjudication_conditional_relationship_components +=
             listing.candidate_adjudication_conditional_relationship_components;
+        summary.candidate_triage_identity_components +=
+            listing.candidate_triage_identity_components;
+        summary.candidate_triage_conditional_relationship_components +=
+            listing.candidate_triage_conditional_relationship_components;
         summary.grounded_initial_identity_components +=
             listing.grounded_initial_identity_components;
         summary.grounded_conditional_relationship_components +=
@@ -676,6 +688,8 @@ async fn preflight_listing(
         verified_local_identity_components: 0,
         candidate_adjudication_identity_components: 0,
         candidate_adjudication_conditional_relationship_components: 0,
+        candidate_triage_identity_components: 0,
+        candidate_triage_conditional_relationship_components: 0,
         grounded_initial_identity_components: 0,
         grounded_conditional_relationship_components: 0,
         generic_invalid_identity_components: 0,
@@ -763,6 +777,9 @@ async fn preflight_listing(
             AvionicsIdentityVerificationRoute::CandidateAdjudication => {
                 report.candidate_adjudication_identity_components += 1;
             }
+            AvionicsIdentityVerificationRoute::CandidateTriage => {
+                report.candidate_triage_identity_components += 1;
+            }
             AvionicsIdentityVerificationRoute::GroundedCuration => {
                 report.grounded_initial_identity_components += 1;
             }
@@ -804,6 +821,14 @@ async fn preflight_listing(
             }
             AvionicsIdentityVerificationRoute::CandidateAdjudication => {
                 report.candidate_adjudication_conditional_relationship_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::CandidateTriage
+                if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
+            {
+                report.candidate_triage_identity_components += 1;
+            }
+            AvionicsIdentityVerificationRoute::CandidateTriage => {
+                report.candidate_triage_conditional_relationship_components += 1;
             }
             AvionicsIdentityVerificationRoute::GroundedCuration
                 if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
@@ -862,6 +887,9 @@ fn provider_request_plan(
     let candidate = summary.candidate_adjudication_identity_components;
     let conditional_candidate = summary.candidate_adjudication_conditional_relationship_components;
     let all_candidate_components = candidate.saturating_add(conditional_candidate);
+    let triage = summary.candidate_triage_identity_components;
+    let conditional_triage = summary.candidate_triage_conditional_relationship_components;
+    let all_triage_components = triage.saturating_add(conditional_triage);
     let grounded = summary.grounded_initial_identity_components;
     let conditional_grounded = summary.grounded_conditional_relationship_components;
     let all_grounded_components = grounded.saturating_add(conditional_grounded);
@@ -877,6 +905,11 @@ fn provider_request_plan(
         candidate_adjudication_provider_requests_baseline: candidate,
         candidate_grounded_fallback_provider_requests_baseline_maximum: all_candidate_components
             .saturating_mul(4),
+        candidate_triage_identity_components: triage,
+        candidate_triage_conditional_relationship_components: conditional_triage,
+        candidate_triage_provider_requests_baseline: triage,
+        candidate_triage_grounded_fallback_provider_requests_baseline_maximum:
+            all_triage_components.saturating_mul(4),
         grounded_initial_identity_components: grounded,
         grounded_conditional_relationship_components: conditional_grounded,
         generic_invalid_identity_components: generic_invalid,
@@ -889,19 +922,25 @@ fn provider_request_plan(
             .saturating_mul(15),
         known_total_provider_requests_minimum_baseline: reextractions
             .saturating_add(candidate)
+            .saturating_add(triage)
             .saturating_add(generic_invalid)
-            .saturating_add(grounded.saturating_mul(4)),
+            .saturating_add(grounded.saturating_mul(4))
+            .saturating_add(triage.saturating_mul(4)),
         known_total_provider_requests_all_positive_baseline: reextractions
             .saturating_add(all_candidate_components)
+            .saturating_add(all_triage_components)
             .saturating_add(generic_invalid)
-            .saturating_add(all_grounded_components.saturating_mul(7)),
+            .saturating_add(all_grounded_components.saturating_mul(7))
+            .saturating_add(all_triage_components.saturating_mul(7)),
         known_total_provider_requests_validation_envelope_maximum: reextractions
             .saturating_mul(2)
             .saturating_add(all_candidate_components)
+            .saturating_add(all_triage_components)
             .saturating_add(generic_invalid)
             .saturating_add(
                 all_grounded_components
                     .saturating_add(all_candidate_components)
+                    .saturating_add(all_triage_components)
                     .saturating_mul(15),
             ),
         legacy_reextraction_identity_outputs_unknown: reextractions > 0,
@@ -913,7 +952,7 @@ fn provider_request_plan(
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every bounded candidate adjudication succeeds without Search and every conditional relationship target is skipped. Candidate adjudication is one tools-disabled request; a successful candidate decision does not run the concreteness classifier. An uncertain, negative, invalid, or stale answer falls through to the ordinary grounded route and then incurs exactly one classifier request before grounded research. Structurally valid generic-label observations contribute exactly one classifier request to every plan total and never continue to grounding from the invalid-observation path. The all-positive baseline includes every conditional target but assumes candidate adjudication succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. Each comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid generic-label observations contribute exactly one classifier request to every plan total and never continue to grounding from the invalid-observation path. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -3440,6 +3479,8 @@ mod tests {
             verified_local_identity_components: 1,
             candidate_adjudication_identity_components: 2,
             candidate_adjudication_conditional_relationship_components: 1,
+            candidate_triage_identity_components: 1,
+            candidate_triage_conditional_relationship_components: 1,
             grounded_initial_identity_components: 3,
             grounded_conditional_relationship_components: 1,
             generic_invalid_identity_components: 2,
@@ -3456,6 +3497,11 @@ mod tests {
             plan.candidate_grounded_fallback_provider_requests_baseline_maximum,
             12
         );
+        assert_eq!(plan.candidate_triage_provider_requests_baseline, 1);
+        assert_eq!(
+            plan.candidate_triage_grounded_fallback_provider_requests_baseline_maximum,
+            8
+        );
         assert_eq!(plan.initial_grounded_provider_requests_baseline, 12);
         assert_eq!(
             plan.initial_grounded_provider_requests_nonpositive_validation_envelope,
@@ -3468,11 +3514,11 @@ mod tests {
         );
         assert_eq!(plan.generic_invalid_identity_components, 2);
         assert_eq!(plan.generic_invalid_classifier_provider_requests, 2);
-        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 18);
-        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 35);
+        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 23);
+        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 51);
         assert_eq!(
             plan.known_total_provider_requests_validation_envelope_maximum,
-            114
+            146
         );
         assert!(plan.legacy_reextraction_identity_outputs_unknown);
         assert!(!plan.logical_provider_request_counts_include_transport_retries);

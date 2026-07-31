@@ -58,6 +58,11 @@ model = "gemini-3.5-flash-lite"
 thinking_level = "low"
 max_output_tokens = 2048
 
+[tasks.avionics_candidate_triage]
+model = "gemini-3.5-flash-lite"
+thinking_level = "low"
+max_output_tokens = 2048
+
 [tasks.aircraft_visual_identity]
 model = "gemini-3.1-flash-lite"
 thinking_level = "low"
