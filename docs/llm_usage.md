@@ -513,6 +513,15 @@ Every extracted candidate first goes through a local catalog pass:
 
 Candidates unresolved by that local pass enter the grounded workflow:
 
+Before grounded research, a tools-disabled concreteness classifier provides one
+narrow discard fast path. The server accepts its exact response shape and
+automatically rejects only `generic` at `very_high` confidence when
+`model_identifies_single_unit=false` and the response contains concrete,
+non-empty generic indicators. Classifier errors, unknown or malformed fields,
+blank indicators, `ambiguous`, and every weaker-confidence answer continue into
+ordinary grounding. All supplied context is explicitly labeled untrusted; the
+classifier cannot approve or create a catalog identity.
+
 1. Gemini returns `existing_match`, `propose_new`, `reject`, or `unresolved`
    with authoritative identity evidence. Existing IDs are schema-constrained
    to the supplied shortlist.

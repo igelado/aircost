@@ -804,39 +804,39 @@ fn provider_request_plan(
         candidate_adjudication_conditional_relationship_components: conditional_candidate,
         candidate_adjudication_provider_requests_baseline: candidate,
         candidate_grounded_fallback_provider_requests_baseline_maximum: all_candidate_components
-            .saturating_mul(3),
+            .saturating_mul(4),
         grounded_initial_identity_components: grounded,
         grounded_conditional_relationship_components: conditional_grounded,
-        initial_grounded_provider_requests_baseline: grounded.saturating_mul(3),
+        initial_grounded_provider_requests_baseline: grounded.saturating_mul(4),
         initial_grounded_provider_requests_nonpositive_validation_envelope: grounded
-            .saturating_mul(8),
-        positive_identity_provider_requests_baseline: all_grounded_components.saturating_mul(6),
+            .saturating_mul(9),
+        positive_identity_provider_requests_baseline: all_grounded_components.saturating_mul(7),
         positive_identity_provider_requests_validation_envelope: all_grounded_components
-            .saturating_mul(14),
+            .saturating_mul(15),
         known_total_provider_requests_minimum_baseline: reextractions
             .saturating_add(candidate)
-            .saturating_add(grounded.saturating_mul(3)),
+            .saturating_add(grounded.saturating_mul(4)),
         known_total_provider_requests_all_positive_baseline: reextractions
             .saturating_add(all_candidate_components)
-            .saturating_add(all_grounded_components.saturating_mul(6)),
+            .saturating_add(all_grounded_components.saturating_mul(7)),
         known_total_provider_requests_validation_envelope_maximum: reextractions
             .saturating_mul(2)
             .saturating_add(all_candidate_components)
             .saturating_add(
                 all_grounded_components
                     .saturating_add(all_candidate_components)
-                    .saturating_mul(14),
+                    .saturating_mul(15),
             ),
         legacy_reextraction_identity_outputs_unknown: reextractions > 0,
         logical_provider_request_counts_include_transport_retries: false,
         default_max_transport_attempts_per_logical_request: usize::from(
             RetryPolicy::default().max_attempts(),
         ),
-        grounded_pass_note: "One fresh grounded identity pass has three logical provider requests at baseline (Search, URL Context, structure) and at most six after per-stage validation fallbacks. One reused-evidence identity correction can raise that pass envelope to eight. A positive identity adds an independent collision pass, but its review and optional domain correction share one two-structure-call budget: six requests at baseline and up to fourteen in the complete validation envelope. A nonpositive identity does not run collision review."
+        grounded_pass_note: "Every identity that reaches the grounded route first uses exactly one tools-disabled concreteness-classifier request. A strict very-high-confidence generic result stops there; malformed, ambiguous, weaker, or concrete results continue. The fresh grounded identity pass then has three logical provider requests at baseline (Search, URL Context, structure) and at most six after per-stage validation fallbacks. One reused-evidence identity correction can raise the grounded portion to eight. Including the classifier, a positive identity and its independent collision pass use seven requests at baseline and up to fifteen in the complete validation envelope. A nonpositive grounded identity does not run collision review."
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every bounded candidate adjudication succeeds without Search and every conditional relationship target is skipped. Candidate adjudication is one tools-disabled request; an uncertain, negative, invalid, or stale answer falls through to the ordinary grounded pipeline. The all-positive baseline includes every conditional target but assumes candidate adjudication succeeds. The maximum validation envelope includes grounded fallback for every candidate. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every bounded candidate adjudication succeeds without Search and every conditional relationship target is skipped. Candidate adjudication is one tools-disabled request; a successful candidate decision does not run the concreteness classifier. An uncertain, negative, invalid, or stale answer falls through to the ordinary grounded route and then incurs exactly one classifier request before grounded research. The all-positive baseline includes every conditional target but assumes candidate adjudication succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -2970,23 +2970,23 @@ mod tests {
         assert_eq!(plan.candidate_adjudication_provider_requests_baseline, 2);
         assert_eq!(
             plan.candidate_grounded_fallback_provider_requests_baseline_maximum,
-            9
+            12
         );
-        assert_eq!(plan.initial_grounded_provider_requests_baseline, 9);
+        assert_eq!(plan.initial_grounded_provider_requests_baseline, 12);
         assert_eq!(
             plan.initial_grounded_provider_requests_nonpositive_validation_envelope,
-            24
+            27
         );
-        assert_eq!(plan.positive_identity_provider_requests_baseline, 24);
+        assert_eq!(plan.positive_identity_provider_requests_baseline, 28);
         assert_eq!(
             plan.positive_identity_provider_requests_validation_envelope,
-            56
+            60
         );
-        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 13);
-        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 29);
+        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 16);
+        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 33);
         assert_eq!(
             plan.known_total_provider_requests_validation_envelope_maximum,
-            105
+            112
         );
         assert!(plan.legacy_reextraction_identity_outputs_unknown);
         assert!(!plan.logical_provider_request_counts_include_transport_retries);
@@ -2994,6 +2994,12 @@ mod tests {
         assert!(plan
             .transport_retry_note
             .contains("four transport attempts"));
+        assert!(plan
+            .grounded_pass_note
+            .contains("exactly one tools-disabled"));
+        assert!(plan
+            .uncertainty_note
+            .contains("does not run the concreteness classifier"));
     }
 
     #[test]
