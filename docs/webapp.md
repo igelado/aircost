@@ -236,13 +236,18 @@ not covered, absent, ambiguous, or conflicts with the supplied serial number.
 Preview remains read-only and may still display extracted data that admission
 will reject.
 
-During creation or an explicit avionics replacement, the server automatically
-discards an observation as garbage only for a high-confidence structured
-`rejection_basis` and a basis-consistent, candidate-specific negative reason.
-The entire normalized reason must appear in one linked Google Search citation
-support span. A citation that only establishes product identity, contradicts
-the negative claim, or is otherwise unrelated leaves the observation pending
-for review instead of discarding it.
+During creation or an explicit avionics replacement, one narrow tools-disabled
+fast path may discard an observation before grounded research: the classifier
+must return the exact response shape, classify it as `generic` with
+`very_high` confidence, set `model_identifies_single_unit=false`, and provide
+concrete non-empty indicators. Invalid, ambiguous, weaker, or failed answers
+continue normally. The grounded resolver has a separate discard path for a
+high-confidence structured `rejection_basis` and a basis-consistent,
+candidate-specific negative reason. For that path, the entire normalized
+reason must appear in one linked Google Search citation support span. A
+citation that only establishes product identity, contradicts the negative
+claim, or is otherwise unrelated leaves the observation pending for review
+instead of discarding it.
 
 Create a listing from the same payload accepted by preview:
 
@@ -487,10 +492,13 @@ listing still has a current pending review.
 
 Before creating a run, the browser reports the current full-Pipeline Gemini
 request plan and warns that finalization enrichment is additional. This is a
-cost warning, not a hard budget. Deterministically FAA-rejected aircraft and
-reference-only listings remain visible but are not selectable for another
-automatic identity run. `GEMINI_API_KEY` enables extraction and curation;
-`FAA_DRS_API_KEY` additionally enables unresolved aircraft grounding.
+cost warning, not a hard budget. The avionics totals include one tools-disabled
+concreteness-classifier request for every identity that reaches grounded
+curation; verified-local identities and successful closed-context candidate
+adjudications do not incur that request. Deterministically FAA-rejected
+aircraft and reference-only listings remain visible but are not selectable for
+another automatic identity run. `GEMINI_API_KEY` enables extraction and
+curation; `FAA_DRS_API_KEY` additionally enables unresolved aircraft grounding.
 Deterministic FAA/catalog reuse still works without paid calls; unresolved or
 uncertain observations remain in review rather than being auto-approved.
 When aircraft and avionics review is complete but valuation-grade factory

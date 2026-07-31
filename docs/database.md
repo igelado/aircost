@@ -1029,16 +1029,21 @@ The request plan counts logical provider requests rather than describing a
 grounded workflow as one "call." It reports tools-disabled candidate
 adjudication separately at one request per eligible identity, including the
 maximum grounded fallback if those decisions do not pass their local gates.
-One fresh grounded pass has three baseline requests: Search, URL Context, and
-structure. Per-stage model-validation
-fallback raises the identity pass to at most six requests; one reused-evidence
-identity correction makes that pass envelope eight. A positive identity also
-requires an independent collision pass. Its review and optional domain
-correction share a two-structure-call budget, for six baseline requests and a
-fourteen-request complete validation envelope. The report separates its known
+Successful local reuse and successful candidate adjudication do not run the
+concreteness classifier. Every identity that reaches the grounded route first
+uses exactly one tools-disabled classifier request. A strict `very_high`
+generic result can stop there; every other valid, invalid, ambiguous, or failed
+classification continues normally. The fresh grounded portion then has three
+baseline requests: Search, URL Context, and structure. Per-stage
+model-validation fallback raises that portion to at most six requests; one
+reused-evidence identity correction makes that portion's envelope eight. A
+positive identity also requires an independent collision pass. Its review and
+optional domain correction share a two-structure-call budget, for seven
+baseline requests and a fifteen-request complete validation envelope including
+the classifier. The report separates its known
 minimum baseline (candidate comparison succeeds and conditional relationship
 targets are skipped), all-positive baseline, and maximum validation envelope
-(every candidate falls through to grounding). A legacy
+(every candidate falls through to classifier plus grounding). A legacy
 listing re-extraction is one baseline request and up to two with JSON repair.
 Transport retry attempts are reported separately and are not multiplied into
 these logical counts. Identity counts produced by legacy re-extraction, later

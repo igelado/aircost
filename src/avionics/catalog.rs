@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
@@ -335,6 +335,38 @@ pub enum AvionicsIdentityOutcome {
     Approved(ApprovedAvionicsIdentity),
     Rejected { reason: String },
     Unresolved { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AvionicsConcretenessClassification {
+    Concrete,
+    Generic,
+    Ambiguous,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AvionicsConcretenessConfidence {
+    VeryHigh,
+    High,
+    Medium,
+    Low,
+}
+
+/// Exact tools-disabled classifier response accepted by the pre-grounding
+/// generic-label gate. Unknown or missing fields fail deserialization so a
+/// provider/schema drift can never turn an observation into an automatic
+/// discard.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvionicsConcretenessReview {
+    classification: AvionicsConcretenessClassification,
+    manufacturer_is_avionics_maker: bool,
+    model_identifies_single_unit: bool,
+    confidence: AvionicsConcretenessConfidence,
+    generic_indicators: Vec<String>,
+    notes: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1518,6 +1550,20 @@ async fn resolve_avionics_identity_with_write_mode(
         },
         catalog_candidates: shortlist.clone(),
     };
+
+    // The tools-disabled check is only a narrow discard fast path. It runs
+    // after every local reuse/adjudication opportunity and before paid
+    // grounded research. Any call failure, response-shape drift, ambiguity,
+    // or confidence below very_high deliberately falls through to the
+    // ordinary evidence-backed workflow.
+    if let Ok(classification) = extractor
+        .classify_avionics_unit_concreteness(&context)
+        .await
+    {
+        if let Some(reason) = generic_concreteness_rejection_reason(&context, classification) {
+            return Ok(AvionicsIdentityOutcome::Rejected { reason });
+        }
+    }
 
     let initial_response = match &grounding_plan {
         IdentityGroundingPlan::Direct(plan)
@@ -3839,6 +3885,45 @@ fn nonpositive_identity_outcome(
     }
 }
 
+fn generic_concreteness_rejection_reason(
+    context: &AvionicsUnitResolutionContext,
+    response: Value,
+) -> Option<String> {
+    let review = serde_json::from_value::<AvionicsConcretenessReview>(response).ok()?;
+    if review.classification != AvionicsConcretenessClassification::Generic
+        || review.confidence != AvionicsConcretenessConfidence::VeryHigh
+        || review.model_identifies_single_unit
+        || review.generic_indicators.is_empty()
+        || review
+            .generic_indicators
+            .iter()
+            .any(|indicator| indicator.trim().is_empty())
+    {
+        return None;
+    }
+
+    // Reading the remaining exact-shape fields is intentional: they are
+    // advisory context, not independent discard predicates. A real avionics
+    // maker can still be paired with a generic class label, and free-form
+    // notes must never strengthen the decision.
+    let _manufacturer_is_avionics_maker = review.manufacturer_is_avionics_maker;
+    let _notes = review.notes;
+    let indicators = review
+        .generic_indicators
+        .iter()
+        .map(|indicator| indicator.trim())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let observed_identity = format!(
+        "{} {}",
+        context.candidate.manufacturer.trim(),
+        context.candidate.model.trim()
+    );
+    Some(format!(
+        "pre-grounding concreteness review classified observed avionics {observed_identity:?} as a generic non-product label with very high confidence: {indicators}"
+    ))
+}
+
 fn verified_identity_from_response(response: &Value) -> CatalogResult<VerifiedIdentity> {
     let identity = VerifiedIdentity {
         canonical_manufacturer: required_field(response, "canonical_manufacturer")?,
@@ -5146,13 +5231,14 @@ mod tests {
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
-        explicit_authoritative_direct_source_plan, known_approved_local_match,
-        load_catalog_candidates, load_known_approved_candidates, load_review_catalog_candidates,
-        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
-        model_identity_relation_score, nonpositive_identity_outcome,
-        opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
-        persist_approved_identity, persist_existing_reuse_attestation,
-        plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
+        explicit_authoritative_direct_source_plan, generic_concreteness_rejection_reason,
+        known_approved_local_match, load_catalog_candidates, load_known_approved_candidates,
+        load_review_catalog_candidates, manufacturer_collision_snapshot_sha256,
+        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
+        nonpositive_identity_outcome, opportunistic_authoritative_direct_source_plan,
+        persist_approved_capability_enrichment, persist_approved_identity,
+        persist_existing_reuse_attestation, plan_avionics_identity_verification_route,
+        proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
         revalidate_direct_source_admission_state, select_opportunistic_authoritative_source_urls,
@@ -5406,6 +5492,101 @@ mod tests {
                 quantity: 1,
             },
             catalog_candidates: candidates,
+        }
+    }
+
+    fn very_high_generic_concreteness_response() -> serde_json::Value {
+        json!({
+            "classification": "generic",
+            "manufacturer_is_avionics_maker": true,
+            "model_identifies_single_unit": false,
+            "confidence": "very_high",
+            "generic_indicators": [
+                "the observed model is an equipment capability rather than a product designation"
+            ],
+            "notes": "No single model designation is present."
+        })
+    }
+
+    #[test]
+    fn very_high_exact_shape_generic_review_can_reject_before_grounding() {
+        let context = context(vec![]);
+        let reason = generic_concreteness_rejection_reason(
+            &context,
+            very_high_generic_concreteness_response(),
+        )
+        .expect("the narrow very-high-confidence generic decision should be accepted");
+
+        assert!(reason.contains("Garmin GTX345R"));
+        assert!(reason.contains("equipment capability rather than a product designation"));
+    }
+
+    #[test]
+    fn concreteness_review_falls_through_unless_every_rejection_gate_passes() {
+        let context = context(vec![]);
+        let variants = [
+            json!({
+                "classification": "generic",
+                "manufacturer_is_avionics_maker": true,
+                "model_identifies_single_unit": false,
+                "confidence": "high",
+                "generic_indicators": ["equipment class"],
+                "notes": ""
+            }),
+            json!({
+                "classification": "ambiguous",
+                "manufacturer_is_avionics_maker": true,
+                "model_identifies_single_unit": false,
+                "confidence": "very_high",
+                "generic_indicators": ["could name multiple units"],
+                "notes": ""
+            }),
+            json!({
+                "classification": "generic",
+                "manufacturer_is_avionics_maker": true,
+                "model_identifies_single_unit": true,
+                "confidence": "very_high",
+                "generic_indicators": ["equipment class"],
+                "notes": ""
+            }),
+            json!({
+                "classification": "generic",
+                "manufacturer_is_avionics_maker": true,
+                "model_identifies_single_unit": false,
+                "confidence": "very_high",
+                "generic_indicators": [],
+                "notes": ""
+            }),
+            json!({
+                "classification": "generic",
+                "manufacturer_is_avionics_maker": true,
+                "model_identifies_single_unit": false,
+                "confidence": "very_high",
+                "generic_indicators": ["   "],
+                "notes": ""
+            }),
+        ];
+
+        for response in variants {
+            assert!(generic_concreteness_rejection_reason(&context, response).is_none());
+        }
+    }
+
+    #[test]
+    fn concreteness_review_shape_drift_fails_closed_into_grounding() {
+        let context = context(vec![]);
+        let mut extra_field = very_high_generic_concreteness_response();
+        extra_field["unexpected"] = json!(true);
+        let mut missing_field = very_high_generic_concreteness_response();
+        missing_field
+            .as_object_mut()
+            .expect("review fixture object")
+            .remove("notes");
+        let mut wrong_type = very_high_generic_concreteness_response();
+        wrong_type["model_identifies_single_unit"] = json!("false");
+
+        for response in [extra_field, missing_field, wrong_type, json!(null)] {
+            assert!(generic_concreteness_rejection_reason(&context, response).is_none());
         }
     }
 
