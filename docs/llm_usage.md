@@ -58,7 +58,9 @@ An unusable Search-discovery redirect is discarded when another citation
 resolves successfully; the unresolved URL is never forwarded as a fallback.
 If none resolve, Search retries normally. URL Context citation resolution
 remains all-or-nothing because its verified output is evidence for the
-structure stage.
+structure stage. A citation or fresh publisher fetch whose actual terminal URL
+is not HTTPS is likewise rejected before structure conversion; the application
+does not rewrite an HTTP URL into an unfetched HTTPS claim.
 
 Legacy grounded-metadata calls that still use GenerateContent follow the
 provider's Search/structured-output constraint: the Search request sets JSON

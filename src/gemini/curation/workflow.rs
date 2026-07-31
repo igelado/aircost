@@ -888,6 +888,7 @@ impl VerifiedEvidenceDossier {
                 if citation.cited_text.trim().is_empty() {
                     bail!("verified evidence contains an empty citation span");
                 }
+                require_final_https_source_url(&citation.final_url, "verified evidence citation")?;
                 canonical_url_key(&citation.final_url)?;
                 Ok(citation.final_url.clone())
             })
@@ -1925,6 +1926,7 @@ where
     }
     let structure_source_urls =
         structure_source_url_allowlist(verified_urls, direct_source_packet.as_ref());
+    require_final_https_source_urls(&structure_source_urls, "structure evidence allow-list")?;
     let structure_citations =
         citations_for_candidate_urls(verified_citations, &structure_source_urls);
     let structure_url_output =
@@ -2735,15 +2737,7 @@ async fn resolve_citation_inputs(
             .with_context(|| format!("could not resolve Gemini citation {raw_url}"))?;
         resolved_urls.insert(raw_url, resolved.final_url.to_string());
     }
-    Ok(citation_inputs
-        .into_iter()
-        .map(|input| VerifiedCitation {
-            final_url: resolved_urls[&input.raw_url].clone(),
-            raw_url: input.raw_url,
-            title: input.title,
-            cited_text: input.cited_text,
-        })
-        .collect())
+    bind_resolved_citation_inputs(citation_inputs, &resolved_urls)
 }
 
 async fn resolve_search_citation_inputs(
@@ -2777,26 +2771,56 @@ fn bind_resolved_search_citation_inputs(
     resolved_urls: &BTreeMap<String, String>,
     first_resolution_error: Option<&str>,
 ) -> Result<Vec<VerifiedCitation>> {
+    let mut first_resolution_error = first_resolution_error.map(str::to_string);
     let resolved = citation_inputs
         .into_iter()
         .filter_map(|input| {
-            resolved_urls
-                .get(&input.raw_url)
-                .map(|final_url| VerifiedCitation {
-                    final_url: final_url.clone(),
-                    raw_url: input.raw_url,
-                    title: input.title,
-                    cited_text: input.cited_text,
-                })
+            let final_url = resolved_urls.get(&input.raw_url)?;
+            if let Err(error) = require_final_https_source_url(final_url, "Gemini Search citation")
+            {
+                first_resolution_error.get_or_insert_with(|| error.to_string());
+                return None;
+            }
+            Some(VerifiedCitation {
+                final_url: final_url.clone(),
+                raw_url: input.raw_url,
+                title: input.title,
+                cited_text: input.cited_text,
+            })
         })
         .collect::<Vec<_>>();
     if resolved.is_empty() {
         let detail = first_resolution_error
+            .as_deref()
             .map(|error| format!("; first failure: {error}"))
             .unwrap_or_default();
         bail!("could not resolve any Gemini Search citation{detail}");
     }
     Ok(resolved)
+}
+
+fn bind_resolved_citation_inputs(
+    citation_inputs: Vec<CitationInput>,
+    resolved_urls: &BTreeMap<String, String>,
+) -> Result<Vec<VerifiedCitation>> {
+    citation_inputs
+        .into_iter()
+        .map(|input| {
+            let final_url = resolved_urls.get(&input.raw_url).ok_or_else(|| {
+                anyhow!(
+                    "Gemini citation {} has no resolved final URL",
+                    input.raw_url
+                )
+            })?;
+            require_final_https_source_url(final_url, "Gemini URL Context citation")?;
+            Ok(VerifiedCitation {
+                final_url: final_url.clone(),
+                raw_url: input.raw_url,
+                title: input.title,
+                cited_text: input.cited_text,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3089,6 +3113,19 @@ async fn prepare_url_context_sources(
                     continue;
                 }
             };
+            let final_url = match admitted_fetched_final_https_url(
+                &fetched.final_url,
+                "revalidated direct-source fetch",
+            ) {
+                Ok(final_url) => final_url,
+                Err(error) => {
+                    documents.failures.insert(
+                        source_url.clone(),
+                        bounded_error_excerpt(&error.to_string()),
+                    );
+                    continue;
+                }
+            };
             let missing_anchor_indexes = missing_publisher_document_relevance_anchor_indexes(
                 &fetched.publisher_text,
                 &request.direct_source_relevance_anchors,
@@ -3107,7 +3144,6 @@ async fn prepare_url_context_sources(
                 );
                 continue;
             }
-            let final_url = fetched.final_url.to_string();
             insert_transient_source_document(
                 &mut documents,
                 &final_url,
@@ -3146,6 +3182,7 @@ async fn prepare_url_context_sources(
         .map(|citation| citation.final_url.clone())
         .collect::<BTreeSet<_>>();
     let mut source_to_final_url = BTreeMap::new();
+    let mut non_https_source_urls = BTreeSet::new();
     let mut documents = TransientSourceDocuments::default();
     for source_url in source_urls {
         let fetched = match client.fetch_public_source_document(&source_url).await {
@@ -3158,7 +3195,20 @@ async fn prepare_url_context_sources(
                 continue;
             }
         };
-        let final_url = fetched.final_url.to_string();
+        let final_url = match admitted_fetched_final_https_url(
+            &fetched.final_url,
+            "Search publisher-document fetch",
+        ) {
+            Ok(final_url) => final_url,
+            Err(error) => {
+                documents.failures.insert(
+                    source_url.clone(),
+                    bounded_error_excerpt(&error.to_string()),
+                );
+                non_https_source_urls.insert(source_url);
+                continue;
+            }
+        };
         insert_transient_source_document(
             &mut documents,
             &final_url,
@@ -3168,6 +3218,7 @@ async fn prepare_url_context_sources(
         source_to_final_url.insert(source_url, final_url);
     }
 
+    citations.retain(|citation| !non_https_source_urls.contains(&citation.final_url));
     for citation in &mut citations {
         if let Some(final_url) = source_to_final_url.get(&citation.final_url) {
             citation.final_url.clone_from(final_url);
@@ -3246,6 +3297,12 @@ async fn prepare_url_context_sources(
             if fetched.final_url.origin().ascii_serialization() != expected_origin {
                 continue;
             }
+            let Ok(final_url) = admitted_fetched_final_https_url(
+                &fetched.final_url,
+                "publisher-index document fetch",
+            ) else {
+                continue;
+            };
             let final_path_score =
                 publisher_index_path_token_score(&fetched.final_url, &identity_tokens);
             if final_path_score < MIN_PUBLISHER_INDEX_PATH_TOKEN_MATCHES
@@ -3257,7 +3314,6 @@ async fn prepare_url_context_sources(
             {
                 continue;
             }
-            let final_url = fetched.final_url.to_string();
             insert_transient_source_document(
                 &mut documents,
                 &final_url,
@@ -3283,6 +3339,7 @@ fn insert_transient_source_document(
     content_sha256: String,
     publisher_text: String,
 ) -> Result<()> {
+    require_final_https_source_url(final_url, "transient publisher document")?;
     if let Some(existing) = documents.verified.get(final_url) {
         if existing.content_sha256 != content_sha256 {
             bail!(
@@ -3532,7 +3589,10 @@ async fn prepare_direct_source_documents(
                     continue;
                 }
             };
-            let final_url = fetched.final_url.to_string();
+            let final_url = admitted_fetched_final_https_url(
+                &fetched.final_url,
+                "verified publisher-document fetch",
+            )?;
             insert_transient_source_document(
                 &mut documents,
                 &final_url,
@@ -5089,6 +5149,27 @@ fn canonical_url_key(value: &str) -> Result<String> {
     Ok(value)
 }
 
+fn require_final_https_source_url(value: &str, stage: &str) -> Result<()> {
+    let url = Url::parse(value)
+        .with_context(|| format!("{stage} returned invalid final URL {value:?}"))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        bail!("{stage} returned a non-HTTPS final URL: {url}");
+    }
+    Ok(())
+}
+
+fn require_final_https_source_urls(urls: &BTreeSet<String>, stage: &str) -> Result<()> {
+    for url in urls {
+        require_final_https_source_url(url, stage)?;
+    }
+    Ok(())
+}
+
+fn admitted_fetched_final_https_url(final_url: &Url, stage: &str) -> Result<String> {
+    require_final_https_source_url(final_url.as_str(), stage)?;
+    Ok(final_url.to_string())
+}
+
 fn grounding_trace(response: &InteractionResponse) -> GroundingTrace {
     let search_calls = response
         .interaction
@@ -5747,6 +5828,148 @@ mod tests {
             .to_string()
             .contains("could not resolve any Gemini Search citation"));
         assert!(error.to_string().contains("invalid peer certificate"));
+    }
+
+    #[test]
+    fn search_citation_binding_discards_non_https_final_urls_when_https_survives() {
+        let downgraded_raw = "https://search.example/downgraded".to_string();
+        let admitted_raw = "https://search.example/admitted".to_string();
+        let inputs = vec![
+            CitationInput {
+                raw_url: downgraded_raw.clone(),
+                title: "Downgraded manual".to_string(),
+                cited_text: "An authoritative passage behind an HTTP terminal URL.".to_string(),
+            },
+            CitationInput {
+                raw_url: admitted_raw.clone(),
+                title: "HTTPS manual".to_string(),
+                cited_text: "An authoritative passage behind an HTTPS terminal URL.".to_string(),
+            },
+        ];
+        let resolved_urls = [
+            (
+                downgraded_raw,
+                "http://publisher.example/legacy-manual.pdf".to_string(),
+            ),
+            (
+                admitted_raw.clone(),
+                "https://publisher.example/current-manual.pdf".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let citations = bind_resolved_search_citation_inputs(inputs, &resolved_urls, None).unwrap();
+
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].raw_url, admitted_raw);
+        assert_eq!(
+            citations[0].final_url,
+            "https://publisher.example/current-manual.pdf"
+        );
+    }
+
+    #[test]
+    fn search_citation_binding_rejects_when_only_non_https_final_urls_resolve() {
+        let raw_url = "https://search.example/downgraded".to_string();
+        let resolved_urls = [(
+            raw_url.clone(),
+            "http://publisher.example/legacy-manual.pdf".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let error = bind_resolved_search_citation_inputs(
+            vec![CitationInput {
+                raw_url,
+                title: "Downgraded manual".to_string(),
+                cited_text: "An authoritative passage behind an HTTP terminal URL.".to_string(),
+            }],
+            &resolved_urls,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Gemini Search citation returned a non-HTTPS final URL"));
+    }
+
+    #[test]
+    fn url_context_citation_binding_is_all_or_nothing_for_final_https() {
+        let https_raw = "https://context.example/https".to_string();
+        let http_raw = "https://context.example/http".to_string();
+        let inputs = vec![
+            CitationInput {
+                raw_url: https_raw.clone(),
+                title: "HTTPS source".to_string(),
+                cited_text: "One HTTPS passage.".to_string(),
+            },
+            CitationInput {
+                raw_url: http_raw.clone(),
+                title: "HTTP source".to_string(),
+                cited_text: "One HTTP passage.".to_string(),
+            },
+        ];
+        let resolved_urls = [
+            (
+                https_raw,
+                "https://publisher.example/manual.pdf".to_string(),
+            ),
+            (http_raw, "http://publisher.example/archive.pdf".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let error = bind_resolved_citation_inputs(inputs, &resolved_urls).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Gemini URL Context citation returned a non-HTTPS final URL"));
+    }
+
+    #[tokio::test]
+    async fn non_https_final_url_fails_before_structure_provider_call() {
+        let client = GeminiInteractionsClient::with_test_endpoint(
+            "test-key",
+            Url::parse("http://127.0.0.1:9/interactions").unwrap(),
+            RetryPolicy::new(1, Duration::from_millis(1), Duration::from_millis(1)).unwrap(),
+        )
+        .unwrap();
+        let request = evidence_request();
+        let verified_urls = ["http://publisher.example/legacy-manual.pdf".to_string()]
+            .into_iter()
+            .collect();
+        let accounted = AtomicUsize::new(0);
+        let accounting = |task, purpose| {
+            accounted.fetch_add(1, Ordering::SeqCst);
+            InteractionAccountingContext::new(task, purpose)
+        };
+        let mut interactions = Vec::new();
+
+        let error = run_structure_stage(
+            &client,
+            &GeminiRuntimeConfig::default(),
+            &request,
+            "Verified dossier.",
+            &[],
+            &verified_urls,
+            false,
+            None,
+            &[],
+            None,
+            EvidenceProvenance::SearchUrlContext,
+            &accounting,
+            &mut interactions,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(accounted.load(Ordering::SeqCst), 0);
+        assert!(interactions.is_empty());
+        assert!(error
+            .to_string()
+            .contains("structure evidence allow-list returned a non-HTTPS final URL"));
     }
 
     #[test]
