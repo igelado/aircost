@@ -558,8 +558,15 @@ remain pending without a classifier request.
    the collision shortlist is empty, so an empty array is not a vacuous pass.
    The call uses the separately configurable
    `AIRCOST_GEMINI_AVIONICS_REVIEW_MODEL`.
-4. Only after all checks pass does one transaction promote the
-   confirmed legacy row or create a new `approved` row.
+4. Only after all checks pass does one transaction promote the confirmed
+   legacy row or create a new `approved` row. When the review marks multiple
+   unreviewed rows as the same product, automatic consolidation is limited to
+   the complete group sharing one exact stored normalized model and one
+   effective manufacturer identity. The write transaction rechecks full
+   catalog and manufacturer-collision fingerprints, exact membership, stable
+   identifier compatibility, and every association remap. It then approves one
+   survivor atomically or leaves the observation pending; model similarity,
+   descriptive aliases, and meaningful variants never authorize this path.
 
 Grounded product approval and cross-run reuse are separate conclusions. A
 verified product is approved even when its evidence URL is outside every

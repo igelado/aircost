@@ -6,6 +6,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
+use super::consolidation::{
+    consolidate_and_approve_grounded_exact_model, GroundedExactModelConsolidationRequest,
+    GroundedExactModelMember,
+};
 use super::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
     authorize_manufacturer_source_urls, canonical_exact_https_origin,
@@ -337,6 +341,75 @@ pub enum AvionicsIdentityOutcome {
     Unresolved { reason: String },
 }
 
+/// Result of the network-capable preflight used by the manual review API.
+///
+/// Ordinary identity decisions remain read-only and are returned as previews.
+/// A complete grounded exact-model duplicate group is different: it is safe to
+/// curate independently of the listing decision, so the preflight applies that
+/// catalog-only transaction and tells the caller to reload the rewritten
+/// review before submitting a listing decision.
+pub(crate) enum ReviewPreflightAvionicsIdentityOutcome {
+    Preview(AvionicsIdentityOutcome),
+    CatalogConsolidated(ApprovedAvionicsIdentity),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityPersistenceMode {
+    Apply,
+    Preview,
+    ApplyGroundedConsolidationOnly,
+}
+
+impl IdentityPersistenceMode {
+    fn persists_ordinary_identity(self) -> bool {
+        self == Self::Apply
+    }
+
+    fn applies_grounded_consolidation(self) -> bool {
+        self != Self::Preview
+    }
+}
+
+struct IdentityResolutionExecution {
+    mode: IdentityPersistenceMode,
+    grounded_exact_model_consolidated: bool,
+}
+
+impl IdentityResolutionExecution {
+    fn new(mode: IdentityPersistenceMode) -> Self {
+        Self {
+            mode,
+            grounded_exact_model_consolidated: false,
+        }
+    }
+}
+
+fn grounded_consolidation_preview_block(
+    mode: IdentityPersistenceMode,
+) -> Option<AvionicsIdentityOutcome> {
+    (!mode.applies_grounded_consolidation()).then(|| AvionicsIdentityOutcome::Unresolved {
+        reason: "the independent collision review found a complete grounded exact-model duplicate group; apply mode must consolidate and approve it atomically"
+            .to_string(),
+    })
+}
+
+fn review_preflight_outcome(
+    outcome: AvionicsIdentityOutcome,
+    grounded_exact_model_consolidated: bool,
+) -> CatalogResult<ReviewPreflightAvionicsIdentityOutcome> {
+    if !grounded_exact_model_consolidated {
+        return Ok(ReviewPreflightAvionicsIdentityOutcome::Preview(outcome));
+    }
+    let AvionicsIdentityOutcome::Approved(approved) = outcome else {
+        return Err(CatalogError::Validation(
+            "grounded exact-model consolidation completed without an approved survivor".to_string(),
+        ));
+    };
+    Ok(ReviewPreflightAvionicsIdentityOutcome::CatalogConsolidated(
+        approved,
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum AvionicsConcretenessClassification {
@@ -519,7 +592,8 @@ pub async fn resolve_avionics_identity(
     extractor: &GeminiListingExtractor,
     request: &AvionicsIdentityRequest,
 ) -> CatalogResult<AvionicsIdentityOutcome> {
-    resolve_avionics_identity_with_write_mode(db, extractor, request, true).await
+    let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Apply);
+    resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await
 }
 
 /// Run the same grounded classification and independent collision review
@@ -530,7 +604,24 @@ pub async fn preview_avionics_identity(
     extractor: &GeminiListingExtractor,
     request: &AvionicsIdentityRequest,
 ) -> CatalogResult<AvionicsIdentityOutcome> {
-    resolve_avionics_identity_with_write_mode(db, extractor, request, false).await
+    let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Preview);
+    resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await
+}
+
+/// Run manual-review grounding without applying an ordinary create or
+/// promotion. If the independent review proves one complete exact-model
+/// duplicate group, apply that catalog-only consolidation immediately so the
+/// pending review can be rewritten to the resulting verified product.
+pub(crate) async fn resolve_avionics_identity_for_review_preflight(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    request: &AvionicsIdentityRequest,
+) -> CatalogResult<ReviewPreflightAvionicsIdentityOutcome> {
+    let mut execution =
+        IdentityResolutionExecution::new(IdentityPersistenceMode::ApplyGroundedConsolidationOnly);
+    let outcome =
+        resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
+    review_preflight_outcome(outcome, execution.grounded_exact_model_consolidated)
 }
 
 /// Run only the single tools-disabled generic-label discard gate for a raw
@@ -1489,7 +1580,7 @@ async fn resolve_avionics_identity_with_write_mode(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
     request: &AvionicsIdentityRequest,
-    persist: bool,
+    execution: &mut IdentityResolutionExecution,
 ) -> CatalogResult<AvionicsIdentityOutcome> {
     if request.manufacturer.trim().is_empty() || request.model.trim().is_empty() {
         return Ok(AvionicsIdentityOutcome::Unresolved {
@@ -1531,6 +1622,13 @@ async fn resolve_avionics_identity_with_write_mode(
         input_manufacturer_identity_id,
         &review_catalog,
     );
+    let reviewed_manufacturer_collision_snapshot = input_manufacturer_identity_id.map(|identity| {
+        manufacturer_collision_snapshot_sha256(
+            &request.manufacturer,
+            Some(identity),
+            &review_catalog,
+        )
+    });
     let mut grounding_plan = if let Some(plan) = explicit_direct_source_plan {
         IdentityGroundingPlan::Direct(plan)
     } else if let Some(plan) = opportunistic_authoritative_direct_source_plan(
@@ -1772,7 +1870,10 @@ async fn resolve_avionics_identity_with_write_mode(
                 grounded_response.verified_evidence.as_ref(),
                 &grounding_plan,
                 &catalog_snapshot,
-                persist,
+                &manufacturer_catalog,
+                input_manufacturer_identity_id,
+                reviewed_manufacturer_collision_snapshot.as_deref(),
+                execution,
             )
             .await
         }
@@ -1790,7 +1891,10 @@ async fn resolve_avionics_identity_with_write_mode(
                 grounded_response.verified_evidence.as_ref(),
                 &grounding_plan,
                 &catalog_snapshot,
-                persist,
+                &manufacturer_catalog,
+                input_manufacturer_identity_id,
+                reviewed_manufacturer_collision_snapshot.as_deref(),
+                execution,
             )
             .await
         }
@@ -1810,7 +1914,10 @@ async fn resolve_verified_identity(
     source_evidence: Option<&crate::extract::GroundedAvionicsEvidence>,
     grounding_plan: &IdentityGroundingPlan,
     reviewed_catalog_fingerprint: &str,
-    persist: bool,
+    manufacturer_catalog: &[AvionicsCatalogCandidate],
+    manufacturer_identity_id: Option<i64>,
+    reviewed_manufacturer_collision_snapshot: Option<&str>,
+    execution: &mut IdentityResolutionExecution,
 ) -> CatalogResult<AvionicsIdentityOutcome> {
     let review_context = AvionicsCatalogCollisionReviewContext {
         classification_context: context.clone(),
@@ -1995,6 +2102,40 @@ async fn resolve_verified_identity(
             ),
         });
     }
+    let distinct_same_ids = same_ids.iter().copied().collect::<BTreeSet<_>>();
+    if distinct_same_ids.len() > 1 {
+        let grounded_consolidation = match grounded_exact_model_consolidation_request(
+            manufacturer_catalog,
+            manufacturer_identity_id,
+            &same_ids,
+            &proposed,
+            reviewed_catalog_fingerprint,
+            reviewed_manufacturer_collision_snapshot,
+        ) {
+            Ok(request) => request,
+            Err(reason) => {
+                return Ok(AvionicsIdentityOutcome::Unresolved { reason });
+            }
+        };
+        if let Some(preview) = grounded_consolidation_preview_block(execution.mode) {
+            return Ok(preview);
+        }
+        let report = consolidate_and_approve_grounded_exact_model(db, &grounded_consolidation)
+            .await
+            .map_err(|error| match error {
+                super::consolidation::ConsolidationError::Database(message) => {
+                    CatalogError::Database(message)
+                }
+                super::consolidation::ConsolidationError::Validation(message)
+                | super::consolidation::ConsolidationError::Conflict(message) => {
+                    CatalogError::Validation(message)
+                }
+            })?;
+        execution.grounded_exact_model_consolidated = true;
+        return Ok(AvionicsIdentityOutcome::Approved(
+            approved_identity_from_verified(report.survivor.id, &proposed),
+        ));
+    }
     if let Some(existing) = approved_same.first() {
         let review = reviews
             .iter()
@@ -2009,7 +2150,7 @@ async fn resolve_verified_identity(
             }
         };
         if !additions.is_empty() {
-            if !persist {
+            if !execution.mode.persists_ordinary_identity() {
                 return Ok(AvionicsIdentityOutcome::Approved(
                     approved_identity_from_verified(existing.id, &proposed),
                 ));
@@ -2023,7 +2164,7 @@ async fn resolve_verified_identity(
             .await?;
             return Ok(AvionicsIdentityOutcome::Approved(stored));
         }
-        if persist {
+        if execution.mode.persists_ordinary_identity() {
             persist_existing_reuse_attestation(
                 db,
                 existing,
@@ -2049,21 +2190,8 @@ async fn resolve_verified_identity(
         ));
     }
 
-    if same_ids.len() > 1 {
-        let mut duplicate_ids = same_ids.clone();
-        duplicate_ids.sort_unstable();
-        duplicate_ids.dedup();
-        if duplicate_ids.len() > 1 {
-            return Ok(AvionicsIdentityOutcome::Unresolved {
-                reason: format!(
-                    "independent collision review confirmed multiple legacy catalog rows as the same product ({duplicate_ids:?}); explicitly consolidate them before approving the identity"
-                ),
-            });
-        }
-    }
-
     let target_id = selected_existing_id.or_else(|| same_ids.iter().copied().min());
-    if !persist {
+    if !execution.mode.persists_ordinary_identity() {
         return Ok(AvionicsIdentityOutcome::Approved(
             approved_identity_from_verified(target_id.unwrap_or(0), &proposed),
         ));
@@ -2079,6 +2207,125 @@ async fn resolve_verified_identity(
     Ok(AvionicsIdentityOutcome::Approved(stored))
 }
 
+fn grounded_exact_model_consolidation_request(
+    manufacturer_catalog: &[AvionicsCatalogCandidate],
+    manufacturer_identity_id: Option<i64>,
+    same_ids: &[i64],
+    proposed: &VerifiedIdentity,
+    reviewed_catalog_fingerprint: &str,
+    reviewed_manufacturer_collision_snapshot: Option<&str>,
+) -> Result<GroundedExactModelConsolidationRequest, String> {
+    let manufacturer_identity_id = manufacturer_identity_id.ok_or_else(|| {
+        "automatic duplicate consolidation requires one evidence-backed effective manufacturer identity"
+            .to_string()
+    })?;
+    let reviewed_manufacturer_collision_snapshot =
+        reviewed_manufacturer_collision_snapshot.ok_or_else(|| {
+            "automatic duplicate consolidation requires the complete reviewed manufacturer collision snapshot"
+                .to_string()
+        })?;
+    let same_ids = same_ids.iter().copied().collect::<BTreeSet<_>>();
+    if same_ids.len() < 2 {
+        return Err(
+            "automatic duplicate consolidation requires at least two reviewed rows".to_string(),
+        );
+    }
+    let anchor = manufacturer_catalog
+        .iter()
+        .find(|candidate| same_ids.contains(&candidate.id))
+        .ok_or_else(|| {
+            "the current collision decision no longer names a manufacturer-scoped catalog row"
+                .to_string()
+        })?;
+    let exact_model_key = normalize_avionics_model_name(&anchor.model);
+    if exact_model_key.is_empty() {
+        return Err("the reviewed duplicate group has no usable normalized model key".to_string());
+    }
+    let complete_group = manufacturer_catalog
+        .iter()
+        .filter(|candidate| normalize_avionics_model_name(&candidate.model) == exact_model_key)
+        .collect::<Vec<_>>();
+    let complete_ids = complete_group
+        .iter()
+        .map(|candidate| candidate.id)
+        .collect::<BTreeSet<_>>();
+    if complete_ids != same_ids {
+        let omitted = complete_ids
+            .difference(&same_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        let nonexact = same_ids
+            .difference(&complete_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "the current collision pass did not authorize exactly one complete normalized-model group; omitted={omitted:?}, nonexact={nonexact:?}"
+        ));
+    }
+    if complete_group
+        .iter()
+        .any(|candidate| candidate.catalog_status != "unreviewed")
+    {
+        return Err(
+            "automatic grounded exact-model consolidation permits only unreviewed catalog rows"
+                .to_string(),
+        );
+    }
+    for (index, left) in complete_group.iter().enumerate() {
+        let left_identifier = (!left.manufacturer_identifier.trim().is_empty()).then(|| {
+            (
+                left.manufacturer_identifier_kind.as_str(),
+                normalize_avionics_identifier(&left.manufacturer_identifier),
+            )
+        });
+        for right in complete_group.iter().skip(index + 1) {
+            let right_identifier = (!right.manufacturer_identifier.trim().is_empty()).then(|| {
+                (
+                    right.manufacturer_identifier_kind.as_str(),
+                    normalize_avionics_identifier(&right.manufacturer_identifier),
+                )
+            });
+            if matches!(
+                (&left_identifier, &right_identifier),
+                (Some(left), Some(right)) if left != right
+            ) {
+                return Err(format!(
+                    "reviewed exact-model rows {} and {} have conflicting stable identifiers",
+                    left.id, right.id
+                ));
+            }
+        }
+    }
+    let members = complete_group
+        .into_iter()
+        .map(|candidate| GroundedExactModelMember {
+            id: candidate.id,
+            manufacturer: candidate.manufacturer.clone(),
+            model: candidate.model.clone(),
+            avionics_types: candidate.avionics_types.clone(),
+            manufacturer_identifier_kind: candidate.manufacturer_identifier_kind.clone(),
+            manufacturer_identifier: candidate.manufacturer_identifier.clone(),
+            catalog_status: candidate.catalog_status.clone(),
+        })
+        .collect();
+    Ok(GroundedExactModelConsolidationRequest {
+        members,
+        effective_manufacturer_identity_id: manufacturer_identity_id,
+        reviewed_catalog_fingerprint: reviewed_catalog_fingerprint.to_string(),
+        manufacturer_collision_snapshot_sha256: reviewed_manufacturer_collision_snapshot
+            .to_string(),
+        canonical_manufacturer: proposed.canonical_manufacturer.clone(),
+        canonical_model: proposed.canonical_model.clone(),
+        canonical_types: proposed.canonical_types.clone(),
+        manufacturer_identifier_kind: proposed.manufacturer_identifier_kind.clone(),
+        manufacturer_identifier: proposed.manufacturer_identifier.clone(),
+        identity_source_url: proposed.identity_source_url.clone(),
+        identity_source_title: proposed.identity_source_title.clone(),
+        identity_evidence: proposed.identity_evidence.clone(),
+        grounded_claim_source_urls: proposed.grounded_claim_source_urls.clone(),
+    })
+}
+
 async fn load_catalog_candidates(db: &AppDb) -> CatalogResult<Vec<AvionicsCatalogCandidate>> {
     let rows = query_as_all!(db, CatalogRow, CATALOG_SELECT_SQL)?;
     Ok(catalog_candidates_from_rows(rows))
@@ -2087,6 +2334,61 @@ async fn load_catalog_candidates(db: &AppDb) -> CatalogResult<Vec<AvionicsCatalo
 async fn load_review_catalog_candidates(db: &AppDb) -> CatalogResult<Vec<ReviewCatalogCandidate>> {
     let rows = query_as_all!(db, CatalogRow, CATALOG_SELECT_SQL)?;
     Ok(review_catalog_candidates_from_rows(rows))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CurrentCatalogReviewFingerprints {
+    pub catalog_fingerprint: String,
+    pub manufacturer_collision_snapshot_sha256: String,
+}
+
+fn catalog_review_fingerprints_from_rows(
+    rows: Vec<CatalogRow>,
+    manufacturer_identity_id: i64,
+) -> CurrentCatalogReviewFingerprints {
+    let review_catalog = review_catalog_candidates_from_rows(rows);
+    let catalog = review_catalog
+        .iter()
+        .map(|candidate| candidate.candidate.clone())
+        .collect::<Vec<_>>();
+    CurrentCatalogReviewFingerprints {
+        catalog_fingerprint: catalog_fingerprint(&catalog),
+        manufacturer_collision_snapshot_sha256: manufacturer_collision_snapshot_sha256(
+            "",
+            Some(manufacturer_identity_id),
+            &review_catalog,
+        ),
+    }
+}
+
+pub(super) async fn current_catalog_review_fingerprints_sqlite(
+    db: &AppDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    manufacturer_identity_id: i64,
+) -> CatalogResult<CurrentCatalogReviewFingerprints> {
+    let sql = db.sql(CATALOG_SELECT_SQL);
+    let rows = sqlx::query_as::<_, CatalogRow>(&sql)
+        .fetch_all(&mut **transaction)
+        .await?;
+    Ok(catalog_review_fingerprints_from_rows(
+        rows,
+        manufacturer_identity_id,
+    ))
+}
+
+pub(super) async fn current_catalog_review_fingerprints_postgres(
+    db: &AppDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    manufacturer_identity_id: i64,
+) -> CatalogResult<CurrentCatalogReviewFingerprints> {
+    let sql = db.sql(CATALOG_SELECT_SQL);
+    let rows = sqlx::query_as::<_, CatalogRow>(&sql)
+        .fetch_all(&mut **transaction)
+        .await?;
+    Ok(catalog_review_fingerprints_from_rows(
+        rows,
+        manufacturer_identity_id,
+    ))
 }
 
 /// Retrieve, but never authorize, one exact-model candidate for review.
@@ -5273,27 +5575,27 @@ mod tests {
 
     use super::{
         approved_candidate_adjudication_plan, approved_candidate_adjudication_plan_is_unchanged,
-        approved_candidate_adjudication_selection, attest_grounded_existing_avionics_identity,
-        attest_pending_review_product_identity, avionics_model_identity_relation,
-        canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
-        collision_correction_plan, collision_response_issues,
-        collision_reviews_with_direct_source_proofs, complete_manufacturer_collision_family,
-        deterministic_graph_approved_identity_from_source,
+        approved_candidate_adjudication_selection, approved_identity_from_verified,
+        attest_grounded_existing_avionics_identity, attest_pending_review_product_identity,
+        avionics_model_identity_relation, canonical_avionics_types_for_label,
+        canonical_types_from_response, catalog_fingerprint, collision_correction_plan,
+        collision_response_issues, collision_reviews_with_direct_source_proofs,
+        complete_manufacturer_collision_family, deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
         explicit_authoritative_direct_source_plan, generic_concreteness_rejection_reason,
-        known_approved_local_match, load_catalog_candidates, load_known_approved_candidates,
-        load_review_catalog_candidates, manufacturer_collision_snapshot_sha256,
-        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
-        nonpositive_identity_outcome, opportunistic_authoritative_direct_source_plan,
-        persist_approved_capability_enrichment, persist_approved_identity,
-        persist_existing_reuse_attestation, plan_avionics_identity_verification_route,
-        proposal_attestation_with_direct_source_proofs,
+        grounded_consolidation_preview_block, known_approved_local_match, load_catalog_candidates,
+        load_known_approved_candidates, load_review_catalog_candidates,
+        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
+        model_identity_relation_score, nonpositive_identity_outcome,
+        opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
+        persist_approved_identity, persist_existing_reuse_attestation,
+        plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
-        revalidate_direct_source_admission_state, select_opportunistic_authoritative_source_urls,
-        select_unique_exact_review_candidate, shortlist_avionics_candidates,
-        should_run_listing_only_approved_candidate_adjudication,
+        revalidate_direct_source_admission_state, review_preflight_outcome,
+        select_opportunistic_authoritative_source_urls, select_unique_exact_review_candidate,
+        shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
         validate_collision_decision_relation, validate_evidence_values,
         verified_identity_from_response, ApprovedAvionicsIdentity,
@@ -5303,8 +5605,9 @@ mod tests {
         AvionicsModelIdentityRelation, AvionicsUnitResolutionCandidate,
         AvionicsUnitResolutionContext, CollisionCorrectionPlan, DirectSourceRequirement,
         GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
-        KnownApprovedAvionicsCandidate, PendingProductAttestationCommitGuard,
-        ReviewCatalogCandidate, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
+        IdentityPersistenceMode, KnownApprovedAvionicsCandidate,
+        PendingProductAttestationCommitGuard, ReviewCatalogCandidate,
+        ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, COLLISION_STRUCTURE_CALL_BUDGET,
         KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
@@ -5657,6 +5960,60 @@ mod tests {
                 "https://static.garmin.com/manuals/gtx345r.pdf".to_string()
             ],
         }
+    }
+
+    #[test]
+    fn grounded_exact_group_preview_never_claims_an_unapproved_legacy_survivor() {
+        let preview = grounded_consolidation_preview_block(IdentityPersistenceMode::Preview)
+            .expect("read-only preview must not apply a grounded consolidation");
+        assert!(matches!(
+            preview,
+            AvionicsIdentityOutcome::Unresolved { reason }
+                if reason.contains("apply mode must consolidate and approve it atomically")
+        ));
+        assert!(grounded_consolidation_preview_block(IdentityPersistenceMode::Apply).is_none());
+        assert!(grounded_consolidation_preview_block(
+            IdentityPersistenceMode::ApplyGroundedConsolidationOnly
+        )
+        .is_none());
+        assert!(
+            !IdentityPersistenceMode::ApplyGroundedConsolidationOnly.persists_ordinary_identity()
+        );
+    }
+
+    #[test]
+    fn manual_preflight_distinguishes_preview_from_committed_catalog_consolidation() {
+        let preview_identity = approved_identity_from_verified(0, &verified_identity());
+        let preview =
+            review_preflight_outcome(AvionicsIdentityOutcome::Approved(preview_identity), false)
+                .unwrap();
+        assert!(matches!(
+            preview,
+            ReviewPreflightAvionicsIdentityOutcome::Preview(AvionicsIdentityOutcome::Approved(
+                ApprovedAvionicsIdentity { id: 0, .. }
+            ))
+        ));
+
+        let consolidated_identity = approved_identity_from_verified(42, &verified_identity());
+        let consolidated = review_preflight_outcome(
+            AvionicsIdentityOutcome::Approved(consolidated_identity),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            consolidated,
+            ReviewPreflightAvionicsIdentityOutcome::CatalogConsolidated(ApprovedAvionicsIdentity {
+                id: 42,
+                ..
+            })
+        ));
+        assert!(review_preflight_outcome(
+            AvionicsIdentityOutcome::Unresolved {
+                reason: "unexpected".to_string(),
+            },
+            true,
+        )
+        .is_err());
     }
 
     fn known_candidate(id: i64, model: &str) -> KnownApprovedAvionicsCandidate {

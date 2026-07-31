@@ -227,14 +227,23 @@ create curated identities from unreviewed legacy names. Once one side gains
 authoritative evidence, matching unassigned makers are staged as pending alias
 candidates without approval.
 
-`avionics_catalog_consolidation_guard` is a transient transaction guard, not a
-review queue or durable merge log. A row authorizes one exact unreviewed
-duplicate-to-survivor pair only. Its insert and every association remap
-revalidate equal canonical manufacturer plus equal product or non-empty stable
-identifier kind and normalized value. A matching identifier value with a
-different kind is not an identity edge. While a pair exists, both endpoint
-identities and statuses are immutable. Consolidation must delete and verify all
-guard rows before changing or deleting either endpoint and before committing.
+`avionics_catalog_consolidation_guard` is the transient stable-identifier
+transaction guard, not a review queue or durable merge log. It requires equal
+canonical manufacturer plus equal non-empty stable identifier kind and
+normalized value.
+
+Grounded exact-model authority uses separate transient
+`avionics_catalog_grounded_consolidation_authorizations`, `_guard`, and
+`_claim` tables. The header binds the reviewed catalog and manufacturer
+collision fingerprints to one effective manufacturer, exact stored model key,
+survivor, and complete member count. Pair rows must enumerate every
+non-survivor, and only a claim that rechecks the complete current group and
+identifier compatibility exposes those pairs to remap triggers. Descriptive
+expansions and meaningful variants cannot use this authority. While a claim is
+active, endpoint identities and statuses are immutable. Duplicate deletion
+consumes every pair by cascade; the transaction must then remove the claim and
+header and verify that all transient rows are gone before committing. No Gemini
+response or URL-context dossier is retained.
 
 `aircraft_sale_listing_avionics`
 

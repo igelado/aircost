@@ -479,6 +479,13 @@ member label. Omitted model-equivalent rows, stale member keys, conflicting
 stable identifiers, or reference claims that cannot be preserved block the
 operation.
 
+The ordinary create-product review path can also discover a complete grounded
+exact-model duplicate group. In that case the server consolidates and approves
+the catalog group atomically but does not apply the now-stale listing decision.
+The browser treats the dedicated response as progress, reloads the same listing
+with the verified survivor selected, and asks the reviewer to confirm once
+more. It is not displayed as a failed verification.
+
 Pipeline and opened-listing **Automatically verify** actions create the same
 durable server-owned verification run. The browser sends the selected listing
 IDs with a cryptographically random `Idempotency-Key`, stores only the returned

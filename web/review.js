@@ -3091,7 +3091,26 @@ async function resolveReview() {
       );
     }
   } catch (error) {
-    if (isStaleError(error)) {
+    if (isAvionicsCatalogConsolidated(error)) {
+      state.resolving = false;
+      await Promise.allSettled([
+        loadQueue({ quiet: true }),
+        Promise.resolve(refreshAvionics?.()),
+      ]);
+      await openReview(resolvedListingId, {
+        historyMode: "none",
+        discardDraft: true,
+        force: true,
+      });
+      if (
+        positiveInteger(state.currentReview?.listing_id) === resolvedListingId
+        && !state.stale
+      ) {
+        setWorkspaceMessage(
+          "Duplicate avionics catalog records were consolidated into a verified product. The review was refreshed with the corrected catalog identity; confirm the updated selection and verify again.",
+        );
+      }
+    } else if (isStaleError(error)) {
       markStale(error.message);
     } else if (isFinalizationError(error)) {
       await recoverCommittedResolution(
@@ -3648,6 +3667,10 @@ function markStale(message) {
 function isStaleError(error) {
   return error?.payload?.error?.code === "review_stale"
     || error?.status === 412;
+}
+
+function isAvionicsCatalogConsolidated(error) {
+  return error?.payload?.error?.code === "avionics_catalog_consolidated";
 }
 
 function isFinalizationError(error) {
