@@ -569,6 +569,13 @@ pub struct PendingProductReviewPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PreparedPendingProductReviews {
+    pub inspected_listing_count: i64,
+    pub restaged_listing_count: i64,
+    pub catalog_revision_sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductAssociationEligibilityStatus {
@@ -683,6 +690,8 @@ pub struct ReviewAspectView {
     pub proposed_product: Option<ReviewProduct>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reuse_attestation_target: Option<ReviewProduct>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_attestation_status: Option<ProductAttestationStatus>,
     pub allowed_actions: Vec<ReviewAction>,
 }
 
@@ -3365,23 +3374,19 @@ pub async fn list_pending_product_reviews(
             continue;
         }
         let mut eligibility_counts = ProductAssociationEligibilityCounts::default();
-        if status == ProductAttestationStatus::Required {
-            eligibility_counts.product_attestation_required = pending_association_count;
-        } else {
-            for association in associations {
-                let eligibility = evaluate_existing_product_association_with_snapshot(
-                    db,
-                    &snapshot,
-                    owner_user_id,
-                    association.listing_id,
-                    &association.aspect_id,
-                    &association.review_payload_sha256,
-                    &snapshot.catalog_revision_sha256,
-                )
-                .await?
-                .eligibility();
-                eligibility_counts.record(&eligibility);
-            }
+        for association in associations {
+            let eligibility = evaluate_existing_product_association_with_snapshot(
+                db,
+                &snapshot,
+                owner_user_id,
+                association.listing_id,
+                &association.aspect_id,
+                &association.review_payload_sha256,
+                &snapshot.catalog_revision_sha256,
+            )
+            .await?
+            .eligibility();
+            eligibility_counts.record(&eligibility);
         }
         groups.push((
             product_id,
@@ -4987,6 +4992,60 @@ pub async fn restage_unattested_preserved_products(
         .await
 }
 
+/// Make hidden approved-product references visible to the product review
+/// queue without re-running extraction or contacting a provider.
+///
+/// Only owner-scoped pending listings that retain an approved product without
+/// a current reuse attestation cross the hash-guarded restage boundary. A
+/// second call observes the already-staged hash and performs no review
+/// mutation.
+pub async fn prepare_pending_product_reviews(
+    db: &AppDb,
+    owner_user_id: i64,
+) -> ReviewResult<PreparedPendingProductReviews> {
+    let rows = load_product_review_source_rows(db, owner_user_id).await?;
+    let inspected_listing_count = rows.len() as i64;
+    let approved = load_all_approved_product_map(db).await?;
+    let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
+    let mut restaged_listing_count = 0;
+
+    for row in rows {
+        let assignments = load_existing_assignments(db, row.listing_id).await?;
+        let needs_product_source = assignments.iter().any(|assignment| {
+            let installed_needs_source = approved.contains_key(&assignment.avionics_model_id)
+                && !reuse_attested_ids.contains(&assignment.avionics_model_id);
+            let replacement_needs_source =
+                assignment
+                    .replaces_avionics_model_id
+                    .is_some_and(|product_id| {
+                        approved.contains_key(&product_id)
+                            && !reuse_attested_ids.contains(&product_id)
+                    });
+            installed_needs_source || replacement_needs_source
+        });
+        if !needs_product_source {
+            continue;
+        }
+
+        let previous_sha256 = row.review_payload_sha256;
+        let restaged =
+            restage_pending_review_if_current(db, owner_user_id, row.listing_id, &previous_sha256)
+                .await?;
+        if restaged
+            .as_ref()
+            .is_none_or(|review| review.review_payload_sha256 != previous_sha256)
+        {
+            restaged_listing_count += 1;
+        }
+    }
+
+    Ok(PreparedPendingProductReviews {
+        inspected_listing_count,
+        restaged_listing_count,
+        catalog_revision_sha256: approved_catalog_revision_sha256(db).await?,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingProductAttestationTarget {
     pub product: ReviewProduct,
@@ -5800,6 +5859,13 @@ pub async fn get_listing_review(
             let reuse_attestation_target = aspect
                 .reuse_attestation_target_id
                 .and_then(|id| all_approved.get(&id).cloned());
+            let reuse_attestation_status = aspect.reuse_attestation_target_id.map(|id| {
+                if approved.contains_key(&id) {
+                    ProductAttestationStatus::Current
+                } else {
+                    ProductAttestationStatus::Required
+                }
+            });
             ReviewAspectView {
                 id: aspect.id,
                 kind: aspect.kind,
@@ -5816,6 +5882,7 @@ pub async fn get_listing_review(
                 suggested_product,
                 proposed_product: aspect.proposed_product,
                 reuse_attestation_target,
+                reuse_attestation_status,
                 // `use_verified_product` is also a catalog-search action; it
                 // remains valid without a preselected suggestion.
                 allowed_actions: aspect.allowed_actions,
@@ -10008,6 +10075,18 @@ mod tests {
                 Some("high".to_string()),
             )
             .with_reuse_attestation_target(unattested_product_id),
+            PendingReviewAspect::avionics(
+                "attestation-missing-evidence",
+                "avionics_identity",
+                "Garmin GTX 345",
+                "Garmin GTX 345 transponder",
+                "catalog_match_requires_review",
+                1,
+                "installed",
+                None,
+                None,
+            )
+            .with_reuse_attestation_target(unattested_product_id),
         ];
         let staged = stage_pending_review(&db, listing_id, Some(submission_id), &aspects)
             .await
@@ -10046,7 +10125,7 @@ mod tests {
             unattested_group.eligibility_counts,
             ProductAssociationEligibilityCounts {
                 ready_local: 0,
-                source_evidence_missing: 0,
+                source_evidence_missing: 1,
                 product_attestation_required: 1,
                 manual_review_required: 0,
             }
@@ -10319,6 +10398,10 @@ mod tests {
             preserved_review_aspect_id(link_id, ListingAssociationRole::Installed)
         );
         assert_eq!(preserved.allowed_actions, vec![ReviewAction::Discard]);
+        assert_eq!(
+            preserved.reuse_attestation_status,
+            Some(ProductAttestationStatus::Required)
+        );
         assert_eq!(preserved.observed_text, "Garmin GNS 430W");
         assert_eq!(preserved.source_evidence_text, None);
         assert_eq!(preserved.source_confidence, None);
@@ -10337,6 +10420,103 @@ mod tests {
         .await
         .expect_err("a concurrent review mutation must not be overwritten");
         assert!(matches!(stale, ReviewError::Stale(_)));
+    }
+
+    #[tokio::test]
+    async fn product_queue_prepare_is_owner_scoped_provider_free_and_idempotent() {
+        let db = test_db().await;
+        let (owner_user_id, owned_listing_id) = insert_listing(&db).await;
+        let (_, foreign_listing_id) = insert_listing(&db).await;
+        let pool = sqlite_pool(&db);
+        let foreign_user_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO users (email, display_name, auth_provider, auth_subject)
+            VALUES ('other-reviewer@example.test', 'Other reviewer', 'local', 'other-reviewer')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE aircraft_sale_listings SET created_by_user_id = ? WHERE id = ?")
+            .bind(foreign_user_id)
+            .bind(foreign_listing_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let preserved_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let reviewed_id = insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await;
+        for listing_id in [owned_listing_id, foreign_listing_id] {
+            sqlx::query(
+                r#"
+                INSERT INTO aircraft_sale_listing_avionics (
+                  aircraft_sale_listing_id, avionics_model_id, quantity, source,
+                  source_notes, source_confidence, configuration_action
+                ) VALUES (?, ?, 1, 'listing', 'Garmin GNS 430W shown in the listing',
+                          'high', 'installed')
+                "#,
+            )
+            .bind(listing_id)
+            .bind(preserved_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            stage_pending_review(
+                &db,
+                listing_id,
+                None,
+                &[pending_aspect("reviewed-unit", reviewed_id)],
+            )
+            .await
+            .unwrap();
+        }
+        let gemini_usage_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let first = prepare_pending_product_reviews(&db, owner_user_id)
+            .await
+            .unwrap();
+        assert_eq!(first.inspected_listing_count, 1);
+        assert_eq!(first.restaged_listing_count, 1);
+        assert_eq!(first.catalog_revision_sha256.len(), 64);
+        assert_eq!(
+            list_pending_product_reviews(&db, owner_user_id, ProductReviewPageQuery::default())
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter(|group| group.product.id == Some(preserved_id))
+                .count(),
+            1
+        );
+        assert!(list_pending_product_reviews(
+            &db,
+            foreign_user_id,
+            ProductReviewPageQuery::default()
+        )
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .all(|group| group.product.id != Some(preserved_id)));
+
+        let second = prepare_pending_product_reviews(&db, owner_user_id)
+            .await
+            .unwrap();
+        assert_eq!(second.inspected_listing_count, 1);
+        assert_eq!(second.restaged_listing_count, 0);
+        assert_eq!(
+            second.catalog_revision_sha256,
+            first.catalog_revision_sha256
+        );
+        let gemini_usage_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(gemini_usage_after, gemini_usage_before);
     }
 
     #[tokio::test]

@@ -1345,18 +1345,22 @@ label span,
 }
 
 .review-product-table th:nth-child(1) {
-  width: 38%;
+  width: 30%;
 }
 
 .review-product-table th:nth-child(2) {
-  width: 24%;
+  width: 16%;
 }
 
 .review-product-table th:nth-child(3) {
-  width: 25%;
+  width: 18%;
 }
 
 .review-product-table th:nth-child(4) {
+  width: 25%;
+}
+
+.review-product-table th:nth-child(5) {
   width: 140px;
 }
 
