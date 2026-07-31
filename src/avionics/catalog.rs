@@ -1210,6 +1210,73 @@ pub async fn resolve_verified_local_avionics_identity(
     ))
 }
 
+/// Resolve product identity for non-listing enrichment from the current local
+/// catalog without invoking Gemini.
+///
+/// This is deliberately narrower than listing occurrence resolution. It can
+/// only reuse one exact effective-manufacturer/model match whose complete
+/// approved graph has a current reuse attestation. Listing requests are never
+/// admitted here: their retained occurrence evidence must continue through
+/// `resolve_verified_local_avionics_identity`.
+pub(crate) async fn resolve_verified_catalog_avionics_identity(
+    db: &AppDb,
+    request: &AvionicsIdentityRequest,
+) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
+    if request.requires_listing_evidence
+        || !request.authoritative_direct_source_urls.is_empty()
+        || !request.authoritative_identity_anchors.is_empty()
+        || !is_usable_avionics_label(&request.manufacturer, &request.model)
+    {
+        return Ok(None);
+    }
+    let observed_types = canonicalize_avionics_types(&request.avionics_types);
+    if observed_types.is_empty() || observed_types.len() != request.avionics_types.len() {
+        return Ok(None);
+    }
+    let Some(manufacturer_identity_id) =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
+    else {
+        return Ok(None);
+    };
+    let product_key = normalize_avionics_identifier(&request.model);
+    if product_key.is_empty() {
+        return Ok(None);
+    }
+
+    let candidates = load_known_approved_candidates(db).await?;
+    let matching = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.avionics_manufacturer_identity_id == manufacturer_identity_id
+                && candidate.canonical_product_key == product_key
+                && observed_types
+                    .iter()
+                    .all(|capability| candidate.avionics_types.contains(capability))
+        })
+        .collect::<Vec<_>>();
+    let [selected] = matching.as_slice() else {
+        return Ok(None);
+    };
+    let catalog = load_catalog_candidates(db).await?;
+    if catalog_identity_is_duplicated(selected, &catalog) {
+        return Ok(None);
+    }
+
+    Ok(Some(ApprovedAvionicsIdentity {
+        id: selected.id,
+        manufacturer: selected.manufacturer.clone(),
+        model: selected.model.clone(),
+        avionics_types: selected.avionics_types.clone(),
+        manufacturer_identifier_kind: selected.manufacturer_identifier_kind.clone(),
+        manufacturer_identifier: selected.manufacturer_identifier.clone(),
+        evidence_url: selected.identity_source_url.clone(),
+        evidence_title: selected.identity_source_title.clone(),
+        evidence: selected.identity_evidence.clone(),
+        reason: "Reused one exact, unique graph-approved catalog product with a current reuse attestation for non-listing metadata enrichment without Gemini".to_string(),
+        grounded_claim_source_urls: Vec::new(),
+    }))
+}
+
 /// Classify the cheapest safe identity route without invoking Gemini.
 ///
 /// Candidate adjudication is available only when the current manufacturer
@@ -1630,6 +1697,9 @@ async fn resolve_avionics_identity_with_write_mode(
         explicit_authoritative_direct_source_plan(db, request).await?;
 
     if let Some(approved) = resolve_verified_local_avionics_identity(db, request).await? {
+        return Ok(AvionicsIdentityOutcome::Approved(approved));
+    }
+    if let Some(approved) = resolve_verified_catalog_avionics_identity(db, request).await? {
         return Ok(AvionicsIdentityOutcome::Approved(approved));
     }
 
@@ -5621,7 +5691,8 @@ mod tests {
         persist_approved_identity, persist_existing_reuse_attestation,
         plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
-        resolution_issues_with_direct_source_proofs, resolve_verified_local_avionics_identity,
+        resolution_issues_with_direct_source_proofs, resolve_avionics_identity,
+        resolve_verified_catalog_avionics_identity, resolve_verified_local_avionics_identity,
         revalidate_direct_source_admission_state, review_preflight_outcome,
         select_opportunistic_authoritative_source_urls, select_unique_exact_review_candidate,
         shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
@@ -5644,7 +5715,7 @@ mod tests {
         ManufacturerSourceOriginAdmission,
     };
     use crate::db::{AppDb, DatabaseBackend};
-    use crate::extract::AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT;
+    use crate::extract::{GeminiListingExtractor, AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT};
     use crate::gemini::curation::workflow::{
         SourceEvidenceProof, SourceEvidenceSpanProof, MAX_EXACT_PRODUCT_SIGNAL_TOKEN_SPAN,
     };
@@ -9673,6 +9744,113 @@ mod tests {
                 .is_none(),
             "the local path requires exact server taxonomy values"
         );
+    }
+
+    #[tokio::test]
+    async fn non_listing_exact_catalog_reuse_requires_current_attestation_and_uniqueness() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_garmin_static_source_authority(&db).await;
+        let stored = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .expect("approved current-attested product should seed");
+        let mut request = local_request("");
+        request.requires_listing_evidence = false;
+        request.listing_context =
+            "model-produced metadata is not listing occurrence evidence".to_string();
+
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let exact = resolve_avionics_identity(&db, &extractor, &request)
+            .await
+            .expect("exact current-attested identity must bypass the unreachable Gemini endpoint");
+        let AvionicsIdentityOutcome::Approved(exact) = exact else {
+            panic!("the current exact graph identity should be reusable without Gemini")
+        };
+        assert_eq!(exact.id, stored.id);
+        assert!(exact.reason.contains("non-listing metadata enrichment"));
+
+        let listing_request = AvionicsIdentityRequest {
+            requires_listing_evidence: true,
+            listing_context: "Garmin GTX 345R installed".to_string(),
+            ..request.clone()
+        };
+        assert!(
+            resolve_verified_catalog_avionics_identity(&db, &listing_request)
+                .await
+                .expect("listing request should be rejected by the product-only path")
+                .is_none(),
+            "listing occurrence must remain governed by its separate evidence-bound resolver"
+        );
+
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let duplicate_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name
+            )
+            SELECT avionics_manufacturer_id, name, normalized_name
+            FROM avionics_models
+            WHERE id = ?
+            RETURNING id
+            "#,
+        )
+        .bind(stored.id)
+        .fetch_one(pool)
+        .await
+        .expect("legacy duplicate should seed");
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
+            SELECT ?, avionics_type_id
+            FROM avionics_model_types
+            WHERE avionics_model_id = ?
+            "#,
+        )
+        .bind(duplicate_id)
+        .bind(stored.id)
+        .execute(pool)
+        .await
+        .expect("duplicate capability should seed");
+        assert!(
+            resolve_verified_catalog_avionics_identity(&db, &request)
+                .await
+                .expect("ambiguous catalog lookup should fail closed")
+                .is_none(),
+            "an exact unreviewed collision must retain full identity grounding"
+        );
+        resolve_avionics_identity(&db, &extractor, &request)
+            .await
+            .expect_err("an ambiguous identity must fall back to the unreachable Gemini endpoint");
+
+        sqlx::query("DELETE FROM avionics_models WHERE id = ?")
+            .bind(duplicate_id)
+            .execute(pool)
+            .await
+            .expect("test duplicate should be removable");
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(stored.id)
+            .execute(pool)
+            .await
+            .expect("current attestation should be removable");
+        assert!(
+            resolve_verified_catalog_avionics_identity(&db, &request)
+                .await
+                .expect("stale catalog lookup should fail closed")
+                .is_none(),
+            "an approved product without a current attestation must retain full identity grounding"
+        );
+        resolve_avionics_identity(&db, &extractor, &request)
+            .await
+            .expect_err("a stale identity must fall back to the unreachable Gemini endpoint");
     }
 
     #[tokio::test]
