@@ -1664,7 +1664,11 @@ impl GeminiListingExtractor {
 
         match (result, accounting) {
             (Ok(response_payload), Some((store, attempt))) => {
-                let metrics = generate_content_usage_metrics(&response_payload, google_search);
+                let metrics = generate_content_usage_metrics(
+                    &response_payload,
+                    google_search,
+                    payload.get("cachedContent").is_some(),
+                );
                 let mut outcome = UsageOutcome::completed(metrics.clone());
                 outcome.provider_request_id = response_payload
                     .get("responseId")
@@ -1731,6 +1735,7 @@ fn request_fingerprint(payload: &Value) -> Result<String> {
 fn generate_content_usage_metrics(
     response_payload: &Value,
     google_search_requested: bool,
+    cached_content_requested: bool,
 ) -> UsageMetrics {
     let usage = response_payload.get("usageMetadata");
     let counter = |name: &str| {
@@ -1738,6 +1743,12 @@ fn generate_content_usage_metrics(
             .and_then(|usage| usage.get(name))
             .and_then(Value::as_u64)
     };
+    let input_tokens = counter("promptTokenCount");
+    let output_tokens = counter("candidatesTokenCount");
+    let thought_tokens = counter("thoughtsTokenCount").or_else(|| {
+        let accounted_tokens = input_tokens?.checked_add(output_tokens?)?;
+        counter("totalTokenCount")?.checked_sub(accounted_tokens)
+    });
     let search_query_count = response_payload
         .get("candidates")
         .and_then(Value::as_array)
@@ -1751,10 +1762,11 @@ fn generate_content_usage_metrics(
                 .sum::<u64>()
         });
     UsageMetrics {
-        input_tokens: counter("promptTokenCount"),
-        output_tokens: counter("candidatesTokenCount"),
-        thought_tokens: counter("thoughtsTokenCount"),
-        cached_tokens: counter("cachedContentTokenCount"),
+        input_tokens,
+        output_tokens,
+        thought_tokens,
+        cached_tokens: counter("cachedContentTokenCount")
+            .or_else(|| (!cached_content_requested).then_some(0)),
         tool_tokens: counter("toolUsePromptTokenCount"),
         search_query_count: search_query_count.or_else(|| (!google_search_requested).then_some(0)),
     }
@@ -4006,7 +4018,8 @@ mod tests {
         gemini_avionics_unit_resolution_response_schema,
         gemini_default_aircraft_avionics_response_schema, gemini_google_search_was_used,
         gemini_grounding_sources, gemini_grounding_supports, gemini_listing_avionics_item_schema,
-        generate_content_json_config, parsed_listing_from_model_output, preview_manual_listing,
+        generate_content_json_config, generate_content_usage_metrics,
+        parsed_listing_from_model_output, preview_manual_listing,
         validate_avionics_approved_candidate_adjudication_context, AuthorizedDirectSourcePolicy,
         AvionicsApprovedCandidateAdjudicationContext, AvionicsApprovedCatalogCandidate,
         AvionicsCatalogCandidate, AvionicsCatalogCollisionReviewContext, AvionicsMetadataContext,
@@ -5440,5 +5453,64 @@ mod tests {
 
         let tools_disabled = generate_content_json_config(schema.clone(), 1024, true);
         assert_eq!(tools_disabled["responseSchema"], schema);
+    }
+
+    #[test]
+    fn generate_content_usage_derives_omitted_zero_thoughts_from_provider_total() {
+        let response = json!({
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 150
+            }
+        });
+
+        let metrics = generate_content_usage_metrics(&response, false, false);
+
+        assert_eq!(metrics.input_tokens, Some(120));
+        assert_eq!(metrics.output_tokens, Some(30));
+        assert_eq!(metrics.thought_tokens, Some(0));
+        assert_eq!(metrics.cached_tokens, Some(0));
+        assert_eq!(metrics.search_query_count, Some(0));
+    }
+
+    #[test]
+    fn generate_content_usage_derives_unreported_thoughts_without_guessing() {
+        let response = json!({
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 165
+            }
+        });
+
+        let metrics = generate_content_usage_metrics(&response, false, false);
+
+        assert_eq!(metrics.thought_tokens, Some(15));
+    }
+
+    #[test]
+    fn generate_content_usage_keeps_non_derivable_counters_unknown() {
+        let missing_total = json!({
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 30
+            }
+        });
+        let inconsistent_total = json!({
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 149
+            }
+        });
+
+        let missing = generate_content_usage_metrics(&missing_total, false, true);
+        let inconsistent = generate_content_usage_metrics(&inconsistent_total, false, true);
+
+        assert_eq!(missing.thought_tokens, None);
+        assert_eq!(missing.cached_tokens, None);
+        assert_eq!(inconsistent.thought_tokens, None);
+        assert_eq!(inconsistent.cached_tokens, None);
     }
 }

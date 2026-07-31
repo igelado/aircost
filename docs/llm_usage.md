@@ -114,6 +114,14 @@ model/tier has a dated pricing snapshot. Otherwise cost remains unknown: both
 `estimated_cost_microusd` and `pricing_snapshot_json` stay null rather than
 silently treating missing counters as zero.
 
+GenerateContent may omit `thoughtsTokenCount` when it is zero. When
+`totalTokenCount`, `promptTokenCount`, and `candidatesTokenCount` are present,
+the accounting adapter derives the exact thought count from those
+provider-reported totals. It records zero cached tokens only for requests that
+did not send `cachedContent`; a missing cache counter on a cache-backed request
+remains unknown. These exact deductions allow pricing without treating an
+unexplained missing counter as zero.
+
 Interactions reports tool-use input separately from ordinary prompt input.
 URL Context and custom-function tool tokens are charged at the model's uncached
 input rate; Google Search retrieved context is excluded while its search-query
