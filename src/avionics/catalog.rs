@@ -260,7 +260,6 @@ impl ApprovedProductAssociationResolver {
         {
             return None;
         }
-        let observed_types = canonicalize_avionics_types(&request.avionics_types);
         let manufacturer_identity_id = resolve_input_manufacturer_identity_from_memberships(
             &request.manufacturer,
             &self.manufacturer_identity_memberships,
@@ -268,7 +267,6 @@ impl ApprovedProductAssociationResolver {
         known_approved_local_match_core(
             &request.model,
             &request.listing_evidence_text,
-            &observed_types,
             manufacturer_identity_id,
             &self.approved_candidates,
             &self.catalog,
@@ -1004,8 +1002,6 @@ pub async fn resolve_verified_local_avionics_identity(
     {
         return Ok(None);
     }
-    let observed_types = canonicalize_avionics_types(&request.avionics_types);
-
     let Some(manufacturer_identity_id) =
         resolve_input_manufacturer_identity(db, &request.manufacturer).await?
     else {
@@ -1016,7 +1012,6 @@ pub async fn resolve_verified_local_avionics_identity(
     Ok(known_approved_local_match_core(
         &request.model,
         &request.listing_context,
-        &observed_types,
         manufacturer_identity_id,
         &approved_candidates,
         &catalog,
@@ -2633,7 +2628,6 @@ fn approved_candidate_adjudication_plan_is_unchanged(
 #[cfg(test)]
 fn known_approved_local_match(
     request: &AvionicsIdentityRequest,
-    observed_types: &[String],
     manufacturer_identity_id: i64,
     candidates: &[KnownApprovedAvionicsCandidate],
     catalog: &[AvionicsCatalogCandidate],
@@ -2641,7 +2635,6 @@ fn known_approved_local_match(
     known_approved_local_match_core(
         &request.model,
         &request.listing_context,
-        observed_types,
         manufacturer_identity_id,
         candidates,
         catalog,
@@ -2651,7 +2644,6 @@ fn known_approved_local_match(
 fn known_approved_local_match_core(
     observed_model: &str,
     listing_evidence_text: &str,
-    observed_types: &[String],
     manufacturer_identity_id: i64,
     candidates: &[KnownApprovedAvionicsCandidate],
     catalog: &[AvionicsCatalogCandidate],
@@ -2662,17 +2654,11 @@ fn known_approved_local_match_core(
     }
     let eligible_candidates = candidates
         .iter()
-        .filter(|candidate| {
-            if candidate.avionics_manufacturer_identity_id != manufacturer_identity_id
-                || observed_types.is_empty()
-                || !observed_types
-                    .iter()
-                    .all(|capability| candidate.avionics_types.contains(capability))
-            {
-                return false;
-            }
-            true
-        })
+        // Listing-extracted capabilities are observations, not product
+        // identity. An exact approved manufacturer/model match supplies the
+        // curated capability set; a noisy extra capability must not force a
+        // redundant grounded identity search.
+        .filter(|candidate| candidate.avionics_manufacturer_identity_id == manufacturer_identity_id)
         .collect::<Vec<_>>();
 
     let identifier_matches = eligible_candidates
@@ -7037,7 +7023,6 @@ mod tests {
         let candidates = vec![known_candidate(7, "GTX 345R")];
         let approved = known_approved_local_match(
             &request,
-            &["Transponder".to_string()],
             1,
             &candidates,
             &[candidate(7, "GTX 345R", "approved")],
@@ -7050,6 +7035,27 @@ mod tests {
     }
 
     #[test]
+    fn exact_local_label_uses_catalog_capabilities_when_listing_classification_is_noisy() {
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Garmin".to_string(),
+            model: "GDL-69A".to_string(),
+            avionics_types: vec!["Datalink".to_string(), "Weather Radar".to_string()],
+            listing_context: "GDL-69A Datalink Weather".to_string(),
+            ..local_request("")
+        };
+        let mut selected = known_candidate(22, "GDL 69A");
+        selected.avionics_types = vec!["Datalink".to_string()];
+        let mut selected_catalog = candidate(22, "GDL 69A", "approved");
+        selected_catalog.avionics_types = vec!["Datalink".to_string()];
+
+        let approved = known_approved_local_match(&request, 1, &[selected], &[selected_catalog])
+            .expect("an exact product label must not inherit noisy listing capabilities");
+
+        assert_eq!(approved.id, 22);
+        assert_eq!(approved.avionics_types, vec!["Datalink"]);
+    }
+
+    #[test]
     fn exact_label_does_not_require_proving_that_an_unwritten_variant_was_absent() {
         let request = local_request("Garmin avionics package; GTX345R installed");
         let selected = known_candidate(7, "GTX 345R");
@@ -7058,7 +7064,6 @@ mod tests {
         let longer_neighbor = candidate(8, "GTX 345RD", "unreviewed");
         let approved = known_approved_local_match(
             &request,
-            &["Transponder".to_string()],
             1,
             &[selected],
             &[selected_catalog, longer_neighbor],
@@ -7071,7 +7076,6 @@ mod tests {
     fn globally_unique_exact_model_uses_the_resolved_manufacturer_identity() {
         let approved = known_approved_local_match(
             &gma_1347_model_only_request(),
-            &["Audio Panel".to_string()],
             1,
             &[gma_1347_known_candidate()],
             &[gma_1347_catalog_candidate("approved")],
@@ -7085,7 +7089,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &gma_1347_model_only_request(),
-                &["Audio Panel".to_string()],
                 99,
                 &[gma_1347_known_candidate()],
                 &[gma_1347_catalog_candidate("approved")],
@@ -7104,7 +7107,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &request,
-                &["Audio Panel".to_string()],
                 1,
                 &[gma_1347_known_candidate()],
                 &[gma_1347_catalog_candidate("approved")],
@@ -7125,7 +7127,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &gma_1347_model_only_request(),
-                &["Audio Panel".to_string()],
                 1,
                 &known,
                 &[approved.clone(), duplicate_model],
@@ -7141,7 +7142,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &gma_1347_model_only_request(),
-                &["Audio Panel".to_string()],
                 1,
                 &known,
                 &[approved, duplicate_identifier],
@@ -7160,7 +7160,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &gma_1347_model_only_request(),
-                &["Audio Panel".to_string()],
                 1,
                 &[gma_1347_known_candidate()],
                 &[gma_1347_catalog_candidate("approved"), cross_manufacturer,],
@@ -7190,7 +7189,6 @@ mod tests {
         };
         let approved = known_approved_local_match(
             &request,
-            &["Datalink".to_string()],
             1,
             &[selected, shorter_known],
             &[selected_catalog, shorter_neighbor],
@@ -7222,7 +7220,6 @@ mod tests {
         };
         let approved = known_approved_local_match(
             &request,
-            &["Integrated Flight Deck".to_string()],
             1,
             &[selected],
             &[selected_catalog, shorter_neighbor],
@@ -7254,7 +7251,6 @@ mod tests {
 
         let approved = known_approved_local_match(
             &request,
-            &["Integrated Flight Deck".to_string()],
             1,
             &[selected],
             &[selected_catalog, shorter_neighbor],
@@ -7271,7 +7267,6 @@ mod tests {
         longer_neighbor.manufacturer_identifier = "011-NEIGHBOR-94".to_string();
         let approved = known_approved_local_match(
             &gma_1347_model_only_request(),
-            &["Audio Panel".to_string()],
             1,
             &[gma_1347_known_candidate()],
             &[gma_1347_catalog_candidate("approved"), longer_neighbor],
@@ -7281,18 +7276,15 @@ mod tests {
     }
 
     #[test]
-    fn model_only_match_rejects_an_unverified_capability() {
-        assert!(
-            known_approved_local_match(
-                &gma_1347_model_only_request(),
-                &["Audio Panel".to_string(), "COM".to_string()],
-                1,
-                &[gma_1347_known_candidate()],
-                &[gma_1347_catalog_candidate("approved")],
-            )
-            .is_none(),
-            "model-only evidence cannot expand an approved product's capabilities"
-        );
+    fn model_only_match_does_not_copy_an_unverified_listing_capability() {
+        let approved = known_approved_local_match(
+            &gma_1347_model_only_request(),
+            1,
+            &[gma_1347_known_candidate()],
+            &[gma_1347_catalog_candidate("approved")],
+        )
+        .expect("exact identity may reuse the curated product despite noisy metadata");
+        assert_eq!(approved.avionics_types, vec!["Audio Panel"]);
     }
 
     #[test]
@@ -7310,15 +7302,9 @@ mod tests {
         neighbor.manufacturer_identifier = "011-UNREVIEWED-99".to_string();
         let catalog = vec![gma_1347_catalog_candidate("approved"), neighbor];
         assert_eq!(
-            known_approved_local_match(
-                &request,
-                &["Audio Panel".to_string()],
-                1,
-                &known,
-                &catalog,
-            )
-            .expect("exact local evidence should resolve before bounded adjudication")
-            .id,
+            known_approved_local_match(&request, 1, &known, &catalog,)
+                .expect("exact local evidence should resolve before bounded adjudication")
+                .id,
             2
         );
 
@@ -7481,7 +7467,6 @@ mod tests {
             assert!(
                 known_approved_local_match(
                     &request,
-                    &integrated_flight_deck,
                     1,
                     std::slice::from_ref(&approved),
                     std::slice::from_ref(&catalog),
@@ -7706,7 +7691,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &request,
-                &["Transponder".to_string()],
                 1,
                 &candidates,
                 &[candidate(7, "GTX 345R", "approved")],
@@ -7720,7 +7704,6 @@ mod tests {
         assert_eq!(
             known_approved_local_match(
                 &request,
-                &["Transponder".to_string()],
                 1,
                 &candidates,
                 &[candidate(7, "GTX 345R", "approved")],
@@ -7738,7 +7721,6 @@ mod tests {
         let candidates = vec![known_candidate(7, "GTX 345R")];
         let approved = known_approved_local_match(
             &request,
-            &["Transponder".to_string()],
             1,
             &candidates,
             &[candidate(7, "GTX 345R", "approved")],
@@ -7756,7 +7738,6 @@ mod tests {
         assert!(
             known_approved_local_match(
                 &request,
-                &["Transponder".to_string()],
                 1,
                 &candidates,
                 &[
@@ -7788,15 +7769,9 @@ mod tests {
         ];
 
         assert_eq!(
-            known_approved_local_match(
-                &request,
-                &["Transponder".to_string()],
-                1,
-                &candidates,
-                &catalog,
-            )
-            .expect("the listing literally names the base product")
-            .id,
+            known_approved_local_match(&request, 1, &candidates, &catalog,)
+                .expect("the listing literally names the base product")
+                .id,
             7
         );
 
@@ -7805,14 +7780,7 @@ mod tests {
             ..request.clone()
         };
         assert!(
-            known_approved_local_match(
-                &qualified_request,
-                &["Transponder".to_string()],
-                1,
-                &candidates,
-                &catalog,
-            )
-            .is_none(),
+            known_approved_local_match(&qualified_request, 1, &candidates, &catalog,).is_none(),
             "an explicitly named longer variant must not collapse into the base product"
         );
 
@@ -7822,32 +7790,23 @@ mod tests {
                 .to_string(),
             ..request
         };
-        let selected = known_approved_local_match(
-            &identified_request,
-            &["Transponder".to_string()],
-            1,
-            &candidates,
-            &catalog,
-        )
-        .expect("an exact stable identifier may disambiguate a prefix collision");
+        let selected = known_approved_local_match(&identified_request, 1, &candidates, &catalog)
+            .expect("an exact stable identifier may disambiguate a prefix collision");
         assert_eq!(selected.id, 7);
     }
 
     #[test]
-    fn local_match_falls_through_on_an_unverified_extra_capability() {
+    fn local_match_keeps_curated_capabilities_instead_of_listing_extras() {
         let request = local_request("Garmin GTX345R installed");
         let candidates = vec![known_candidate(7, "GTX 345R")];
-        assert!(
-            known_approved_local_match(
-                &request,
-                &["Transponder".to_string(), "GPS".to_string()],
-                1,
-                &candidates,
-                &[candidate(7, "GTX 345R", "approved")],
-            )
-            .is_none(),
-            "the local path cannot enrich an approved product"
-        );
+        let approved = known_approved_local_match(
+            &request,
+            1,
+            &candidates,
+            &[candidate(7, "GTX 345R", "approved")],
+        )
+        .expect("exact identity must not inherit noisy listing capabilities");
+        assert_eq!(approved.avionics_types, vec!["Transponder"]);
     }
 
     #[test]
