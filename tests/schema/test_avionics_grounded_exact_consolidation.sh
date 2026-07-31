@@ -106,11 +106,11 @@ for definition in \
   "$repository_root/migrations/20260810_avionics_grounded_exact_model_consolidation.sqlite.sql" \
   "$repository_root/migrations/20260810_avionics_grounded_exact_model_consolidation.postgres.sql"
 do
-  rg -q 'avionics_catalog_grounded_consolidation_authorizations' "$definition"
-  rg -q 'avionics_catalog_grounded_consolidation_guard' "$definition"
-  rg -q 'avionics_catalog_grounded_consolidation_claim' "$definition"
-  rg -q 'avionics_catalog_valid_grounded_consolidation_pairs' "$definition"
-  rg -q '20260810_avionics_grounded_exact_model_consolidation' "$definition"
+  grep -q 'avionics_catalog_grounded_consolidation_authorizations' "$definition"
+  grep -q 'avionics_catalog_grounded_consolidation_guard' "$definition"
+  grep -q 'avionics_catalog_grounded_consolidation_claim' "$definition"
+  grep -q 'avionics_catalog_valid_grounded_consolidation_pairs' "$definition"
+  grep -q '20260810_avionics_grounded_exact_model_consolidation' "$definition"
 done
 
 echo "Grounded exact-model avionics consolidation schema contract passed"
