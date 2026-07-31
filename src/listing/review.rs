@@ -62,8 +62,9 @@ const ACTIVE_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
 const EXTRACTION_FINGERPRINT_DOMAIN: &[u8] = b"aircost:listing-avionics-observation:v1";
 const ASSOCIATION_CORROBORATION_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:listing-avionics-association-corroboration:v1";
-const ASSOCIATION_CORROBORATION_POLICY_VERSION: &str = "listing_avionics_association_v1";
-const ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION: &str = "listing_avionics_collision_closure_v1";
+pub(super) const ASSOCIATION_CORROBORATION_POLICY_VERSION: &str = "listing_avionics_association_v1";
+pub(super) const ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION: &str =
+    "listing_avionics_collision_closure_v1";
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
@@ -801,8 +802,8 @@ pub(crate) struct CatalogFingerprintRow {
 }
 
 #[derive(Clone, Debug, FromRow)]
-struct ActiveCollisionCatalogFingerprintRow {
-    id: i64,
+pub(super) struct ActiveCollisionCatalogFingerprintRow {
+    pub(super) id: i64,
     catalog_status: String,
     effective_manufacturer_identity_id: Option<i64>,
     model: String,
@@ -1043,7 +1044,7 @@ const APPROVED_CATALOG_ROWS_SQL: &str = r#"
     ORDER BY model.id, capability.normalized_name, capability.id
 "#;
 
-const ACTIVE_COLLISION_CATALOG_ROWS_SQL: &str = r#"
+pub(super) const ACTIVE_COLLISION_CATALOG_ROWS_SQL: &str = r#"
     SELECT
       model.id,
       model.catalog_status,
@@ -1110,11 +1111,13 @@ pub(crate) fn fingerprint_approved_catalog_rows(rows: Vec<CatalogFingerprintRow>
     fingerprint_catalog_products(&catalog_products(rows))
 }
 
-fn fingerprint_active_collision_closure(
+fn active_collision_closure_rows(
     rows: &[ActiveCollisionCatalogFingerprintRow],
-    current_reuse_eligible_ids: &HashSet<i64>,
     target_id: i64,
-) -> Option<String> {
+) -> Option<(
+    &ActiveCollisionCatalogFingerprintRow,
+    Vec<&ActiveCollisionCatalogFingerprintRow>,
+)> {
     let target_rows = rows
         .iter()
         .filter(|row| row.id == target_id)
@@ -1132,8 +1135,7 @@ fn fingerprint_active_collision_closure(
     if target_model_key.is_empty() || target_identifier_key.is_empty() {
         return None;
     }
-
-    let mut keys = rows
+    let members = rows
         .iter()
         .filter(|row| {
             let model_key = normalize_avionics_identifier(&row.model);
@@ -1149,6 +1151,26 @@ fn fingerprint_active_collision_closure(
                     && (model_key.starts_with(&target_model_key)
                         || target_model_key.starts_with(&model_key)))
         })
+        .collect();
+    Some((target, members))
+}
+
+pub(super) fn active_collision_closure_member_ids(
+    rows: &[ActiveCollisionCatalogFingerprintRow],
+    target_id: i64,
+) -> Option<Vec<i64>> {
+    let (_, members) = active_collision_closure_rows(rows, target_id)?;
+    Some(members.into_iter().map(|row| row.id).collect())
+}
+
+pub(super) fn fingerprint_active_collision_closure(
+    rows: &[ActiveCollisionCatalogFingerprintRow],
+    current_reuse_eligible_ids: &HashSet<i64>,
+    target_id: i64,
+) -> Option<String> {
+    let (_, members) = active_collision_closure_rows(rows, target_id)?;
+    let mut keys = members
+        .into_iter()
         .map(|row| {
             [
                 row.id.to_string(),
@@ -3759,22 +3781,51 @@ fn validate_listing_evidence_capture(
             );
         }
     }
+    validate_exact_listing_evidence_span(&capture.rendered_html, evidence_text)?;
+    Ok(ListingEvidenceProvenance {
+        plugin_submission_id: capture.plugin_submission_id,
+        rendered_html_sha256: capture.rendered_html_sha256.clone(),
+    })
+}
+
+pub(super) fn validate_exact_listing_evidence_span(
+    rendered_html: &str,
+    evidence_text: &str,
+) -> Result<(), String> {
     if evidence_text.is_empty()
         || evidence_text.len() > MAX_LISTING_EVIDENCE_CONTEXT_BYTES
-        || !listing_body_contains_exact_structurally_visible_text_span(
-            &capture.rendered_html,
-            evidence_text,
-        )
+        || !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence_text)
     {
         return Err(
             "source_evidence_text is not one bounded exact structurally visible-body span from the retained listing capture"
                 .to_string(),
         );
     }
-    Ok(ListingEvidenceProvenance {
-        plugin_submission_id: capture.plugin_submission_id,
-        rendered_html_sha256: capture.rendered_html_sha256.clone(),
-    })
+    Ok(())
+}
+
+pub(super) fn validate_exact_listing_product_evidence(
+    rendered_html: &str,
+    evidence_text: &str,
+    manufacturer: &str,
+    model: &str,
+) -> Result<(), String> {
+    validate_exact_listing_evidence_span(rendered_html, evidence_text)?;
+    let source = ListingEvidenceContext::from_publisher_html(Some(rendered_html));
+    let evidence = ListingEvidenceContext::from_cleaned_text(evidence_text);
+    let exact_product = source.contains_exact_product_evidence(evidence_text, manufacturer, model);
+    let exact_model = source
+        .unique_exact_model_slice(model)
+        .is_some_and(|identity| {
+            evidence.unique_exact_model_slice(model).as_deref() == Some(identity.as_str())
+        });
+    if !exact_product && !exact_model {
+        return Err(
+            "source_evidence_text does not itself contain the exact unique catalog product model"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 async fn load_listing_evidence_provenance(
@@ -4479,21 +4530,45 @@ fn association_observation_sha256(
             assignment.replaces_avionics_model_id.unwrap_or_default()
         }
     };
+    association_observation_sha256_from_values(
+        listing_id,
+        assignment.listing_link_id,
+        role,
+        target_id,
+        assignment.avionics_model_id,
+        assignment.replaces_avionics_model_id,
+        assignment.quantity,
+        &assignment.configuration_action,
+        evidence_text,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn association_observation_sha256_from_values(
+    listing_id: i64,
+    listing_link_id: i64,
+    role: ListingAssociationRole,
+    target_id: i64,
+    avionics_model_id: i64,
+    replaces_avionics_model_id: Option<i64>,
+    quantity: i64,
+    configuration_action: &str,
+    evidence_text: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ASSOCIATION_CORROBORATION_FINGERPRINT_DOMAIN);
     for value in [
         ASSOCIATION_CORROBORATION_POLICY_VERSION.to_string(),
         listing_id.to_string(),
-        assignment.listing_link_id.to_string(),
+        listing_link_id.to_string(),
         association_role_label(role).to_string(),
         target_id.to_string(),
-        assignment.avionics_model_id.to_string(),
-        assignment
-            .replaces_avionics_model_id
+        avionics_model_id.to_string(),
+        replaces_avionics_model_id
             .map(|id| id.to_string())
             .unwrap_or_default(),
-        assignment.quantity.to_string(),
-        assignment.configuration_action.clone(),
+        quantity.to_string(),
+        configuration_action.to_string(),
         evidence_text.to_string(),
     ] {
         feed_fingerprint(&mut hasher, &value);

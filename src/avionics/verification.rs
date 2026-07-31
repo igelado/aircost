@@ -29,8 +29,8 @@ use crate::listing::review::automation::{
     apply_automated_avionics_review, AutomatedAvionicsLink, AutomatedReviewApplyRequest,
 };
 use crate::listing::review::{
-    parse_current_pending_review_aspects, PendingReviewAspect, ReviewAction, ReviewAspectId,
-    ReviewProduct, StableIdentifier,
+    active_collision_closure_revision_sha256, parse_current_pending_review_aspects,
+    PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
 };
 use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
@@ -360,12 +360,14 @@ struct CatalogStatusRow {
 struct PreparedLink {
     identity_key: String,
     avionics_model_id: i64,
+    expected_collision_closure_sha256: Option<String>,
     quantity: i64,
     source_notes: Option<String>,
     source_confidence: Option<String>,
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
     replacement_identity_key: Option<String>,
+    expected_replacement_collision_closure_sha256: Option<String>,
 }
 
 struct IdentityInput<'a> {
@@ -379,6 +381,7 @@ struct IdentityAttempt {
     report: AvionicsVerificationCandidateReport,
     approved_id: Option<i64>,
     identity_key: Option<String>,
+    collision_closure_sha256: Option<String>,
     suggested_product: Option<ReviewProduct>,
 }
 
@@ -1182,12 +1185,14 @@ async fn process_listing(
                 let incoming_link = PreparedLink {
                     identity_key: primary_identity_key,
                     avionics_model_id: primary_id,
+                    expected_collision_closure_sha256: primary.collision_closure_sha256.clone(),
                     quantity: raw.quantity,
                     source_notes: raw.source_evidence_text.clone(),
                     source_confidence: Some("high".to_string()),
                     configuration_action: raw.configuration_action.clone(),
                     replaces_avionics_model_id: None,
                     replacement_identity_key: None,
+                    expected_replacement_collision_closure_sha256: None,
                 };
                 if let Err(error) =
                     merge_prepared_link_for_candidate(&mut prepared, incoming_link, &mut primary)
@@ -1368,12 +1373,16 @@ async fn process_listing(
         let incoming_link = PreparedLink {
             identity_key: primary_identity_key,
             avionics_model_id: primary_id,
+            expected_collision_closure_sha256: primary.collision_closure_sha256.clone(),
             quantity: raw.quantity,
             source_notes: raw.source_evidence_text.clone(),
             source_confidence: Some("high".to_string()),
             configuration_action: raw.configuration_action.clone(),
             replaces_avionics_model_id: Some(replacement_id),
             replacement_identity_key: Some(replacement_identity_key),
+            expected_replacement_collision_closure_sha256: replacement_attempt
+                .collision_closure_sha256
+                .clone(),
         };
         if let Err(error) =
             merge_prepared_link_for_candidate(&mut prepared, incoming_link, &mut primary)
@@ -1405,17 +1414,38 @@ async fn process_listing(
         return listing_report;
     }
 
-    let accepted_links = prepared
-        .into_iter()
-        .map(|link| AutomatedAvionicsLink {
+    let mut accepted_links = Vec::with_capacity(prepared.len());
+    for link in prepared {
+        let Some(expected_collision_closure_sha256) = link.expected_collision_closure_sha256 else {
+            listing_report.status = "blocked".to_string();
+            listing_report.error = Some(format!(
+                "catalog id {} lost its resolution-time collision-closure revision",
+                link.avionics_model_id
+            ));
+            return listing_report;
+        };
+        if link.replaces_avionics_model_id.is_some()
+            && link.expected_replacement_collision_closure_sha256.is_none()
+        {
+            listing_report.status = "blocked".to_string();
+            listing_report.error = Some(format!(
+                "replacement for catalog id {} lost its resolution-time collision-closure revision",
+                link.avionics_model_id
+            ));
+            return listing_report;
+        }
+        accepted_links.push(AutomatedAvionicsLink {
             avionics_model_id: link.avionics_model_id,
+            expected_collision_closure_sha256,
             quantity: link.quantity,
             source_notes: link.source_notes,
             source_confidence: link.source_confidence,
             configuration_action: link.configuration_action,
             replaces_avionics_model_id: link.replaces_avionics_model_id,
-        })
-        .collect();
+            expected_replacement_collision_closure_sha256: link
+                .expected_replacement_collision_closure_sha256,
+        });
+    }
     let request = AutomatedReviewApplyRequest {
         listing_id: row.listing_id,
         plugin_submission_id: submission_id,
@@ -1848,38 +1878,42 @@ fn merge_duplicate_link(
         "installed" => {
             existing.replaces_avionics_model_id.is_none()
                 && incoming.replaces_avionics_model_id.is_none()
+                && existing
+                    .expected_replacement_collision_closure_sha256
+                    .is_none()
+                && incoming
+                    .expected_replacement_collision_closure_sha256
+                    .is_none()
         }
         "replaces" | "removes" => {
             existing.replacement_identity_key.is_some()
                 && existing.replacement_identity_key == incoming.replacement_identity_key
+                && existing.expected_replacement_collision_closure_sha256
+                    == incoming.expected_replacement_collision_closure_sha256
         }
         _ => false,
     };
-    if !same_action || !compatible_replacement {
+    if !same_action
+        || !compatible_replacement
+        || existing.expected_collision_closure_sha256 != incoming.expected_collision_closure_sha256
+    {
         return Err(format!(
-            "catalog id {} resolved from multiple raw rows with conflicting action or replacement semantics",
+            "catalog id {} resolved from multiple raw rows with conflicting action, replacement, or collision-closure semantics",
             existing.avionics_model_id
         ));
     }
     existing.quantity = existing.quantity.max(incoming.quantity);
-    existing.source_notes = combine_source_notes(
-        existing.source_notes.as_deref(),
-        incoming.source_notes.as_deref(),
-    );
+    // One durable association corroboration must point to one exact source
+    // span. Joining independently extracted excerpts manufactures text that
+    // may not occur contiguously in the retained listing.
+    if existing.source_notes.is_none() {
+        existing.source_notes = incoming.source_notes.clone();
+    }
     existing.source_confidence = conservative_confidence(
         existing.source_confidence.as_deref(),
         incoming.source_confidence.as_deref(),
     );
     Ok(())
-}
-
-fn combine_source_notes(left: Option<&str>, right: Option<&str>) -> Option<String> {
-    match (left, right) {
-        (None, None) => None,
-        (Some(value), None) | (None, Some(value)) => Some(value.to_string()),
-        (Some(left), Some(right)) if left == right => Some(left.to_string()),
-        (Some(left), Some(right)) => Some(format!("{left}\n{right}")),
-    }
 }
 
 fn conservative_confidence(left: Option<&str>, right: Option<&str>) -> Option<String> {
@@ -2163,6 +2197,7 @@ async fn resolve_identity_attempt(
                         ),
                         approved_id: None,
                         identity_key: None,
+                        collision_closure_sha256: None,
                         suggested_product: None,
                     };
                 }
@@ -2201,6 +2236,7 @@ async fn resolve_identity_attempt(
                                 ),
                                 approved_id: None,
                                 identity_key: None,
+                                collision_closure_sha256: None,
                                 suggested_product,
                             };
                     }
@@ -2227,6 +2263,7 @@ async fn resolve_identity_attempt(
                         ),
                         approved_id: None,
                         identity_key: None,
+                        collision_closure_sha256: None,
                         suggested_product,
                     };
                 }
@@ -2254,6 +2291,7 @@ async fn resolve_identity_attempt(
                                 ),
                                 approved_id: None,
                                 identity_key: None,
+                                collision_closure_sha256: None,
                                 suggested_product,
                             };
                         }
@@ -2265,7 +2303,7 @@ async fn resolve_identity_attempt(
                     // apply mode must persist and reload the graph identity.
                     preview_approved_identity_key(&approved)
                 };
-            approved_attempt(
+            let mut attempt = approved_attempt(
                 apply,
                 candidate_index,
                 role,
@@ -2276,7 +2314,23 @@ async fn resolve_identity_attempt(
                 approved,
                 identity_key,
                 catalog_statuses,
-            )
+            );
+            if apply {
+                if let Some(model_id) = attempt.approved_id {
+                    match active_collision_closure_revision_sha256(db, model_id).await {
+                        Ok(revision) => attempt.collision_closure_sha256 = Some(revision),
+                        Err(error) => {
+                            attempt.report.status = "error".to_string();
+                            attempt.report.reason = format!(
+                                "approved identity could not be bound to its active collision closure: {error}"
+                            );
+                            attempt.approved_id = None;
+                            attempt.identity_key = None;
+                        }
+                    }
+                }
+            }
+            attempt
         }
         Ok(AvionicsIdentityOutcome::Rejected { reason }) => IdentityAttempt {
             report: outcome_report(
@@ -2295,6 +2349,7 @@ async fn resolve_identity_attempt(
             ),
             approved_id: None,
             identity_key: None,
+            collision_closure_sha256: None,
             suggested_product: None,
         },
         Ok(AvionicsIdentityOutcome::Unresolved { reason }) => IdentityAttempt {
@@ -2314,6 +2369,7 @@ async fn resolve_identity_attempt(
             ),
             approved_id: None,
             identity_key: None,
+            collision_closure_sha256: None,
             suggested_product: None,
         },
         Err(error) => IdentityAttempt {
@@ -2333,6 +2389,7 @@ async fn resolve_identity_attempt(
             ),
             approved_id: None,
             identity_key: None,
+            collision_closure_sha256: None,
             suggested_product: None,
         },
     }
@@ -2388,6 +2445,7 @@ fn approved_attempt(
             ),
             approved_id: None,
             identity_key: None,
+            collision_closure_sha256: None,
             suggested_product,
         };
     }
@@ -2409,6 +2467,7 @@ fn approved_attempt(
             ),
             approved_id: None,
             identity_key: None,
+            collision_closure_sha256: None,
             suggested_product,
         };
     };
@@ -2439,6 +2498,7 @@ fn approved_attempt(
             Some(approved.id)
         },
         identity_key: Some(identity_key),
+        collision_closure_sha256: None,
         suggested_product,
     }
 }
@@ -4211,31 +4271,32 @@ mod tests {
         let mut existing = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
+            expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: Some("GPS navigator".to_string()),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
         };
         let incoming = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
+            expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 2,
             source_notes: Some("Mode S transponder".to_string()),
             source_confidence: Some("medium".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
         };
 
         merge_duplicate_link(&mut existing, &incoming).unwrap();
 
         assert_eq!(existing.quantity, 2);
-        assert_eq!(
-            existing.source_notes.as_deref(),
-            Some("GPS navigator\nMode S transponder")
-        );
+        assert_eq!(existing.source_notes.as_deref(), Some("GPS navigator"));
         assert_eq!(existing.source_confidence.as_deref(), Some("medium"));
 
         let no_confidence = PreparedLink {
@@ -4251,22 +4312,26 @@ mod tests {
         let mut prepared = [PreparedLink {
             identity_key: "catalog:375".to_string(),
             avionics_model_id: 375,
+            expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: Some("GNX 375 GPS navigator installed".to_string()),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
         }];
         let transponder_row = PreparedLink {
             identity_key: "catalog:375".to_string(),
             avionics_model_id: 375,
+            expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: Some("GNX 375 transponder installed".to_string()),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
         };
 
         let existing = prepared
@@ -4279,7 +4344,7 @@ mod tests {
         assert_eq!(prepared[0].quantity, 1, "capabilities are not extra units");
         assert_eq!(
             prepared[0].source_notes.as_deref(),
-            Some("GNX 375 GPS navigator installed\nGNX 375 transponder installed")
+            Some("GNX 375 GPS navigator installed")
         );
     }
 
@@ -4313,12 +4378,14 @@ mod tests {
             PreparedLink {
                 identity_key: gps_key,
                 avionics_model_id: 0,
+                expected_collision_closure_sha256: None,
                 quantity: 1,
                 source_notes: Some("GNX 375 GPS navigator".to_string()),
                 source_confidence: Some("high".to_string()),
                 configuration_action: "installed".to_string(),
                 replaces_avionics_model_id: None,
                 replacement_identity_key: None,
+                expected_replacement_collision_closure_sha256: None,
             },
         )
         .unwrap());
@@ -4327,19 +4394,21 @@ mod tests {
             PreparedLink {
                 identity_key: transponder_key,
                 avionics_model_id: 0,
+                expected_collision_closure_sha256: None,
                 quantity: 1,
                 source_notes: Some("GNX 375 transponder".to_string()),
                 source_confidence: Some("high".to_string()),
                 configuration_action: "installed".to_string(),
                 replaces_avionics_model_id: None,
                 replacement_identity_key: None,
+                expected_replacement_collision_closure_sha256: None,
             },
         )
         .unwrap());
         assert_eq!(prepared.len(), 1);
         assert_eq!(
             prepared[0].source_notes.as_deref(),
-            Some("GNX 375 GPS navigator\nGNX 375 transponder")
+            Some("GNX 375 GPS navigator")
         );
     }
 
@@ -4348,12 +4417,14 @@ mod tests {
         let mut existing = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
+            expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: None,
             source_confidence: None,
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
         };
         let conflicting = PreparedLink {
             configuration_action: "replaces".to_string(),
@@ -4387,12 +4458,14 @@ mod tests {
         PreparedLink {
             identity_key: key.to_string(),
             avionics_model_id: id,
+            expected_collision_closure_sha256: (id > 0).then(|| "a".repeat(64)),
             quantity: 1,
             source_notes: None,
             source_confidence: Some("high".to_string()),
             configuration_action: action.to_string(),
             replaces_avionics_model_id: target_id,
             replacement_identity_key: target_key.map(ToString::to_string),
+            expected_replacement_collision_closure_sha256: target_id.map(|_| "b".repeat(64)),
         }
     }
 
