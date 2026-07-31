@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use super::consolidation::{
-    consolidate_and_approve_grounded_exact_model, GroundedExactModelConsolidationRequest,
-    GroundedExactModelMember,
+    consolidate_and_approve_grounded_exact_model_with_receipts,
+    GroundedExactModelConsolidationRequest, GroundedExactModelMember, PendingReviewRevisionReceipt,
 };
 use super::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
@@ -373,6 +373,7 @@ impl IdentityPersistenceMode {
 struct IdentityResolutionExecution {
     mode: IdentityPersistenceMode,
     grounded_exact_model_consolidated: bool,
+    pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
 }
 
 impl IdentityResolutionExecution {
@@ -380,8 +381,14 @@ impl IdentityResolutionExecution {
         Self {
             mode,
             grounded_exact_model_consolidated: false,
+            pending_review_revision_receipts: Vec::new(),
         }
     }
+}
+
+pub(crate) struct AutomatedReviewAvionicsIdentityResolution {
+    pub outcome: AvionicsIdentityOutcome,
+    pub pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
 }
 
 fn grounded_consolidation_preview_block(
@@ -594,6 +601,24 @@ pub async fn resolve_avionics_identity(
 ) -> CatalogResult<AvionicsIdentityOutcome> {
     let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Apply);
     resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await
+}
+
+/// Apply identity resolution for the automatic listing-review workflow while
+/// retaining exact pending-review revisions caused by a grounded catalog
+/// consolidation in this call. The ordinary public resolver deliberately
+/// discards these internal capabilities.
+pub(crate) async fn resolve_avionics_identity_for_automated_review(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    request: &AvionicsIdentityRequest,
+) -> CatalogResult<AutomatedReviewAvionicsIdentityResolution> {
+    let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Apply);
+    let outcome =
+        resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
+    Ok(AutomatedReviewAvionicsIdentityResolution {
+        outcome,
+        pending_review_revision_receipts: execution.pending_review_revision_receipts,
+    })
 }
 
 /// Run the same grounded classification and independent collision review
@@ -2120,20 +2145,24 @@ async fn resolve_verified_identity(
         if let Some(preview) = grounded_consolidation_preview_block(execution.mode) {
             return Ok(preview);
         }
-        let report = consolidate_and_approve_grounded_exact_model(db, &grounded_consolidation)
-            .await
-            .map_err(|error| match error {
-                super::consolidation::ConsolidationError::Database(message) => {
-                    CatalogError::Database(message)
-                }
-                super::consolidation::ConsolidationError::Validation(message)
-                | super::consolidation::ConsolidationError::Conflict(message) => {
-                    CatalogError::Validation(message)
-                }
-            })?;
+        let consolidation =
+            consolidate_and_approve_grounded_exact_model_with_receipts(db, &grounded_consolidation)
+                .await
+                .map_err(|error| match error {
+                    super::consolidation::ConsolidationError::Database(message) => {
+                        CatalogError::Database(message)
+                    }
+                    super::consolidation::ConsolidationError::Validation(message)
+                    | super::consolidation::ConsolidationError::Conflict(message) => {
+                        CatalogError::Validation(message)
+                    }
+                })?;
         execution.grounded_exact_model_consolidated = true;
+        execution
+            .pending_review_revision_receipts
+            .extend(consolidation.pending_review_revision_receipts);
         return Ok(AvionicsIdentityOutcome::Approved(
-            approved_identity_from_verified(report.survivor.id, &proposed),
+            approved_identity_from_verified(consolidation.report.survivor.id, &proposed),
         ));
     }
     if let Some(existing) = approved_same.first() {
