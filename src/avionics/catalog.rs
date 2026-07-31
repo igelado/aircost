@@ -8102,6 +8102,111 @@ mod tests {
     }
 
     #[test]
+    fn grounded_identity_accepts_an_exact_legacy_model_designation_without_a_part_number() {
+        let mut context = context(vec![]);
+        context.listing_context = "Legacy Avionics Maker RX-100A installed".to_string();
+        context.candidate.manufacturer = "Legacy Avionics Maker".to_string();
+        context.candidate.model = "RX-100A".to_string();
+        context.candidate.avionics_types = vec!["NAV".to_string()];
+        let source_url = "https://legacy-avionics.example/manuals/rx-100a";
+        let evidence = "Legacy Avionics Maker identifies the RX-100A navigation receiver model.";
+        let response = json!({
+            "status": "propose_new",
+            "catalog_id": 0,
+            "canonical_manufacturer": "Legacy Avionics Maker",
+            "canonical_model": "RX-100A",
+            "canonical_types": ["NAV"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "RX-100A",
+            "manufacturer_identifier_scope": "exact_catalog_product",
+            "rejection_basis": "none",
+            "confidence": "very_high",
+            "identity_source_url": source_url,
+            "identity_source_title": "RX-100A navigation receiver manual",
+            "identity_evidence": evidence,
+            "reason": "The manufacturer manual identifies one exact receiver model."
+        });
+        let proof = direct_source_proof(source_url, evidence);
+
+        let issues = resolution_issues_with_direct_source_proofs(
+            &context,
+            &response,
+            true,
+            &[],
+            &[],
+            &[proof],
+        );
+        assert!(
+            issues.is_empty(),
+            "an exact publisher model designation is a valid stable model number without a separate part number: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn collision_attestation_keeps_exact_suffix_boundaries_for_model_designation_fallback() {
+        let mut context = context(vec![]);
+        context.listing_context = "Legacy Avionics Maker RX-100A installed".to_string();
+        context.candidate.manufacturer = "Legacy Avionics Maker".to_string();
+        context.candidate.model = "RX-100A".to_string();
+        context.candidate.avionics_types = vec!["NAV".to_string()];
+        let source_url = "https://legacy-avionics.example/manuals/rx-100a";
+        let evidence = "Legacy Avionics Maker identifies the RX-100A navigation receiver model.";
+        let proposed = VerifiedIdentity {
+            canonical_manufacturer: "Legacy Avionics Maker".to_string(),
+            canonical_model: "RX-100A".to_string(),
+            canonical_types: vec!["NAV".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "RX-100A".to_string(),
+            manufacturer_identifier_scope: "exact_catalog_product".to_string(),
+            identity_source_url: source_url.to_string(),
+            identity_source_title: "RX-100A navigation receiver manual".to_string(),
+            identity_evidence: evidence.to_string(),
+            reason: "The manufacturer manual identifies one exact receiver model.".to_string(),
+            grounded_claim_source_urls: vec![source_url.to_string()],
+        };
+        let mut response = json!({
+            "proposal_decision": "confirmed_same_as_input",
+            "canonical_manufacturer": "Legacy Avionics Maker",
+            "canonical_model": "RX-100A",
+            "canonical_types": ["NAV"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "RX-100A",
+            "proposal_manufacturer_identifier_scope": "exact_catalog_product",
+            "proposal_confidence": "very_high",
+            "input_evidence_text": "RX-100A",
+            "proposal_source_url": source_url,
+            "proposal_source_title": "RX-100A navigation receiver manual",
+            "proposal_evidence": evidence,
+            "proposal_reason": "The listing and manufacturer passage identify the same exact model.",
+            "reviews": []
+        });
+        let proof = direct_source_proof(source_url, evidence);
+        let attestation = proposal_attestation_with_direct_source_proofs(
+            &context,
+            &proposed,
+            &response,
+            &[proof],
+        )
+        .expect("one exact model occurrence should attest a model-number fallback");
+        assert!(attestation.confirmed);
+
+        let wrong_suffix_evidence =
+            "Legacy Avionics Maker identifies the RX-100AX navigation receiver model.";
+        response["proposal_evidence"] = json!(wrong_suffix_evidence);
+        let wrong_suffix_proof = direct_source_proof(source_url, wrong_suffix_evidence);
+        let error = proposal_attestation_with_direct_source_proofs(
+            &context,
+            &proposed,
+            &response,
+            &[wrong_suffix_proof],
+        )
+        .expect_err("a longer suffix must not prove the shorter legacy model");
+        assert!(error.to_string().contains(
+            "complete canonical model and manufacturer identifier at alphanumeric boundaries"
+        ));
+    }
+
+    #[test]
     fn short_incidental_model_token_is_not_sufficient_identity_evidence() {
         let source_url = "https://static.garmin.com/manuals/g5.pdf";
         let evidence = "Garmin G5";
