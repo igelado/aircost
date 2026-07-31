@@ -4573,21 +4573,26 @@ fn validate_url_context_trace(
             call.arguments.urls.len(),
         );
     }
-    let supplied = call.arguments.urls.iter().cloned().collect::<BTreeSet<_>>();
-    if supplied.len() != call.arguments.urls.len() {
+    let supplied_raw = call.arguments.urls.iter().cloned().collect::<BTreeSet<_>>();
+    if supplied_raw.len() != call.arguments.urls.len() {
         bail!("URL Context call contained duplicate URLs");
     }
-    if &supplied != expected_urls {
-        let missing = expected_urls
-            .difference(&supplied)
-            .cloned()
-            .collect::<Vec<_>>();
-        let unexpected = supplied
-            .difference(expected_urls)
-            .cloned()
-            .collect::<Vec<_>>();
+    let supplied = supplied_raw
+        .iter()
+        .map(|url| canonical_url_key(url))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if supplied.len() != supplied_raw.len() {
+        bail!("URL Context call contained canonically duplicate URLs");
+    }
+    let expected = expected_urls
+        .iter()
+        .map(|url| canonical_url_key(url))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if supplied != expected {
+        let missing = expected.difference(&supplied).cloned().collect::<Vec<_>>();
+        let unexpected = supplied.difference(&expected).cloned().collect::<Vec<_>>();
         bail!(
-            "URL Context call did not use the exact server-preflighted URL set; missing={missing:?}, unexpected={unexpected:?}"
+            "URL Context call did not use the canonical server-preflighted URL set; missing={missing:?}, unexpected={unexpected:?}"
         );
     }
 
@@ -8188,6 +8193,57 @@ fallback_thinking_level = "medium"
             ]
         }));
         assert!(validate_url_context_trace(&injected, &expected, MAX_URL_CONTEXT_URLS).is_err());
+    }
+
+    #[test]
+    fn url_context_trace_accepts_dot_segment_spelling_of_the_exact_allowed_url() {
+        let expected_url = "https://www.piperowner.org/talk/uploads/editor/kr/fgkw4la43rtu.pdf";
+        let tool_url =
+            "https://www.piperowner.org/tunnel/../talk/uploads/editor/kr/fgkw4la43rtu.pdf";
+        let expected = [expected_url.to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let response = response(json!({
+            "id": "url-dot-segments",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {"type": "url_context_call", "id": "url-1", "arguments": {"urls": [tool_url]}},
+                {"type": "url_context_result", "call_id": "url-1", "result": {"url": tool_url, "status": "success"}},
+                {"type": "model_output", "content": [{"type": "text", "text": "verified"}]}
+            ]
+        }));
+
+        assert_eq!(
+            validate_url_context_trace(&response, &expected, MAX_URL_CONTEXT_URLS).unwrap(),
+            [canonical_url_key(expected_url).unwrap()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn url_context_trace_rejects_canonically_duplicate_tool_urls() {
+        let expected_url = "https://example.com/manual";
+        let expected = [expected_url.to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let response = response(json!({
+            "id": "url-canonical-duplicate",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {
+                    "type": "url_context_call",
+                    "id": "url-1",
+                    "arguments": {"urls": [expected_url, "https://example.com/a/../manual"]}
+                },
+                {"type": "url_context_result", "call_id": "url-1", "result": {"url": expected_url, "status": "success"}},
+                {"type": "model_output", "content": [{"type": "text", "text": "verified"}]}
+            ]
+        }));
+
+        assert!(validate_url_context_trace(&response, &expected, MAX_URL_CONTEXT_URLS).is_err());
     }
 
     #[test]
