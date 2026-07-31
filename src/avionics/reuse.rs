@@ -230,6 +230,41 @@ async fn load_attestation_rows(db: &AppDb) -> Result<Vec<ReuseAttestationRow>, s
     }
 }
 
+async fn load_attestation_row(
+    db: &AppDb,
+    avionics_model_id: i64,
+) -> Result<Option<ReuseAttestationRow>, sqlx::Error> {
+    let sql = db.sql(
+        r#"
+        SELECT
+          attestation.avionics_model_id,
+          attestation.avionics_authoritative_source_origin_id,
+          attestation.policy_version,
+          attestation.product_fingerprint
+        FROM avionics_product_reuse_attestations attestation
+        JOIN avionics_active_authoritative_source_origins source_origin
+          ON source_origin.id =
+             attestation.avionics_authoritative_source_origin_id
+        WHERE attestation.avionics_model_id = ?
+        LIMIT 1
+        "#,
+    );
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, ReuseAttestationRow>(&sql)
+                .bind(avionics_model_id)
+                .fetch_optional(pool)
+                .await
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, ReuseAttestationRow>(&sql)
+                .bind(avionics_model_id)
+                .fetch_optional(pool)
+                .await
+        }
+    }
+}
+
 async fn load_fingerprint_rows(
     db: &AppDb,
     avionics_model_id: i64,
@@ -278,6 +313,35 @@ pub(crate) async fn current_reuse_attested_product_ids(
         }
     }
     Ok(eligible)
+}
+
+/// Whether one approved product is eligible for listing reuse right now.
+///
+/// Grounded catalog approval and automatic listing reuse are deliberately
+/// separate boundaries. A product proven only by secondary evidence remains
+/// approved historical catalog truth, but cannot enter an automatic listing
+/// mutation until an active manufacturer-primary origin attests its current
+/// identity fingerprint.
+pub(crate) async fn product_reuse_attestation_is_current(
+    db: &AppDb,
+    avionics_model_id: i64,
+) -> Result<bool, sqlx::Error> {
+    if avionics_model_id <= 0 {
+        return Ok(false);
+    }
+    let Some(attestation) = load_attestation_row(db, avionics_model_id).await? else {
+        return Ok(false);
+    };
+    if attestation.policy_version != AVIONICS_REUSE_POLICY_VERSION {
+        return Ok(false);
+    }
+    let rows = load_fingerprint_rows(
+        db,
+        attestation.avionics_model_id,
+        attestation.avionics_authoritative_source_origin_id,
+    )
+    .await?;
+    Ok(fingerprint_rows(&rows).as_deref() == Some(attestation.product_fingerprint.as_str()))
 }
 
 /// Whether this exact HTTPS origin is currently curated as a primary
@@ -594,7 +658,11 @@ pub(crate) async fn reuse_attestation_is_current_postgres(
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint_rows, ReuseFingerprintRow, AVIONICS_REUSE_POLICY_VERSION};
+    use super::{
+        fingerprint_rows, product_reuse_attestation_is_current, ReuseFingerprintRow,
+        AVIONICS_REUSE_POLICY_VERSION,
+    };
+    use crate::db::AppDb;
 
     fn row(capability: &str) -> ReuseFingerprintRow {
         ReuseFingerprintRow {
@@ -663,5 +731,13 @@ mod tests {
         let mut missing_evidence = row("COM");
         missing_evidence.identity_evidence_text = None;
         assert!(fingerprint_rows(&[missing_evidence]).is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_product_query_fails_closed_without_a_current_attestation() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+
+        assert!(!product_reuse_attestation_is_current(&db, 28).await.unwrap());
+        assert!(!product_reuse_attestation_is_current(&db, 0).await.unwrap());
     }
 }
