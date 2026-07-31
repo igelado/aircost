@@ -107,6 +107,26 @@ pub(crate) struct GroundedExactModelConsolidationRequest {
     pub grounded_claim_source_urls: Vec<String>,
 }
 
+/// Exact compare-and-swap transition produced by the locked consolidation
+/// transaction when it rewrites a pending listing review.
+///
+/// This is an in-memory capability, not durable audit state. Automatic review
+/// may advance its initially loaded revision only through a contiguous chain
+/// of these receipts for the same listing and pending-review row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingReviewRevisionReceipt {
+    pub listing_id: i64,
+    pub pending_review_id: i64,
+    pub before_sha256: String,
+    pub after_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroundedExactModelConsolidationOutcome {
+    pub report: AvionicsConsolidationReport,
+    pub pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
+}
+
 /// Optional listing-review provenance for a human duplicate adjudication.
 ///
 /// The persisted authorization snapshots the current pending-review row and
@@ -528,6 +548,8 @@ struct SuiteLinkPlan {
 #[derive(Clone, Debug)]
 struct PendingReviewPlan {
     id: i64,
+    listing_id: i64,
+    before_review_payload_sha256: String,
     extraction_sha256: String,
     pending_aspect_count: i64,
     review_payload_json: String,
@@ -1800,6 +1822,8 @@ fn remap_pending_review(
     })?;
     Ok(Some(PendingReviewPlan {
         id: row.id,
+        listing_id: row.listing_id,
+        before_review_payload_sha256: row.review_payload_sha256.clone(),
         extraction_sha256: serialized.extraction_sha256,
         pending_aspect_count: serialized.pending_aspect_count,
         review_payload_json: serialized.review_payload_json,
@@ -3104,6 +3128,7 @@ async fn consolidate_avionics_models_internal(
 ) -> ConsolidationResult<(
     AvionicsConsolidationReport,
     Option<HumanReviewedConsolidationAuthorization>,
+    Vec<PendingReviewRevisionReceipt>,
 )> {
     // Validate cheap request-shape errors before opening a write transaction.
     normalized_request(request)?;
@@ -4084,6 +4109,16 @@ async fn consolidate_avionics_models_internal(
                 )));
             }
             transaction.commit().await?;
+            let pending_review_revision_receipts = plan
+                .pending_reviews
+                .iter()
+                .map(|review| PendingReviewRevisionReceipt {
+                    listing_id: review.listing_id,
+                    pending_review_id: review.id,
+                    before_sha256: review.before_review_payload_sha256.clone(),
+                    after_sha256: review.review_payload_sha256.clone(),
+                })
+                .collect::<Vec<_>>();
             plan.report.dry_run = false;
             plan.report.applied = true;
             if let Some(authorization) = authorization.as_mut() {
@@ -4093,9 +4128,14 @@ async fn consolidate_avionics_models_internal(
                 (
                     AvionicsConsolidationReport,
                     Option<HumanReviewedConsolidationAuthorization>,
+                    Vec<PendingReviewRevisionReceipt>,
                 ),
                 ConsolidationError,
-            >((plan.report, authorization))
+            >((
+                plan.report,
+                authorization,
+                pending_review_revision_receipts,
+            ))
         }};
     }
 
@@ -4124,7 +4164,7 @@ pub async fn consolidate_avionics_models(
     db: &AppDb,
     request: &AvionicsConsolidationRequest,
 ) -> ConsolidationResult<AvionicsConsolidationReport> {
-    let (report, authorization) =
+    let (report, authorization, _pending_review_revision_receipts) =
         consolidate_avionics_models_internal(db, request, None, None).await?;
     debug_assert!(authorization.is_none());
     Ok(report)
@@ -4137,7 +4177,7 @@ pub async fn consolidate_avionics_models_with_human_review(
     request: &HumanReviewedAvionicsConsolidationRequest,
 ) -> ConsolidationResult<HumanReviewedAvionicsConsolidationReport> {
     let base = human_request_base(request)?;
-    let (consolidation, authorization) =
+    let (consolidation, authorization, _pending_review_revision_receipts) =
         consolidate_avionics_models_internal(db, &base, Some(request), None).await?;
     let authorization = authorization.ok_or_else(|| {
         ConsolidationError::Conflict(
@@ -4154,16 +4194,31 @@ pub async fn consolidate_avionics_models_with_human_review(
 /// decision, remap every supported reference, and approve the surviving
 /// canonical product. No Gemini request or dossier is accepted or persisted by
 /// this transaction boundary.
-pub(crate) async fn consolidate_and_approve_grounded_exact_model(
+pub(crate) async fn consolidate_and_approve_grounded_exact_model_with_receipts(
+    db: &AppDb,
+    grounded: &GroundedExactModelConsolidationRequest,
+) -> ConsolidationResult<GroundedExactModelConsolidationOutcome> {
+    let state = load_state(db).await?;
+    let (base, _) = grounded_exact_model_request(&state, grounded)?;
+    let (report, authorization, pending_review_revision_receipts) =
+        consolidate_avionics_models_internal(db, &base, None, Some(grounded)).await?;
+    debug_assert!(authorization.is_none());
+    Ok(GroundedExactModelConsolidationOutcome {
+        report,
+        pending_review_revision_receipts,
+    })
+}
+
+#[cfg(test)]
+async fn consolidate_and_approve_grounded_exact_model(
     db: &AppDb,
     grounded: &GroundedExactModelConsolidationRequest,
 ) -> ConsolidationResult<AvionicsConsolidationReport> {
-    let state = load_state(db).await?;
-    let (base, _) = grounded_exact_model_request(&state, grounded)?;
-    let (report, authorization) =
-        consolidate_avionics_models_internal(db, &base, None, Some(grounded)).await?;
-    debug_assert!(authorization.is_none());
-    Ok(report)
+    Ok(
+        consolidate_and_approve_grounded_exact_model_with_receipts(db, grounded)
+            .await?
+            .report,
+    )
 }
 
 #[cfg(test)]
@@ -4839,9 +4894,16 @@ mod tests {
             Some("high".to_string()),
         )
         .with_proposed_product(pending_product);
-        stage_pending_review(&db, pending_listing_id, None, &[pending_aspect])
+        let staged = stage_pending_review(&db, pending_listing_id, None, &[pending_aspect])
             .await
             .unwrap();
+        let pending_review_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(pending_listing_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
         let foreign_key_errors_before: Vec<(String, i64, String, i64)> =
             sqlx::query_as("PRAGMA foreign_key_check")
                 .fetch_all(pool(&db))
@@ -4857,9 +4919,24 @@ mod tests {
             "https://manufacturer.example/manuals/kap140",
         )
         .await;
-        let report = consolidate_and_approve_grounded_exact_model(&db, &grounded)
+        let outcome = consolidate_and_approve_grounded_exact_model_with_receipts(&db, &grounded)
             .await
             .unwrap();
+        assert_eq!(outcome.pending_review_revision_receipts.len(), 1);
+        let receipt = &outcome.pending_review_revision_receipts[0];
+        assert_eq!(receipt.listing_id, pending_listing_id);
+        assert_eq!(receipt.pending_review_id, pending_review_id);
+        assert_eq!(receipt.before_sha256, staged.review_payload_sha256);
+        assert_ne!(receipt.after_sha256, receipt.before_sha256);
+        let stored_review_sha256: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE id = ?",
+        )
+        .bind(pending_review_id)
+        .fetch_one(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(receipt.after_sha256, stored_review_sha256);
+        let report = outcome.report;
         assert!(report
             .matches
             .iter()

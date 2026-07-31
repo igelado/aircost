@@ -8,10 +8,11 @@ use sqlx::FromRow;
 use crate::aircraft::faa::require_listing_faa_admission;
 use crate::avionics::catalog::{
     classify_invalid_generic_avionics_observation, plan_avionics_identity_verification_route,
-    preview_avionics_identity, resolve_avionics_identity, unique_exact_avionics_review_candidate,
-    ApprovedAvionicsIdentity, AvionicsIdentityOutcome, AvionicsIdentityRequest,
-    AvionicsIdentityVerificationRoute,
+    preview_avionics_identity, resolve_avionics_identity_for_automated_review,
+    unique_exact_avionics_review_candidate, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
+    AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
 };
+use crate::avionics::consolidation::PendingReviewRevisionReceipt;
 use crate::avionics::reuse::product_reuse_attestation_is_current;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
@@ -321,6 +322,7 @@ pub enum ListingAvionicsVerification {
 #[derive(Debug, FromRow)]
 struct ListingSourceRow {
     listing_id: i64,
+    pending_review_id: i64,
     listing_owner_user_id: i64,
     listing_source_url: Option<String>,
     aircraft_manufacturer: String,
@@ -377,6 +379,54 @@ struct IdentityAttempt {
     approved_id: Option<i64>,
     identity_key: Option<String>,
     suggested_product: Option<ReviewProduct>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingReviewRevisionCursor {
+    listing_id: i64,
+    pending_review_id: i64,
+    current_sha256: String,
+    stale_reason: Option<String>,
+}
+
+impl PendingReviewRevisionCursor {
+    fn from_listing(row: &ListingSourceRow) -> Self {
+        Self {
+            listing_id: row.listing_id,
+            pending_review_id: row.pending_review_id,
+            current_sha256: row.review_payload_sha256.clone(),
+            stale_reason: None,
+        }
+    }
+
+    fn advance(&mut self, receipts: &[PendingReviewRevisionReceipt]) -> Result<(), String> {
+        if let Some(reason) = self.stale_reason.as_ref() {
+            return Err(reason.clone());
+        }
+        for receipt in receipts {
+            if receipt.listing_id != self.listing_id {
+                continue;
+            }
+            if receipt.pending_review_id != self.pending_review_id {
+                let reason = format!(
+                    "grounded consolidation rewrote pending review {} for listing {}, but automatic review loaded pending review {}",
+                    receipt.pending_review_id, self.listing_id, self.pending_review_id
+                );
+                self.stale_reason = Some(reason.clone());
+                return Err(reason);
+            }
+            if receipt.before_sha256 != self.current_sha256 {
+                let reason = format!(
+                    "grounded consolidation review revision chain is stale for listing {}; expected {}, receipt starts at {}",
+                    self.listing_id, self.current_sha256, receipt.before_sha256
+                );
+                self.stale_reason = Some(reason.clone());
+                return Err(reason);
+            }
+            self.current_sha256 = receipt.after_sha256.clone();
+        }
+        Ok(())
+    }
 }
 
 /// Automate only listings already waiting in the review queue. The exact
@@ -1013,6 +1063,7 @@ async fn process_listing(
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
     let mut prepared: Vec<PreparedLink> = Vec::new();
     let mut blocking_reasons = Vec::new();
+    let mut review_revision = PendingReviewRevisionCursor::from_listing(row);
 
     for (candidate_index, raw) in raw_avionics.iter().enumerate() {
         if let Some(issue) = raw_candidate_structure_issue(raw) {
@@ -1100,6 +1151,7 @@ async fn process_listing(
             raw.source_evidence_text.as_deref(),
             raw.source_confidence.as_deref(),
             catalog_statuses,
+            &mut review_revision,
         )
         .await;
         if primary.report.status == "rejected" {
@@ -1188,6 +1240,7 @@ async fn process_listing(
             raw.source_evidence_text.as_deref(),
             raw.source_confidence.as_deref(),
             catalog_statuses,
+            &mut review_revision,
         )
         .await;
         let replacement_is_approved = identity_is_approved(&replacement_attempt);
@@ -1327,6 +1380,11 @@ async fn process_listing(
         listing_report.candidates.push(replacement_attempt.report);
     }
 
+    if let Some(reason) = review_revision.stale_reason.as_ref() {
+        blocking_reasons.push(format!(
+            "pending review revision could not be advanced safely: {reason}"
+        ));
+    }
     if let Err(error) = validate_prepared_links(&prepared) {
         blocking_reasons.push(format!("listing avionics action graph is invalid: {error}"));
     }
@@ -1357,7 +1415,7 @@ async fn process_listing(
     let request = AutomatedReviewApplyRequest {
         listing_id: row.listing_id,
         plugin_submission_id: submission_id,
-        expected_review_payload_sha256: row.review_payload_sha256.clone(),
+        expected_review_payload_sha256: review_revision.current_sha256,
         expected_rendered_html_sha256: row
             .rendered_html_sha256
             .clone()
@@ -2069,6 +2127,7 @@ async fn resolve_identity_attempt(
     source_evidence_text: Option<&str>,
     source_confidence: Option<&str>,
     catalog_statuses: &mut HashMap<i64, String>,
+    review_revision: &mut PendingReviewRevisionCursor,
 ) -> IdentityAttempt {
     let request = identity_request(
         row,
@@ -2078,7 +2137,35 @@ async fn resolve_identity_attempt(
         source_evidence_text,
     );
     let outcome = if apply {
-        resolve_avionics_identity(db, extractor, &request).await
+        match resolve_avionics_identity_for_automated_review(db, extractor, &request).await {
+            Ok(resolution) => {
+                if let Err(error) =
+                    review_revision.advance(&resolution.pending_review_revision_receipts)
+                {
+                    return IdentityAttempt {
+                        report: outcome_report(
+                            candidate_index,
+                            role,
+                            &identity,
+                            configuration_action,
+                            source_evidence_text,
+                            source_confidence,
+                            "error",
+                            None,
+                            None,
+                            None,
+                            Vec::new(),
+                            error,
+                        ),
+                        approved_id: None,
+                        identity_key: None,
+                        suggested_product: None,
+                    };
+                }
+                Ok(resolution.outcome)
+            }
+            Err(error) => Err(error),
+        }
     } else {
         preview_avionics_identity(db, extractor, &request).await
     };
@@ -2822,6 +2909,7 @@ async fn load_listing_sources(
         r#"
         SELECT
           listing.id AS listing_id,
+          pending.id AS pending_review_id,
           listing.created_by_user_id AS listing_owner_user_id,
           listing.source_url AS listing_source_url,
           aircraft_mfr.name AS aircraft_manufacturer,
@@ -3044,6 +3132,99 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn revision_receipt(
+        listing_id: i64,
+        pending_review_id: i64,
+        before_sha256: &str,
+        after_sha256: &str,
+    ) -> PendingReviewRevisionReceipt {
+        PendingReviewRevisionReceipt {
+            listing_id,
+            pending_review_id,
+            before_sha256: before_sha256.to_string(),
+            after_sha256: after_sha256.to_string(),
+        }
+    }
+
+    #[test]
+    fn pending_review_revision_cursor_advances_only_a_contiguous_listing_chain() {
+        let mut cursor = PendingReviewRevisionCursor {
+            listing_id: 41,
+            pending_review_id: 38,
+            current_sha256: "h0".to_string(),
+            stale_reason: None,
+        };
+
+        cursor
+            .advance(&[
+                revision_receipt(75, 91, "other-before", "other-after"),
+                revision_receipt(41, 38, "h0", "h1"),
+                revision_receipt(41, 38, "h1", "h2"),
+            ])
+            .unwrap();
+
+        assert_eq!(cursor.current_sha256, "h2");
+        assert_eq!(cursor.stale_reason, None);
+    }
+
+    #[test]
+    fn pending_review_revision_cursor_does_not_adopt_an_unrelated_listing_revision() {
+        let mut cursor = PendingReviewRevisionCursor {
+            listing_id: 41,
+            pending_review_id: 38,
+            current_sha256: "h0".to_string(),
+            stale_reason: None,
+        };
+
+        cursor
+            .advance(&[revision_receipt(75, 91, "h0", "h1")])
+            .unwrap();
+
+        assert_eq!(cursor.current_sha256, "h0");
+        assert_eq!(cursor.stale_reason, None);
+    }
+
+    #[test]
+    fn pending_review_revision_cursor_rejects_a_broken_chain_and_stays_stale() {
+        let mut cursor = PendingReviewRevisionCursor {
+            listing_id: 41,
+            pending_review_id: 38,
+            current_sha256: "h0".to_string(),
+            stale_reason: None,
+        };
+
+        let error = cursor
+            .advance(&[revision_receipt(41, 38, "unexpected", "h1")])
+            .unwrap_err();
+        assert!(error.contains("chain is stale"));
+        assert_eq!(cursor.current_sha256, "h0");
+        assert_eq!(cursor.stale_reason.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            cursor
+                .advance(&[revision_receipt(41, 38, "h0", "h1")])
+                .unwrap_err(),
+            error
+        );
+        assert_eq!(cursor.current_sha256, "h0");
+    }
+
+    #[test]
+    fn pending_review_revision_cursor_rejects_a_different_review_for_its_listing() {
+        let mut cursor = PendingReviewRevisionCursor {
+            listing_id: 41,
+            pending_review_id: 38,
+            current_sha256: "h0".to_string(),
+            stale_reason: None,
+        };
+
+        let error = cursor
+            .advance(&[revision_receipt(41, 39, "h0", "h1")])
+            .unwrap_err();
+
+        assert!(error.contains("pending review 39"));
+        assert_eq!(cursor.current_sha256, "h0");
+    }
 
     #[derive(Clone)]
     struct ClassifierEndpointState {
