@@ -1,5 +1,6 @@
+use ego_tree::{NodeId, NodeRef};
 use html_escape::decode_html_entities;
-use scraper::{Html, Selector};
+use scraper::{node::Element, ElementRef, Html, Node, Selector};
 use std::collections::HashSet;
 
 const DEFAULT_MAX_LISTING_TEXT_CHARACTERS: usize = 24_000;
@@ -40,36 +41,225 @@ pub fn clean_listing_html_with_limit(html: &str, max_characters: usize) -> Strin
 /// Unlike listing cleanup, this preserves the complete document and never
 /// moves or truncates the result around an aircraft-listing anchor. Script,
 /// style, template, and other non-visible text is excluded so it cannot be
-/// mistaken for publisher evidence.
+/// mistaken for publisher evidence. Visible DOM line and block boundaries are
+/// retained; source-formatting whitespace is collapsed except inside `pre`.
 pub fn clean_publisher_source_html(html: &str) -> String {
     let document = Html::parse_document(html);
+    clean_publisher_nodes(
+        &document,
+        document.tree.root().descendants(),
+        |node| {
+            node.ancestors().any(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .is_some_and(|element| element.name() == "pre")
+            })
+        },
+        publisher_element_is_hidden,
+    )
+}
+
+/// Extract visible text from one already-validated publisher element while
+/// preserving its author-entered line boundaries.
+pub(crate) fn clean_publisher_multiline_element_text(
+    document: &Html,
+    element: ElementRef<'_>,
+) -> String {
+    clean_publisher_nodes(
+        document,
+        element.descendants(),
+        |_| true,
+        structurally_hidden_element,
+    )
+}
+
+fn clean_publisher_nodes<'a>(
+    document: &'a Html,
+    nodes: impl Iterator<Item = NodeRef<'a, Node>>,
+    preserves_line_breaks: impl Fn(NodeRef<'a, Node>) -> bool,
+    element_is_hidden: fn(&Element) -> bool,
+) -> String {
+    let stylesheet_hidden_nodes = stylesheet_hidden_node_ids(document);
     let mut text = String::new();
-    for node in document.tree.root().descendants() {
+    let mut previous_line_container = None;
+    let mut pending_line_break = false;
+    for node in nodes {
+        if publisher_node_is_hidden(node, &stylesheet_hidden_nodes, element_is_hidden) {
+            continue;
+        }
+        if node
+            .value()
+            .as_element()
+            .is_some_and(|element| element.name() == "br")
+        {
+            pending_line_break = true;
+            continue;
+        }
         let Some(node_text) = node.value().as_text() else {
             continue;
         };
-        if node.ancestors().any(|ancestor| {
-            ancestor.value().as_element().is_some_and(|element| {
-                matches!(
-                    element.name(),
-                    "script" | "style" | "noscript" | "template" | "svg" | "canvas" | "iframe"
-                ) || element.attr("hidden").is_some()
-                    || element
-                        .attr("aria-hidden")
-                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-                    || element
-                        .attr("style")
-                        .is_some_and(inline_style_hides_element)
-            })
-        }) {
+        let preserves_line_breaks = preserves_line_breaks(node);
+        let (node_text, starts_with_line_break, ends_with_line_break) =
+            normalize_publisher_text_fragment(node_text, preserves_line_breaks);
+        if node_text.is_empty() {
+            pending_line_break |=
+                preserves_line_breaks && (starts_with_line_break || ends_with_line_break);
             continue;
         }
+        let line_container = node.ancestors().find_map(|ancestor| {
+            ancestor
+                .value()
+                .as_element()
+                .is_some_and(|element| publisher_text_element_starts_line(element.name()))
+                .then(|| ancestor.id())
+        });
         if !text.is_empty() {
-            text.push(' ');
+            if pending_line_break
+                || starts_with_line_break
+                || line_container != previous_line_container
+            {
+                text.push('\n');
+            } else {
+                text.push(' ');
+            }
         }
-        text.push_str(node_text);
+        text.push_str(&node_text);
+        previous_line_container = line_container;
+        pending_line_break = ends_with_line_break;
     }
-    normalize_page_text(&text)
+    text
+}
+
+fn stylesheet_hidden_node_ids(document: &Html) -> HashSet<NodeId> {
+    let mut hidden_nodes = HashSet::new();
+    let style_selector = Selector::parse("style").expect("static style selector is valid");
+    for stylesheet in document.select(&style_selector) {
+        let stylesheet_text = stylesheet.text().collect::<String>();
+        for rule in stylesheet_text.split('}') {
+            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
+                continue;
+            };
+            if !inline_style_hides_element(declarations) {
+                continue;
+            }
+            for selector_text in selectors.split(',') {
+                let Ok(selector) = Selector::parse(selector_text.trim()) else {
+                    continue;
+                };
+                hidden_nodes.extend(document.select(&selector).map(|element| element.id()));
+            }
+        }
+    }
+    hidden_nodes
+}
+
+fn publisher_node_is_hidden(
+    node: NodeRef<'_, Node>,
+    stylesheet_hidden: &HashSet<NodeId>,
+    element_is_hidden: fn(&Element) -> bool,
+) -> bool {
+    std::iter::once(node)
+        .chain(node.ancestors())
+        .any(|candidate| {
+            stylesheet_hidden.contains(&candidate.id())
+                || candidate
+                    .value()
+                    .as_element()
+                    .is_some_and(element_is_hidden)
+        })
+}
+
+fn publisher_element_is_hidden(element: &Element) -> bool {
+    matches!(
+        element.name(),
+        "script" | "style" | "noscript" | "template" | "svg" | "canvas" | "iframe"
+    ) || element.attr("hidden").is_some()
+        || element
+            .attr("aria-hidden")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+        || element
+            .attr("style")
+            .is_some_and(inline_style_hides_element)
+}
+
+fn structurally_hidden_element(element: &Element) -> bool {
+    publisher_element_is_hidden(element)
+        || element.name() == "head"
+        || (element.name() == "dialog" && element.attr("open").is_none())
+        || (element.name() == "details" && element.attr("open").is_none())
+}
+
+fn publisher_text_element_starts_line(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "dd"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "tbody"
+            | "tfoot"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
+fn normalize_publisher_text_fragment(
+    value: &str,
+    preserves_line_breaks: bool,
+) -> (String, bool, bool) {
+    let decoded = decode_html_entities(value);
+    if !preserves_line_breaks {
+        return (
+            decoded.split_whitespace().collect::<Vec<_>>().join(" "),
+            false,
+            false,
+        );
+    }
+    let starts_with_line_break = decoded
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .any(|character| matches!(character, '\r' | '\n'));
+    let ends_with_line_break = decoded
+        .chars()
+        .rev()
+        .take_while(|character| character.is_whitespace())
+        .any(|character| matches!(character, '\r' | '\n'));
+    let text = decoded
+        .split(['\r', '\n'])
+        .filter_map(|line| {
+            let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!line.is_empty()).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (text, starts_with_line_break, ends_with_line_break)
 }
 
 /// Return whether one evidence value is an exact structurally visible-body
@@ -89,53 +279,21 @@ pub fn listing_body_contains_exact_structurally_visible_text_span(
         return false;
     }
     let document = Html::parse_document(html);
-    let mut stylesheet_hidden_nodes = HashSet::new();
-    let style_selector = Selector::parse("style").expect("static style selector is valid");
-    for stylesheet in document.select(&style_selector) {
-        let stylesheet_text = stylesheet.text().collect::<String>();
-        for rule in stylesheet_text.split('}') {
-            let Some((selectors, declarations)) = rule.rsplit_once('{') else {
-                continue;
-            };
-            if !inline_style_hides_element(declarations) {
-                continue;
-            }
-            for selector_text in selectors.split(',') {
-                let Ok(selector) = Selector::parse(selector_text.trim()) else {
-                    continue;
-                };
-                stylesheet_hidden_nodes
-                    .extend(document.select(&selector).map(|element| element.id()));
-            }
-        }
-    }
+    let stylesheet_hidden_nodes = stylesheet_hidden_node_ids(&document);
     let mut text = String::new();
     for node in document.tree.root().descendants() {
         let Some(node_text) = node.value().as_text() else {
             continue;
         };
-        let mut inside_body = false;
-        let mut excluded = false;
-        for ancestor in node.ancestors() {
-            let Some(element) = ancestor.value().as_element() else {
-                continue;
-            };
-            inside_body |= element.name() == "body";
-            excluded |= matches!(
-                element.name(),
-                "head" | "script" | "style" | "noscript" | "template" | "svg" | "canvas" | "iframe"
-            ) || element.attr("hidden").is_some()
-                || (element.name() == "dialog" && element.attr("open").is_none())
-                || (element.name() == "details" && element.attr("open").is_none())
-                || element
-                    .attr("aria-hidden")
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-                || element
-                    .attr("style")
-                    .is_some_and(inline_style_hides_element)
-                || stylesheet_hidden_nodes.contains(&ancestor.id());
-        }
-        if !inside_body || excluded {
+        let inside_body = node.ancestors().any(|ancestor| {
+            ancestor
+                .value()
+                .as_element()
+                .is_some_and(|element| element.name() == "body")
+        });
+        if !inside_body
+            || publisher_node_is_hidden(node, &stylesheet_hidden_nodes, structurally_hidden_element)
+        {
             continue;
         }
         if !text.is_empty() {
@@ -374,11 +532,81 @@ mod tests {
              <p>designation <i>18</i><b>2</b></p></body></html>",
         );
 
+        assert_eq!(text, "Cessna 182\ndesignation 18 2");
         assert!(publisher_text_contains_evidence_span(&text, "Cessna 182"));
         assert!(!publisher_text_contains_evidence_span(
             &text,
             "designation 182"
         ));
+    }
+
+    #[test]
+    fn publisher_source_text_preserves_semantic_lines_without_breaking_inline_text() {
+        let text = clean_publisher_source_html(
+            r#"<html><body>
+              <div>Dual <strong>GDU-1044B</strong> PFD/MFD</div>
+              <div>Dual GIA-63W NAV/COM/GPS/WAAS<br>Garmin GTX 33 Transponder ADS-B Compliant</div>
+              <p>Literal first line
+                 Literal second line</p>
+            </body></html>"#,
+        );
+
+        assert_eq!(
+            text,
+            "Dual GDU-1044B PFD/MFD\nDual GIA-63W NAV/COM/GPS/WAAS\nGarmin GTX 33 Transponder ADS-B Compliant\nLiteral first line Literal second line"
+        );
+    }
+
+    #[test]
+    fn publisher_source_text_collapses_source_formatting_across_inline_markup() {
+        let text = clean_publisher_source_html(
+            "<div>GIA-63W NAV/COM/GPS/WAAS\n<strong>Garmin GTX 33 Transponder ADS-B Compliant</strong></div>",
+        );
+
+        assert_eq!(
+            text,
+            "GIA-63W NAV/COM/GPS/WAAS Garmin GTX 33 Transponder ADS-B Compliant"
+        );
+    }
+
+    #[test]
+    fn publisher_source_text_ignores_hidden_breaks_but_preserves_preformatted_lines() {
+        assert_eq!(
+            clean_publisher_source_html(
+                "<div>Garmin GTX 33<br hidden>ADS-B compliant<br style='display:none'>still qualified</div>"
+            ),
+            "Garmin GTX 33 ADS-B compliant still qualified"
+        );
+        assert_eq!(
+            clean_publisher_source_html(
+                "<style>.gone { display: none }</style><div>Garmin GTX 33<br class='gone'>ADS-B compliant</div>"
+            ),
+            "Garmin GTX 33 ADS-B compliant",
+            "an embedded-stylesheet-hidden break must not create a clause boundary"
+        );
+        assert_eq!(
+            clean_publisher_source_html(
+                "<pre><span>GIA-63W NAV/COM/GPS/WAAS</span>\n<strong>Garmin GTX 33 ADS-B compliant</strong></pre>"
+            ),
+            "GIA-63W NAV/COM/GPS/WAAS\nGarmin GTX 33 ADS-B compliant"
+        );
+    }
+
+    #[test]
+    fn publisher_source_text_does_not_privilege_publisher_specific_classes() {
+        assert_eq!(
+            clean_publisher_source_html(
+                "<div class='other detail__specs-value'>Dual GDU-1044B PFD/MFD\nDual GIA-63W NAV/COM/GPS/WAAS\nGarmin GTX 33 ADS-B compliant</div>"
+            ),
+            "Dual GDU-1044B PFD/MFD Dual GIA-63W NAV/COM/GPS/WAAS Garmin GTX 33 ADS-B compliant"
+        );
+        assert_eq!(
+            clean_publisher_source_html(
+                "<div class='detail__specs-value-other'>GIA-63W\nGarmin GTX 33 ADS-B compliant</div>"
+            ),
+            "GIA-63W Garmin GTX 33 ADS-B compliant",
+            "generic publisher cleaning never grants source-specific class privileges"
+        );
     }
 
     #[test]

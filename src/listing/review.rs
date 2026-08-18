@@ -932,6 +932,7 @@ struct ReviewRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ListingEvidenceProvenance {
     plugin_submission_id: i64,
+    source_url: String,
     rendered_html_sha256: String,
 }
 
@@ -940,6 +941,7 @@ struct ListingEvidenceCaptureRow {
     plugin_submission_id: i64,
     user_id: i64,
     canonical_listing_id: Option<i64>,
+    source_url: String,
     rendered_html: String,
     rendered_html_sha256: String,
 }
@@ -2005,6 +2007,7 @@ async fn restage_pending_review_if_current_with_commit(
                     || !valid_sha256(&commit.expected_catalog_revision_sha256)
                     || !valid_sha256(&commit.expected_collision_closure_sha256)
                     || commit.evidence_provenance.plugin_submission_id <= 0
+                    || commit.evidence_provenance.source_url.trim().is_empty()
                     || !valid_sha256(&commit.evidence_provenance.rendered_html_sha256)
             }
             ReviewMaintenanceCommit::UseExistingForOrdinaryAspect(commit) => {
@@ -2016,14 +2019,14 @@ async fn restage_pending_review_if_current_with_commit(
                             evidence_provenance,
                         } if !valid_sha256(expected_collision_closure_sha256)
                             || evidence_provenance.plugin_submission_id <= 0
+                            || evidence_provenance.source_url.trim().is_empty()
                             || !valid_sha256(&evidence_provenance.rendered_html_sha256)
                     )
             }
         })
     {
         return Err(ReviewError::Validation(
-            "review, catalog, and observation revisions must be lowercase SHA-256 hex values"
-                .to_string(),
+            "review maintenance revisions or listing evidence provenance are invalid".to_string(),
         ));
     }
     let lock_catalog = match db.backend() {
@@ -2061,34 +2064,14 @@ async fn restage_pending_review_if_current_with_commit(
         ORDER BY avionics_model_id
         "#,
     );
-    let snapshot_select = match db.backend() {
-        DatabaseBackend::Sqlite(_) => db.sql(
-            r#"
-            SELECT rendered_html, rendered_html_sha256
-            FROM plugin_submissions
-            WHERE id = ?
-              AND canonical_listing_id = ?
-              AND user_id = ?
-            "#,
-        ),
-        DatabaseBackend::Postgres(_) => db.sql(
-            r#"
-            SELECT rendered_html, rendered_html_sha256
-            FROM plugin_submissions
-            WHERE id = ?
-              AND canonical_listing_id = ?
-              AND user_id = ?
-            FOR SHARE
-            "#,
-        ),
-    };
-    let verification_capture_select = match db.backend() {
+    let evidence_capture_select = match db.backend() {
         DatabaseBackend::Sqlite(_) => db.sql(
             r#"
             SELECT
               id AS plugin_submission_id,
               user_id,
               canonical_listing_id,
+              source_url,
               rendered_html,
               rendered_html_sha256
             FROM plugin_submissions
@@ -2101,6 +2084,7 @@ async fn restage_pending_review_if_current_with_commit(
               id AS plugin_submission_id,
               user_id,
               canonical_listing_id,
+              source_url,
               rendered_html,
               rendered_html_sha256
             FROM plugin_submissions
@@ -2348,7 +2332,7 @@ async fn restage_pending_review_if_current_with_commit(
                     ));
                 }
                 let capture =
-                    sqlx::query_as::<_, ListingEvidenceCaptureRow>(&verification_capture_select)
+                    sqlx::query_as::<_, ListingEvidenceCaptureRow>(&evidence_capture_select)
                         .bind(expected_provenance.plugin_submission_id)
                         .fetch_optional(&mut *transaction)
                         .await?
@@ -2434,28 +2418,46 @@ async fn restage_pending_review_if_current_with_commit(
                         .await?;
                 let rendered_capture = match row.plugin_submission_id {
                     Some(plugin_submission_id) if action_graph_issues == 0 => {
-                        sqlx::query_as::<_, (String, String)>(&snapshot_select)
+                        let capture = sqlx::query_as::<_, ListingEvidenceCaptureRow>(
+                            &evidence_capture_select,
+                        )
                             .bind(plugin_submission_id)
-                            .bind(listing_id)
-                            .bind(owner_user_id)
                             .fetch_optional(&mut *transaction)
                             .await?
+                            .ok_or_else(|| {
+                                ReviewError::Stale(
+                                    "pending review lost its exact retained listing source capture"
+                                        .to_string(),
+                                )
+                            })?;
+                        let provenance = validate_listing_evidence_capture_provenance(
+                            &row, &capture, None,
+                        )
+                        .map_err(ReviewError::Stale)?;
+                        Some((capture, provenance))
                     }
                     _ => None,
                 };
                 let source = rendered_capture
                     .as_ref()
-                    .map(|(html, _)| html.as_str())
-                    .map(|html| ListingEvidenceContext::from_publisher_html(Some(html)));
-                repair_evidence_capture_sha256 =
-                    rendered_capture.as_ref().map(|(_, sha256)| sha256.clone());
+                    .map(|(capture, _)| {
+                        ListingEvidenceContext::from_listing_capture(
+                            Some(capture.source_url.as_str()),
+                            Some(capture.rendered_html.as_str()),
+                        )
+                    });
+                repair_evidence_capture_sha256 = rendered_capture
+                    .as_ref()
+                    .map(|(_, provenance)| provenance.rendered_html_sha256.clone());
                 let repairs = plan_pending_association_evidence_repair(
                     &payload,
                     &assignments,
                     &approved,
                     &catalog_identity_rows,
                     source.as_ref(),
-                    rendered_capture.as_ref().map(|(html, _)| html.as_str()),
+                    rendered_capture
+                        .as_ref()
+                        .map(|(capture, _)| capture.rendered_html.as_str()),
                 );
                 for repair in repairs {
                     let assignment = &mut assignments[repair.assignment_index];
@@ -4538,6 +4540,16 @@ fn validate_listing_evidence_capture(
     evidence_text: &str,
     expected: Option<&ListingEvidenceProvenance>,
 ) -> Result<ListingEvidenceProvenance, String> {
+    let provenance = validate_listing_evidence_capture_provenance(review, capture, expected)?;
+    validate_exact_listing_evidence_span(&capture.rendered_html, evidence_text)?;
+    Ok(provenance)
+}
+
+fn validate_listing_evidence_capture_provenance(
+    review: &ReviewRow,
+    capture: &ListingEvidenceCaptureRow,
+    expected: Option<&ListingEvidenceProvenance>,
+) -> Result<ListingEvidenceProvenance, String> {
     if review.plugin_submission_id != Some(capture.plugin_submission_id)
         || capture.user_id != review.owner_user_id
         || capture.canonical_listing_id != Some(review.listing_id)
@@ -4547,14 +4559,31 @@ fn validate_listing_evidence_capture(
                 .to_string(),
         );
     }
-    if capture.plugin_submission_id <= 0
-        || !valid_sha256(&capture.rendered_html_sha256)
+    let listing_source_url = review
+        .source_url
+        .as_deref()
+        .filter(|source_url| !source_url.trim().is_empty())
+        .ok_or_else(|| {
+            "pending review does not retain the listing source URL for its source capture"
+                .to_string()
+        })?;
+    if capture.plugin_submission_id <= 0 || capture.source_url.trim().is_empty() {
+        return Err("retained listing source capture has invalid provenance".to_string());
+    }
+    if capture.source_url != listing_source_url {
+        return Err(
+            "retained listing source capture changed: its URL does not match the listing source URL"
+                .to_string(),
+        );
+    }
+    if !valid_sha256(&capture.rendered_html_sha256)
         || sha256_hex(capture.rendered_html.as_bytes()) != capture.rendered_html_sha256
     {
         return Err("retained listing source capture failed its content hash".to_string());
     }
     if let Some(expected) = expected {
         if expected.plugin_submission_id != capture.plugin_submission_id
+            || expected.source_url != capture.source_url
             || expected.rendered_html_sha256 != capture.rendered_html_sha256
         {
             return Err(
@@ -4562,9 +4591,9 @@ fn validate_listing_evidence_capture(
             );
         }
     }
-    validate_exact_listing_evidence_span(&capture.rendered_html, evidence_text)?;
     Ok(ListingEvidenceProvenance {
         plugin_submission_id: capture.plugin_submission_id,
+        source_url: capture.source_url.clone(),
         rendered_html_sha256: capture.rendered_html_sha256.clone(),
     })
 }
@@ -4623,6 +4652,7 @@ async fn load_listing_evidence_provenance(
           id AS plugin_submission_id,
           user_id,
           canonical_listing_id,
+          source_url,
           rendered_html,
           rendered_html_sha256
         FROM plugin_submissions
@@ -10655,7 +10685,7 @@ mod tests {
         };
         let source_html =
             "<body>Garmin integrated avionics. The listing identifies a GMA-1347 audio panel.</body>";
-        let source = ListingEvidenceContext::from_publisher_html(Some(source_html));
+        let source = ListingEvidenceContext::from_listing_capture(None, Some(source_html));
         let mut assignment = existing_assignment(7, 10, 1, "installed", None);
         assignment.installed_manufacturer = Some("Garmin".to_string());
         assignment.installed_model = Some("GMA 1347".to_string());
@@ -10715,7 +10745,7 @@ mod tests {
         );
 
         let ambiguous_html = "<body>Garmin GMA-1347 and a spare GMA-1347 NXi</body>";
-        let ambiguous = ListingEvidenceContext::from_publisher_html(Some(ambiguous_html));
+        let ambiguous = ListingEvidenceContext::from_listing_capture(None, Some(ambiguous_html));
         assert_eq!(
             plan_pending_association_evidence_repair(
                 &payload,
@@ -10731,7 +10761,7 @@ mod tests {
 
         let hidden_html =
             "<style>.hidden { display: none }</style><body><div class=hidden>GMA-1347</div></body>";
-        let hidden = ListingEvidenceContext::from_publisher_html(Some(hidden_html));
+        let hidden = ListingEvidenceContext::from_listing_capture(None, Some(hidden_html));
         assert_eq!(
             plan_pending_association_evidence_repair(
                 &payload,
@@ -10746,7 +10776,7 @@ mod tests {
         );
 
         let script_html = "<body><script>const equipment = 'GMA-1347';</script></body>";
-        let script = ListingEvidenceContext::from_publisher_html(Some(script_html));
+        let script = ListingEvidenceContext::from_listing_capture(None, Some(script_html));
         assert_eq!(
             plan_pending_association_evidence_repair(
                 &payload,
@@ -10781,6 +10811,71 @@ mod tests {
             .evidence_text,
             None
         );
+    }
+
+    #[test]
+    fn pending_association_repair_scopes_qualifiers_to_publisher_equipment_lines() {
+        let identities = [
+            (10, "GDU 1044B", "011-01000-10"),
+            (11, "GIA 63W", "011-01000-11"),
+            (12, "GTX 33", "011-01000-12"),
+        ];
+        let approved = identities
+            .iter()
+            .map(|(id, model, part_number)| {
+                (
+                    *id,
+                    ReviewProduct::verified(*id, "Garmin", *model, vec!["Avionics".to_string()])
+                        .with_stable_identifier("manufacturer_part_number", *part_number),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let catalog = identities
+            .iter()
+            .map(|(id, model, part_number)| RecoverableCatalogIdentityRow {
+                id: *id,
+                model: (*model).to_string(),
+                manufacturer_identifier_kind: Some("manufacturer_part_number".to_string()),
+                manufacturer_identifier: Some((*part_number).to_string()),
+            })
+            .collect::<Vec<_>>();
+        let assignments = identities
+            .iter()
+            .map(|(id, model, _)| {
+                let mut assignment = existing_assignment(*id, *id, 1, "installed", None);
+                assignment.installed_model = Some((*model).to_string());
+                assignment
+            })
+            .collect::<Vec<_>>();
+        let payload = PendingReviewPayload {
+            version: REVIEW_PAYLOAD_VERSION,
+            aspects: Vec::new(),
+        };
+        let source_html = r#"<html><body>
+          <div class="detail__specs-wrapper">
+            <div class="detail__specs-label">Avionics/Radios</div>
+            <div class="detail__specs-value">Dual GDU-1044B PFD/MFD
+Dual GIA-63W NAV/COM/GPS/WAAS
+Garmin GTX 33 Transponder ADS-B Compliant</div>
+          </div>
+        </body></html>"#;
+        let source = ListingEvidenceContext::from_listing_capture(
+            Some("https://www.controller.com/listing/for-sale/257737897/example"),
+            Some(source_html),
+        );
+
+        let repairs = plan_pending_association_evidence_repair(
+            &payload,
+            &assignments,
+            &approved,
+            &catalog,
+            Some(&source),
+            Some(source_html),
+        );
+
+        assert_eq!(repairs[0].evidence_text.as_deref(), Some("GDU-1044B"));
+        assert_eq!(repairs[1].evidence_text.as_deref(), Some("GIA-63W"));
+        assert_eq!(repairs[2].evidence_text, None);
     }
 
     #[test]
@@ -10928,6 +11023,51 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    async fn insert_repairable_capture_review(
+        db: &AppDb,
+    ) -> (i64, i64, i64, i64, StagedPendingReview) {
+        let (user_id, listing_id) = insert_listing(db).await;
+        let product_id = insert_approved_product(db, "GMA 1347", "GMA1347", "Audio Panel").await;
+        attest_approved_product_for_current_policy_reuse(db, product_id).await;
+        let submission_id = insert_review_bound_submission(
+            db,
+            user_id,
+            listing_id,
+            "<main>Installed GMA-1347 Digital Audio Panel.</main>",
+        )
+        .await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Generated resolver prose', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap();
+        let aspect = PendingReviewAspect::avionics(
+            "repairable-audio-panel",
+            "avionics",
+            "Garmin GMA-1347",
+            "structured observation",
+            "listing_link_confidence_not_high",
+            1,
+            "installed",
+            None,
+            None,
+        )
+        .with_covered_association(link_id, ListingAssociationRole::Installed, product_id);
+        let staged = stage_pending_review(db, listing_id, Some(submission_id), &[aspect])
+            .await
+            .unwrap();
+        (user_id, listing_id, submission_id, link_id, staged)
     }
 
     async fn insert_additional_listing(db: &AppDb, user_id: i64, source_url: &str) -> i64 {
@@ -12136,6 +12276,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second, Some(restaged), "recovery must be idempotent");
+    }
+
+    #[tokio::test]
+    async fn maintenance_repair_rejects_a_corrupt_retained_capture_hash() {
+        let db = test_db().await;
+        let (user_id, listing_id, submission_id, link_id, staged) =
+            insert_repairable_capture_review(&db).await;
+        sqlx::query("UPDATE plugin_submissions SET rendered_html_sha256 = ? WHERE id = ?")
+            .bind("f".repeat(64))
+            .bind(submission_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+
+        let error = restage_pending_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &staged.review_payload_sha256,
+        )
+        .await
+        .expect_err("maintenance repair must reject a stale retained capture digest");
+        assert!(
+            matches!(&error, ReviewError::Stale(message) if message.contains("content hash")),
+            "{error:?}"
+        );
+        let link: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT source_notes, source_confidence FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(link, (Some("Generated resolver prose".to_string()), None));
+        assert_eq!(
+            load_review_row(&db, listing_id)
+                .await
+                .unwrap()
+                .review_payload_sha256,
+            staged.review_payload_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_repair_rejects_a_capture_url_mismatch() {
+        let db = test_db().await;
+        let (user_id, listing_id, submission_id, link_id, staged) =
+            insert_repairable_capture_review(&db).await;
+        sqlx::query("UPDATE plugin_submissions SET source_url = ? WHERE id = ?")
+            .bind("https://broker.example/aircraft/other")
+            .bind(submission_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+
+        let error = restage_pending_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &staged.review_payload_sha256,
+        )
+        .await
+        .expect_err("maintenance repair must reject a mismatched retained capture URL");
+        assert!(
+            matches!(&error, ReviewError::Stale(message) if message.contains("does not match the listing source URL")),
+            "{error:?}"
+        );
+        let link: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT source_notes, source_confidence FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(link, (Some("Generated resolver prose".to_string()), None));
+        assert_eq!(
+            load_review_row(&db, listing_id)
+                .await
+                .unwrap()
+                .review_payload_sha256,
+            staged.review_payload_sha256
+        );
     }
 
     #[tokio::test]
@@ -14047,6 +14269,34 @@ mod tests {
                 .await
                 .unwrap();
 
+        sqlx::query("UPDATE plugin_submissions SET source_url = ? WHERE id = ?")
+            .bind("https://other.example/aircraft/one")
+            .bind(submission_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+        let error = approve_locally_verified_ordinary_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &ReviewAspectId::from("observation-17"),
+            &staged.review_payload_sha256,
+            &staged.catalog_revision_sha256,
+            &expected_active_collision_revision,
+            product_id,
+            &evidence_provenance,
+        )
+        .await
+        .expect_err("a changed capture URL must invalidate the preflight authorization");
+        assert!(matches!(error, ReviewError::Stale(_)));
+        assert!(error.to_string().contains("source capture changed"));
+
+        sqlx::query("UPDATE plugin_submissions SET source_url = ? WHERE id = ?")
+            .bind("https://broker.example/aircraft/one")
+            .bind(submission_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
         let changed_capture =
             "<html><body>Garmin GMA 1347 audio panel in a changed capture</body></html>";
         sqlx::query(

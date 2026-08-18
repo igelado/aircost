@@ -4,7 +4,13 @@
 //! always consists of slices copied from the cleaned source corpus, separated
 //! by a fixed delimiter. No raw hint is ever copied into the result.
 
-use crate::html::clean::{clean_listing_html_with_limit, clean_publisher_source_html};
+use scraper::{ElementRef, Html, Selector};
+
+use crate::html::clean::{
+    clean_listing_html_with_limit, clean_publisher_multiline_element_text,
+    clean_publisher_source_html,
+};
+use crate::html::listing::media::validate_controller_listing_source_url;
 
 pub(crate) const MAX_LISTING_EVIDENCE_CONTEXT_BYTES: usize = 4_096;
 pub(crate) const MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES: usize = 256;
@@ -12,6 +18,10 @@ const MAX_CLEANED_LISTING_SOURCE_BYTES: usize = 4_000_000;
 const HEADER_CONTEXT_BYTES: usize = 600;
 const CANDIDATE_CONTEXT_BYTES: usize = 2_800;
 const MANUFACTURER_CONTEXT_BYTES: usize = 600;
+const CONTROLLER_SPECS_WRAPPER_CLASS: &str = "detail__specs-wrapper";
+const CONTROLLER_SPECS_LABEL_CLASS: &str = "detail__specs-label";
+const CONTROLLER_SPECS_VALUE_CLASS: &str = "detail__specs-value";
+const CONTROLLER_AVIONICS_LABEL: &str = "Avionics/Radios";
 // Alphanumeric words are intentional. Catalog exact-token matching must not
 // concatenate a manufacturer at the end of one slice with a model at the
 // beginning of the next and mistake the synthetic adjacency for source text.
@@ -65,14 +75,24 @@ impl ListingEvidenceContext {
         ))
     }
 
-    /// Index all publisher-authored visible text. Callers using this broader
-    /// corpus for occurrence proof must still require the selected slice to
-    /// pass the exact structurally-visible listing-body gate.
-    pub(crate) fn from_publisher_html(rendered_html: Option<&str>) -> Self {
-        rendered_html
-            .map(clean_publisher_source_html)
-            .map(Self::from_cleaned_text)
-            .unwrap_or_default()
+    /// Index visible text from an exact retained listing capture.
+    ///
+    /// Controller listing equipment is a publisher-defined multiline field;
+    /// only its exact source origin, route, wrapper, label, and value structure
+    /// authorize treating raw newlines as equipment boundaries. Other sources
+    /// use generic visible-text cleanup. Callers must still require selected
+    /// slices to pass the structurally-visible listing-body gate.
+    pub(crate) fn from_listing_capture(
+        source_url: Option<&str>,
+        rendered_html: Option<&str>,
+    ) -> Self {
+        let Some(rendered_html) = rendered_html else {
+            return Self::default();
+        };
+        let cleaned = source_url
+            .and_then(|source_url| controller_avionics_evidence(source_url, rendered_html))
+            .unwrap_or_else(|| clean_publisher_source_html(rendered_html));
+        Self::from_cleaned_text(cleaned)
     }
 
     pub(crate) fn from_cleaned_text(cleaned: impl Into<String>) -> Self {
@@ -332,6 +352,56 @@ impl ListingEvidenceContext {
             })
             .collect()
     }
+}
+
+fn controller_avionics_evidence(source_url: &str, rendered_html: &str) -> Option<String> {
+    if validate_controller_listing_source_url(source_url).is_err() {
+        return None;
+    }
+
+    let document = Html::parse_document(rendered_html);
+    let wrapper_selector = Selector::parse(".detail__specs-wrapper")
+        .expect("static Controller wrapper selector is valid");
+    let mut accepted = None;
+    for wrapper in document.select(&wrapper_selector) {
+        if !element_has_exact_class_token(wrapper, CONTROLLER_SPECS_WRAPPER_CLASS) {
+            continue;
+        }
+        let children = wrapper.child_elements().collect::<Vec<_>>();
+        let labels = children
+            .iter()
+            .copied()
+            .filter(|element| element_has_exact_class_token(*element, CONTROLLER_SPECS_LABEL_CLASS))
+            .collect::<Vec<_>>();
+        let values = children
+            .iter()
+            .copied()
+            .filter(|element| element_has_exact_class_token(*element, CONTROLLER_SPECS_VALUE_CLASS))
+            .collect::<Vec<_>>();
+        if labels.len() != 1 || values.len() != 1 {
+            continue;
+        }
+        let label = clean_publisher_multiline_element_text(&document, labels[0])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if label != CONTROLLER_AVIONICS_LABEL {
+            continue;
+        }
+        let value = clean_publisher_multiline_element_text(&document, values[0]);
+        if value.is_empty() || accepted.replace(value).is_some() {
+            return None;
+        }
+    }
+    accepted
+}
+
+fn element_has_exact_class_token(element: ElementRef<'_>, expected: &str) -> bool {
+    element.attr("class").is_some_and(|classes| {
+        classes
+            .split_ascii_whitespace()
+            .any(|class| class == expected)
+    })
 }
 
 fn has_distinct_product_suffix(source: &str, identity: SourceRange) -> bool {
@@ -764,10 +834,125 @@ mod tests {
     }
 
     #[test]
+    fn publisher_line_boundaries_scope_semantic_qualifiers_to_their_equipment_line() {
+        let context = ListingEvidenceContext::from_listing_capture(
+            Some("https://www.controller.com/listing/for-sale/257737897/example"),
+            Some(
+                r#"<html><body>
+              <div class="detail__specs-wrapper">
+                <div class="detail__specs-label">Avionics/Radios</div>
+                <div class="detail__specs-value">Dual GDU-1044B PFD/MFD
+Dual GIA-63W NAV/COM/GPS/WAAS
+Garmin GTX 33 Transponder ADS-B Compliant</div>
+              </div>
+              <div class="detail__specs-wrapper">
+                <div class="detail__specs-label">Additional Equipment</div>
+                <div class="detail__specs-value">Comparison-only GDU-1044B NXi package</div>
+              </div>
+            </body></html>"#,
+            ),
+        );
+
+        assert_eq!(
+            context.cleaned,
+            "Dual GDU-1044B PFD/MFD\nDual GIA-63W NAV/COM/GPS/WAAS\nGarmin GTX 33 Transponder ADS-B Compliant"
+        );
+        assert_eq!(
+            context.unique_exact_model_slice("GDU 1044B").as_deref(),
+            Some("GDU-1044B")
+        );
+        assert_eq!(
+            context.unique_exact_model_slice("GIA 63W").as_deref(),
+            Some("GIA-63W")
+        );
+        assert_eq!(context.unique_exact_model_slice("GTX 33"), None);
+
+        for html in [
+            "<div>Garmin GTX 33\nADS-B compliant</div>",
+            "<div>Garmin GTX 33<br hidden>ADS-B compliant</div>",
+            "<div>Garmin GTX 33<br style='display:none'>ADS-B compliant</div>",
+            "<style>.gone { display:none }</style><div>Garmin GTX 33<br class='gone'>ADS-B compliant</div>",
+        ] {
+            assert_eq!(
+                ListingEvidenceContext::from_listing_capture(None, Some(html))
+                    .unique_exact_model_slice("GTX 33"),
+                None,
+                "{html:?} must keep the qualifier in the same visible clause"
+            );
+        }
+
+        assert_eq!(
+            ListingEvidenceContext::from_listing_capture(
+                None,
+                Some("<div>Garmin\n<strong>GDU-1044B</strong> PFD/MFD</div>")
+            )
+            .unique_exact_product_slice("Garmin", "GDU 1044B")
+            .as_deref(),
+            Some("Garmin GDU-1044B")
+        );
+
+        for html in [
+            "<div>GIA-63W NAV/COM/GPS/WAAS<br>Garmin GTX 33 ADS-B compliant</div>",
+            "<pre><span>GIA-63W NAV/COM/GPS/WAAS</span>\n<strong>Garmin GTX 33 ADS-B compliant</strong></pre>",
+        ] {
+            let context = ListingEvidenceContext::from_listing_capture(None, Some(html));
+            assert_eq!(
+                context.unique_exact_model_slice("GIA 63W").as_deref(),
+                Some("GIA-63W"),
+                "{html:?} must preserve the visible line boundary"
+            );
+            assert_eq!(context.unique_exact_model_slice("GTX 33"), None);
+        }
+    }
+
+    #[test]
+    fn controller_multiline_evidence_requires_exact_source_and_field_structure() {
+        const URL: &str = "https://www.controller.com/listing/for-sale/257737897/example";
+        const FIELD: &str = r#"<div class="detail__specs-wrapper">
+          <div class="detail__specs-label">Avionics/Radios</div>
+          <div class="detail__specs-value">GIA-63W NAV/COM/GPS/WAAS
+Garmin GTX 33 ADS-B compliant</div>
+        </div>"#;
+
+        for source_url in [
+            "https://www.controller.com.evil.example/listing/for-sale/257737897/example",
+            "http://www.controller.com/listing/for-sale/257737897/example",
+            "https://user@www.controller.com/listing/for-sale/257737897/example",
+            "https://www.controller.com:8443/listing/for-sale/257737897/example",
+            "https://www.controller.com/listing/wanted/257737897/example",
+            "https://www.controller.com/listing/for-sale/",
+            "https://www.controller.com/listing/for-sale/not-a-number/example",
+            "https://www.controller.com/listing/for-sale/257737897",
+            "https://www.controller.com/listing/for-sale//example",
+        ] {
+            assert_eq!(
+                ListingEvidenceContext::from_listing_capture(Some(source_url), Some(FIELD))
+                    .unique_exact_model_slice("GIA 63W"),
+                None,
+                "{source_url:?} must not authorize Controller multiline semantics"
+            );
+        }
+
+        for html in [
+            FIELD.replace("Avionics/Radios", "Additional Equipment"),
+            FIELD.replace("detail__specs-value", "detail__specs-value-spoof"),
+            FIELD.replace("detail__specs-wrapper", "detail__specs-wrapper-spoof"),
+        ] {
+            assert_eq!(
+                ListingEvidenceContext::from_listing_capture(Some(URL), Some(&html))
+                    .unique_exact_model_slice("GIA 63W"),
+                None,
+                "a wrong label or class token must not authorize multiline semantics"
+            );
+        }
+    }
+
+    #[test]
     fn retained_exact_product_evidence_must_be_a_visible_unambiguous_slice() {
-        let context = ListingEvidenceContext::from_publisher_html(Some(
-            "<html><body>Garmin GDL 69A shown in the listing. Weather Radar.</body></html>",
-        ));
+        let context = ListingEvidenceContext::from_listing_capture(
+            None,
+            Some("<html><body>Garmin GDL 69A shown in the listing. Weather Radar.</body></html>"),
+        );
         assert_eq!(
             context.cleaned,
             "Garmin GDL 69A shown in the listing. Weather Radar."

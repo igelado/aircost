@@ -71,6 +71,7 @@ dependencies = [
  "base64 0.22.1",
  "burn",
  "csv",
+ "ego-tree",
  "eoka",
  "html-escape",
  "lopdf",

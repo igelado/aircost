@@ -181,7 +181,7 @@ pub fn discover(
     source_url: &str,
     retained_html: &str,
 ) -> Result<ListingMediaDiscovery, MediaDiscoveryError> {
-    let source_url = validate_source_url(source_url)?;
+    let source_url = validate_controller_listing_source_url(source_url)?;
     if retained_html.len() > MAX_RETAINED_HTML_BYTES {
         return Err(MediaDiscoveryError::RetainedHtmlTooLarge {
             actual_bytes: retained_html.len(),
@@ -229,7 +229,9 @@ pub fn discover(
     })
 }
 
-fn validate_source_url(source_url: &str) -> Result<String, MediaDiscoveryError> {
+pub(crate) fn validate_controller_listing_source_url(
+    source_url: &str,
+) -> Result<String, MediaDiscoveryError> {
     let source_url = source_url.trim();
     if source_url.len() > MAX_SOURCE_URL_BYTES {
         return Err(MediaDiscoveryError::SourceUrlTooLong {
@@ -809,6 +811,10 @@ mod tests {
             "https://controller.com.evil.test/listing/for-sale/1/test",
             "https://user@www.controller.com/listing/for-sale/1/test",
             "https://www.controller.com/search",
+            "https://www.controller.com/listing/for-sale/",
+            "https://www.controller.com/listing/for-sale/not-a-number/test",
+            "https://www.controller.com/listing/for-sale/1",
+            "https://www.controller.com/listing/for-sale//test",
         ] {
             assert!(discover(unsafe_source, "").is_err(), "{unsafe_source}");
         }
