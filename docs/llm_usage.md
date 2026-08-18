@@ -136,6 +136,24 @@ The accounting table stores no prompt text, response body, downloaded image
 bytes, or API key. Prompts and images exist only in memory for the request, and
 `GEMINI_API_KEY` remains process configuration.
 
+Apply-mode recovery of an obsolete listing extraction has a distinct durable
+boundary. The returned raw avionics array must contain explicit quantity,
+action, and replacement semantics, pass the current capability schema, and
+bind every excerpt exactly to the retained source capture. The application
+then replaces only `avionics` in the retained top-level extraction object and
+stores the compact merged JSON; it never accepts aircraft identity, hours,
+price, valuation facts, or other non-avionics values from this scoped pass. A
+missing or invalid prior object fails closed. The write is bound to the exact
+submission, owner, listing, source URL, capture bytes and hash, pending-review
+revision, canonical listing binding, and prior extraction/error state.
+PostgreSQL takes the project listing-child lock order and locks/revalidates the
+listing, review, and submission rows before updating. The write is idempotent
+for the same extraction and fails closed on any concurrent change. This lets a
+later blocked identity run resume without paying for extraction again; it does
+not persist prompts, provider envelopes, Search results, URL Context dossiers,
+or grounding evidence. Preview mode never performs this domain write, and an
+empty equipment extraction is not persisted.
+
 ## Evidence Retention And Reuse
 
 Search and URL Context output is request-scoped working data, not a durable

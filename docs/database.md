@@ -1074,7 +1074,26 @@ finalization is still written to `gemini_api_usage`.
 
 Use `--preview` to explicitly enable a paid preview. Preview
 writes no catalog, listing, review, or plugin domain data; normal Gemini usage
-accounting still applies. Set `GEMINI_API_KEY` and review the per-listing
+accounting still applies. In apply mode, obsolete avionics in a plugin
+extraction are a separate durable first phase. The returned raw occurrence
+array must provide explicit quantity, action, and replacement semantics, pass
+the current capability schema, and bind every evidence excerpt to the retained
+source. The workflow then replaces only the `avionics` member of the retained
+top-level extraction object; aircraft identity, hours, price, valuation facts,
+and every other non-avionics value remain unchanged. A missing, invalid, or
+non-object prior extraction fails closed rather than accepting unvalidated
+whole-listing values from this avionics pass. One optimistic transaction binds
+the compact merged JSON to the exact submission, owner, listing, source URL,
+rendered HTML bytes and SHA-256, pending-review revision, canonical binding,
+and prior extraction/error state. PostgreSQL writers first take the shared
+listing-child table lock order, then lock and revalidate the exact listing,
+pending-review, and submission rows before updating. A concurrent change fails
+closed, while an identical repeated write is idempotent. This phase stores no
+prompt, response envelope, Search result, URL Context dossier, or grounding
+evidence. Because it commits before identity work, a later catalog or listing
+block retains the validated avionics and a retry can preflight and replay them
+without another listing-extraction request.
+Set `GEMINI_API_KEY` and review the per-listing
 source, re-extraction, error, accepted, safely-discarded, and remaining-review
 counts before using `--apply`. Apply mode persists independently grounded
 catalog identities through the ordinary catalog resolver; listing links and
@@ -1121,8 +1140,9 @@ path.
 The workflow also fails closed before apply when retained HTML or its source
 URL is missing, the HTML hash is invalid, the HTML cleans to no usable text,
 the listing lacks current FAA admission, or a re-extraction returns no usable
-equipment observations. An empty equipment array is never treated as evidence
-that all prior observations are garbage. The workflow never writes dollar
+equipment observations. An empty equipment array is not durably stored and is
+never treated as evidence that all prior observations are garbage. The
+workflow never writes dollar
 metadata; avionics acceptance alone does not make a listing valuation-grade.
 
 ## Durable Listing Verification Runs

@@ -34,9 +34,9 @@ use crate::listing::review::{
     evaluate_existing_product_associations, grounded_collision_closure_revision_sha256,
     parse_current_pending_review_aspects, ExistingProductAssociationCommit,
     ExistingProductAssociationEvaluation, ListingAssociationRole, PendingReviewAspect,
-    ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
+    ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
-use crate::models::ParsedAvionics;
+use crate::models::{ParsedAvionics, ParsedListing};
 use crate::normalize::is_generic_avionics_model_name;
 use crate::plugin::sha256_hex;
 
@@ -356,6 +356,34 @@ struct ListingSourceRow {
     submission_extraction_error: Option<String>,
 }
 
+#[derive(Debug)]
+struct ValidatedListingReextraction {
+    extracted_listing_json: String,
+    avionics: Vec<ParsedAvionics>,
+}
+
+#[derive(Debug, FromRow)]
+struct LockedReextractionStateRow {
+    listing_id: i64,
+    listing_owner_user_id: i64,
+    listing_source_url: Option<String>,
+    ingestion_state: String,
+    is_verified: bool,
+    pending_review_id: i64,
+    pending_submission_id: i64,
+    pending_aspect_count: i64,
+    review_payload_json: String,
+    review_payload_sha256: String,
+    submission_id: i64,
+    submission_owner_user_id: i64,
+    submission_canonical_listing_id: Option<i64>,
+    submission_source_url: String,
+    rendered_html: String,
+    rendered_html_sha256: String,
+    extracted_listing_json: Option<String>,
+    submission_extraction_error: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct ListingVerificationStateRow {
     ingestion_state: String,
@@ -453,13 +481,13 @@ impl PendingReviewRevisionCursor {
 /// plugin submission attached to the pending bundle is replayed; no newer
 /// same-URL submission may silently replace its evidence. Current, hash-bound
 /// pending-review observations are reused only while their exact evidence
-/// remains present in that submission. Otherwise, legacy extraction payloads
-/// are never transformed: the tool runs the current Gemini listing extractor
-/// against the retained, hash-verified HTML and uses that transient result.
-/// Dry-run still makes paid preview calls without domain writes. Apply mode
-/// atomically accepts only grounded products with exact high-confidence
-/// listing evidence, safely discards grounded garbage, and leaves every other
-/// aspect pending. Signed plugin payloads are never overwritten.
+/// remains present in that submission. Otherwise, apply mode runs the current
+/// Gemini listing extractor against the retained, hash-verified HTML and
+/// durably replaces the obsolete derived extraction before identity work. The
+/// guarded write is bound to the exact submission, owner, listing, source URL,
+/// capture bytes/hash, pending-review revision, and prior extraction state.
+/// Dry-run still makes paid preview calls without domain writes. Listing links
+/// and residual review state retain their separate atomic apply boundary.
 pub async fn verify_listing_avionics_page(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
@@ -492,7 +520,7 @@ pub async fn verify_listing_avionics_page(
         checkpoint,
         provider_request_plan,
         reextraction_policy_note: if apply {
-            "Apply mode first reuses current hash-bound review observations whose exact excerpts remain in the retained submission, otherwise re-extracts incompatible legacy payloads from retained HTML, then atomically persists high-confidence approved links plus only the residual review aspects; signed plugin payloads are never overwritten."
+            "Apply mode first reuses current hash-bound review observations whose exact excerpts remain in the retained submission. Otherwise it strictly validates the raw avionics occurrence array and durably replaces only the retained extraction's avionics member under exact source, owner, listing, capture-hash, review-revision, and prior-extraction guards before identity work; a later identity or listing block retains that extraction for provider-free replay. Listing links and residual review aspects keep their separate atomic apply boundary."
                 .to_string()
         } else {
             "Preview mode reuses current exact review observations before making Gemini requests, including legacy re-extraction only when required; neither generated extraction nor catalog/listing changes are persisted."
@@ -736,7 +764,7 @@ async fn preflight_listing(
             }
             report.status = "ready_legacy_reextraction".to_string();
             report.note = format!(
-                "{reason}; one listing-extraction request is planned, but its identity component count is unknowable until extraction completes"
+                "{reason}; one listing-extraction request is planned before identity work, but downstream identity calls are unknown until that validated extraction is durably available and preflighted again; the reported one-to-two extraction calls are not an end-to-end total"
             );
             return report;
         }
@@ -960,7 +988,7 @@ fn provider_request_plan(
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. Each comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid generic-label observations contribute exactly one classifier request to every plan total and never continue to grounding from the invalid-observation path. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. Legacy re-extraction output counts and correction/fallback outcomes are unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. Each comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid generic-label observations contribute exactly one tools-disabled classifier request to every plan total and never continue to grounding from the invalid-observation path. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. When legacy_reextraction_identity_outputs_unknown is true, every known-total field is only the calls-before-extraction floor: downstream identity calls are unknown until the validated extraction is durably persisted and preflighted again, so those fields must not be presented as an end-to-end total. Correction and fallback outcomes remain unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -1096,11 +1124,37 @@ async fn process_listing(
                 }
             };
             listing_report.reextraction_attempted = true;
-            match reextract_avionics(&scoped_extractor, &listing_text, &listing_context).await {
-                Ok(avionics) => {
+            match reextract_avionics(
+                &scoped_extractor,
+                &listing_text,
+                &listing_context,
+                row.extracted_listing_json.as_deref(),
+            )
+            .await
+            {
+                Ok(reextraction) => {
                     listing_report.raw_avionics_source = "gemini_reextraction".to_string();
+                    if apply && !reextraction.avionics.is_empty() {
+                        if let Err(error) = persist_validated_listing_reextraction(
+                            db,
+                            row,
+                            submission_id,
+                            &reextraction.extracted_listing_json,
+                        )
+                        .await
+                        {
+                            let error = error.to_string();
+                            listing_report.status = "blocked".to_string();
+                            listing_report.reextraction_error = Some(error.clone());
+                            listing_report.error = Some(format!(
+                                "validated current-schema re-extraction was not persisted because its retained source binding changed: {error}"
+                            ));
+                            return listing_report;
+                        }
+                        listing_report.source_extraction_error = None;
+                    }
                     listing_report.reextraction_succeeded = true;
-                    (avionics, preserved_aspects)
+                    (reextraction.avionics, preserved_aspects)
                 }
                 Err(error) => {
                     listing_report.status = "error".to_string();
@@ -3180,24 +3234,399 @@ fn prepare_stored_listing_text(source_url: &str, rendered_html: &str) -> Result<
     Ok(listing_text)
 }
 
+/// Commit one retained extraction with a validated current-schema avionics
+/// member before identity resolution.
+///
+/// The extraction is derived data, not part of the signed source capture. The
+/// single guarded update is nevertheless tied to every source and ownership
+/// value used to produce it, the exact pending-review revision that selected
+/// the submission, and the exact prior extraction/error state. Repeating the
+/// same write is idempotent; a different concurrent extraction or any capture,
+/// binding, owner, listing, or review change fails closed.
+async fn persist_validated_listing_reextraction(
+    db: &AppDb,
+    row: &ListingSourceRow,
+    submission_id: i64,
+    extracted_listing_json: &str,
+) -> VerificationResult<()> {
+    let submission_source_url = row.submission_source_url.as_deref().ok_or_else(|| {
+        AvionicsVerificationError::Validation(
+            "validated re-extraction lost its submission source URL".to_string(),
+        )
+    })?;
+    let rendered_html = row.rendered_html.as_deref().ok_or_else(|| {
+        AvionicsVerificationError::Validation(
+            "validated re-extraction lost its retained rendered HTML".to_string(),
+        )
+    })?;
+    let rendered_html_sha256 = row.rendered_html_sha256.as_deref().ok_or_else(|| {
+        AvionicsVerificationError::Validation(
+            "validated re-extraction lost its rendered HTML SHA-256".to_string(),
+        )
+    })?;
+    if extracted_listing_json.trim().is_empty() {
+        return Err(AvionicsVerificationError::Validation(
+            "validated re-extraction cannot persist an empty JSON document".to_string(),
+        ));
+    }
+
+    let update_sql = db.sql(
+        r#"
+        UPDATE plugin_submissions AS submission
+        SET extracted_listing_json = ?, extraction_error = NULL
+        WHERE submission.id = ?
+          AND submission.user_id = ?
+          AND submission.source_url = ?
+          AND submission.rendered_html = ?
+          AND submission.rendered_html_sha256 = ?
+          AND (
+            submission.canonical_listing_id = ?
+            OR (
+              submission.canonical_listing_id IS NULL
+              AND ? IS NULL
+            )
+          )
+          AND (
+            (
+              (
+                submission.extracted_listing_json = ?
+                OR (
+                  submission.extracted_listing_json IS NULL
+                  AND ? IS NULL
+                )
+              )
+              AND (
+                submission.extraction_error = ?
+                OR (
+                  submission.extraction_error IS NULL
+                  AND ? IS NULL
+                )
+              )
+            )
+            OR (
+              submission.extracted_listing_json = ?
+              AND submission.extraction_error IS NULL
+            )
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM aircraft_sale_listing_pending_reviews pending
+            JOIN aircraft_sale_listings listing
+              ON listing.id = pending.listing_id
+            WHERE pending.id = ?
+              AND pending.listing_id = ?
+              AND pending.plugin_submission_id = submission.id
+              AND pending.review_payload_sha256 = ?
+              AND listing.created_by_user_id = ?
+              AND listing.ingestion_state = 'pending_review'
+              AND listing.is_verified = FALSE
+              AND (
+                listing.source_url = ?
+                OR (
+                  listing.source_url IS NULL
+                  AND ? IS NULL
+                )
+              )
+              AND (
+                submission.canonical_listing_id = listing.id
+                OR (
+                  submission.canonical_listing_id IS NULL
+                  AND listing.source_url = submission.source_url
+                )
+              )
+          )
+        "#,
+    );
+
+    macro_rules! execute_guarded_update {
+        ($transaction:expr) => {{
+            sqlx::query(&update_sql)
+                .bind(extracted_listing_json)
+                .bind(submission_id)
+                .bind(row.listing_owner_user_id)
+                .bind(submission_source_url)
+                .bind(rendered_html)
+                .bind(rendered_html_sha256)
+                .bind(row.submission_canonical_listing_id)
+                .bind(row.submission_canonical_listing_id)
+                .bind(row.extracted_listing_json.as_deref())
+                .bind(row.extracted_listing_json.as_deref())
+                .bind(row.submission_extraction_error.as_deref())
+                .bind(row.submission_extraction_error.as_deref())
+                .bind(extracted_listing_json)
+                .bind(row.pending_review_id)
+                .bind(row.listing_id)
+                .bind(&row.review_payload_sha256)
+                .bind(row.listing_owner_user_id)
+                .bind(row.listing_source_url.as_deref())
+                .bind(row.listing_source_url.as_deref())
+                .execute($transaction)
+                .await?
+                .rows_affected()
+        }};
+    }
+
+    macro_rules! persist_sqlite_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            let changed = execute_guarded_update!(&mut *transaction);
+            if changed != 1 {
+                return Err(AvionicsVerificationError::Validation(format!(
+                    "plugin submission {submission_id} or its exact owner, listing, source capture, pending-review revision, or prior extraction state changed while re-extraction was running"
+                )));
+            }
+            transaction.commit().await?;
+            Ok(())
+        }};
+    }
+
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => persist_sqlite_transaction!(pool),
+        DatabaseBackend::Postgres(pool) => {
+            let lock_listing_children = db.sql(POSTGRES_LISTING_CHILD_LOCK_SQL);
+            let locked_state_sql = db.sql(
+                r#"
+                SELECT
+                  listing.id AS listing_id,
+                  listing.created_by_user_id AS listing_owner_user_id,
+                  listing.source_url AS listing_source_url,
+                  listing.ingestion_state,
+                  listing.is_verified,
+                  pending.id AS pending_review_id,
+                  pending.plugin_submission_id AS pending_submission_id,
+                  pending.pending_aspect_count,
+                  pending.review_payload_json,
+                  pending.review_payload_sha256,
+                  submission.id AS submission_id,
+                  submission.user_id AS submission_owner_user_id,
+                  submission.canonical_listing_id AS submission_canonical_listing_id,
+                  submission.source_url AS submission_source_url,
+                  submission.rendered_html,
+                  submission.rendered_html_sha256,
+                  submission.extracted_listing_json,
+                  submission.extraction_error AS submission_extraction_error
+                FROM aircraft_sale_listings listing
+                JOIN aircraft_sale_listing_pending_reviews pending
+                  ON pending.listing_id = listing.id
+                JOIN plugin_submissions submission
+                  ON submission.id = pending.plugin_submission_id
+                WHERE listing.id = ?
+                  AND pending.id = ?
+                  AND submission.id = ?
+                FOR UPDATE OF listing, pending, submission
+                "#,
+            );
+            let mut transaction = pool.begin().await?;
+            // Keep the same PostgreSQL ordering as every listing writer:
+            // mutable listing-child tables first, then the exact parent,
+            // pending-review, and retained-submission rows.
+            sqlx::query(&lock_listing_children)
+                .execute(&mut *transaction)
+                .await?;
+            let locked = sqlx::query_as::<_, LockedReextractionStateRow>(&locked_state_sql)
+                .bind(row.listing_id)
+                .bind(row.pending_review_id)
+                .bind(submission_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    AvionicsVerificationError::Validation(format!(
+                        "plugin submission {submission_id} or its exact listing and pending review changed while re-extraction was running"
+                    ))
+                })?;
+            validate_locked_reextraction_state(
+                row,
+                submission_id,
+                extracted_listing_json,
+                &locked,
+            )?;
+            let changed = execute_guarded_update!(&mut *transaction);
+            if changed != 1 {
+                return Err(AvionicsVerificationError::Validation(format!(
+                    "plugin submission {submission_id} or its exact owner, listing, source capture, pending-review revision, or prior extraction state changed while re-extraction was running"
+                )));
+            }
+            transaction.commit().await?;
+            Ok(())
+        }
+    }
+}
+
+fn validate_locked_reextraction_state(
+    expected: &ListingSourceRow,
+    submission_id: i64,
+    extracted_listing_json: &str,
+    locked: &LockedReextractionStateRow,
+) -> VerificationResult<()> {
+    let source_binding_is_current = locked.submission_canonical_listing_id
+        == Some(locked.listing_id)
+        || (locked.submission_canonical_listing_id.is_none()
+            && locked.listing_source_url.as_deref() == Some(locked.submission_source_url.as_str()));
+    let exact_state_is_current = locked.listing_id == expected.listing_id
+        && locked.listing_owner_user_id == expected.listing_owner_user_id
+        && locked.listing_source_url == expected.listing_source_url
+        && locked.ingestion_state == "pending_review"
+        && !locked.is_verified
+        && locked.pending_review_id == expected.pending_review_id
+        && locked.pending_submission_id == submission_id
+        && locked.pending_aspect_count == expected.pending_aspect_count
+        && locked.review_payload_json == expected.review_payload_json
+        && locked.review_payload_sha256 == expected.review_payload_sha256
+        && locked.submission_id == submission_id
+        && expected.submission_id == Some(submission_id)
+        && locked.submission_owner_user_id == expected.listing_owner_user_id
+        && expected.submission_owner_user_id == Some(locked.submission_owner_user_id)
+        && locked.submission_canonical_listing_id == expected.submission_canonical_listing_id
+        && expected.submission_source_url.as_deref() == Some(locked.submission_source_url.as_str())
+        && !locked.submission_source_url.trim().is_empty()
+        && expected.rendered_html.as_deref() == Some(locked.rendered_html.as_str())
+        && !locked.rendered_html.trim().is_empty()
+        && expected.rendered_html_sha256.as_deref() == Some(locked.rendered_html_sha256.as_str())
+        && valid_sha256(&locked.rendered_html_sha256)
+        && sha256_hex(locked.rendered_html.as_bytes()) == locked.rendered_html_sha256
+        && valid_sha256(&locked.review_payload_sha256)
+        && sha256_hex(locked.review_payload_json.as_bytes()) == locked.review_payload_sha256
+        && source_binding_is_current;
+    if !exact_state_is_current {
+        return Err(AvionicsVerificationError::Validation(format!(
+            "plugin submission {submission_id} or its exact owner, listing, source capture, or pending-review revision changed while re-extraction was running"
+        )));
+    }
+    let prior_is_current = locked.extracted_listing_json == expected.extracted_listing_json
+        && locked.submission_extraction_error == expected.submission_extraction_error;
+    let identical_retry = locked.extracted_listing_json.as_deref() == Some(extracted_listing_json)
+        && locked.submission_extraction_error.is_none();
+    if !prior_is_current && !identical_retry {
+        return Err(AvionicsVerificationError::Validation(format!(
+            "plugin submission {submission_id} prior extraction state changed while re-extraction was running"
+        )));
+    }
+    Ok(())
+}
+
 async fn reextract_avionics(
     extractor: &GeminiListingExtractor,
     listing_text: &str,
     listing_context: &ListingEvidenceContext,
-) -> Result<Vec<ParsedAvionics>, String> {
+    prior_extracted_listing_json: Option<&str>,
+) -> Result<ValidatedListingReextraction, String> {
     let extracted = extractor
         .extract(listing_text)
         .await
         .map_err(|error| format!("Gemini listing extraction request failed: {error}"))?;
+    validate_reextracted_occurrence_json(&extracted).map_err(|error| {
+        format!("Gemini returned invalid current-schema avionics occurrence data: {error}")
+    })?;
     let avionics = parse_raw_avionics_value(&extracted).map_err(|error| {
         format!(
             "Gemini returned output incompatible with the current capability-array schema: {error}"
         )
     })?;
+    for (index, observation) in avionics.iter().enumerate() {
+        if let Some(issue) = raw_candidate_structure_issue(observation) {
+            return Err(format!(
+                "Gemini returned invalid current-schema avionics[{index}]: {issue}"
+            ));
+        }
+    }
     validate_exact_listing_evidence(&avionics, listing_context).map_err(|error| {
         format!("Gemini returned listing evidence not present in the retained source: {error}")
     })?;
-    Ok(avionics)
+    let extracted_listing_json = if avionics.is_empty() {
+        String::new()
+    } else {
+        merge_validated_avionics_into_prior_extraction(prior_extracted_listing_json, &avionics)?
+    };
+    Ok(ValidatedListingReextraction {
+        extracted_listing_json,
+        avionics,
+    })
+}
+
+/// Replace only the derived avionics portion of a retained extraction.
+///
+/// This workflow validates avionics evidence, not aircraft identity, hours,
+/// price, or valuation facts. Those unrelated values therefore remain exactly
+/// the prior JSON values and are never refreshed from this Gemini response.
+fn merge_validated_avionics_into_prior_extraction(
+    prior_extracted_listing_json: Option<&str>,
+    avionics: &[ParsedAvionics],
+) -> Result<String, String> {
+    let prior = prior_extracted_listing_json
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "cannot durably persist avionics re-extraction without a retained top-level listing extraction whose non-avionics fields can be preserved"
+                .to_string()
+        })?;
+    let mut extraction: Value = serde_json::from_str(prior).map_err(|error| {
+        format!(
+            "cannot durably persist avionics re-extraction because the retained listing extraction is invalid JSON: {error}"
+        )
+    })?;
+    let object = extraction.as_object_mut().ok_or_else(|| {
+        "cannot durably persist avionics re-extraction because the retained listing extraction is not a top-level object"
+            .to_string()
+    })?;
+    let avionics = serde_json::to_value(avionics)
+        .map_err(|error| format!("could not serialize validated avionics extraction: {error}"))?;
+    object.insert("avionics".to_string(), avionics);
+    serde_json::from_value::<ParsedListing>(extraction.clone()).map_err(|error| {
+        format!(
+            "cannot durably persist avionics re-extraction because the merged listing extraction does not match the current schema: {error}"
+        )
+    })?;
+    serde_json::to_string(&extraction)
+        .map_err(|error| format!("could not serialize validated listing extraction: {error}"))
+}
+
+fn validate_reextracted_occurrence_json(value: &Value) -> Result<(), String> {
+    let observations = value
+        .get("avionics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "top-level avionics array is missing".to_string())?;
+    for (index, observation) in observations.iter().enumerate() {
+        let path = format!("avionics[{index}]");
+        let object = observation
+            .as_object()
+            .ok_or_else(|| format!("{path} must be an object"))?;
+        let quantity = object
+            .get("quantity")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("{path}.quantity must be an explicit integer"))?;
+        if quantity < 1 {
+            return Err(format!("{path}.quantity must be at least 1"));
+        }
+        let action = object
+            .get("configuration_action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{path}.configuration_action must be an explicit installed, replaces, or removes value"
+                )
+            })?;
+        if !matches!(action, "installed" | "replaces" | "removes") {
+            return Err(format!(
+                "{path}.configuration_action must be installed, replaces, or removes"
+            ));
+        }
+        let replacement = object.get("replaces").ok_or_else(|| {
+            format!("{path}.replaces must be explicit null or one replacement object")
+        })?;
+        match action {
+            "installed" if !replacement.is_null() => {
+                return Err(format!(
+                    "{path} installed occurrence must use replaces=null"
+                ));
+            }
+            "replaces" | "removes" if !replacement.is_object() => {
+                return Err(format!(
+                    "{path} {action} occurrence requires one replacement object"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn parse_raw_avionics(raw_json: &str) -> Result<Vec<ParsedAvionics>, String> {
@@ -3762,6 +4191,138 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/"), request_count, server)
+    }
+
+    #[derive(Clone)]
+    struct ListingExtractionEndpointState {
+        request_count: Arc<AtomicUsize>,
+        extraction: Value,
+    }
+
+    async fn listing_extraction_endpoint_response(
+        State(state): State<ListingExtractionEndpointState>,
+        Json(_request): Json<Value>,
+    ) -> Json<Value> {
+        state.request_count.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": state.extraction.to_string()}]}
+            }]
+        }))
+    }
+
+    async fn spawn_listing_extraction_endpoint(
+        avionics: Value,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let state = ListingExtractionEndpointState {
+            request_count: request_count.clone(),
+            extraction: json!({
+                "manufacturer": "Cessna",
+                "model": "172",
+                "variant": "S",
+                "model_year": 2020,
+                "asking_price_usd": 300000,
+                "currency": "USD",
+                "airframe_hours": 1000,
+                "engine_hours": null,
+                "engine_time_basis": "unknown",
+                "engine_time_evidence": null,
+                "engine_time_confidence": null,
+                "propeller_hours": null,
+                "propeller_time_basis": "unknown",
+                "propeller_time_evidence": null,
+                "propeller_time_confidence": null,
+                "installed_engine": null,
+                "installed_propeller": null,
+                "registration_number": "N12345",
+                "serial_number": null,
+                "status": "active",
+                "avionics": avionics,
+                "valuation_facts": []
+            }),
+        };
+        let app = Router::new()
+            .route("/", post(listing_extraction_endpoint_response))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), request_count, server)
+    }
+
+    fn retained_legacy_listing_extraction() -> Value {
+        json!({
+            "manufacturer": "Retained Aircraft Maker",
+            "model": "Retained Aircraft Model",
+            "variant": "Retained Aircraft Variant",
+            "model_year": 1997,
+            "asking_price_usd": 123456,
+            "currency": "USD",
+            "airframe_hours": 4321.25,
+            "engine_hours": 987.5,
+            "engine_time_basis": "SMOH",
+            "engine_time_evidence": "987.5 SMOH",
+            "engine_time_confidence": "high",
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N98765",
+            "serial_number": "RETAINED-SERIAL",
+            "status": "retained-status",
+            "avionics": [{
+                "manufacturer": "Legacy",
+                "model": "Scalar payload",
+                "type": "Flight Display"
+            }],
+            "valuation_facts": [{
+                "kind": "paint_condition",
+                "value": "retained value",
+                "evidence_text": "retained evidence",
+                "source_url": null,
+                "confidence": "low"
+            }]
+        })
+    }
+
+    async fn store_retained_legacy_listing_extraction(db: &AppDb, submission_id: i64) {
+        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = ? WHERE id = ?")
+            .bind(retained_legacy_listing_extraction().to_string())
+            .bind(submission_id)
+            .execute(sqlite_pool(db))
+            .await
+            .unwrap();
+    }
+
+    fn locked_reextraction_state(
+        row: &ListingSourceRow,
+        submission_id: i64,
+    ) -> LockedReextractionStateRow {
+        LockedReextractionStateRow {
+            listing_id: row.listing_id,
+            listing_owner_user_id: row.listing_owner_user_id,
+            listing_source_url: row.listing_source_url.clone(),
+            ingestion_state: "pending_review".to_string(),
+            is_verified: false,
+            pending_review_id: row.pending_review_id,
+            pending_submission_id: submission_id,
+            pending_aspect_count: row.pending_aspect_count,
+            review_payload_json: row.review_payload_json.clone(),
+            review_payload_sha256: row.review_payload_sha256.clone(),
+            submission_id,
+            submission_owner_user_id: row.submission_owner_user_id.unwrap(),
+            submission_canonical_listing_id: row.submission_canonical_listing_id,
+            submission_source_url: row.submission_source_url.clone().unwrap(),
+            rendered_html: row.rendered_html.clone().unwrap(),
+            rendered_html_sha256: row.rendered_html_sha256.clone().unwrap(),
+            extracted_listing_json: row.extracted_listing_json.clone(),
+            submission_extraction_error: row.submission_extraction_error.clone(),
+        }
     }
 
     #[test]
@@ -4458,6 +5019,119 @@ mod tests {
             panic!("a scalar legacy type must never be replayed or converted locally")
         };
         assert!(reason.contains("scalar type payloads are intentionally unsupported"));
+    }
+
+    #[test]
+    fn durable_avionics_merge_preserves_every_non_avionics_value() {
+        let prior = retained_legacy_listing_extraction();
+        let avionics = vec![ParsedAvionics {
+            manufacturer: "Garmin".to_string(),
+            model: "G5".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            quantity: 2,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some("Dual Garmin G5 displays".to_string()),
+            source_confidence: Some("high".to_string()),
+        }];
+
+        let merged =
+            merge_validated_avionics_into_prior_extraction(Some(&prior.to_string()), &avionics)
+                .unwrap();
+        let merged: Value = serde_json::from_str(&merged).unwrap();
+        for (field, value) in prior.as_object().unwrap() {
+            if field != "avionics" {
+                assert_eq!(&merged[field], value, "field {field} changed");
+            }
+        }
+        assert_eq!(
+            serde_json::from_value::<Vec<ParsedAvionics>>(merged["avionics"].clone()).unwrap(),
+            avionics
+        );
+        assert!(
+            merge_validated_avionics_into_prior_extraction(None, &avionics)
+                .unwrap_err()
+                .contains("without a retained top-level listing extraction")
+        );
+        assert!(merge_validated_avionics_into_prior_extraction(
+            Some(r#"{"status":"active"}"#),
+            &avionics,
+        )
+        .unwrap_err()
+        .contains("does not match the current schema"));
+    }
+
+    #[test]
+    fn durable_occurrence_validation_rejects_missing_defaults_and_relationship_repair() {
+        let missing_quantity = json!({"avionics": [{
+            "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
+            "configuration_action": "installed", "replaces": null
+        }]});
+        assert!(validate_reextracted_occurrence_json(&missing_quantity)
+            .unwrap_err()
+            .contains("quantity must be an explicit integer"));
+
+        let missing_action = json!({"avionics": [{
+            "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
+            "quantity": 1, "replaces": null
+        }]});
+        assert!(validate_reextracted_occurrence_json(&missing_action)
+            .unwrap_err()
+            .contains("configuration_action must be an explicit"));
+
+        let missing_replacement = json!({"avionics": [{
+            "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
+            "quantity": 1, "configuration_action": "replaces", "replaces": null
+        }]});
+        assert!(validate_reextracted_occurrence_json(&missing_replacement)
+            .unwrap_err()
+            .contains("requires one replacement object"));
+
+        let unexpected_replacement = json!({"avionics": [{
+            "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
+            "quantity": 1, "configuration_action": "installed",
+            "replaces": {"manufacturer": "Garmin", "model": "G3X", "types": ["Flight Display"]}
+        }]});
+        assert!(
+            validate_reextracted_occurrence_json(&unexpected_replacement)
+                .unwrap_err()
+                .contains("must use replaces=null")
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_reextraction_rejects_invalid_occurrence_semantics_without_repair() {
+        let evidence = "Garmin G5 installed";
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": "Garmin",
+            "model": "G5",
+            "types": ["Flight Display"],
+            "quantity": 0,
+            "configuration_action": "installed",
+            "replaces": {
+                "manufacturer": "Garmin",
+                "model": "G3X",
+                "types": ["Flight Display"]
+            },
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let prior = retained_legacy_listing_extraction().to_string();
+
+        let error = reextract_avionics(
+            &extractor,
+            evidence,
+            &ListingEvidenceContext::from_cleaned_text(evidence),
+            Some(&prior),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(error.contains("quantity must be at least 1"));
     }
 
     #[test]
@@ -5601,6 +6275,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_apply_retains_validated_reextraction_and_rerun_skips_provider() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let (listing_id, link_id, _) = seed_preserved_association_listing(
+            &db,
+            "durable-reextraction-after-block",
+            product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let submission_id = append_nonreplayable_review_aspect(&db, listing_id).await;
+        store_retained_legacy_listing_extraction(&db, submission_id).await;
+        let pool = sqlite_pool(&db);
+        let (manufacturer, model, evidence): (String, String, String) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.name, model.name, link.source_notes
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            JOIN aircraft_sale_listing_avionics link
+              ON link.avionics_model_id = model.id
+            WHERE model.id = ? AND link.id = ?
+            "#,
+        )
+        .bind(product_id)
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": manufacturer,
+            "model": model,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let first = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("the downstream duplicate conflict should be a reported block");
+        server.abort();
+        let ListingAvionicsVerification::Processed { report } = first else {
+            panic!("the listing should remain in review")
+        };
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(report.status, "blocked");
+        assert!(report.reextraction_required);
+        assert!(report.reextraction_attempted);
+        assert!(report.reextraction_succeeded);
+        assert!(report.reextraction_error.is_none());
+        assert!(report.source_extraction_error.is_none());
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("multiple raw rows")));
+
+        let (persisted_json, extraction_error): (String, Option<String>) = sqlx::query_as(
+            "SELECT extracted_listing_json, extraction_error FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(extraction_error.is_none());
+        let persisted: Value = serde_json::from_str(&persisted_json).unwrap();
+        let prior = retained_legacy_listing_extraction();
+        for field in [
+            "manufacturer",
+            "model",
+            "variant",
+            "model_year",
+            "asking_price_usd",
+            "airframe_hours",
+            "engine_hours",
+            "registration_number",
+            "serial_number",
+            "status",
+            "valuation_facts",
+        ] {
+            assert_eq!(persisted[field], prior[field], "field {field} changed");
+        }
+        assert_eq!(persisted["avionics"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            persisted["avionics"][0]["source_confidence"],
+            Value::String("high".to_string())
+        );
+
+        let preflight = preflight_listing_avionics(&db, listing_id).await.unwrap();
+        let ListingAvionicsVerificationPreflight::PendingReview { report } = preflight else {
+            panic!("the duplicate conflict should leave a pending review")
+        };
+        assert_eq!(report.status, "ready_retained_observations");
+        assert!(!report.reextraction_required);
+        assert_eq!(report.retained_identity_components, 1);
+        assert_eq!(report.verified_local_identity_components, 1);
+
+        let unavailable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let second = verify_listing_avionics(
+            &db,
+            &unavailable,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("the durable extraction must make the blocked rerun provider-free");
+        let ListingAvionicsVerification::Processed { report } = second else {
+            panic!("the duplicate conflict should remain pending")
+        };
+        assert_eq!(report.status, "blocked");
+        assert_eq!(report.raw_avionics_source, "retained_extraction");
+        assert!(!report.reextraction_required);
+        assert!(!report.reextraction_attempted);
+    }
+
+    #[tokio::test]
+    async fn stale_capture_rejects_validated_reextraction_without_writing_it() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let (listing_id, link_id, _) = seed_preserved_association_listing(
+            &db,
+            "stale-capture-reextraction",
+            product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let submission_id = append_nonreplayable_review_aspect(&db, listing_id).await;
+        store_retained_legacy_listing_extraction(&db, submission_id).await;
+        let pool = sqlite_pool(&db);
+        let (manufacturer, model, evidence): (String, String, String) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.name, model.name, link.source_notes
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            JOIN aircraft_sale_listing_avionics link
+              ON link.avionics_model_id = model.id
+            WHERE model.id = ? AND link.id = ?
+            "#,
+        )
+        .bind(product_id)
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let stale_row = load_listing_sources(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let changed_html = "<p>The retained capture changed while Gemini was running</p>";
+        sqlx::query(
+            "UPDATE plugin_submissions SET rendered_html = ?, rendered_html_sha256 = ? WHERE id = ?",
+        )
+        .bind(changed_html)
+        .bind(sha256_hex(changed_html.as_bytes()))
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": manufacturer,
+            "model": model,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let mut catalog_statuses = load_catalog_statuses(&db).await.unwrap();
+        let report =
+            process_listing(&db, &extractor, true, &stale_row, &mut catalog_statuses).await;
+        server.abort();
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(report.status, "blocked");
+        assert!(report.reextraction_attempted);
+        assert!(!report.reextraction_succeeded);
+        assert!(report
+            .reextraction_error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed while re-extraction was running")));
+
+        let (stored_html, stored_extraction, stored_error): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT rendered_html, extracted_listing_json, extraction_error FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_html, changed_html);
+        let expected_prior_extraction = retained_legacy_listing_extraction().to_string();
+        assert_eq!(
+            stored_extraction.as_deref(),
+            Some(expected_prior_extraction.as_str())
+        );
+        assert_eq!(
+            stored_error.as_deref(),
+            Some("legacy extraction unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_reextraction_write_is_idempotent_and_rejects_a_different_prior_state() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id =
+            seed_listing(&db, "https://example.test/listing/reextraction-idempotency").await;
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            "https://example.test/listing/reextraction-idempotency",
+            "<p>Garmin fixture installed</p>",
+            Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"Fixture","types":["GPS"]}]}"#),
+            Some(listing_id),
+            Some("legacy extraction warning"),
+        )
+        .await;
+        let row = load_listing_sources(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let validated = json!({
+            "manufacturer": "Cessna",
+            "model": "172",
+            "variant": "S",
+            "model_year": 2020,
+            "asking_price_usd": 300000,
+            "currency": "USD",
+            "airframe_hours": 1000,
+            "avionics": [{
+                "manufacturer": "Garmin",
+                "model": "Fixture",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin fixture installed",
+                "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        })
+        .to_string();
+        persist_validated_listing_reextraction(&db, &row, submission_id, &validated)
+            .await
+            .unwrap();
+        persist_validated_listing_reextraction(&db, &row, submission_id, &validated)
+            .await
+            .expect("the same guarded extraction write must be idempotent");
+
+        let concurrent =
+            r#"{"avionics":[{"manufacturer":"Garmin","model":"Concurrent","types":["GPS"]}]}"#;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(concurrent)
+        .bind(submission_id)
+        .execute(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let error = persist_validated_listing_reextraction(&db, &row, submission_id, &validated)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("prior extraction state changed"));
+        let stored: String = sqlx::query_scalar(
+            "SELECT extracted_listing_json FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(submission_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(stored, concurrent);
+    }
+
+    #[tokio::test]
+    async fn locked_reextraction_state_revalidates_every_postgres_write_dependency() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let listing_id =
+            seed_listing(&db, "https://example.test/listing/reextraction-lock-state").await;
+        let prior_extraction = retained_legacy_listing_extraction().to_string();
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            "https://example.test/listing/reextraction-lock-state",
+            "<p>Garmin G5 installed</p>",
+            Some(&prior_extraction),
+            Some(listing_id),
+            Some("legacy extraction warning"),
+        )
+        .await;
+        let row = load_listing_sources(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let target = r#"{"avionics":[]}"#;
+        let mut locked = locked_reextraction_state(&row, submission_id);
+
+        validate_locked_reextraction_state(&row, submission_id, target, &locked).unwrap();
+
+        locked.extracted_listing_json = Some(target.to_string());
+        locked.submission_extraction_error = None;
+        validate_locked_reextraction_state(&row, submission_id, target, &locked)
+            .expect("an identical retry remains valid after locking");
+
+        locked.extracted_listing_json = Some(r#"{"avionics":[1]}"#.to_string());
+        let error =
+            validate_locked_reextraction_state(&row, submission_id, target, &locked).unwrap_err();
+        assert!(error.to_string().contains("prior extraction state changed"));
+
+        locked = locked_reextraction_state(&row, submission_id);
+        locked.review_payload_json.push(' ');
+        let error =
+            validate_locked_reextraction_state(&row, submission_id, target, &locked).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pending-review revision changed"));
+
+        locked = locked_reextraction_state(&row, submission_id);
+        locked.rendered_html.push_str(" changed");
+        let error =
+            validate_locked_reextraction_state(&row, submission_id, target, &locked).unwrap_err();
+        assert!(error.to_string().contains("source capture"));
+    }
+
+    #[tokio::test]
     async fn ineligible_preserved_associations_remain_pending_without_provider_usage() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let attested_product_id = seed_approved_suggestion_product(&db, true).await;
@@ -6230,6 +7257,55 @@ mod tests {
         .await
         .unwrap();
         (listing_id, link_id, aspect_id)
+    }
+
+    async fn append_nonreplayable_review_aspect(db: &AppDb, listing_id: i64) -> i64 {
+        let pool = sqlite_pool(db);
+        let (submission_id, review_json, review_sha256, pending_aspect_count): (
+            i64,
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            r#"
+            SELECT plugin_submission_id, review_payload_json,
+                   review_payload_sha256, pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews
+            WHERE listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut aspects = parse_current_pending_review_aspects(
+            &review_json,
+            &review_sha256,
+            pending_aspect_count,
+        )
+        .unwrap();
+        aspects.push(
+            PendingReviewAspect::avionics(
+                format!("fixture:nonreplayable:{listing_id}"),
+                "avionics",
+                "Legacy unresolved observation",
+                "Legacy unresolved observation",
+                "legacy observation has no exact current-schema source evidence",
+                1,
+                "installed",
+                None,
+                None,
+            )
+            .with_proposed_product(ReviewProduct::proposed(
+                "Unknown",
+                "Legacy unresolved observation",
+                vec!["Unknown".to_string()],
+            )),
+        );
+        crate::listing::review::stage_pending_review(db, listing_id, Some(submission_id), &aspects)
+            .await
+            .unwrap();
+        submission_id
     }
 
     async fn seed_listing(db: &AppDb, source_url: &str) -> i64 {
