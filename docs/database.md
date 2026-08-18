@@ -1037,6 +1037,26 @@ cargo run --bin aircost-admin -- verify-listings \
 `--after-listing-id` and `--listing-id` are mutually exclusive. An exact
 listing ID remains available to retry or inspect a residual item separately.
 
+Apply-readiness preflight also checks eligible existing avionics links that are
+outside the catalog scope produced by the same identity resolver that will run
+the paid candidates. That scope uses bounded selectable catalog IDs and exact
+avionics manufacturer identities; it does not infer aircraft-maker aliases
+from raw listing labels. Candidate adjudication remains unbounded for this
+early gate because an uncertain, invalid, or stale answer falls through to
+global triage, which can correct the manufacturer. When that fallback, direct
+triage, or unknown-manufacturer grounding can legitimately escape the initial
+bounds, preflight does not reject existing links early and leaves the complete
+decision to the final transaction. Otherwise, before reporting paid work as
+runnable, each unrelated link must have a current manufacturer-reuse
+attestation or exact current same-listing authorization, including the current
+catalog and collision-closure revisions.
+A deterministic unrelated blocker contributes zero requests to the provider
+plan. A link inside the resolver-produced scope is not rejected early because
+the paid result may legitimately replace or repair it; the final transaction
+remains the complete graph and concurrency authority. Paid preview
+intentionally skips this readiness gate so it can still inspect prospective
+provider behavior without claiming that the result can be applied.
+
 The request plan counts logical provider requests rather than describing a
 grounded workflow as one "call." It reports tools-disabled candidate
 adjudication separately at one request per eligible identity, including the
@@ -1098,6 +1118,12 @@ source, re-extraction, error, accepted, safely-discarded, and remaining-review
 counts before using `--apply`. Apply mode persists independently grounded
 catalog identities through the ordinary catalog resolver; listing links and
 review state are handled separately by the atomic apply boundary below.
+`prepared_link_count` is diagnostic: it counts links assembled from resolved
+observations for the attempted atomic request, not every existing database
+link inspected by the readiness gate. `accepted` counts only links committed
+by a successful atomic apply. A blocked attempt or final transaction rejection
+therefore reports zero accepted links even when its prepared-link count is
+nonzero.
 
 Candidate outcomes are partial rather than all-or-nothing:
 
