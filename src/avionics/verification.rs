@@ -1214,7 +1214,117 @@ async fn process_listing(
     }
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
 
+    // Route every concrete retained observation without invoking Gemini before
+    // executing any identity resolution. This lets exact local identities and
+    // their prepared-link semantics fail closed before a later candidate can
+    // spend provider requests or curate catalog state for a listing whose
+    // transaction cannot commit.
+    let mut provider_free_candidate_indices = Vec::new();
+    let mut provider_candidate_indices = Vec::new();
     for (candidate_index, raw) in raw_avionics.iter().enumerate() {
+        if raw_candidate_structure_issue(raw).is_some() {
+            provider_free_candidate_indices.push(candidate_index);
+            continue;
+        }
+        if generic_model_issue(raw).is_some() {
+            provider_candidate_indices.push(candidate_index);
+            continue;
+        }
+        let primary_route = match preflight_identity_component(
+            db,
+            row,
+            source_url.as_deref(),
+            &listing_context,
+            IdentityInput {
+                manufacturer: &raw.manufacturer,
+                model: &raw.model,
+                avionics_types: &raw.avionics_types,
+                quantity: raw.quantity,
+            },
+            raw.source_evidence_text.as_deref(),
+        )
+        .await
+        {
+            Ok(route) => route,
+            Err(error) => {
+                blocking_reasons.push(format!(
+                    "candidate {candidate_index}: provider-free primary identity preflight failed: {error}"
+                ));
+                continue;
+            }
+        };
+        let replacement_route = if let Some(replacement) = raw.replaces.as_ref() {
+            match preflight_identity_component(
+                db,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                IdentityInput {
+                    manufacturer: &replacement.manufacturer,
+                    model: &replacement.model,
+                    avionics_types: &replacement.avionics_types,
+                    quantity: 1,
+                },
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(route) => Some(route),
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: provider-free replacement identity preflight failed: {error}"
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let fully_local = primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal
+            && replacement_route
+                .is_none_or(|route| route == AvionicsIdentityVerificationRoute::VerifiedLocal);
+        if fully_local {
+            provider_free_candidate_indices.push(candidate_index);
+        } else {
+            provider_candidate_indices.push(candidate_index);
+        }
+    }
+
+    let mut execution_order = provider_free_candidate_indices
+        .into_iter()
+        .map(|candidate_index| (candidate_index, false))
+        .chain(
+            provider_candidate_indices
+                .into_iter()
+                .map(|candidate_index| (candidate_index, true)),
+        )
+        .collect::<Vec<_>>();
+    let mut execution_cursor = 0;
+    let mut provider_phase_started = false;
+    let mut provider_phase_blocked_at_barrier = false;
+
+    while execution_cursor < execution_order.len() {
+        let (candidate_index, requires_provider) = execution_order[execution_cursor];
+        execution_cursor += 1;
+        if requires_provider && !provider_phase_started {
+            provider_phase_started = true;
+            if let Some(reason) = review_revision.stale_reason.as_ref() {
+                blocking_reasons.push(format!(
+                    "pending review revision could not be advanced safely: {reason}"
+                ));
+            }
+            if let Err(error) = validate_prepared_links(&prepared) {
+                blocking_reasons.push(format!("listing avionics action graph is invalid: {error}"));
+            }
+            if !blocking_reasons.is_empty() {
+                provider_phase_blocked_at_barrier = true;
+                break;
+            }
+        }
+        if requires_provider && !blocking_reasons.is_empty() {
+            break;
+        }
+        let raw = &raw_avionics[candidate_index];
         if let Some(issue) = raw_candidate_structure_issue(raw) {
             listing_report.candidates.push(input_error_report(
                 candidate_index,
@@ -1281,28 +1391,60 @@ async fn process_listing(
             continue;
         }
 
-        let mut primary = resolve_identity_attempt(
-            db,
-            &scoped_extractor,
-            apply,
-            row,
-            source_url.as_deref(),
-            &listing_context,
-            candidate_index,
-            "primary",
-            IdentityInput {
-                manufacturer: &raw.manufacturer,
-                model: &raw.model,
-                avionics_types: &raw.avionics_types,
-                quantity: raw.quantity,
-            },
-            &raw.configuration_action,
-            raw.source_evidence_text.as_deref(),
-            raw.source_confidence.as_deref(),
-            catalog_statuses,
-            &mut review_revision,
-        )
-        .await;
+        let primary_identity = IdentityInput {
+            manufacturer: &raw.manufacturer,
+            model: &raw.model,
+            avionics_types: &raw.avionics_types,
+            quantity: raw.quantity,
+        };
+        let mut primary = if requires_provider {
+            resolve_identity_attempt(
+                db,
+                &scoped_extractor,
+                apply,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                candidate_index,
+                "primary",
+                primary_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                catalog_statuses,
+                &mut review_revision,
+            )
+            .await
+        } else {
+            match resolve_local_only_identity_attempt(
+                db,
+                apply,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                candidate_index,
+                "primary",
+                primary_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                catalog_statuses,
+            )
+            .await
+            {
+                Ok(Some(attempt)) => attempt,
+                Ok(None) => {
+                    execution_order.push((candidate_index, true));
+                    continue;
+                }
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: provider-free primary identity resolution failed: {error}"
+                    ));
+                    continue;
+                }
+            }
+        };
         if primary.report.status == "rejected" {
             listing_report.candidates.push(primary.report);
             listing_report.safely_discarded += 1;
@@ -1375,28 +1517,60 @@ async fn process_listing(
             .replaces
             .as_ref()
             .expect("raw_candidate_issue requires replacement identity");
-        let mut replacement_attempt = resolve_identity_attempt(
-            db,
-            &scoped_extractor,
-            apply,
-            row,
-            source_url.as_deref(),
-            &listing_context,
-            candidate_index,
-            "replacement",
-            IdentityInput {
-                manufacturer: &replacement.manufacturer,
-                model: &replacement.model,
-                avionics_types: &replacement.avionics_types,
-                quantity: 1,
-            },
-            &raw.configuration_action,
-            raw.source_evidence_text.as_deref(),
-            raw.source_confidence.as_deref(),
-            catalog_statuses,
-            &mut review_revision,
-        )
-        .await;
+        let replacement_identity = IdentityInput {
+            manufacturer: &replacement.manufacturer,
+            model: &replacement.model,
+            avionics_types: &replacement.avionics_types,
+            quantity: 1,
+        };
+        let mut replacement_attempt = if requires_provider {
+            resolve_identity_attempt(
+                db,
+                &scoped_extractor,
+                apply,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                candidate_index,
+                "replacement",
+                replacement_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                catalog_statuses,
+                &mut review_revision,
+            )
+            .await
+        } else {
+            match resolve_local_only_identity_attempt(
+                db,
+                apply,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                candidate_index,
+                "replacement",
+                replacement_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                catalog_statuses,
+            )
+            .await
+            {
+                Ok(Some(attempt)) => attempt,
+                Ok(None) => {
+                    execution_order.push((candidate_index, true));
+                    continue;
+                }
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: provider-free replacement identity resolution failed: {error}"
+                    ));
+                    continue;
+                }
+            }
+        };
         let replacement_is_approved = identity_is_approved(&replacement_attempt);
         if replacement_is_approved && !primary_has_high_evidence {
             mark_weak_listing_evidence(&mut replacement_attempt.report);
@@ -1541,13 +1715,18 @@ async fn process_listing(
         listing_report.candidates.push(replacement_attempt.report);
     }
 
-    if let Some(reason) = review_revision.stale_reason.as_ref() {
-        blocking_reasons.push(format!(
-            "pending review revision could not be advanced safely: {reason}"
-        ));
-    }
-    if let Err(error) = validate_prepared_links(&prepared) {
-        blocking_reasons.push(format!("listing avionics action graph is invalid: {error}"));
+    listing_report
+        .candidates
+        .sort_by_key(|candidate| (candidate.candidate_index, candidate.role != "primary"));
+    if !provider_phase_blocked_at_barrier {
+        if let Some(reason) = review_revision.stale_reason.as_ref() {
+            blocking_reasons.push(format!(
+                "pending review revision could not be advanced safely: {reason}"
+            ));
+        }
+        if let Err(error) = validate_prepared_links(&prepared) {
+            blocking_reasons.push(format!("listing avionics action graph is invalid: {error}"));
+        }
     }
     listing_report.prepared_link_count = prepared.len();
     listing_report.accepted = prepared.len();
@@ -2313,6 +2492,79 @@ fn identity_request(
         avionics_types: identity.avionics_types.to_vec(),
         quantity: identity.quantity,
     }
+}
+
+/// Resolve one preflight-local identity without any provider or catalog write.
+///
+/// `None` means the exact local reuse proof changed after route planning. The
+/// caller must move the complete observation behind the paid-work barrier and
+/// let the ordinary resolver reconsider it there; it must never fall through
+/// to that resolver while deterministic local work is still being processed.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_local_only_identity_attempt(
+    db: &AppDb,
+    apply: bool,
+    row: &ListingSourceRow,
+    source_url: Option<&str>,
+    listing_context: &ListingEvidenceContext,
+    candidate_index: usize,
+    role: &str,
+    identity: IdentityInput<'_>,
+    configuration_action: &str,
+    source_evidence_text: Option<&str>,
+    source_confidence: Option<&str>,
+    catalog_statuses: &mut HashMap<i64, String>,
+) -> Result<Option<IdentityAttempt>, String> {
+    let request = identity_request(
+        row,
+        source_url,
+        listing_context,
+        &identity,
+        source_evidence_text,
+    );
+    let Some(approved) = resolve_verified_local_avionics_identity(db, &request)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    if approved.id <= 0 {
+        return Err(
+            "verified-local resolution returned a non-persisted catalog identity".to_string(),
+        );
+    }
+    if apply
+        && !product_reuse_attestation_is_current(db, approved.id)
+            .await
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    let identity_key = load_approved_graph_identity_key(db, approved.id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let approved_id = approved.id;
+    let mut attempt = approved_attempt(
+        apply,
+        candidate_index,
+        role,
+        &identity,
+        configuration_action,
+        source_evidence_text,
+        source_confidence,
+        approved,
+        Some(identity_key),
+        catalog_statuses,
+    );
+    if apply {
+        attempt.authorization = Some(AutomatedAssociationAuthorization::ManufacturerReuse);
+        attempt.collision_closure_sha256 = Some(
+            active_collision_closure_revision_sha256(db, approved_id)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(Some(attempt))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5326,6 +5578,135 @@ mod tests {
         assert_eq!(existing.source_confidence, None);
     }
 
+    fn preserved_guard(
+        listing_link_id: i64,
+        expected_observation_sha256: &str,
+    ) -> AutomatedPreservedAssociationGuard {
+        AutomatedPreservedAssociationGuard {
+            listing_link_id,
+            association_role: ListingAssociationRole::Installed,
+            expected_observation_sha256: expected_observation_sha256.to_string(),
+        }
+    }
+
+    #[test]
+    fn unbound_fresh_duplicate_cannot_consume_a_preserved_occurrence() {
+        let guard = preserved_guard(416, &"a".repeat(64));
+        let mut preserved = PreparedLink {
+            identity_key: "catalog:94".to_string(),
+            avionics_model_id: 94,
+            authorization: Some(AutomatedAssociationAuthorization::ManufacturerReuse),
+            expected_collision_closure_sha256: Some("b".repeat(64)),
+            quantity: 1,
+            source_notes: Some("Garmin Flight Stream 210".to_string()),
+            source_confidence: Some("high".to_string()),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+            replacement_authorization: None,
+            replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
+            preserved_association_guard: Some(guard.clone()),
+        };
+        let fresh = PreparedLink {
+            source_notes: Some("Garmin FlightStream 210".to_string()),
+            preserved_association_guard: None,
+            ..preserved.clone()
+        };
+
+        assert!(merge_duplicate_link(&mut preserved, &fresh).is_err());
+
+        assert_eq!(preserved.preserved_association_guard, Some(guard));
+        assert_eq!(preserved.quantity, 1);
+        assert_eq!(
+            preserved.source_notes.as_deref(),
+            Some("Garmin Flight Stream 210")
+        );
+    }
+
+    #[test]
+    fn preserved_occurrence_guard_cannot_be_adopted_by_identity_match() {
+        let guard = preserved_guard(416, &"a".repeat(64));
+        let mut fresh = PreparedLink {
+            identity_key: "catalog:94".to_string(),
+            avionics_model_id: 94,
+            authorization: Some(AutomatedAssociationAuthorization::ManufacturerReuse),
+            expected_collision_closure_sha256: Some("b".repeat(64)),
+            quantity: 1,
+            source_notes: Some("Garmin FlightStream 210".to_string()),
+            source_confidence: Some("high".to_string()),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+            replacement_authorization: None,
+            replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
+            preserved_association_guard: None,
+        };
+        let preserved = PreparedLink {
+            source_notes: Some("Garmin Flight Stream 210".to_string()),
+            preserved_association_guard: Some(guard.clone()),
+            ..fresh.clone()
+        };
+
+        assert!(merge_duplicate_link(&mut fresh, &preserved).is_err());
+
+        assert_eq!(fresh.preserved_association_guard, None);
+        assert_eq!(fresh.quantity, 1);
+        assert_eq!(
+            fresh.source_notes.as_deref(),
+            Some("Garmin FlightStream 210")
+        );
+    }
+
+    #[test]
+    fn duplicate_guard_authorization_and_collision_mismatches_fail_closed() {
+        let original_guard = preserved_guard(416, &"a".repeat(64));
+        let original = PreparedLink {
+            identity_key: "catalog:94".to_string(),
+            avionics_model_id: 94,
+            authorization: Some(AutomatedAssociationAuthorization::ManufacturerReuse),
+            expected_collision_closure_sha256: Some("b".repeat(64)),
+            quantity: 1,
+            source_notes: Some("Garmin Flight Stream 210".to_string()),
+            source_confidence: Some("high".to_string()),
+            configuration_action: "installed".to_string(),
+            replaces_avionics_model_id: None,
+            replacement_authorization: None,
+            replacement_identity_key: None,
+            expected_replacement_collision_closure_sha256: None,
+            preserved_association_guard: Some(original_guard.clone()),
+        };
+        let mismatches = [
+            PreparedLink {
+                preserved_association_guard: Some(preserved_guard(417, &"a".repeat(64))),
+                ..original.clone()
+            },
+            PreparedLink {
+                authorization: None,
+                preserved_association_guard: None,
+                ..original.clone()
+            },
+            PreparedLink {
+                expected_collision_closure_sha256: Some("c".repeat(64)),
+                preserved_association_guard: None,
+                ..original.clone()
+            },
+        ];
+
+        for mismatch in mismatches {
+            let mut existing = original.clone();
+            assert!(merge_duplicate_link(&mut existing, &mismatch).is_err());
+            assert_eq!(
+                existing.preserved_association_guard,
+                Some(original_guard.clone())
+            );
+            assert_eq!(existing.authorization, original.authorization);
+            assert_eq!(
+                existing.expected_collision_closure_sha256,
+                original.expected_collision_closure_sha256
+            );
+        }
+    }
+
     #[test]
     fn gnx_375_gps_and_transponder_rows_become_one_physical_link() {
         let mut prepared = [PreparedLink {
@@ -5807,6 +6188,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_verified_local_route_never_falls_through_to_a_provider() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let listing_id = seed_suggestion_only_listing(
+            &db,
+            "stale-verified-local-route",
+            product_id,
+            product_id,
+            "high",
+        )
+        .await;
+        let row = load_listing_sources(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let (manufacturer, model): (String, String) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.name, model.name
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            WHERE model.id = ?
+            "#,
+        )
+        .bind(product_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let evidence = format!("{manufacturer} {model} standby instrument");
+        let listing_context =
+            ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+        let avionics_types = vec!["Flight Display".to_string()];
+        let identity = || IdentityInput {
+            manufacturer: &manufacturer,
+            model: &model,
+            avionics_types: &avionics_types,
+            quantity: 1,
+        };
+        assert_eq!(
+            preflight_identity_component(
+                &db,
+                &row,
+                row.submission_source_url.as_deref(),
+                &listing_context,
+                identity(),
+                Some(&evidence),
+            )
+            .await
+            .unwrap(),
+            AvionicsIdentityVerificationRoute::VerifiedLocal
+        );
+
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(product_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+        // The deletion trigger may restage the pending review, but the local
+        // resolver deliberately receives the route-planning snapshot here to
+        // model eligibility changing between the two phases.
+        let mut catalog_statuses = load_catalog_statuses(&db).await.unwrap();
+        let attempt = resolve_local_only_identity_attempt(
+            &db,
+            true,
+            &row,
+            row.submission_source_url.as_deref(),
+            &listing_context,
+            0,
+            "primary",
+            identity(),
+            "installed",
+            Some(&evidence),
+            Some("high"),
+            &mut catalog_statuses,
+        )
+        .await
+        .unwrap();
+
+        assert!(attempt.is_none(), "stale local work must be reclassified");
+        let usage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(usage_count, 0);
+    }
+
+    #[tokio::test]
     async fn current_exact_preserved_association_is_consumed_without_provider_usage() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let product_id = seed_approved_suggestion_product(&db, true).await;
@@ -5869,6 +6345,337 @@ mod tests {
         assert_eq!(persisted_link_id, link_id);
         assert_eq!(authorization_count, 1);
         assert_eq!(pending_count, 0);
+        assert_eq!(usage_count, 0);
+    }
+
+    #[tokio::test]
+    async fn unbound_fresh_observation_cannot_consume_a_preserved_listing_occurrence() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let (listing_id, link_id, _) = seed_preserved_association_listing(
+            &db,
+            "fresh-and-preserved-same-product",
+            product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        let (manufacturer, model): (String, String) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.name, model.name
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            WHERE model.id = ?
+            "#,
+        )
+        .bind(product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let compact_model = model.replace(' ', "");
+        let fresh_evidence = format!("{manufacturer} {compact_model} installed");
+        let (submission_id, rendered_html, review_json, review_sha256, aspect_count): (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            r#"
+            SELECT review.plugin_submission_id, submission.rendered_html,
+                   review.review_payload_json, review.review_payload_sha256,
+                   review.pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN plugin_submissions submission
+              ON submission.id = review.plugin_submission_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut aspects =
+            parse_current_pending_review_aspects(&review_json, &review_sha256, aspect_count)
+                .unwrap();
+        aspects.push(
+            PendingReviewAspect::avionics(
+                "fixture:fresh-duplicate:0",
+                "avionics",
+                compact_model.clone(),
+                fresh_evidence.clone(),
+                "fresh exact observation requires catalog resolution",
+                1,
+                "installed",
+                Some(fresh_evidence.clone()),
+                Some("high".to_string()),
+            )
+            .with_proposed_product(ReviewProduct::proposed(
+                manufacturer,
+                compact_model,
+                vec!["Flight Display".to_string()],
+            )),
+        );
+        let rendered_html = format!("{rendered_html}<p>{fresh_evidence}</p>");
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET rendered_html = ?, rendered_html_sha256 = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rendered_html)
+        .bind(sha256_hex(rendered_html.as_bytes()))
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &aspects,
+        )
+        .await
+        .unwrap();
+
+        let (endpoint, request_count, _requests, server) =
+            spawn_classifier_endpoint("very_high").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let result = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("the unbound duplicate should fail closed without provider work");
+        server.abort();
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the listing should still have been processed")
+        };
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(report.status, "blocked");
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.remaining_review_aspects, 2);
+        assert!(report.error.as_deref().is_some_and(|error| error
+            .contains("conflicting action, replacement, or collision-closure semantics")));
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].candidate_index, 0);
+        assert_eq!(report.candidates[0].catalog_id, Some(product_id));
+
+        let stored_links: Vec<(i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT id, avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let usage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT pending_aspect_count FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_links, vec![(link_id, product_id)]);
+        assert_eq!(pending_count, 2);
+        assert_eq!(usage_count, 0);
+    }
+
+    #[tokio::test]
+    async fn local_prepared_link_conflict_blocks_earlier_paid_candidate() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let replacement_id = seed_approved_suggestion_product(&db, true).await;
+        let (listing_id, link_id, _) = seed_preserved_association_listing(
+            &db,
+            "local-conflict-before-paid-candidate",
+            product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        let products: Vec<(i64, String, String)> = sqlx::query_as(
+            r#"
+            SELECT model.id, manufacturer.name, model.name
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            WHERE model.id IN (?, ?)
+            ORDER BY model.id
+            "#,
+        )
+        .bind(product_id)
+        .bind(replacement_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let product = products
+            .iter()
+            .find(|product| product.0 == product_id)
+            .unwrap();
+        let replacement = products
+            .iter()
+            .find(|product| product.0 == replacement_id)
+            .unwrap();
+        let product_model = product.2.replace(' ', "");
+        let replacement_model = replacement.2.replace(' ', "");
+        let generic_evidence = "Garmin GPS capability";
+        let relationship_evidence = format!(
+            "{} {} replaces {} {}",
+            product.1, product_model, replacement.1, replacement_model
+        );
+        let (submission_id, rendered_html, review_json, review_sha256, aspect_count): (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            r#"
+            SELECT review.plugin_submission_id, submission.rendered_html,
+                   review.review_payload_json, review.review_payload_sha256,
+                   review.pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN plugin_submissions submission
+              ON submission.id = review.plugin_submission_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut aspects =
+            parse_current_pending_review_aspects(&review_json, &review_sha256, aspect_count)
+                .unwrap();
+        aspects.push(
+            PendingReviewAspect::avionics(
+                "fixture:relationship-fallback:1",
+                "avionics",
+                product_model.clone(),
+                relationship_evidence.clone(),
+                "replacement relationship requires replay",
+                1,
+                "replaces",
+                Some(relationship_evidence.clone()),
+                Some("high".to_string()),
+            )
+            .with_proposed_product(ReviewProduct::proposed(
+                product.1.clone(),
+                product_model.clone(),
+                vec!["Flight Display".to_string()],
+            ))
+            .with_replacement_product(replacement_id),
+        );
+        let rendered_html =
+            format!("{rendered_html}<p>{generic_evidence}</p><p>{relationship_evidence}</p>");
+        let extracted_listing_json = json!({
+            "avionics": [
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GPS",
+                    "types": ["GPS"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "source_evidence_text": generic_evidence,
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": product.1,
+                    "model": product_model,
+                    "types": ["Flight Display"],
+                    "quantity": 1,
+                    "configuration_action": "replaces",
+                    "replaces": {
+                        "manufacturer": replacement.1,
+                        "model": replacement_model,
+                        "types": ["Flight Display"]
+                    },
+                    "source_evidence_text": relationship_evidence,
+                    "source_confidence": "high"
+                }
+            ]
+        })
+        .to_string();
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET rendered_html = ?, rendered_html_sha256 = ?,
+                extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rendered_html)
+        .bind(sha256_hex(rendered_html.as_bytes()))
+        .bind(extracted_listing_json)
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &aspects,
+        )
+        .await
+        .unwrap();
+
+        let (endpoint, request_count, _requests, server) =
+            spawn_classifier_endpoint("very_high").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let result = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("a deterministic prepared-link conflict should block before paid work");
+        server.abort();
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the listing should still have been inspected")
+        };
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert_eq!(report.status, "blocked");
+        assert!(report.error.as_deref().is_some_and(|error| error
+            .contains("conflicting action, replacement, or collision-closure semantics")));
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report
+            .candidates
+            .iter()
+            .all(|candidate| candidate.candidate_index == 1));
+        let stored_link_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let usage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_link_id, link_id);
         assert_eq!(usage_count, 0);
     }
 
