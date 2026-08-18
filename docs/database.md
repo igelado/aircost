@@ -1038,17 +1038,24 @@ cargo run --bin aircost-admin -- verify-listings \
 listing ID remains available to retry or inspect a residual item separately.
 
 Apply-readiness preflight also checks eligible existing avionics links that are
-unrelated to the exact subject/replacement graph-key envelope of pending paid
-candidates. Before reporting that work as runnable, each such unrelated link
-must have a current manufacturer-reuse attestation or exact current
-same-listing authorization, including the current catalog and
-collision-closure revisions. A deterministic unrelated blocker contributes
-zero requests to the provider plan. A link inside the candidate envelope is
-not rejected early because the paid result may legitimately replace or repair
-it; the final transaction remains the complete graph and concurrency
-authority. Paid preview intentionally skips this readiness gate so it can
-still inspect prospective provider behavior without claiming that the result
-can be applied.
+outside the catalog scope produced by the same identity resolver that will run
+the paid candidates. That scope uses bounded selectable catalog IDs and exact
+avionics manufacturer identities; it does not infer aircraft-maker aliases
+from raw listing labels. Candidate adjudication remains unbounded for this
+early gate because an uncertain, invalid, or stale answer falls through to
+global triage, which can correct the manufacturer. When that fallback, direct
+triage, or unknown-manufacturer grounding can legitimately escape the initial
+bounds, preflight does not reject existing links early and leaves the complete
+decision to the final transaction. Otherwise, before reporting paid work as
+runnable, each unrelated link must have a current manufacturer-reuse
+attestation or exact current same-listing authorization, including the current
+catalog and collision-closure revisions.
+A deterministic unrelated blocker contributes zero requests to the provider
+plan. A link inside the resolver-produced scope is not rejected early because
+the paid result may legitimately replace or repair it; the final transaction
+remains the complete graph and concurrency authority. Paid preview
+intentionally skips this readiness gate so it can still inspect prospective
+provider behavior without claiming that the result can be applied.
 
 The request plan counts logical provider requests rather than describing a
 grounded workflow as one "call." It reports tools-disabled candidate

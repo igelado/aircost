@@ -644,6 +644,19 @@ pub(crate) enum AvionicsIdentityVerificationRoute {
     GroundedCuration,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AvionicsExistingCatalogScope {
+    pub catalog_ids: BTreeSet<i64>,
+    pub manufacturer_identity_ids: BTreeSet<i64>,
+    pub unbounded: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AvionicsIdentityVerificationPlan {
+    pub route: AvionicsIdentityVerificationRoute,
+    pub existing_catalog_scope: AvionicsExistingCatalogScope,
+}
+
 #[derive(Clone, Debug, FromRow)]
 struct CatalogRow {
     id: i64,
@@ -1503,13 +1516,18 @@ pub(crate) async fn resolve_verified_catalog_avionics_identity(
 pub(crate) async fn plan_avionics_identity_verification_route(
     db: &AppDb,
     request: &AvionicsIdentityRequest,
-) -> CatalogResult<AvionicsIdentityVerificationRoute> {
-    if resolve_verified_local_avionics_identity(db, request)
-        .await?
-        .is_some()
-    {
-        return Ok(AvionicsIdentityVerificationRoute::VerifiedLocal);
+) -> CatalogResult<AvionicsIdentityVerificationPlan> {
+    if let Some(approved) = resolve_verified_local_avionics_identity(db, request).await? {
+        return Ok(AvionicsIdentityVerificationPlan {
+            route: AvionicsIdentityVerificationRoute::VerifiedLocal,
+            existing_catalog_scope: AvionicsExistingCatalogScope {
+                catalog_ids: BTreeSet::from([approved.id]),
+                ..AvionicsExistingCatalogScope::default()
+            },
+        });
     }
+    let manufacturer_identity_id =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?;
     if !request.authoritative_direct_source_urls.is_empty()
         || !request.authoritative_identity_anchors.is_empty()
         || !request.requires_listing_evidence
@@ -1517,7 +1535,7 @@ pub(crate) async fn plan_avionics_identity_verification_route(
         || !is_usable_avionics_label(&request.manufacturer, &request.model)
         || !exact_token_phrase_is_present(&request.listing_context, &request.manufacturer)
     {
-        return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
+        return Ok(grounded_verification_plan(manufacturer_identity_id));
     }
     let input_types = request
         .avionics_types
@@ -1527,10 +1545,8 @@ pub(crate) async fn plan_avionics_identity_verification_route(
         .map(str::to_string)
         .collect::<Vec<_>>();
     if input_types.is_empty() {
-        return Ok(AvionicsIdentityVerificationRoute::GroundedCuration);
+        return Ok(grounded_verification_plan(manufacturer_identity_id));
     }
-    let manufacturer_identity_id =
-        resolve_input_manufacturer_identity(db, &request.manufacturer).await?;
     let review_catalog = load_review_catalog_candidates(db).await?;
     if let Some(manufacturer_identity_id) = manufacturer_identity_id {
         let manufacturer_catalog = manufacturer_scoped_catalog_candidates(
@@ -1539,25 +1555,66 @@ pub(crate) async fn plan_avionics_identity_verification_route(
             &review_catalog,
         );
         let approved_candidates = load_known_approved_candidates(db).await?;
-        if approved_candidate_adjudication_plan(
+        if let Some(plan) = approved_candidate_adjudication_plan(
             request,
             &input_types,
             manufacturer_identity_id,
             &approved_candidates,
             &manufacturer_catalog,
-        )
-        .is_some()
-        {
-            return Ok(AvionicsIdentityVerificationRoute::CandidateAdjudication);
+        ) {
+            return Ok(AvionicsIdentityVerificationPlan {
+                route: AvionicsIdentityVerificationRoute::CandidateAdjudication,
+                existing_catalog_scope: AvionicsExistingCatalogScope {
+                    catalog_ids: plan.selectable_catalog_ids.into_iter().collect(),
+                    manufacturer_identity_ids: BTreeSet::from([manufacturer_identity_id]),
+                    // An uncertain, invalid, or stale closed-context answer
+                    // falls through to global candidate triage. That fallback
+                    // can correct the manufacturer before grounded curation,
+                    // so readiness cannot prove that any cross-maker existing
+                    // graph is unrelated before the provider work runs.
+                    unbounded: true,
+                },
+            });
         }
     }
-    Ok(
-        if candidate_triage_plan(request, &review_catalog, &HashSet::new()).is_some() {
-            AvionicsIdentityVerificationRoute::CandidateTriage
-        } else {
-            AvionicsIdentityVerificationRoute::GroundedCuration
+    if let Some(plan) = candidate_triage_plan(request, &review_catalog, &HashSet::new()) {
+        return Ok(AvionicsIdentityVerificationPlan {
+            route: AvionicsIdentityVerificationRoute::CandidateTriage,
+            existing_catalog_scope: AvionicsExistingCatalogScope {
+                catalog_ids: plan
+                    .family
+                    .into_iter()
+                    .map(|candidate| candidate.candidate.id)
+                    .collect(),
+                manufacturer_identity_ids: BTreeSet::new(),
+                // Triage may correct the manufacturer before the ordinary
+                // grounded pass, so its eventual existing identity is not
+                // bounded to the raw input manufacturer's graph.
+                unbounded: true,
+            },
+        });
+    }
+    Ok(grounded_verification_plan(manufacturer_identity_id))
+}
+
+fn grounded_verification_plan(
+    manufacturer_identity_id: Option<i64>,
+) -> AvionicsIdentityVerificationPlan {
+    AvionicsIdentityVerificationPlan {
+        route: AvionicsIdentityVerificationRoute::GroundedCuration,
+        existing_catalog_scope: match manufacturer_identity_id {
+            Some(identity_id) => AvionicsExistingCatalogScope {
+                catalog_ids: BTreeSet::new(),
+                manufacturer_identity_ids: BTreeSet::from([identity_id]),
+                unbounded: false,
+            },
+            None => AvionicsExistingCatalogScope {
+                catalog_ids: BTreeSet::new(),
+                manufacturer_identity_ids: BTreeSet::new(),
+                unbounded: true,
+            },
         },
-    )
+    }
 }
 
 async fn explicit_authoritative_direct_source_plan(
@@ -10760,7 +10817,8 @@ mod tests {
                 &local_request("Garmin GTX345R P/N 011-03520-00 installed"),
             )
             .await
-            .expect("the route planner should use the same local catalog"),
+            .expect("the route planner should use the same local catalog")
+            .route,
             AvionicsIdentityVerificationRoute::VerifiedLocal
         );
 
@@ -10772,7 +10830,8 @@ mod tests {
         assert_eq!(
             plan_avionics_identity_verification_route(&db, &suffix_ambiguous)
                 .await
-                .expect("the bounded catalog family should plan without Gemini"),
+                .expect("the bounded catalog family should plan without Gemini")
+                .route,
             AvionicsIdentityVerificationRoute::GroundedCuration,
             "closed-context adjudication cannot select a product whose meaningful suffix is absent"
         );
@@ -10784,7 +10843,8 @@ mod tests {
         assert_eq!(
             plan_avionics_identity_verification_route(&db, &capability_mismatch)
                 .await
-                .expect("the mismatch should fail closed"),
+                .expect("the mismatch should fail closed")
+                .route,
             AvionicsIdentityVerificationRoute::GroundedCuration,
             "candidate adjudication cannot expand an approved product's capabilities"
         );
@@ -10799,6 +10859,99 @@ mod tests {
                 .is_none(),
             "the local path requires exact server taxonomy values"
         );
+    }
+
+    #[tokio::test]
+    async fn descriptive_expansion_plan_keeps_the_resolvers_approved_product_in_scope() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_garmin_static_source_authority(&db).await;
+        let mut g1000 = verified_identity();
+        g1000.canonical_model = "G1000".to_string();
+        g1000.canonical_types = vec!["Integrated Flight Deck".to_string()];
+        g1000.manufacturer_identifier = "G1000-SYSTEM".to_string();
+        g1000.identity_source_url = "https://static.garmin.com/manuals/g1000.pdf".to_string();
+        g1000.identity_source_title = "Garmin G1000 system guide".to_string();
+        g1000.identity_evidence =
+            "The Garmin system guide identifies the G1000 integrated flight deck as product G1000-SYSTEM."
+                .to_string();
+        g1000.grounded_claim_source_urls = vec![g1000.identity_source_url.clone()];
+        let stored = persist_approved_identity(&db, None, &[], &g1000, &catalog_fingerprint(&[]))
+            .await
+            .expect("approved G1000 should seed");
+        let request = AvionicsIdentityRequest {
+            model: "Garmin G1000 Integrated Flight Deck".to_string(),
+            avionics_types: vec!["Integrated Flight Deck".to_string()],
+            listing_context: "Garmin G1000 Integrated Flight Deck installed".to_string(),
+            ..local_request("")
+        };
+
+        let plan = plan_avionics_identity_verification_route(&db, &request)
+            .await
+            .expect("descriptive expansion should produce a bounded route plan");
+
+        assert_eq!(
+            plan.route,
+            AvionicsIdentityVerificationRoute::CandidateAdjudication
+        );
+        assert!(plan.existing_catalog_scope.catalog_ids.contains(&stored.id));
+        assert_eq!(
+            plan.existing_catalog_scope.manufacturer_identity_ids.len(),
+            1
+        );
+        assert!(
+            plan.existing_catalog_scope.unbounded,
+            "adjudication can fall through to cross-manufacturer candidate triage"
+        );
+    }
+
+    #[tokio::test]
+    async fn textron_input_does_not_inherit_the_cessna_avionics_manufacturer_identity() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let cessna_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Cessna', 'cessna') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("Cessna manufacturer should seed");
+        let cessna_identity = ensure_manufacturer_identity(
+            &db,
+            cessna_id,
+            &ManufacturerIdentityEvidence {
+                source_url: "https://www.cessna.com/".to_string(),
+                source_title: "Cessna".to_string(),
+                evidence_text: "Cessna identifies its own manufacturer name.".to_string(),
+            },
+        )
+        .await
+        .expect("Cessna manufacturer identity should seed");
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Textron Aviation".to_string(),
+            model: "Legacy Display".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            listing_context: "Textron Aviation Legacy Display installed".to_string(),
+            ..local_request("")
+        };
+
+        let plan = plan_avionics_identity_verification_route(&db, &request)
+            .await
+            .expect("unknown avionics manufacturer should produce a grounded plan");
+
+        assert_eq!(
+            plan.route,
+            AvionicsIdentityVerificationRoute::GroundedCuration
+        );
+        assert!(plan.existing_catalog_scope.unbounded);
+        assert!(!plan
+            .existing_catalog_scope
+            .manufacturer_identity_ids
+            .contains(&cessna_identity.avionics_manufacturer_identity_id));
     }
 
     #[tokio::test]

@@ -10,8 +10,9 @@ use crate::avionics::catalog::{
     classify_invalid_generic_avionics_observation, plan_avionics_identity_verification_route,
     preview_avionics_identity, resolve_avionics_identity_for_automated_review,
     resolve_verified_local_avionics_identity, unique_exact_avionics_review_candidate,
-    ApprovedAvionicsIdentity, AvionicsIdentityOutcome, AvionicsIdentityRequest,
-    AvionicsIdentityVerificationRoute, GroundedAvionicsResolutionReceipt,
+    ApprovedAvionicsIdentity, AvionicsExistingCatalogScope, AvionicsIdentityOutcome,
+    AvionicsIdentityRequest, AvionicsIdentityVerificationPlan, AvionicsIdentityVerificationRoute,
+    GroundedAvionicsResolutionReceipt,
 };
 use crate::avionics::consolidation::PendingReviewRevisionReceipt;
 use crate::avionics::reuse::product_reuse_attestation_is_current;
@@ -38,10 +39,7 @@ use crate::listing::review::{
     ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
 use crate::models::{ParsedAvionics, ParsedListing};
-use crate::normalize::{
-    is_generic_avionics_model_name, normalize_avionics_identifier,
-    normalize_avionics_manufacturer_name,
-};
+use crate::normalize::is_generic_avionics_model_name;
 use crate::plugin::sha256_hex;
 
 #[derive(Debug)]
@@ -402,10 +400,9 @@ struct CatalogStatusRow {
 
 #[derive(Debug, FromRow)]
 struct ApprovedGraphEnvelopeRow {
+    avionics_model_id: i64,
     manufacturer_identity_id: i64,
     canonical_product_key: String,
-    manufacturer: String,
-    model: String,
 }
 
 #[derive(Clone, Debug)]
@@ -747,7 +744,7 @@ async fn preflight_listing(
         invalid_retained_observations: 0,
         note: String::new(),
     };
-    let mut paid_candidate_identities = Vec::new();
+    let mut paid_candidate_scope = AvionicsExistingCatalogScope::default();
     if let Err(error) = validate_pending_source_binding(row) {
         report.note = error;
         return report;
@@ -800,7 +797,7 @@ async fn preflight_listing(
             report.generic_invalid_identity_components += 1;
             continue;
         }
-        let primary_route = match preflight_identity_component(
+        let primary_plan = match preflight_identity_component(
             db,
             row,
             row.submission_source_url.as_deref(),
@@ -815,14 +812,14 @@ async fn preflight_listing(
         )
         .await
         {
-            Ok(route) => route,
+            Ok(plan) => plan,
             Err(error) => {
                 report.note = format!("verified-local identity preflight failed: {error}");
                 return report;
             }
         };
         report.retained_identity_components += 1;
-        match primary_route {
+        match primary_plan.route {
             AvionicsIdentityVerificationRoute::VerifiedLocal => {
                 report.verified_local_identity_components += 1;
             }
@@ -838,12 +835,15 @@ async fn preflight_listing(
         }
 
         let Some(replacement) = raw.replaces.as_ref() else {
-            if primary_route != AvionicsIdentityVerificationRoute::VerifiedLocal {
-                paid_candidate_identities.push((raw.manufacturer.clone(), raw.model.clone()));
+            if primary_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal {
+                extend_existing_catalog_scope(
+                    &mut paid_candidate_scope,
+                    &primary_plan.existing_catalog_scope,
+                );
             }
             continue;
         };
-        let replacement_route = match preflight_identity_component(
+        let replacement_plan = match preflight_identity_component(
             db,
             row,
             row.submission_source_url.as_deref(),
@@ -858,26 +858,31 @@ async fn preflight_listing(
         )
         .await
         {
-            Ok(route) => route,
+            Ok(plan) => plan,
             Err(error) => {
                 report.note = format!("verified-local replacement preflight failed: {error}");
                 return report;
             }
         };
-        if primary_route != AvionicsIdentityVerificationRoute::VerifiedLocal
-            || replacement_route != AvionicsIdentityVerificationRoute::VerifiedLocal
+        if primary_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal
+            || replacement_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal
         {
-            paid_candidate_identities.push((raw.manufacturer.clone(), raw.model.clone()));
-            paid_candidate_identities
-                .push((replacement.manufacturer.clone(), replacement.model.clone()));
+            extend_existing_catalog_scope(
+                &mut paid_candidate_scope,
+                &primary_plan.existing_catalog_scope,
+            );
+            extend_existing_catalog_scope(
+                &mut paid_candidate_scope,
+                &replacement_plan.existing_catalog_scope,
+            );
         }
         report.retained_identity_components += 1;
-        match replacement_route {
+        match replacement_plan.route {
             AvionicsIdentityVerificationRoute::VerifiedLocal => {
                 report.verified_local_identity_components += 1;
             }
             AvionicsIdentityVerificationRoute::CandidateAdjudication
-                if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
+                if primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
             {
                 report.candidate_adjudication_identity_components += 1;
             }
@@ -885,7 +890,7 @@ async fn preflight_listing(
                 report.candidate_adjudication_conditional_relationship_components += 1;
             }
             AvionicsIdentityVerificationRoute::CandidateTriage
-                if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
+                if primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
             {
                 report.candidate_triage_identity_components += 1;
             }
@@ -893,7 +898,7 @@ async fn preflight_listing(
                 report.candidate_triage_conditional_relationship_components += 1;
             }
             AvionicsIdentityVerificationRoute::GroundedCuration
-                if primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
+                if primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
             {
                 // A locally approved primary cannot be rejected, so the
                 // execution path necessarily evaluates its relationship.
@@ -906,13 +911,16 @@ async fn preflight_listing(
         }
     }
     if require_commit_readiness
-        && (!paid_candidate_identities.is_empty() || report.generic_invalid_identity_components > 0)
+        && (report.candidate_adjudication_identity_components > 0
+            || report.candidate_adjudication_conditional_relationship_components > 0
+            || report.candidate_triage_identity_components > 0
+            || report.candidate_triage_conditional_relationship_components > 0
+            || report.grounded_initial_identity_components > 0
+            || report.grounded_conditional_relationship_components > 0
+            || report.generic_invalid_identity_components > 0)
     {
-        let candidate_graph_keys = match exact_candidate_graph_key_envelope(
-            db,
-            &paid_candidate_identities,
-        )
-        .await
+        let candidate_graph_keys = match candidate_graph_key_envelope(db, &paid_candidate_scope)
+            .await
         {
             Ok(keys) => keys,
             Err(error) => {
@@ -923,22 +931,25 @@ async fn preflight_listing(
                 return report;
             }
         };
-        match unrelated_preserved_avionics_blocker(db, row.listing_id, &candidate_graph_keys).await
-        {
-            Ok(Some(reason)) => {
-                clear_paid_preflight_counts(&mut report);
-                report.note = format!(
-                    "automatic verification is unavailable before paid avionics work: {reason}"
-                );
-                return report;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                clear_paid_preflight_counts(&mut report);
-                report.note = format!(
-                    "automatic verification readiness could not be checked before paid avionics work: {error}"
-                );
-                return report;
+        if let Some(candidate_graph_keys) = candidate_graph_keys {
+            match unrelated_preserved_avionics_blocker(db, row.listing_id, &candidate_graph_keys)
+                .await
+            {
+                Ok(Some(reason)) => {
+                    clear_paid_preflight_counts(&mut report);
+                    report.note = format!(
+                        "automatic verification is unavailable before paid avionics work: {reason}"
+                    );
+                    return report;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    clear_paid_preflight_counts(&mut report);
+                    report.note = format!(
+                        "automatic verification readiness could not be checked before paid avionics work: {error}"
+                    );
+                    return report;
+                }
             }
         }
     }
@@ -966,7 +977,7 @@ async fn preflight_identity_component(
     listing_context: &ListingEvidenceContext,
     identity: IdentityInput<'_>,
     source_evidence_text: Option<&str>,
-) -> Result<AvionicsIdentityVerificationRoute, String> {
+) -> Result<AvionicsIdentityVerificationPlan, String> {
     let request = identity_request(
         row,
         source_url,
@@ -979,38 +990,40 @@ async fn preflight_identity_component(
         .map_err(|error| error.to_string())
 }
 
-async fn exact_candidate_graph_key_envelope(
+fn extend_existing_catalog_scope(
+    target: &mut AvionicsExistingCatalogScope,
+    source: &AvionicsExistingCatalogScope,
+) {
+    target
+        .catalog_ids
+        .extend(source.catalog_ids.iter().copied());
+    target
+        .manufacturer_identity_ids
+        .extend(source.manufacturer_identity_ids.iter().copied());
+    target.unbounded |= source.unbounded;
+}
+
+async fn candidate_graph_key_envelope(
     db: &AppDb,
-    identities: &[(String, String)],
-) -> VerificationResult<BTreeSet<String>> {
-    let normalized_identities = identities
-        .iter()
-        .filter_map(|(manufacturer, model)| {
-            let manufacturer = normalize_avionics_manufacturer_name(manufacturer);
-            let model = normalize_avionics_identifier(model);
-            (!manufacturer.is_empty() && !model.is_empty()).then_some((manufacturer, model))
-        })
-        .collect::<BTreeSet<_>>();
-    if normalized_identities.is_empty() {
-        return Ok(BTreeSet::new());
+    scope: &AvionicsExistingCatalogScope,
+) -> VerificationResult<Option<BTreeSet<String>>> {
+    if scope.unbounded {
+        return Ok(None);
+    }
+    if scope.catalog_ids.is_empty() && scope.manufacturer_identity_ids.is_empty() {
+        return Ok(Some(BTreeSet::new()));
     }
     let sql = db.sql(
         r#"
         SELECT
+          graph.avionics_model_id,
           graph.avionics_manufacturer_identity_id AS manufacturer_identity_id,
-          graph.canonical_product_key,
-          manufacturer.name AS manufacturer,
-          model.name AS model
+          graph.canonical_product_key
         FROM avionics_approved_product_graph_identities graph
         JOIN avionics_models model
           ON model.id = graph.avionics_model_id
-        JOIN avionics_manufacturer_effective_memberships membership
-          ON membership.avionics_manufacturer_identity_id =
-             graph.avionics_manufacturer_identity_id
-        JOIN avionics_manufacturers manufacturer
-          ON manufacturer.id = membership.avionics_manufacturer_id
         WHERE model.catalog_status = 'approved'
-        ORDER BY model.id, manufacturer.id
+        ORDER BY model.id
         "#,
     );
     let rows = match db.backend() {
@@ -1027,16 +1040,17 @@ async fn exact_candidate_graph_key_envelope(
     };
     rows.into_iter()
         .filter(|row| {
-            normalized_identities.contains(&(
-                normalize_avionics_manufacturer_name(&row.manufacturer),
-                normalize_avionics_identifier(&row.model),
-            ))
+            scope.catalog_ids.contains(&row.avionics_model_id)
+                || scope
+                    .manufacturer_identity_ids
+                    .contains(&row.manufacturer_identity_id)
         })
         .map(|row| {
             approved_avionics_product_key(row.manufacturer_identity_id, &row.canonical_product_key)
                 .map_err(AvionicsVerificationError::Validation)
         })
-        .collect()
+        .collect::<VerificationResult<BTreeSet<_>>>()
+        .map(Some)
 }
 
 fn clear_paid_preflight_counts(report: &mut AvionicsVerificationPreflightListingReport) {
@@ -1354,6 +1368,7 @@ async fn process_listing(
     // transaction cannot commit.
     let mut provider_free_candidate_indices = Vec::new();
     let mut provider_candidate_indices = Vec::new();
+    let mut candidate_scope = AvionicsExistingCatalogScope::default();
     for (candidate_index, raw) in raw_avionics.iter().enumerate() {
         if raw_candidate_structure_issue(raw).is_some() {
             provider_free_candidate_indices.push(candidate_index);
@@ -1363,7 +1378,7 @@ async fn process_listing(
             provider_candidate_indices.push(candidate_index);
             continue;
         }
-        let primary_route = match preflight_identity_component(
+        let primary_plan = match preflight_identity_component(
             db,
             row,
             source_url.as_deref(),
@@ -1378,7 +1393,7 @@ async fn process_listing(
         )
         .await
         {
-            Ok(route) => route,
+            Ok(plan) => plan,
             Err(error) => {
                 blocking_reasons.push(format!(
                     "candidate {candidate_index}: provider-free primary identity preflight failed: {error}"
@@ -1386,7 +1401,8 @@ async fn process_listing(
                 continue;
             }
         };
-        let replacement_route = if let Some(replacement) = raw.replaces.as_ref() {
+        extend_existing_catalog_scope(&mut candidate_scope, &primary_plan.existing_catalog_scope);
+        let replacement_plan = if let Some(replacement) = raw.replaces.as_ref() {
             match preflight_identity_component(
                 db,
                 row,
@@ -1402,7 +1418,7 @@ async fn process_listing(
             )
             .await
             {
-                Ok(route) => Some(route),
+                Ok(plan) => Some(plan),
                 Err(error) => {
                     blocking_reasons.push(format!(
                         "candidate {candidate_index}: provider-free replacement identity preflight failed: {error}"
@@ -1413,9 +1429,16 @@ async fn process_listing(
         } else {
             None
         };
-        let fully_local = primary_route == AvionicsIdentityVerificationRoute::VerifiedLocal
-            && replacement_route
-                .is_none_or(|route| route == AvionicsIdentityVerificationRoute::VerifiedLocal);
+        if let Some(replacement_plan) = replacement_plan.as_ref() {
+            extend_existing_catalog_scope(
+                &mut candidate_scope,
+                &replacement_plan.existing_catalog_scope,
+            );
+        }
+        let fully_local = primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal
+            && replacement_plan
+                .as_ref()
+                .is_none_or(|plan| plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal);
         if fully_local {
             provider_free_candidate_indices.push(candidate_index);
         } else {
@@ -1423,26 +1446,13 @@ async fn process_listing(
         }
     }
 
-    let paid_candidate_identities = raw_avionics
-        .iter()
-        .filter(|raw| {
-            raw_candidate_structure_issue(raw).is_none() && generic_model_issue(raw).is_none()
-        })
-        .flat_map(|raw| {
-            std::iter::once((raw.manufacturer.clone(), raw.model.clone())).chain(
-                raw.replaces.iter().map(|replacement| {
-                    (replacement.manufacturer.clone(), replacement.model.clone())
-                }),
-            )
-        })
-        .collect::<Vec<_>>();
     let (mut paid_candidate_graph_keys, paid_candidate_graph_key_error) = if apply {
-        match exact_candidate_graph_key_envelope(db, &paid_candidate_identities).await {
+        match candidate_graph_key_envelope(db, &candidate_scope).await {
             Ok(keys) => (keys, None),
-            Err(error) => (BTreeSet::new(), Some(error.to_string())),
+            Err(error) => (Some(BTreeSet::new()), Some(error.to_string())),
         }
     } else {
-        (BTreeSet::new(), None)
+        (None, None)
     };
 
     let mut execution_order = provider_free_candidate_indices
@@ -1473,19 +1483,21 @@ async fn process_listing(
             }
             if apply {
                 listing_report.prepared_link_count = prepared.len();
-                paid_candidate_graph_keys.extend(prepared.iter().flat_map(|link| {
-                    std::iter::once(link.identity_key.clone())
-                        .chain(link.replacement_identity_key.iter().cloned())
-                }));
+                if let Some(candidate_graph_keys) = paid_candidate_graph_keys.as_mut() {
+                    candidate_graph_keys.extend(prepared.iter().flat_map(|link| {
+                        std::iter::once(link.identity_key.clone())
+                            .chain(link.replacement_identity_key.iter().cloned())
+                    }));
+                }
                 if let Some(error) = paid_candidate_graph_key_error.as_ref() {
                     blocking_reasons.push(format!(
                         "paid candidate graph-key envelope could not be checked before identity work: {error}"
                     ));
-                } else {
+                } else if let Some(candidate_graph_keys) = paid_candidate_graph_keys.as_ref() {
                     match unrelated_preserved_avionics_blocker(
                         db,
                         row.listing_id,
-                        &paid_candidate_graph_keys,
+                        candidate_graph_keys,
                     )
                     .await
                     {
@@ -6553,7 +6565,8 @@ mod tests {
                 Some(&evidence),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .route,
             AvionicsIdentityVerificationRoute::VerifiedLocal
         );
 
@@ -7333,6 +7346,125 @@ mod tests {
             error.contains("automated review apply was rejected")
                 && !error.contains("unrelated existing listing avionics cannot commit")
         }));
+    }
+
+    #[tokio::test]
+    async fn cross_maker_adjudication_fallback_does_not_false_block_apply_preflight() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let garmin_product_id = seed_approved_suggestion_product(&db, true).await;
+        let cessna_product_id = seed_approved_suggestion_product_for_manufacturer(
+            &db,
+            true,
+            "Cessna",
+            "https://www.cessna.com",
+        )
+        .await;
+        let (listing_id, _link_id, _) = seed_preserved_association_listing(
+            &db,
+            "cross-maker-adjudication-fallback",
+            cessna_product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(cessna_product_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let (garmin_manufacturer, garmin_model): (String, String) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.name, model.name
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            WHERE model.id = ?
+            "#,
+        )
+        .bind(garmin_product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let (submission_id, rendered_html, review_json, review_sha256, aspect_count): (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            r#"
+            SELECT review.plugin_submission_id, submission.rendered_html,
+                   review.review_payload_json, review.review_payload_sha256,
+                   review.pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN plugin_submissions submission
+              ON submission.id = review.plugin_submission_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut aspects =
+            parse_current_pending_review_aspects(&review_json, &review_sha256, aspect_count)
+                .unwrap();
+        let observed_model = format!("{garmin_model} Flight Display");
+        let evidence = format!("{garmin_manufacturer} {observed_model} installed");
+        aspects.push(
+            PendingReviewAspect::avionics(
+                "fixture:cross-maker-adjudication:0",
+                "avionics",
+                observed_model.clone(),
+                evidence.clone(),
+                "descriptive expansion requires candidate adjudication",
+                1,
+                "installed",
+                Some(evidence.clone()),
+                Some("high".to_string()),
+            )
+            .with_proposed_product(ReviewProduct::proposed(
+                garmin_manufacturer,
+                observed_model,
+                vec!["Flight Display".to_string()],
+            )),
+        );
+        let rendered_html = format!("{rendered_html}<p>{evidence}</p>");
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET rendered_html = ?, rendered_html_sha256 = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rendered_html)
+        .bind(sha256_hex(rendered_html.as_bytes()))
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &aspects,
+        )
+        .await
+        .unwrap();
+
+        let preflight =
+            preflight_listing_avionics(&db, listing_id, AvionicsVerificationExecutionMode::Apply)
+                .await
+                .unwrap();
+        let ListingAvionicsVerificationPreflight::PendingReview { report } = preflight else {
+            panic!("the listing should remain in review")
+        };
+
+        assert_eq!(report.status, "ready_retained_observations");
+        assert_eq!(report.candidate_adjudication_identity_components, 1);
+        assert!(!report
+            .note
+            .contains("automatic verification is unavailable"));
     }
 
     #[tokio::test]
@@ -8439,11 +8571,27 @@ mod tests {
     }
 
     async fn seed_approved_suggestion_product(db: &AppDb, attest: bool) -> i64 {
-        let pool = sqlite_pool(db);
-        let manufacturer_key = normalize_avionics_manufacturer_name("Garmin");
-        sqlx::query(
-            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', ?) ON CONFLICT (normalized_name) DO NOTHING",
+        seed_approved_suggestion_product_for_manufacturer(
+            db,
+            attest,
+            "Garmin",
+            "https://www.garmin.com",
         )
+        .await
+    }
+
+    async fn seed_approved_suggestion_product_for_manufacturer(
+        db: &AppDb,
+        attest: bool,
+        manufacturer: &str,
+        source_origin: &str,
+    ) -> i64 {
+        let pool = sqlite_pool(db);
+        let manufacturer_key = normalize_avionics_manufacturer_name(manufacturer);
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(manufacturer)
         .bind(&manufacturer_key)
         .execute(pool)
         .await
@@ -8458,9 +8606,9 @@ mod tests {
             db,
             manufacturer_id,
             &ManufacturerIdentityEvidence {
-                source_url: "https://www.garmin.com/en-US/aviation/".to_string(),
-                source_title: "Garmin Aviation".to_string(),
-                evidence_text: "Garmin identifies its aviation products.".to_string(),
+                source_url: format!("{source_origin}/aviation/"),
+                source_title: format!("{manufacturer} Aviation"),
+                evidence_text: format!("{manufacturer} identifies its aviation products."),
             },
         )
         .await
@@ -8470,8 +8618,20 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap();
-        let model = format!("GI 275 TEST {sequence}");
-        let identifier = format!("GI-275-TEST-{sequence}");
+        let model = if manufacturer == "Garmin" {
+            format!("GI 275 TEST {sequence}")
+        } else {
+            format!("{manufacturer} DISPLAY TEST {sequence}")
+        };
+        let identifier = if manufacturer == "Garmin" {
+            format!("GI-275-TEST-{sequence}")
+        } else {
+            format!(
+                "{}-DISPLAY-TEST-{sequence}",
+                manufacturer_key.to_uppercase()
+            )
+        };
+        let product_source_url = format!("{source_origin}/aviation/product");
         let product_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO avionics_models (
@@ -8481,8 +8641,7 @@ mod tests {
               identity_source_title, identity_evidence_text,
               identity_evidence_kind, identity_confidence, catalog_reviewed_at
             ) VALUES (?, ?, ?, 'manufacturer_model_number', ?, ?,
-                      'https://www.garmin.com/aviation/product', 'Garmin product manual',
-                      'Garmin identifies the exact test flight display.',
+                      ?, ?, ?,
                       'authoritative_reference', 'very_high', CURRENT_TIMESTAMP)
             RETURNING id
             "#,
@@ -8492,6 +8651,11 @@ mod tests {
         .bind(normalize_avionics_model_name(&model))
         .bind(&identifier)
         .bind(normalize_avionics_identifier(&identifier))
+        .bind(&product_source_url)
+        .bind(format!("{manufacturer} product manual"))
+        .bind(format!(
+            "{manufacturer} identifies the exact test flight display."
+        ))
         .fetch_one(pool)
         .await
         .unwrap();
@@ -8528,16 +8692,17 @@ mod tests {
                   approval_basis, approval_reason
                 )
                 SELECT 'manufacturer_primary', avionics_manufacturer_identity_id,
-                       'https://www.garmin.com',
-                       'https://www.garmin.com/aviation/product',
-                       'Garmin aviation product catalog',
-                       'Garmin publishes the exact test product.',
+                       ?, ?, ?, ?,
                        'curated_bootstrap', 'verification test fixture'
                 FROM avionics_approved_product_identities
                 WHERE avionics_model_id = ?
                 ON CONFLICT DO NOTHING
-                "#,
+            "#,
             )
+            .bind(source_origin)
+            .bind(&product_source_url)
+            .bind(format!("{manufacturer} aviation product catalog"))
+            .bind(format!("{manufacturer} publishes the exact test product."))
             .bind(product_id)
             .execute(pool)
             .await
@@ -8547,7 +8712,7 @@ mod tests {
                 db,
                 &mut transaction,
                 product_id,
-                "https://www.garmin.com/aviation/product",
+                &product_source_url,
             )
             .await
             .unwrap());
