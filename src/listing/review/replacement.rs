@@ -578,7 +578,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-            let corroborated_associations = current_authorized_associations(
+            let authorized_associations = current_authorized_associations(
                 listing_id,
                 &assignments,
                 &corroboration_rows,
@@ -596,8 +596,8 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 role: ListingAssociationRole::Replacement,
                 avionics_model_id: request.child.product_id,
             };
-            if !corroborated_associations.contains(&accepted_parent)
-                || !corroborated_associations.contains(&accepted_child)
+            if !authorized_associations.contains(&accepted_parent)
+                || !authorized_associations.contains(&accepted_child)
             {
                 return Err(ReviewError::Conflict(
                     "atomic replacement approval did not produce exact listing corroboration"
@@ -605,24 +605,21 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 ));
             }
 
-            remove_attested_preserved_aspects(
+            remove_authorized_preserved_aspects(
                 &mut payload.aspects,
-                &reuse_attested_ids,
-                &corroborated_associations,
+                &authorized_associations,
             )?;
-            add_unattested_preserved_aspects(
+            add_unauthorized_preserved_aspects(
                 &mut payload.aspects,
                 &assignments,
                 &approved,
-                &reuse_attested_ids,
-                &corroborated_associations,
+                &authorized_associations,
             )?;
             validate_current_covered_associations(&payload.aspects, &assignments)?;
             let hidden_blockers = hidden_preserved_blockers(
                 &payload.aspects,
                 &assignments,
-                &reuse_attested_ids,
-                &corroborated_associations,
+                &authorized_associations,
             );
             if !hidden_blockers.is_empty() {
                 return Err(ReviewError::Conflict(format!(

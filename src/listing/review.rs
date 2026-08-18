@@ -2858,7 +2858,7 @@ async fn restage_pending_review_if_current_with_commit(
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-            let mut corroborated_associations = current_authorized_associations(
+            let mut authorized_associations = current_authorized_associations(
                 listing_id,
                 &assignments,
                 &corroboration_rows,
@@ -2979,7 +2979,7 @@ async fn restage_pending_review_if_current_with_commit(
                     )));
                 }
 
-                if !corroborated_associations.contains(association) {
+                if !authorized_associations.contains(association) {
                     // A stale row is not useful history: it refers to an
                     // observation or product fingerprint that no longer
                     // authorizes this exact association. Replace it inside
@@ -3005,7 +3005,7 @@ async fn restage_pending_review_if_current_with_commit(
                             .bind(listing_id)
                             .fetch_all(&mut *transaction)
                             .await?;
-                    corroborated_associations = current_authorized_associations(
+                    authorized_associations = current_authorized_associations(
                         listing_id,
                         &assignments,
                         &corroboration_rows,
@@ -3013,7 +3013,7 @@ async fn restage_pending_review_if_current_with_commit(
                         &active_collision_catalog_rows,
                         &catalog_product_fingerprints,
                     );
-                    if !corroborated_associations.contains(association) {
+                    if !authorized_associations.contains(association) {
                         return Err(ReviewError::Conflict(format!(
                             "exact listing corroboration for catalog id {} could not be persisted",
                             commit.avionics_model_id
@@ -3022,17 +3022,15 @@ async fn restage_pending_review_if_current_with_commit(
                 }
             }
 
-            let removed_attested = remove_attested_preserved_aspects(
+            let removed_authorized = remove_authorized_preserved_aspects(
                 &mut payload.aspects,
-                &reuse_attested_ids,
-                &corroborated_associations,
+                &authorized_associations,
             )?;
-            let added_unattested = add_unattested_preserved_aspects(
+            let added_unauthorized = add_unauthorized_preserved_aspects(
                 &mut payload.aspects,
                 &assignments,
                 &approved,
-                &reuse_attested_ids,
-                &corroborated_associations,
+                &authorized_associations,
             )?;
             repaired_evidence |= apply_exact_association_evidence(
                 &mut payload.aspects,
@@ -3042,8 +3040,7 @@ async fn restage_pending_review_if_current_with_commit(
             let hidden_blockers = hidden_preserved_blockers(
                 &payload.aspects,
                 &assignments,
-                &reuse_attested_ids,
-                &corroborated_associations,
+                &authorized_associations,
             );
             if !hidden_blockers.is_empty() {
                 return Err(ReviewError::Conflict(format!(
@@ -3080,8 +3077,8 @@ async fn restage_pending_review_if_current_with_commit(
                 return Ok::<Option<StagedPendingReview>, ReviewError>(None);
             }
             let (review_payload_sha256, pending_aspect_count) =
-                if removed_attested
-                    || added_unattested
+                if removed_authorized
+                    || added_unauthorized
                     || repaired_evidence
                     || ordinary_aspect_used
                 {
@@ -5374,19 +5371,25 @@ fn current_authorized_associations(
         catalog_product_fingerprints,
     );
 
-    // A completed whole-listing review is already the durable corroboration
-    // boundary for every component of that exact link. Do not require a
-    // redundant role row for this pre-existing stronger conclusion.
+    // A completed whole-listing review remains a legacy authorization only
+    // while each exact product is globally reusable. Unlike a hash-bound
+    // authorization row, source/confidence alone carries no current product
+    // or collision fingerprint and must never bypass global eligibility.
     for assignment in assignments.iter().filter(|assignment| {
         assignment.source == "listing_review"
             && assignment.source_confidence.as_deref() == Some("high")
     }) {
-        authorized.insert(CoveredListingAssociation {
-            listing_link_id: assignment.listing_link_id,
-            role: ListingAssociationRole::Installed,
-            avionics_model_id: assignment.avionics_model_id,
-        });
-        if let Some(avionics_model_id) = assignment.replaces_avionics_model_id {
+        if reuse_attested_ids.contains(&assignment.avionics_model_id) {
+            authorized.insert(CoveredListingAssociation {
+                listing_link_id: assignment.listing_link_id,
+                role: ListingAssociationRole::Installed,
+                avionics_model_id: assignment.avionics_model_id,
+            });
+        }
+        if let Some(avionics_model_id) = assignment
+            .replaces_avionics_model_id
+            .filter(|id| reuse_attested_ids.contains(id))
+        {
             authorized.insert(CoveredListingAssociation {
                 listing_link_id: assignment.listing_link_id,
                 role: ListingAssociationRole::Replacement,
@@ -5481,30 +5484,25 @@ fn current_row_backed_authorized_associations(
     authorized
 }
 
-/// Remove hash-bound maintenance aspects after their approved catalog target
-/// has acquired both a current reuse attestation and exact listing-association
-/// corroboration.
+/// Remove hash-bound maintenance aspects after their exact association has a
+/// current authorization.
 ///
 /// A real extraction aspect can also be annotated with a reuse target while
 /// that target is unselectable. Its identity and reviewer decision remain
-/// relevant after attestation, so only the exact synthetic preserved-
+/// relevant after authorization, so only the exact synthetic preserved-
 /// association shape created by `preserved_product_aspect` is retired here.
-fn remove_attested_preserved_aspects(
+fn remove_authorized_preserved_aspects(
     aspects: &mut Vec<PendingReviewAspect>,
-    reuse_attested_ids: &HashSet<i64>,
-    corroborated_associations: &HashSet<CoveredListingAssociation>,
+    authorized_associations: &HashSet<CoveredListingAssociation>,
 ) -> ReviewResult<bool> {
     let candidates = aspects
         .iter()
         .filter(|aspect| {
             is_synthetic_preserved_attestation_aspect(aspect)
                 && aspect
-                    .reuse_attestation_target_id
-                    .is_some_and(|target_id| reuse_attested_ids.contains(&target_id))
-                && aspect
                     .covered_associations
                     .first()
-                    .is_some_and(|association| corroborated_associations.contains(association))
+                    .is_some_and(|association| authorized_associations.contains(association))
         })
         .filter_map(|aspect| {
             aspect
@@ -5573,8 +5571,7 @@ fn covered_association_owners(
 fn hidden_preserved_blockers(
     aspects: &[PendingReviewAspect],
     assignments: &[ExistingAssignmentRow],
-    reuse_attested_ids: &HashSet<i64>,
-    corroborated_associations: &HashSet<CoveredListingAssociation>,
+    authorized_associations: &HashSet<CoveredListingAssociation>,
 ) -> Vec<String> {
     let covered = covered_association_owners(aspects);
     let mut blockers = Vec::new();
@@ -5589,18 +5586,13 @@ fn hidden_preserved_blockers(
                     "link {} installed catalog id {} is not approved",
                     assignment.listing_link_id, assignment.avionics_model_id
                 ));
-            } else if !reuse_attested_ids.contains(&assignment.avionics_model_id) {
-                blockers.push(format!(
-                    "link {} installed catalog id {} lacks a current reuse attestation",
-                    assignment.listing_link_id, assignment.avionics_model_id
-                ));
-            } else if !corroborated_associations.contains(&CoveredListingAssociation {
+            } else if !authorized_associations.contains(&CoveredListingAssociation {
                 listing_link_id: assignment.listing_link_id,
                 role: ListingAssociationRole::Installed,
                 avionics_model_id: assignment.avionics_model_id,
             }) {
                 blockers.push(format!(
-                    "link {} installed catalog id {} lacks exact listing corroboration",
+                    "link {} installed catalog id {} lacks current association authorization",
                     assignment.listing_link_id, assignment.avionics_model_id
                 ));
             }
@@ -5616,18 +5608,13 @@ fn hidden_preserved_blockers(
                         "link {} replacement catalog id {replacement_id} is not approved",
                         assignment.listing_link_id
                     ));
-                } else if !reuse_attested_ids.contains(&replacement_id) {
-                    blockers.push(format!(
-                        "link {} replacement catalog id {replacement_id} lacks a current reuse attestation",
-                        assignment.listing_link_id
-                    ));
-                } else if !corroborated_associations.contains(&CoveredListingAssociation {
+                } else if !authorized_associations.contains(&CoveredListingAssociation {
                     listing_link_id: assignment.listing_link_id,
                     role: ListingAssociationRole::Replacement,
                     avionics_model_id: replacement_id,
                 }) {
                     blockers.push(format!(
-                        "link {} replacement catalog id {replacement_id} lacks exact listing corroboration",
+                        "link {} replacement catalog id {replacement_id} lacks current association authorization",
                         assignment.listing_link_id
                     ));
                 }
@@ -5799,16 +5786,15 @@ fn remove_stale_covered_relationships(
 }
 
 /// Add an explicit, hash-bound aspect for every preserved approved listing
-/// association that cannot pass the current positive-only reuse gate.
+/// association that lacks current authorization.
 ///
 /// A replacement component can only be reviewed with its installed parent,
 /// so an otherwise reusable parent is also materialized when necessary.
-fn add_unattested_preserved_aspects(
+fn add_unauthorized_preserved_aspects(
     aspects: &mut Vec<PendingReviewAspect>,
     assignments: &[ExistingAssignmentRow],
     approved: &HashMap<i64, ReviewProduct>,
-    reuse_attested_ids: &HashSet<i64>,
-    corroborated_associations: &HashSet<CoveredListingAssociation>,
+    authorized_associations: &HashSet<CoveredListingAssociation>,
 ) -> ReviewResult<bool> {
     fn annotate_existing_aspect(
         aspect: &mut PendingReviewAspect,
@@ -5871,17 +5857,15 @@ fn add_unattested_preserved_aspects(
             avionics_model_id: assignment.avionics_model_id,
         };
         let installed_needs_attestation = installed_product.is_some()
-            && (!reuse_attested_ids.contains(&assignment.avionics_model_id)
-                || !corroborated_associations.contains(&installed_association));
+            && !authorized_associations.contains(&installed_association);
         let replacement_needs_attestation =
             assignment.replaces_avionics_model_id.is_some_and(|id| {
                 replacement_product.is_some()
-                    && (!reuse_attested_ids.contains(&id)
-                        || !corroborated_associations.contains(&CoveredListingAssociation {
-                            listing_link_id: assignment.listing_link_id,
-                            role: ListingAssociationRole::Replacement,
-                            avionics_model_id: id,
-                        }))
+                    && !authorized_associations.contains(&CoveredListingAssociation {
+                        listing_link_id: assignment.listing_link_id,
+                        role: ListingAssociationRole::Replacement,
+                        avionics_model_id: id,
+                    })
             });
         let installed_is_covered = owners.contains_key(&installed_key);
         let replacement_is_covered = owners.contains_key(&replacement_key);
@@ -6540,7 +6524,7 @@ async fn preflight_existing_product_association_with_snapshot(
     let assignments = load_existing_assignments(db, listing_id).await?;
     validate_current_covered_associations(&payload.aspects, &assignments)?;
     let corroboration_rows = load_association_authorizations(db, listing_id).await?;
-    let corroborated_associations = current_authorized_associations(
+    let authorized_associations = current_authorized_associations(
         listing_id,
         &assignments,
         &corroboration_rows,
@@ -6548,12 +6532,8 @@ async fn preflight_existing_product_association_with_snapshot(
         &snapshot.active_collision_catalog_rows,
         &snapshot.catalog_product_fingerprints,
     );
-    let hidden = hidden_preserved_blockers(
-        &payload.aspects,
-        &assignments,
-        &snapshot.reuse_attested_ids,
-        &corroborated_associations,
-    );
+    let hidden =
+        hidden_preserved_blockers(&payload.aspects, &assignments, &authorized_associations);
     if !hidden.is_empty() {
         return Err(ReviewError::Stale(format!(
             "the pending review omits preserved avionics; restage before grounding: {}",
@@ -7770,7 +7750,7 @@ pub async fn preflight_listing_review_resolution(
     let corroboration_rows = load_association_authorizations(db, review.listing_id).await?;
     let active_collision_catalog_rows = load_active_collision_catalog_rows(db).await?;
     let catalog_product_fingerprints = load_catalog_product_fingerprint_map(db).await?;
-    let corroborated_associations = current_authorized_associations(
+    let authorized_associations = current_authorized_associations(
         review.listing_id,
         &existing_assignments,
         &corroboration_rows,
@@ -7781,12 +7761,11 @@ pub async fn preflight_listing_review_resolution(
     let hidden_blockers = hidden_preserved_blockers(
         &current_payload.aspects,
         &existing_assignments,
-        &reuse_attested_ids,
-        &corroborated_associations,
+        &authorized_associations,
     );
     if !hidden_blockers.is_empty() {
         return Err(ReviewError::Stale(format!(
-            "the pending review omits preserved avionics that cannot pass current-policy reuse; restage before grounding: {}",
+            "the pending review omits preserved avionics without current association authorization; restage before grounding: {}",
             hidden_blockers.join("; ")
         )));
     }
@@ -8359,7 +8338,7 @@ pub async fn resolve_listing_review(
                 .bind(listing_id)
                 .fetch_all(&mut *transaction)
                 .await?;
-            let corroborated_associations = current_authorized_associations(
+            let authorized_associations = current_authorized_associations(
                 listing_id,
                 &existing_links,
                 &association_corroboration_rows,
@@ -8445,32 +8424,20 @@ pub async fn resolve_listing_review(
                     role: ListingAssociationRole::Installed,
                     avionics_model_id: existing.avionics_model_id,
                 };
-                if !current_reuse_attested_ids.contains(&existing.avionics_model_id) {
+                if !authorized_associations.contains(&installed_association) {
                     return Err(ReviewError::Stale(format!(
-                        "preserved avionics catalog id {} on listing link {} is not eligible for current-policy reuse; ground and re-attest it before resolving this review",
-                        existing.avionics_model_id, existing.listing_link_id
-                    )));
-                }
-                if !corroborated_associations.contains(&installed_association) {
-                    return Err(ReviewError::Stale(format!(
-                        "preserved avionics catalog id {} on listing link {} lacks exact listing-association corroboration; corroborate it before resolving this review",
+                        "preserved avionics catalog id {} on listing link {} lacks current association authorization; restage and review it before resolving this review",
                         existing.avionics_model_id, existing.listing_link_id
                     )));
                 }
                 if let Some(replacement_id) = existing.replaces_avionics_model_id {
-                    if !current_reuse_attested_ids.contains(&replacement_id) {
-                        return Err(ReviewError::Stale(format!(
-                            "preserved replacement catalog id {replacement_id} on listing link {} is not eligible for current-policy reuse; ground and re-attest it before resolving this review",
-                            existing.listing_link_id
-                        )));
-                    }
-                    if !corroborated_associations.contains(&CoveredListingAssociation {
+                    if !authorized_associations.contains(&CoveredListingAssociation {
                         listing_link_id: existing.listing_link_id,
                         role: ListingAssociationRole::Replacement,
                         avionics_model_id: replacement_id,
                     }) {
                         return Err(ReviewError::Stale(format!(
-                            "preserved replacement catalog id {replacement_id} on listing link {} lacks exact listing-association corroboration; corroborate it before resolving this review",
+                            "preserved replacement catalog id {replacement_id} on listing link {} lacks current association authorization; restage and review it before resolving this review",
                             existing.listing_link_id
                         )));
                     }
@@ -9410,6 +9377,54 @@ mod tests {
             .collect()
     }
 
+    fn collision_catalog_row(id: i64) -> ActiveCollisionCatalogFingerprintRow {
+        ActiveCollisionCatalogFingerprintRow {
+            id,
+            catalog_status: "approved".to_string(),
+            effective_manufacturer_identity_id: Some(1),
+            model: format!("Product {id}"),
+            manufacturer_identifier_kind: Some("manufacturer_model_number".to_string()),
+            manufacturer_identifier: Some(format!("PRODUCT{id}")),
+        }
+    }
+
+    fn same_case_authorization_row(
+        listing_id: i64,
+        assignment: &ExistingAssignmentRow,
+        role: ListingAssociationRole,
+        product_fingerprint: &str,
+        collision_rows: &[ActiveCollisionCatalogFingerprintRow],
+    ) -> AssociationAuthorizationRow {
+        let avionics_model_id = match role {
+            ListingAssociationRole::Installed => assignment.avionics_model_id,
+            ListingAssociationRole::Replacement => assignment
+                .replaces_avionics_model_id
+                .expect("replacement authorization requires a replacement target"),
+        };
+        AssociationAuthorizationRow {
+            listing_link_id: assignment.listing_link_id,
+            association_role: association_role_label(role).to_string(),
+            avionics_model_id,
+            authorization_kind: "same_case_grounded".to_string(),
+            observation_sha256: association_observation_sha256(
+                listing_id,
+                assignment,
+                role,
+                assignment.source_notes.as_deref().unwrap_or_default(),
+            ),
+            product_fingerprint: product_fingerprint.to_string(),
+            current_reuse_product_fingerprint: None,
+            grounded_resolution_sha256: Some("a".repeat(64)),
+            evidence_capture_is_current: true,
+            policy_version: ASSOCIATION_AUTHORIZATION_POLICY_VERSION.to_string(),
+            collision_closure_sha256: fingerprint_grounded_collision_closure(
+                collision_rows,
+                avionics_model_id,
+            )
+            .expect("test target must have a collision closure"),
+        }
+    }
+
     fn projected_suggestion_for_test(
         aspect_id: &str,
         aspects: &[PendingReviewAspect],
@@ -10164,11 +10179,10 @@ mod tests {
             existing_assignment(8, 12, 1, "replaces", Some(13)),
         ];
         let approved = approved_review_products(&[11, 12, 13]);
-        assert!(add_unattested_preserved_aspects(
+        assert!(add_unauthorized_preserved_aspects(
             &mut aspects,
             &assignments,
             &approved,
-            &HashSet::new(),
             &HashSet::new(),
         )
         .unwrap());
@@ -10186,8 +10200,7 @@ mod tests {
             "a preserved aspect must carry the exact installed association quantity"
         );
         assert!(
-            hidden_preserved_blockers(&aspects, &assignments, &HashSet::new(), &HashSet::new(),)
-                .is_empty(),
+            hidden_preserved_blockers(&aspects, &assignments, &HashSet::new()).is_empty(),
             "every association that would fail the transaction is now hash-bound to an aspect"
         );
 
@@ -10228,16 +10241,189 @@ mod tests {
     }
 
     #[test]
+    fn same_case_authorization_is_the_complete_preserved_association_gate_without_global_reuse() {
+        let listing_id = 1;
+        let assignment = existing_assignment(7, 11, 1, "installed", None);
+        let collision_rows = vec![collision_catalog_row(11)];
+        let product_fingerprint = "b".repeat(64);
+        let authorization = same_case_authorization_row(
+            listing_id,
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product_fingerprint,
+            &collision_rows,
+        );
+        let authorized = current_authorized_associations(
+            listing_id,
+            std::slice::from_ref(&assignment),
+            &[authorization],
+            &HashSet::new(),
+            &collision_rows,
+            &HashMap::from([(11, product_fingerprint)]),
+        );
+        let association = CoveredListingAssociation {
+            listing_link_id: 7,
+            role: ListingAssociationRole::Installed,
+            avionics_model_id: 11,
+        };
+        assert_eq!(authorized, HashSet::from([association]));
+
+        let approved = approved_review_products(&[11]);
+        let mut aspects = vec![preserved_product_aspect(
+            &assignment,
+            ListingAssociationRole::Installed,
+            approved.get(&11).unwrap(),
+            None,
+        )];
+        assert!(remove_authorized_preserved_aspects(&mut aspects, &authorized).unwrap());
+        assert!(aspects.is_empty());
+        assert!(!add_unauthorized_preserved_aspects(
+            &mut aspects,
+            std::slice::from_ref(&assignment),
+            &approved,
+            &authorized,
+        )
+        .unwrap());
+        assert!(hidden_preserved_blockers(
+            &aspects,
+            std::slice::from_ref(&assignment),
+            &authorized,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn stale_same_case_capture_product_or_collision_proof_is_not_authorized() {
+        let listing_id = 1;
+        let assignment = existing_assignment(7, 11, 1, "installed", None);
+        let collision_rows = vec![collision_catalog_row(11)];
+        let product_fingerprint = "b".repeat(64);
+        let current = same_case_authorization_row(
+            listing_id,
+            &assignment,
+            ListingAssociationRole::Installed,
+            &product_fingerprint,
+            &collision_rows,
+        );
+        let product_fingerprints = HashMap::from([(11, product_fingerprint)]);
+
+        let mut stale_capture = current.clone();
+        stale_capture.evidence_capture_is_current = false;
+        let mut stale_product = current.clone();
+        stale_product.product_fingerprint = "c".repeat(64);
+        let mut stale_collision = current;
+        stale_collision.collision_closure_sha256 = "d".repeat(64);
+        for stale in [stale_capture, stale_product, stale_collision] {
+            assert!(current_authorized_associations(
+                listing_id,
+                std::slice::from_ref(&assignment),
+                &[stale],
+                &HashSet::new(),
+                &collision_rows,
+                &product_fingerprints,
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_high_confidence_review_requires_current_reuse_for_each_role() {
+        let listing_id = 1;
+        let mut assignment = existing_assignment(8, 12, 1, "replaces", Some(13));
+        assignment.source = "listing_review".to_string();
+        assignment.source_confidence = Some("high".to_string());
+        assert!(current_authorized_associations(
+            listing_id,
+            std::slice::from_ref(&assignment),
+            &[],
+            &HashSet::new(),
+            &[],
+            &HashMap::new(),
+        )
+        .is_empty());
+
+        let installed_only = current_authorized_associations(
+            listing_id,
+            std::slice::from_ref(&assignment),
+            &[],
+            &HashSet::from([12]),
+            &[],
+            &HashMap::new(),
+        );
+        assert_eq!(
+            installed_only,
+            HashSet::from([CoveredListingAssociation {
+                listing_link_id: 8,
+                role: ListingAssociationRole::Installed,
+                avionics_model_id: 12,
+            }])
+        );
+
+        let both_roles = current_authorized_associations(
+            listing_id,
+            &[assignment],
+            &[],
+            &HashSet::from([12, 13]),
+            &[],
+            &HashMap::new(),
+        );
+        assert_eq!(both_roles.len(), 2);
+        assert!(both_roles.contains(&CoveredListingAssociation {
+            listing_link_id: 8,
+            role: ListingAssociationRole::Replacement,
+            avionics_model_id: 13,
+        }));
+    }
+
+    #[test]
+    fn same_case_authorization_covers_the_replacement_role_without_global_reuse() {
+        let listing_id = 1;
+        let assignment = existing_assignment(8, 12, 1, "replaces", Some(13));
+        let collision_rows = vec![collision_catalog_row(12), collision_catalog_row(13)];
+        let installed_fingerprint = "b".repeat(64);
+        let replacement_fingerprint = "c".repeat(64);
+        let rows = [
+            same_case_authorization_row(
+                listing_id,
+                &assignment,
+                ListingAssociationRole::Installed,
+                &installed_fingerprint,
+                &collision_rows,
+            ),
+            same_case_authorization_row(
+                listing_id,
+                &assignment,
+                ListingAssociationRole::Replacement,
+                &replacement_fingerprint,
+                &collision_rows,
+            ),
+        ];
+        let authorized = current_authorized_associations(
+            listing_id,
+            &[assignment],
+            &rows,
+            &HashSet::new(),
+            &collision_rows,
+            &HashMap::from([(12, installed_fingerprint), (13, replacement_fingerprint)]),
+        );
+        assert_eq!(authorized.len(), 2);
+        assert!(authorized.contains(&CoveredListingAssociation {
+            listing_link_id: 8,
+            role: ListingAssociationRole::Replacement,
+            avionics_model_id: 13,
+        }));
+    }
+
+    #[test]
     fn covered_unattested_approved_target_is_annotated_without_unreviewed_contract() {
         let mut aspects = vec![candidate_aspect("covered", 11, "Product 11")
             .with_covered_association(7, ListingAssociationRole::Installed, 11)];
         let assignments = vec![existing_assignment(7, 11, 1, "installed", None)];
         let approved = approved_review_products(&[11]);
-        assert!(add_unattested_preserved_aspects(
+        assert!(add_unauthorized_preserved_aspects(
             &mut aspects,
             &assignments,
             &approved,
-            &HashSet::new(),
             &HashSet::new(),
         )
         .unwrap());
@@ -10267,11 +10453,10 @@ mod tests {
         aspect.reason = "catalog_product_reuse_attestation_missing".to_string();
         let mut aspects = vec![aspect];
 
-        assert!(add_unattested_preserved_aspects(
+        assert!(add_unauthorized_preserved_aspects(
             &mut aspects,
             &[assignment],
             &approved,
-            &HashSet::from([11]),
             &HashSet::new(),
         )
         .unwrap());
@@ -10282,11 +10467,10 @@ mod tests {
     fn retiring_attested_replacement_child_preserves_parent_replacement_identity() {
         let assignments = vec![existing_assignment(8, 12, 1, "replaces", Some(13))];
         let mut aspects = Vec::new();
-        assert!(add_unattested_preserved_aspects(
+        assert!(add_unauthorized_preserved_aspects(
             &mut aspects,
             &assignments,
             &approved_review_products(&[12, 13]),
-            &HashSet::new(),
             &HashSet::new(),
         )
         .unwrap());
@@ -10297,9 +10481,8 @@ mod tests {
             role: ListingAssociationRole::Replacement,
             avionics_model_id: 13,
         };
-        assert!(remove_attested_preserved_aspects(
+        assert!(remove_authorized_preserved_aspects(
             &mut aspects,
-            &HashSet::from([13]),
             &HashSet::from([replacement.clone()]),
         )
         .unwrap());
@@ -10308,13 +10491,10 @@ mod tests {
         assert_eq!(parent.reuse_attestation_target_id, Some(12));
         assert_eq!(parent.replacement_aspect_id, None);
         assert_eq!(parent.replaces_product_id, Some(13));
-        assert!(hidden_preserved_blockers(
-            &aspects,
-            &assignments,
-            &HashSet::from([13]),
-            &HashSet::from([replacement]),
-        )
-        .is_empty());
+        assert!(
+            hidden_preserved_blockers(&aspects, &assignments, &HashSet::from([replacement]),)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -10337,11 +10517,10 @@ mod tests {
             role: ListingAssociationRole::Installed,
             avionics_model_id: 11,
         };
-        assert!(!add_unattested_preserved_aspects(
+        assert!(!add_unauthorized_preserved_aspects(
             &mut aspects,
             &assignments,
             &approved_review_products(&[11]),
-            &HashSet::from([11]),
             &HashSet::from([corroborated]),
         )
         .unwrap());
@@ -10932,6 +11111,65 @@ mod tests {
             .expect("reuse attestation should commit");
     }
 
+    async fn insert_current_same_case_authorization(
+        db: &AppDb,
+        listing_id: i64,
+        listing_link_id: i64,
+        avionics_model_id: i64,
+        plugin_submission_id: i64,
+        role: ListingAssociationRole,
+    ) {
+        let assignment = load_existing_assignments(db, listing_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|assignment| assignment.listing_link_id == listing_link_id)
+            .expect("authorized test link must exist");
+        let product_fingerprint = load_catalog_product_fingerprint_map(db)
+            .await
+            .unwrap()
+            .remove(&avionics_model_id)
+            .expect("authorized test product must be approved");
+        let collision_closure_sha256 =
+            grounded_collision_closure_revision_sha256(db, avionics_model_id)
+                .await
+                .unwrap();
+        let evidence_capture_sha256: String =
+            sqlx::query_scalar("SELECT rendered_html_sha256 FROM plugin_submissions WHERE id = ?")
+                .bind(plugin_submission_id)
+                .fetch_one(sqlite_pool(db))
+                .await
+                .unwrap();
+        let observation_sha256 = association_observation_sha256(
+            listing_id,
+            &assignment,
+            role,
+            assignment.source_notes.as_deref().unwrap_or_default(),
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              collision_closure_sha256, policy_version
+            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(listing_link_id)
+        .bind(association_role_label(role))
+        .bind(avionics_model_id)
+        .bind(observation_sha256)
+        .bind(product_fingerprint)
+        .bind("e".repeat(64))
+        .bind(evidence_capture_sha256)
+        .bind(collision_closure_sha256)
+        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
+        .execute(sqlite_pool(db))
+        .await
+        .unwrap();
+    }
+
     async fn insert_unreviewed_product(
         db: &AppDb,
         model: &str,
@@ -10939,6 +11177,178 @@ mod tests {
         capability: &str,
     ) -> i64 {
         insert_catalog_product(db, model, identifier, capability, false).await
+    }
+
+    #[tokio::test]
+    async fn whole_listing_resolution_preserves_current_same_case_link_without_global_reuse() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "WX-500", "WX500", "Weather Radar").await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            "<main>Installed L3 WX-500 stormscope</main>",
+        )
+        .await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'L3 WX-500', 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        insert_current_same_case_authorization(
+            &db,
+            listing_id,
+            link_id,
+            product_id,
+            submission_id,
+            ListingAssociationRole::Installed,
+        )
+        .await;
+        let reuse_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(product_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(reuse_count, 0);
+
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[pending_aspect("discard-unrelated", product_id)],
+        )
+        .await
+        .unwrap();
+        let detail = get_listing_review(&db, user_id, listing_id).await.unwrap();
+        assert_eq!(detail.review.aspects.len(), 1);
+        assert_eq!(detail.review.aspects[0].id, "discard-unrelated".into());
+
+        resolve_listing_review(
+            &db,
+            user_id,
+            listing_id,
+            &ResolveReviewRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256,
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                finalize_listing: false,
+                decisions: vec![ReviewDecision::Discard {
+                    aspect_id: "discard-unrelated".into(),
+                    reason: "not installed".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("a current same-case authorization must preserve the untouched link");
+
+        let preserved: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT avionics_model_id, quantity FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_all(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(preserved, vec![(product_id, 1)]);
+    }
+
+    #[tokio::test]
+    async fn whole_listing_resolution_preserves_current_same_case_replacement_role() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let installed_id = insert_approved_product(&db, "GTN 750Xi", "GTN750XI", "GPS").await;
+        let replacement_id = insert_approved_product(&db, "GNS 430W", "GNS430W", "GPS").await;
+        let evidence = "Garmin GTN 750Xi replaces Garmin GNS 430W";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            &format!("<main>{evidence}</main>"),
+        )
+        .await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action,
+              replaces_avionics_model_id
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'replaces', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(installed_id)
+        .bind(evidence)
+        .bind(replacement_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        for (product_id, role) in [
+            (installed_id, ListingAssociationRole::Installed),
+            (replacement_id, ListingAssociationRole::Replacement),
+        ] {
+            insert_current_same_case_authorization(
+                &db,
+                listing_id,
+                link_id,
+                product_id,
+                submission_id,
+                role,
+            )
+            .await;
+        }
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[pending_aspect("discard-unrelated", installed_id)],
+        )
+        .await
+        .unwrap();
+
+        resolve_listing_review(
+            &db,
+            user_id,
+            listing_id,
+            &ResolveReviewRequest {
+                expected_review_payload_sha256: staged.review_payload_sha256,
+                expected_catalog_revision_sha256: staged.catalog_revision_sha256,
+                finalize_listing: false,
+                decisions: vec![ReviewDecision::Discard {
+                    aspect_id: "discard-unrelated".into(),
+                    reason: "not installed".to_string(),
+                }],
+            },
+        )
+        .await
+        .expect("both current same-case roles must preserve the replacement link");
+
+        let preserved: Vec<(i64, String, Option<i64>)> = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, configuration_action,
+                   replaces_avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_all(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            preserved,
+            vec![(installed_id, "replaces".to_string(), Some(replacement_id))]
+        );
     }
 
     #[tokio::test]
@@ -14519,7 +14929,7 @@ mod tests {
             error,
             ReviewError::Stale(message)
                 if message.contains("preserved avionics catalog id")
-                    && message.contains("not eligible for current-policy reuse")
+                    && message.contains("lacks current association authorization")
         ));
         let ids: Vec<i64> = sqlx::query_scalar(
             "SELECT avionics_model_id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
