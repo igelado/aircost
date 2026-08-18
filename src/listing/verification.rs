@@ -387,7 +387,12 @@ pub async fn verify_listing(
             pending_before_avionics,
         )
     } else {
-        let preflight = preflight_listing_avionics(db, listing_id)
+        let avionics_mode = if mode == ListingVerificationMode::Preview {
+            AvionicsVerificationExecutionMode::Preview
+        } else {
+            AvionicsVerificationExecutionMode::Apply
+        };
+        let preflight = preflight_listing_avionics(db, listing_id, avionics_mode)
             .await
             .map_err(|error| ListingVerificationError::Avionics(error.to_string()))?;
         match mode {
@@ -401,6 +406,9 @@ pub async fn verify_listing(
                 ) =>
             {
                 ListingAvionicsVerificationStage::no_pending_review()
+            }
+            ListingVerificationMode::Apply if !avionics_preflight_is_runnable(&preflight) => {
+                avionics_preflight_stage(preflight, pending_before_avionics)
             }
             ListingVerificationMode::Preview | ListingVerificationMode::Apply => {
                 let extractor = services.extractor.ok_or_else(|| {
@@ -632,8 +640,13 @@ async fn verify_listing_page(
         {
             aircraft_grounding_candidates += usize::from(reason_code == "grounding_required");
         }
+        let avionics_mode = if mode == ListingVerificationMode::Preview {
+            AvionicsVerificationExecutionMode::Preview
+        } else {
+            AvionicsVerificationExecutionMode::Apply
+        };
         if let Ok(ListingAvionicsVerificationPreflight::PendingReview { report }) =
-            preflight_listing_avionics(db, listing_id).await
+            preflight_listing_avionics(db, listing_id, avionics_mode).await
         {
             avionics_preflights.push(report);
         }
@@ -1096,6 +1109,16 @@ fn avionics_preflight_stage(
                 gemini_used: false,
             }
         }
+    }
+}
+
+fn avionics_preflight_is_runnable(outcome: &ListingAvionicsVerificationPreflight) -> bool {
+    match outcome {
+        ListingAvionicsVerificationPreflight::NoPendingReview { .. } => false,
+        ListingAvionicsVerificationPreflight::PendingReview { report } => matches!(
+            report.status.as_str(),
+            "ready_retained_observations" | "ready_legacy_reextraction"
+        ),
     }
 }
 
