@@ -7722,6 +7722,19 @@ ON CONFLICT (migration_name) DO UPDATE SET
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
+  '20260818_listing_avionics_authorization_hash_domain_reset',
+  1,
+  'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = excluded.contract_version,
+  contract_fingerprint = excluded.contract_fingerprint,
+  installed_at = excluded.installed_at;
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
   '20260802_default_avionics_candidate_quarantine',
   2,
   'b8a6ecd15acc0ce14f67bf37ff4387c0ded4d1c6669d2fc4698b6c0a6c209ba4',

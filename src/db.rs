@@ -92,6 +92,11 @@ const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION: &str =
 const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION: i64 = 1;
 const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT: &str =
     "bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9";
+const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION: &str =
+    "20260818_listing_avionics_authorization_hash_domain_reset";
+const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1;
+const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
+    "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -2565,6 +2570,21 @@ impl AppDb {
                 listing_avionics_association_authorizations_migration_required_message(self.kind())
             );
         }
+        if self
+            .migration_contract_missing(
+                "aircraft_sale_listing_avionics_authorizations",
+                LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
+                LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
+                LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
+            )
+            .await?
+        {
+            bail!(
+                listing_avionics_authorization_hash_domain_reset_migration_required_message(
+                    self.kind()
+                )
+            );
+        }
         Ok(())
     }
 
@@ -3373,6 +3393,22 @@ fn listing_avionics_association_authorizations_migration_required_message(
     )
 }
 
+fn listing_avionics_authorization_hash_domain_reset_migration_required_message(
+    kind: DatabaseKind,
+) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: incompatible derived manufacturer-reuse \
+         receipts must be invalidated without changing listing links or catalog products; back up \
+         the database, apply \
+         `migrations/{LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION}.{backend}.sql`, \
+         then restart aircost"
+    )
+}
+
 pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
     if is_database_url(database_url) || !database_url.trim().is_empty() {
         Ok(())
@@ -3429,7 +3465,10 @@ mod tests {
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
         IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
-        LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION, POSTGRES_SCHEMA_SQL,
+        LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
+        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
+        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
+        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION, POSTGRES_SCHEMA_SQL,
         SQLITE_SCHEMA_SQL, VALUATION_DATA_HARDENING_MIGRATION,
     };
 
@@ -3484,6 +3523,12 @@ mod tests {
     );
     const LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL: &str = include_str!(
         "../migrations/20260818_listing_avionics_association_authorizations.postgres.sql"
+    );
+    const LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL: &str = include_str!(
+        "../migrations/20260818_listing_avionics_authorization_hash_domain_reset.sqlite.sql"
+    );
+    const LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL: &str = include_str!(
+        "../migrations/20260818_listing_avionics_authorization_hash_domain_reset.postgres.sql"
     );
     async fn sqlite_db_with_statements(statements: &[&str]) -> AppDb {
         let pool = SqlitePoolOptions::new()
@@ -4774,7 +4819,14 @@ mod tests {
             assert!(definition.contains(LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION));
             assert!(definition
                 .contains(LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT));
+            assert!(definition.contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION));
+            assert!(definition
+                .contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT));
         }
+        assert_eq!(
+            LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
+            1
+        );
         for migration in [
             LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL,
             LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
@@ -4785,7 +4837,25 @@ mod tests {
             assert!(migration
                 .contains("DROP TABLE aircraft_sale_listing_avionics_corroboration_scopes"));
             assert!(migration.contains("link.source_confidence = 'high'"));
+            assert!(
+                migration.contains("corroboration.observation_sha256"),
+                "the already-applied transition must remain immutable"
+            );
         }
+        for migration in [
+            LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(migration.contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION));
+            assert!(migration
+                .contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT));
+            assert!(migration.contains("DELETE FROM aircraft_sale_listing_avionics_authorizations"));
+            assert!(migration.contains("WHERE authorization_kind = 'manufacturer_reuse'"));
+            assert!(migration.contains("Listing links and catalog rows"));
+        }
+        assert!(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL.contains(
+            "LOCK TABLE aircraft_sale_listing_avionics_authorizations\nIN SHARE ROW EXCLUSIVE MODE"
+        ));
         for definition in [
             SQLITE_SCHEMA_SQL,
             POSTGRES_SCHEMA_SQL,
@@ -5055,6 +5125,201 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn sqlite_listing_avionics_authorization_hash_reset_is_fail_closed_and_idempotent() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("SQLite hash-reset fixture should connect");
+        sqlx::raw_sql(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE schema_migration_contracts (
+              migration_name TEXT PRIMARY KEY,
+              contract_version INTEGER NOT NULL,
+              contract_fingerprint TEXT NOT NULL,
+              installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO schema_migration_contracts
+              (migration_name, contract_version, contract_fingerprint)
+            VALUES (
+              '20260818_listing_avionics_association_authorizations',
+              1,
+              'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9'
+            );
+            CREATE TABLE aircraft_sale_listing_avionics (
+              id INTEGER PRIMARY KEY
+            );
+            INSERT INTO aircraft_sale_listing_avionics VALUES (11), (12), (13);
+            CREATE TABLE avionics_models (
+              id INTEGER PRIMARY KEY
+            );
+            INSERT INTO avionics_models VALUES (7);
+            CREATE TABLE aircraft_sale_listing_avionics_authorizations (
+              listing_link_id INTEGER NOT NULL,
+              authorization_kind TEXT NOT NULL
+            );
+            INSERT INTO aircraft_sale_listing_avionics_authorizations VALUES
+              (11, 'manufacturer_reuse'),
+              (12, 'same_case_grounded');
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("hash-reset fixture should initialize");
+
+        sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL)
+            .execute(&mut connection)
+            .await
+            .expect("hash reset should invalidate predecessor-derived receipts");
+
+        let retained_after_reset: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT listing_link_id, authorization_kind \
+             FROM aircraft_sale_listing_avionics_authorizations ORDER BY listing_link_id",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained_after_reset,
+            vec![(12, "same_case_grounded".to_string())]
+        );
+        let retained_links: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_sale_listing_avionics")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        let retained_models: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(retained_links, 3, "listing links are not receipts");
+        assert_eq!(retained_models, 1, "catalog products are not receipts");
+
+        sqlx::query("INSERT INTO aircraft_sale_listing_avionics_authorizations VALUES (?, ?)")
+            .bind(13_i64)
+            .bind("manufacturer_reuse")
+            .execute(&mut connection)
+            .await
+            .expect("current workflow should be able to issue a new receipt");
+        sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL)
+            .execute(&mut connection)
+            .await
+            .expect("verified migration reapplication should be a no-op");
+
+        let retained_after_reapply: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT listing_link_id, authorization_kind \
+             FROM aircraft_sale_listing_avionics_authorizations ORDER BY listing_link_id",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained_after_reapply,
+            vec![
+                (12, "same_case_grounded".to_string()),
+                (13, "manufacturer_reuse".to_string()),
+            ]
+        );
+        let reset_contract: (i64, String) = sqlx::query_as(
+            "SELECT contract_version, contract_fingerprint \
+             FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(reset_contract.0, 1);
+        assert_eq!(
+            reset_contract.1,
+            LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_manufacturer_reuse_receipt_requires_hash_reset_before_startup() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let validation_trigger_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema \
+             WHERE type = 'trigger' \
+               AND name = 'listing_avionics_authorizations_validate_insert'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER listing_avionics_authorizations_validate_insert")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              collision_closure_sha256, policy_version
+            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL, ?, ?, ?)
+            "#,
+        )
+        .bind(999_i64)
+        .bind(999_i64)
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind("c".repeat(64))
+        .bind("d".repeat(64))
+        .bind("listing_avionics_authorization_v1")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::raw_sql(&validation_trigger_sql)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migration_contracts WHERE migration_name = ?")
+            .bind(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("a predecessor receipt without the reset contract must fail startup")
+            .to_string();
+        assert!(error.contains("incompatible derived manufacturer-reuse receipts"));
+        assert!(
+            error.contains("20260818_listing_avionics_authorization_hash_domain_reset.sqlite.sql")
+        );
+
+        sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .expect("the explicit reset migration should invalidate the stale receipt");
+        db.ensure_required_migrations()
+            .await
+            .expect("startup should pass after the reset contract is installed");
+        let stale_receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations \
+             WHERE authorization_kind = 'manufacturer_reuse'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stale_receipts, 0);
     }
 
     #[test]
