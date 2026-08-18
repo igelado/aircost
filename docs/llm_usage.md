@@ -676,7 +676,11 @@ listing-link notes never fill a missing `source_evidence_text`. Legacy review
 backfill retains complete extraction evidence pairs, but stages unmatched
 installed/replacement link notes without evidence. The explicit local restage
 path can recover a unique exact visible manufacturer/model slice from the
-bound plugin capture without Gemini; otherwise the aspect remains pending.
+bound plugin capture without Gemini; otherwise the aspect remains pending. If
+that canonical repair changes a link that was already covered by a current
+corroboration and collision scope, the same transaction reissues both proofs
+for the repaired exact slice. Restage does not mint a new occurrence conclusion
+when no current pre-repair corroboration exists.
 
 All three actions remain available for every avionics aspect, including an
 aspect with a suggested match or legacy candidate. The reviewer must make

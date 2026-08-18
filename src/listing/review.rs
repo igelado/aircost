@@ -2022,7 +2022,7 @@ async fn restage_pending_review_if_current_with_commit(
           product_fingerprint,
           policy_version
         )
-        SELECT ?, 'installed', ?, ?, attestation.product_fingerprint, ?
+        SELECT ?, ?, ?, ?, attestation.product_fingerprint, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         ON CONFLICT (listing_link_id, association_role) DO NOTHING
@@ -2035,14 +2035,14 @@ async fn restage_pending_review_if_current_with_commit(
           association_role,
           collision_closure_sha256,
           policy_version
-        ) VALUES (?, 'installed', ?, ?)
+        ) VALUES (?, ?, ?, ?)
         "#,
     );
     let delete_existing_corroboration = db.sql(
         r#"
         DELETE FROM aircraft_sale_listing_avionics_corroborations
         WHERE listing_link_id = ?
-          AND association_role = 'installed'
+          AND association_role = ?
         "#,
     );
     let select_approved_product_identity = db.sql(
@@ -2265,6 +2265,19 @@ async fn restage_pending_review_if_current_with_commit(
                 )
                 .fetch_all(&mut *transaction)
                 .await?;
+            let corroboration_rows_before_repair =
+                sqlx::query_as::<_, AssociationCorroborationRow>(&corroborations_sql)
+                    .bind(listing_id)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+            let corroborated_before_evidence_repair =
+                current_row_backed_corroborated_associations(
+                    listing_id,
+                    &assignments,
+                    &corroboration_rows_before_repair,
+                    &reuse_attested_ids,
+                    &active_collision_catalog_rows,
+                );
             if maintenance_commit.is_none() {
                 repaired_evidence |= remove_stale_covered_relationships(
                     &mut payload.aspects,
@@ -2279,6 +2292,7 @@ async fn restage_pending_review_if_current_with_commit(
                 fingerprint_catalog_products(&catalog_products(catalog_rows));
 
             let mut exact_association_evidence = HashMap::new();
+            let mut evidence_repaired_link_ids = HashSet::new();
             if maintenance_commit.is_none() {
                 let action_graph_issues: i64 =
                     sqlx::query_scalar(&invalid_action_graph_sql)
@@ -2341,6 +2355,7 @@ async fn restage_pending_review_if_current_with_commit(
                         assignment.source_notes = repair.link_evidence_text.clone();
                         assignment.source_confidence =
                             expected_confidence.map(str::to_string);
+                        evidence_repaired_link_ids.insert(assignment.listing_link_id);
                         repaired_evidence = true;
                     }
                     let association = CoveredListingAssociation {
@@ -2612,6 +2627,93 @@ async fn restage_pending_review_if_current_with_commit(
                 ordinary_aspect_used = true;
             }
 
+            // Repairing a link's exact source note deliberately invalidates
+            // every hash-bound corroboration on that row. Preserve only
+            // conclusions that were current before the repair and whose
+            // repaired note is itself the exact retained evidence for the
+            // same unchanged association role. This cannot mint a new
+            // conclusion from restage text alone.
+            for association in corroborated_before_evidence_repair.iter().filter(|association| {
+                evidence_repaired_link_ids.contains(&association.listing_link_id)
+            }) {
+                let Some(evidence_text) = exact_association_evidence.get(association) else {
+                    continue;
+                };
+                let Some(assignment) = assignments.iter().find(|assignment| {
+                    assignment.listing_link_id == association.listing_link_id
+                }) else {
+                    continue;
+                };
+                if assignment.source_notes.as_deref() != Some(evidence_text.as_str()) {
+                    continue;
+                }
+                let current_target_id = match association.role {
+                    ListingAssociationRole::Installed => assignment.avionics_model_id,
+                    ListingAssociationRole::Replacement => {
+                        let Some(target_id) = assignment.replaces_avionics_model_id else {
+                            continue;
+                        };
+                        target_id
+                    }
+                };
+                if current_target_id != association.avionics_model_id {
+                    continue;
+                }
+                let collision_closure_sha256 = fingerprint_active_collision_closure(
+                    &active_collision_catalog_rows,
+                    &reuse_attested_ids,
+                    association.avionics_model_id,
+                )
+                .ok_or_else(|| {
+                    ReviewError::Stale(format!(
+                        "catalog id {} lost its unique active collision closure during occurrence-evidence repair",
+                        association.avionics_model_id
+                    ))
+                })?;
+                let observation_sha256 = association_observation_sha256(
+                    listing_id,
+                    assignment,
+                    association.role,
+                    evidence_text,
+                );
+                let role_label = association_role_label(association.role);
+                sqlx::query(&delete_existing_corroboration)
+                    .bind(association.listing_link_id)
+                    .bind(role_label)
+                    .execute(&mut *transaction)
+                    .await?;
+                let inserted = sqlx::query(&insert_corroboration)
+                    .bind(association.listing_link_id)
+                    .bind(role_label)
+                    .bind(association.avionics_model_id)
+                    .bind(observation_sha256)
+                    .bind(ASSOCIATION_CORROBORATION_POLICY_VERSION)
+                    .bind(association.avionics_model_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ReviewError::Conflict(format!(
+                        "current product attestation for catalog id {} disappeared during occurrence-evidence repair",
+                        association.avionics_model_id
+                    )));
+                }
+                let inserted = sqlx::query(&insert_corroboration_scope)
+                    .bind(association.listing_link_id)
+                    .bind(role_label)
+                    .bind(collision_closure_sha256)
+                    .bind(ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ReviewError::Conflict(format!(
+                        "collision closure for catalog id {} could not be restored after occurrence-evidence repair",
+                        association.avionics_model_id
+                    )));
+                }
+            }
+
             let mut corroboration_rows =
                 sqlx::query_as::<_, AssociationCorroborationRow>(&corroborations_sql)
                     .bind(listing_id)
@@ -2744,10 +2846,12 @@ async fn restage_pending_review_if_current_with_commit(
                     // the same hash-bound transaction.
                     sqlx::query(&delete_existing_corroboration)
                         .bind(association.listing_link_id)
+                        .bind("installed")
                         .execute(&mut *transaction)
                         .await?;
                     sqlx::query(&insert_corroboration)
                         .bind(association.listing_link_id)
+                        .bind("installed")
                         .bind(commit.avionics_model_id)
                         .bind(commit.observation_sha256.as_str())
                         .bind(ASSOCIATION_CORROBORATION_POLICY_VERSION)
@@ -2756,6 +2860,7 @@ async fn restage_pending_review_if_current_with_commit(
                         .await?;
                     sqlx::query(&insert_corroboration_scope)
                         .bind(association.listing_link_id)
+                        .bind("installed")
                         .bind(commit.expected_collision_closure_sha256.as_str())
                         .bind(ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION)
                         .execute(&mut *transaction)
@@ -5079,11 +5184,13 @@ fn current_corroborated_associations(
     reuse_attested_ids: &HashSet<i64>,
     active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
 ) -> HashSet<CoveredListingAssociation> {
-    let assignments_by_link = assignments
-        .iter()
-        .map(|assignment| (assignment.listing_link_id, assignment))
-        .collect::<HashMap<_, _>>();
-    let mut corroborated = HashSet::new();
+    let mut corroborated = current_row_backed_corroborated_associations(
+        listing_id,
+        assignments,
+        rows,
+        reuse_attested_ids,
+        active_collision_catalog_rows,
+    );
 
     // A completed whole-listing review is already the durable corroboration
     // boundary for every component of that exact link. Do not require a
@@ -5105,6 +5212,21 @@ fn current_corroborated_associations(
             });
         }
     }
+    corroborated
+}
+
+fn current_row_backed_corroborated_associations(
+    listing_id: i64,
+    assignments: &[ExistingAssignmentRow],
+    rows: &[AssociationCorroborationRow],
+    reuse_attested_ids: &HashSet<i64>,
+    active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
+) -> HashSet<CoveredListingAssociation> {
+    let assignments_by_link = assignments
+        .iter()
+        .map(|assignment| (assignment.listing_link_id, assignment))
+        .collect::<HashMap<_, _>>();
+    let mut corroborated = HashSet::new();
 
     for row in rows {
         if row.policy_version != ASSOCIATION_CORROBORATION_POLICY_VERSION

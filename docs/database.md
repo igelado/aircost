@@ -431,12 +431,15 @@ evidence fallback. Before review, the explicit restage transaction rechecks
 existing listing-link notes against the bound plugin capture. A unique,
 unqualified exact manufacturer/model occurrence replaces generated or stale
 notes with the visible source slice at high confidence for any unchanged
-positive quantity. An exact capture-backed existing pair is retained even when
-the association shape still requires manual review. For an otherwise
-auto-repairable installed link, ambiguous or missing source clears both link
-fields and both staged fields atomically. Unsupported replacement or
-unapproved shapes are not blanket-rewritten; their unverified link notes are
-excluded from review evidence. The reviewer endpoint
+positive quantity. When that repair changes the note of an association that
+already has a current hash-bound corroboration and collision scope, restage
+atomically reissues both against the repaired exact slice; it never creates a
+new corroboration from recovered text alone. An exact capture-backed existing
+pair is retained even when the association shape still requires manual review.
+For an otherwise auto-repairable installed link, ambiguous or missing source
+clears both link fields and both staged fields atomically. Unsupported
+replacement or unapproved shapes are not blanket-rewritten; their unverified
+link notes are excluded from review evidence. The reviewer endpoint
 `POST /api/review/listings/{id}/restage` is the apply path for this repair and
 updates the review hash in the same transaction.
 
