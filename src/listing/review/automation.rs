@@ -2054,6 +2054,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_case_authorization_is_removed_only_for_its_revoked_exact_origin() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+        let reviewer_user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(crate::db::DEVELOPER_EMAIL)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let static_origin_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM avionics_authoritative_source_origins WHERE https_origin = 'https://static.garmin.com'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'Regression test revokes a sibling exact origin')
+            "#,
+        )
+        .bind(static_origin_id)
+        .bind(reviewer_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorization_count, 1,
+            "revoking a sibling exact origin must not invalidate this source proof"
+        );
+
+        let product_origin_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM avionics_authoritative_source_origins WHERE https_origin = 'https://www.garmin.com'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'Regression test revokes the product proof origin')
+            "#,
+        )
+        .bind(product_origin_id)
+        .bind(reviewer_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn same_case_authorization_is_removed_for_a_revoked_regulator_origin() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE avionics_models
+            SET identity_source_url = 'https://drs.faa.gov/browse/avionics/gtx345',
+                identity_source_title = 'FAA DRS GTX 345 record',
+                identity_evidence_text =
+                  'FAA DRS identifies the exact GTX 345 avionics product.'
+            WHERE id = ?
+            "#,
+        )
+        .bind(model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let reviewer_user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(crate::db::DEVELOPER_EMAIL)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let regulator_origin_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_authoritative_source_origins (
+              authority_kind, avionics_manufacturer_identity_id,
+              regulator_key, https_origin, evidence_source_url,
+              evidence_source_title, evidence_text, approval_basis,
+              approved_by_user_id, approval_reason
+            ) VALUES (
+              'regulator_primary', NULL, 'faa_drs', 'https://drs.faa.gov',
+              'https://drs.faa.gov', 'FAA Dynamic Regulatory System',
+              'FAA DRS is an authoritative regulator source for this test.',
+              'human_review', ?,
+              'Regression test approves the exact FAA DRS origin'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(reviewer_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'Regression test revokes the regulator proof origin')
+            "#,
+        )
+        .bind(regulator_origin_id)
+        .bind(reviewer_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
+    }
+
+    #[tokio::test]
     async fn listing_authorization_is_removed_when_its_only_capture_changes() {
         let fixture = fixture().await;
         let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;

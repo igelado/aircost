@@ -91,7 +91,7 @@ const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION: &str =
     "20260818_listing_avionics_association_authorizations";
 const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION: i64 = 1;
 const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT: &str =
-    "d2f4b14b93b8cfb02b69f22a6b110d91439b5d9f71b0f1c50409cfdc4326b566";
+    "bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -2475,10 +2475,11 @@ impl AppDb {
                               'listing_avionics_authorizations_invalidate_graph_delete',
                               'listing_avionics_authorizations_invalidate_graph_update',
                               'listing_avionics_authorizations_invalidate_manufacturer_update',
+                              'listing_avionics_authorizations_invalidate_origin_revocation',
                               'listing_avionics_authorizations_invalidate_capture_delete',
                               'listing_avionics_authorizations_invalidate_capture_update'
                             )
-                        ) <> 15
+                        ) <> 16
                         OR (
                           SELECT COUNT(*)
                           FROM pragma_foreign_key_list(
@@ -2518,6 +2519,9 @@ impl AppDb {
                             to_regclass('avionics_types'),
                             to_regclass('avionics_approved_product_identities'),
                             to_regclass('avionics_manufacturers'),
+                            to_regclass(
+                              'avionics_authoritative_source_origin_revocations'
+                            ),
                             to_regclass('plugin_submissions')
                           )
                             AND tgname IN (
@@ -2534,11 +2538,12 @@ impl AppDb {
                               'listing_avionics_authorizations_invalidate_graph_delete',
                               'listing_avionics_authorizations_invalidate_graph_update',
                               'listing_avionics_authorizations_invalidate_manufacturer_update',
+                              'listing_avionics_authorizations_invalidate_origin_revocation',
                               'listing_avionics_authorizations_invalidate_capture_delete',
                               'listing_avionics_authorizations_invalidate_capture_update'
                             )
                             AND NOT tgisinternal
-                        ) <> 15
+                        ) <> 16
                       )
                     "#,
                 )
@@ -4797,6 +4802,7 @@ mod tests {
                 "listing_avionics_authorizations_invalidate_graph_delete",
                 "listing_avionics_authorizations_invalidate_graph_update",
                 "listing_avionics_authorizations_invalidate_manufacturer_update",
+                "listing_avionics_authorizations_invalidate_origin_revocation",
                 "listing_avionics_authorizations_invalidate_capture_delete",
                 "listing_avionics_authorizations_invalidate_capture_update",
             ] {
@@ -4828,8 +4834,12 @@ mod tests {
                '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3'),
               ('20260807_avionics_product_reuse_v2', 1,
                'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc');
-            CREATE TABLE avionics_models (id INTEGER PRIMARY KEY);
-            INSERT INTO avionics_models (id) VALUES (7);
+            CREATE TABLE avionics_models (
+              id INTEGER PRIMARY KEY,
+              identity_source_url TEXT
+            );
+            INSERT INTO avionics_models (id, identity_source_url)
+            VALUES (7, 'https://www.garmin.com/en-US/aviation/');
             CREATE TABLE avionics_manufacturers (id INTEGER PRIMARY KEY);
             CREATE TABLE avionics_types (
               id INTEGER PRIMARY KEY,
@@ -4848,10 +4858,31 @@ mod tests {
               canonical_identifier_key TEXT
             );
             CREATE TABLE avionics_approved_product_graph_identities (
-              avionics_model_id INTEGER PRIMARY KEY
+              avionics_model_id INTEGER PRIMARY KEY,
+              avionics_manufacturer_identity_id INTEGER
             );
             INSERT INTO avionics_approved_product_graph_identities
-              (avionics_model_id) VALUES (7);
+              (avionics_model_id, avionics_manufacturer_identity_id)
+            VALUES (7, 3);
+            CREATE TABLE avionics_manufacturer_effective_identities (
+              identity_id INTEGER PRIMARY KEY,
+              avionics_manufacturer_identity_id INTEGER NOT NULL
+            );
+            INSERT INTO avionics_manufacturer_effective_identities
+              (identity_id, avionics_manufacturer_identity_id)
+            VALUES (3, 3);
+            CREATE TABLE avionics_authoritative_source_origins (
+              id INTEGER PRIMARY KEY,
+              authority_kind TEXT NOT NULL,
+              avionics_manufacturer_identity_id INTEGER,
+              https_origin TEXT NOT NULL
+            );
+            INSERT INTO avionics_authoritative_source_origins VALUES (
+              5, 'manufacturer_primary', 3, 'https://www.garmin.com'
+            );
+            CREATE TABLE avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id INTEGER PRIMARY KEY
+            );
             CREATE TABLE avionics_product_reuse_attestations (
               avionics_model_id INTEGER PRIMARY KEY,
               product_fingerprint TEXT NOT NULL,
@@ -4877,7 +4908,8 @@ mod tests {
                source_notes, source_confidence, configuration_action)
             VALUES
               (11, 23, 7, 1, 'Garmin GTX 345', 'high', 'installed'),
-              (12, 24, 7, 1, 'Garmin GTX 345', 'medium', 'installed');
+              (12, 24, 7, 1, 'Garmin GTX 345', 'medium', 'installed'),
+              (13, 25, 7, 1, 'Garmin GTX 345', 'high', 'installed');
             CREATE TABLE plugin_submissions (
               canonical_listing_id INTEGER,
               rendered_html TEXT NOT NULL,
@@ -4889,7 +4921,9 @@ mod tests {
               (23, '<p>Garmin GTX 345</p>',
                'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
               (24, '<p>Garmin GTX 345</p>',
-               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'),
+              (25, '<p>Garmin GTX 345</p>',
+               '7777777777777777777777777777777777777777777777777777777777777777');
             CREATE TABLE aircraft_sale_listing_avionics_corroborations (
               listing_link_id INTEGER NOT NULL,
               association_role TEXT NOT NULL,
@@ -4961,6 +4995,41 @@ mod tests {
         assert_eq!(
             downgraded_count, 0,
             "a downgraded predecessor link must not acquire authorization"
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              collision_closure_sha256, policy_version
+            ) VALUES (
+              13, 'installed', 7, 'same_case_grounded',
+              '9999999999999999999999999999999999999999999999999999999999999999',
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              '8888888888888888888888888888888888888888888888888888888888888888',
+              '7777777777777777777777777777777777777777777777777777777777777777',
+              '6666666666666666666666666666666666666666666666666666666666666666',
+              'listing_avionics_authorization_v1'
+            )
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("a same-case authorization should be admitted before revocation");
+        sqlx::query("INSERT INTO avionics_authoritative_source_origin_revocations VALUES (5)")
+            .execute(&mut connection)
+            .await
+            .expect("the exact source origin should be revocable");
+        let revoked_same_case_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = 13",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            revoked_same_case_count, 0,
+            "revoking the exact product-proof origin must invalidate same-case authorization"
         );
         let old_object_count: i64 = sqlx::query_scalar(
             r#"

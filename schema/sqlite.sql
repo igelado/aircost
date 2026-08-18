@@ -7616,6 +7616,47 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_origin_revocation
+AFTER INSERT ON avionics_authoritative_source_origin_revocations
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id IN (
+      SELECT model.id
+      FROM avionics_models model
+      JOIN avionics_approved_product_graph_identities product_identity
+        ON product_identity.avionics_model_id = model.id
+      JOIN avionics_authoritative_source_origins source_origin
+        ON source_origin.id =
+             NEW.avionics_authoritative_source_origin_id
+      LEFT JOIN avionics_manufacturer_effective_identities origin_identity
+        ON origin_identity.identity_id =
+             source_origin.avionics_manufacturer_identity_id
+      WHERE (
+          lower(trim(model.identity_source_url)) = source_origin.https_origin
+          OR substr(
+              lower(trim(model.identity_source_url)),
+              1,
+              length(source_origin.https_origin) + 1
+            ) IN (
+              source_origin.https_origin || '/',
+              source_origin.https_origin || '?',
+              source_origin.https_origin || '#'
+            )
+        )
+        AND (
+          source_origin.authority_kind = 'regulator_primary'
+          OR (
+            source_origin.authority_kind = 'manufacturer_primary'
+            AND origin_identity.avionics_manufacturer_identity_id =
+                  product_identity.avionics_manufacturer_identity_id
+          )
+        )
+    );
+END;
+
+
+CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_capture_delete
 AFTER DELETE ON plugin_submissions
 BEGIN
@@ -7670,7 +7711,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260818_listing_avionics_association_authorizations',
   1,
-  'd2f4b14b93b8cfb02b69f22a6b110d91439b5d9f71b0f1c50409cfdc4326b566',
+  'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
