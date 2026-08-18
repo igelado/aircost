@@ -3965,6 +3965,19 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_fingerprint = EXCLUDED.contract_fingerprint,
   installed_at = EXCLUDED.installed_at;
 
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260818_listing_avionics_authorization_hash_domain_reset',
+  1,
+  'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = EXCLUDED.contract_version,
+  contract_fingerprint = EXCLUDED.contract_fingerprint,
+  installed_at = EXCLUDED.installed_at;
+
 -- Audit surfaces for legacy action graphs. Non-ready legacy listings may
 -- retain invalid rows until review; no represented listing may become ready.
 CREATE OR REPLACE VIEW avionics_semantic_duplicate_listing_links AS
