@@ -6605,6 +6605,41 @@ pub(crate) async fn evaluate_existing_product_association(
     .await
 }
 
+/// Evaluate several existing-product association cards against one immutable
+/// catalog snapshot.
+///
+/// The automatic listing verifier uses this provider-free boundary so its
+/// batch path applies the same exact-evidence, current-attestation, collision,
+/// and association-shape rules as the one-by-one review endpoint without
+/// repeatedly rebuilding the catalog resolver for every aspect.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn evaluate_existing_product_associations(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    aspect_ids: &[ReviewAspectId],
+    expected_review_payload_sha256: &str,
+    expected_catalog_revision_sha256: &str,
+) -> ReviewResult<Vec<ExistingProductAssociationEvaluation>> {
+    let snapshot = load_existing_product_association_global_snapshot(db).await?;
+    let mut evaluations = Vec::with_capacity(aspect_ids.len());
+    for aspect_id in aspect_ids {
+        evaluations.push(
+            evaluate_existing_product_association_with_snapshot(
+                db,
+                &snapshot,
+                owner_user_id,
+                listing_id,
+                aspect_id,
+                expected_review_payload_sha256,
+                expected_catalog_revision_sha256,
+            )
+            .await?,
+        );
+    }
+    Ok(evaluations)
+}
+
 pub async fn get_listing_review(
     db: &AppDb,
     owner_user_id: i64,
