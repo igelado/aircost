@@ -21,6 +21,7 @@ axum = "0.8"
 base64 = "0.22"
 csv = "1"
 eoka = "0.4"
+ego-tree = "0.11"
 html-escape = "0.2"
 lopdf = { version = "0.44", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["charset", "gzip", "json", "rustls"] }
