@@ -7518,12 +7518,159 @@ BEGIN
     AND avionics_model_id = OLD.avionics_model_id;
 END;
 
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_model_proof_update
+AFTER UPDATE OF
+  avionics_manufacturer_id, name, normalized_name, catalog_status,
+  manufacturer_identifier_kind, manufacturer_identifier,
+  normalized_manufacturer_identifier, identity_source_url,
+  identity_source_title, identity_evidence_text
+ON avionics_models
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id = OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_model_type_insert
+AFTER INSERT ON avionics_model_types
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id = NEW.avionics_model_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_model_type_delete
+AFTER DELETE ON avionics_model_types
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id = OLD.avionics_model_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_model_type_update
+AFTER UPDATE OF avionics_model_id, avionics_type_id ON avionics_model_types
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id IN (OLD.avionics_model_id, NEW.avionics_model_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_type_update
+AFTER UPDATE OF name, normalized_name ON avionics_types
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id IN (
+      SELECT avionics_model_id FROM avionics_model_types
+      WHERE avionics_type_id = OLD.id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_graph_insert
+AFTER INSERT ON avionics_approved_product_identities
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id = NEW.avionics_model_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_graph_delete
+AFTER DELETE ON avionics_approved_product_identities
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id = OLD.avionics_model_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_graph_update
+AFTER UPDATE OF
+  avionics_model_id, avionics_manufacturer_identity_id,
+  canonical_product_key, manufacturer_identifier_kind,
+  canonical_identifier_key
+ON avionics_approved_product_identities
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id IN (OLD.avionics_model_id, NEW.avionics_model_id);
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_manufacturer_update
+AFTER UPDATE OF name, normalized_name ON avionics_manufacturers
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND avionics_model_id IN (
+      SELECT id FROM avionics_models
+      WHERE avionics_manufacturer_id = OLD.id
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_capture_delete
+AFTER DELETE ON plugin_submissions
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE evidence_capture_sha256 = OLD.rendered_html_sha256
+    AND EXISTS (
+      SELECT 1 FROM aircraft_sale_listing_avionics link
+      WHERE link.id =
+              aircraft_sale_listing_avionics_authorizations.listing_link_id
+        AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
+        AND length(trim(COALESCE(link.source_notes, ''))) > 0
+        AND instr(OLD.rendered_html, link.source_notes) > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM plugin_submissions retained_capture
+          WHERE retained_capture.canonical_listing_id =
+                  link.aircraft_sale_listing_id
+            AND retained_capture.rendered_html_sha256 =
+                  aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256
+            AND instr(retained_capture.rendered_html, link.source_notes) > 0
+        )
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_capture_update
+AFTER UPDATE OF canonical_listing_id, rendered_html, rendered_html_sha256
+ON plugin_submissions
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE evidence_capture_sha256 = OLD.rendered_html_sha256
+    AND EXISTS (
+      SELECT 1 FROM aircraft_sale_listing_avionics link
+      WHERE link.id =
+              aircraft_sale_listing_avionics_authorizations.listing_link_id
+        AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
+        AND length(trim(COALESCE(link.source_notes, ''))) > 0
+        AND instr(OLD.rendered_html, link.source_notes) > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM plugin_submissions retained_capture
+          WHERE retained_capture.canonical_listing_id =
+                  link.aircraft_sale_listing_id
+            AND retained_capture.rendered_html_sha256 =
+                  aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256
+            AND instr(retained_capture.rendered_html, link.source_notes) > 0
+        )
+    );
+END;
+
+
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260818_listing_avionics_association_authorizations',
   1,
-  'cf1860e6eea09fd3d5ee0ffde4ce05bd91cddae5ca29efec6513f14698628cbb',
+  'd2f4b14b93b8cfb02b69f22a6b110d91439b5d9f71b0f1c50409cfdc4326b566',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET

@@ -91,7 +91,7 @@ const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION: &str =
     "20260818_listing_avionics_association_authorizations";
 const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION: i64 = 1;
 const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT: &str =
-    "cf1860e6eea09fd3d5ee0ffde4ce05bd91cddae5ca29efec6513f14698628cbb";
+    "d2f4b14b93b8cfb02b69f22a6b110d91439b5d9f71b0f1c50409cfdc4326b566";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -2465,9 +2465,20 @@ impl AppDb {
                               'listing_avionics_authorizations_validate_insert',
                               'listing_avionics_authorizations_immutable_update',
                               'listing_avionics_authorizations_invalidate_link_update',
-                              'listing_avionics_authorizations_invalidate_reuse_delete'
+                              'listing_avionics_authorizations_invalidate_reuse_delete',
+                              'listing_avionics_authorizations_invalidate_model_proof_update',
+                              'listing_avionics_authorizations_invalidate_model_type_insert',
+                              'listing_avionics_authorizations_invalidate_model_type_delete',
+                              'listing_avionics_authorizations_invalidate_model_type_update',
+                              'listing_avionics_authorizations_invalidate_type_update',
+                              'listing_avionics_authorizations_invalidate_graph_insert',
+                              'listing_avionics_authorizations_invalidate_graph_delete',
+                              'listing_avionics_authorizations_invalidate_graph_update',
+                              'listing_avionics_authorizations_invalidate_manufacturer_update',
+                              'listing_avionics_authorizations_invalidate_capture_delete',
+                              'listing_avionics_authorizations_invalidate_capture_update'
                             )
-                        ) <> 4
+                        ) <> 15
                         OR (
                           SELECT COUNT(*)
                           FROM pragma_foreign_key_list(
@@ -2501,16 +2512,33 @@ impl AppDb {
                               'aircraft_sale_listing_avionics_authorizations'
                             ),
                             to_regclass('aircraft_sale_listing_avionics'),
-                            to_regclass('avionics_product_reuse_attestations')
+                            to_regclass('avionics_product_reuse_attestations'),
+                            to_regclass('avionics_models'),
+                            to_regclass('avionics_model_types'),
+                            to_regclass('avionics_types'),
+                            to_regclass('avionics_approved_product_identities'),
+                            to_regclass('avionics_manufacturers'),
+                            to_regclass('plugin_submissions')
                           )
                             AND tgname IN (
                               'listing_avionics_authorizations_validate_insert',
                               'listing_avionics_authorizations_immutable_update',
                               'listing_avionics_authorizations_invalidate_link_update',
-                              'listing_avionics_authorizations_invalidate_reuse_delete'
+                              'listing_avionics_authorizations_invalidate_reuse_delete',
+                              'listing_avionics_authorizations_invalidate_model_proof_update',
+                              'listing_avionics_authorizations_invalidate_model_type_insert',
+                              'listing_avionics_authorizations_invalidate_model_type_delete',
+                              'listing_avionics_authorizations_invalidate_model_type_update',
+                              'listing_avionics_authorizations_invalidate_type_update',
+                              'listing_avionics_authorizations_invalidate_graph_insert',
+                              'listing_avionics_authorizations_invalidate_graph_delete',
+                              'listing_avionics_authorizations_invalidate_graph_update',
+                              'listing_avionics_authorizations_invalidate_manufacturer_update',
+                              'listing_avionics_authorizations_invalidate_capture_delete',
+                              'listing_avionics_authorizations_invalidate_capture_update'
                             )
                             AND NOT tgisinternal
-                        ) <> 4
+                        ) <> 15
                       )
                     "#,
                 )
@@ -4751,6 +4779,29 @@ mod tests {
             assert!(migration.contains("DROP TABLE aircraft_sale_listing_avionics_corroborations"));
             assert!(migration
                 .contains("DROP TABLE aircraft_sale_listing_avionics_corroboration_scopes"));
+            assert!(migration.contains("link.source_confidence = 'high'"));
+        }
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+        ] {
+            for cleanup_trigger in [
+                "listing_avionics_authorizations_invalidate_model_proof_update",
+                "listing_avionics_authorizations_invalidate_model_type_insert",
+                "listing_avionics_authorizations_invalidate_model_type_delete",
+                "listing_avionics_authorizations_invalidate_model_type_update",
+                "listing_avionics_authorizations_invalidate_type_update",
+                "listing_avionics_authorizations_invalidate_graph_insert",
+                "listing_avionics_authorizations_invalidate_graph_delete",
+                "listing_avionics_authorizations_invalidate_graph_update",
+                "listing_avionics_authorizations_invalidate_manufacturer_update",
+                "listing_avionics_authorizations_invalidate_capture_delete",
+                "listing_avionics_authorizations_invalidate_capture_update",
+            ] {
+                assert!(definition.contains(cleanup_trigger));
+            }
         }
     }
 
@@ -4779,6 +4830,23 @@ mod tests {
                'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc');
             CREATE TABLE avionics_models (id INTEGER PRIMARY KEY);
             INSERT INTO avionics_models (id) VALUES (7);
+            CREATE TABLE avionics_manufacturers (id INTEGER PRIMARY KEY);
+            CREATE TABLE avionics_types (
+              id INTEGER PRIMARY KEY,
+              name TEXT,
+              normalized_name TEXT
+            );
+            CREATE TABLE avionics_model_types (
+              avionics_model_id INTEGER NOT NULL,
+              avionics_type_id INTEGER NOT NULL
+            );
+            CREATE TABLE avionics_approved_product_identities (
+              avionics_model_id INTEGER PRIMARY KEY,
+              avionics_manufacturer_identity_id INTEGER,
+              canonical_product_key TEXT,
+              manufacturer_identifier_kind TEXT,
+              canonical_identifier_key TEXT
+            );
             CREATE TABLE avionics_approved_product_graph_identities (
               avionics_model_id INTEGER PRIMARY KEY
             );
@@ -4807,7 +4875,9 @@ mod tests {
             INSERT INTO aircraft_sale_listing_avionics
               (id, aircraft_sale_listing_id, avionics_model_id, quantity,
                source_notes, source_confidence, configuration_action)
-            VALUES (11, 23, 7, 1, 'Garmin GTX 345', 'high', 'installed');
+            VALUES
+              (11, 23, 7, 1, 'Garmin GTX 345', 'high', 'installed'),
+              (12, 24, 7, 1, 'Garmin GTX 345', 'medium', 'installed');
             CREATE TABLE plugin_submissions (
               canonical_listing_id INTEGER,
               rendered_html TEXT NOT NULL,
@@ -4815,8 +4885,11 @@ mod tests {
             );
             INSERT INTO plugin_submissions
               (canonical_listing_id, rendered_html, rendered_html_sha256)
-            VALUES (23, '<p>Garmin GTX 345</p>',
-              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+            VALUES
+              (23, '<p>Garmin GTX 345</p>',
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+              (24, '<p>Garmin GTX 345</p>',
+               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
             CREATE TABLE aircraft_sale_listing_avionics_corroborations (
               listing_link_id INTEGER NOT NULL,
               association_role TEXT NOT NULL,
@@ -4827,12 +4900,15 @@ mod tests {
               corroborated_at TEXT NOT NULL,
               PRIMARY KEY (listing_link_id, association_role)
             );
-            INSERT INTO aircraft_sale_listing_avionics_corroborations VALUES (
-              11, 'installed', 7,
-              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-              'listing_avionics_association_v1', '2026-08-18 12:00:00'
-            );
+            INSERT INTO aircraft_sale_listing_avionics_corroborations VALUES
+              (11, 'installed', 7,
+               'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'listing_avionics_association_v1', '2026-08-18 12:00:00'),
+              (12, 'installed', 7,
+               'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'listing_avionics_association_v1', '2026-08-18 12:00:00');
             CREATE TABLE aircraft_sale_listing_avionics_corroboration_scopes (
               listing_link_id INTEGER NOT NULL,
               association_role TEXT NOT NULL,
@@ -4840,11 +4916,13 @@ mod tests {
               policy_version TEXT NOT NULL,
               PRIMARY KEY (listing_link_id, association_role)
             );
-            INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes VALUES (
-              11, 'installed',
-              'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-              'listing_avionics_collision_closure_v1'
-            );
+            INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes VALUES
+              (11, 'installed',
+               'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+               'listing_avionics_collision_closure_v1'),
+              (12, 'installed',
+               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+               'listing_avionics_collision_closure_v1');
             "#,
         )
         .execute(&mut connection)
@@ -4874,6 +4952,16 @@ mod tests {
         assert_eq!(migrated.2, "a".repeat(64));
         assert_eq!(migrated.3, "b".repeat(64));
         assert_eq!(migrated.4, "listing_avionics_authorization_v1");
+        let downgraded_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = 12",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            downgraded_count, 0,
+            "a downgraded predecessor link must not acquire authorization"
+        );
         let old_object_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*) FROM sqlite_schema

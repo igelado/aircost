@@ -848,6 +848,13 @@ pub(crate) struct CatalogFingerprintRow {
     pub(crate) capability: String,
     pub(crate) manufacturer_identifier_kind: Option<String>,
     pub(crate) manufacturer_identifier: Option<String>,
+    pub(crate) avionics_manufacturer_identity_id: i64,
+    pub(crate) canonical_product_key: String,
+    pub(crate) graph_manufacturer_identifier_kind: String,
+    pub(crate) canonical_identifier_key: String,
+    pub(crate) identity_source_url: Option<String>,
+    pub(crate) identity_source_title: Option<String>,
+    pub(crate) identity_evidence_text: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -868,6 +875,13 @@ struct CatalogFingerprintProduct {
     capabilities: Vec<String>,
     manufacturer_identifier_kind: String,
     manufacturer_identifier: String,
+    avionics_manufacturer_identity_id: i64,
+    canonical_product_key: String,
+    graph_manufacturer_identifier_kind: String,
+    canonical_identifier_key: String,
+    identity_source_url: String,
+    identity_source_title: String,
+    identity_evidence_text: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -1083,7 +1097,14 @@ const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       model.name AS model,
       capability.name AS capability,
       model.manufacturer_identifier_kind,
-      model.manufacturer_identifier
+      model.manufacturer_identifier,
+      graph.avionics_manufacturer_identity_id,
+      graph.canonical_product_key,
+      graph.manufacturer_identifier_kind AS graph_manufacturer_identifier_kind,
+      graph.canonical_identifier_key,
+      model.identity_source_url,
+      model.identity_source_title,
+      model.identity_evidence_text
     FROM avionics_models model
     JOIN avionics_manufacturers manufacturer
       ON manufacturer.id = model.avionics_manufacturer_id
@@ -1091,6 +1112,8 @@ const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       ON membership.avionics_model_id = model.id
     JOIN avionics_types capability
       ON capability.id = membership.avionics_type_id
+    JOIN avionics_approved_product_graph_identities graph
+      ON graph.avionics_model_id = model.id
     WHERE model.catalog_status = 'approved'
     ORDER BY model.id, capability.normalized_name, capability.id
 "#;
@@ -1134,6 +1157,13 @@ fn catalog_products(rows: Vec<CatalogFingerprintRow>) -> Vec<CatalogFingerprintP
                 capabilities: Vec::new(),
                 manufacturer_identifier_kind: row.manufacturer_identifier_kind.unwrap_or_default(),
                 manufacturer_identifier: row.manufacturer_identifier.unwrap_or_default(),
+                avionics_manufacturer_identity_id: row.avionics_manufacturer_identity_id,
+                canonical_product_key: row.canonical_product_key,
+                graph_manufacturer_identifier_kind: row.graph_manufacturer_identifier_kind,
+                canonical_identifier_key: row.canonical_identifier_key,
+                identity_source_url: row.identity_source_url.unwrap_or_default(),
+                identity_source_title: row.identity_source_title.unwrap_or_default(),
+                identity_evidence_text: row.identity_evidence_text.unwrap_or_default(),
             });
         product.capabilities.push(row.capability);
     }
@@ -1151,6 +1181,13 @@ fn fingerprint_catalog_products(products: &[CatalogFingerprintProduct]) -> Strin
             product.capabilities.join("\u{1f}"),
             product.manufacturer_identifier_kind.clone(),
             product.manufacturer_identifier.clone(),
+            product.avionics_manufacturer_identity_id.to_string(),
+            product.canonical_product_key.clone(),
+            product.graph_manufacturer_identifier_kind.clone(),
+            product.canonical_identifier_key.clone(),
+            product.identity_source_url.clone(),
+            product.identity_source_title.clone(),
+            product.identity_evidence_text.clone(),
         ] {
             feed_fingerprint(&mut hasher, &value);
         }
@@ -1168,6 +1205,13 @@ fn fingerprint_catalog_product(product: &CatalogFingerprintProduct) -> String {
         product.capabilities.join("\u{1f}"),
         product.manufacturer_identifier_kind.clone(),
         product.manufacturer_identifier.clone(),
+        product.avionics_manufacturer_identity_id.to_string(),
+        product.canonical_product_key.clone(),
+        product.graph_manufacturer_identifier_kind.clone(),
+        product.canonical_identifier_key.clone(),
+        product.identity_source_url.clone(),
+        product.identity_source_title.clone(),
+        product.identity_evidence_text.clone(),
     ] {
         feed_fingerprint(&mut hasher, &value);
     }
@@ -12782,6 +12826,52 @@ mod tests {
             model: model.to_string(),
             manufacturer_identifier_kind: Some("manufacturer_part_number".to_string()),
             manufacturer_identifier: Some(manufacturer_identifier.to_string()),
+        }
+    }
+
+    #[test]
+    fn same_case_product_fingerprint_binds_graph_identity_and_source_proof() {
+        let product = CatalogFingerprintProduct {
+            id: 7,
+            manufacturer: "Garmin".to_string(),
+            model: "GTX 345".to_string(),
+            capabilities: vec!["Transponder".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "GTX345".to_string(),
+            avionics_manufacturer_identity_id: 11,
+            canonical_product_key: "gtx345".to_string(),
+            graph_manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            canonical_identifier_key: "gtx345".to_string(),
+            identity_source_url: "https://www.garmin.com/gtx345".to_string(),
+            identity_source_title: "GTX 345".to_string(),
+            identity_evidence_text: "Garmin identifies the GTX 345 model.".to_string(),
+        };
+        let original = fingerprint_catalog_product(&product);
+        let mut mutations = Vec::new();
+        let mut changed = product.clone();
+        changed.avionics_manufacturer_identity_id += 1;
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.canonical_product_key.push('w');
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.graph_manufacturer_identifier_kind = "sku".to_string();
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.canonical_identifier_key.push('w');
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.identity_source_url.push_str("?revision=2");
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.identity_source_title.push_str(" product page");
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.identity_evidence_text.push_str(" Updated proof.");
+        mutations.push(changed);
+
+        for changed in mutations {
+            assert_ne!(fingerprint_catalog_product(&changed), original);
         }
     }
 

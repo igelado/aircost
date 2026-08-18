@@ -481,9 +481,23 @@ pub(crate) struct AutomatedReviewAvionicsIdentityResolution {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GroundedAvionicsResolutionReceipt {
-    pub listing_id: i64,
-    pub avionics_model_id: i64,
-    pub resolution_sha256: String,
+    listing_id: i64,
+    avionics_model_id: i64,
+    resolution_sha256: String,
+}
+
+impl GroundedAvionicsResolutionReceipt {
+    pub(crate) fn listing_id(&self) -> i64 {
+        self.listing_id
+    }
+
+    pub(crate) fn avionics_model_id(&self) -> i64 {
+        self.avionics_model_id
+    }
+
+    pub(crate) fn resolution_sha256(&self) -> &str {
+        &self.resolution_sha256
+    }
 }
 
 fn grounded_resolution_receipt(
@@ -522,6 +536,42 @@ fn grounded_resolution_receipt(
         avionics_model_id: approved.id,
         resolution_sha256: format!("{:x}", hasher.finalize()),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn grounded_resolution_receipt_for_test(
+    listing_id: i64,
+    avionics_model_id: i64,
+) -> GroundedAvionicsResolutionReceipt {
+    let request = AvionicsIdentityRequest {
+        aircraft_manufacturer: "Test Aircraft".to_string(),
+        aircraft_model: "Test Model".to_string(),
+        aircraft_variant: "Test Variant".to_string(),
+        model_year: 2026,
+        source_url: "https://example.test/listing".to_string(),
+        listing_context: "Test listing evidence".to_string(),
+        requires_listing_evidence: true,
+        authoritative_direct_source_urls: Vec::new(),
+        authoritative_identity_anchors: Vec::new(),
+        manufacturer: "Test Avionics".to_string(),
+        model: format!("Test Product {avionics_model_id}"),
+        avionics_types: vec!["navigation".to_string()],
+        quantity: 1,
+    };
+    let approved = ApprovedAvionicsIdentity {
+        id: avionics_model_id,
+        manufacturer: request.manufacturer.clone(),
+        model: request.model.clone(),
+        avionics_types: request.avionics_types.clone(),
+        manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+        manufacturer_identifier: format!("TEST-{avionics_model_id}"),
+        evidence_url: "https://example.test/product".to_string(),
+        evidence_title: "Test product proof".to_string(),
+        evidence: "Test-only grounded identity proof".to_string(),
+        reason: "test-only catalog receipt fixture".to_string(),
+        grounded_claim_source_urls: Vec::new(),
+    };
+    grounded_resolution_receipt(listing_id, &request, &approved)
 }
 
 fn grounded_consolidation_preview_block(

@@ -2367,11 +2367,11 @@ async fn resolve_identity_attempt(
                 if reuse_is_current {
                     authorization = Some(AutomatedAssociationAuthorization::ManufacturerReuse);
                 } else if let Some(receipt) = grounded_receipt.take().filter(|receipt| {
-                    receipt.listing_id == row.listing_id
-                        && receipt.avionics_model_id == approved.id
-                        && receipt.resolution_sha256.len() == 64
+                    receipt.listing_id() == row.listing_id
+                        && receipt.avionics_model_id() == approved.id
+                        && receipt.resolution_sha256().len() == 64
                         && receipt
-                            .resolution_sha256
+                            .resolution_sha256()
                             .bytes()
                             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 }) {
