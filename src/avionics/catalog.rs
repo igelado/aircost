@@ -4439,6 +4439,26 @@ fn resolution_issues(
     )
 }
 
+fn append_positive_listing_identity_issues(
+    context: &AvionicsUnitResolutionContext,
+    response: &Value,
+    issues: &mut Vec<String>,
+) {
+    if !context.requires_listing_evidence {
+        return;
+    }
+    let canonical_model_key =
+        normalize_avionics_identifier(string_field(response, "canonical_model"));
+    if canonical_model_key.is_empty()
+        || !exact_compact_identity_is_present(&context.listing_context, &canonical_model_key)
+    {
+        issues.push(
+            "positive identity requires the complete canonical model to appear in retained listing evidence at alphanumeric boundaries"
+                .to_string(),
+        );
+    }
+}
+
 fn resolution_issues_with_direct_source_proofs(
     context: &AvionicsUnitResolutionContext,
     response: &Value,
@@ -4467,6 +4487,7 @@ fn resolution_issues_with_direct_source_proofs(
     }
     match status {
         "existing_match" => {
+            append_positive_listing_identity_issues(context, response, &mut issues);
             if string_field(response, "manufacturer_identifier_scope")
                 != EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE
             {
@@ -4581,6 +4602,7 @@ fn resolution_issues_with_direct_source_proofs(
             );
         }
         "propose_new" => {
+            append_positive_listing_identity_issues(context, response, &mut issues);
             if string_field(response, "manufacturer_identifier_scope")
                 != EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE
             {
@@ -9414,6 +9436,84 @@ mod tests {
         assert!(
             issues.is_empty(),
             "an exact publisher model designation is a valid stable model number without a separate part number: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn first_stage_positive_identity_rejects_listing_suffix_substitution() {
+        let mut context = context(vec![]);
+        context.listing_context = "Garmin GTN 650TXi navigator installed".to_string();
+        context.candidate.model = "GTN 650TXi".to_string();
+        context.candidate.avionics_types = vec!["GPS".to_string()];
+        let source_url = "https://www.garmin.com/manuals/gtn-650xi";
+        let evidence = "Garmin identifies the GTN 650Xi navigator model.";
+        let response = json!({
+            "status": "propose_new",
+            "catalog_id": 0,
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "GTN 650Xi",
+            "canonical_types": ["GPS"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "GTN 650Xi",
+            "manufacturer_identifier_scope": "exact_catalog_product",
+            "rejection_basis": "none",
+            "confidence": "very_high",
+            "identity_source_url": source_url,
+            "identity_source_title": "GTN 650Xi product manual",
+            "identity_evidence": evidence,
+            "reason": "The publisher source identifies the product."
+        });
+
+        let issues = resolution_issues_with_direct_source_proofs(
+            &context,
+            &response,
+            true,
+            &[],
+            &[],
+            &[direct_source_proof(source_url, evidence)],
+        );
+
+        assert!(issues.iter().any(|issue| issue.contains(
+            "complete canonical model to appear in retained listing evidence at alphanumeric boundaries"
+        )), "suffix substitution must fail before collision review: {issues:?}");
+    }
+
+    #[test]
+    fn first_stage_positive_identity_accepts_punctuation_only_listing_typography() {
+        let mut context = context(vec![]);
+        context.listing_context = "Garmin GTX-345 transponder installed".to_string();
+        context.candidate.model = "GTX-345".to_string();
+        let source_url = "https://www.garmin.com/manuals/gtx-345";
+        let evidence = "Garmin identifies the GTX 345 transponder model.";
+        let response = json!({
+            "status": "propose_new",
+            "catalog_id": 0,
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "GTX 345",
+            "canonical_types": ["Transponder"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "GTX 345",
+            "manufacturer_identifier_scope": "exact_catalog_product",
+            "rejection_basis": "none",
+            "confidence": "very_high",
+            "identity_source_url": source_url,
+            "identity_source_title": "GTX 345 product manual",
+            "identity_evidence": evidence,
+            "reason": "The publisher source identifies the product."
+        });
+
+        let issues = resolution_issues_with_direct_source_proofs(
+            &context,
+            &response,
+            true,
+            &[],
+            &[],
+            &[direct_source_proof(source_url, evidence)],
+        );
+
+        assert!(
+            issues.is_empty(),
+            "punctuation-only model typography should remain equivalent: {issues:?}"
         );
     }
 

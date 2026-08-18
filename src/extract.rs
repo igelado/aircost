@@ -609,40 +609,56 @@ fn avionics_collision_direct_source_relevance_hints(
     hints
 }
 
-fn avionics_direct_source_product_identity_requirements(
+fn avionics_identity_product_identity_requirements(
     context: &AvionicsUnitResolutionContext,
 ) -> Vec<DirectSourceProductIdentityRequirement> {
-    context
-        .catalog_candidates
-        .iter()
-        .map(|candidate| DirectSourceProductIdentityRequirement {
-            key: format!("catalog:{}", candidate.id),
-            // Catalog candidates are scoped to the observed product's
-            // effective manufacturer identity before this context is built.
-            // Use that canonical request subject so an alias display spelling
-            // cannot turn model/part numbers into globally unique identities.
-            manufacturer: context.candidate.manufacturer.clone(),
-            model: candidate.model.clone(),
-            manufacturer_identifier: if matches!(
-                candidate.manufacturer_identifier_kind.as_str(),
-                "manufacturer_part_number" | "manufacturer_model_number" | "sku"
-            ) {
-                candidate.manufacturer_identifier.clone()
-            } else {
-                String::new()
-            },
-        })
-        .collect()
+    vec![DirectSourceProductIdentityRequirement {
+        key: "observed".to_string(),
+        manufacturer: context.candidate.manufacturer.clone(),
+        model: context.candidate.model.clone(),
+        manufacturer_identifier: String::new(),
+    }]
 }
 
-fn effective_avionics_product_identity_requirements(
-    context: &AvionicsUnitResolutionContext,
-) -> Vec<DirectSourceProductIdentityRequirement> {
-    if context.authoritative_direct_source_urls.is_empty() {
-        Vec::new()
+fn stable_avionics_manufacturer_identifier(kind: &str, identifier: &str) -> String {
+    if matches!(
+        kind,
+        "manufacturer_part_number" | "manufacturer_model_number" | "sku"
+    ) {
+        identifier.to_string()
     } else {
-        avionics_direct_source_product_identity_requirements(context)
+        String::new()
     }
+}
+
+fn avionics_collision_product_identity_requirements(
+    context: &AvionicsCatalogCollisionReviewContext,
+) -> Vec<DirectSourceProductIdentityRequirement> {
+    std::iter::once(DirectSourceProductIdentityRequirement {
+        key: "proposal".to_string(),
+        manufacturer: context.proposed_identity.canonical_manufacturer.clone(),
+        model: context.proposed_identity.canonical_model.clone(),
+        manufacturer_identifier: stable_avionics_manufacturer_identifier(
+            &context.proposed_identity.manufacturer_identifier_kind,
+            &context.proposed_identity.manufacturer_identifier,
+        ),
+    })
+    .chain(
+        context
+            .classification_context
+            .catalog_candidates
+            .iter()
+            .map(|candidate| DirectSourceProductIdentityRequirement {
+                key: format!("catalog:{}", candidate.id),
+                manufacturer: candidate.manufacturer.clone(),
+                model: candidate.model.clone(),
+                manufacturer_identifier: stable_avionics_manufacturer_identifier(
+                    &candidate.manufacturer_identifier_kind,
+                    &candidate.manufacturer_identifier,
+                ),
+            }),
+    )
+    .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1047,7 +1063,7 @@ impl GeminiListingExtractor {
         let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            effective_avionics_product_identity_requirements(context);
+            avionics_identity_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_identity",
             build_avionics_unit_resolution_prompt(context),
@@ -1076,7 +1092,7 @@ impl GeminiListingExtractor {
             effective_avionics_publisher_anchors(&context.classification_context);
         let relevance_hints = avionics_collision_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            effective_avionics_product_identity_requirements(&context.classification_context);
+            avionics_collision_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review",
             build_avionics_catalog_collision_review_prompt(context),
@@ -1117,7 +1133,7 @@ impl GeminiListingExtractor {
             effective_avionics_publisher_anchors(&context.classification_context);
         let relevance_hints = avionics_collision_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            effective_avionics_product_identity_requirements(&context.classification_context);
+            avionics_collision_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review",
             build_avionics_catalog_collision_review_prompt(context),
@@ -1154,7 +1170,7 @@ impl GeminiListingExtractor {
             effective_avionics_publisher_anchors(&context.classification_context);
         let relevance_hints = avionics_collision_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            effective_avionics_product_identity_requirements(&context.classification_context);
+            avionics_collision_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_catalog_collision_review_correction",
             build_avionics_catalog_collision_review_correction_prompt(
@@ -1192,7 +1208,7 @@ impl GeminiListingExtractor {
         let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            effective_avionics_product_identity_requirements(context);
+            avionics_identity_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_identity_correction",
             build_avionics_unit_resolution_correction_prompt(
@@ -1227,7 +1243,7 @@ impl GeminiListingExtractor {
         let publisher_anchors = effective_avionics_publisher_anchors(context);
         let relevance_hints = avionics_identity_direct_source_relevance_hints(context);
         let product_identity_requirements =
-            effective_avionics_product_identity_requirements(context);
+            avionics_identity_product_identity_requirements(context);
         self.generate_avionics_grounded_json(
             "avionics_identity_correction",
             build_avionics_unit_resolution_correction_prompt(
@@ -4269,17 +4285,17 @@ mod tests {
 
     use super::{
         avionics_collision_direct_source_relevance_hints, avionics_collision_evidence_scope,
-        avionics_direct_source_chain_scopes, avionics_direct_source_product_identity_requirements,
+        avionics_collision_product_identity_requirements, avionics_direct_source_chain_scopes,
         avionics_identity_direct_source_relevance_hints, avionics_identity_evidence_scope,
-        avionics_metadata_evidence_scope, build_avionics_approved_candidate_adjudication_prompt,
+        avionics_identity_product_identity_requirements, avionics_metadata_evidence_scope,
+        build_avionics_approved_candidate_adjudication_prompt,
         build_avionics_candidate_triage_prompt, build_avionics_catalog_collision_research_prompt,
         build_avionics_catalog_collision_review_correction_prompt,
         build_avionics_catalog_collision_review_prompt, build_avionics_metadata_correction_prompt,
         build_avionics_metadata_prompt, build_avionics_unit_concreteness_prompt,
         build_avionics_unit_resolution_correction_prompt, build_avionics_unit_resolution_prompt,
         build_avionics_unit_resolution_research_prompt, build_extraction_prompt,
-        configure_avionics_authoritative_direct_sources,
-        effective_avionics_product_identity_requirements, effective_avionics_publisher_anchors,
+        configure_avionics_authoritative_direct_sources, effective_avionics_publisher_anchors,
         gemini_aircraft_spec_metadata_response_schema,
         gemini_avionics_approved_candidate_adjudication_response_schema,
         gemini_avionics_candidate_triage_response_schema,
@@ -5661,20 +5677,26 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_search_does_not_require_proof_for_every_similarity_candidate() {
+    fn identity_product_proof_is_required_for_search_and_authorized_urls() {
         let context = avionics_identity_context();
-        assert!(
-            effective_avionics_product_identity_requirements(&context).is_empty(),
-            "ordinary Search must be able to return unresolved or reject without proving every shortlist row"
+        let expected = vec![DirectSourceProductIdentityRequirement {
+            key: "observed".to_string(),
+            manufacturer: "Garmin".to_string(),
+            model: "GTX 345R".to_string(),
+            manufacturer_identifier: String::new(),
+        }];
+        assert_eq!(
+            avionics_identity_product_identity_requirements(&context),
+            expected
         );
 
         let mut direct = context;
         direct.authoritative_direct_source_urls =
             vec!["https://static.garmin.com/manual.pdf".to_string()];
         assert_eq!(
-            effective_avionics_product_identity_requirements(&direct).len(),
-            direct.catalog_candidates.len(),
-            "caller-selected direct-source review retains strict shortlist coverage"
+            avionics_identity_product_identity_requirements(&direct),
+            expected,
+            "proof requirements must not depend on how publisher URLs were discovered"
         );
     }
 
@@ -5712,23 +5734,15 @@ mod tests {
                 "identity hints omitted {expected:?}: {identity_hints:?}"
             );
         }
-        let product_requirements = avionics_direct_source_product_identity_requirements(&context);
+        let product_requirements = avionics_identity_product_identity_requirements(&context);
         assert_eq!(
             product_requirements,
-            vec![
-                DirectSourceProductIdentityRequirement {
-                    key: "catalog:239".to_string(),
-                    manufacturer: "Garmin".to_string(),
-                    model: "GIA 63W".to_string(),
-                    manufacturer_identifier: "GIA 63W".to_string(),
-                },
-                DirectSourceProductIdentityRequirement {
-                    key: "catalog:11".to_string(),
-                    manufacturer: "Garmin".to_string(),
-                    model: "GIA 63".to_string(),
-                    manufacturer_identifier: "011-00781-00".to_string(),
-                },
-            ]
+            vec![DirectSourceProductIdentityRequirement {
+                key: "observed".to_string(),
+                manufacturer: "Garmin".to_string(),
+                model: "GIA 63W".to_string(),
+                manufacturer_identifier: String::new(),
+            }]
         );
 
         let collision = AvionicsCatalogCollisionReviewContext {
@@ -5746,6 +5760,29 @@ mod tests {
             .iter()
             .any(|hint| hint == "GIA 63W 010-00386-00"));
         assert!(collision_hints.len() <= AVIONICS_DIRECT_SOURCE_RELEVANCE_HINT_LIMIT);
+        assert_eq!(
+            avionics_collision_product_identity_requirements(&collision),
+            vec![
+                DirectSourceProductIdentityRequirement {
+                    key: "proposal".to_string(),
+                    manufacturer: "Garmin".to_string(),
+                    model: "GIA 63W".to_string(),
+                    manufacturer_identifier: "010-00386-00".to_string(),
+                },
+                DirectSourceProductIdentityRequirement {
+                    key: "catalog:239".to_string(),
+                    manufacturer: "Garmin".to_string(),
+                    model: "GIA 63W".to_string(),
+                    manufacturer_identifier: "GIA 63W".to_string(),
+                },
+                DirectSourceProductIdentityRequirement {
+                    key: "catalog:11".to_string(),
+                    manufacturer: "Garmin".to_string(),
+                    model: "GIA 63".to_string(),
+                    manufacturer_identifier: "011-00781-00".to_string(),
+                },
+            ]
+        );
     }
 
     fn approved_candidate_adjudication_context() -> AvionicsApprovedCandidateAdjudicationContext {
