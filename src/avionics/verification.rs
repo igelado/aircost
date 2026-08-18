@@ -1028,6 +1028,7 @@ async fn process_listing(
         }
     };
     let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+    let mut ordinary_review_forced_fallback = false;
     let (raw_avionics, mut residual_aspects) = match retained_observation_source(
         db,
         row,
@@ -1046,6 +1047,7 @@ async fn process_listing(
             avionics,
             preserved_aspects,
         }) => {
+            ordinary_review_forced_fallback = true;
             listing_report.raw_avionics_source = "retained_extraction".to_string();
             (avionics, preserved_aspects)
         }
@@ -1053,6 +1055,7 @@ async fn process_listing(
             reason,
             preserved_aspects,
         }) => {
+            ordinary_review_forced_fallback = true;
             listing_report.reextraction_required = true;
             listing_report.reextraction_reason = Some(reason);
             let Some(rendered_html) = row
@@ -1111,6 +1114,14 @@ async fn process_listing(
             return listing_report;
         }
     };
+    if ordinary_review_forced_fallback && raw_avionics.is_empty() {
+        listing_report.status = "blocked".to_string();
+        listing_report.error = Some(
+            "fallback extraction returned no avionics observations; the complete prior review and links were retained because empty extraction is not evidence that prior observations are garbage"
+                .to_string(),
+        );
+        return listing_report;
+    }
     let mut prepared: Vec<PreparedLink> = Vec::new();
     let mut blocking_reasons = Vec::new();
     let mut review_revision = PendingReviewRevisionCursor::from_listing(row);
@@ -3626,6 +3637,65 @@ mod tests {
         )
     }
 
+    #[derive(Clone)]
+    struct EmptyExtractionEndpointState {
+        request_count: Arc<AtomicUsize>,
+    }
+
+    async fn empty_extraction_endpoint_response(
+        State(state): State<EmptyExtractionEndpointState>,
+        Json(_request): Json<Value>,
+    ) -> Json<Value> {
+        state.request_count.fetch_add(1, Ordering::SeqCst);
+        let content = json!({
+            "manufacturer": "Cessna",
+            "model": "172",
+            "variant": "S",
+            "model_year": 2020,
+            "asking_price_usd": 300000,
+            "currency": "USD",
+            "airframe_hours": 1000,
+            "engine_hours": null,
+            "engine_time_basis": "unknown",
+            "engine_time_evidence": null,
+            "engine_time_confidence": null,
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "propeller_time_evidence": null,
+            "propeller_time_confidence": null,
+            "installed_engine": null,
+            "installed_propeller": null,
+            "registration_number": "N12345",
+            "serial_number": null,
+            "status": "active",
+            "avionics": [],
+            "valuation_facts": []
+        })
+        .to_string();
+        Json(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": content}]}
+            }]
+        }))
+    }
+
+    async fn spawn_empty_extraction_endpoint(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let state = EmptyExtractionEndpointState {
+            request_count: request_count.clone(),
+        };
+        let app = Router::new()
+            .route("/", post(empty_extraction_endpoint_response))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), request_count, server)
+    }
+
     #[test]
     fn provider_request_plan_counts_logical_stages_not_transport_attempts() {
         let plan = provider_request_plan(&AvionicsVerificationPreflightSummary {
@@ -5253,6 +5323,211 @@ mod tests {
             .any(|aspect| aspect.id == ordinary_aspect_id));
         assert_eq!(proof_count, 1);
         assert_eq!(usage_count, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_reextraction_after_ordinary_review_fallback_preserves_all_prior_state() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let (listing_id, link_id, preserved_aspect_id) = seed_preserved_association_listing(
+            &db,
+            "empty-reextraction-preserves-prior-state",
+            product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        let (submission_id, review_json, review_sha256, pending_aspect_count, rendered_html): (
+            i64,
+            String,
+            String,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT review.plugin_submission_id, review.review_payload_json,
+                   review.review_payload_sha256, review.pending_aspect_count,
+                   submission.rendered_html
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN plugin_submissions submission
+              ON submission.id = review.plugin_submission_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut aspects = parse_current_pending_review_aspects(
+            &review_json,
+            &review_sha256,
+            pending_aspect_count,
+        )
+        .unwrap();
+        let ordinary_aspect_id = ReviewAspectId::from("fixture:empty-fallback:replacement");
+        let ordinary_evidence = "Unknown replacement package";
+        aspects.push(
+            PendingReviewAspect::avionics(
+                ordinary_aspect_id.clone(),
+                "avionics",
+                "Unknown replacement package",
+                "Unknown replacement package",
+                "replacement relationship requires review",
+                1,
+                "replaces",
+                Some(ordinary_evidence.to_string()),
+                Some("high".to_string()),
+            )
+            .with_proposed_product(ReviewProduct::proposed(
+                "Unknown",
+                "Replacement Package",
+                vec!["GPS".to_string()],
+            ))
+            .with_replacement_product(product_id),
+        );
+        let rendered_html = format!("{rendered_html}<p>{ordinary_evidence}</p>");
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET rendered_html = ?, rendered_html_sha256 = ?,
+                extracted_listing_json = NULL,
+                extraction_error = 'legacy extraction unavailable'
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rendered_html)
+        .bind(sha256_hex(rendered_html.as_bytes()))
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &aspects,
+        )
+        .await
+        .unwrap();
+
+        let review_before: (i64, String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT id, review_payload_json, review_payload_sha256, pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews
+            WHERE listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let link_before: (
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+        ) = sqlx::query_as(
+            r#"
+            SELECT id, avionics_model_id, quantity, source, source_notes,
+                   source_confidence, configuration_action, replaces_avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE id = ?
+            "#,
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let (endpoint, request_count, server) = spawn_empty_extraction_endpoint().await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let result = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("a valid empty re-extraction should fail closed without mutating prior state");
+        server.abort();
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the complete prior review should remain pending")
+        };
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(report.status, "blocked");
+        assert_eq!(report.raw_avionics_source, "gemini_reextraction");
+        assert!(report.reextraction_required);
+        assert!(report.reextraction_attempted);
+        assert!(report.reextraction_succeeded);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.remaining_review_aspects, 2);
+        assert!(report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("complete prior review and links were retained")));
+
+        let review_after: (i64, String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT id, review_payload_json, review_payload_sha256, pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews
+            WHERE listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let link_after: (
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+        ) = sqlx::query_as(
+            r#"
+            SELECT id, avionics_model_id, quantity, source, source_notes,
+                   source_confidence, configuration_action, replaces_avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE id = ?
+            "#,
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let proof_counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations
+               WHERE listing_link_id = ?),
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes
+               WHERE listing_link_id = ?)
+            "#,
+        )
+        .bind(link_id)
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let retained_aspects =
+            parse_current_pending_review_aspects(&review_after.1, &review_after.2, review_after.3)
+                .unwrap();
+        assert_eq!(review_after, review_before);
+        assert_eq!(link_after, link_before);
+        assert_eq!(proof_counts, (0, 0));
+        assert!(retained_aspects
+            .iter()
+            .any(|aspect| aspect.id == preserved_aspect_id));
+        assert!(retained_aspects
+            .iter()
+            .any(|aspect| aspect.id == ordinary_aspect_id));
     }
 
     #[tokio::test]
