@@ -50,10 +50,11 @@ they cannot be emitted as structured source fields.
 Each bounded publisher window receives a transient request-local identifier.
 Evidence fields in the structure schema select one of those identifiers instead
 of asking Gemini to reproduce or count offsets into publisher prose. The server
-binds the selection to its sibling source URL, replaces it with the exact window
-text, and then runs the unchanged document, digest, evidence-proof, and domain
-validators. Unknown, cross-source, or nested/offset-shaped selections fail
-closed, and neither selectors nor evidence packets are persisted.
+derives and overwrites the sibling source URL from the selected window, replaces
+the selector with the exact window text, and then runs the document, digest,
+evidence-proof, and domain validators. A source URL emitted alongside the
+selector cannot choose or rebind its evidence. Unknown or nested/offset-shaped
+selectors fail closed, and neither selectors nor evidence packets are persisted.
 An unusable Search-discovery redirect is discarded when another citation
 resolves successfully; the unresolved URL is never forwarded as a fallback.
 If none resolve, Search retries normally. URL Context citation resolution
