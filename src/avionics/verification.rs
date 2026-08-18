@@ -711,9 +711,9 @@ async fn preflight_listing(
     }
     let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
     let raw_avionics = match retained_observation_source(db, row, &listing_context).await {
-        Ok(RetainedObservationSource::Review(replay)) => replay.avionics,
-        Ok(RetainedObservationSource::Extraction(avionics)) => avionics,
-        Ok(RetainedObservationSource::RequiresReextraction { reason }) => {
+        Ok(RetainedObservationSource::Review { avionics, .. })
+        | Ok(RetainedObservationSource::Extraction { avionics, .. }) => avionics,
+        Ok(RetainedObservationSource::RequiresReextraction { reason, .. }) => {
             report.reextraction_required = true;
             let Some(rendered_html) = row.rendered_html.as_deref() else {
                 report.note =
@@ -1035,15 +1035,24 @@ async fn process_listing(
     )
     .await
     {
-        Ok(RetainedObservationSource::Review(replay)) => {
+        Ok(RetainedObservationSource::Review {
+            avionics,
+            preserved_aspects,
+        }) => {
             listing_report.raw_avionics_source = "pending_review".to_string();
-            (replay.avionics, replay.preserved_aspects)
+            (avionics, preserved_aspects)
         }
-        Ok(RetainedObservationSource::Extraction(avionics)) => {
+        Ok(RetainedObservationSource::Extraction {
+            avionics,
+            preserved_aspects,
+        }) => {
             listing_report.raw_avionics_source = "retained_extraction".to_string();
-            (avionics, Vec::new())
+            (avionics, preserved_aspects)
         }
-        Ok(RetainedObservationSource::RequiresReextraction { reason }) => {
+        Ok(RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects,
+        }) => {
             listing_report.reextraction_required = true;
             listing_report.reextraction_reason = Some(reason);
             let Some(rendered_html) = row
@@ -1084,7 +1093,7 @@ async fn process_listing(
                 Ok(avionics) => {
                     listing_report.raw_avionics_source = "gemini_reextraction".to_string();
                     listing_report.reextraction_succeeded = true;
-                    (avionics, Vec::new())
+                    (avionics, preserved_aspects)
                 }
                 Err(error) => {
                     listing_report.status = "error".to_string();
@@ -2782,10 +2791,26 @@ struct RetainedReviewObservations {
     preserved_aspects: Vec<PendingReviewAspect>,
 }
 
+enum RetainedReviewObservationSource {
+    Current(RetainedReviewObservations),
+    RequiresFallback {
+        preserved_aspects: Vec<PendingReviewAspect>,
+    },
+}
+
 enum RetainedObservationSource {
-    Review(RetainedReviewObservations),
-    Extraction(Vec<ParsedAvionics>),
-    RequiresReextraction { reason: String },
+    Review {
+        avionics: Vec<ParsedAvionics>,
+        preserved_aspects: Vec<PendingReviewAspect>,
+    },
+    Extraction {
+        avionics: Vec<ParsedAvionics>,
+        preserved_aspects: Vec<PendingReviewAspect>,
+    },
+    RequiresReextraction {
+        reason: String,
+        preserved_aspects: Vec<PendingReviewAspect>,
+    },
 }
 
 async fn retained_observation_source(
@@ -2793,16 +2818,28 @@ async fn retained_observation_source(
     row: &ListingSourceRow,
     listing_context: &ListingEvidenceContext,
 ) -> Result<RetainedObservationSource, String> {
-    if let Some(replay) = retained_review_observations(db, row, listing_context).await? {
-        return Ok(RetainedObservationSource::Review(replay));
-    }
+    let preserved_aspects = match retained_review_observations(db, row, listing_context).await? {
+        RetainedReviewObservationSource::Current(replay) => {
+            return Ok(RetainedObservationSource::Review {
+                avionics: replay.avionics,
+                preserved_aspects: replay.preserved_aspects,
+            });
+        }
+        RetainedReviewObservationSource::RequiresFallback { preserved_aspects } => {
+            preserved_aspects
+        }
+    };
     Ok(
         match retained_avionics_source(row.extracted_listing_json.as_deref(), listing_context) {
-            RetainedAvionicsSource::Current(avionics) => {
-                RetainedObservationSource::Extraction(avionics)
-            }
+            RetainedAvionicsSource::Current(avionics) => RetainedObservationSource::Extraction {
+                avionics,
+                preserved_aspects,
+            },
             RetainedAvionicsSource::RequiresReextraction { reason } => {
-                RetainedObservationSource::RequiresReextraction { reason }
+                RetainedObservationSource::RequiresReextraction {
+                    reason,
+                    preserved_aspects,
+                }
             }
         },
     )
@@ -2812,7 +2849,7 @@ async fn retained_review_observations(
     db: &AppDb,
     row: &ListingSourceRow,
     listing_context: &ListingEvidenceContext,
-) -> Result<Option<RetainedReviewObservations>, String> {
+) -> Result<RetainedReviewObservationSource, String> {
     let aspects = parse_current_pending_review_aspects(
         &row.review_payload_json,
         &row.review_payload_sha256,
@@ -2820,12 +2857,12 @@ async fn retained_review_observations(
     )
     .map_err(|error| format!("pending review cannot be replayed safely: {error}"))?;
     let mut avionics = Vec::new();
-    let mut preserved_aspects = Vec::new();
-    for aspect in aspects {
-        if aspect.kind != "avionics" {
-            preserved_aspects.push(aspect);
-            continue;
-        }
+    let preserved_aspects = aspects
+        .iter()
+        .filter(|aspect| aspect.kind != "avionics")
+        .cloned()
+        .collect::<Vec<_>>();
+    for aspect in aspects.iter().filter(|aspect| aspect.kind == "avionics") {
         let evidence_is_current = aspect
             .source_evidence_text
             .as_deref()
@@ -2838,7 +2875,7 @@ async fn retained_review_observations(
             && aspect.replaces_product_id.is_none()
             && aspect.replacement_aspect_id.is_none();
         if !evidence_is_current || !independent_installation {
-            return Ok(None);
+            return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
         }
         let product = if let Some(product) = aspect.proposed_product.as_ref() {
             if product.capabilities.is_empty()
@@ -2847,14 +2884,14 @@ async fn retained_review_observations(
                     .iter()
                     .any(|capability| capability.trim().is_empty())
             {
-                return Ok(None);
+                return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
             }
             product.clone()
         } else {
             let Some(product) =
                 replay_current_verified_suggestion(db, row, listing_context, &aspect).await?
             else {
-                return Ok(None);
+                return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
             };
             product
         };
@@ -2873,12 +2910,14 @@ async fn retained_review_observations(
         && validate_exact_listing_evidence(&avionics, listing_context).is_err())
         || (avionics.is_empty() && preserved_aspects.is_empty())
     {
-        return Ok(None);
+        return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
     }
-    Ok(Some(RetainedReviewObservations {
-        avionics,
-        preserved_aspects,
-    }))
+    Ok(RetainedReviewObservationSource::Current(
+        RetainedReviewObservations {
+            avionics,
+            preserved_aspects,
+        },
+    ))
 }
 
 async fn prepare_current_preserved_associations(
@@ -4835,10 +4874,13 @@ mod tests {
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
 
-        let replay = retained_review_observations(&db, &row, &listing_context)
-            .await
-            .unwrap()
-            .expect("the current exact pending review is the reusable work queue");
+        let RetainedReviewObservationSource::Current(replay) =
+            retained_review_observations(&db, &row, &listing_context)
+                .await
+                .unwrap()
+        else {
+            panic!("the current exact pending review is the reusable work queue")
+        };
         assert_eq!(replay.avionics.len(), 1);
         assert_eq!(replay.avionics[0].model, "Fixture");
         assert!(replay.preserved_aspects.is_empty());
@@ -5010,6 +5052,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_fallback_preserves_synthetic_cards_without_duplicating_ordinary_review() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_suggestion_product(&db, true).await;
+        let (listing_id, link_id, preserved_aspect_id) = seed_preserved_association_listing(
+            &db,
+            "mixed-preserved-and-nonreplayable",
+            product_id,
+            PreservedAssociationFixture::Exact,
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        let (submission_id, review_json, review_sha256, pending_aspect_count, rendered_html): (
+            i64,
+            String,
+            String,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            r#"
+            SELECT review.plugin_submission_id, review.review_payload_json,
+                   review.review_payload_sha256, review.pending_aspect_count,
+                   submission.rendered_html
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN plugin_submissions submission
+              ON submission.id = review.plugin_submission_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut aspects = parse_current_pending_review_aspects(
+            &review_json,
+            &review_sha256,
+            pending_aspect_count,
+        )
+        .unwrap();
+        let ineligible_product_id = seed_approved_suggestion_product(&db, true).await;
+        let (ineligible_manufacturer, ineligible_model): (String, String) = sqlx::query_as(
+            r#"
+            SELECT manufacturer.name, model.name
+            FROM avionics_models model
+            JOIN avionics_manufacturers manufacturer
+              ON manufacturer.id = model.avionics_manufacturer_id
+            WHERE model.id = ?
+            "#,
+        )
+        .bind(ineligible_product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let ineligible_evidence =
+            format!("{ineligible_manufacturer} {ineligible_model} backup display");
+        let ineligible_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(ineligible_product_id)
+        .bind(&ineligible_evidence)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let ineligible_aspect_id =
+            ReviewAspectId::from(format!("avionics:preserved:{ineligible_link_id}:installed"));
+        aspects.push(
+            PendingReviewAspect::avionics(
+                ineligible_aspect_id.clone(),
+                "avionics_reuse_attestation",
+                format!("{ineligible_manufacturer} {ineligible_model}"),
+                format!("{ineligible_manufacturer} {ineligible_model}"),
+                "catalog_product_or_listing_corroboration_missing",
+                1,
+                "installed",
+                None,
+                None,
+            )
+            .with_covered_association(
+                ineligible_link_id,
+                ListingAssociationRole::Installed,
+                ineligible_product_id,
+            )
+            .with_reuse_attestation_target(ineligible_product_id),
+        );
+        let ordinary_aspect_id = ReviewAspectId::from("fixture:mixed:replacement");
+        let ordinary_evidence = "Unknown replacement package";
+        aspects.push(
+            PendingReviewAspect::avionics(
+                ordinary_aspect_id.clone(),
+                "avionics",
+                "Unknown replacement package",
+                "Unknown replacement package",
+                "replacement relationship requires review",
+                1,
+                "replaces",
+                Some(ordinary_evidence.to_string()),
+                Some("high".to_string()),
+            )
+            .with_proposed_product(ReviewProduct::proposed(
+                "Unknown",
+                "Replacement Package",
+                vec!["GPS".to_string()],
+            ))
+            .with_replacement_product(product_id),
+        );
+        let rendered_html =
+            format!("{rendered_html}<p>{ineligible_evidence}</p><p>{ordinary_evidence}</p>");
+        let extracted_listing_json = format!(
+            r#"{{"avionics":[{{"manufacturer":"","model":"Replacement Package","types":["GPS"],"quantity":1,"configuration_action":"installed","source_evidence_text":"{ordinary_evidence}","source_confidence":"high"}}]}}"#
+        );
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET rendered_html = ?, rendered_html_sha256 = ?,
+                extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rendered_html)
+        .bind(sha256_hex(rendered_html.as_bytes()))
+        .bind(extracted_listing_json)
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &aspects,
+        )
+        .await
+        .unwrap();
+
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let result = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("mixed fallback should consume independent local work without a provider");
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the mixed review should remain pending after partial local progress")
+        };
+        assert_eq!(report.status, "applied");
+        assert_eq!(report.raw_avionics_source, "retained_extraction");
+        assert!(!report.reextraction_attempted);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.remaining_review_aspects, 2);
+
+        let (retained_review_json, retained_review_sha256, retained_aspect_count): (
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT review_payload_json, review_payload_sha256, pending_aspect_count FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let retained_aspects = parse_current_pending_review_aspects(
+            &retained_review_json,
+            &retained_review_sha256,
+            retained_aspect_count,
+        )
+        .unwrap();
+        let proof_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let usage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_aspects.len(), 2);
+        assert!(retained_aspects
+            .iter()
+            .any(|aspect| aspect.id == ineligible_aspect_id));
+        assert!(!retained_aspects
+            .iter()
+            .any(|aspect| aspect.id == preserved_aspect_id));
+        assert!(!retained_aspects
+            .iter()
+            .any(|aspect| aspect.id == ordinary_aspect_id));
+        assert_eq!(proof_count, 1);
+        assert_eq!(usage_count, 0);
+    }
+
+    #[tokio::test]
     async fn ineligible_preserved_associations_remain_pending_without_provider_usage() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let attested_product_id = seed_approved_suggestion_product(&db, true).await;
@@ -5151,10 +5397,14 @@ mod tests {
         .unwrap();
         let listing_context =
             ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
-        assert!(retained_review_observations(&db, &row, &listing_context)
-            .await
-            .unwrap()
-            .is_none());
+        let RetainedReviewObservationSource::RequiresFallback { preserved_aspects } =
+            retained_review_observations(&db, &row, &listing_context)
+                .await
+                .unwrap()
+        else {
+            panic!("non-source review evidence must require fallback")
+        };
+        assert!(preserved_aspects.is_empty());
     }
 
     #[tokio::test]
