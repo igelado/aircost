@@ -1356,6 +1356,7 @@ mod tests {
         let rendered_html = r#"<html><body>
             Garmin avionics: Garmin GTN 750Xi, Garmin GTX 345, Garmin GNS 430W,
             Garmin GMA 340, Garmin GTN 650Xi, Garmin GNS 530W, and Garmin Unverified Unit.
+            GIA-63W NAV/COM/GPS with Glideslope.
             Garmin GTN 750Xi replaces Garmin GNS 530W.
         </body></html>"#;
         let rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
@@ -1651,6 +1652,185 @@ mod tests {
             .aspects
             .iter()
             .all(|aspect| aspect.reuse_attestation_target_id != Some(accepted_id)));
+    }
+
+    #[tokio::test]
+    async fn restage_reissues_corroboration_after_model_only_evidence_repair() {
+        let fixture = fixture().await;
+        let accepted_id = insert_product(&fixture.db, "GIA63W", "GIA63W", true).await;
+        let residual = pending_aspect("residual:0", "Unclear audio panel");
+        let collision_revision =
+            super::super::active_collision_closure_revision_sha256(&fixture.db, accepted_id)
+                .await
+                .unwrap();
+        let result = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![accepted_with_revision(
+                    accepted_id,
+                    collision_revision.clone(),
+                    "GIA-63W NAV/COM/GPS with Glideslope".to_string(),
+                )],
+                vec![residual.clone()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.accepted_link_count, 1);
+        assert_eq!(result.residual_aspect_count, 1);
+
+        let pool = pool(&fixture.db);
+        let (link_id, source_notes): (i64, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT id, source_notes
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+              AND avionics_model_id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(accepted_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            source_notes.as_deref(),
+            Some("GIA-63W NAV/COM/GPS with Glideslope")
+        );
+        let before: (String, String) = sqlx::query_as(
+            r#"
+            SELECT corroboration.observation_sha256,
+                   scope.collision_closure_sha256
+            FROM aircraft_sale_listing_avionics_corroborations corroboration
+            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
+              ON scope.listing_link_id = corroboration.listing_link_id
+             AND scope.association_role = corroboration.association_role
+            WHERE corroboration.listing_link_id = ?
+              AND corroboration.association_role = 'installed'
+            "#,
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(before.1, collision_revision);
+
+        let owner_user_id: i64 = sqlx::query_scalar(
+            "SELECT created_by_user_id FROM aircraft_sale_listings WHERE id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let review_hash: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        super::super::restage_pending_review_if_current(
+            &fixture.db,
+            owner_user_id,
+            fixture.listing_id,
+            &review_hash,
+        )
+        .await
+        .unwrap();
+
+        let (repaired_notes, confidence): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT source_notes, source_confidence FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired_notes.as_deref(), Some("GIA-63W"));
+        assert_eq!(confidence.as_deref(), Some("high"));
+        let after: (String, String) = sqlx::query_as(
+            r#"
+            SELECT corroboration.observation_sha256,
+                   scope.collision_closure_sha256
+            FROM aircraft_sale_listing_avionics_corroborations corroboration
+            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
+              ON scope.listing_link_id = corroboration.listing_link_id
+             AND scope.association_role = corroboration.association_role
+            WHERE corroboration.listing_link_id = ?
+              AND corroboration.association_role = 'installed'
+            "#,
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_ne!(after.0, before.0);
+        assert_eq!(
+            after.0,
+            association_observation_sha256_from_values(
+                fixture.listing_id,
+                link_id,
+                ListingAssociationRole::Installed,
+                accepted_id,
+                accepted_id,
+                None,
+                1,
+                "installed",
+                "GIA-63W",
+            )
+        );
+        assert_eq!(after.1, collision_revision);
+        let restaged: (String, i64, String) = sqlx::query_as(
+            "SELECT review_payload_json, pending_aspect_count, review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let payload = parse_payload(&restaged.0, None, restaged.1).unwrap();
+        assert_eq!(payload.aspects.len(), 1);
+        assert_eq!(payload.aspects[0].id, residual.id);
+        assert_ne!(
+            payload.aspects[0].reuse_attestation_target_id,
+            Some(accepted_id)
+        );
+
+        let second = super::super::restage_pending_review_if_current(
+            &fixture.db,
+            owner_user_id,
+            fixture.listing_id,
+            &restaged.2,
+        )
+        .await
+        .unwrap()
+        .expect("the independent residual remains pending");
+        assert_eq!(second.review_payload_sha256, restaged.2);
+        assert_eq!(second.pending_aspect_count, 1);
+        let after_second: (String, String, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT corroboration.observation_sha256,
+                   scope.collision_closure_sha256,
+                   (SELECT COUNT(*)
+                    FROM aircraft_sale_listing_avionics_corroborations
+                    WHERE listing_link_id = ?),
+                   (SELECT COUNT(*)
+                    FROM aircraft_sale_listing_avionics_corroboration_scopes
+                    WHERE listing_link_id = ?)
+            FROM aircraft_sale_listing_avionics_corroborations corroboration
+            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
+              ON scope.listing_link_id = corroboration.listing_link_id
+             AND scope.association_role = corroboration.association_role
+            WHERE corroboration.listing_link_id = ?
+              AND corroboration.association_role = 'installed'
+            "#,
+        )
+        .bind(link_id)
+        .bind(link_id)
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(after_second, (after.0, after.1, 1, 1));
     }
 
     #[tokio::test]
