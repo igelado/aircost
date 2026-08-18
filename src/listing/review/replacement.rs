@@ -273,7 +273,7 @@ pub(crate) async fn approve_replacement_products_and_restage(
     let active_collision_catalog_sql = db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
     let approved_products_sql = db.sql(APPROVED_PRODUCT_ROWS_SQL);
     let assignments_sql = db.sql(EXISTING_ASSIGNMENT_ROWS_SQL);
-    let corroborations_sql = db.sql(ASSOCIATION_CORROBORATION_ROWS_SQL);
+    let corroborations_sql = db.sql(association_authorization_rows_sql(db));
     let attested_product_ids_sql = db.sql(
         "SELECT avionics_model_id FROM avionics_product_reuse_attestations ORDER BY avionics_model_id",
     );
@@ -413,8 +413,10 @@ pub(crate) async fn approve_replacement_products_and_restage(
             let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
                 .fetch_all(&mut *transaction)
                 .await?;
-            let catalog_revision_sha256 =
-                fingerprint_catalog_products(&catalog_products(catalog_rows));
+            let catalog_products = catalog_products(catalog_rows);
+            let catalog_product_fingerprints =
+                catalog_product_fingerprints(&catalog_products);
+            let catalog_revision_sha256 = fingerprint_catalog_products(&catalog_products);
             if catalog_revision_sha256 != request.catalog_revision_sha256
                 || catalog_revision_sha256 != row.catalog_revision_sha256
             {
@@ -572,16 +574,17 @@ pub(crate) async fn approve_replacement_products_and_restage(
                 .fetch_all(&mut *transaction)
                 .await?;
             let corroboration_rows =
-                sqlx::query_as::<_, AssociationCorroborationRow>(&corroborations_sql)
+                sqlx::query_as::<_, AssociationAuthorizationRow>(&corroborations_sql)
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-            let corroborated_associations = current_corroborated_associations(
+            let corroborated_associations = current_authorized_associations(
                 listing_id,
                 &assignments,
                 &corroboration_rows,
                 &reuse_attested_ids,
                 &active_collision_catalog_rows,
+                &catalog_product_fingerprints,
             );
             let accepted_parent = CoveredListingAssociation {
                 listing_link_id,

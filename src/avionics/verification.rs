@@ -11,7 +11,7 @@ use crate::avionics::catalog::{
     preview_avionics_identity, resolve_avionics_identity_for_automated_review,
     resolve_verified_local_avionics_identity, unique_exact_avionics_review_candidate,
     ApprovedAvionicsIdentity, AvionicsIdentityOutcome, AvionicsIdentityRequest,
-    AvionicsIdentityVerificationRoute,
+    AvionicsIdentityVerificationRoute, GroundedAvionicsResolutionReceipt,
 };
 use crate::avionics::consolidation::PendingReviewRevisionReceipt;
 use crate::avionics::reuse::product_reuse_attestation_is_current;
@@ -26,14 +26,15 @@ use crate::listing::avionics::{
 };
 use crate::listing::evidence::{identity_span_has_boundaries, ListingEvidenceContext};
 use crate::listing::review::automation::{
-    apply_automated_avionics_review, AutomatedAvionicsLink, AutomatedPreservedAssociationGuard,
-    AutomatedReviewApplyRequest,
+    apply_automated_avionics_review, AutomatedAssociationAuthorization, AutomatedAvionicsLink,
+    AutomatedPreservedAssociationGuard, AutomatedReviewApplyRequest,
 };
 use crate::listing::review::{
     active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
-    evaluate_existing_product_associations, parse_current_pending_review_aspects,
-    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingAssociationRole,
-    PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
+    evaluate_existing_product_associations, grounded_collision_closure_revision_sha256,
+    parse_current_pending_review_aspects, ExistingProductAssociationCommit,
+    ExistingProductAssociationEvaluation, ListingAssociationRole, PendingReviewAspect,
+    ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
 };
 use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
@@ -371,12 +372,14 @@ struct CatalogStatusRow {
 struct PreparedLink {
     identity_key: String,
     avionics_model_id: i64,
+    authorization: Option<AutomatedAssociationAuthorization>,
     expected_collision_closure_sha256: Option<String>,
     quantity: i64,
     source_notes: Option<String>,
     source_confidence: Option<String>,
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
+    replacement_authorization: Option<AutomatedAssociationAuthorization>,
     replacement_identity_key: Option<String>,
     expected_replacement_collision_closure_sha256: Option<String>,
     preserved_association_guard: Option<AutomatedPreservedAssociationGuard>,
@@ -394,6 +397,7 @@ struct IdentityAttempt {
     approved_id: Option<i64>,
     identity_key: Option<String>,
     collision_closure_sha256: Option<String>,
+    authorization: Option<AutomatedAssociationAuthorization>,
     suggested_product: Option<ReviewProduct>,
 }
 
@@ -1269,12 +1273,14 @@ async fn process_listing(
                 let incoming_link = PreparedLink {
                     identity_key: primary_identity_key,
                     avionics_model_id: primary_id,
+                    authorization: primary.authorization.clone(),
                     expected_collision_closure_sha256: primary.collision_closure_sha256.clone(),
                     quantity: raw.quantity,
                     source_notes: raw.source_evidence_text.clone(),
                     source_confidence: Some("high".to_string()),
                     configuration_action: raw.configuration_action.clone(),
                     replaces_avionics_model_id: None,
+                    replacement_authorization: None,
                     replacement_identity_key: None,
                     expected_replacement_collision_closure_sha256: None,
                     preserved_association_guard: None,
@@ -1458,12 +1464,14 @@ async fn process_listing(
         let incoming_link = PreparedLink {
             identity_key: primary_identity_key,
             avionics_model_id: primary_id,
+            authorization: primary.authorization.clone(),
             expected_collision_closure_sha256: primary.collision_closure_sha256.clone(),
             quantity: raw.quantity,
             source_notes: raw.source_evidence_text.clone(),
             source_confidence: Some("high".to_string()),
             configuration_action: raw.configuration_action.clone(),
             replaces_avionics_model_id: Some(replacement_id),
+            replacement_authorization: replacement_attempt.authorization.clone(),
             replacement_identity_key: Some(replacement_identity_key),
             expected_replacement_collision_closure_sha256: replacement_attempt
                 .collision_closure_sha256
@@ -1502,6 +1510,14 @@ async fn process_listing(
 
     let mut accepted_links = Vec::with_capacity(prepared.len());
     for link in prepared {
+        let Some(authorization) = link.authorization else {
+            listing_report.status = "blocked".to_string();
+            listing_report.error = Some(format!(
+                "catalog id {} lost its automatic association authorization",
+                link.avionics_model_id
+            ));
+            return listing_report;
+        };
         let Some(expected_collision_closure_sha256) = link.expected_collision_closure_sha256 else {
             listing_report.status = "blocked".to_string();
             listing_report.error = Some(format!(
@@ -1511,7 +1527,8 @@ async fn process_listing(
             return listing_report;
         };
         if link.replaces_avionics_model_id.is_some()
-            && link.expected_replacement_collision_closure_sha256.is_none()
+            && (link.expected_replacement_collision_closure_sha256.is_none()
+                || link.replacement_authorization.is_none())
         {
             listing_report.status = "blocked".to_string();
             listing_report.error = Some(format!(
@@ -1522,12 +1539,14 @@ async fn process_listing(
         }
         accepted_links.push(AutomatedAvionicsLink {
             avionics_model_id: link.avionics_model_id,
+            authorization,
             expected_collision_closure_sha256,
             quantity: link.quantity,
             source_notes: link.source_notes,
             source_confidence: link.source_confidence,
             configuration_action: link.configuration_action,
             replaces_avionics_model_id: link.replaces_avionics_model_id,
+            replacement_authorization: link.replacement_authorization,
             expected_replacement_collision_closure_sha256: link
                 .expected_replacement_collision_closure_sha256,
             preserved_association_guard: link.preserved_association_guard,
@@ -1986,6 +2005,8 @@ fn merge_duplicate_link(
         || !compatible_replacement
         || existing.expected_collision_closure_sha256 != incoming.expected_collision_closure_sha256
         || existing.preserved_association_guard != incoming.preserved_association_guard
+        || existing.authorization != incoming.authorization
+        || existing.replacement_authorization != incoming.replacement_authorization
     {
         return Err(format!(
             "catalog id {} resolved from multiple raw rows with conflicting action, replacement, or collision-closure semantics",
@@ -2264,8 +2285,16 @@ async fn resolve_identity_attempt(
         &identity,
         source_evidence_text,
     );
+    let mut grounded_receipt: Option<GroundedAvionicsResolutionReceipt> = None;
     let outcome = if apply {
-        match resolve_avionics_identity_for_automated_review(db, extractor, &request).await {
+        match resolve_avionics_identity_for_automated_review(
+            db,
+            extractor,
+            row.listing_id,
+            &request,
+        )
+        .await
+        {
             Ok(resolution) => {
                 if let Err(error) =
                     review_revision.advance(&resolution.pending_review_revision_receipts)
@@ -2288,9 +2317,11 @@ async fn resolve_identity_attempt(
                         approved_id: None,
                         identity_key: None,
                         collision_closure_sha256: None,
+                        authorization: None,
                         suggested_product: None,
                     };
                 }
+                grounded_receipt = resolution.grounded_receipt;
                 Ok(resolution.outcome)
             }
             Err(error) => Err(error),
@@ -2301,6 +2332,7 @@ async fn resolve_identity_attempt(
     match outcome {
         Ok(AvionicsIdentityOutcome::Approved(approved)) => {
             let suggested_product = Some(review_product_from_approved(&approved));
+            let mut authorization = None;
             if apply && approved.id > 0 {
                 let reuse_is_current = match product_reuse_attestation_is_current(db, approved.id)
                     .await
@@ -2327,11 +2359,25 @@ async fn resolve_identity_attempt(
                                 approved_id: None,
                                 identity_key: None,
                                 collision_closure_sha256: None,
+                                authorization: None,
                                 suggested_product,
                             };
                     }
                 };
-                if !reuse_is_current {
+                if reuse_is_current {
+                    authorization = Some(AutomatedAssociationAuthorization::ManufacturerReuse);
+                } else if let Some(receipt) = grounded_receipt.take().filter(|receipt| {
+                    receipt.listing_id == row.listing_id
+                        && receipt.avionics_model_id == approved.id
+                        && receipt.resolution_sha256.len() == 64
+                        && receipt
+                            .resolution_sha256
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) {
+                    authorization =
+                        Some(AutomatedAssociationAuthorization::SameCaseGrounded(receipt));
+                } else {
                     if approved.id > 0 {
                         catalog_statuses.insert(approved.id, "approved".to_string());
                     }
@@ -2348,12 +2394,13 @@ async fn resolve_identity_attempt(
                             Some(approved.manufacturer),
                             Some(approved.model),
                             approved.avionics_types,
-                            "the product identity is approved, but it needs a current manufacturer-primary source attestation before automatic listing reuse"
+                            "the product identity is approved, but this resolution produced neither manufacturer reuse nor a same-case grounded association authorization"
                                 .to_string(),
                         ),
                         approved_id: None,
                         identity_key: None,
                         collision_closure_sha256: None,
+                        authorization: None,
                         suggested_product,
                     };
                 }
@@ -2382,6 +2429,7 @@ async fn resolve_identity_attempt(
                                 approved_id: None,
                                 identity_key: None,
                                 collision_closure_sha256: None,
+                                authorization: None,
                                 suggested_product,
                             };
                         }
@@ -2405,9 +2453,21 @@ async fn resolve_identity_attempt(
                 identity_key,
                 catalog_statuses,
             );
+            attempt.authorization = authorization;
             if apply {
                 if let Some(model_id) = attempt.approved_id {
-                    match active_collision_closure_revision_sha256(db, model_id).await {
+                    let collision_revision = match attempt.authorization.as_ref() {
+                        Some(AutomatedAssociationAuthorization::ManufacturerReuse) => {
+                            active_collision_closure_revision_sha256(db, model_id).await
+                        }
+                        Some(AutomatedAssociationAuthorization::SameCaseGrounded(_)) => {
+                            grounded_collision_closure_revision_sha256(db, model_id).await
+                        }
+                        None => Err(crate::listing::review::ReviewError::Conflict(format!(
+                            "catalog id {model_id} has no automatic association authorization"
+                        ))),
+                    };
+                    match collision_revision {
                         Ok(revision) => attempt.collision_closure_sha256 = Some(revision),
                         Err(error) => {
                             attempt.report.status = "error".to_string();
@@ -2440,6 +2500,7 @@ async fn resolve_identity_attempt(
             approved_id: None,
             identity_key: None,
             collision_closure_sha256: None,
+            authorization: None,
             suggested_product: None,
         },
         Ok(AvionicsIdentityOutcome::Unresolved { reason }) => IdentityAttempt {
@@ -2460,6 +2521,7 @@ async fn resolve_identity_attempt(
             approved_id: None,
             identity_key: None,
             collision_closure_sha256: None,
+            authorization: None,
             suggested_product: None,
         },
         Err(error) => IdentityAttempt {
@@ -2480,6 +2542,7 @@ async fn resolve_identity_attempt(
             approved_id: None,
             identity_key: None,
             collision_closure_sha256: None,
+            authorization: None,
             suggested_product: None,
         },
     }
@@ -2536,6 +2599,7 @@ fn approved_attempt(
             approved_id: None,
             identity_key: None,
             collision_closure_sha256: None,
+            authorization: None,
             suggested_product,
         };
     }
@@ -2558,6 +2622,7 @@ fn approved_attempt(
             approved_id: None,
             identity_key: None,
             collision_closure_sha256: None,
+            authorization: None,
             suggested_product,
         };
     };
@@ -2589,6 +2654,7 @@ fn approved_attempt(
         },
         identity_key: Some(identity_key),
         collision_closure_sha256: None,
+        authorization: None,
         suggested_product,
     }
 }
@@ -2994,12 +3060,14 @@ async fn prepare_current_preserved_associations(
         prepared.push(PreparedLink {
             identity_key,
             avionics_model_id,
+            authorization: Some(AutomatedAssociationAuthorization::ManufacturerReuse),
             expected_collision_closure_sha256: Some(collision_closure_sha256),
             quantity: aspect.quantity,
             source_notes: Some(target.listing_evidence_text),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: Some(AutomatedPreservedAssociationGuard {
@@ -4542,12 +4610,14 @@ mod tests {
         let mut existing = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
+            authorization: None,
             expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: Some("GPS navigator".to_string()),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
@@ -4555,12 +4625,14 @@ mod tests {
         let incoming = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
+            authorization: None,
             expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 2,
             source_notes: Some("Mode S transponder".to_string()),
             source_confidence: Some("medium".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
@@ -4585,12 +4657,14 @@ mod tests {
         let mut prepared = [PreparedLink {
             identity_key: "catalog:375".to_string(),
             avionics_model_id: 375,
+            authorization: None,
             expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: Some("GNX 375 GPS navigator installed".to_string()),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
@@ -4598,12 +4672,14 @@ mod tests {
         let transponder_row = PreparedLink {
             identity_key: "catalog:375".to_string(),
             avionics_model_id: 375,
+            authorization: None,
             expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: Some("GNX 375 transponder installed".to_string()),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
@@ -4653,12 +4729,14 @@ mod tests {
             PreparedLink {
                 identity_key: gps_key,
                 avionics_model_id: 0,
+                authorization: None,
                 expected_collision_closure_sha256: None,
                 quantity: 1,
                 source_notes: Some("GNX 375 GPS navigator".to_string()),
                 source_confidence: Some("high".to_string()),
                 configuration_action: "installed".to_string(),
                 replaces_avionics_model_id: None,
+                replacement_authorization: None,
                 replacement_identity_key: None,
                 expected_replacement_collision_closure_sha256: None,
                 preserved_association_guard: None,
@@ -4670,12 +4748,14 @@ mod tests {
             PreparedLink {
                 identity_key: transponder_key,
                 avionics_model_id: 0,
+                authorization: None,
                 expected_collision_closure_sha256: None,
                 quantity: 1,
                 source_notes: Some("GNX 375 transponder".to_string()),
                 source_confidence: Some("high".to_string()),
                 configuration_action: "installed".to_string(),
                 replaces_avionics_model_id: None,
+                replacement_authorization: None,
                 replacement_identity_key: None,
                 expected_replacement_collision_closure_sha256: None,
                 preserved_association_guard: None,
@@ -4694,12 +4774,14 @@ mod tests {
         let mut existing = PreparedLink {
             identity_key: "catalog:42".to_string(),
             avionics_model_id: 42,
+            authorization: None,
             expected_collision_closure_sha256: Some("a".repeat(64)),
             quantity: 1,
             source_notes: None,
             source_confidence: None,
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             replacement_identity_key: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
@@ -4736,12 +4818,14 @@ mod tests {
         PreparedLink {
             identity_key: key.to_string(),
             avionics_model_id: id,
+            authorization: None,
             expected_collision_closure_sha256: (id > 0).then(|| "a".repeat(64)),
             quantity: 1,
             source_notes: None,
             source_confidence: Some("high".to_string()),
             configuration_action: action.to_string(),
             replaces_avionics_model_id: target_id,
+            replacement_authorization: None,
             replacement_identity_key: target_key.map(ToString::to_string),
             expected_replacement_collision_closure_sha256: target_id.map(|_| "b".repeat(64)),
             preserved_association_guard: None,

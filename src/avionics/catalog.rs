@@ -48,6 +48,8 @@ use crate::normalize::{
 const CANDIDATE_LIMIT: usize = 16;
 const COLLISION_CANDIDATE_LIMIT: usize = 32;
 const COLLISION_STRUCTURE_CALL_BUDGET: usize = 2;
+const GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:grounded-listing-avionics-resolution:v1";
 const EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE: &str = "exact_catalog_product";
 const NO_IDENTIFIER_SCOPE: &str = "none";
 const NO_REJECTION_BASIS: &str = "none";
@@ -412,6 +414,7 @@ struct IdentityResolutionExecution {
     pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
     review_direct_source_verification: Option<ReviewDirectSourceVerification>,
     review_direct_source_verification_conflicted: bool,
+    grounded_resolution_completed: bool,
 }
 
 impl IdentityResolutionExecution {
@@ -422,6 +425,7 @@ impl IdentityResolutionExecution {
             pending_review_revision_receipts: Vec::new(),
             review_direct_source_verification: None,
             review_direct_source_verification_conflicted: false,
+            grounded_resolution_completed: false,
         }
     }
 
@@ -472,6 +476,52 @@ impl IdentityResolutionExecution {
 pub(crate) struct AutomatedReviewAvionicsIdentityResolution {
     pub outcome: AvionicsIdentityOutcome,
     pub pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
+    pub grounded_receipt: Option<GroundedAvionicsResolutionReceipt>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GroundedAvionicsResolutionReceipt {
+    pub listing_id: i64,
+    pub avionics_model_id: i64,
+    pub resolution_sha256: String,
+}
+
+fn grounded_resolution_receipt(
+    listing_id: i64,
+    request: &AvionicsIdentityRequest,
+    approved: &ApprovedAvionicsIdentity,
+) -> GroundedAvionicsResolutionReceipt {
+    let mut hasher = Sha256::new();
+    hasher.update(GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN);
+    for value in std::iter::once(listing_id.to_string()).chain([
+        request.aircraft_manufacturer.clone(),
+        request.aircraft_model.clone(),
+        request.aircraft_variant.clone(),
+        request.model_year.to_string(),
+        request.source_url.clone(),
+        request.listing_context.clone(),
+        request.manufacturer.clone(),
+        request.model.clone(),
+        request.avionics_types.join("\u{1f}"),
+        request.quantity.to_string(),
+        approved.id.to_string(),
+        approved.manufacturer.clone(),
+        approved.model.clone(),
+        approved.avionics_types.join("\u{1f}"),
+        approved.manufacturer_identifier_kind.clone(),
+        approved.manufacturer_identifier.clone(),
+        approved.evidence_url.clone(),
+        approved.evidence_title.clone(),
+        approved.evidence.clone(),
+    ]) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    GroundedAvionicsResolutionReceipt {
+        listing_id,
+        avionics_model_id: approved.id,
+        resolution_sha256: format!("{:x}", hasher.finalize()),
+    }
 }
 
 fn grounded_consolidation_preview_block(
@@ -711,14 +761,24 @@ pub async fn resolve_avionics_identity(
 pub(crate) async fn resolve_avionics_identity_for_automated_review(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
+    listing_id: i64,
     request: &AvionicsIdentityRequest,
 ) -> CatalogResult<AutomatedReviewAvionicsIdentityResolution> {
     let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Apply);
     let outcome =
         resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
+    let grounded_receipt = match &outcome {
+        AvionicsIdentityOutcome::Approved(approved)
+            if execution.grounded_resolution_completed && listing_id > 0 && approved.id > 0 =>
+        {
+            Some(grounded_resolution_receipt(listing_id, request, approved))
+        }
+        _ => None,
+    };
     Ok(AutomatedReviewAvionicsIdentityResolution {
         outcome,
         pending_review_revision_receipts: execution.pending_review_revision_receipts,
+        grounded_receipt,
     })
 }
 
@@ -2087,7 +2147,7 @@ async fn resolve_avionics_identity_with_write_mode(
     // canonicalization and revocation checks.
     require_response_evidence_source_urls_not_revoked(db, &grounded_response).await?;
     let status = response["status"].as_str().unwrap_or_default();
-    match status {
+    let outcome = match status {
         "existing_match" => {
             let catalog_id = response["catalog_id"].as_i64().unwrap_or_default();
             let _selected = shortlist
@@ -2164,7 +2224,11 @@ async fn resolve_avionics_identity_with_write_mode(
         _ => Err(CatalogError::Validation(format!(
             "unexpected Gemini avionics identity status: {status}"
         ))),
+    }?;
+    if matches!(outcome, AvionicsIdentityOutcome::Approved(_)) {
+        execution.grounded_resolution_completed = true;
     }
+    Ok(outcome)
 }
 
 async fn resolve_verified_identity(
@@ -5514,7 +5578,7 @@ async fn persist_existing_reuse_attestation(
     reviewed_existing: &AvionicsCatalogCandidate,
     identity: &VerifiedIdentity,
     reviewed_catalog_fingerprint: &str,
-) -> CatalogResult<()> {
+) -> CatalogResult<bool> {
     let additions = approved_capability_additions(reviewed_existing, identity)?;
     if !additions.is_empty() {
         return Err(CatalogError::Validation(
@@ -5574,17 +5638,16 @@ async fn persist_existing_reuse_attestation(
                 identity.identity_evidence.as_str(),
             )
             .await?;
-            if !reuse_attested {
-                return Err(CatalogError::Validation(format!(
-                    "approved catalog id {} could not be bound to a current active exact manufacturer source origin",
-                    reviewed_existing.id
-                )));
+            if reuse_attested {
+                transaction.commit().await?;
+            } else {
+                transaction.rollback().await?;
             }
-            transaction.commit().await?;
+            reuse_attested
         }};
     }
 
-    match db.backend() {
+    let reuse_attested = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
             attest!(pool, refresh_grounded_evidence_and_reuse_attestation_sqlite)
         }
@@ -5592,8 +5655,8 @@ async fn persist_existing_reuse_attestation(
             pool,
             refresh_grounded_evidence_and_reuse_attestation_postgres
         ),
-    }
-    Ok(())
+    };
+    Ok(reuse_attested)
 }
 
 async fn persist_approved_capability_enrichment(
@@ -11242,9 +11305,11 @@ mod tests {
         fresh.identity_evidence =
             "The current Garmin manual identifies the exact GTX 345R product.".to_string();
         fresh.grounded_claim_source_urls = vec![fresh.identity_source_url.clone()];
-        persist_existing_reuse_attestation(&db, &reviewed, &fresh, &reviewed_fingerprint)
-            .await
-            .expect("fresh automated grounding should commit");
+        let reuse_attested =
+            persist_existing_reuse_attestation(&db, &reviewed, &fresh, &reviewed_fingerprint)
+                .await
+                .expect("fresh automated grounding should commit");
+        assert!(reuse_attested);
 
         let persisted: (String, String, String, String, String, String, String) = sqlx::query_as(
             r#"
@@ -11294,17 +11359,15 @@ mod tests {
         unauthorized.identity_source_title = "Unrelated product page".to_string();
         unauthorized.identity_evidence = "An unrelated source mentions GTX 345R.".to_string();
         unauthorized.grounded_claim_source_urls = vec![unauthorized.identity_source_url.clone()];
-        let error = persist_existing_reuse_attestation(
+        let reuse_attested = persist_existing_reuse_attestation(
             &db,
             &reviewed,
             &unauthorized,
             &reviewed_fingerprint,
         )
         .await
-        .expect_err("an unauthorized origin must fail closed");
-        assert!(error
-            .to_string()
-            .contains("could not be bound to a current active exact manufacturer source origin"));
+        .expect("an unauthorized origin should remain usable only for its grounded case");
+        assert!(!reuse_attested);
         let evidence_after_rollback: (String, String, String) = sqlx::query_as(
             r#"
             SELECT identity_source_url, identity_source_title, identity_evidence_text
@@ -11323,7 +11386,7 @@ mod tests {
                 fresh.identity_source_title,
                 fresh.identity_evidence,
             ),
-            "failed automated attestation must roll back its evidence refresh"
+            "a non-reusable grounded match must roll back its global evidence refresh"
         );
     }
 

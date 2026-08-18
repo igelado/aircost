@@ -87,16 +87,11 @@ const AVIONICS_GROUNDED_EVIDENCE_REFRESH_MIGRATION: &str =
 const AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_FINGERPRINT: &str =
     "0c44e30c662d8f51c11f7db883251c1356cfda4d53957df038988c32d3b91399";
-const LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_MIGRATION: &str =
-    "20260805_listing_avionics_association_corroborations";
-const LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_CONTRACT_VERSION: i64 = 1;
-const LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_CONTRACT_FINGERPRINT: &str =
-    "2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9";
-const LISTING_AVIONICS_COLLISION_CLOSURE_MIGRATION: &str =
-    "20260806_listing_avionics_collision_closure";
-const LISTING_AVIONICS_COLLISION_CLOSURE_CONTRACT_VERSION: i64 = 1;
-const LISTING_AVIONICS_COLLISION_CLOSURE_CONTRACT_FINGERPRINT: &str =
-    "363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3";
+const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION: &str =
+    "20260818_listing_avionics_association_authorizations";
+const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION: i64 = 1;
+const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT: &str =
+    "cf1860e6eea09fd3d5ee0ffde4ce05bd91cddae5ca29efec6513f14698628cbb";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -2439,7 +2434,7 @@ impl AppDb {
         {
             bail!(avionics_grounded_evidence_refresh_migration_required_message(self.kind()));
         }
-        let missing_listing_avionics_corroboration_objects = match self.backend() {
+        let missing_listing_avionics_authorization_objects = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
@@ -2454,28 +2449,29 @@ impl AppDb {
                           SELECT 1 FROM sqlite_schema
                           WHERE type = 'table'
                             AND name =
-                              'aircraft_sale_listing_avionics_corroborations'
+                              'aircraft_sale_listing_avionics_authorizations'
                         )
                         OR NOT EXISTS (
                           SELECT 1 FROM sqlite_schema
                           WHERE type = 'index'
                             AND name =
-                              'idx_listing_avionics_corroborations_model'
+                              'idx_listing_avionics_authorizations_model'
                         )
                         OR (
                           SELECT COUNT(*)
                           FROM sqlite_schema
                           WHERE type = 'trigger'
                             AND name IN (
-                              'listing_avionics_corroborations_validate_insert',
-                              'listing_avionics_corroborations_immutable_update',
-                              'listing_avionics_corroborations_invalidate_link_update'
+                              'listing_avionics_authorizations_validate_insert',
+                              'listing_avionics_authorizations_immutable_update',
+                              'listing_avionics_authorizations_invalidate_link_update',
+                              'listing_avionics_authorizations_invalidate_reuse_delete'
                             )
-                        ) <> 3
+                        ) <> 4
                         OR (
                           SELECT COUNT(*)
                           FROM pragma_foreign_key_list(
-                            'aircraft_sale_listing_avionics_corroborations'
+                            'aircraft_sale_listing_avionics_authorizations'
                           )
                         ) <> 2
                       )
@@ -2492,27 +2488,29 @@ impl AppDb {
                       to_regclass('aircraft_sale_listing_avionics') IS NOT NULL
                       AND (
                         to_regclass(
-                          'aircraft_sale_listing_avionics_corroborations'
+                          'aircraft_sale_listing_avionics_authorizations'
                         ) IS NULL
                         OR to_regclass(
-                          'idx_listing_avionics_corroborations_model'
+                          'idx_listing_avionics_authorizations_model'
                         ) IS NULL
                         OR (
                           SELECT COUNT(*)
                           FROM pg_trigger
                           WHERE tgrelid IN (
                             to_regclass(
-                              'aircraft_sale_listing_avionics_corroborations'
+                              'aircraft_sale_listing_avionics_authorizations'
                             ),
-                            to_regclass('aircraft_sale_listing_avionics')
+                            to_regclass('aircraft_sale_listing_avionics'),
+                            to_regclass('avionics_product_reuse_attestations')
                           )
                             AND tgname IN (
-                              'listing_avionics_corroborations_validate_insert',
-                              'listing_avionics_corroborations_immutable_update',
-                              'listing_avionics_corroborations_invalidate_link_update'
+                              'listing_avionics_authorizations_validate_insert',
+                              'listing_avionics_authorizations_immutable_update',
+                              'listing_avionics_authorizations_invalidate_link_update',
+                              'listing_avionics_authorizations_invalidate_reuse_delete'
                             )
                             AND NOT tgisinternal
-                        ) <> 3
+                        ) <> 4
                       )
                     "#,
                 )
@@ -2520,97 +2518,19 @@ impl AppDb {
                 .await?
             }
         };
-        let missing_listing_avionics_corroborations = missing_listing_avionics_corroboration_objects
+        let missing_listing_avionics_authorizations = missing_listing_avionics_authorization_objects
             || self
                 .migration_contract_missing(
                     "aircraft_sale_listing_avionics",
-                    LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_MIGRATION,
-                    LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_CONTRACT_VERSION,
-                    LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_CONTRACT_FINGERPRINT,
+                    LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
+                    LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION,
+                    LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
                 )
                 .await?;
-        if missing_listing_avionics_corroborations {
+        if missing_listing_avionics_authorizations {
             bail!(
-                listing_avionics_association_corroborations_migration_required_message(self.kind())
+                listing_avionics_association_authorizations_migration_required_message(self.kind())
             );
-        }
-        let missing_listing_avionics_collision_closure_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_scalar::<_, i64>(
-                    r#"
-                    SELECT
-                      EXISTS (
-                        SELECT 1 FROM sqlite_schema
-                        WHERE type = 'table'
-                          AND name =
-                            'aircraft_sale_listing_avionics_corroborations'
-                      )
-                      AND (
-                        NOT EXISTS (
-                          SELECT 1 FROM sqlite_schema
-                          WHERE type = 'table'
-                            AND name =
-                              'aircraft_sale_listing_avionics_corroboration_scopes'
-                        )
-                        OR NOT EXISTS (
-                          SELECT 1 FROM sqlite_schema
-                          WHERE type = 'trigger'
-                            AND name =
-                              'listing_avionics_corroboration_scopes_immutable_update'
-                        )
-                        OR (
-                          SELECT COUNT(*)
-                          FROM pragma_foreign_key_list(
-                            'aircraft_sale_listing_avionics_corroboration_scopes'
-                          )
-                        ) <> 2
-                      )
-                    "#,
-                )
-                .fetch_one(pool)
-                .await?
-                    != 0
-            }
-            DatabaseBackend::Postgres(pool) => {
-                sqlx::query_scalar::<_, bool>(
-                    r#"
-                    SELECT
-                      to_regclass(
-                        'aircraft_sale_listing_avionics_corroborations'
-                      ) IS NOT NULL
-                      AND (
-                        to_regclass(
-                          'aircraft_sale_listing_avionics_corroboration_scopes'
-                        ) IS NULL
-                        OR NOT EXISTS (
-                          SELECT 1
-                          FROM pg_trigger
-                          WHERE tgrelid = to_regclass(
-                            'aircraft_sale_listing_avionics_corroboration_scopes'
-                          )
-                            AND tgname =
-                              'listing_avionics_corroboration_scopes_immutable_update'
-                            AND NOT tgisinternal
-                        )
-                      )
-                    "#,
-                )
-                .fetch_one(pool)
-                .await?
-            }
-        };
-        let missing_listing_avionics_collision_closure =
-            missing_listing_avionics_collision_closure_objects
-                || self
-                    .migration_contract_missing(
-                        "aircraft_sale_listing_avionics_corroborations",
-                        LISTING_AVIONICS_COLLISION_CLOSURE_MIGRATION,
-                        LISTING_AVIONICS_COLLISION_CLOSURE_CONTRACT_VERSION,
-                        LISTING_AVIONICS_COLLISION_CLOSURE_CONTRACT_FINGERPRINT,
-                    )
-                    .await?;
-        if missing_listing_avionics_collision_closure {
-            bail!(listing_avionics_collision_closure_migration_required_message(self.kind()));
         }
         Ok(())
     }
@@ -3405,7 +3325,7 @@ fn avionics_grounded_evidence_refresh_migration_required_message(kind: DatabaseK
     )
 }
 
-fn listing_avionics_association_corroborations_migration_required_message(
+fn listing_avionics_association_authorizations_migration_required_message(
     kind: DatabaseKind,
 ) -> String {
     let backend = match kind {
@@ -3413,23 +3333,10 @@ fn listing_avionics_association_corroborations_migration_required_message(
         DatabaseKind::Postgres => "postgres",
     };
     format!(
-        "database migration required before startup: exact listing-avionics associations must be \
-         corroborated independently from reusable catalog products; back up the database, apply \
-         `migrations/{LISTING_AVIONICS_ASSOCIATION_CORROBORATIONS_MIGRATION}.{backend}.sql`, then \
+        "database migration required before startup: exact listing-avionics associations must use \
+         current manufacturer-reuse or same-case grounded authorization; back up the database, apply \
+         `migrations/{LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION}.{backend}.sql`, then \
          restart aircost"
-    )
-}
-
-fn listing_avionics_collision_closure_migration_required_message(kind: DatabaseKind) -> String {
-    let backend = match kind {
-        DatabaseKind::Sqlite => "sqlite",
-        DatabaseKind::Postgres => "postgres",
-    };
-    format!(
-        "database migration required before startup: exact listing-avionics corroborations must \
-         be bound to their target-scoped active collision closure; back up the database, apply \
-         `migrations/{LISTING_AVIONICS_COLLISION_CLOSURE_MIGRATION}.{backend}.sql`, then restart \
-         aircost"
     )
 }
 
@@ -3446,8 +3353,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use sqlx::sqlite::SqlitePoolOptions;
-    use sqlx::Executor;
+    use sqlx::sqlite::{SqliteConnection, SqlitePoolOptions};
+    use sqlx::{Connection, Executor};
 
     use super::{
         aircraft_catalog_retrieval_keys_migration_required_message,
@@ -3537,6 +3444,12 @@ mod tests {
         include_str!("../migrations/20260807_avionics_product_reuse_v2.sqlite.sql");
     const AVIONICS_REUSE_V2_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260807_avionics_product_reuse_v2.postgres.sql");
+    const LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL: &str = include_str!(
+        "../migrations/20260818_listing_avionics_association_authorizations.sqlite.sql"
+    );
+    const LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL: &str = include_str!(
+        "../migrations/20260818_listing_avionics_association_authorizations.postgres.sql"
+    );
     async fn sqlite_db_with_statements(statements: &[&str]) -> AppDb {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

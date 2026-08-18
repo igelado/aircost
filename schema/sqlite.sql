@@ -7377,51 +7377,6 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_fingerprint = excluded.contract_fingerprint,
   installed_at = excluded.installed_at;
 
--- Target-scoped collision state that made a local listing-association
--- corroboration safe. Unbound legacy corroborations are intentionally stale.
-CREATE TABLE IF NOT EXISTS
-  aircraft_sale_listing_avionics_corroboration_scopes (
-    listing_link_id INTEGER NOT NULL,
-    association_role TEXT NOT NULL
-      CHECK (association_role IN ('installed', 'replacement')),
-    collision_closure_sha256 TEXT NOT NULL,
-    policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_collision_closure_v1'),
-    bound_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (listing_link_id, association_role),
-    FOREIGN KEY (listing_link_id, association_role)
-      REFERENCES aircraft_sale_listing_avionics_corroborations (
-        listing_link_id, association_role
-      )
-      ON DELETE CASCADE,
-    CHECK (length(collision_closure_sha256) = 64),
-    CHECK (collision_closure_sha256 = lower(collision_closure_sha256)),
-    CHECK (collision_closure_sha256 NOT GLOB '*[^0-9a-f]*')
-  );
-
-CREATE TRIGGER IF NOT EXISTS
-  listing_avionics_corroboration_scopes_immutable_update
-BEFORE UPDATE ON aircraft_sale_listing_avionics_corroboration_scopes
-BEGIN
-  SELECT RAISE(
-    ABORT,
-    'listing avionics corroboration collision scopes are replaced, never updated'
-  );
-END;
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260806_listing_avionics_collision_closure',
-  1,
-  '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
-
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
@@ -7435,96 +7390,141 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_fingerprint = excluded.contract_fingerprint,
   installed_at = excluded.installed_at;
 
--- Positive proof that one exact listing-link component names one currently
--- reusable product. Product attestation alone never supplies this conclusion.
+-- Exact authorization for one listing-link component. Manufacturer-reuse
+-- authorizations bind the current global attestation; same-case authorizations
+-- bind the transient grounded resolution that approved this exact association.
 CREATE TABLE IF NOT EXISTS
-  aircraft_sale_listing_avionics_corroborations (
+  aircraft_sale_listing_avionics_authorizations (
     listing_link_id INTEGER NOT NULL
       REFERENCES aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
     association_role TEXT NOT NULL
       CHECK (association_role IN ('installed', 'replacement')),
     avionics_model_id INTEGER NOT NULL
-      REFERENCES avionics_product_reuse_attestations(avionics_model_id)
-      ON DELETE CASCADE,
+      REFERENCES avionics_models(id) ON DELETE CASCADE,
+    authorization_kind TEXT NOT NULL
+      CHECK (authorization_kind IN ('manufacturer_reuse', 'same_case_grounded')),
     observation_sha256 TEXT NOT NULL,
     product_fingerprint TEXT NOT NULL,
+    grounded_resolution_sha256 TEXT,
+    evidence_capture_sha256 TEXT NOT NULL,
+    collision_closure_sha256 TEXT NOT NULL,
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_association_v1'),
-    corroborated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CHECK (policy_version = 'listing_avionics_authorization_v1'),
+    authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (listing_link_id, association_role),
     CHECK (length(observation_sha256) = 64),
     CHECK (observation_sha256 = lower(observation_sha256)),
     CHECK (observation_sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (length(product_fingerprint) = 64),
     CHECK (product_fingerprint = lower(product_fingerprint)),
-    CHECK (product_fingerprint NOT GLOB '*[^0-9a-f]*')
+    CHECK (product_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(evidence_capture_sha256) = 64),
+    CHECK (evidence_capture_sha256 = lower(evidence_capture_sha256)),
+    CHECK (evidence_capture_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (length(collision_closure_sha256) = 64),
+    CHECK (collision_closure_sha256 = lower(collision_closure_sha256)),
+    CHECK (collision_closure_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (
+      (authorization_kind = 'manufacturer_reuse'
+        AND grounded_resolution_sha256 IS NULL)
+      OR
+      (authorization_kind = 'same_case_grounded'
+        AND length(grounded_resolution_sha256) = 64
+        AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)
+        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*')
+    )
   );
 
 CREATE INDEX IF NOT EXISTS
-  idx_listing_avionics_corroborations_model
-ON aircraft_sale_listing_avionics_corroborations (avionics_model_id);
+  idx_listing_avionics_authorizations_model
+ON aircraft_sale_listing_avionics_authorizations (avionics_model_id);
 
 CREATE TRIGGER IF NOT EXISTS
-  listing_avionics_corroborations_validate_insert
-BEFORE INSERT ON aircraft_sale_listing_avionics_corroborations
+  listing_avionics_authorizations_validate_insert
+BEFORE INSERT ON aircraft_sale_listing_avionics_authorizations
 WHEN NOT EXISTS (
   SELECT 1
   FROM aircraft_sale_listing_avionics link
-  JOIN avionics_product_reuse_attestations attestation
-    ON attestation.avionics_model_id = NEW.avionics_model_id
-   AND attestation.product_fingerprint = NEW.product_fingerprint
   WHERE link.id = NEW.listing_link_id
+    AND link.source_confidence = 'high'
+    AND length(trim(COALESCE(link.source_notes, ''))) > 0
     AND (
-      (
-        NEW.association_role = 'installed'
+      (NEW.association_role = 'installed'
         AND link.avionics_model_id = NEW.avionics_model_id
       )
       OR
-      (
-        NEW.association_role = 'replacement'
+      (NEW.association_role = 'replacement'
         AND link.configuration_action IN ('replaces', 'removes')
         AND link.replaces_avionics_model_id = NEW.avionics_model_id
       )
+    )
+    AND EXISTS (
+      SELECT 1 FROM plugin_submissions capture
+      WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+        AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
+        AND instr(capture.rendered_html, link.source_notes) > 0
+    )
+    AND (
+      (NEW.authorization_kind = 'manufacturer_reuse' AND EXISTS (
+        SELECT 1 FROM avionics_product_reuse_attestations attestation
+        WHERE attestation.avionics_model_id = NEW.avionics_model_id
+          AND attestation.product_fingerprint = NEW.product_fingerprint
+      ))
+      OR
+      (NEW.authorization_kind = 'same_case_grounded' AND EXISTS (
+        SELECT 1 FROM avionics_approved_product_graph_identities identity
+        WHERE identity.avionics_model_id = NEW.avionics_model_id
+      ))
     )
 )
 BEGIN
   SELECT RAISE(
     ABORT,
-    'listing avionics corroboration requires the exact current link role and product attestation'
+    'listing avionics authorization requires the exact current link role, retained capture, and product proof'
   );
 END;
 
 CREATE TRIGGER IF NOT EXISTS
-  listing_avionics_corroborations_immutable_update
-BEFORE UPDATE ON aircraft_sale_listing_avionics_corroborations
+  listing_avionics_authorizations_immutable_update
+BEFORE UPDATE ON aircraft_sale_listing_avionics_authorizations
 BEGIN
   SELECT RAISE(
     ABORT,
-    'listing avionics corroborations are replaced, never updated'
+    'listing avionics authorizations are replaced, never updated'
   );
 END;
 
 CREATE TRIGGER IF NOT EXISTS
-  listing_avionics_corroborations_invalidate_link_update
+  listing_avionics_authorizations_invalidate_link_update
 AFTER UPDATE OF
   aircraft_sale_listing_id,
   avionics_model_id,
   quantity,
   source_notes,
+  source_confidence,
   configuration_action,
   replaces_avionics_model_id
 ON aircraft_sale_listing_avionics
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_corroborations
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
   WHERE listing_link_id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_reuse_delete
+AFTER DELETE ON avionics_product_reuse_attestations
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'manufacturer_reuse'
+    AND avionics_model_id = OLD.avionics_model_id;
 END;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260805_listing_avionics_association_corroborations',
+  '20260818_listing_avionics_association_authorizations',
   1,
-  '2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9',
+  'cf1860e6eea09fd3d5ee0ffde4ce05bd91cddae5ca29efec6513f14698628cbb',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET

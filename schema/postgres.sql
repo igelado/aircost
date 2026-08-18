@@ -3540,33 +3540,46 @@ CREATE UNIQUE INDEX IF NOT EXISTS
   )
   WHERE configuration_action IN ('replaces', 'removes');
 
--- Positive proof that one exact listing-link component names one currently
--- reusable product. This is intentionally narrower than product reuse and
--- narrower than the whole-link reviewer provenance stored on the link.
+-- Exact authorization for one listing-link component. Manufacturer-reuse
+-- authorizations bind the current global attestation; same-case authorizations
+-- bind the transient grounded resolution that approved this exact association.
 CREATE TABLE IF NOT EXISTS
-  aircraft_sale_listing_avionics_corroborations (
+  aircraft_sale_listing_avionics_authorizations (
     listing_link_id BIGINT NOT NULL
       REFERENCES aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
     association_role TEXT NOT NULL
       CHECK (association_role IN ('installed', 'replacement')),
     avionics_model_id BIGINT NOT NULL
-      REFERENCES avionics_product_reuse_attestations(avionics_model_id)
-      ON DELETE CASCADE,
+      REFERENCES avionics_models(id) ON DELETE CASCADE,
+    authorization_kind TEXT NOT NULL
+      CHECK (authorization_kind IN ('manufacturer_reuse', 'same_case_grounded')),
     observation_sha256 TEXT NOT NULL
       CHECK (observation_sha256 ~ '^[0-9a-f]{64}$'),
     product_fingerprint TEXT NOT NULL
       CHECK (product_fingerprint ~ '^[0-9a-f]{64}$'),
+    grounded_resolution_sha256 TEXT,
+    evidence_capture_sha256 TEXT NOT NULL
+      CHECK (evidence_capture_sha256 ~ '^[0-9a-f]{64}$'),
+    collision_closure_sha256 TEXT NOT NULL
+      CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_association_v1'),
-    corroborated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (listing_link_id, association_role)
+      CHECK (policy_version = 'listing_avionics_authorization_v1'),
+    authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (listing_link_id, association_role),
+    CHECK (
+      (authorization_kind = 'manufacturer_reuse'
+        AND grounded_resolution_sha256 IS NULL)
+      OR
+      (authorization_kind = 'same_case_grounded'
+        AND grounded_resolution_sha256 ~ '^[0-9a-f]{64}$')
+    )
   );
 
 CREATE INDEX IF NOT EXISTS
-  idx_listing_avionics_corroborations_model
-ON aircraft_sale_listing_avionics_corroborations (avionics_model_id);
+  idx_listing_avionics_authorizations_model
+ON aircraft_sale_listing_avionics_authorizations (avionics_model_id);
 
-CREATE OR REPLACE FUNCTION validate_listing_avionics_corroboration()
+CREATE OR REPLACE FUNCTION validate_listing_avionics_authorization()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $function$
@@ -3574,133 +3587,116 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM aircraft_sale_listing_avionics link
-    JOIN avionics_product_reuse_attestations attestation
-      ON attestation.avionics_model_id = NEW.avionics_model_id
-     AND attestation.product_fingerprint = NEW.product_fingerprint
     WHERE link.id = NEW.listing_link_id
+      AND link.source_confidence = 'high'
+      AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
       AND (
-        (
-          NEW.association_role = 'installed'
+        (NEW.association_role = 'installed'
           AND link.avionics_model_id = NEW.avionics_model_id
         )
         OR
-        (
-          NEW.association_role = 'replacement'
+        (NEW.association_role = 'replacement'
           AND link.configuration_action IN ('replaces', 'removes')
           AND link.replaces_avionics_model_id = NEW.avionics_model_id
         )
       )
+      AND EXISTS (
+        SELECT 1 FROM plugin_submissions capture
+        WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+          AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
+          AND position(link.source_notes IN capture.rendered_html) > 0
+      )
+      AND (
+        (NEW.authorization_kind = 'manufacturer_reuse' AND EXISTS (
+          SELECT 1 FROM avionics_product_reuse_attestations attestation
+          WHERE attestation.avionics_model_id = NEW.avionics_model_id
+            AND attestation.product_fingerprint = NEW.product_fingerprint
+        ))
+        OR
+        (NEW.authorization_kind = 'same_case_grounded' AND EXISTS (
+          SELECT 1 FROM avionics_approved_product_graph_identities identity
+          WHERE identity.avionics_model_id = NEW.avionics_model_id
+        ))
+      )
   ) THEN
     RAISE EXCEPTION
-      'listing avionics corroboration requires the exact current link role and product attestation';
+      'listing avionics authorization requires the exact current link role, retained capture, and product proof';
   END IF;
   RETURN NEW;
 END;
 $function$;
 
-DROP TRIGGER IF EXISTS listing_avionics_corroborations_validate_insert
-  ON aircraft_sale_listing_avionics_corroborations;
-CREATE TRIGGER listing_avionics_corroborations_validate_insert
-BEFORE INSERT ON aircraft_sale_listing_avionics_corroborations
-FOR EACH ROW EXECUTE FUNCTION validate_listing_avionics_corroboration();
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_validate_insert
+  ON aircraft_sale_listing_avionics_authorizations;
+CREATE TRIGGER listing_avionics_authorizations_validate_insert
+BEFORE INSERT ON aircraft_sale_listing_avionics_authorizations
+FOR EACH ROW EXECUTE FUNCTION validate_listing_avionics_authorization();
 
-CREATE OR REPLACE FUNCTION preserve_listing_avionics_corroboration()
+CREATE OR REPLACE FUNCTION preserve_listing_avionics_authorization()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $function$
 BEGIN
-  RAISE EXCEPTION 'listing avionics corroborations are replaced, never updated';
+  RAISE EXCEPTION 'listing avionics authorizations are replaced, never updated';
   RETURN NEW;
 END;
 $function$;
 
-DROP TRIGGER IF EXISTS listing_avionics_corroborations_immutable_update
-  ON aircraft_sale_listing_avionics_corroborations;
-CREATE TRIGGER listing_avionics_corroborations_immutable_update
-BEFORE UPDATE ON aircraft_sale_listing_avionics_corroborations
-FOR EACH ROW EXECUTE FUNCTION preserve_listing_avionics_corroboration();
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_immutable_update
+  ON aircraft_sale_listing_avionics_authorizations;
+CREATE TRIGGER listing_avionics_authorizations_immutable_update
+BEFORE UPDATE ON aircraft_sale_listing_avionics_authorizations
+FOR EACH ROW EXECUTE FUNCTION preserve_listing_avionics_authorization();
 
-CREATE OR REPLACE FUNCTION invalidate_listing_avionics_corroboration()
+CREATE OR REPLACE FUNCTION invalidate_listing_avionics_authorization_for_link()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_corroborations
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
   WHERE listing_link_id = NEW.id;
   RETURN NEW;
 END;
 $function$;
 
-DROP TRIGGER IF EXISTS listing_avionics_corroborations_invalidate_link_update
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_link_update
   ON aircraft_sale_listing_avionics;
-CREATE TRIGGER listing_avionics_corroborations_invalidate_link_update
+CREATE TRIGGER listing_avionics_authorizations_invalidate_link_update
 AFTER UPDATE OF
   aircraft_sale_listing_id,
   avionics_model_id,
   quantity,
   source_notes,
+  source_confidence,
   configuration_action,
   replaces_avionics_model_id
 ON aircraft_sale_listing_avionics
-FOR EACH ROW EXECUTE FUNCTION invalidate_listing_avionics_corroboration();
+FOR EACH ROW EXECUTE FUNCTION invalidate_listing_avionics_authorization_for_link();
 
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260805_listing_avionics_association_corroborations',
-  1,
-  '2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
-
--- Target-scoped collision state that made a local listing-association
--- corroboration safe. Unbound legacy corroborations are intentionally stale.
-CREATE TABLE IF NOT EXISTS
-  aircraft_sale_listing_avionics_corroboration_scopes (
-    listing_link_id BIGINT NOT NULL,
-    association_role TEXT NOT NULL
-      CHECK (association_role IN ('installed', 'replacement')),
-    collision_closure_sha256 TEXT NOT NULL
-      CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
-    policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_collision_closure_v1'),
-    bound_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (listing_link_id, association_role),
-    FOREIGN KEY (listing_link_id, association_role)
-      REFERENCES aircraft_sale_listing_avionics_corroborations (
-        listing_link_id, association_role
-      )
-      ON DELETE CASCADE
-  );
-
-CREATE OR REPLACE FUNCTION preserve_listing_avionics_corroboration_scope()
+CREATE OR REPLACE FUNCTION invalidate_listing_avionics_authorization_for_reuse()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $function$
 BEGIN
-  RAISE EXCEPTION
-    'listing avionics corroboration collision scopes are replaced, never updated';
-  RETURN NEW;
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'manufacturer_reuse'
+    AND avionics_model_id = OLD.avionics_model_id;
+  RETURN OLD;
 END;
 $function$;
 
-DROP TRIGGER IF EXISTS
-  listing_avionics_corroboration_scopes_immutable_update
-ON aircraft_sale_listing_avionics_corroboration_scopes;
-CREATE TRIGGER listing_avionics_corroboration_scopes_immutable_update
-BEFORE UPDATE ON aircraft_sale_listing_avionics_corroboration_scopes
-FOR EACH ROW EXECUTE FUNCTION preserve_listing_avionics_corroboration_scope();
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_reuse_delete
+  ON avionics_product_reuse_attestations;
+CREATE TRIGGER listing_avionics_authorizations_invalidate_reuse_delete
+AFTER DELETE ON avionics_product_reuse_attestations
+FOR EACH ROW EXECUTE FUNCTION invalidate_listing_avionics_authorization_for_reuse();
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260806_listing_avionics_collision_closure',
+  '20260818_listing_avionics_association_authorizations',
   1,
-  '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3',
+  'cf1860e6eea09fd3d5ee0ffde4ce05bd91cddae5ca29efec6513f14698628cbb',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
