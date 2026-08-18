@@ -115,6 +115,11 @@ const AVIONICS_GROUNDING_SOURCE_POLICY: &str = r#"Authoritative-source policy:
 - Ordinary aircraft listings, retailer pages, forums, scraped catalogs, and model memory are discovery material, never authoritative product-identity, factory-default, or value evidence.
 - Preserve conflicts between sources. When the evidence does not distinguish a hardware suffix, generation, remote/panel form factor, suite composition, or part-number variant, return unresolved rather than collapsing products."#;
 
+const AVIONICS_PUBLISHER_WINDOW_RESPONSE_POLICY: &str = r#"Publisher-window response policy:
+- Every nonempty identity, proposal, or candidate evidence field must select exactly one supplied server-fetched publisher window_id; return the selector, never copied publisher prose.
+- Its sibling field named source_url or ending in _source_url must be a string but is not an independent source choice. Return an empty string there. The server derives and overwrites the exact final HTTPS URL from the selected window and replaces the selector with that window's exact publisher text before validation.
+- Never select, copy, infer, or repair a source URL independently of its evidence window. Use empty evidence and source strings only for a decision whose unresolved/reject representation does not require publisher proof."#;
+
 pub struct AvionicsMetadataContext<'a> {
     pub manufacturer: &'a str,
     pub model: &'a str,
@@ -2435,8 +2440,9 @@ Rules:\n\
 - Use unresolved with catalog_id=0 when evidence is insufficient, ambiguous, or contradictory. Do not guess between similar generations or products.\n\
 - Do not substitute factory/default equipment for an ambiguous listing candidate. Factory defaults are modeled separately from listing-installed equipment.\n\
 - Do not treat generic features/classes as concrete units. Examples: ADS-B, WAAS GPS, Dual WAAS, Remote Transponder, Standard Audio Panel, Audio Controller, Autopilot, Synthetic Vision, Engine Monitor, radios, NAV/COM, GPS, Traffic, Datalink Weather, Backup Instruments.\n\
-- identity_source_url/title/evidence must cite authoritative identity evidence for existing_match or propose_new, and identity_source_url must copy the final verified HTTPS URL exactly, including its query when present; do not return an earlier redirect URL or rewrite the URL. Prefer manufacturer product pages, official manuals/service documents, FAA approval records, or equivalent primary references. An ordinary sale listing is installation context, not authoritative product-identity evidence.\n\
-- For every positive decision, identity_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this structure call. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. The passage must itself contain the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. When manufacturer_identifier is the same official model designation as canonical_model after punctuation normalization, one exact occurrence satisfies both fields, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Model and identifier mentions elsewhere on a multi-product page cannot repair an unrelated excerpt. If no supplied publisher passage satisfies these rules, return unresolved.\n\
+- identity_source_title and the publisher window selected by identity_evidence must identify authoritative evidence for existing_match or propose_new. Prefer manufacturer product pages, official manuals/service documents, FAA approval records, or equivalent primary references. An ordinary sale listing is installation context, not authoritative product-identity evidence.\n\
+{AVIONICS_PUBLISHER_WINDOW_RESPONSE_POLICY}\n\
+- For every positive decision, the publisher window selected by identity_evidence must itself contain the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. When manufacturer_identifier is the same official model designation as canonical_model after punctuation normalization, one exact occurrence satisfies both fields, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Model and identifier mentions elsewhere on a multi-product page cannot repair an unrelated window. If no supplied publisher window satisfies these rules, return unresolved.\n\
 - For propose_new, promotion of an unreviewed candidate, or capability enrichment of an approved candidate, identity_evidence must explicitly support the exact product identifier and every new returned canonical_types capability. Omit an unproven capability on new/unreviewed identities; for an approved identity with an unverified new observation, return unresolved instead of dropping the observation or changing the stored capability set.\n\
 - For reject or unresolved, use empty canonical identity/source/identifier strings, an empty canonical_types array, manufacturer_identifier_kind=none, and manufacturer_identifier_scope=none.\n\
 - reason must briefly explain the evidence-based identity decision. For reject, reason must be a candidate-specific negative claim conservatively copied from one cited support span, explicitly naming the observed model and its usable manufacturer; do not paraphrase or infer a negative conclusion from an identity-only citation.\n\
@@ -2513,8 +2519,9 @@ Correction rules:\n\
 - manufacturer_identifier_scope must be exact_catalog_product, component_of_catalog_product, approval_or_article_scope, family_or_series, unknown, or none. Every positive decision requires exact_catalog_product; if the identifier scopes only a component, approval/article, family/series, or cannot be scoped confidently, return unresolved.\n\
 - Identifier scope is relative to canonical_model. A concrete LRU, internal box, replaceable component, sensor, display, or controller may be the exact catalog product; its own identifier is exact_catalog_product. That identifier cannot identify a different containing multi-box system, integrated suite, or named package. A manufacturer model number is acceptable when authoritative evidence establishes it as the identifier of the exact proposed product, including a concrete LRU, rather than a broad family.\n\
 - Positive canonical_types must be distinct exact server values from: {curated_types}. Include every verified multifunction capability; use both NAV and COM rather than NAV/COM.\n\
-- Use official manufacturer documents or equivalent primary records. identity_source_url must copy the final verified HTTPS URL exactly, including its query when present; identity_source_url/title/evidence must identify the exact source and support the exact product, exact-scope identifier, and every new/promoted capability. Never invent, paraphrase, or broaden a support passage; preserve conflicts.\n\
-- For every positive decision, identity_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this correction call. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. The passage must itself contain the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. When the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Separate mentions elsewhere on a multi-product page are insufficient. If no supplied publisher passage satisfies these rules, return unresolved.\n\
+- Use official manufacturer documents or equivalent primary records. identity_source_title and the publisher window selected by identity_evidence must identify the exact source and support the exact product, exact-scope identifier, and every new/promoted capability. Preserve conflicts.\n\
+{AVIONICS_PUBLISHER_WINDOW_RESPONSE_POLICY}\n\
+- For every positive decision, the publisher window selected by identity_evidence must itself contain the complete canonical_model and manufacturer_identifier at alphanumeric boundaries. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. When the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also explicitly name the canonical manufacturer and cannot be shorter than 12 characters. Separate mentions elsewhere on a multi-product page are insufficient. If no supplied publisher window satisfies these rules, return unresolved.\n\
 - reject and unresolved require catalog_id=0, an empty canonical_types array, blank identity/source/identifier fields, identifier kind none, and manufacturer_identifier_scope=none. reject requires rejection_basis=generic_or_class_only, feature_only, not_installed_equipment, or demonstrably_nonexistent; every other status requires rejection_basis=none.\n\
 - reject additionally requires high/very_high confidence and one linked authoritative support span containing the complete candidate-specific negative reason and substantiating rejection_basis; an identity-only mention is insufficient.\n\
 - If evidence cannot satisfy an exact identity, exact identifier scope, capability, source, evidence, or confidence requirement, return unresolved. Fill every schema field without nulls or extras.\n\n\
@@ -2587,8 +2594,9 @@ Rules:\n\
 - Do not return different_product when the independently proven identities have the same exact stable identifier, or the same complete normalized model for a legacy candidate without an identifier.\n\
 - Treat different hardware suffixes, generations, form factors, certification variants, remote versus panel units, materially different packages, and separate manufacturer part/model numbers as different products unless authoritative evidence proves they are the same identity.\n\
 - Compare manufacturer_identifier_kind and manufacturer_identifier whenever present, but verify them against authoritative sources. String similarity and mechanical normalization are not identity evidence.\n\
-- The top-level proposal_source_url, proposal_source_title, and proposal_evidence are the one authoritative proof of the proposed identity, and proposal_source_url must copy the final verified HTTPS URL exactly, including its query when present. proposal_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this structure call; Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. The passage must contain the complete proposed canonical_model and manufacturer_identifier; when the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also name the canonical manufacturer and cannot be shorter than 12 characters.\n\
-- Each review's candidate_source_url must copy its final verified HTTPS URL exactly, including its query when present. candidate_source_title and candidate_evidence are the authoritative proof of that reviewed catalog candidate. candidate_evidence must be copied verbatim from one bounded server-fetched publisher passage supplied to this structure call and contain the candidate's complete model and manufacturer identifier when present.\n\
+- The top-level proposal_source_url is the empty string placeholder governed by the publisher-window policy below. proposal_source_title and the publisher window selected by proposal_evidence are the one authoritative proof of the proposed identity. The selected window must contain the complete proposed canonical_model and manufacturer_identifier; when the official manufacturer model number equals canonical_model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation window must also name the canonical manufacturer and cannot be shorter than 12 characters. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence.\n\
+- Each review's candidate_source_url is the empty string placeholder governed by the publisher-window policy below. candidate_source_title and the publisher window selected by candidate_evidence are the authoritative proof of that reviewed catalog candidate. The selected window must contain the candidate's complete model and manufacturer identifier when present.\n\
+{AVIONICS_PUBLISHER_WINDOW_RESPONSE_POLICY}\n\
 - Proposal and candidate proof passages are independently source-bound and may come from separate exact rows or passages, including separate rows on the same authoritative page. Do not require one passage to contain both products. Use decision and reason to compare the two independently proven identities.\n\
 - Use manufacturer pages, manuals, service documents, FAA approval records, or equivalent primary identity references for both proofs. Ordinary sale listings and retailer-generated SKUs are not authoritative identity evidence.\n\
 - For confirmed_same_as_input, confidence must be very_high for every candidate review. Use very_high only when identifiers or authoritative documentation establish that candidate decision directly. If any review would have high, medium, or low confidence, return proposal_decision=not_confirmed and preserve the honest review confidence instead.\n\
@@ -2644,8 +2652,9 @@ Correction rules:\n\
 - same_product requires the exact same physical product or named suite/package. Distinct suffixes, generations, remote/panel form factors, certification variants, packages, or manufacturer identifiers are different_product unless the verified evidence directly establishes sameness.\n\
 - Under this split-proof schema, same_product must have the same exact manufacturer identifier kind/value after punctuation normalization when the candidate has an identifier. A legacy candidate without an identifier may instead use the same complete normalized model or a description-only label expansion consisting of one complete supplied canonical capability, when authoritative evidence supports that both labels denote the same named product. Meaningful product suffixes, generations, form factors, and certification variants never qualify. If neither rule applies, use proposal_decision=not_confirmed rather than asserting an ungrounded relationship in reason.\n\
 - Do not return different_product for identities carrying the same exact stable signal.\n\
-- The top-level proposal source/evidence triplet must come from the verified dossier, copy the final verified HTTPS URL exactly including its query when present, and copy one exact, short server-fetched publisher passage proving the complete proposed canonical model and manufacturer identifier. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence. When the official manufacturer model number equals the canonical model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation passage must also name the canonical manufacturer and cannot be shorter than 12 characters.\n\
-- Each review's candidate_source_url must copy its final verified HTTPS URL exactly, including its query when present. candidate_source_title and candidate_evidence must come from the verified dossier and prove only that reviewed candidate's complete model and manufacturer identifier in one exact, short server-fetched publisher passage. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence.\n\
+- The top-level proposal_source_url is the empty string placeholder governed by the publisher-window policy below. proposal_source_title and the publisher window selected by proposal_evidence must prove the complete proposed canonical model and manufacturer identifier. When the official manufacturer model number equals the canonical model after punctuation normalization, one exact occurrence satisfies both, but a short model-designation window must also name the canonical manufacturer and cannot be shorter than 12 characters. Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence.\n\
+- Each review's candidate_source_url is the empty string placeholder governed by the publisher-window policy below. candidate_source_title and the publisher window selected by candidate_evidence must prove only that reviewed candidate's complete model and manufacturer identifier in one exact, short window.\n\
+{AVIONICS_PUBLISHER_WINDOW_RESPONSE_POLICY}\n\
 - Proposal and candidate passages are independently source-bound and may be separate exact rows or passages, including separate rows on one authoritative page. Do not require or fabricate one passage containing both products. Use decision and reason to compare the two proven identities.\n\
 - Preserve conflicts; do not broaden, paraphrase, or combine unrelated mentions elsewhere on a multi-product page.\n\
 - When listing evidence is required, input_evidence_text must be an exact nonempty substring of the immutable listing_context containing both the complete raw observed candidate model and the complete proposed canonical model at alphanumeric boundaries. Do not narrow a suite/family label to an unmentioned LRU or component.\n\
@@ -4448,8 +4457,9 @@ mod tests {
             assert!(prompt.contains(capability));
         }
         assert!(prompt.contains(
-            "identity_evidence must be copied verbatim from one bounded server-fetched publisher passage"
+            "Every nonempty identity, proposal, or candidate evidence field must select exactly one supplied server-fetched publisher window_id"
         ));
+        assert!(prompt.contains("The server derives and overwrites the exact final HTTPS URL"));
         assert!(prompt.contains(
             "Gemini Search or URL Context prose, citation summaries, and paraphrases are not publisher evidence"
         ));
@@ -4868,11 +4878,10 @@ mod tests {
         ));
         assert!(prompt.contains("Do not require one passage to contain both products"));
         assert!(prompt.contains(
-            "candidate_evidence must be copied verbatim from one bounded server-fetched publisher passage"
+            "publisher window selected by candidate_evidence are the authoritative proof"
         ));
-        assert!(prompt.contains(
-            "Each review's candidate_source_url must copy its final verified HTTPS URL exactly"
-        ));
+        assert!(prompt.contains("Return an empty string there"));
+        assert!(prompt.contains("server derives and overwrites the exact final HTTPS URL"));
         let serialized = serde_json::to_string(&context).expect("review context should serialize");
         for forbidden in [
             "estimated_unit_value_usd",
@@ -4921,8 +4930,8 @@ mod tests {
             "Identifier scope is relative to canonical_model",
             "concrete LRU",
             "cannot identify a different containing multi-box system",
-            "final verified HTTPS URL exactly",
-            "including its query when present",
+            "server derives and overwrites the exact final HTTPS URL",
+            "Return an empty string there",
             "short model-designation passage must also explicitly name the canonical manufacturer",
             "one exact occurrence satisfies both fields",
             "existing_match and propose_new require exact_catalog_product",
@@ -4946,8 +4955,10 @@ mod tests {
         );
         assert!(correction_prompt.contains("Identifier scope is relative to canonical_model"));
         assert!(correction_prompt.contains("concrete LRU"));
-        assert!(correction_prompt.contains("final verified HTTPS URL exactly"));
-        assert!(correction_prompt.contains("including its query when present"));
+        assert!(
+            correction_prompt.contains("server derives and overwrites the exact final HTTPS URL")
+        );
+        assert!(correction_prompt.contains("Return an empty string there"));
         assert!(correction_prompt.contains("one exact occurrence satisfies both"));
         assert!(correction_prompt.contains("candidate-specific negative reason"));
         assert!(correction_prompt.contains("rejection_basis"));
@@ -4972,10 +4983,14 @@ mod tests {
         assert!(collision_prompt.contains(
             "input_evidence_text must copy an exact, nonempty substring from classification_context.listing_context that contains both the complete raw observed candidate model and the complete proposed canonical_model"
         ));
-        assert!(collision_prompt
-            .contains("proposal_source_url must copy the final verified HTTPS URL exactly"));
-        assert!(collision_prompt.contains("including its query when present"));
+        assert!(collision_prompt.contains("Return an empty string there"));
+        assert!(
+            collision_prompt.contains("server derives and overwrites the exact final HTTPS URL")
+        );
         assert!(collision_prompt.contains("one exact occurrence satisfies both"));
+        for prompt in [&identity_prompt, &correction_prompt, &collision_prompt] {
+            assert!(!prompt.contains("must copy the final verified HTTPS URL exactly"));
+        }
 
         let observed_types = vec!["Transponder".to_string()];
         let metadata_prompt = build_avionics_metadata_prompt(&AvionicsMetadataContext {
@@ -5344,7 +5359,7 @@ mod tests {
             "identity_source_url",
             "identity_evidence",
             "candidate-specific negative reason",
-            "server-fetched publisher passage",
+            "server-fetched publisher window_id",
             "paraphrases are not publisher evidence",
         ] {
             assert!(
@@ -5421,7 +5436,7 @@ mod tests {
             "candidate_evidence",
             "Do not require or fabricate one passage containing both products",
             "every candidate catalog_id",
-            "server-fetched publisher passage",
+            "server-fetched publisher window_id",
             "paraphrases are not publisher evidence",
         ] {
             assert!(

@@ -29,7 +29,10 @@ const MAX_GOOGLE_SEARCH_QUERIES: usize = 32;
 const MAX_RETRY_FEEDBACK_CHARACTERS: usize = 600;
 pub(crate) const MAX_DIRECT_SOURCE_RELEVANCE_ANCHORS: usize = 24;
 pub(crate) const MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS: usize = 128;
-pub(crate) const MAX_DIRECT_SOURCE_PRODUCT_IDENTITY_REQUIREMENTS: usize = 32;
+// One proposed product plus the bounded 32-candidate avionics collision set.
+// Keep this finite so request validation cannot turn source proof collection
+// into an unbounded packet-construction workload.
+pub(crate) const MAX_DIRECT_SOURCE_PRODUCT_IDENTITY_REQUIREMENTS: usize = 1 + 32;
 pub(crate) const MAX_EXACT_PRODUCT_SIGNAL_TOKEN_SPAN: usize = 24;
 const MAX_DIRECT_SOURCE_RELEVANCE_HINTS: usize = 64;
 const MAX_DIRECT_SOURCE_PACKET_SOURCES: usize = 8;
@@ -170,8 +173,9 @@ pub struct GroundedJsonPassRequest {
     evidence_scope: Option<EvidenceScope>,
     direct_source_text_verification: bool,
     /// Server-owned observed-identity labels used to admit freshly fetched
-    /// publisher documents. A document may instead enter when it proves one
-    /// exact server-owned product requirement below.
+    /// publisher documents. Ordinary Search discovery may alternatively
+    /// admit a document proving one exact product requirement below. Every
+    /// anchor remains mandatory for caller-selected direct-source URLs.
     direct_source_relevance_anchors: Vec<String>,
     /// Optional server-owned ranking labels. These may select useful windows
     /// but can never admit a document or source URL.
@@ -1170,6 +1174,7 @@ struct RankedTextWindow {
     score: usize,
     start: usize,
     end: usize,
+    required_product_identity_keys: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -3138,16 +3143,21 @@ async fn prepare_url_context_sources(
                     continue;
                 }
             };
-            if !publisher_document_is_relevant_to_request(
+            let missing_anchor_indexes = missing_publisher_document_relevance_anchor_indexes(
                 &fetched.publisher_text,
-                &identity_tokens,
-                minimum_document_matches,
-                &request.direct_source_product_identity_requirements,
-            ) {
+                &request.direct_source_relevance_anchors,
+            );
+            if !missing_anchor_indexes.is_empty() {
                 documents.failures.insert(
                     source_url.clone(),
-                    "fresh publisher text matched neither the observed identity anchors nor a required product identity"
-                        .to_string(),
+                    format!(
+                        "fresh publisher text did not match immutable identity anchor index(es): {}",
+                        missing_anchor_indexes
+                            .into_iter()
+                            .map(|index| index.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
                 );
                 continue;
             }
@@ -3475,7 +3485,6 @@ fn publisher_document_is_relevant_to_request(
         || publisher_document_matches_any_product_identity_requirement(publisher_text, requirements)
 }
 
-#[cfg(test)]
 fn publisher_document_matches_all_relevance_anchors(
     publisher_text: &str,
     anchors: &[String],
@@ -3484,7 +3493,6 @@ fn publisher_document_matches_all_relevance_anchors(
         && missing_publisher_document_relevance_anchor_indexes(publisher_text, anchors).is_empty()
 }
 
-#[cfg(test)]
 fn missing_publisher_document_relevance_anchor_indexes(
     publisher_text: &str,
     anchors: &[String],
@@ -3659,11 +3667,9 @@ async fn prepare_direct_source_documents(
                 .verified
                 .get(&citation.final_url)
                 .is_some_and(|document| {
-                    publisher_document_is_relevant_to_request(
+                    publisher_document_matches_all_relevance_anchors(
                         &document.publisher_text,
-                        &identity_tokens,
-                        minimum_document_matches,
-                        &request.direct_source_product_identity_requirements,
+                        &request.direct_source_relevance_anchors,
                     )
                 })
         });
@@ -3832,6 +3838,7 @@ fn prepare_direct_source_evidence_packet(
     let mut packet = DirectSourceEvidencePacket {
         sources: Vec::new(),
     };
+    let mut retained_requirement_keys = BTreeSet::new();
     let mut total_text_bytes = 0usize;
     for source in ranked_sources {
         if packet.sources.len() == MAX_DIRECT_SOURCE_PACKET_SOURCES {
@@ -3853,7 +3860,7 @@ fn prepare_direct_source_evidence_packet(
                 continue;
             }
             source_text_bytes += window_bytes;
-            windows.push(window.text);
+            windows.push(window);
         }
         if windows.is_empty() {
             continue;
@@ -3867,11 +3874,11 @@ fn prepare_direct_source_evidence_packet(
             final_url: source.final_url,
             content_sha256: source.content_sha256,
             text_windows: windows
-                .into_iter()
+                .iter()
                 .enumerate()
-                .map(|(index, text)| DirectSourceEvidencePacketWindow {
+                .map(|(index, window)| DirectSourceEvidencePacketWindow {
                     window_id: format!("publisher_window_{}", first_window_index + index),
-                    text,
+                    text: window.text.clone(),
                 })
                 .collect(),
         });
@@ -3881,6 +3888,11 @@ fn prepare_direct_source_evidence_packet(
             packet.sources.pop();
             continue;
         }
+        retained_requirement_keys.extend(
+            windows
+                .iter()
+                .flat_map(|window| window.required_product_identity_keys.iter().cloned()),
+        );
         total_text_bytes += source_text_bytes;
     }
     if packet.sources.is_empty() {
@@ -3888,10 +3900,12 @@ fn prepare_direct_source_evidence_packet(
             "no bounded publisher-text window matched the direct-source relevance anchors or verified citation labels"
         );
     }
-    let missing_requirements = missing_packet_product_identity_requirements(
-        &packet,
-        &request.direct_source_product_identity_requirements,
-    );
+    let missing_requirements = request
+        .direct_source_product_identity_requirements
+        .iter()
+        .filter(|requirement| !retained_requirement_keys.contains(&requirement.key))
+        .map(|requirement| requirement.key.clone())
+        .collect::<Vec<_>>();
     if !missing_requirements.is_empty() {
         bail!(
             "direct-source product identity proof windows could not fit the bounded evidence packet for requirement key(s): {}",
@@ -4166,31 +4180,11 @@ fn required_direct_source_product_identity_windows(
                     score: 1_000_000 + window.requirement_keys.len(),
                     start,
                     end,
+                    required_product_identity_keys: window.requirement_keys,
                 });
             }
             Ok((final_url, ranked))
         })
-        .collect()
-}
-
-fn missing_packet_product_identity_requirements(
-    packet: &DirectSourceEvidencePacket,
-    requirements: &[DirectSourceProductIdentityRequirement],
-) -> Vec<String> {
-    requirements
-        .iter()
-        .filter(|requirement| {
-            !packet.sources.iter().any(|source| {
-                source.text_windows.iter().any(|window| {
-                    direct_source_product_identity_signal_is_present(
-                        &window.text,
-                        &requirement.model,
-                        &requirement.manufacturer_identifier,
-                    )
-                })
-            })
-        })
-        .map(|requirement| requirement.key.clone())
         .collect()
 }
 
@@ -4361,6 +4355,7 @@ fn relevance_ranked_text_windows(
                 score,
                 start,
                 end,
+                required_product_identity_keys: BTreeSet::new(),
             });
     }
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
@@ -4457,6 +4452,7 @@ fn pin_longest_required_anchor_window(
         score: 0,
         start,
         end,
+        required_product_identity_keys: BTreeSet::new(),
     };
     if selected.len() == MAX_DIRECT_SOURCE_WINDOWS_PER_SOURCE {
         selected.pop();
@@ -5752,6 +5748,37 @@ mod tests {
     }
 
     #[test]
+    fn product_requirement_limit_accepts_proposal_plus_thirty_two_candidates() {
+        let requirements = (0..MAX_DIRECT_SOURCE_PRODUCT_IDENTITY_REQUIREMENTS)
+            .map(|index| {
+                product_requirement(&format!("product:{index}"), &format!("UNIT {index}"), "")
+            })
+            .collect::<Vec<_>>();
+        let request = evidence_request()
+            .with_direct_source_text_verification()
+            .with_direct_source_relevance_anchors(["Garmin", "UNIT"])
+            .with_direct_source_product_identity_requirements(requirements);
+
+        request.validate().unwrap();
+
+        let overflow = (0..=MAX_DIRECT_SOURCE_PRODUCT_IDENTITY_REQUIREMENTS)
+            .map(|index| {
+                product_requirement(&format!("product:{index}"), &format!("UNIT {index}"), "")
+            })
+            .collect::<Vec<_>>();
+        let error = evidence_request()
+            .with_direct_source_text_verification()
+            .with_direct_source_relevance_anchors(["Garmin", "UNIT"])
+            .with_direct_source_product_identity_requirements(overflow)
+            .validate()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("at most 33 entries"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn optional_direct_source_hints_cannot_satisfy_required_anchor_preflight() {
         let request = evidence_request()
             .with_direct_source_text_verification()
@@ -6682,6 +6709,67 @@ mod tests {
         assert_eq!(packet.evidence_windows.len(), 2);
     }
 
+    #[test]
+    fn packet_truncation_cannot_rebind_requirement_to_other_manufacturer_window() {
+        let manufacturers = [
+            "Alpha Avionics",
+            "Bravo Avionics",
+            "Charlie Avionics",
+            "Delta Avionics",
+            "Echo Avionics",
+            "Foxtrot Avionics",
+            "Golf Avionics",
+            "Hotel Avionics",
+            "India Avionics",
+        ];
+        assert_eq!(manufacturers.len(), MAX_DIRECT_SOURCE_PACKET_SOURCES + 1);
+        let requirements = manufacturers
+            .iter()
+            .enumerate()
+            .map(
+                |(index, manufacturer)| DirectSourceProductIdentityRequirement {
+                    key: format!("catalog:{index}"),
+                    manufacturer: (*manufacturer).to_string(),
+                    model: "X 100".to_string(),
+                    manufacturer_identifier: "PN-100".to_string(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let request = evidence_request()
+            .with_direct_source_text_verification()
+            .with_direct_source_relevance_anchors(["Avionics", "X 100"])
+            .with_direct_source_product_identity_requirements(requirements);
+        let documents = TransientSourceDocuments {
+            verified: manufacturers
+                .iter()
+                .enumerate()
+                .map(|(index, manufacturer)| {
+                    (
+                        format!("https://example.com/{index}"),
+                        TransientSourceDocument {
+                            content_sha256: format!("{index:064x}"),
+                            publisher_text: format!(
+                                "{manufacturer} identifies the X 100 product as manufacturer part PN-100."
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+            failures: BTreeMap::new(),
+        };
+
+        let error = match prepare_direct_source_evidence_packet(&request, &[], &documents) {
+            Ok(_) => panic!("packet truncation must not lose a requirement binding"),
+            Err(error) => error,
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("could not fit the bounded evidence packet")
+                && error.contains("catalog:8"),
+            "a same-model/part window from another manufacturer must not satisfy the truncated requirement: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn grouped_candidate_packet_fit_failure_precedes_provider_accounting() {
         let source_url = "https://www.garmin.com/large-catalog";
@@ -7051,10 +7139,15 @@ mod tests {
             &format!("GARMIN installation manual: {exact_evidence}."),
             &anchors,
         ));
-        assert!(!publisher_document_matches_all_relevance_anchors(
-            "Garmin GIA 63W installation manual, part number 010-00386-00, but not the reviewer-supplied exact excerpt.",
-            &anchors,
+        let missing_pinned_passage = "Garmin GIA 63W installation manual, part number 010-00386-00, but not the reviewer-supplied exact excerpt.";
+        assert!(publisher_document_matches_any_product_identity_requirement(
+            missing_pinned_passage,
+            &[product_requirement("proposal", "GIA 63W", "010-00386-00")],
         ));
+        assert!(!publisher_document_matches_all_relevance_anchors(
+            missing_pinned_passage,
+            &anchors,
+        ), "an exact model/part product requirement must not bypass the missing caller-pinned passage");
         assert_eq!(
             missing_publisher_document_relevance_anchor_indexes(
                 "Garmin GIA 63W installation manual, part number 010-00386-00.",

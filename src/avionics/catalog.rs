@@ -4449,7 +4449,24 @@ fn append_positive_listing_identity_issues(
     }
     let canonical_model_key =
         normalize_avionics_identifier(string_field(response, "canonical_model"));
+    let canonical_types =
+        canonical_types_from_response(response, "canonical_types").unwrap_or_default();
+    let listing_model_relation = avionics_model_identity_relation(
+        &context.candidate.manufacturer,
+        &context.candidate.model,
+        &context.candidate.avionics_types,
+        string_field(response, "canonical_manufacturer"),
+        string_field(response, "canonical_model"),
+        &canonical_types,
+    );
     if canonical_model_key.is_empty()
+        || !matches!(
+            listing_model_relation,
+            Some(
+                AvionicsModelIdentityRelation::TypographyExact
+                    | AvionicsModelIdentityRelation::DescriptiveExpansion
+            )
+        )
         || !exact_compact_identity_is_present(&context.listing_context, &canonical_model_key)
     {
         issues.push(
@@ -9476,6 +9493,63 @@ mod tests {
         assert!(issues.iter().any(|issue| issue.contains(
             "complete canonical model to appear in retained listing evidence at alphanumeric boundaries"
         )), "suffix substitution must fail before collision review: {issues:?}");
+    }
+
+    #[test]
+    fn first_stage_positive_identity_rejects_separated_meaningful_suffixes() {
+        for (listing_context, observed_model, canonical_model, capability) in [
+            (
+                "Garmin G1000 NXi integrated flight deck installed",
+                "G1000 NXi",
+                "G1000",
+                "Integrated Flight Deck",
+            ),
+            (
+                "Garmin GIA 63 W navigation/communications unit installed",
+                "GIA 63 W",
+                "GIA 63",
+                "COM",
+            ),
+        ] {
+            let mut context = context(vec![]);
+            context.listing_context = listing_context.to_string();
+            context.candidate.model = observed_model.to_string();
+            context.candidate.avionics_types = vec![capability.to_string()];
+            let source_url = "https://www.garmin.com/manuals/product";
+            let evidence = format!("Garmin identifies the {canonical_model} product model.");
+            let response = json!({
+                "status": "propose_new",
+                "catalog_id": 0,
+                "canonical_manufacturer": "Garmin",
+                "canonical_model": canonical_model,
+                "canonical_types": [capability],
+                "manufacturer_identifier_kind": "manufacturer_model_number",
+                "manufacturer_identifier": canonical_model,
+                "manufacturer_identifier_scope": "exact_catalog_product",
+                "rejection_basis": "none",
+                "confidence": "very_high",
+                "identity_source_url": source_url,
+                "identity_source_title": "Product manual",
+                "identity_evidence": evidence,
+                "reason": "The publisher source identifies the product."
+            });
+
+            let issues = resolution_issues_with_direct_source_proofs(
+                &context,
+                &response,
+                true,
+                &[],
+                &[],
+                &[direct_source_proof(source_url, &evidence)],
+            );
+
+            assert!(
+                issues.iter().any(|issue| issue.contains(
+                    "complete canonical model to appear in retained listing evidence at alphanumeric boundaries"
+                )),
+                "separated meaningful suffix in {observed_model:?} must not authorize base {canonical_model:?}: {issues:?}"
+            );
+        }
     }
 
     #[test]
