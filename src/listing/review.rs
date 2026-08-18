@@ -2270,13 +2270,14 @@ async fn restage_pending_review_if_current_with_commit(
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-            let corroborated_before_evidence_repair = current_corroborated_associations(
-                listing_id,
-                &assignments,
-                &corroboration_rows_before_repair,
-                &reuse_attested_ids,
-                &active_collision_catalog_rows,
-            );
+            let corroborated_before_evidence_repair =
+                current_row_backed_corroborated_associations(
+                    listing_id,
+                    &assignments,
+                    &corroboration_rows_before_repair,
+                    &reuse_attested_ids,
+                    &active_collision_catalog_rows,
+                );
             if maintenance_commit.is_none() {
                 repaired_evidence |= remove_stale_covered_relationships(
                     &mut payload.aspects,
@@ -5183,11 +5184,13 @@ fn current_corroborated_associations(
     reuse_attested_ids: &HashSet<i64>,
     active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
 ) -> HashSet<CoveredListingAssociation> {
-    let assignments_by_link = assignments
-        .iter()
-        .map(|assignment| (assignment.listing_link_id, assignment))
-        .collect::<HashMap<_, _>>();
-    let mut corroborated = HashSet::new();
+    let mut corroborated = current_row_backed_corroborated_associations(
+        listing_id,
+        assignments,
+        rows,
+        reuse_attested_ids,
+        active_collision_catalog_rows,
+    );
 
     // A completed whole-listing review is already the durable corroboration
     // boundary for every component of that exact link. Do not require a
@@ -5209,6 +5212,21 @@ fn current_corroborated_associations(
             });
         }
     }
+    corroborated
+}
+
+fn current_row_backed_corroborated_associations(
+    listing_id: i64,
+    assignments: &[ExistingAssignmentRow],
+    rows: &[AssociationCorroborationRow],
+    reuse_attested_ids: &HashSet<i64>,
+    active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
+) -> HashSet<CoveredListingAssociation> {
+    let assignments_by_link = assignments
+        .iter()
+        .map(|assignment| (assignment.listing_link_id, assignment))
+        .collect::<HashMap<_, _>>();
+    let mut corroborated = HashSet::new();
 
     for row in rows {
         if row.policy_version != ASSOCIATION_CORROBORATION_POLICY_VERSION

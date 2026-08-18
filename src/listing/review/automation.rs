@@ -1834,6 +1834,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restage_does_not_mint_corroboration_from_listing_review_provenance() {
+        let fixture = fixture().await;
+        let reviewed_id = insert_product(&fixture.db, "GIA63W", "GIA63W", true).await;
+        let pool = pool(&fixture.db);
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing_review',
+                      'GIA-63W NAV/COM/GPS with Glideslope',
+                      'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(reviewed_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let owner_user_id: i64 = sqlx::query_scalar(
+            "SELECT created_by_user_id FROM aircraft_sale_listings WHERE id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let restaged = super::super::restage_pending_review_if_current(
+            &fixture.db,
+            owner_user_id,
+            fixture.listing_id,
+            &fixture.review_payload_sha256,
+        )
+        .await
+        .unwrap()
+        .expect("the independent residual remains pending");
+        assert_eq!(restaged.pending_aspect_count, 1);
+        let repaired_notes: Option<String> = sqlx::query_scalar(
+            "SELECT source_notes FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired_notes.as_deref(), Some("GIA-63W"));
+        let proof_counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*)
+               FROM aircraft_sale_listing_avionics_corroborations
+               WHERE listing_link_id = ?),
+              (SELECT COUNT(*)
+               FROM aircraft_sale_listing_avionics_corroboration_scopes
+               WHERE listing_link_id = ?)
+            "#,
+        )
+        .bind(link_id)
+        .bind(link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(proof_counts, (0, 0));
+    }
+
+    #[tokio::test]
     async fn all_pass_clears_review_but_never_marks_listing_ready() {
         let fixture = fixture().await;
         let accepted_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
