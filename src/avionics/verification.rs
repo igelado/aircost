@@ -5171,16 +5171,9 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let proof_counts: (i64, i64) = sqlx::query_as(
-            r#"
-            SELECT
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations
-               WHERE listing_link_id = ?),
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes
-               WHERE listing_link_id = ?)
-            "#,
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
-        .bind(link_id)
         .bind(link_id)
         .fetch_one(pool)
         .await
@@ -5200,7 +5193,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(persisted_link_id, link_id);
-        assert_eq!(proof_counts, (1, 1));
+        assert_eq!(authorization_count, 1);
         assert_eq!(pending_count, 0);
         assert_eq!(usage_count, 0);
     }
@@ -5382,7 +5375,7 @@ mod tests {
         )
         .unwrap();
         let proof_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)
@@ -5586,16 +5579,9 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let proof_counts: (i64, i64) = sqlx::query_as(
-            r#"
-            SELECT
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations
-               WHERE listing_link_id = ?),
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes
-               WHERE listing_link_id = ?)
-            "#,
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
-        .bind(link_id)
         .bind(link_id)
         .fetch_one(pool)
         .await
@@ -5605,7 +5591,7 @@ mod tests {
                 .unwrap();
         assert_eq!(review_after, review_before);
         assert_eq!(link_after, link_before);
-        assert_eq!(proof_counts, (0, 0));
+        assert_eq!(authorization_count, 0);
         assert!(retained_aspects
             .iter()
             .any(|aspect| aspect.id == preserved_aspect_id));

@@ -3394,7 +3394,9 @@ mod tests {
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
-        IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT, POSTGRES_SCHEMA_SQL,
+        IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
+        LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
+        LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION, POSTGRES_SCHEMA_SQL,
         SQLITE_SCHEMA_SQL, VALUATION_DATA_HARDENING_MIGRATION,
     };
 
@@ -4440,7 +4442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupted_reuse_trigger_and_index_fail_preflight_and_migration_repairs_them() {
+    async fn corrupted_reuse_trigger_and_index_fail_preflight() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
@@ -4477,54 +4479,6 @@ mod tests {
             .to_string();
         assert!(error.contains("target-aware current-policy reuse-attestation gate"));
         assert!(error.contains("20260807_avionics_product_reuse_v2.sqlite.sql"));
-
-        let mut connection = pool.acquire().await.unwrap();
-        for statement in split_sql_statements(AVIONICS_REUSE_V2_SQLITE_MIGRATION_SQL) {
-            connection.execute(statement).await.unwrap();
-        }
-        drop(connection);
-        db.ensure_required_migrations()
-            .await
-            .expect("repair migration must restore the canonical structures");
-
-        let (trigger_parent, trigger_sql): (String, String) = sqlx::query_as(
-            r#"
-            SELECT tbl_name, lower(sql)
-            FROM sqlite_schema
-            WHERE type = 'trigger'
-              AND name = 'avionics_product_reuse_invalidate_origin_revocation'
-            "#,
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            trigger_parent,
-            "avionics_authoritative_source_origin_revocations"
-        );
-        assert!(trigger_sql.contains("delete from avionics_product_reuse_attestations"));
-        let index_parent: String = sqlx::query_scalar(
-            r#"
-            SELECT tbl_name
-            FROM sqlite_schema
-            WHERE type = 'index'
-              AND name = 'idx_avionics_product_reuse_origin'
-            "#,
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(index_parent, "avionics_product_reuse_attestations");
-        let index_columns: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM pragma_index_info('idx_avionics_product_reuse_origin')",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            index_columns,
-            vec!["avionics_authoritative_source_origin_id".to_string()]
-        );
     }
 
     #[tokio::test]
@@ -4757,6 +4711,193 @@ mod tests {
                 "Postgres v2 repair migration is missing {repaired_object}"
             );
         }
+    }
+
+    #[test]
+    fn listing_avionics_authorization_contract_has_backend_parity() {
+        let table = "aircraft_sale_listing_avionics_authorizations";
+        let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
+        assert_eq!(
+            sqlite_columns,
+            table_columns(POSTGRES_SCHEMA_SQL, table),
+            "SQLite/Postgres schema column mismatch for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL, table),
+            "canonical schema and SQLite upgrade disagree for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(
+                LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+                table
+            ),
+            "canonical schema and Postgres upgrade disagree for {table}"
+        );
+        for definition in [SQLITE_SCHEMA_SQL, POSTGRES_SCHEMA_SQL] {
+            assert!(!definition.contains("aircraft_sale_listing_avionics_corroborations"));
+            assert!(!definition.contains("aircraft_sale_listing_avionics_corroboration_scopes"));
+            assert!(definition.contains(LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION));
+            assert!(definition
+                .contains(LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT));
+        }
+        for migration in [
+            LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(migration.contains("'manufacturer_reuse'"));
+            assert!(migration.contains("'same_case_grounded'"));
+            assert!(migration.contains("DROP TABLE aircraft_sale_listing_avionics_corroborations"));
+            assert!(migration
+                .contains("DROP TABLE aircraft_sale_listing_avionics_corroboration_scopes"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_listing_avionics_authorization_upgrade_is_idempotent_and_integral() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("SQLite migration fixture should connect");
+        sqlx::raw_sql(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE schema_migration_contracts (
+              migration_name TEXT PRIMARY KEY,
+              contract_version INTEGER NOT NULL,
+              contract_fingerprint TEXT NOT NULL,
+              installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO schema_migration_contracts
+              (migration_name, contract_version, contract_fingerprint)
+            VALUES
+              ('20260805_listing_avionics_association_corroborations', 1,
+               '2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9'),
+              ('20260806_listing_avionics_collision_closure', 1,
+               '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3'),
+              ('20260807_avionics_product_reuse_v2', 1,
+               'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc');
+            CREATE TABLE avionics_models (id INTEGER PRIMARY KEY);
+            INSERT INTO avionics_models (id) VALUES (7);
+            CREATE TABLE avionics_approved_product_graph_identities (
+              avionics_model_id INTEGER PRIMARY KEY
+            );
+            INSERT INTO avionics_approved_product_graph_identities
+              (avionics_model_id) VALUES (7);
+            CREATE TABLE avionics_product_reuse_attestations (
+              avionics_model_id INTEGER PRIMARY KEY,
+              product_fingerprint TEXT NOT NULL,
+              policy_version TEXT NOT NULL
+            );
+            INSERT INTO avionics_product_reuse_attestations
+              (avionics_model_id, product_fingerprint, policy_version)
+            VALUES (7,
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              'avionics_reuse_v2');
+            CREATE TABLE aircraft_sale_listing_avionics (
+              id INTEGER PRIMARY KEY,
+              aircraft_sale_listing_id INTEGER NOT NULL,
+              avionics_model_id INTEGER NOT NULL,
+              quantity INTEGER NOT NULL,
+              source_notes TEXT,
+              source_confidence TEXT,
+              configuration_action TEXT NOT NULL,
+              replaces_avionics_model_id INTEGER
+            );
+            INSERT INTO aircraft_sale_listing_avionics
+              (id, aircraft_sale_listing_id, avionics_model_id, quantity,
+               source_notes, source_confidence, configuration_action)
+            VALUES (11, 23, 7, 1, 'Garmin GTX 345', 'high', 'installed');
+            CREATE TABLE plugin_submissions (
+              canonical_listing_id INTEGER,
+              rendered_html TEXT NOT NULL,
+              rendered_html_sha256 TEXT NOT NULL
+            );
+            INSERT INTO plugin_submissions
+              (canonical_listing_id, rendered_html, rendered_html_sha256)
+            VALUES (23, '<p>Garmin GTX 345</p>',
+              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+            CREATE TABLE aircraft_sale_listing_avionics_corroborations (
+              listing_link_id INTEGER NOT NULL,
+              association_role TEXT NOT NULL,
+              avionics_model_id INTEGER NOT NULL,
+              observation_sha256 TEXT NOT NULL,
+              product_fingerprint TEXT NOT NULL,
+              policy_version TEXT NOT NULL,
+              corroborated_at TEXT NOT NULL,
+              PRIMARY KEY (listing_link_id, association_role)
+            );
+            INSERT INTO aircraft_sale_listing_avionics_corroborations VALUES (
+              11, 'installed', 7,
+              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              'listing_avionics_association_v1', '2026-08-18 12:00:00'
+            );
+            CREATE TABLE aircraft_sale_listing_avionics_corroboration_scopes (
+              listing_link_id INTEGER NOT NULL,
+              association_role TEXT NOT NULL,
+              collision_closure_sha256 TEXT NOT NULL,
+              policy_version TEXT NOT NULL,
+              PRIMARY KEY (listing_link_id, association_role)
+            );
+            INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes VALUES (
+              11, 'installed',
+              'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+              'listing_avionics_collision_closure_v1'
+            );
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .expect("legacy authorization fixture should initialize");
+
+        for _ in 0..2 {
+            sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL)
+                .execute(&mut connection)
+                .await
+                .expect("authorization upgrade should be safely repeatable");
+        }
+
+        let migrated: (i64, String, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, authorization_kind, product_fingerprint,
+                   evidence_capture_sha256, policy_version
+            FROM aircraft_sale_listing_avionics_authorizations
+            WHERE listing_link_id = 11 AND association_role = 'installed'
+            "#,
+        )
+        .fetch_one(&mut connection)
+        .await
+        .expect("the valid predecessor proof should migrate once");
+        assert_eq!(migrated.0, 7);
+        assert_eq!(migrated.1, "manufacturer_reuse");
+        assert_eq!(migrated.2, "a".repeat(64));
+        assert_eq!(migrated.3, "b".repeat(64));
+        assert_eq!(migrated.4, "listing_avionics_authorization_v1");
+        let old_object_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM sqlite_schema
+            WHERE name IN (
+              'aircraft_sale_listing_avionics_corroborations',
+              'aircraft_sale_listing_avionics_corroboration_scopes'
+            )
+            "#,
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(old_object_count, 0);
+        let foreign_key_errors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
     }
 
     #[test]

@@ -3543,8 +3543,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS
 -- Exact authorization for one listing-link component. Manufacturer-reuse
 -- authorizations bind the current global attestation; same-case authorizations
 -- bind the transient grounded resolution that approved this exact association.
-CREATE TABLE IF NOT EXISTS
-  aircraft_sale_listing_avionics_authorizations (
+CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
     listing_link_id BIGINT NOT NULL
       REFERENCES aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
     association_role TEXT NOT NULL
