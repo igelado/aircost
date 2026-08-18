@@ -374,6 +374,10 @@ struct ModelRow {
     identity_evidence_kind: String,
     identity_confidence: Option<String>,
     catalog_reviewed_at: Option<String>,
+    approved_manufacturer_identity_id: Option<i64>,
+    approved_canonical_product_key: Option<String>,
+    approved_identifier_kind: Option<String>,
+    approved_canonical_identifier_key: Option<String>,
 }
 
 impl ModelRow {
@@ -588,13 +592,23 @@ const MODEL_SQL: &str = r#"
       model.identity_evidence_text,
       model.identity_evidence_kind,
       model.identity_confidence,
-      model.catalog_reviewed_at
+      model.catalog_reviewed_at,
+      approved_identity.avionics_manufacturer_identity_id
+        AS approved_manufacturer_identity_id,
+      approved_identity.canonical_product_key
+        AS approved_canonical_product_key,
+      approved_identity.manufacturer_identifier_kind
+        AS approved_identifier_kind,
+      approved_identity.canonical_identifier_key
+        AS approved_canonical_identifier_key
     FROM avionics_models model
     JOIN avionics_manufacturers manufacturer
       ON manufacturer.id = model.avionics_manufacturer_id
     LEFT JOIN avionics_manufacturer_effective_memberships manufacturer_identity
       ON manufacturer_identity.avionics_manufacturer_id
         = model.avionics_manufacturer_id
+    LEFT JOIN avionics_approved_product_graph_identities approved_identity
+      ON approved_identity.avionics_model_id = model.id
     ORDER BY model.id
 "#;
 
@@ -730,6 +744,20 @@ fn approved_catalog_revision_from_state(state: &CatalogState) -> String {
         .iter()
         .filter(|model| model.catalog_status == "approved")
     {
+        let (
+            Some(avionics_manufacturer_identity_id),
+            Some(canonical_product_key),
+            Some(graph_manufacturer_identifier_kind),
+            Some(canonical_identifier_key),
+        ) = (
+            model.approved_manufacturer_identity_id,
+            model.approved_canonical_product_key.as_ref(),
+            model.approved_identifier_kind.as_ref(),
+            model.approved_canonical_identifier_key.as_ref(),
+        )
+        else {
+            continue;
+        };
         for membership in state
             .model_types
             .iter()
@@ -742,6 +770,13 @@ fn approved_catalog_revision_from_state(state: &CatalogState) -> String {
                 capability: membership.capability.clone(),
                 manufacturer_identifier_kind: model.manufacturer_identifier_kind.clone(),
                 manufacturer_identifier: model.manufacturer_identifier.clone(),
+                avionics_manufacturer_identity_id,
+                canonical_product_key: canonical_product_key.clone(),
+                graph_manufacturer_identifier_kind: graph_manufacturer_identifier_kind.clone(),
+                canonical_identifier_key: canonical_identifier_key.clone(),
+                identity_source_url: model.identity_source_url.clone(),
+                identity_source_title: model.identity_source_title.clone(),
+                identity_evidence_text: model.identity_evidence_text.clone(),
             });
         }
     }
@@ -4294,6 +4329,10 @@ mod tests {
             identity_evidence_kind: "unreviewed".to_string(),
             identity_confidence: None,
             catalog_reviewed_at: None,
+            approved_manufacturer_identity_id: None,
+            approved_canonical_product_key: None,
+            approved_identifier_kind: None,
+            approved_canonical_identifier_key: None,
         }
     }
 

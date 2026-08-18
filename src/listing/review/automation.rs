@@ -20,15 +20,16 @@ use crate::listing::avionics::{
 
 use super::{
     active_collision_closure_member_ids, association_observation_sha256_from_values,
-    catalog_products, conservative_confidence, fingerprint_active_collision_closure,
-    fingerprint_catalog_products, merged_notes, parse_payload, serialize_review_payload,
+    catalog_product_fingerprints, catalog_products, conservative_confidence,
+    fingerprint_active_collision_closure, fingerprint_catalog_products,
+    fingerprint_grounded_collision_closure, merged_notes, parse_payload, serialize_review_payload,
     sha256_hex, valid_sha256, validate_exact_listing_evidence_span,
     validate_exact_listing_product_evidence, ActiveCollisionCatalogFingerprintRow,
     CatalogFingerprintRow, ListingAssociationRole, PendingReviewAspect, ReviewError, ReviewResult,
     ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
-    ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION, ASSOCIATION_CORROBORATION_POLICY_VERSION,
-    POSTGRES_LISTING_CHILD_LOCK_SQL,
+    ASSOCIATION_AUTHORIZATION_POLICY_VERSION, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
+use crate::avionics::catalog::GroundedAvionicsResolutionReceipt;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AutomatedPreservedAssociationGuard {
@@ -37,20 +38,28 @@ pub(crate) struct AutomatedPreservedAssociationGuard {
     pub expected_observation_sha256: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AutomatedAssociationAuthorization {
+    ManufacturerReuse,
+    SameCaseGrounded(GroundedAvionicsResolutionReceipt),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AutomatedAvionicsLink {
     pub avionics_model_id: i64,
+    pub authorization: AutomatedAssociationAuthorization,
     pub expected_collision_closure_sha256: String,
     pub quantity: i64,
     pub source_notes: Option<String>,
     pub source_confidence: Option<String>,
     pub configuration_action: String,
     pub replaces_avionics_model_id: Option<i64>,
+    pub replacement_authorization: Option<AutomatedAssociationAuthorization>,
     pub expected_replacement_collision_closure_sha256: Option<String>,
     pub preserved_association_guard: Option<AutomatedPreservedAssociationGuard>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AutomatedReviewApplyRequest {
     pub listing_id: i64,
     pub plugin_submission_id: i64,
@@ -119,6 +128,19 @@ struct ExistingLinkRow {
     replacement_product_key: Option<String>,
 }
 
+#[derive(Debug, FromRow)]
+struct ExistingSameCaseAuthorizationRow {
+    listing_link_id: i64,
+    association_role: String,
+    avionics_model_id: i64,
+    observation_sha256: String,
+    product_fingerprint: String,
+    grounded_resolution_sha256: Option<String>,
+    evidence_capture_is_current: bool,
+    collision_closure_sha256: String,
+    policy_version: String,
+}
+
 #[derive(Clone, Debug)]
 struct CatalogGraphIdentity {
     key: String,
@@ -129,6 +151,7 @@ struct CatalogGraphIdentity {
 #[derive(Clone, Debug)]
 struct PreparedLink {
     avionics_model_id: i64,
+    authorization: AutomatedAssociationAuthorization,
     subject_key: String,
     quantity: i64,
     source: String,
@@ -136,6 +159,7 @@ struct PreparedLink {
     source_confidence: Option<String>,
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
+    replacement_authorization: Option<AutomatedAssociationAuthorization>,
     replacement_key: Option<String>,
 }
 
@@ -206,13 +230,32 @@ fn validate_request(
                 )));
             }
         }
+        for (target_id, authorization) in
+            std::iter::once((link.avionics_model_id, &link.authorization)).chain(
+                link.replaces_avionics_model_id
+                    .zip(link.replacement_authorization.as_ref()),
+            )
+        {
+            if let AutomatedAssociationAuthorization::SameCaseGrounded(receipt) = authorization {
+                if receipt.listing_id() != request.listing_id
+                    || receipt.avionics_model_id() != target_id
+                    || !valid_sha256(receipt.resolution_sha256())
+                {
+                    return Err(ReviewError::Validation(format!(
+                        "same-case grounded authorization for catalog id {target_id} is not bound to this listing and product"
+                    )));
+                }
+            }
+        }
         match link.configuration_action.as_str() {
             "installed"
                 if link.replaces_avionics_model_id.is_none()
-                    && link.expected_replacement_collision_closure_sha256.is_none() => {}
+                    && link.expected_replacement_collision_closure_sha256.is_none()
+                    && link.replacement_authorization.is_none() => {}
             "replaces" | "removes"
                 if link.replaces_avionics_model_id.is_some_and(|id| id > 0)
-                    && link.expected_replacement_collision_closure_sha256.is_some() => {}
+                    && link.expected_replacement_collision_closure_sha256.is_some()
+                    && link.replacement_authorization.is_some() => {}
             _ => {
                 return Err(ReviewError::Validation(format!(
                     "accepted avionics catalog id {} has invalid action/target semantics",
@@ -256,6 +299,8 @@ fn merge_compatible(existing: &mut PreparedLink, incoming: PreparedLink) -> Revi
     if existing.configuration_action != incoming.configuration_action
         || existing.replacement_key != incoming.replacement_key
         || existing.replaces_avionics_model_id != incoming.replaces_avionics_model_id
+        || existing.authorization != incoming.authorization
+        || existing.replacement_authorization != incoming.replacement_authorization
     {
         return Err(ReviewError::Validation(format!(
             "avionics catalog id {} has conflicting installation actions or replacement targets",
@@ -297,6 +342,53 @@ fn persisted_values_match(existing: &ExistingLinkRow, assignment: &PreparedLink)
         && existing.source_confidence == assignment.source_confidence
         && existing.configuration_action == assignment.configuration_action
         && existing.replaces_avionics_model_id == assignment.replaces_avionics_model_id
+}
+
+fn current_same_case_authorization(
+    listing_id: i64,
+    link: &ExistingLinkRow,
+    role: ListingAssociationRole,
+    target_id: i64,
+    authorizations: &[ExistingSameCaseAuthorizationRow],
+    catalog_product_fingerprints: &std::collections::HashMap<i64, String>,
+    active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
+) -> bool {
+    let role_label = match role {
+        ListingAssociationRole::Installed => "installed",
+        ListingAssociationRole::Replacement => "replacement",
+    };
+    let Some(authorization) = authorizations.iter().find(|authorization| {
+        authorization.listing_link_id == link.id
+            && authorization.association_role == role_label
+            && authorization.avionics_model_id == target_id
+    }) else {
+        return false;
+    };
+    if authorization.policy_version != ASSOCIATION_AUTHORIZATION_POLICY_VERSION
+        || !authorization.evidence_capture_is_current
+        || !authorization
+            .grounded_resolution_sha256
+            .as_deref()
+            .is_some_and(valid_sha256)
+        || catalog_product_fingerprints.get(&target_id) != Some(&authorization.product_fingerprint)
+        || fingerprint_grounded_collision_closure(active_collision_catalog_rows, target_id)
+            .as_deref()
+            != Some(authorization.collision_closure_sha256.as_str())
+    {
+        return false;
+    }
+    authorization.observation_sha256
+        == association_observation_sha256_from_values(
+            listing_id,
+            link.id,
+            role,
+            target_id,
+            link.avionics_model_id,
+            link.replaces_avionics_model_id,
+            link.quantity,
+            &link.configuration_action,
+            link.source_notes.as_deref().unwrap_or_default(),
+        )
 }
 
 fn serial_is_compatible(
@@ -473,6 +565,58 @@ pub(crate) async fn apply_automated_avionics_review(
         ORDER BY link.id
         "#,
     );
+    let select_existing_same_case_authorizations = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            r#"
+            SELECT
+              authorization.listing_link_id,
+              authorization.association_role,
+              authorization.avionics_model_id,
+              authorization.observation_sha256,
+              authorization.product_fingerprint,
+              authorization.grounded_resolution_sha256,
+              EXISTS (
+                SELECT 1 FROM plugin_submissions capture
+                WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+                  AND capture.rendered_html_sha256 = authorization.evidence_capture_sha256
+                  AND length(trim(COALESCE(link.source_notes, ''))) > 0
+                  AND instr(capture.rendered_html, link.source_notes) > 0
+              ) AS evidence_capture_is_current,
+              authorization.collision_closure_sha256,
+              authorization.policy_version
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            JOIN aircraft_sale_listing_avionics link
+              ON link.id = authorization.listing_link_id
+            WHERE link.aircraft_sale_listing_id = ?
+              AND authorization.authorization_kind = 'same_case_grounded'
+            "#,
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(
+            r#"
+            SELECT
+              authorization.listing_link_id,
+              authorization.association_role,
+              authorization.avionics_model_id,
+              authorization.observation_sha256,
+              authorization.product_fingerprint,
+              authorization.grounded_resolution_sha256,
+              EXISTS (
+                SELECT 1 FROM plugin_submissions capture
+                WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+                  AND capture.rendered_html_sha256 = authorization.evidence_capture_sha256
+                  AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
+                  AND position(link.source_notes IN capture.rendered_html) > 0
+              ) AS evidence_capture_is_current,
+              authorization.collision_closure_sha256,
+              authorization.policy_version
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            JOIN aircraft_sale_listing_avionics link
+              ON link.id = authorization.listing_link_id
+            WHERE link.aircraft_sale_listing_id = ?
+              AND authorization.authorization_kind = 'same_case_grounded'
+            "#,
+        ),
+    };
     let active_collision_catalog_sql = db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
     let delete_link = db.sql(
         "DELETE FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? AND id = ?",
@@ -491,36 +635,47 @@ pub(crate) async fn apply_automated_avionics_review(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
-    let delete_corroboration = db.sql(
+    let delete_authorization = db.sql(
         r#"
-        DELETE FROM aircraft_sale_listing_avionics_corroborations
+        DELETE FROM aircraft_sale_listing_avionics_authorizations
         WHERE listing_link_id = ?
           AND association_role = ?
         "#,
     );
-    let insert_corroboration = db.sql(
+    let insert_reuse_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_corroborations (
+        INSERT INTO aircraft_sale_listing_avionics_authorizations (
           listing_link_id,
           association_role,
           avionics_model_id,
+          authorization_kind,
           observation_sha256,
           product_fingerprint,
+          grounded_resolution_sha256,
+          evidence_capture_sha256,
+          collision_closure_sha256,
           policy_version
         )
-        SELECT ?, ?, ?, ?, attestation.product_fingerprint, ?
+        SELECT ?, ?, ?, 'manufacturer_reuse', ?, attestation.product_fingerprint,
+               NULL, ?, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         "#,
     );
-    let insert_corroboration_scope = db.sql(
+    let insert_grounded_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes (
+        INSERT INTO aircraft_sale_listing_avionics_authorizations (
           listing_link_id,
           association_role,
+          avionics_model_id,
+          authorization_kind,
+          observation_sha256,
+          product_fingerprint,
+          grounded_resolution_sha256,
+          evidence_capture_sha256,
           collision_closure_sha256,
           policy_version
-        ) VALUES (?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?)
         "#,
     );
     let update_review = db.sql(
@@ -746,15 +901,40 @@ pub(crate) async fn apply_automated_avionics_review(
             let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
                 .fetch_all(&mut *transaction)
                 .await?;
-            let catalog_revision_sha256 =
-                fingerprint_catalog_products(&catalog_products(catalog_rows));
+            let catalog_products = catalog_products(catalog_rows);
+            let catalog_product_fingerprints =
+                catalog_product_fingerprints(&catalog_products);
+            let catalog_revision_sha256 = fingerprint_catalog_products(&catalog_products);
 
             let mut identity_cache = BTreeMap::<i64, CatalogGraphIdentity>::new();
             let mut required_model_ids = BTreeSet::new();
+            let mut authorization_by_model = BTreeMap::new();
             for link in &request.accepted_links {
                 required_model_ids.insert(link.avionics_model_id);
+                if authorization_by_model
+                    .insert(link.avionics_model_id, link.authorization.clone())
+                    .is_some_and(|existing| existing != link.authorization)
+                {
+                    return Err(ReviewError::Conflict(format!(
+                        "catalog id {} has conflicting automatic authorization proofs",
+                        link.avionics_model_id
+                    )));
+                }
                 if let Some(target) = link.replaces_avionics_model_id {
                     required_model_ids.insert(target);
+                    let replacement_authorization = link
+                        .replacement_authorization
+                        .as_ref()
+                        .expect("validated replacement has an authorization")
+                        .clone();
+                    if authorization_by_model
+                        .insert(target, replacement_authorization.clone())
+                        .is_some_and(|existing| existing != replacement_authorization)
+                    {
+                        return Err(ReviewError::Conflict(format!(
+                            "replacement catalog id {target} has conflicting automatic authorization proofs"
+                        )));
+                    }
                 }
             }
             let active_collision_catalog_rows =
@@ -784,16 +964,29 @@ pub(crate) async fn apply_automated_avionics_review(
             }
             let mut collision_closures = BTreeMap::new();
             for model_id in &required_model_ids {
-                if !current_reuse_attested_ids.contains(model_id) {
-                    return Err(ReviewError::Stale(format!(
-                        "accepted avionics catalog id {model_id} is not eligible for current-policy reuse; ground and re-attest it before automated linking"
-                    )));
+                let authorization = authorization_by_model
+                    .get(model_id)
+                    .expect("required model authorization was collected");
+                let collision_closure = match authorization {
+                    AutomatedAssociationAuthorization::ManufacturerReuse => {
+                        if !current_reuse_attested_ids.contains(model_id) {
+                            return Err(ReviewError::Stale(format!(
+                                "accepted avionics catalog id {model_id} lost its manufacturer-primary reuse authorization"
+                            )));
+                        }
+                        fingerprint_active_collision_closure(
+                            &active_collision_catalog_rows,
+                            &current_reuse_attested_ids,
+                            *model_id,
+                        )
+                    }
+                    AutomatedAssociationAuthorization::SameCaseGrounded(_) => {
+                        fingerprint_grounded_collision_closure(
+                            &active_collision_catalog_rows,
+                            *model_id,
+                        )
+                    }
                 }
-                let collision_closure = fingerprint_active_collision_closure(
-                    &active_collision_catalog_rows,
-                    &current_reuse_attested_ids,
-                    *model_id,
-                )
                 .ok_or_else(|| {
                     ReviewError::Stale(format!(
                         "accepted avionics catalog id {model_id} has no unique active collision-closure identity"
@@ -863,6 +1056,7 @@ pub(crate) async fn apply_automated_avionics_review(
                 touched_keys.extend(replacement_key.iter().cloned());
                 let incoming = PreparedLink {
                     avionics_model_id: link.avionics_model_id,
+                    authorization: link.authorization.clone(),
                     subject_key: subject.key.clone(),
                     quantity: link.quantity,
                     source: "listing".to_string(),
@@ -872,6 +1066,7 @@ pub(crate) async fn apply_automated_avionics_review(
                     source_confidence: link.source_confidence.clone(),
                     configuration_action: link.configuration_action.clone(),
                     replaces_avionics_model_id: link.replaces_avionics_model_id,
+                    replacement_authorization: link.replacement_authorization.clone(),
                     replacement_key,
                 };
                 if let Some(existing) = accepted.get_mut(&incoming.subject_key) {
@@ -890,6 +1085,13 @@ pub(crate) async fn apply_automated_avionics_review(
                     .bind(request.listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
+            let existing_same_case_authorizations =
+                sqlx::query_as::<_, ExistingSameCaseAuthorizationRow>(
+                    &select_existing_same_case_authorizations,
+                )
+                .bind(request.listing_id)
+                .fetch_all(&mut *transaction)
+                .await?;
             for link in &request.accepted_links {
                 let Some(guard) = link.preserved_association_guard.as_ref() else {
                     continue;
@@ -938,12 +1140,6 @@ pub(crate) async fn apply_automated_avionics_review(
                 {
                     continue;
                 }
-                if !$reuse_is_current(db, &mut transaction, row.avionics_model_id).await? {
-                    return Err(ReviewError::Stale(format!(
-                        "preserved avionics catalog id {} is not eligible for current-policy reuse; ground and re-attest it before automated review",
-                        row.avionics_model_id
-                    )));
-                }
                 let subject_key = graph_key(
                     row.installed_manufacturer_identity_id,
                     row.installed_product_key.as_deref(),
@@ -954,11 +1150,6 @@ pub(crate) async fn apply_automated_avionics_review(
                 {
                     if row.replacement_catalog_status.as_deref() != Some("approved") {
                         continue;
-                    }
-                    if !$reuse_is_current(db, &mut transaction, target_id).await? {
-                        return Err(ReviewError::Stale(format!(
-                            "preserved replacement catalog id {target_id} is not eligible for current-policy reuse; ground and re-attest it before automated review"
-                        )));
                     }
                     Some(graph_key(
                         row.replacement_manufacturer_identity_id,
@@ -981,8 +1172,44 @@ pub(crate) async fn apply_automated_avionics_review(
                 {
                     continue;
                 }
+                let installed_reuse_is_current =
+                    $reuse_is_current(db, &mut transaction, row.avionics_model_id).await?;
+                let installed_same_case_is_current = current_same_case_authorization(
+                    request.listing_id,
+                    row,
+                    ListingAssociationRole::Installed,
+                    row.avionics_model_id,
+                    &existing_same_case_authorizations,
+                    &catalog_product_fingerprints,
+                    &active_collision_catalog_rows,
+                );
+                if !installed_reuse_is_current && !installed_same_case_is_current {
+                    return Err(ReviewError::Stale(format!(
+                        "preserved avionics catalog id {} has neither current manufacturer-reuse nor same-case grounded authorization",
+                        row.avionics_model_id
+                    )));
+                }
+                if let Some(target_id) = row.replaces_avionics_model_id {
+                    let replacement_reuse_is_current =
+                        $reuse_is_current(db, &mut transaction, target_id).await?;
+                    let replacement_same_case_is_current = current_same_case_authorization(
+                        request.listing_id,
+                        row,
+                        ListingAssociationRole::Replacement,
+                        target_id,
+                        &existing_same_case_authorizations,
+                        &catalog_product_fingerprints,
+                        &active_collision_catalog_rows,
+                    );
+                    if !replacement_reuse_is_current && !replacement_same_case_is_current {
+                        return Err(ReviewError::Stale(format!(
+                            "preserved replacement catalog id {target_id} has neither current manufacturer-reuse nor same-case grounded authorization"
+                        )));
+                    }
+                }
                 let incoming = PreparedLink {
                     avionics_model_id: row.avionics_model_id,
+                    authorization: AutomatedAssociationAuthorization::ManufacturerReuse,
                     subject_key: subject_key.clone(),
                     quantity: row.quantity,
                     source: row.source.clone(),
@@ -990,6 +1217,9 @@ pub(crate) async fn apply_automated_avionics_review(
                     source_confidence: row.source_confidence.clone(),
                     configuration_action: row.configuration_action.clone(),
                     replaces_avionics_model_id: row.replaces_avionics_model_id,
+                    replacement_authorization: row
+                        .replaces_avionics_model_id
+                        .map(|_| AutomatedAssociationAuthorization::ManufacturerReuse),
                     replacement_key,
                 };
                 if let Some(existing) = preserved.get_mut(&subject_key) {
@@ -1105,15 +1335,20 @@ pub(crate) async fn apply_automated_avionics_review(
                     ListingAssociationRole::Installed,
                     "installed",
                     assignment.avionics_model_id,
+                    &assignment.authorization,
                 )];
                 if let Some(replacement_id) = assignment.replaces_avionics_model_id {
                     roles.push((
                         ListingAssociationRole::Replacement,
                         "replacement",
                         replacement_id,
+                        assignment
+                            .replacement_authorization
+                            .as_ref()
+                            .expect("prepared replacement has an authorization"),
                     ));
                 }
-                for (role, role_label, target_id) in roles {
+                for (role, role_label, target_id, authorization) in roles {
                     let observation_sha256 = association_observation_sha256_from_values(
                         request.listing_id,
                         persisted.id,
@@ -1125,40 +1360,55 @@ pub(crate) async fn apply_automated_avionics_review(
                         &assignment.configuration_action,
                         evidence_text,
                     );
-                    sqlx::query(&delete_corroboration)
+                    sqlx::query(&delete_authorization)
                         .bind(persisted.id)
                         .bind(role_label)
                         .execute(&mut *transaction)
                         .await?;
-                    let inserted = sqlx::query(&insert_corroboration)
-                        .bind(persisted.id)
-                        .bind(role_label)
-                        .bind(target_id)
-                        .bind(observation_sha256)
-                        .bind(ASSOCIATION_CORROBORATION_POLICY_VERSION)
-                        .bind(target_id)
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected();
-                    if inserted != 1 {
-                        return Err(ReviewError::Conflict(format!(
-                            "current product attestation for accepted avionics catalog id {target_id} disappeared before association corroboration"
-                        )));
-                    }
                     let collision_closure = collision_closures
                         .get(&target_id)
                         .expect("accepted target collision closure was loaded");
-                    let inserted = sqlx::query(&insert_corroboration_scope)
-                        .bind(persisted.id)
-                        .bind(role_label)
-                        .bind(collision_closure)
-                        .bind(ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION)
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected();
+                    let inserted = match authorization {
+                        AutomatedAssociationAuthorization::ManufacturerReuse => {
+                            sqlx::query(&insert_reuse_authorization)
+                                .bind(persisted.id)
+                                .bind(role_label)
+                                .bind(target_id)
+                                .bind(observation_sha256.as_str())
+                                .bind(request.expected_rendered_html_sha256.as_str())
+                                .bind(collision_closure)
+                                .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
+                                .bind(target_id)
+                                .execute(&mut *transaction)
+                                .await?
+                                .rows_affected()
+                        }
+                        AutomatedAssociationAuthorization::SameCaseGrounded(receipt) => {
+                            let product_fingerprint = catalog_product_fingerprints
+                                .get(&target_id)
+                                .ok_or_else(|| {
+                                    ReviewError::Stale(format!(
+                                        "grounded catalog id {target_id} lost its approved product fingerprint"
+                                    ))
+                                })?;
+                            sqlx::query(&insert_grounded_authorization)
+                                .bind(persisted.id)
+                                .bind(role_label)
+                                .bind(target_id)
+                                .bind(observation_sha256.as_str())
+                                .bind(product_fingerprint)
+                                .bind(receipt.resolution_sha256())
+                                .bind(request.expected_rendered_html_sha256.as_str())
+                                .bind(collision_closure)
+                                .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
+                                .execute(&mut *transaction)
+                                .await?
+                                .rows_affected()
+                        }
+                    };
                     if inserted != 1 {
                         return Err(ReviewError::Conflict(format!(
-                            "collision closure for accepted avionics catalog id {target_id} could not be persisted"
+                            "accepted avionics catalog id {target_id} lost its exact association authorization before commit"
                         )));
                     }
                 }
@@ -1580,12 +1830,14 @@ mod tests {
     ) -> AutomatedAvionicsLink {
         AutomatedAvionicsLink {
             avionics_model_id: model_id,
+            authorization: AutomatedAssociationAuthorization::ManufacturerReuse,
             expected_collision_closure_sha256,
             quantity: 1,
             source_notes: Some(source_notes),
             source_confidence: Some("high".to_string()),
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
+            replacement_authorization: None,
             expected_replacement_collision_closure_sha256: None,
             preserved_association_guard: None,
         }
@@ -1622,6 +1874,438 @@ mod tests {
         )
     }
 
+    async fn same_case_accepted(fixture: &Fixture, model_id: i64) -> AutomatedAvionicsLink {
+        let mut link = accepted_with_revision(
+            model_id,
+            super::super::grounded_collision_closure_revision_sha256(&fixture.db, model_id)
+                .await
+                .unwrap(),
+            "Garmin GTX 345".to_string(),
+        );
+        link.authorization = AutomatedAssociationAuthorization::SameCaseGrounded(
+            crate::avionics::catalog::grounded_resolution_receipt_for_test(
+                fixture.listing_id,
+                model_id,
+            ),
+        );
+        link
+    }
+
+    #[tokio::test]
+    async fn same_case_grounded_authorization_accepts_without_global_reuse() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let accepted_link = same_case_accepted(&fixture, model_id).await;
+        let AutomatedAssociationAuthorization::SameCaseGrounded(receipt) =
+            &accepted_link.authorization
+        else {
+            unreachable!()
+        };
+        let resolution_sha256 = receipt.resolution_sha256().to_string();
+        let residual = pending_aspect("residual:0", "Unknown audio panel");
+
+        let result = apply_automated_avionics_review(
+            &fixture.db,
+            &request(&fixture, vec![accepted_link], vec![residual.clone()]),
+        )
+        .await
+        .expect("full grounding should authorize its exact listing association");
+        assert_eq!(result.accepted_link_count, 1);
+
+        let stored: (String, Option<String>, String) = sqlx::query_as(
+            r#"
+            SELECT authorization_kind, grounded_resolution_sha256,
+                   evidence_capture_sha256
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            JOIN aircraft_sale_listing_avionics link
+              ON link.id = authorization.listing_link_id
+            WHERE link.aircraft_sale_listing_id = ?
+              AND authorization.association_role = 'installed'
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, "same_case_grounded");
+        assert_eq!(stored.1.as_deref(), Some(resolution_sha256.as_str()));
+        assert_eq!(stored.2, fixture.rendered_html_sha256);
+        let reuse_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(reuse_count, 0, "same-case proof must not mint global reuse");
+
+        let mut replay = request(&fixture, vec![], vec![residual]);
+        replay.expected_review_payload_sha256 = result
+            .review_payload_sha256
+            .expect("the residual review should remain staged");
+        let replayed = apply_automated_avionics_review(&fixture.db, &replay)
+            .await
+            .expect(
+                "a current same-case authorization should preserve its exact link without Gemini",
+            );
+        assert_eq!(replayed.preserved_link_count, 1);
+        assert_eq!(replayed.stored_link_count, 1);
+    }
+
+    #[tokio::test]
+    async fn same_case_grounding_repairs_an_exact_existing_link_without_prior_authorization() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let existing_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', 'Garmin GTX 345',
+                      'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let result = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .expect("fresh same-case grounding should authorize the touched exact row");
+
+        assert_eq!(result.accepted_link_count, 1);
+        assert_eq!(result.stored_link_count, 1);
+        let stored: (i64, String) = sqlx::query_as(
+            r#"
+            SELECT link.id, authorization.authorization_kind
+            FROM aircraft_sale_listing_avionics link
+            JOIN aircraft_sale_listing_avionics_authorizations authorization
+              ON authorization.listing_link_id = link.id
+             AND authorization.association_role = 'installed'
+            WHERE link.aircraft_sale_listing_id = ?
+              AND link.avionics_model_id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, (existing_link_id, "same_case_grounded".to_string()));
+    }
+
+    #[tokio::test]
+    async fn same_case_authorization_is_removed_when_product_source_proof_changes() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE avionics_models SET identity_evidence_text = ? WHERE id = ?")
+            .bind("The authoritative identity proof was replaced.")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn same_case_authorization_is_removed_only_for_its_revoked_exact_origin() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+        let reviewer_user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(crate::db::DEVELOPER_EMAIL)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        let static_origin_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM avionics_authoritative_source_origins WHERE https_origin = 'https://static.garmin.com'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'Regression test revokes a sibling exact origin')
+            "#,
+        )
+        .bind(static_origin_id)
+        .bind(reviewer_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorization_count, 1,
+            "revoking a sibling exact origin must not invalidate this source proof"
+        );
+
+        let product_origin_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM avionics_authoritative_source_origins WHERE https_origin = 'https://www.garmin.com'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'Regression test revokes the product proof origin')
+            "#,
+        )
+        .bind(product_origin_id)
+        .bind(reviewer_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn same_case_authorization_is_removed_for_a_revoked_regulator_origin() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE avionics_models
+            SET identity_source_url = 'https://drs.faa.gov/browse/avionics/gtx345',
+                identity_source_title = 'FAA DRS GTX 345 record',
+                identity_evidence_text =
+                  'FAA DRS identifies the exact GTX 345 avionics product.'
+            WHERE id = ?
+            "#,
+        )
+        .bind(model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let reviewer_user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(crate::db::DEVELOPER_EMAIL)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let regulator_origin_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_authoritative_source_origins (
+              authority_kind, avionics_manufacturer_identity_id,
+              regulator_key, https_origin, evidence_source_url,
+              evidence_source_title, evidence_text, approval_basis,
+              approved_by_user_id, approval_reason
+            ) VALUES (
+              'regulator_primary', NULL, 'faa_drs', 'https://drs.faa.gov',
+              'https://drs.faa.gov', 'FAA Dynamic Regulatory System',
+              'FAA DRS is an authoritative regulator source for this test.',
+              'human_review', ?,
+              'Regression test approves the exact FAA DRS origin'
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(reviewer_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'Regression test revokes the regulator proof origin')
+            "#,
+        )
+        .bind(regulator_origin_id)
+        .bind(reviewer_user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn listing_authorization_is_removed_when_its_only_capture_changes() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![same_case_accepted(&fixture, model_id).await],
+                vec![],
+            ),
+        )
+        .await
+        .unwrap();
+
+        let changed_html = "<html><body>Listing capture replaced.</body></html>";
+        sqlx::query(
+            "UPDATE plugin_submissions SET rendered_html = ?, rendered_html_sha256 = ? WHERE id = ?",
+        )
+        .bind(changed_html)
+        .bind(sha256_hex(changed_html.as_bytes()))
+        .bind(fixture.submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization_count, 0);
+    }
+
+    #[tokio::test]
+    async fn same_case_grounded_receipt_cannot_be_replayed_for_another_listing_or_product() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let other_id = insert_product(&fixture.db, "GTN 750Xi", "GTN750XI", true).await;
+        let pool = pool(&fixture.db);
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut wrong_listing = same_case_accepted(&fixture, model_id).await;
+        wrong_listing.authorization = AutomatedAssociationAuthorization::SameCaseGrounded(
+            crate::avionics::catalog::grounded_resolution_receipt_for_test(
+                fixture.listing_id + 1,
+                model_id,
+            ),
+        );
+        assert!(matches!(
+            apply_automated_avionics_review(
+                &fixture.db,
+                &request(&fixture, vec![wrong_listing], vec![])
+            )
+            .await,
+            Err(ReviewError::Validation(message))
+                if message.contains("not bound to this listing and product")
+        ));
+
+        let mut wrong_product = same_case_accepted(&fixture, model_id).await;
+        wrong_product.avionics_model_id = other_id;
+        wrong_product.expected_collision_closure_sha256 =
+            super::super::grounded_collision_closure_revision_sha256(&fixture.db, other_id)
+                .await
+                .unwrap();
+        assert!(matches!(
+            apply_automated_avionics_review(
+                &fixture.db,
+                &request(&fixture, vec![wrong_product], vec![])
+            )
+            .await,
+            Err(ReviewError::Validation(message))
+                if message.contains("not bound to this listing and product")
+        ));
+    }
+
     #[tokio::test]
     async fn partial_success_persists_accepted_links_and_only_residual_review() {
         let fixture = fixture().await;
@@ -1651,27 +2335,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored, ("listing".to_string(), Some("high".to_string())));
-        let corroboration: (i64, i64) = sqlx::query_as(
+        let authorization_count: i64 = sqlx::query_scalar(
             r#"
-            SELECT
-              (SELECT COUNT(*)
-               FROM aircraft_sale_listing_avionics_corroborations corroboration
-               JOIN aircraft_sale_listing_avionics link
-                 ON link.id = corroboration.listing_link_id
-               WHERE link.aircraft_sale_listing_id = ?),
-              (SELECT COUNT(*)
-               FROM aircraft_sale_listing_avionics_corroboration_scopes scope
-               JOIN aircraft_sale_listing_avionics link
-                 ON link.id = scope.listing_link_id
-               WHERE link.aircraft_sale_listing_id = ?)
+            SELECT COUNT(*)
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            JOIN aircraft_sale_listing_avionics link
+              ON link.id = authorization.listing_link_id
+            WHERE link.aircraft_sale_listing_id = ?
             "#,
         )
-        .bind(fixture.listing_id)
         .bind(fixture.listing_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(corroboration, (1, 1));
+        assert_eq!(authorization_count, 1);
         let review: (i64, String) = sqlx::query_as(
             "SELECT pending_aspect_count, review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
         )
@@ -1761,14 +2438,11 @@ mod tests {
         );
         let before: (String, String) = sqlx::query_as(
             r#"
-            SELECT corroboration.observation_sha256,
-                   scope.collision_closure_sha256
-            FROM aircraft_sale_listing_avionics_corroborations corroboration
-            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
-              ON scope.listing_link_id = corroboration.listing_link_id
-             AND scope.association_role = corroboration.association_role
-            WHERE corroboration.listing_link_id = ?
-              AND corroboration.association_role = 'installed'
+            SELECT authorization.observation_sha256,
+                   authorization.collision_closure_sha256
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            WHERE authorization.listing_link_id = ?
+              AND authorization.association_role = 'installed'
             "#,
         )
         .bind(link_id)
@@ -1811,14 +2485,11 @@ mod tests {
         assert_eq!(confidence.as_deref(), Some("high"));
         let after: (String, String) = sqlx::query_as(
             r#"
-            SELECT corroboration.observation_sha256,
-                   scope.collision_closure_sha256
-            FROM aircraft_sale_listing_avionics_corroborations corroboration
-            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
-              ON scope.listing_link_id = corroboration.listing_link_id
-             AND scope.association_role = corroboration.association_role
-            WHERE corroboration.listing_link_id = ?
-              AND corroboration.association_role = 'installed'
+            SELECT authorization.observation_sha256,
+                   authorization.collision_closure_sha256
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            WHERE authorization.listing_link_id = ?
+              AND authorization.association_role = 'installed'
             "#,
         )
         .bind(link_id)
@@ -1867,31 +2538,24 @@ mod tests {
         .expect("the independent residual remains pending");
         assert_eq!(second.review_payload_sha256, restaged.2);
         assert_eq!(second.pending_aspect_count, 1);
-        let after_second: (String, String, i64, i64) = sqlx::query_as(
+        let after_second: (String, String, i64) = sqlx::query_as(
             r#"
-            SELECT corroboration.observation_sha256,
-                   scope.collision_closure_sha256,
+            SELECT authorization.observation_sha256,
+                   authorization.collision_closure_sha256,
                    (SELECT COUNT(*)
-                    FROM aircraft_sale_listing_avionics_corroborations
-                    WHERE listing_link_id = ?),
-                   (SELECT COUNT(*)
-                    FROM aircraft_sale_listing_avionics_corroboration_scopes
+                    FROM aircraft_sale_listing_avionics_authorizations
                     WHERE listing_link_id = ?)
-            FROM aircraft_sale_listing_avionics_corroborations corroboration
-            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
-              ON scope.listing_link_id = corroboration.listing_link_id
-             AND scope.association_role = corroboration.association_role
-            WHERE corroboration.listing_link_id = ?
-              AND corroboration.association_role = 'installed'
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            WHERE authorization.listing_link_id = ?
+              AND authorization.association_role = 'installed'
             "#,
         )
-        .bind(link_id)
         .bind(link_id)
         .bind(link_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(after_second, (after.0, after.1, 1, 1));
+        assert_eq!(after_second, (after.0, after.1, 1));
     }
 
     #[tokio::test]
@@ -1941,23 +2605,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(repaired_notes.as_deref(), Some("GIA-63W"));
-        let proof_counts: (i64, i64) = sqlx::query_as(
-            r#"
-            SELECT
-              (SELECT COUNT(*)
-               FROM aircraft_sale_listing_avionics_corroborations
-               WHERE listing_link_id = ?),
-              (SELECT COUNT(*)
-               FROM aircraft_sale_listing_avionics_corroboration_scopes
-               WHERE listing_link_id = ?)
-            "#,
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
-        .bind(link_id)
         .bind(link_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(proof_counts, (0, 0));
+        assert_eq!(authorization_count, 0);
     }
 
     #[tokio::test]
@@ -2025,27 +2680,20 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_corroborations (
+            INSERT INTO aircraft_sale_listing_avionics_authorizations (
               listing_link_id, association_role, avionics_model_id,
-              observation_sha256, product_fingerprint, policy_version
-            ) VALUES (?, 'installed', ?, ?, ?, 'listing_avionics_association_v1')
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              collision_closure_sha256, policy_version
+            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL,
+                      ?, ?, 'listing_avionics_authorization_v1')
             "#,
         )
         .bind(existing_link_id)
         .bind(accepted_id)
         .bind("1".repeat(64))
         .bind(&product_fingerprint)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes (
-              listing_link_id, association_role, collision_closure_sha256, policy_version
-            ) VALUES (?, 'installed', ?, 'listing_avionics_collision_closure_v1')
-            "#,
-        )
-        .bind(existing_link_id)
+        .bind(&fixture.rendered_html_sha256)
         .bind("2".repeat(64))
         .execute(pool)
         .await
@@ -2073,30 +2721,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored_link_id, existing_link_id);
-        let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(existing_link_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        let scope_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes WHERE listing_link_id = ?",
-        )
-        .bind(existing_link_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!((corroboration_count, scope_count), (1, 1));
+        assert_eq!(authorization_count, 1);
         let refreshed: (String, String) = sqlx::query_as(
             r#"
-            SELECT corroboration.observation_sha256, scope.collision_closure_sha256
-            FROM aircraft_sale_listing_avionics_corroborations corroboration
-            JOIN aircraft_sale_listing_avionics_corroboration_scopes scope
-              ON scope.listing_link_id = corroboration.listing_link_id
-             AND scope.association_role = corroboration.association_role
-            WHERE corroboration.listing_link_id = ?
-              AND corroboration.association_role = 'installed'
+            SELECT authorization.observation_sha256,
+                   authorization.collision_closure_sha256
+            FROM aircraft_sale_listing_avionics_authorizations authorization
+            WHERE authorization.listing_link_id = ?
+              AND authorization.association_role = 'installed'
             "#,
         )
         .bind(existing_link_id)
@@ -2136,16 +2775,21 @@ mod tests {
         .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_corroborations (
+            INSERT INTO aircraft_sale_listing_avionics_authorizations (
               listing_link_id, association_role, avionics_model_id,
-              observation_sha256, product_fingerprint, policy_version
-            ) VALUES (?, 'installed', ?, ?, ?, 'listing_avionics_association_v1')
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              collision_closure_sha256, policy_version
+            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL,
+                      ?, ?, 'listing_avionics_authorization_v1')
             "#,
         )
         .bind(existing_link_id)
         .bind(accepted_id)
         .bind("1".repeat(64))
         .bind(product_fingerprint)
+        .bind(&fixture.rendered_html_sha256)
+        .bind("2".repeat(64))
         .execute(pool)
         .await
         .unwrap();
@@ -2170,32 +2814,22 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(stored_link_id, existing_link_id);
-        let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        let old_authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(existing_link_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(corroboration_count, 0);
-        let replacement_corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        assert_eq!(old_authorization_count, 0);
+        let replacement_authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(stored_link_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        let replacement_scope_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes WHERE listing_link_id = ?",
-        )
-        .bind(stored_link_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            (replacement_corroboration_count, replacement_scope_count),
-            (1, 1)
-        );
+        assert_eq!(replacement_authorization_count, 1);
     }
 
     #[tokio::test]
@@ -2270,8 +2904,8 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(listing_link_id)
         .fetch_one(pool)
@@ -2279,7 +2913,7 @@ mod tests {
         .unwrap();
         assert_eq!(retained_quantity, 2);
         assert_eq!(retained_review_sha256, fixture.review_payload_sha256);
-        assert_eq!(corroboration_count, 0);
+        assert_eq!(authorization_count, 0);
     }
 
     #[tokio::test]
@@ -2450,7 +3084,7 @@ mod tests {
         assert!(matches!(
             error,
             ReviewError::Stale(message)
-                if message.contains("not eligible for current-policy reuse")
+                if message.contains("lost its manufacturer-primary reuse authorization")
         ));
         let link_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
@@ -2539,20 +3173,19 @@ mod tests {
             error,
             ReviewError::Stale(message) if message.contains("exact canonical listing")
         ));
-        let counts: (i64, i64, i64) = sqlx::query_as(
+        let counts: (i64, i64) = sqlx::query_as(
             r#"
             SELECT
               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
                WHERE aircraft_sale_listing_id = ?),
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations),
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroboration_scopes)
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations)
             "#,
         )
         .bind(fixture.listing_id)
         .fetch_one(pool(&fixture.db))
         .await
         .unwrap();
-        assert_eq!(counts, (0, 0, 0));
+        assert_eq!(counts, (0, 0));
     }
 
     #[tokio::test]
@@ -2562,6 +3195,7 @@ mod tests {
         let replacement_id = insert_product(&fixture.db, "GNS 530W", "GNS530W", true).await;
         let link = AutomatedAvionicsLink {
             avionics_model_id: installed_id,
+            authorization: AutomatedAssociationAuthorization::ManufacturerReuse,
             expected_collision_closure_sha256:
                 super::super::active_collision_closure_revision_sha256(&fixture.db, installed_id)
                     .await
@@ -2571,6 +3205,7 @@ mod tests {
             source_confidence: Some("high".to_string()),
             configuration_action: "replaces".to_string(),
             replaces_avionics_model_id: Some(replacement_id),
+            replacement_authorization: Some(AutomatedAssociationAuthorization::ManufacturerReuse),
             expected_replacement_collision_closure_sha256: Some(
                 super::super::active_collision_closure_revision_sha256(&fixture.db, replacement_id)
                     .await
@@ -2584,12 +3219,12 @@ mod tests {
             .unwrap();
         let rows: Vec<(String, i64)> = sqlx::query_as(
             r#"
-            SELECT corroboration.association_role, corroboration.avionics_model_id
-            FROM aircraft_sale_listing_avionics_corroborations corroboration
+            SELECT authorization.association_role, authorization.avionics_model_id
+            FROM aircraft_sale_listing_avionics_authorizations authorization
             JOIN aircraft_sale_listing_avionics link
-              ON link.id = corroboration.listing_link_id
+              ON link.id = authorization.listing_link_id
             WHERE link.aircraft_sale_listing_id = ?
-            ORDER BY corroboration.association_role
+            ORDER BY authorization.association_role
             "#,
         )
         .bind(fixture.listing_id)
@@ -2603,12 +3238,12 @@ mod tests {
                 ("replacement".to_string(), replacement_id),
             ]
         );
-        let scope_count: i64 = sqlx::query_scalar(
+        let authorization_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM aircraft_sale_listing_avionics_corroboration_scopes scope
+            FROM aircraft_sale_listing_avionics_authorizations authorization
             JOIN aircraft_sale_listing_avionics link
-              ON link.id = scope.listing_link_id
+              ON link.id = authorization.listing_link_id
             WHERE link.aircraft_sale_listing_id = ?
             "#,
         )
@@ -2616,7 +3251,7 @@ mod tests {
         .fetch_one(pool(&fixture.db))
         .await
         .unwrap();
-        assert_eq!(scope_count, 2);
+        assert_eq!(authorization_count, 2);
     }
 
     #[tokio::test]
@@ -2658,7 +3293,7 @@ mod tests {
             error,
             ReviewError::Stale(message)
                 if message.contains("preserved avionics catalog id")
-                    && message.contains("not eligible for current-policy reuse")
+                    && message.contains("neither current manufacturer-reuse nor same-case grounded authorization")
         ));
         let ids: Vec<i64> = sqlx::query_scalar(
             "SELECT avionics_model_id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? ORDER BY avionics_model_id",

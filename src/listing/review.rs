@@ -57,14 +57,17 @@ const DEFAULT_PAGE_LIMIT: i64 = 25;
 const MAX_PAGE_LIMIT: i64 = 100;
 const REVIEW_PAYLOAD_VERSION: u32 = 1;
 const APPROVED_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"aircost:approved-avionics-catalog:v1";
+const APPROVED_CATALOG_PRODUCT_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:approved-avionics-catalog-product:v1";
 const ACTIVE_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:active-avionics-collision-closure:v1";
+const GROUNDED_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:grounded-avionics-collision-closure:v1";
 const EXTRACTION_FINGERPRINT_DOMAIN: &[u8] = b"aircost:listing-avionics-observation:v1";
-const ASSOCIATION_CORROBORATION_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-association-corroboration:v1";
-pub(super) const ASSOCIATION_CORROBORATION_POLICY_VERSION: &str = "listing_avionics_association_v1";
-pub(super) const ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION: &str =
-    "listing_avionics_collision_closure_v1";
+const ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:listing-avionics-association-authorization:v1";
+pub(super) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str =
+    "listing_avionics_authorization_v1";
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
@@ -73,8 +76,7 @@ const PRESERVED_ASSOCIATION_REVIEW_REASON: &str =
 const REVIEWER_CORRECTED_AVIONICS_KIND: &str = "avionics_reviewer_correction";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
     LOCK TABLE aircraft_sale_listing_avionics,
-               aircraft_sale_listing_avionics_corroborations,
-               aircraft_sale_listing_avionics_corroboration_scopes,
+               aircraft_sale_listing_avionics_authorizations,
                aircraft_sale_listing_pending_reviews
     IN SHARE ROW EXCLUSIVE MODE
 "#;
@@ -846,6 +848,13 @@ pub(crate) struct CatalogFingerprintRow {
     pub(crate) capability: String,
     pub(crate) manufacturer_identifier_kind: Option<String>,
     pub(crate) manufacturer_identifier: Option<String>,
+    pub(crate) avionics_manufacturer_identity_id: i64,
+    pub(crate) canonical_product_key: String,
+    pub(crate) graph_manufacturer_identifier_kind: String,
+    pub(crate) canonical_identifier_key: String,
+    pub(crate) identity_source_url: Option<String>,
+    pub(crate) identity_source_title: Option<String>,
+    pub(crate) identity_evidence_text: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -866,6 +875,13 @@ struct CatalogFingerprintProduct {
     capabilities: Vec<String>,
     manufacturer_identifier_kind: String,
     manufacturer_identifier: String,
+    avionics_manufacturer_identity_id: i64,
+    canonical_product_key: String,
+    graph_manufacturer_identifier_kind: String,
+    canonical_identifier_key: String,
+    identity_source_url: String,
+    identity_source_title: String,
+    identity_evidence_text: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -968,16 +984,18 @@ struct ExistingAssignmentRow {
 }
 
 #[derive(Clone, Debug, FromRow)]
-struct AssociationCorroborationRow {
+struct AssociationAuthorizationRow {
     listing_link_id: i64,
     association_role: String,
     avionics_model_id: i64,
+    authorization_kind: String,
     observation_sha256: String,
     product_fingerprint: String,
-    current_product_fingerprint: String,
+    current_reuse_product_fingerprint: Option<String>,
+    grounded_resolution_sha256: Option<String>,
+    evidence_capture_is_current: bool,
     policy_version: String,
     collision_closure_sha256: String,
-    collision_closure_policy_version: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -1079,7 +1097,14 @@ const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       model.name AS model,
       capability.name AS capability,
       model.manufacturer_identifier_kind,
-      model.manufacturer_identifier
+      model.manufacturer_identifier,
+      graph.avionics_manufacturer_identity_id,
+      graph.canonical_product_key,
+      graph.manufacturer_identifier_kind AS graph_manufacturer_identifier_kind,
+      graph.canonical_identifier_key,
+      model.identity_source_url,
+      model.identity_source_title,
+      model.identity_evidence_text
     FROM avionics_models model
     JOIN avionics_manufacturers manufacturer
       ON manufacturer.id = model.avionics_manufacturer_id
@@ -1087,6 +1112,8 @@ const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       ON membership.avionics_model_id = model.id
     JOIN avionics_types capability
       ON capability.id = membership.avionics_type_id
+    JOIN avionics_approved_product_graph_identities graph
+      ON graph.avionics_model_id = model.id
     WHERE model.catalog_status = 'approved'
     ORDER BY model.id, capability.normalized_name, capability.id
 "#;
@@ -1130,6 +1157,13 @@ fn catalog_products(rows: Vec<CatalogFingerprintRow>) -> Vec<CatalogFingerprintP
                 capabilities: Vec::new(),
                 manufacturer_identifier_kind: row.manufacturer_identifier_kind.unwrap_or_default(),
                 manufacturer_identifier: row.manufacturer_identifier.unwrap_or_default(),
+                avionics_manufacturer_identity_id: row.avionics_manufacturer_identity_id,
+                canonical_product_key: row.canonical_product_key,
+                graph_manufacturer_identifier_kind: row.graph_manufacturer_identifier_kind,
+                canonical_identifier_key: row.canonical_identifier_key,
+                identity_source_url: row.identity_source_url.unwrap_or_default(),
+                identity_source_title: row.identity_source_title.unwrap_or_default(),
+                identity_evidence_text: row.identity_evidence_text.unwrap_or_default(),
             });
         product.capabilities.push(row.capability);
     }
@@ -1147,6 +1181,13 @@ fn fingerprint_catalog_products(products: &[CatalogFingerprintProduct]) -> Strin
             product.capabilities.join("\u{1f}"),
             product.manufacturer_identifier_kind.clone(),
             product.manufacturer_identifier.clone(),
+            product.avionics_manufacturer_identity_id.to_string(),
+            product.canonical_product_key.clone(),
+            product.graph_manufacturer_identifier_kind.clone(),
+            product.canonical_identifier_key.clone(),
+            product.identity_source_url.clone(),
+            product.identity_source_title.clone(),
+            product.identity_evidence_text.clone(),
         ] {
             feed_fingerprint(&mut hasher, &value);
         }
@@ -1154,8 +1195,55 @@ fn fingerprint_catalog_products(products: &[CatalogFingerprintProduct]) -> Strin
     format!("{:x}", hasher.finalize())
 }
 
+fn fingerprint_catalog_product(product: &CatalogFingerprintProduct) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(APPROVED_CATALOG_PRODUCT_FINGERPRINT_DOMAIN);
+    for value in [
+        product.id.to_string(),
+        product.manufacturer.clone(),
+        product.model.clone(),
+        product.capabilities.join("\u{1f}"),
+        product.manufacturer_identifier_kind.clone(),
+        product.manufacturer_identifier.clone(),
+        product.avionics_manufacturer_identity_id.to_string(),
+        product.canonical_product_key.clone(),
+        product.graph_manufacturer_identifier_kind.clone(),
+        product.canonical_identifier_key.clone(),
+        product.identity_source_url.clone(),
+        product.identity_source_title.clone(),
+        product.identity_evidence_text.clone(),
+    ] {
+        feed_fingerprint(&mut hasher, &value);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn catalog_product_fingerprints(products: &[CatalogFingerprintProduct]) -> HashMap<i64, String> {
+    products
+        .iter()
+        .map(|product| (product.id, fingerprint_catalog_product(product)))
+        .collect()
+}
+
 pub(crate) fn fingerprint_approved_catalog_rows(rows: Vec<CatalogFingerprintRow>) -> String {
     fingerprint_catalog_products(&catalog_products(rows))
+}
+
+async fn load_catalog_product_fingerprint_map(db: &AppDb) -> ReviewResult<HashMap<i64, String>> {
+    let sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
+    let rows = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, CatalogFingerprintRow>(&sql)
+                .fetch_all(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, CatalogFingerprintRow>(&sql)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    Ok(catalog_product_fingerprints(&catalog_products(rows)))
 }
 
 fn active_collision_closure_rows(
@@ -1247,6 +1335,41 @@ pub(super) fn fingerprint_active_collision_closure(
     Some(format!("{:x}", hasher.finalize()))
 }
 
+pub(super) fn fingerprint_grounded_collision_closure(
+    rows: &[ActiveCollisionCatalogFingerprintRow],
+    target_id: i64,
+) -> Option<String> {
+    let (_, members) = active_collision_closure_rows(rows, target_id)?;
+    let mut keys = members
+        .into_iter()
+        .map(|row| {
+            [
+                row.id.to_string(),
+                row.catalog_status.clone(),
+                row.effective_manufacturer_identity_id
+                    .map(|identity_id| identity_id.to_string())
+                    .unwrap_or_default(),
+                normalize_avionics_identifier(&row.model),
+                row.manufacturer_identifier_kind.clone().unwrap_or_default(),
+                normalize_avionics_identifier(
+                    row.manufacturer_identifier.as_deref().unwrap_or_default(),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(GROUNDED_COLLISION_CLOSURE_FINGERPRINT_DOMAIN);
+    feed_fingerprint(&mut hasher, &target_id.to_string());
+    for key in keys {
+        for value in key {
+            feed_fingerprint(&mut hasher, &value);
+        }
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Optimistic token for every catalog fact that can change the zero-Gemini
 /// listing-association resolver's identity decision.
 ///
@@ -1267,6 +1390,18 @@ pub(crate) async fn active_collision_closure_revision_sha256(
             ))
         },
     )
+}
+
+pub(crate) async fn grounded_collision_closure_revision_sha256(
+    db: &AppDb,
+    target_id: i64,
+) -> ReviewResult<String> {
+    let rows = load_active_collision_catalog_rows(db).await?;
+    fingerprint_grounded_collision_closure(&rows, target_id).ok_or_else(|| {
+        ReviewError::Conflict(format!(
+            "catalog id {target_id} has no unique grounded collision-closure identity"
+        ))
+    })
 }
 
 async fn load_active_collision_catalog_rows(
@@ -1918,7 +2053,7 @@ async fn restage_pending_review_if_current_with_commit(
         "#,
     );
     let assignments_sql = db.sql(EXISTING_ASSIGNMENT_ROWS_SQL);
-    let corroborations_sql = db.sql(ASSOCIATION_CORROBORATION_ROWS_SQL);
+    let corroborations_sql = db.sql(association_authorization_rows_sql(db));
     let attested_product_ids_sql = db.sql(
         r#"
         SELECT avionics_model_id
@@ -1929,7 +2064,7 @@ async fn restage_pending_review_if_current_with_commit(
     let snapshot_select = match db.backend() {
         DatabaseBackend::Sqlite(_) => db.sql(
             r#"
-            SELECT rendered_html
+            SELECT rendered_html, rendered_html_sha256
             FROM plugin_submissions
             WHERE id = ?
               AND canonical_listing_id = ?
@@ -1938,7 +2073,7 @@ async fn restage_pending_review_if_current_with_commit(
         ),
         DatabaseBackend::Postgres(_) => db.sql(
             r#"
-            SELECT rendered_html
+            SELECT rendered_html, rendered_html_sha256
             FROM plugin_submissions
             WHERE id = ?
               AND canonical_listing_id = ?
@@ -2012,35 +2147,30 @@ async fn restage_pending_review_if_current_with_commit(
           AND review_payload_sha256 = ?
         "#,
     );
-    let insert_corroboration = db.sql(
+    let insert_reuse_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_corroborations (
+        INSERT INTO aircraft_sale_listing_avionics_authorizations (
           listing_link_id,
           association_role,
           avionics_model_id,
+          authorization_kind,
           observation_sha256,
           product_fingerprint,
+          grounded_resolution_sha256,
+          evidence_capture_sha256,
+          collision_closure_sha256,
           policy_version
         )
-        SELECT ?, ?, ?, ?, attestation.product_fingerprint, ?
+        SELECT ?, ?, ?, 'manufacturer_reuse', ?, attestation.product_fingerprint,
+               NULL, ?, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         ON CONFLICT (listing_link_id, association_role) DO NOTHING
         "#,
     );
-    let insert_corroboration_scope = db.sql(
+    let delete_existing_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes (
-          listing_link_id,
-          association_role,
-          collision_closure_sha256,
-          policy_version
-        ) VALUES (?, ?, ?, ?)
-        "#,
-    );
-    let delete_existing_corroboration = db.sql(
-        r#"
-        DELETE FROM aircraft_sale_listing_avionics_corroborations
+        DELETE FROM aircraft_sale_listing_avionics_authorizations
         WHERE listing_link_id = ?
           AND association_role = ?
         "#,
@@ -2265,18 +2395,26 @@ async fn restage_pending_review_if_current_with_commit(
                 )
                 .fetch_all(&mut *transaction)
                 .await?;
+            let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let catalog_products = catalog_products(catalog_rows);
+            let catalog_product_fingerprints =
+                catalog_product_fingerprints(&catalog_products);
+            let catalog_revision_sha256 = fingerprint_catalog_products(&catalog_products);
             let corroboration_rows_before_repair =
-                sqlx::query_as::<_, AssociationCorroborationRow>(&corroborations_sql)
+                sqlx::query_as::<_, AssociationAuthorizationRow>(&corroborations_sql)
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
             let corroborated_before_evidence_repair =
-                current_row_backed_corroborated_associations(
+                current_row_backed_authorized_associations(
                     listing_id,
                     &assignments,
                     &corroboration_rows_before_repair,
                     &reuse_attested_ids,
                     &active_collision_catalog_rows,
+                    &catalog_product_fingerprints,
                 );
             if maintenance_commit.is_none() {
                 repaired_evidence |= remove_stale_covered_relationships(
@@ -2285,23 +2423,18 @@ async fn restage_pending_review_if_current_with_commit(
                 );
             }
             validate_current_covered_associations(&payload.aspects, &assignments)?;
-            let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
-                .fetch_all(&mut *transaction)
-                .await?;
-            let catalog_revision_sha256 =
-                fingerprint_catalog_products(&catalog_products(catalog_rows));
-
             let mut exact_association_evidence = HashMap::new();
             let mut evidence_repaired_link_ids = HashSet::new();
+            let mut repair_evidence_capture_sha256 = None;
             if maintenance_commit.is_none() {
                 let action_graph_issues: i64 =
                     sqlx::query_scalar(&invalid_action_graph_sql)
                         .bind(listing_id)
                         .fetch_one(&mut *transaction)
                         .await?;
-                let rendered_html = match row.plugin_submission_id {
+                let rendered_capture = match row.plugin_submission_id {
                     Some(plugin_submission_id) if action_graph_issues == 0 => {
-                        sqlx::query_scalar::<_, String>(&snapshot_select)
+                        sqlx::query_as::<_, (String, String)>(&snapshot_select)
                             .bind(plugin_submission_id)
                             .bind(listing_id)
                             .bind(owner_user_id)
@@ -2310,16 +2443,19 @@ async fn restage_pending_review_if_current_with_commit(
                     }
                     _ => None,
                 };
-                let source = rendered_html
-                    .as_deref()
+                let source = rendered_capture
+                    .as_ref()
+                    .map(|(html, _)| html.as_str())
                     .map(|html| ListingEvidenceContext::from_publisher_html(Some(html)));
+                repair_evidence_capture_sha256 =
+                    rendered_capture.as_ref().map(|(_, sha256)| sha256.clone());
                 let repairs = plan_pending_association_evidence_repair(
                     &payload,
                     &assignments,
                     &approved,
                     &catalog_identity_rows,
                     source.as_ref(),
-                    rendered_html.as_deref(),
+                    rendered_capture.as_ref().map(|(html, _)| html.as_str()),
                 );
                 for repair in repairs {
                     let assignment = &mut assignments[repair.assignment_index];
@@ -2659,6 +2795,21 @@ async fn restage_pending_review_if_current_with_commit(
                 if current_target_id != association.avionics_model_id {
                     continue;
                 }
+                if !corroboration_rows_before_repair.iter().any(|row| {
+                    row.listing_link_id == association.listing_link_id
+                        && row.association_role == association_role_label(association.role)
+                        && row.authorization_kind == "manufacturer_reuse"
+                }) {
+                    // A same-case grounded receipt is bound to the exact
+                    // original observation. Evidence repair must reopen it
+                    // rather than silently mint a new grounded conclusion.
+                    continue;
+                }
+                let Some(evidence_capture_sha256) =
+                    repair_evidence_capture_sha256.as_deref()
+                else {
+                    continue;
+                };
                 let collision_closure_sha256 = fingerprint_active_collision_closure(
                     &active_collision_catalog_rows,
                     &reuse_attested_ids,
@@ -2677,17 +2828,19 @@ async fn restage_pending_review_if_current_with_commit(
                     evidence_text,
                 );
                 let role_label = association_role_label(association.role);
-                sqlx::query(&delete_existing_corroboration)
+                sqlx::query(&delete_existing_authorization)
                     .bind(association.listing_link_id)
                     .bind(role_label)
                     .execute(&mut *transaction)
                     .await?;
-                let inserted = sqlx::query(&insert_corroboration)
+                let inserted = sqlx::query(&insert_reuse_authorization)
                     .bind(association.listing_link_id)
                     .bind(role_label)
                     .bind(association.avionics_model_id)
                     .bind(observation_sha256)
-                    .bind(ASSOCIATION_CORROBORATION_POLICY_VERSION)
+                    .bind(evidence_capture_sha256)
+                    .bind(collision_closure_sha256)
+                    .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                     .bind(association.avionics_model_id)
                     .execute(&mut *transaction)
                     .await?
@@ -2698,33 +2851,20 @@ async fn restage_pending_review_if_current_with_commit(
                         association.avionics_model_id
                     )));
                 }
-                let inserted = sqlx::query(&insert_corroboration_scope)
-                    .bind(association.listing_link_id)
-                    .bind(role_label)
-                    .bind(collision_closure_sha256)
-                    .bind(ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION)
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected();
-                if inserted != 1 {
-                    return Err(ReviewError::Conflict(format!(
-                        "collision closure for catalog id {} could not be restored after occurrence-evidence repair",
-                        association.avionics_model_id
-                    )));
-                }
             }
 
             let mut corroboration_rows =
-                sqlx::query_as::<_, AssociationCorroborationRow>(&corroborations_sql)
+                sqlx::query_as::<_, AssociationAuthorizationRow>(&corroborations_sql)
                     .bind(listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
-            let mut corroborated_associations = current_corroborated_associations(
+            let mut corroborated_associations = current_authorized_associations(
                 listing_id,
                 &assignments,
                 &corroboration_rows,
                 &reuse_attested_ids,
                 &active_collision_catalog_rows,
+                &catalog_product_fingerprints,
             );
 
             if let Some(ReviewMaintenanceCommit::CorroborateAssociation(commit)) =
@@ -2844,38 +2984,34 @@ async fn restage_pending_review_if_current_with_commit(
                     // observation or product fingerprint that no longer
                     // authorizes this exact association. Replace it inside
                     // the same hash-bound transaction.
-                    sqlx::query(&delete_existing_corroboration)
+                    sqlx::query(&delete_existing_authorization)
                         .bind(association.listing_link_id)
                         .bind("installed")
                         .execute(&mut *transaction)
                         .await?;
-                    sqlx::query(&insert_corroboration)
+                    sqlx::query(&insert_reuse_authorization)
                         .bind(association.listing_link_id)
                         .bind("installed")
                         .bind(commit.avionics_model_id)
                         .bind(commit.observation_sha256.as_str())
-                        .bind(ASSOCIATION_CORROBORATION_POLICY_VERSION)
+                        .bind(commit.evidence_provenance.rendered_html_sha256.as_str())
+                        .bind(commit.expected_collision_closure_sha256.as_str())
+                        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                         .bind(commit.avionics_model_id)
                         .execute(&mut *transaction)
                         .await?;
-                    sqlx::query(&insert_corroboration_scope)
-                        .bind(association.listing_link_id)
-                        .bind("installed")
-                        .bind(commit.expected_collision_closure_sha256.as_str())
-                        .bind(ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION)
-                        .execute(&mut *transaction)
-                        .await?;
                     corroboration_rows =
-                        sqlx::query_as::<_, AssociationCorroborationRow>(&corroborations_sql)
+                        sqlx::query_as::<_, AssociationAuthorizationRow>(&corroborations_sql)
                             .bind(listing_id)
                             .fetch_all(&mut *transaction)
                             .await?;
-                    corroborated_associations = current_corroborated_associations(
+                    corroborated_associations = current_authorized_associations(
                         listing_id,
                         &assignments,
                         &corroboration_rows,
                         &reuse_attested_ids,
                         &active_collision_catalog_rows,
+                        &catalog_product_fingerprints,
                     );
                     if !corroborated_associations.contains(association) {
                         return Err(ReviewError::Conflict(format!(
@@ -4217,28 +4353,72 @@ const EXISTING_ASSIGNMENT_ROWS_SQL: &str = r#"
     ORDER BY link.id
 "#;
 
-const ASSOCIATION_CORROBORATION_ROWS_SQL: &str = r#"
+const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
     SELECT
-      corroboration.listing_link_id,
-      corroboration.association_role,
-      corroboration.avionics_model_id,
-      corroboration.observation_sha256,
-      corroboration.product_fingerprint,
-      attestation.product_fingerprint AS current_product_fingerprint,
-      corroboration.policy_version,
-      collision_scope.collision_closure_sha256,
-      collision_scope.policy_version AS collision_closure_policy_version
-    FROM aircraft_sale_listing_avionics_corroborations corroboration
-    JOIN aircraft_sale_listing_avionics_corroboration_scopes collision_scope
-      ON collision_scope.listing_link_id = corroboration.listing_link_id
-     AND collision_scope.association_role = corroboration.association_role
+      authorization.listing_link_id,
+      authorization.association_role,
+      authorization.avionics_model_id,
+      authorization.authorization_kind,
+      authorization.observation_sha256,
+      authorization.product_fingerprint,
+      attestation.product_fingerprint AS current_reuse_product_fingerprint,
+      authorization.grounded_resolution_sha256,
+      EXISTS (
+        SELECT 1
+        FROM plugin_submissions capture
+        WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+          AND capture.rendered_html_sha256 = authorization.evidence_capture_sha256
+          AND length(trim(COALESCE(link.source_notes, ''))) > 0
+          AND instr(capture.rendered_html, link.source_notes) > 0
+      ) AS evidence_capture_is_current,
+      authorization.policy_version,
+      authorization.collision_closure_sha256
+    FROM aircraft_sale_listing_avionics_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
-      ON link.id = corroboration.listing_link_id
-    JOIN avionics_product_reuse_attestations attestation
-      ON attestation.avionics_model_id = corroboration.avionics_model_id
+      ON link.id = authorization.listing_link_id
+    LEFT JOIN avionics_product_reuse_attestations attestation
+      ON authorization.authorization_kind = 'manufacturer_reuse'
+     AND attestation.avionics_model_id = authorization.avionics_model_id
     WHERE link.aircraft_sale_listing_id = ?
-    ORDER BY corroboration.listing_link_id, corroboration.association_role
+    ORDER BY authorization.listing_link_id, authorization.association_role
 "#;
+
+const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
+    SELECT
+      authorization.listing_link_id,
+      authorization.association_role,
+      authorization.avionics_model_id,
+      authorization.authorization_kind,
+      authorization.observation_sha256,
+      authorization.product_fingerprint,
+      attestation.product_fingerprint AS current_reuse_product_fingerprint,
+      authorization.grounded_resolution_sha256,
+      EXISTS (
+        SELECT 1
+        FROM plugin_submissions capture
+        WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+          AND capture.rendered_html_sha256 = authorization.evidence_capture_sha256
+          AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
+          AND position(link.source_notes IN capture.rendered_html) > 0
+      ) AS evidence_capture_is_current,
+      authorization.policy_version,
+      authorization.collision_closure_sha256
+    FROM aircraft_sale_listing_avionics_authorizations authorization
+    JOIN aircraft_sale_listing_avionics link
+      ON link.id = authorization.listing_link_id
+    LEFT JOIN avionics_product_reuse_attestations attestation
+      ON authorization.authorization_kind = 'manufacturer_reuse'
+     AND attestation.avionics_model_id = authorization.avionics_model_id
+    WHERE link.aircraft_sale_listing_id = ?
+    ORDER BY authorization.listing_link_id, authorization.association_role
+"#;
+
+fn association_authorization_rows_sql(db: &AppDb) -> &'static str {
+    match db.backend() {
+        DatabaseBackend::Sqlite(_) => ASSOCIATION_AUTHORIZATION_ROWS_SQLITE,
+        DatabaseBackend::Postgres(_) => ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES,
+    }
+}
 
 fn approved_product_map(rows: Vec<ApprovedProductRow>) -> HashMap<i64, ReviewProduct> {
     let mut products = BTreeMap::<i64, ReviewProduct>::new();
@@ -4310,20 +4490,20 @@ async fn load_existing_assignments(
     Ok(rows)
 }
 
-async fn load_association_corroborations(
+async fn load_association_authorizations(
     db: &AppDb,
     listing_id: i64,
-) -> ReviewResult<Vec<AssociationCorroborationRow>> {
-    let sql = db.sql(ASSOCIATION_CORROBORATION_ROWS_SQL);
+) -> ReviewResult<Vec<AssociationAuthorizationRow>> {
+    let sql = db.sql(association_authorization_rows_sql(db));
     let rows = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as::<_, AssociationCorroborationRow>(&sql)
+            sqlx::query_as::<_, AssociationAuthorizationRow>(&sql)
                 .bind(listing_id)
                 .fetch_all(pool)
                 .await?
         }
         DatabaseBackend::Postgres(pool) => {
-            sqlx::query_as::<_, AssociationCorroborationRow>(&sql)
+            sqlx::query_as::<_, AssociationAuthorizationRow>(&sql)
                 .bind(listing_id)
                 .fetch_all(pool)
                 .await?
@@ -5157,9 +5337,9 @@ pub(super) fn association_observation_sha256_from_values(
     evidence_text: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(ASSOCIATION_CORROBORATION_FINGERPRINT_DOMAIN);
+    hasher.update(ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN);
     for value in [
-        ASSOCIATION_CORROBORATION_POLICY_VERSION.to_string(),
+        ASSOCIATION_AUTHORIZATION_POLICY_VERSION.to_string(),
         listing_id.to_string(),
         listing_link_id.to_string(),
         association_role_label(role).to_string(),
@@ -5177,19 +5357,21 @@ pub(super) fn association_observation_sha256_from_values(
     format!("{:x}", hasher.finalize())
 }
 
-fn current_corroborated_associations(
+fn current_authorized_associations(
     listing_id: i64,
     assignments: &[ExistingAssignmentRow],
-    rows: &[AssociationCorroborationRow],
+    rows: &[AssociationAuthorizationRow],
     reuse_attested_ids: &HashSet<i64>,
     active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
+    catalog_product_fingerprints: &HashMap<i64, String>,
 ) -> HashSet<CoveredListingAssociation> {
-    let mut corroborated = current_row_backed_corroborated_associations(
+    let mut authorized = current_row_backed_authorized_associations(
         listing_id,
         assignments,
         rows,
         reuse_attested_ids,
         active_collision_catalog_rows,
+        catalog_product_fingerprints,
     );
 
     // A completed whole-listing review is already the durable corroboration
@@ -5199,48 +5381,71 @@ fn current_corroborated_associations(
         assignment.source == "listing_review"
             && assignment.source_confidence.as_deref() == Some("high")
     }) {
-        corroborated.insert(CoveredListingAssociation {
+        authorized.insert(CoveredListingAssociation {
             listing_link_id: assignment.listing_link_id,
             role: ListingAssociationRole::Installed,
             avionics_model_id: assignment.avionics_model_id,
         });
         if let Some(avionics_model_id) = assignment.replaces_avionics_model_id {
-            corroborated.insert(CoveredListingAssociation {
+            authorized.insert(CoveredListingAssociation {
                 listing_link_id: assignment.listing_link_id,
                 role: ListingAssociationRole::Replacement,
                 avionics_model_id,
             });
         }
     }
-    corroborated
+    authorized
 }
 
-fn current_row_backed_corroborated_associations(
+fn current_row_backed_authorized_associations(
     listing_id: i64,
     assignments: &[ExistingAssignmentRow],
-    rows: &[AssociationCorroborationRow],
+    rows: &[AssociationAuthorizationRow],
     reuse_attested_ids: &HashSet<i64>,
     active_collision_catalog_rows: &[ActiveCollisionCatalogFingerprintRow],
+    catalog_product_fingerprints: &HashMap<i64, String>,
 ) -> HashSet<CoveredListingAssociation> {
     let assignments_by_link = assignments
         .iter()
         .map(|assignment| (assignment.listing_link_id, assignment))
         .collect::<HashMap<_, _>>();
-    let mut corroborated = HashSet::new();
+    let mut authorized = HashSet::new();
 
     for row in rows {
-        if row.policy_version != ASSOCIATION_CORROBORATION_POLICY_VERSION
-            || row.collision_closure_policy_version != ASSOCIATION_COLLISION_CLOSURE_POLICY_VERSION
-            || row.product_fingerprint != row.current_product_fingerprint
-            || !reuse_attested_ids.contains(&row.avionics_model_id)
+        if row.policy_version != ASSOCIATION_AUTHORIZATION_POLICY_VERSION
+            || !row.evidence_capture_is_current
         {
             continue;
         }
-        let Some(current_collision_closure_sha256) = fingerprint_active_collision_closure(
-            active_collision_catalog_rows,
-            reuse_attested_ids,
-            row.avionics_model_id,
-        ) else {
+        let current_collision_closure_sha256 = match row.authorization_kind.as_str() {
+            "manufacturer_reuse"
+                if row.grounded_resolution_sha256.is_none()
+                    && row.current_reuse_product_fingerprint.as_deref()
+                        == Some(row.product_fingerprint.as_str())
+                    && reuse_attested_ids.contains(&row.avionics_model_id) =>
+            {
+                fingerprint_active_collision_closure(
+                    active_collision_catalog_rows,
+                    reuse_attested_ids,
+                    row.avionics_model_id,
+                )
+            }
+            "same_case_grounded"
+                if row
+                    .grounded_resolution_sha256
+                    .as_deref()
+                    .is_some_and(valid_sha256)
+                    && catalog_product_fingerprints.get(&row.avionics_model_id)
+                        == Some(&row.product_fingerprint) =>
+            {
+                fingerprint_grounded_collision_closure(
+                    active_collision_catalog_rows,
+                    row.avionics_model_id,
+                )
+            }
+            _ => None,
+        };
+        let Some(current_collision_closure_sha256) = current_collision_closure_sha256 else {
             continue;
         };
         if row.collision_closure_sha256 != current_collision_closure_sha256 {
@@ -5267,13 +5472,13 @@ fn current_row_backed_corroborated_associations(
         {
             continue;
         }
-        corroborated.insert(CoveredListingAssociation {
+        authorized.insert(CoveredListingAssociation {
             listing_link_id: row.listing_link_id,
             role,
             avionics_model_id: row.avionics_model_id,
         });
     }
-    corroborated
+    authorized
 }
 
 /// Remove hash-bound maintenance aspects after their approved catalog target
@@ -5878,6 +6083,7 @@ pub(crate) enum ExistingProductAssociationCommit {
 
 struct ExistingProductAssociationGlobalSnapshot {
     catalog_revision_sha256: String,
+    catalog_product_fingerprints: HashMap<i64, String>,
     products: HashMap<i64, ReviewProduct>,
     reuse_attested_ids: HashSet<i64>,
     active_collision_catalog_rows: Vec<ActiveCollisionCatalogFingerprintRow>,
@@ -5947,6 +6153,7 @@ async fn load_existing_product_association_global_snapshot(
     db: &AppDb,
 ) -> ReviewResult<ExistingProductAssociationGlobalSnapshot> {
     let catalog_revision_sha256 = approved_catalog_revision_sha256(db).await?;
+    let catalog_product_fingerprints = load_catalog_product_fingerprint_map(db).await?;
     let products = load_all_approved_product_map(db).await?;
     let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
     let active_collision_catalog_rows = load_active_collision_catalog_rows(db).await?;
@@ -5962,6 +6169,7 @@ async fn load_existing_product_association_global_snapshot(
     })?;
     Ok(ExistingProductAssociationGlobalSnapshot {
         catalog_revision_sha256,
+        catalog_product_fingerprints,
         products,
         reuse_attested_ids,
         active_collision_catalog_rows,
@@ -6331,13 +6539,14 @@ async fn preflight_existing_product_association_with_snapshot(
     }
     let assignments = load_existing_assignments(db, listing_id).await?;
     validate_current_covered_associations(&payload.aspects, &assignments)?;
-    let corroboration_rows = load_association_corroborations(db, listing_id).await?;
-    let corroborated_associations = current_corroborated_associations(
+    let corroboration_rows = load_association_authorizations(db, listing_id).await?;
+    let corroborated_associations = current_authorized_associations(
         listing_id,
         &assignments,
         &corroboration_rows,
         &snapshot.reuse_attested_ids,
         &snapshot.active_collision_catalog_rows,
+        &snapshot.catalog_product_fingerprints,
     );
     let hidden = hidden_preserved_blockers(
         &payload.aspects,
@@ -7558,14 +7767,16 @@ pub async fn preflight_listing_review_resolution(
     )?;
     let existing_assignments = load_existing_assignments(db, review.listing_id).await?;
     let reuse_attested_ids = current_reuse_attested_product_ids(db).await?;
-    let corroboration_rows = load_association_corroborations(db, review.listing_id).await?;
+    let corroboration_rows = load_association_authorizations(db, review.listing_id).await?;
     let active_collision_catalog_rows = load_active_collision_catalog_rows(db).await?;
-    let corroborated_associations = current_corroborated_associations(
+    let catalog_product_fingerprints = load_catalog_product_fingerprint_map(db).await?;
+    let corroborated_associations = current_authorized_associations(
         review.listing_id,
         &existing_assignments,
         &corroboration_rows,
         &reuse_attested_ids,
         &active_collision_catalog_rows,
+        &catalog_product_fingerprints,
     );
     let hidden_blockers = hidden_preserved_blockers(
         &current_payload.aspects,
@@ -7974,7 +8185,7 @@ pub async fn resolve_listing_review(
         "#,
     );
     let select_existing_links = db.sql(EXISTING_ASSIGNMENT_ROWS_SQL);
-    let select_association_corroborations = db.sql(ASSOCIATION_CORROBORATION_ROWS_SQL);
+    let select_association_corroborations = db.sql(association_authorization_rows_sql(db));
     let delete_links =
         db.sql("DELETE FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?");
     let insert_link = db.sql(
@@ -8094,8 +8305,10 @@ pub async fn resolve_listing_review(
             let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
                 .fetch_all(&mut *transaction)
                 .await?;
-            let current_catalog_revision =
-                fingerprint_catalog_products(&catalog_products(catalog_rows));
+            let catalog_products = catalog_products(catalog_rows);
+            let catalog_product_fingerprints =
+                catalog_product_fingerprints(&catalog_products);
+            let current_catalog_revision = fingerprint_catalog_products(&catalog_products);
             if current_catalog_revision != request.expected_catalog_revision_sha256 {
                 return Err(ReviewError::Stale(
                     "approved avionics catalog changed during review; reload and re-evaluate"
@@ -8140,18 +8353,19 @@ pub async fn resolve_listing_review(
                 .fetch_all(&mut *transaction)
                 .await?;
             let association_corroboration_rows =
-                sqlx::query_as::<_, AssociationCorroborationRow>(
+                sqlx::query_as::<_, AssociationAuthorizationRow>(
                     &select_association_corroborations,
                 )
                 .bind(listing_id)
                 .fetch_all(&mut *transaction)
                 .await?;
-            let corroborated_associations = current_corroborated_associations(
+            let corroborated_associations = current_authorized_associations(
                 listing_id,
                 &existing_links,
                 &association_corroboration_rows,
                 &current_reuse_attested_ids,
                 &active_collision_catalog_rows,
+                &catalog_product_fingerprints,
             );
             let covered_associations = payload
                 .aspects
@@ -11942,7 +12156,7 @@ mod tests {
         assert!(
             POSTGRES_LISTING_CHILD_LOCK_SQL.contains("aircraft_sale_listing_avionics")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
-                    .contains("aircraft_sale_listing_avionics_corroboration_scopes")
+                    .contains("aircraft_sale_listing_avionics_authorizations")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
                     .contains("aircraft_sale_listing_pending_reviews")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL.contains("IN SHARE ROW EXCLUSIVE MODE")
@@ -11959,7 +12173,7 @@ mod tests {
             .find("aircraft_sale_listing_avionics,")
             .expect("listing links must be locked first");
         let corroborations = children
-            .find("aircraft_sale_listing_avionics_corroborations")
+            .find("aircraft_sale_listing_avionics_authorizations")
             .expect("association corroborations must be locked");
         let pending = children
             .find("aircraft_sale_listing_pending_reviews")
@@ -12616,6 +12830,52 @@ mod tests {
     }
 
     #[test]
+    fn same_case_product_fingerprint_binds_graph_identity_and_source_proof() {
+        let product = CatalogFingerprintProduct {
+            id: 7,
+            manufacturer: "Garmin".to_string(),
+            model: "GTX 345".to_string(),
+            capabilities: vec!["Transponder".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "GTX345".to_string(),
+            avionics_manufacturer_identity_id: 11,
+            canonical_product_key: "gtx345".to_string(),
+            graph_manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            canonical_identifier_key: "gtx345".to_string(),
+            identity_source_url: "https://www.garmin.com/gtx345".to_string(),
+            identity_source_title: "GTX 345".to_string(),
+            identity_evidence_text: "Garmin identifies the GTX 345 model.".to_string(),
+        };
+        let original = fingerprint_catalog_product(&product);
+        let mut mutations = Vec::new();
+        let mut changed = product.clone();
+        changed.avionics_manufacturer_identity_id += 1;
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.canonical_product_key.push('w');
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.graph_manufacturer_identifier_kind = "sku".to_string();
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.canonical_identifier_key.push('w');
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.identity_source_url.push_str("?revision=2");
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.identity_source_title.push_str(" product page");
+        mutations.push(changed);
+        let mut changed = product.clone();
+        changed.identity_evidence_text.push_str(" Updated proof.");
+        mutations.push(changed);
+
+        for changed in mutations {
+            assert_ne!(fingerprint_catalog_product(&changed), original);
+        }
+    }
+
+    #[test]
     fn collision_closure_includes_other_identifier_equal_to_target_model() {
         let mut target = collision_fingerprint_row(1, "GTX 345R", "011-03520-00");
         target.catalog_status = "approved".to_string();
@@ -13037,7 +13297,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending_count, 0);
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -13143,7 +13403,7 @@ mod tests {
         assert!(error.to_string().contains("changed"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -13251,7 +13511,7 @@ mod tests {
             .contains("active avionics collision catalog"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -13706,7 +13966,7 @@ mod tests {
         assert!(error.to_string().contains("source capture changed"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))

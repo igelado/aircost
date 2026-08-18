@@ -98,6 +98,21 @@ WHERE listing.source_url = 'https://listing.example/reuse-v2'
 -- Reconstruct the exact v1 parent contract. Rerunning the canonical v1 and
 -- association migrations below restores every predecessor trigger and index.
 PRAGMA foreign_keys = OFF;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_link_update;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_reuse_delete;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_model_proof_update;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_model_type_insert;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_model_type_delete;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_model_type_update;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_type_update;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_graph_insert;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_graph_delete;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_graph_update;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_manufacturer_update;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_origin_revocation;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_capture_delete;
+DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_capture_update;
+DROP TABLE aircraft_sale_listing_avionics_authorizations;
 DROP TRIGGER IF EXISTS avionics_product_reuse_attestations_validate_insert;
 DROP TRIGGER IF EXISTS avionics_product_reuse_attestations_immutable_update;
 DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_type_insert;
@@ -122,10 +137,14 @@ CREATE TABLE avionics_product_reuse_attestations (
   CHECK (product_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 DELETE FROM schema_migration_contracts
-WHERE migration_name = '20260807_avionics_product_reuse_v2';
+WHERE migration_name IN (
+  '20260807_avionics_product_reuse_v2',
+  '20260818_listing_avionics_association_authorizations'
+);
 
 .read $repository_root/migrations/20260803_avionics_product_reuse_attestations.sqlite.sql
 .read $repository_root/migrations/20260805_listing_avionics_association_corroborations.sqlite.sql
+.read $repository_root/migrations/20260806_listing_avionics_collision_closure.sqlite.sql
 
 INSERT INTO avionics_product_reuse_attestations (
   avionics_model_id, avionics_authoritative_source_origin_id,
@@ -235,12 +254,11 @@ test -z "$(sqlite3 "$upgrade_database" "PRAGMA foreign_key_check")"
 test "$(sqlite3 "$upgrade_database" "PRAGMA integrity_check")" = "ok"
 
 sqlite3 -bail "$fresh_database" \
-  ".read $repository_root/schema/sqlite.sql" \
-  ".read $repository_root/migrations/20260807_avionics_product_reuse_v2.sqlite.sql"
+  ".read $repository_root/schema/sqlite.sql"
 test "$(sqlite3 "$fresh_database" \
   "SELECT instr(lower(sql),\"check (policy_version = 'avionics_reuse_v2')\") FROM sqlite_schema WHERE type='table' AND name='avionics_product_reuse_attestations'")" -gt 0
 test "$(sqlite3 "$fresh_database" \
-  "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='20260807_avionics_product_reuse_v2'")" = "1"
+  "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='20260807_avionics_product_reuse_v2' AND contract_version=1 AND contract_fingerprint='efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc'")" = "1"
 test -z "$(sqlite3 "$fresh_database" "PRAGMA foreign_key_check")"
 
 for definition in \
