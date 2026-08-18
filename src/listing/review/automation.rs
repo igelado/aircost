@@ -31,6 +31,13 @@ use super::{
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct AutomatedPreservedAssociationGuard {
+    pub listing_link_id: i64,
+    pub association_role: ListingAssociationRole,
+    pub expected_observation_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AutomatedAvionicsLink {
     pub avionics_model_id: i64,
     pub expected_collision_closure_sha256: String,
@@ -40,6 +47,7 @@ pub(crate) struct AutomatedAvionicsLink {
     pub configuration_action: String,
     pub replaces_avionics_model_id: Option<i64>,
     pub expected_replacement_collision_closure_sha256: Option<String>,
+    pub preserved_association_guard: Option<AutomatedPreservedAssociationGuard>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -184,6 +192,19 @@ fn validate_request(
                 "automated acceptance for avionics catalog id {} requires lowercase collision-closure SHA-256 revisions",
                 link.avionics_model_id
             )));
+        }
+        if let Some(guard) = link.preserved_association_guard.as_ref() {
+            if guard.listing_link_id <= 0
+                || guard.association_role != ListingAssociationRole::Installed
+                || !valid_sha256(&guard.expected_observation_sha256)
+                || link.configuration_action != "installed"
+                || link.replaces_avionics_model_id.is_some()
+            {
+                return Err(ReviewError::Validation(format!(
+                    "preserved-association guard for avionics catalog id {} is invalid",
+                    link.avionics_model_id
+                )));
+            }
         }
         match link.configuration_action.as_str() {
             "installed"
@@ -869,6 +890,45 @@ pub(crate) async fn apply_automated_avionics_review(
                     .bind(request.listing_id)
                     .fetch_all(&mut *transaction)
                     .await?;
+            for link in &request.accepted_links {
+                let Some(guard) = link.preserved_association_guard.as_ref() else {
+                    continue;
+                };
+                let existing = existing_rows
+                    .iter()
+                    .find(|row| row.id == guard.listing_link_id)
+                    .ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "preserved avionics listing link {} disappeared before automated corroboration",
+                            guard.listing_link_id
+                        ))
+                    })?;
+                let target_id = match guard.association_role {
+                    ListingAssociationRole::Installed => existing.avionics_model_id,
+                    ListingAssociationRole::Replacement => {
+                        existing.replaces_avionics_model_id.unwrap_or_default()
+                    }
+                };
+                let actual_observation_sha256 = association_observation_sha256_from_values(
+                    request.listing_id,
+                    existing.id,
+                    guard.association_role,
+                    target_id,
+                    existing.avionics_model_id,
+                    existing.replaces_avionics_model_id,
+                    existing.quantity,
+                    &existing.configuration_action,
+                    existing.source_notes.as_deref().unwrap_or_default(),
+                );
+                if target_id != link.avionics_model_id
+                    || actual_observation_sha256 != guard.expected_observation_sha256
+                {
+                    return Err(ReviewError::Stale(format!(
+                        "preserved avionics listing link {} changed after local evaluation",
+                        guard.listing_link_id
+                    )));
+                }
+            }
             let mut preserved = BTreeMap::<String, PreparedLink>::new();
             for row in &existing_rows {
                 if row.quantity <= 0
@@ -1527,6 +1587,7 @@ mod tests {
             configuration_action: "installed".to_string(),
             replaces_avionics_model_id: None,
             expected_replacement_collision_closure_sha256: None,
+            preserved_association_guard: None,
         }
     }
 
@@ -2138,6 +2199,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changed_preserved_association_guard_fails_closed_before_mutation() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "GTN 750Xi", "GTN750XI", true).await;
+        let pool = pool(&fixture.db);
+        let evidence = "Garmin GTN 750Xi";
+        let listing_link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(model_id)
+        .bind(evidence)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let expected_observation_sha256 = association_observation_sha256_from_values(
+            fixture.listing_id,
+            listing_link_id,
+            ListingAssociationRole::Installed,
+            model_id,
+            model_id,
+            None,
+            1,
+            "installed",
+            evidence,
+        );
+        let mut link = accepted(&fixture.db, model_id).await;
+        link.preserved_association_guard = Some(AutomatedPreservedAssociationGuard {
+            listing_link_id,
+            association_role: ListingAssociationRole::Installed,
+            expected_observation_sha256,
+        });
+
+        sqlx::query("UPDATE aircraft_sale_listing_avionics SET quantity = 2 WHERE id = ?")
+            .bind(listing_link_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let error = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![link],
+                vec![pending_aspect("original:0", "Unknown panel item")],
+            ),
+        )
+        .await
+        .expect_err("a preserved link mutation after evaluation must fail closed");
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("changed after local evaluation")
+        ));
+        let retained_quantity: i64 =
+            sqlx::query_scalar("SELECT quantity FROM aircraft_sale_listing_avionics WHERE id = ?")
+                .bind(listing_link_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let retained_review_sha256: String = sqlx::query_scalar(
+            "SELECT review_payload_sha256 FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let corroboration_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_corroborations WHERE listing_link_id = ?",
+        )
+        .bind(listing_link_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_quantity, 2);
+        assert_eq!(retained_review_sha256, fixture.review_payload_sha256);
+        assert_eq!(corroboration_count, 0);
+    }
+
+    #[tokio::test]
     async fn stale_review_hash_rolls_back_every_link_change() {
         let fixture = fixture().await;
         let existing_id = insert_product(&fixture.db, "GNS 430W", "GNS430W", true).await;
@@ -2431,6 +2576,7 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            preserved_association_guard: None,
         };
 
         apply_automated_avionics_review(&fixture.db, &request(&fixture, vec![link], vec![]))
