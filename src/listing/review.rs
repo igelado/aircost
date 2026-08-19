@@ -9,6 +9,7 @@
 
 pub(crate) mod automation;
 pub(crate) mod replacement;
+pub(crate) mod staging;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -31,6 +32,7 @@ use crate::avionics::manufacturer::{
     ManufacturerIdentityEvidence, ManufacturerProductAdmission,
     ManufacturerProductAdmissionOutcome,
 };
+use crate::avionics::model::avionics_identities_are_typography_exact;
 use crate::avionics::reuse::{
     current_reuse_attested_product_ids, refresh_reuse_attestation_postgres,
     refresh_reuse_attestation_sqlite, reuse_attestation_is_current_postgres,
@@ -40,6 +42,9 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::CURATED_AVIONICS_TYPES;
 use crate::gemini::curation::workflow::MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS;
 use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
+use crate::listing::avionics::extraction::{
+    validate_current_avionics_extraction, CurrentAvionicsExtraction,
+};
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
@@ -51,6 +56,11 @@ use crate::models::SaleListing;
 use crate::normalize::{
     is_usable_avionics_label, normalize_avionics_identifier, normalize_avionics_manufacturer_name,
     normalize_avionics_model_name, normalize_name,
+};
+
+use self::staging::{
+    project_pending_review, reset_requires_reextraction, CatalogProjectionProduct,
+    PendingReviewProjection,
 };
 
 const DEFAULT_PAGE_LIMIT: i64 = 25;
@@ -473,6 +483,47 @@ pub struct StagedPendingReview {
     pub review_payload_sha256: String,
     pub catalog_revision_sha256: String,
     pub pending_aspect_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RebuildPendingAvionicsReview {
+    Rebuilt {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        review: Option<StagedPendingReview>,
+    },
+    Blocked {
+        listing_id: i64,
+        reason_code: RebuildPendingAvionicsReviewBlockReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebuildPendingAvionicsReviewBlockReason {
+    RetainedSourceMissing,
+    ExtractionNotCurrent,
+    OccurrenceDispositionUnknown,
+    UnsupportedReviewState,
+}
+
+impl RebuildPendingAvionicsReviewBlockReason {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RetainedSourceMissing => {
+                "The retained listing source is unavailable. Capture the listing again before rebuilding its avionics review."
+            }
+            Self::ExtractionNotCurrent => {
+                "The retained extraction does not satisfy the current avionics schema. Run a validated re-extraction before rebuilding its review."
+            }
+            Self::OccurrenceDispositionUnknown => {
+                "At least one retained avionics occurrence has no current review or listing-link disposition. Run a validated re-extraction before rebuilding its review."
+            }
+            Self::UnsupportedReviewState => {
+                "This review includes state outside the avionics workflow. No review state was changed."
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -944,6 +995,27 @@ struct ListingEvidenceCaptureRow {
     source_url: String,
     rendered_html: String,
     rendered_html_sha256: String,
+}
+
+#[derive(Debug, FromRow)]
+struct RebuildSubmissionRow {
+    submission_id: i64,
+    user_id: i64,
+    canonical_listing_id: Option<i64>,
+    source_url: String,
+    rendered_html: String,
+    rendered_html_sha256: String,
+    extracted_listing_json: Option<String>,
+    extraction_error: Option<String>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct CatalogProjectionRow {
+    id: i64,
+    manufacturer: String,
+    model: String,
+    capability: Option<String>,
+    catalog_status: String,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -2522,9 +2594,9 @@ async fn restage_pending_review_if_current_with_commit(
                             );
                         }
                         payload.aspects[aspect_index].source_evidence_text =
-                            repair.evidence_text.clone();
+                            repair.aspect_evidence_text.clone();
                         payload.aspects[aspect_index].source_confidence = repair
-                            .evidence_text
+                            .aspect_evidence_text
                             .as_ref()
                             .map(|_| "high".to_string());
                         repaired_evidence |= payload.aspects[aspect_index] != before;
@@ -2549,9 +2621,9 @@ async fn restage_pending_review_if_current_with_commit(
                             aspect.source_confidence.clone(),
                         );
                         aspect.source_evidence_text =
-                            repair.replacement_evidence_text.clone();
+                            repair.replacement_aspect_evidence_text.clone();
                         aspect.source_confidence = repair
-                            .replacement_evidence_text
+                            .replacement_aspect_evidence_text
                             .as_ref()
                             .map(|_| "high".to_string());
                         repaired_evidence |= before
@@ -4443,6 +4515,25 @@ fn approved_product_map(rows: Vec<ApprovedProductRow>) -> HashMap<i64, ReviewPro
     products.into_iter().collect()
 }
 
+fn catalog_projection(rows: Vec<CatalogProjectionRow>) -> Vec<CatalogProjectionProduct> {
+    let mut products = BTreeMap::<i64, CatalogProjectionProduct>::new();
+    for row in rows {
+        let product = products
+            .entry(row.id)
+            .or_insert_with(|| CatalogProjectionProduct {
+                id: row.id,
+                manufacturer: row.manufacturer,
+                model: row.model,
+                capabilities: Vec::new(),
+                catalog_status: row.catalog_status,
+            });
+        if let Some(capability) = row.capability.filter(|value| !value.trim().is_empty()) {
+            product.capabilities.push(capability);
+        }
+    }
+    products.into_values().collect()
+}
+
 async fn load_all_approved_product_map(db: &AppDb) -> ReviewResult<HashMap<i64, ReviewProduct>> {
     let sql = db.sql(APPROVED_PRODUCT_ROWS_SQL);
     let rows = match db.backend() {
@@ -5014,7 +5105,9 @@ struct AssociationEvidenceRepair {
     update_link: bool,
     link_evidence_text: Option<String>,
     evidence_text: Option<String>,
+    aspect_evidence_text: Option<String>,
     replacement_evidence_text: Option<String>,
+    replacement_aspect_evidence_text: Option<String>,
 }
 
 fn catalog_identity_is_unique(
@@ -5218,6 +5311,40 @@ fn plan_pending_association_evidence_repair(
             let link_evidence_text = evidence_text
                 .clone()
                 .or_else(|| exact_retained_replacement_evidence.clone());
+            let aspect_evidence_text =
+                aspect_index.map_or_else(
+                    || evidence_text.clone(),
+                    |index| {
+                        let aspect = &payload.aspects[index];
+                        if aspect.kind == REVIEWER_CORRECTED_AVIONICS_KIND {
+                            paired_aspect_evidence(aspect)
+                        } else if approved.get(&assignment.avionics_model_id).is_some_and(
+                            |product| proposed_identity_conflicts_with_product(aspect, product),
+                        ) {
+                            exact_aspect_identity_evidence(aspect, rendered_html)
+                        } else {
+                            evidence_text.clone()
+                        }
+                    },
+                );
+            let replacement_product = assignment
+                .replaces_avionics_model_id
+                .and_then(|id| approved.get(&id));
+            let replacement_aspect_evidence_text = replacement_aspect_index.map_or_else(
+                || exact_retained_replacement_evidence.clone(),
+                |index| {
+                    let aspect = &payload.aspects[index];
+                    if aspect.kind == REVIEWER_CORRECTED_AVIONICS_KIND {
+                        paired_aspect_evidence(aspect)
+                    } else if replacement_product.is_some_and(|product| {
+                        proposed_identity_conflicts_with_product(aspect, product)
+                    }) {
+                        exact_aspect_identity_evidence(aspect, rendered_html)
+                    } else {
+                        exact_retained_replacement_evidence.clone()
+                    }
+                },
+            );
             let replace_redundant_primary = automatic_repair_shape
                 && evidence_text.is_some()
                 && aspect_index.is_some_and(|index| {
@@ -5239,7 +5366,9 @@ fn plan_pending_association_evidence_repair(
                 update_link,
                 link_evidence_text,
                 evidence_text,
+                aspect_evidence_text,
                 replacement_evidence_text: exact_retained_replacement_evidence,
+                replacement_aspect_evidence_text,
             }
         })
         .collect()
@@ -5815,6 +5944,47 @@ fn remove_stale_covered_relationships(
     true
 }
 
+fn proposed_identity_conflicts_with_product(
+    aspect: &PendingReviewAspect,
+    product: &ReviewProduct,
+) -> bool {
+    let Some(proposed) = aspect.proposed_product.as_ref() else {
+        return false;
+    };
+    !avionics_identities_are_typography_exact(
+        &proposed.manufacturer,
+        &proposed.model,
+        &product.manufacturer,
+        &product.model,
+    )
+}
+
+fn paired_aspect_evidence(aspect: &PendingReviewAspect) -> Option<String> {
+    aspect
+        .source_evidence_text
+        .as_ref()
+        .filter(|_| aspect.source_confidence.is_some())
+        .cloned()
+}
+
+fn exact_aspect_identity_evidence(
+    aspect: &PendingReviewAspect,
+    rendered_html: Option<&str>,
+) -> Option<String> {
+    let proposed = aspect.proposed_product.as_ref()?;
+    paired_aspect_evidence(aspect).filter(|evidence| {
+        rendered_html.is_some_and(|html| {
+            validate_exact_listing_product_evidence(
+                html,
+                evidence,
+                &proposed.manufacturer,
+                &proposed.model,
+            )
+            .is_ok()
+        })
+    })
+}
+
 /// Add an explicit, hash-bound aspect for every preserved approved listing
 /// association that lacks current authorization.
 ///
@@ -5828,8 +5998,21 @@ fn add_unauthorized_preserved_aspects(
 ) -> ReviewResult<bool> {
     fn annotate_existing_aspect(
         aspect: &mut PendingReviewAspect,
-        target_id: i64,
+        target: &ReviewProduct,
     ) -> ReviewResult<bool> {
+        let target_id = target.id.ok_or_else(|| {
+            ReviewError::Conflict(
+                "approved preserved product is missing its catalog id".to_string(),
+            )
+        })?;
+        // An occurrence that explicitly disagrees with the covered catalog
+        // identity already represents the required disposition of that link.
+        // Keep normal use/create/discard actions so review can replace or
+        // remove the stale association; do not collapse it into a
+        // reuse-attestation card for the product it contradicts.
+        if proposed_identity_conflicts_with_product(aspect, target) {
+            return Ok(false);
+        }
         let reason_changed = is_synthetic_preserved_attestation_aspect(aspect)
             && aspect.reason != PRESERVED_ASSOCIATION_REVIEW_REASON;
         if reason_changed {
@@ -5902,15 +6085,16 @@ fn add_unauthorized_preserved_aspects(
 
         if installed_needs_attestation && installed_is_covered {
             let index = owners[&installed_key];
-            changed |= annotate_existing_aspect(&mut aspects[index], assignment.avionics_model_id)?;
+            changed |= annotate_existing_aspect(
+                &mut aspects[index],
+                installed_product.expect("attestation requires an approved installed product"),
+            )?;
         }
         if replacement_needs_attestation && replacement_is_covered {
             let index = owners[&replacement_key];
             changed |= annotate_existing_aspect(
                 &mut aspects[index],
-                assignment
-                    .replaces_avionics_model_id
-                    .expect("replacement coverage requires a target"),
+                replacement_product.expect("attestation requires an approved replacement product"),
             )?;
         }
 
@@ -6018,6 +6202,391 @@ pub async fn restage_unattested_preserved_products(
     }
     restage_pending_review_if_current(db, owner_user_id, listing_id, &row.review_payload_sha256)
         .await
+}
+
+/// Explicitly reset one pending avionics review from its complete, strict
+/// retained extraction without contacting a provider.
+///
+/// This is intentionally separate from ordinary restage maintenance. The
+/// reset first proves that every extracted occurrence already has a one-to-one
+/// durable representation, so it cannot resurrect an observation that an
+/// earlier run may have discarded without a disposition receipt.
+pub async fn rebuild_pending_avionics_review_if_current(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    expected_review_payload_sha256: &str,
+) -> ReviewResult<RebuildPendingAvionicsReview> {
+    if owner_user_id <= 0 || listing_id <= 0 || !valid_sha256(expected_review_payload_sha256) {
+        return Err(ReviewError::Validation(
+            "listing, owner, and expected review revision are required for avionics reset"
+                .to_string(),
+        ));
+    }
+    let lock_catalog = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            "UPDATE avionics_models SET updated_at = updated_at WHERE id = (SELECT id FROM avionics_models WHERE catalog_status = 'approved' ORDER BY id LIMIT 1)",
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(POSTGRES_RESTAGE_CATALOG_LOCK_SQL),
+    };
+    let lock_listing_children = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql("SELECT 1"),
+        DatabaseBackend::Postgres(_) => db.sql(POSTGRES_LISTING_CHILD_LOCK_SQL),
+    };
+    let postgres_review_select = format!("{REVIEW_SELECT_SQL} FOR UPDATE OF listing, review");
+    let select_review = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(REVIEW_SELECT_SQL),
+        DatabaseBackend::Postgres(_) => db.sql(&postgres_review_select),
+    };
+    let submission_select = match db.backend() {
+        DatabaseBackend::Sqlite(_) => db.sql(
+            r#"
+            SELECT id AS submission_id, user_id, canonical_listing_id, source_url,
+                   rendered_html, rendered_html_sha256, extracted_listing_json,
+                   extraction_error
+            FROM plugin_submissions
+            WHERE id = ?
+            "#,
+        ),
+        DatabaseBackend::Postgres(_) => db.sql(
+            r#"
+            SELECT id AS submission_id, user_id, canonical_listing_id, source_url,
+                   rendered_html, rendered_html_sha256, extracted_listing_json,
+                   extraction_error
+            FROM plugin_submissions
+            WHERE id = ?
+            FOR UPDATE
+            "#,
+        ),
+    };
+    let assignments_sql = db.sql(EXISTING_ASSIGNMENT_ROWS_SQL);
+    let catalog_projection_sql = db.sql(
+        r#"
+        SELECT model.id, manufacturer.name AS manufacturer, model.name AS model,
+               capability.name AS capability, model.catalog_status
+        FROM avionics_models model
+        JOIN avionics_manufacturers manufacturer
+          ON manufacturer.id = model.avionics_manufacturer_id
+        LEFT JOIN avionics_model_types membership
+          ON membership.avionics_model_id = model.id
+        LEFT JOIN avionics_types capability
+          ON capability.id = membership.avionics_type_id
+        ORDER BY model.id, capability.normalized_name, capability.id
+        "#,
+    );
+    let approved_products_sql = db.sql(APPROVED_PRODUCT_ROWS_SQL);
+    let active_collision_catalog_sql = db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
+    let catalog_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
+    let corroborations_sql = db.sql(association_authorization_rows_sql(db));
+    let attested_product_ids_sql = db.sql(
+        r#"
+        SELECT avionics_model_id
+        FROM avionics_product_reuse_attestations
+        ORDER BY avionics_model_id
+        "#,
+    );
+    let update_review = db.sql(
+        r#"
+        UPDATE aircraft_sale_listing_pending_reviews
+        SET extraction_sha256 = ?,
+            catalog_revision_sha256 = ?,
+            pending_aspect_count = ?,
+            review_payload_json = ?,
+            review_payload_sha256 = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE listing_id = ?
+          AND review_payload_sha256 = ?
+        "#,
+    );
+    let delete_review = db.sql(
+        r#"
+        DELETE FROM aircraft_sale_listing_pending_reviews
+        WHERE listing_id = ? AND review_payload_sha256 = ?
+        "#,
+    );
+    let mark_incomplete = db.sql(
+        r#"
+        UPDATE aircraft_sale_listings
+        SET ingestion_state = 'incomplete', ingestion_error = NULL,
+            ingestion_completed_at = NULL, is_verified = FALSE,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND created_by_user_id = ?
+          AND ingestion_state = 'pending_review'
+          AND NOT EXISTS (
+            SELECT 1 FROM aircraft_sale_listing_pending_reviews review
+            WHERE review.listing_id = aircraft_sale_listings.id
+          )
+        "#,
+    );
+
+    macro_rules! rebuild_in_transaction {
+        ($pool:expr, $reuse_attestation_is_current:ident) => {{
+            let mut transaction = $pool.begin().await?;
+            sqlx::query(&lock_catalog)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(&lock_listing_children)
+                .execute(&mut *transaction)
+                .await?;
+            let row = sqlx::query_as::<_, ReviewRow>(&select_review)
+                .bind(listing_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    ReviewError::Stale(format!(
+                        "pending review for listing {listing_id} changed or was resolved"
+                    ))
+                })?;
+            if row.owner_user_id != owner_user_id {
+                return Err(ReviewError::Permission(
+                    "reviewers may only reset reviews for listings they own".to_string(),
+                ));
+            }
+            if row.ingestion_state != "pending_review"
+                || row.is_verified
+                || row.review_payload_sha256 != expected_review_payload_sha256
+            {
+                return Err(ReviewError::Stale(
+                    "pending review changed before avionics reset; reload".to_string(),
+                ));
+            }
+            let payload = parse_payload(
+                &row.review_payload_json,
+                Some(&row.review_payload_sha256),
+                row.pending_aspect_count,
+            )?;
+            if payload
+                .aspects
+                .iter()
+                .any(|aspect| !aspect.kind.starts_with("avionics"))
+            {
+                transaction.rollback().await?;
+                return Ok(RebuildPendingAvionicsReview::Blocked {
+                    listing_id,
+                    reason_code: RebuildPendingAvionicsReviewBlockReason::UnsupportedReviewState,
+                });
+            }
+            let Some(submission_id) = row.plugin_submission_id else {
+                transaction.rollback().await?;
+                return Ok(RebuildPendingAvionicsReview::Blocked {
+                    listing_id,
+                    reason_code: RebuildPendingAvionicsReviewBlockReason::RetainedSourceMissing,
+                });
+            };
+            let submission = sqlx::query_as::<_, RebuildSubmissionRow>(&submission_select)
+                .bind(submission_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            let Some(submission) = submission else {
+                transaction.rollback().await?;
+                return Ok(RebuildPendingAvionicsReview::Blocked {
+                    listing_id,
+                    reason_code: RebuildPendingAvionicsReviewBlockReason::RetainedSourceMissing,
+                });
+            };
+            if submission
+                .extraction_error
+                .as_deref()
+                .filter(|error| !error.trim().is_empty())
+                .is_some()
+            {
+                transaction.rollback().await?;
+                return Ok(RebuildPendingAvionicsReview::Blocked {
+                    listing_id,
+                    reason_code: RebuildPendingAvionicsReviewBlockReason::ExtractionNotCurrent,
+                });
+            }
+            let Some(extracted_listing_json) = submission.extracted_listing_json.as_deref() else {
+                transaction.rollback().await?;
+                return Ok(RebuildPendingAvionicsReview::Blocked {
+                    listing_id,
+                    reason_code: RebuildPendingAvionicsReviewBlockReason::RetainedSourceMissing,
+                });
+            };
+            let occurrences =
+                match validate_current_avionics_extraction(CurrentAvionicsExtraction {
+                    listing_id,
+                    listing_owner_user_id: row.owner_user_id,
+                    listing_source_url: row.source_url.as_deref(),
+                    submission_id: submission.submission_id,
+                    submission_owner_user_id: submission.user_id,
+                    submission_canonical_listing_id: submission.canonical_listing_id,
+                    submission_source_url: &submission.source_url,
+                    rendered_html: &submission.rendered_html,
+                    rendered_html_sha256: &submission.rendered_html_sha256,
+                    extracted_listing_json,
+                }) {
+                    Ok(occurrences) if !occurrences.is_empty() => occurrences,
+                    Ok(_) => {
+                        transaction.rollback().await?;
+                        return Ok(RebuildPendingAvionicsReview::Blocked {
+                            listing_id,
+                            reason_code:
+                                RebuildPendingAvionicsReviewBlockReason::ExtractionNotCurrent,
+                        });
+                    }
+                    Err(_) => {
+                        transaction.rollback().await?;
+                        return Ok(RebuildPendingAvionicsReview::Blocked {
+                            listing_id,
+                            reason_code:
+                                RebuildPendingAvionicsReviewBlockReason::ExtractionNotCurrent,
+                        });
+                    }
+                };
+            let assignments = sqlx::query_as::<_, ExistingAssignmentRow>(&assignments_sql)
+                .bind(listing_id)
+                .fetch_all(&mut *transaction)
+                .await?;
+            if reset_requires_reextraction(&occurrences, &assignments, &payload.aspects)?.is_some()
+            {
+                transaction.rollback().await?;
+                return Ok(RebuildPendingAvionicsReview::Blocked {
+                    listing_id,
+                    reason_code:
+                        RebuildPendingAvionicsReviewBlockReason::OccurrenceDispositionUnknown,
+                });
+            }
+            validate_current_covered_associations(&payload.aspects, &assignments)?;
+
+            let projection_rows =
+                sqlx::query_as::<_, CatalogProjectionRow>(&catalog_projection_sql)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+            let catalog = catalog_projection(projection_rows);
+            let approved_rows = sqlx::query_as::<_, ApprovedProductRow>(&approved_products_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let approved = approved_product_map(approved_rows);
+            let attested_product_ids = sqlx::query_scalar::<_, i64>(&attested_product_ids_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let mut reuse_attested_ids = HashSet::new();
+            for avionics_model_id in attested_product_ids {
+                if $reuse_attestation_is_current(db, &mut transaction, avionics_model_id).await? {
+                    reuse_attested_ids.insert(avionics_model_id);
+                }
+            }
+            let active_collision_catalog_rows = sqlx::query_as::<
+                _,
+                ActiveCollisionCatalogFingerprintRow,
+            >(&active_collision_catalog_sql)
+            .fetch_all(&mut *transaction)
+            .await?;
+            let catalog_rows = sqlx::query_as::<_, CatalogFingerprintRow>(&catalog_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+            let catalog_products = catalog_products(catalog_rows);
+            let catalog_revision_sha256 = fingerprint_catalog_products(&catalog_products);
+            let catalog_product_fingerprints = catalog_product_fingerprints(&catalog_products);
+            let corroboration_rows =
+                sqlx::query_as::<_, AssociationAuthorizationRow>(&corroborations_sql)
+                    .bind(listing_id)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+            let authorized_associations = current_authorized_associations(
+                listing_id,
+                &assignments,
+                &corroboration_rows,
+                &reuse_attested_ids,
+                &active_collision_catalog_rows,
+                &catalog_product_fingerprints,
+            );
+            let mut aspects = project_pending_review(PendingReviewProjection {
+                occurrences: &occurrences,
+                assignments: &assignments,
+                catalog: &catalog,
+                authorized_associations: &authorized_associations,
+                prior_aspects: &payload.aspects,
+            })?;
+            remove_authorized_preserved_aspects(&mut aspects, &authorized_associations)?;
+            add_unauthorized_preserved_aspects(
+                &mut aspects,
+                &assignments,
+                &approved,
+                &authorized_associations,
+            )?;
+            validate_current_covered_associations(&aspects, &assignments)?;
+            let blockers =
+                hidden_preserved_blockers(&aspects, &assignments, &authorized_associations);
+            if !blockers.is_empty() {
+                return Err(ReviewError::Conflict(format!(
+                    "current listing avionics cannot be represented by the rebuilt review: {}",
+                    blockers.join("; ")
+                )));
+            }
+            if aspects.is_empty() {
+                let deleted = sqlx::query(&delete_review)
+                    .bind(listing_id)
+                    .bind(expected_review_payload_sha256)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if deleted != 1 {
+                    return Err(ReviewError::Stale(
+                        "pending review changed while avionics reset was being committed"
+                            .to_string(),
+                    ));
+                }
+                let changed = sqlx::query(&mark_incomplete)
+                    .bind(listing_id)
+                    .bind(owner_user_id)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if changed != 1 {
+                    return Err(ReviewError::Stale(
+                        "listing changed while its empty rebuilt review was being cleared"
+                            .to_string(),
+                    ));
+                }
+                transaction.commit().await?;
+                return Ok(RebuildPendingAvionicsReview::Rebuilt { review: None });
+            }
+            let serialized = serialize_review_payload(&aspects)?;
+            if serialized.review_payload_sha256 != row.review_payload_sha256
+                || serialized.review_payload_json != row.review_payload_json
+                || serialized.pending_aspect_count != row.pending_aspect_count
+                || catalog_revision_sha256 != row.catalog_revision_sha256
+            {
+                let changed = sqlx::query(&update_review)
+                    .bind(serialized.extraction_sha256.as_str())
+                    .bind(catalog_revision_sha256.as_str())
+                    .bind(serialized.pending_aspect_count)
+                    .bind(serialized.review_payload_json.as_str())
+                    .bind(serialized.review_payload_sha256.as_str())
+                    .bind(listing_id)
+                    .bind(expected_review_payload_sha256)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if changed != 1 {
+                    return Err(ReviewError::Stale(
+                        "pending review changed while avionics reset was being committed"
+                            .to_string(),
+                    ));
+                }
+            }
+            transaction.commit().await?;
+            Ok(RebuildPendingAvionicsReview::Rebuilt {
+                review: Some(StagedPendingReview {
+                    listing_id,
+                    review_payload_sha256: serialized.review_payload_sha256,
+                    catalog_revision_sha256,
+                    pending_aspect_count: serialized.pending_aspect_count,
+                }),
+            })
+        }};
+    }
+
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            rebuild_in_transaction!(pool, reuse_attestation_is_current_sqlite)
+        }
+        DatabaseBackend::Postgres(pool) => {
+            rebuild_in_transaction!(pool, reuse_attestation_is_current_postgres)
+        }
+    }
 }
 
 /// Make hidden approved-product references visible to the product review
@@ -10814,6 +11383,79 @@ mod tests {
     }
 
     #[test]
+    fn pending_association_repair_preserves_only_exact_visible_correction_evidence() {
+        let linked_product =
+            ReviewProduct::verified(10, "Garmin", "G500", vec!["Flight Display".to_string()])
+                .with_stable_identifier("manufacturer_model_number", "G500");
+        let approved = HashMap::from([(10, linked_product)]);
+        let catalog = vec![RecoverableCatalogIdentityRow {
+            id: 10,
+            model: "G500".to_string(),
+            manufacturer_identifier_kind: Some("manufacturer_model_number".to_string()),
+            manufacturer_identifier: Some("G500".to_string()),
+        }];
+        let mut assignment = existing_assignment(7, 10, 1, "installed", None);
+        assignment.installed_manufacturer = Some("Garmin".to_string());
+        assignment.installed_model = Some("G500".to_string());
+        assignment.source_notes = Some("generated resolver prose".to_string());
+        assignment.source_confidence = Some("high".to_string());
+
+        let mut aspect = PendingReviewAspect::avionics(
+            "changed-identity",
+            "avionics",
+            "Garmin G5",
+            "Garmin G5",
+            "catalog_product_unverified",
+            1,
+            "installed",
+            Some("generated resolver prose".to_string()),
+            Some("high".to_string()),
+        )
+        .with_proposed_product(ReviewProduct::proposed(
+            "Garmin",
+            "G5",
+            vec!["Flight Display".to_string()],
+        ))
+        .with_covered_association(7, ListingAssociationRole::Installed, 10);
+        let source_html = "<body><p>G5 installed</p><p>Garmin G5X spare</p></body>";
+        let source = ListingEvidenceContext::from_listing_capture(None, Some(source_html));
+
+        let payload = PendingReviewPayload {
+            version: REVIEW_PAYLOAD_VERSION,
+            aspects: vec![aspect.clone()],
+        };
+        let generated = plan_pending_association_evidence_repair(
+            &payload,
+            std::slice::from_ref(&assignment),
+            &approved,
+            &catalog,
+            Some(&source),
+            Some(source_html),
+        );
+        assert_eq!(generated[0].link_evidence_text, None);
+        assert_eq!(generated[0].aspect_evidence_text, None);
+
+        aspect.source_evidence_text = Some("G5 installed".to_string());
+        let payload = PendingReviewPayload {
+            version: REVIEW_PAYLOAD_VERSION,
+            aspects: vec![aspect],
+        };
+        let exact = plan_pending_association_evidence_repair(
+            &payload,
+            std::slice::from_ref(&assignment),
+            &approved,
+            &catalog,
+            Some(&source),
+            Some(source_html),
+        );
+        assert_eq!(exact[0].link_evidence_text, None);
+        assert_eq!(
+            exact[0].aspect_evidence_text.as_deref(),
+            Some("G5 installed")
+        );
+    }
+
+    #[test]
     fn pending_association_repair_scopes_qualifiers_to_publisher_equipment_lines() {
         let identities = [
             (10, "GDU 1044B", "011-01000-10"),
@@ -11317,6 +11959,83 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         capability: &str,
     ) -> i64 {
         insert_catalog_product(db, model, identifier, capability, false).await
+    }
+
+    async fn store_current_avionics_extraction(
+        db: &AppDb,
+        submission_id: i64,
+        avionics: serde_json::Value,
+    ) {
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "avionics": avionics }).to_string())
+        .bind(submission_id)
+        .execute(sqlite_pool(db))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_listing_avionics_link(
+        db: &AppDb,
+        listing_id: i64,
+        product_id: i64,
+        quantity: i64,
+        evidence: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, ?, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(quantity)
+        .bind(evidence)
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap()
+    }
+
+    fn retained_occurrence_aspect(
+        id: &str,
+        manufacturer: &str,
+        model: &str,
+        quantity: i64,
+        evidence: &str,
+        link_id: i64,
+        product_id: i64,
+    ) -> PendingReviewAspect {
+        PendingReviewAspect::avionics(
+            id,
+            "avionics",
+            format!("{manufacturer} {model}"),
+            format!("{manufacturer} {model}"),
+            "legacy_machine_reason",
+            quantity,
+            "installed",
+            Some(evidence.to_string()),
+            Some("high".to_string()),
+        )
+        .with_covered_association(link_id, ListingAssociationRole::Installed, product_id)
+    }
+
+    async fn stored_review_state(db: &AppDb, listing_id: i64) -> (String, String, i64) {
+        sqlx::query_as(
+            r#"
+            SELECT review_payload_json, review_payload_sha256, pending_aspect_count
+            FROM aircraft_sale_listing_pending_reviews
+            WHERE listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -17322,6 +18041,591 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(ids.contains("raw-wx"));
         assert!(ids.contains(&format!("avionics:preserved:{current_link_id}:installed")));
         assert!(!ids.contains(&format!("avionics:preserved:{old_link_id}:installed")));
+    }
+
+    #[tokio::test]
+    async fn explicit_avionics_rebuild_is_provider_free_idempotent_and_preserves_authorized_links()
+    {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let products = [
+            insert_approved_product(&db, "GTN 750Xi", "GTN750XI", "GPS").await,
+            insert_approved_product(&db, "GTN 650Xi", "GTN650XI", "GPS").await,
+            insert_approved_product(&db, "G5", "G5", "Flight Display").await,
+            insert_approved_product(&db, "GFC 500", "GFC500", "Autopilot").await,
+            insert_approved_product(&db, "GTX 345", "GTX345", "Transponder").await,
+            insert_approved_product(&db, "Flight Stream 210", "FLIGHTSTREAM210", "Datalink").await,
+        ];
+        let observations = [
+            ("GTN 750Xi", "GPS", 1, "Garmin GTN 750Xi installed"),
+            ("GTN 650Xi", "GPS", 1, "Garmin GTN 650Xi installed"),
+            ("G5", "Flight Display", 2, "Dual Garmin G5 installed"),
+            ("GFC 500", "Autopilot", 1, "Garmin GFC 500 installed"),
+            ("GTX 345", "Transponder", 1, "Garmin GTX 345 installed"),
+            (
+                "FlightStream 210",
+                "Datalink",
+                1,
+                "Garmin FlightStream 210 installed",
+            ),
+        ];
+        let rendered_html = observations
+            .iter()
+            .map(|observation| format!("<p>{}</p>", observation.3))
+            .collect::<String>();
+        let submission_id =
+            insert_review_bound_submission(&db, user_id, listing_id, &rendered_html).await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::Value::Array(
+                observations
+                    .iter()
+                    .map(|(model, capability, quantity, evidence)| {
+                        serde_json::json!({
+                            "manufacturer": "Garmin",
+                            "model": model,
+                            "types": [capability],
+                            "quantity": quantity,
+                            "configuration_action": "installed",
+                            "replaces": null,
+                            "source_evidence_text": evidence,
+                            "source_confidence": "high"
+                        })
+                    })
+                    .collect(),
+            ),
+        )
+        .await;
+
+        let mut links = Vec::new();
+        let mut prior = Vec::new();
+        for (index, ((model, _, quantity, evidence), product_id)) in
+            observations.iter().zip(products).enumerate()
+        {
+            let link_id =
+                insert_listing_avionics_link(&db, listing_id, product_id, *quantity, evidence)
+                    .await;
+            links.push(link_id);
+            prior.push(retained_occurrence_aspect(
+                &format!("legacy-avionics-{index}"),
+                "Garmin",
+                model,
+                *quantity,
+                evidence,
+                link_id,
+                product_id,
+            ));
+        }
+        insert_current_same_case_authorization(
+            &db,
+            listing_id,
+            links[3],
+            products[3],
+            submission_id,
+            ListingAssociationRole::Installed,
+        )
+        .await;
+        let staged = stage_pending_review(&db, listing_id, Some(submission_id), &prior)
+            .await
+            .unwrap();
+        let usage_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let RebuildPendingAvionicsReview::Rebuilt {
+            review: Some(first),
+        } = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &staged.review_payload_sha256,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("strict listing-style fixture must rebuild");
+        };
+        assert_eq!(first.pending_aspect_count, 5);
+        let state = stored_review_state(&db, listing_id).await;
+        let payload = parse_payload(&state.0, Some(&state.1), state.2).unwrap();
+        assert_eq!(payload.aspects.len(), 5);
+        assert!(payload.aspects.iter().all(|aspect| {
+            !aspect.id.to_string().contains("legacy")
+                && !aspect.reason.contains("listing_action_graph_invalid")
+                && aspect.label != "Garmin GFC 500"
+        }));
+        let flight_stream = payload
+            .aspects
+            .iter()
+            .filter(|aspect| aspect.label == "Garmin FlightStream 210")
+            .collect::<Vec<_>>();
+        assert_eq!(flight_stream.len(), 1);
+        assert_eq!(
+            flight_stream[0].covered_associations[0].listing_link_id,
+            links[5]
+        );
+
+        assert!(matches!(
+            rebuild_pending_avionics_review_if_current(
+                &db,
+                user_id,
+                listing_id,
+                &staged.review_payload_sha256,
+            )
+            .await,
+            Err(ReviewError::Stale(_))
+        ));
+        let RebuildPendingAvionicsReview::Rebuilt {
+            review: Some(second),
+        } = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &first.review_payload_sha256,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("a second current-hash rebuild must be idempotent");
+        };
+        assert_eq!(second, first);
+        let usage_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(usage_after, usage_before);
+
+        resolve_listing_review(
+            &db,
+            user_id,
+            listing_id,
+            &ResolveReviewRequest {
+                expected_review_payload_sha256: second.review_payload_sha256,
+                expected_catalog_revision_sha256: second.catalog_revision_sha256,
+                finalize_listing: false,
+                decisions: payload
+                    .aspects
+                    .iter()
+                    .map(|aspect| ReviewDecision::Discard {
+                        aspect_id: aspect.id.clone(),
+                        reason: "fixture rejection".to_string(),
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+        let remaining_links: Vec<(i64, i64, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT avionics_model_id, quantity, source, source_notes, configuration_action FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ? ORDER BY id",
+        )
+        .bind(listing_id)
+        .fetch_all(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining_links,
+            vec![(
+                products[3],
+                1,
+                "listing".to_string(),
+                Some(observations[3].3.to_string()),
+                "installed".to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_identity_rebuild_survives_restage_and_replaces_the_stale_link() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let stale_product_id = insert_approved_product(&db, "G500", "G500", "Flight Display").await;
+        let corrected_product_id = insert_approved_product(&db, "G5", "G5", "Flight Display").await;
+        attest_approved_product_for_current_policy_reuse(&db, corrected_product_id).await;
+
+        let evidence = "Garmin G5 installed";
+        let rendered_html = format!("<main><p>{evidence}</p></main>");
+        let submission_id =
+            insert_review_bound_submission(&db, user_id, listing_id, &rendered_html).await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "G5",
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
+        let link_id =
+            insert_listing_avionics_link(&db, listing_id, stale_product_id, 1, evidence).await;
+        insert_current_same_case_authorization(
+            &db,
+            listing_id,
+            link_id,
+            stale_product_id,
+            submission_id,
+            ListingAssociationRole::Installed,
+        )
+        .await;
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[retained_occurrence_aspect(
+                "legacy-g5",
+                "Garmin",
+                "G5",
+                1,
+                evidence,
+                link_id,
+                stale_product_id,
+            )],
+        )
+        .await
+        .unwrap();
+
+        let RebuildPendingAvionicsReview::Rebuilt {
+            review: Some(first),
+        } = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &staged.review_payload_sha256,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("the strict changed-identity occurrence must rebuild");
+        };
+        let state = stored_review_state(&db, listing_id).await;
+        let payload = parse_payload(&state.0, Some(&state.1), state.2).unwrap();
+        assert_eq!(payload.aspects.len(), 1);
+        let aspect = &payload.aspects[0];
+        assert_eq!(aspect.label, "Garmin G5");
+        assert_eq!(
+            aspect.allowed_actions,
+            vec![
+                ReviewAction::UseVerifiedProduct,
+                ReviewAction::CreateVerifiedProduct,
+                ReviewAction::Discard,
+            ]
+        );
+        assert_eq!(aspect.suggested_product, None);
+        assert_eq!(aspect.reuse_attestation_target_id, None);
+        assert_eq!(
+            aspect.covered_associations,
+            [CoveredListingAssociation {
+                listing_link_id: link_id,
+                role: ListingAssociationRole::Installed,
+                avionics_model_id: stale_product_id,
+            }]
+        );
+
+        let restaged = restage_pending_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &first.review_payload_sha256,
+        )
+        .await
+        .unwrap()
+        .expect("the G5 correction must remain pending");
+        let link_evidence: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT source_notes, source_confidence FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(link_evidence, (None, None));
+        let state = stored_review_state(&db, listing_id).await;
+        let payload = parse_payload(&state.0, Some(&state.1), state.2).unwrap();
+        assert_eq!(payload.aspects.len(), 1);
+        assert_eq!(
+            payload.aspects[0].source_evidence_text.as_deref(),
+            Some(evidence)
+        );
+        assert_eq!(
+            payload.aspects[0].source_confidence.as_deref(),
+            Some("high")
+        );
+
+        let RebuildPendingAvionicsReview::Rebuilt {
+            review: Some(second),
+        } = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &restaged.review_payload_sha256,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("the exact prior correction card must align after link evidence is cleared");
+        };
+        assert_eq!(second.pending_aspect_count, 1);
+        let state = stored_review_state(&db, listing_id).await;
+        let payload = parse_payload(&state.0, Some(&state.1), state.2).unwrap();
+        assert_eq!(payload.aspects.len(), 1);
+        assert_eq!(payload.aspects[0].label, "Garmin G5");
+        assert_eq!(payload.aspects[0].covered_associations.len(), 1);
+        assert_eq!(payload.aspects[0].reuse_attestation_target_id, None);
+
+        let remaining = use_existing_product_for_aspect_and_restage(
+            &db,
+            user_id,
+            listing_id,
+            &payload.aspects[0].id,
+            &second.review_payload_sha256,
+            &second.catalog_revision_sha256,
+            corrected_product_id,
+        )
+        .await
+        .unwrap();
+        assert!(remaining.is_none());
+        let corrected_link: (i64, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT avionics_model_id, source_notes, source_confidence FROM aircraft_sale_listing_avionics WHERE id = ?",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            corrected_link,
+            (
+                corrected_product_id,
+                Some(evidence.to_string()),
+                Some("high".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_avionics_rebuild_refuses_non_avionics_state_without_writes() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let evidence = "Garmin G5 installed";
+        let submission_id =
+            insert_review_bound_submission(&db, user_id, listing_id, &format!("<p>{evidence}</p>"))
+                .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "G5",
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
+        let aircraft = PendingReviewAspect::avionics(
+            "aircraft-registration",
+            "aircraft_identity",
+            "N12345",
+            "N12345",
+            "faa_review_required",
+            1,
+            "installed",
+            None,
+            None,
+        );
+        let mut correction = PendingReviewAspect::avionics(
+            "corrected-g5",
+            REVIEWER_CORRECTED_AVIONICS_KIND,
+            "Garmin G5",
+            "reviewer-selected Garmin G5",
+            "reviewer correction",
+            1,
+            "installed",
+            Some(evidence.to_string()),
+            Some("high".to_string()),
+        );
+        correction.proposed_product = Some(ReviewProduct::proposed(
+            "Garmin",
+            "G5",
+            vec!["Flight Display".to_string()],
+        ));
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[aircraft, correction],
+        )
+        .await
+        .unwrap();
+        let before = stored_review_state(&db, listing_id).await;
+        let outcome = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            listing_id,
+            &staged.review_payload_sha256,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            RebuildPendingAvionicsReview::Blocked {
+                listing_id,
+                reason_code: RebuildPendingAvionicsReviewBlockReason::UnsupportedReviewState,
+            }
+        );
+        assert_eq!(stored_review_state(&db, listing_id).await, before);
+    }
+
+    #[tokio::test]
+    async fn explicit_avionics_rebuild_refuses_legacy_and_unrepresented_extractions_without_writes()
+    {
+        let db = test_db().await;
+        let (user_id, legacy_listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "G5", "G5", "Flight Display").await;
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            legacy_listing_id,
+            "<p>Garmin G5 installed</p>",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(r#"{"avionics":[{"manufacturer":"Garmin","model":"G5","types":["Flight Display"],"source_evidence_text":"Garmin G5 installed","source_confidence":"high"}]}"#)
+        .bind(submission_id)
+        .execute(sqlite_pool(&db))
+        .await
+        .unwrap();
+        let link_id = insert_listing_avionics_link(
+            &db,
+            legacy_listing_id,
+            product_id,
+            1,
+            "Garmin G5 installed",
+        )
+        .await;
+        let staged = stage_pending_review(
+            &db,
+            legacy_listing_id,
+            Some(submission_id),
+            &[retained_occurrence_aspect(
+                "legacy-g5",
+                "Garmin",
+                "G5",
+                1,
+                "Garmin G5 installed",
+                link_id,
+                product_id,
+            )],
+        )
+        .await
+        .unwrap();
+        let before = stored_review_state(&db, legacy_listing_id).await;
+        let outcome = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            legacy_listing_id,
+            &staged.review_payload_sha256,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RebuildPendingAvionicsReview::Blocked {
+                reason_code: RebuildPendingAvionicsReviewBlockReason::ExtractionNotCurrent,
+                ..
+            }
+        ));
+        assert_eq!(stored_review_state(&db, legacy_listing_id).await, before);
+
+        let unrepresented_listing_id = insert_additional_listing(
+            &db,
+            user_id,
+            "https://broker.example/aircraft/unrepresented",
+        )
+        .await;
+        let unrepresented_submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            unrepresented_listing_id,
+            "<p>Garmin G3X installed</p>",
+        )
+        .await;
+        sqlx::query("UPDATE plugin_submissions SET source_url = ? WHERE id = ?")
+            .bind("https://broker.example/aircraft/unrepresented")
+            .bind(unrepresented_submission_id)
+            .execute(sqlite_pool(&db))
+            .await
+            .unwrap();
+        store_current_avionics_extraction(
+            &db,
+            unrepresented_submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "G3X",
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin G3X installed",
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
+        let unrepresented = stage_pending_review(
+            &db,
+            unrepresented_listing_id,
+            Some(unrepresented_submission_id),
+            &[PendingReviewAspect::avionics(
+                "unrelated",
+                "avionics",
+                "Garmin GTX 345",
+                "Garmin GTX 345",
+                "legacy_machine_reason",
+                1,
+                "installed",
+                Some("Garmin GTX 345 installed".to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let before = stored_review_state(&db, unrepresented_listing_id).await;
+        let outcome = rebuild_pending_avionics_review_if_current(
+            &db,
+            user_id,
+            unrepresented_listing_id,
+            &unrepresented.review_payload_sha256,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RebuildPendingAvionicsReview::Blocked {
+                reason_code: RebuildPendingAvionicsReviewBlockReason::OccurrenceDispositionUnknown,
+                ..
+            }
+        ));
+        assert_eq!(
+            stored_review_state(&db, unrepresented_listing_id).await,
+            before
+        );
     }
 
     #[tokio::test]

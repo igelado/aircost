@@ -471,6 +471,7 @@ GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
 POST /api/review/listings/{listing_id}/restage
+POST /api/review/listings/{listing_id}/avionics/rebuild
 POST /api/review/listings/{listing_id}/avionics/consolidate
 POST /api/review/listings/{listing_id}/avionics/use-existing
 POST /api/review/listings/{listing_id}/avionics/revise
@@ -485,6 +486,22 @@ only the stale relationship component, recreates cards from the current link
 set, and retains independent raw observations. Correction and final resolution
 remain strict: they reject stale covered links instead of repairing them
 implicitly.
+
+The avionics rebuild endpoint is a separate, explicitly confirmed reset of the
+machine-owned avionics cards. It accepts the current `review_payload_sha256`,
+uses only the exact retained current-schema extraction, current catalog,
+listing links, authorizations, and reviewer-owned corrections, and never calls
+Gemini. It does not run during ordinary restage or page load. Because historical
+discard decisions do not have a durable disposition ledger, the server first
+requires every retained extraction occurrence to have a one-to-one claim in a
+current link or residual avionics review aspect. Legacy/defaulted extraction
+fields, stale capture bindings, ambiguous matches, an unrepresented occurrence,
+or review state outside the avionics workflow return a typed `blocked` response
+without changing the review. The response exposes only a stable `reason_code`
+and fixed safe message; parser and database details are not reflected to the
+browser. A successful `rebuilt` response carries the new hash-bound review; the
+browser warns that unresolved machine cards may need review again before it
+sends the request.
 
 The aspect-scoped consolidation endpoint never calls Gemini. A reviewer cites
 authoritative evidence and names one survivor plus the complete set of

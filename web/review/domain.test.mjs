@@ -5,6 +5,7 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  avionicsRebuildBlockMessage,
   avionicsObservationCorrectionDraft,
   avionicsObservationRevisionRequest,
   associationsNeedingSourceRecovery,
@@ -39,6 +40,7 @@ import {
 const PRODUCTION_REASON_CODES = [
   "listing_action_graph_invalid",
   "raw_observation_unlinked",
+  "catalog_product_unresolved",
   "catalog_product_unverified",
   "catalog_product_reuse_attestation_missing",
   "catalog_product_or_listing_corroboration_missing",
@@ -73,6 +75,7 @@ const PRODUCTION_REASON_CODES = [
 
 const LIVE_REASON_CODES = [
   "listing_action_graph_invalid",
+  "catalog_product_unresolved",
   "catalog_product_unverified",
   "listing_link_confidence_not_high",
   "raw_observation_unlinked",
@@ -82,6 +85,40 @@ const LIVE_REASON_CODES = [
   "raw_observation_ambiguous",
   "raw_observation_identity_unusable",
 ];
+
+test("avionics rebuild block reasons use fixed non-reflective copy", () => {
+  const expected = new Map([
+    [
+      "retained_source_missing",
+      "The retained listing source is unavailable. Capture the listing again before rebuilding its avionics review.",
+    ],
+    [
+      "extraction_not_current",
+      "The retained extraction does not satisfy the current avionics schema. Run a validated re-extraction before rebuilding its review.",
+    ],
+    [
+      "occurrence_disposition_unknown",
+      "At least one retained avionics occurrence has no current review or listing-link disposition. Run a validated re-extraction before rebuilding its review.",
+    ],
+    [
+      "unsupported_review_state",
+      "This review includes state outside the avionics workflow. No review state was changed.",
+    ],
+  ]);
+
+  for (const [reasonCode, message] of expected) {
+    assert.equal(avionicsRebuildBlockMessage(reasonCode), message);
+  }
+
+  const untrustedDetail = "secret parser detail: quantity failed at avionics[7]";
+  const fallback = avionicsRebuildBlockMessage(untrustedDetail);
+  assert.equal(
+    fallback,
+    "The avionics cards could not be rebuilt safely. No review state was changed.",
+  );
+  assert.equal(fallback.includes(untrustedDetail), false);
+  assert.equal(avionicsRebuildBlockMessage("toString"), fallback);
+});
 
 test("builds one canonical source-free request for every existing-product aspect", () => {
   const expected = {
@@ -649,6 +686,15 @@ test("describes the current multi-code sample with safe user-facing copy", () =>
       },
     ],
   );
+});
+
+test("explains a rebuilt observation with no verified product match", () => {
+  assert.deepEqual(describeReviewReasons("catalog_product_unresolved"), [{
+    code: "catalog_product_unresolved",
+    label: "No verified product match",
+    detail: "Select an existing verified product, create the confirmed product, or discard this listing item.",
+    isListingLevel: false,
+  }]);
 });
 
 test("maps every production code, including every code present in the live database", () => {

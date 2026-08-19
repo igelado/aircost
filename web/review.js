@@ -17,6 +17,7 @@ import {
   REVIEW_AREAS,
   REVIEW_PRODUCT_IDENTITY_LIMITS,
   aircraftIdentityIsVerified,
+  avionicsRebuildBlockMessage,
   avionicsObservationCorrectionDraft,
   avionicsObservationRevisionRequest,
   associationsNeedingSourceRecovery,
@@ -256,6 +257,7 @@ function collectElements() {
     reviewAvionicsAspects: "#review-avionics-aspects",
     reviewProgress: "#review-progress",
     reviewProgressLabel: "#review-progress-label",
+    rebuildAvionicsReview: "#rebuild-avionics-review",
     automaticallyVerifyListing: "#automatically-verify-listing",
     verifyListing: "#verify-listing",
   })) {
@@ -385,6 +387,7 @@ function bindEvents() {
     "click",
     automaticallyVerifyListing,
   );
+  elements.rebuildAvionicsReview.addEventListener("click", rebuildAvionicsReview);
   elements.verifyListing.addEventListener("click", resolveReview);
   window.addEventListener("popstate", () => {
     if (!elements.reviewPanel.classList.contains("is-active")) {
@@ -3263,6 +3266,12 @@ function updateProgress() {
     || drafts.some((draft) => draft.correction.dirty || draft.correction.saving)
     || !hashesPresent
     || !aircraftVerified;
+  elements.rebuildAvionicsReview.disabled = state.resolving
+    || state.automating
+    || state.stale
+    || !state.currentReview
+    || drafts.some((draft) => draft.correction.dirty || draft.correction.saving)
+    || !nonBlank(state.currentReview?.review_payload_sha256);
   elements.automaticallyVerifyListing.disabled = state.resolving
     || state.automating
     || state.stale
@@ -3284,6 +3293,69 @@ async function automaticallyVerifyListing() {
     return;
   }
   await startVerificationRun([review.listing_id], { openedListing: true });
+}
+
+async function rebuildAvionicsReview() {
+  const review = state.currentReview;
+  if (!review || state.stale || state.resolving || state.automating) {
+    return;
+  }
+  if (!confirm(
+    "Reset machine-generated avionics cards from the complete retained extraction? "
+      + "Reviewer corrections and current listing links are preserved. This is provider-free, "
+      + "but every extracted occurrence may need to be reviewed again.",
+  )) {
+    return;
+  }
+  setAutomaticVerificationBusy(true);
+  setWorkspaceMessage("Rebuilding avionics cards from the retained extraction…");
+  try {
+    const payload = await api(
+      `/api/review/listings/${review.listing_id}/avionics/rebuild`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          review_payload_sha256: review.review_payload_sha256,
+        }),
+      },
+    );
+    if (payload?.status === "blocked") {
+      setWorkspaceMessage(
+        `Cards were not changed. ${avionicsRebuildBlockMessage(payload.reason_code)}`,
+        true,
+      );
+      return;
+    }
+    if (payload?.status !== "rebuilt") {
+      throw new Error("The server returned an invalid avionics rebuild result.");
+    }
+    if (payload.review_complete === true) {
+      await leaveAutomaticallyVerifiedReview(
+        review.listing_id,
+        state.reviews.slice(),
+        "The rebuilt avionics review is complete",
+      );
+      return;
+    }
+    if (!isReviewDetail(payload.review, review.listing_id)) {
+      throw new Error("The server returned an invalid rebuilt listing review.");
+    }
+    state.currentReview = payload.review;
+    state.drafts.clear();
+    initializeDrafts(payload.review);
+    renderReview();
+    setWorkspaceMessage(
+      "Avionics cards were rebuilt locally from the strict retained extraction.",
+    );
+  } catch (error) {
+    if (isStaleError(error)) {
+      markStale(error.message);
+    } else {
+      setWorkspaceMessage(`Could not rebuild avionics cards: ${error.message}`, true);
+    }
+  } finally {
+    setAutomaticVerificationBusy(false);
+  }
 }
 
 async function leaveAutomaticallyVerifiedReview(listingId, previousQueue, label) {
@@ -3969,6 +4041,7 @@ function setWorkspaceLoading(listingId) {
   elements.reviewProgress.value = 0;
   elements.reviewProgressLabel.textContent = "Loading decisions";
   elements.automaticallyVerifyListing.disabled = true;
+  elements.rebuildAvionicsReview.disabled = true;
   elements.verifyListing.disabled = true;
   updateNextButton(listingId);
 }
@@ -3994,6 +4067,7 @@ function renderReviewLoadError(listingId, error) {
   elements.reviewAvionicsTabCount.textContent = "0";
   setActiveReviewArea("avionics", { updateLocation: true });
   elements.automaticallyVerifyListing.disabled = true;
+  elements.rebuildAvionicsReview.disabled = true;
   elements.verifyListing.disabled = true;
   elements.reviewProgressLabel.textContent = "Review unavailable";
   setWorkspaceMessage("Review details could not be loaded.", true);
@@ -4060,6 +4134,7 @@ function showQueue({ historyMode = "push", discardDraft = false } = {}) {
   state.automationControlStates.clear();
   elements.reviewWorkspace.setAttribute("aria-busy", "false");
   elements.automaticallyVerifyListing.disabled = true;
+  elements.rebuildAvionicsReview.disabled = true;
   elements.reviewWorkspace.classList.add("is-hidden");
   elements.reviewQueueView.classList.remove("is-hidden");
   updateReviewLocation(null, historyMode);

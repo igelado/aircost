@@ -21,6 +21,10 @@ use crate::extract::GeminiListingExtractor;
 use crate::gemini::interactions::RetryPolicy;
 use crate::gemini::usage::SourceCorrelation;
 use crate::html::clean::clean_listing_html;
+use crate::listing::avionics::extraction::{
+    parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
+    validate_current_avionics_identity_evidence,
+};
 use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
     validate_canonical_avionics_actions, CanonicalAvionicsAction,
@@ -3468,7 +3472,7 @@ async fn retained_review_observations(
         });
     }
     if (!avionics.is_empty()
-        && validate_exact_listing_evidence(&avionics, listing_context).is_err())
+        && validate_current_avionics_identity_evidence(&avionics, listing_context).is_err())
         || (avionics.is_empty() && preserved_aspects.is_empty())
     {
         return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
@@ -3638,7 +3642,7 @@ fn retained_avionics_source(
                     .to_string(),
             }
         }
-        Ok(avionics) => match validate_exact_listing_evidence(&avionics, listing_context) {
+        Ok(avionics) => match validate_current_avionics_identity_evidence(&avionics, listing_context) {
             Ok(()) => RetainedAvionicsSource::Current(avionics),
             Err(error) => RetainedAvionicsSource::RequiresReextraction {
                 reason: format!(
@@ -3944,12 +3948,9 @@ async fn reextract_avionics(
         .extract(listing_text)
         .await
         .map_err(|error| format!("Gemini listing extraction request failed: {error}"))?;
-    validate_reextracted_occurrence_json(&extracted).map_err(|error| {
-        format!("Gemini returned invalid current-schema avionics occurrence data: {error}")
-    })?;
-    let avionics = parse_raw_avionics_value(&extracted).map_err(|error| {
+    let avionics = parse_current_avionics_extraction_value(&extracted).map_err(|error| {
         format!(
-            "Gemini returned output incompatible with the current capability-array schema: {error}"
+            "Gemini returned output incompatible with the current explicit occurrence schema: {error}"
         )
     })?;
     for (index, observation) in avionics.iter().enumerate() {
@@ -3959,7 +3960,7 @@ async fn reextract_avionics(
             ));
         }
     }
-    validate_exact_listing_evidence(&avionics, listing_context).map_err(|error| {
+    validate_current_avionics_identity_evidence(&avionics, listing_context).map_err(|error| {
         format!("Gemini returned listing evidence not present in the retained source: {error}")
     })?;
     let extracted_listing_json = if avionics.is_empty() {
@@ -4009,152 +4010,8 @@ fn merge_validated_avionics_into_prior_extraction(
         .map_err(|error| format!("could not serialize validated listing extraction: {error}"))
 }
 
-fn validate_reextracted_occurrence_json(value: &Value) -> Result<(), String> {
-    let observations = value
-        .get("avionics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "top-level avionics array is missing".to_string())?;
-    for (index, observation) in observations.iter().enumerate() {
-        let path = format!("avionics[{index}]");
-        let object = observation
-            .as_object()
-            .ok_or_else(|| format!("{path} must be an object"))?;
-        let quantity = object
-            .get("quantity")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| format!("{path}.quantity must be an explicit integer"))?;
-        if quantity < 1 {
-            return Err(format!("{path}.quantity must be at least 1"));
-        }
-        let action = object
-            .get("configuration_action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{path}.configuration_action must be an explicit installed, replaces, or removes value"
-                )
-            })?;
-        if !matches!(action, "installed" | "replaces" | "removes") {
-            return Err(format!(
-                "{path}.configuration_action must be installed, replaces, or removes"
-            ));
-        }
-        let replacement = object.get("replaces").ok_or_else(|| {
-            format!("{path}.replaces must be explicit null or one replacement object")
-        })?;
-        match action {
-            "installed" if !replacement.is_null() => {
-                return Err(format!(
-                    "{path} installed occurrence must use replaces=null"
-                ));
-            }
-            "replaces" | "removes" if !replacement.is_object() => {
-                return Err(format!(
-                    "{path} {action} occurrence requires one replacement object"
-                ));
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn parse_raw_avionics(raw_json: &str) -> Result<Vec<ParsedAvionics>, String> {
-    let value: Value =
-        serde_json::from_str(raw_json).map_err(|error| format!("invalid JSON: {error}"))?;
-    parse_raw_avionics_value(&value)
-}
-
-fn parse_raw_avionics_value(value: &Value) -> Result<Vec<ParsedAvionics>, String> {
-    let values = value
-        .get("avionics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "top-level avionics array is missing".to_string())?;
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            validate_capability_array(value, &format!("avionics[{index}]"))?;
-            validate_listing_evidence_fields(value, &format!("avionics[{index}]"))?;
-            if let Some(replacement) = value.get("replaces").filter(|value| !value.is_null()) {
-                validate_capability_array(replacement, &format!("avionics[{index}].replaces"))?;
-            }
-            serde_json::from_value::<ParsedAvionics>(value.clone())
-                .map_err(|error| format!("avionics[{index}] is invalid: {error}"))
-        })
-        .collect()
-}
-
-fn validate_capability_array(value: &Value, path: &str) -> Result<(), String> {
-    let Some(types) = value.get("types").and_then(Value::as_array) else {
-        return Err(format!(
-            "{path}.types must be a non-empty array; scalar type payloads are intentionally unsupported"
-        ));
-    };
-    if types.is_empty()
-        || types.iter().any(|avionics_type| {
-            avionics_type
-                .as_str()
-                .is_none_or(|value| value.trim().is_empty())
-        })
-    {
-        return Err(format!(
-            "{path}.types must contain at least one non-empty string"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_listing_evidence_fields(value: &Value, path: &str) -> Result<(), String> {
-    let evidence = value
-        .get("source_evidence_text")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|evidence| !evidence.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "{path}.source_evidence_text must be one non-empty exact listing-source excerpt"
-            )
-        })?;
-    if evidence.len() > crate::listing::evidence::MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES {
-        return Err(format!(
-            "{path}.source_evidence_text exceeds the bounded listing-evidence limit"
-        ));
-    }
-    let confidence = value
-        .get("source_confidence")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{path}.source_confidence must be high, medium, or low"))?;
-    if !matches!(confidence, "high" | "medium" | "low") {
-        return Err(format!(
-            "{path}.source_confidence must be high, medium, or low"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_exact_listing_evidence(
-    avionics: &[ParsedAvionics],
-    listing_context: &ListingEvidenceContext,
-) -> Result<(), String> {
-    for (index, observation) in avionics.iter().enumerate() {
-        let evidence = observation
-            .source_evidence_text
-            .as_deref()
-            .expect("schema validation requires listing evidence")
-            .trim();
-        let bounded_context = listing_context.for_candidate(
-            &observation.manufacturer,
-            &observation.model,
-            Some(evidence),
-        );
-        if !bounded_context.contains(evidence) {
-            return Err(format!(
-                "avionics[{index}].source_evidence_text is not one exact bounded excerpt containing the candidate identity"
-            ));
-        }
-    }
-    Ok(())
+    parse_current_avionics_extraction_json(raw_json)
 }
 
 async fn load_listing_sources(
@@ -5006,12 +4863,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_parser_preserves_capability_arrays_and_action_defaults() {
+    fn raw_parser_preserves_capability_arrays_and_explicit_actions() {
         let parsed = parse_raw_avionics(
             r#"{
               "avionics": [
                 {
                   "manufacturer":"Garmin","model":"GTX 345R","types":["Transponder"],"quantity":1,
+                  "configuration_action":"installed","replaces":null,
                   "source_evidence_text":"Garmin GTX 345R transponder",
                   "source_confidence":"high"
                 },
@@ -5566,7 +5424,7 @@ mod tests {
             "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
             "configuration_action": "installed", "replaces": null
         }]});
-        assert!(validate_reextracted_occurrence_json(&missing_quantity)
+        assert!(parse_current_avionics_extraction_value(&missing_quantity)
             .unwrap_err()
             .contains("quantity must be an explicit integer"));
 
@@ -5574,7 +5432,7 @@ mod tests {
             "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
             "quantity": 1, "replaces": null
         }]});
-        assert!(validate_reextracted_occurrence_json(&missing_action)
+        assert!(parse_current_avionics_extraction_value(&missing_action)
             .unwrap_err()
             .contains("configuration_action must be an explicit"));
 
@@ -5582,9 +5440,11 @@ mod tests {
             "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
             "quantity": 1, "configuration_action": "replaces", "replaces": null
         }]});
-        assert!(validate_reextracted_occurrence_json(&missing_replacement)
-            .unwrap_err()
-            .contains("requires one replacement object"));
+        assert!(
+            parse_current_avionics_extraction_value(&missing_replacement)
+                .unwrap_err()
+                .contains("requires one replacement object")
+        );
 
         let unexpected_replacement = json!({"avionics": [{
             "manufacturer": "Garmin", "model": "G5", "types": ["Flight Display"],
@@ -5592,7 +5452,7 @@ mod tests {
             "replaces": {"manufacturer": "Garmin", "model": "G3X", "types": ["Flight Display"]}
         }]});
         assert!(
-            validate_reextracted_occurrence_json(&unexpected_replacement)
+            parse_current_avionics_extraction_value(&unexpected_replacement)
                 .unwrap_err()
                 .contains("must use replaces=null")
         );
@@ -5642,6 +5502,8 @@ mod tests {
               "model":"GNX 375",
               "types":["GPS","Transponder"],
               "quantity":1,
+              "configuration_action":"installed",
+              "replaces":null,
               "source_evidence_text":"Garmin GNX 375",
               "source_confidence":"high"
             }
@@ -5667,7 +5529,9 @@ mod tests {
             "manufacturer":"Garmin",
             "model":"GNX 375",
             "types":["GPS","Transponder"],
-            "quantity":1
+            "quantity":1,
+            "configuration_action":"installed",
+            "replaces":null
           }]
         }"#;
 
@@ -5726,6 +5590,9 @@ mod tests {
             "manufacturer":"Garmin",
             "model":"GNX 375",
             "types":["GPS","Transponder"],
+            "quantity":1,
+            "configuration_action":"installed",
+            "replaces":null,
             "source_evidence_text":"Garmin GNX 375 with invented qualifier",
             "source_confidence":"high"
           }]
@@ -5739,7 +5606,7 @@ mod tests {
         let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
             panic!("model-produced evidence absent from the source must never be replayed")
         };
-        assert!(reason.contains("not one exact bounded excerpt"));
+        assert!(reason.contains("not one exact bounded source excerpt"));
     }
 
     #[test]
@@ -6209,7 +6076,7 @@ mod tests {
             "https://example.test/listing/51",
             "<p>Attached GTX 345R installed</p>",
             Some(
-                r#"{"avionics":[{"manufacturer":"Garmin","model":"Attached","types":["Transponder"],"source_evidence_text":"Attached GTX 345R installed","source_confidence":"high"}]}"#,
+                r#"{"avionics":[{"manufacturer":"Garmin","model":"Attached","types":["Transponder"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Attached GTX 345R installed","source_confidence":"high"}]}"#,
             ),
             None,
             Some("prior extraction warning"),
@@ -6918,6 +6785,7 @@ mod tests {
                     "types": ["GPS"],
                     "quantity": 1,
                     "configuration_action": "installed",
+                    "replaces": null,
                     "source_evidence_text": generic_evidence,
                     "source_confidence": "high"
                 },
@@ -7077,6 +6945,7 @@ mod tests {
                 "types": ["GPS"],
                 "quantity": 1,
                 "configuration_action": "installed",
+                "replaces": null,
                 "source_evidence_text": paid_evidence,
                 "source_confidence": "high"
             }]
@@ -7582,7 +7451,7 @@ mod tests {
         let rendered_html =
             format!("{rendered_html}<p>{ineligible_evidence}</p><p>{ordinary_evidence}</p>");
         let extracted_listing_json = format!(
-            r#"{{"avionics":[{{"manufacturer":"","model":"Replacement Package","types":["GPS"],"quantity":1,"configuration_action":"installed","source_evidence_text":"{ordinary_evidence}","source_confidence":"high"}}]}}"#
+            r#"{{"avionics":[{{"manufacturer":"Unknown","model":"Replacement Package","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"{ordinary_evidence}","source_confidence":"high"}}]}}"#
         );
         sqlx::query(
             r#"
@@ -8479,7 +8348,7 @@ mod tests {
             &source_url,
             "<p>GARMIN GPS installed</p>",
             Some(
-                r#"{"avionics":[{"manufacturer":"GARMIN","model":"GPS","types":["GPS"],"quantity":1,"configuration_action":"installed","source_evidence_text":"GARMIN GPS","source_confidence":"high"}]}"#,
+                r#"{"avionics":[{"manufacturer":"GARMIN","model":"GPS","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"GARMIN GPS","source_confidence":"high"}]}"#,
             ),
             Some(listing_id),
             None,

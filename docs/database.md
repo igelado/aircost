@@ -271,6 +271,19 @@ row moves the listing to `pending_review`; unresolved text is not inserted into
 reviewed. Replacing the bundle is an upsert, and deleting the listing cascades
 to its bundle.
 
+An explicit avionics review rebuild is permitted only from an exactly bound
+retained submission using the current explicit occurrence schema. Before any
+write, every extracted occurrence must be represented one-to-one by a current
+listing link or residual avionics aspect; reviewer corrections and their
+connected replacement components are preserved exactly. The database has no
+durable historical discard ledger, so an occurrence with no such claim cannot
+be safely distinguished from a prior discard. That case returns `blocked` with
+the stable `occurrence_disposition_unknown` reason code, rolls back the
+transaction, and leaves the pending review byte-for-byte unchanged rather than
+reconstructing or guessing review state. Reviews containing non-avionics state
+are also refused before review mutation because this reset has an avionics-only
+public contract.
+
 `aircraft_model_variant_default_avionics`
 
 Stores factory/default avionics for a variant/model year. This is used when a
@@ -442,6 +455,12 @@ replacement or unapproved shapes are not blanket-rewritten; their unverified
 link notes are excluded from review evidence. The reviewer endpoint
 `POST /api/review/listings/{id}/restage` is the apply path for this repair and
 updates the review hash in the same transaction.
+
+Restage remains lossless maintenance of the existing review. The separately
+named `POST /api/review/listings/{id}/avionics/rebuild` boundary is the only
+path that replaces machine-owned avionics cards from the complete retained
+extraction. It is provider-free, current-review-hash guarded, and fail-closed
+when the retained extraction or occurrence coverage proof is incomplete.
 
 Reuse attestations use the `avionics_reuse_v2` policy and a v2 fingerprint
 domain that identifies the target-aware OEM proof semantics. The v2 migration
