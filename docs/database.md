@@ -1705,16 +1705,20 @@ migrations/20260819_reference_catalog_cutover.sqlite.sql
 migrations/20260819_reference_catalog_cutover.postgres.sql
 ```
 
-The migration adds the price configuration-basis discriminator and the four
-fact-set completeness attestations, then replaces the publication gates. It
-permanently drops the old specification, variant-price, default-avionics,
+The one-time migration runs inside one `BEGIN IMMEDIATE` SQLite transaction or
+one PostgreSQL transaction. It adds the price configuration-basis discriminator
+and the four fact-set completeness attestations, then replaces the publication
+gates. It permanently drops the old specification, variant-price, default-avionics,
 airframe-depreciation, fit-metadata, and component-depreciation tables; none of
-their rows are copied into the immutable catalog. Rehearse the SQLite migration
-on a disposable copy with writers stopped:
+their rows are copied into the immutable catalog. Any error, including a late
+contract-write failure, restores all seven legacy tables and their old triggers.
+Bounded applicability created outside the final universal serial-key contract
+fails the preflight before destructive work. Rehearse the SQLite migration on a
+consistent disposable backup:
 
 ```sh
 rehearsal_db="$(mktemp /tmp/aircost-reference-cutover.XXXXXX.sqlite3)"
-cp data/aircost.sqlite3 "$rehearsal_db"
+sqlite3 data/aircost.sqlite3 ".backup '$rehearsal_db'"
 sqlite3 -bail "$rehearsal_db" \
   ".read migrations/20260819_reference_catalog_cutover.sqlite.sql" \
   "PRAGMA foreign_key_check;" \
@@ -1779,8 +1783,8 @@ WHERE type = 'table'
   );
 ```
 
-The contract must be version `2` with fingerprint
-`e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f`.
+The contract must be version `1` with fingerprint
+`6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e`.
 Listing reference resolution uses only one complete published version matching
 the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
 scope. Missing and ambiguous matches remain ineligible for snapshots, training,

@@ -2028,8 +2028,8 @@ JOIN avionics_catalog_human_consolidation_claim claim
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260819_reference_catalog_cutover', 2,
-  'e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f',
+  '20260819_reference_catalog_cutover', 1,
+  '6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
@@ -4586,7 +4586,7 @@ CREATE TABLE IF NOT EXISTS aircraft_reference_applicability_scopes (
       AND aircraft_serial_number_scheme_id IS NOT NULL
       AND serial_from_display IS NOT NULL AND serial_to_display IS NOT NULL
       AND serial_from_sort_key IS NOT NULL AND serial_to_sort_key IS NOT NULL
-      AND serial_from_sort_key <= serial_to_sort_key)
+      AND serial_from_sort_key COLLATE BINARY <= serial_to_sort_key COLLATE BINARY)
   ),
   UNIQUE (
     aircraft_reference_configuration_version_id, aircraft_market_id,
@@ -4600,6 +4600,86 @@ CREATE INDEX IF NOT EXISTS idx_aircraft_reference_scope_market
     aircraft_market_id, aircraft_serial_number_scheme_id,
     serial_from_sort_key, serial_to_sort_key
   );
+
+-- Recompute every stored bound from its canonical display value. This view is
+-- also used by the insert trigger so direct SQL cannot create a second,
+-- caller-defined ordering domain.
+CREATE VIEW IF NOT EXISTS aircraft_reference_serial_key_errors AS
+WITH RECURSIVE
+bounds(scope_id, bound_name, serial_value, stored_key) AS (
+  SELECT id, 'from', serial_from_display, serial_from_sort_key
+  FROM aircraft_reference_applicability_scopes
+  WHERE applies_to_all_serials = 0
+  UNION ALL
+  SELECT id, 'to', serial_to_display, serial_to_sort_key
+  FROM aircraft_reference_applicability_scopes
+  WHERE applies_to_all_serials = 0
+),
+state(
+  scope_id, bound_name, serial_value, stored_key,
+  position, segment, alpha_hex, numeric_segment, encoded
+) AS (
+  SELECT
+    scope_id, bound_name, serial_value, stored_key, 2,
+    substr(serial_value, 1, 1),
+    CASE WHEN substr(serial_value, 1, 1) GLOB '[0-9]' THEN ''
+      ELSE printf('%02X', instr(
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, 1, 1)
+      )) END,
+    substr(serial_value, 1, 1) GLOB '[0-9]', '01'
+  FROM bounds
+  UNION ALL
+  SELECT
+    scope_id, bound_name, serial_value, stored_key, position + 1,
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN segment || substr(serial_value, position, 1)
+      ELSE substr(serial_value, position, 1) END,
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN alpha_hex || CASE WHEN numeric_segment THEN '' ELSE printf(
+        '%02X', instr('ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, position, 1))
+      ) END
+      ELSE CASE WHEN substr(serial_value, position, 1) GLOB '[0-9]' THEN ''
+        ELSE printf('%02X', instr(
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, position, 1)
+        )) END END,
+    substr(serial_value, position, 1) GLOB '[0-9]',
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN encoded
+      ELSE encoded || CASE WHEN numeric_segment THEN
+        '20'
+        || printf('%08X', length(CASE WHEN trim(segment, '0') = ''
+          THEN '0' ELSE ltrim(segment, '0') END))
+        || CASE WHEN trim(segment, '0') = '' THEN '0' ELSE ltrim(segment, '0') END
+        || printf('%08X', length(segment)) || segment
+      ELSE '10' || alpha_hex || '00' END END
+  FROM state
+  WHERE position <= length(serial_value)
+),
+expected(scope_id, bound_name, expected_key) AS (
+  SELECT scope_id, bound_name,
+    encoded || CASE WHEN numeric_segment THEN
+      '20'
+      || printf('%08X', length(CASE WHEN trim(segment, '0') = ''
+        THEN '0' ELSE ltrim(segment, '0') END))
+      || CASE WHEN trim(segment, '0') = '' THEN '0' ELSE ltrim(segment, '0') END
+      || printf('%08X', length(segment)) || segment
+    ELSE '10' || alpha_hex || '00' END || '00'
+  FROM state
+  WHERE position = length(serial_value) + 1
+)
+SELECT
+  bounds.scope_id, bounds.bound_name, bounds.serial_value,
+  bounds.stored_key, expected.expected_key
+FROM bounds
+LEFT JOIN expected
+  ON expected.scope_id = bounds.scope_id
+ AND expected.bound_name = bounds.bound_name
+WHERE bounds.serial_value IS NULL
+   OR bounds.serial_value = ''
+   OR bounds.serial_value <> upper(bounds.serial_value)
+   OR bounds.serial_value GLOB '*[^A-Z0-9]*'
+   OR expected.expected_key IS NULL
+   OR bounds.stored_key IS NOT expected.expected_key;
 
 CREATE TABLE IF NOT EXISTS aircraft_reference_prices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5047,7 +5127,8 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
-WHEN NOT EXISTS (
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+OR NOT EXISTS (
   SELECT 1 FROM aircraft_identity_decisions decision
   JOIN aircraft_identity_decision_claims dc ON dc.decision_id = decision.id
   JOIN curation_evidence_claims claim ON claim.id = dc.evidence_claim_id
@@ -5056,7 +5137,11 @@ WHEN NOT EXISTS (
     AND decision.decision_action = 'approve_new' AND decision.entity_kind = 'serial_scheme'
     AND claim.validation_status = 'validated'
 )
-BEGIN SELECT RAISE(ABORT, 'serial scheme requires an approved evidence-backed decision'); END;
+BEGIN SELECT RAISE(ABORT, 'serial scheme requires the universal ordering and an approved evidence-backed decision'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_serial_schemes_preserve_ordering
+BEFORE UPDATE OF normalization_version ON aircraft_serial_number_schemes
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+BEGIN SELECT RAISE(ABORT, 'serial scheme ordering version is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS aircraft_feature_definitions_require_approval
 BEFORE INSERT ON aircraft_feature_definitions
@@ -5112,17 +5197,39 @@ BEFORE INSERT ON aircraft_reference_applicability_scopes
 WHEN NEW.applies_to_all_serials = 0 AND (
   NEW.serial_from_sort_key <> upper(NEW.serial_from_sort_key)
   OR NEW.serial_to_sort_key <> upper(NEW.serial_to_sort_key)
-  OR NEW.serial_from_sort_key GLOB '*[^A-Z0-9]*'
-  OR NEW.serial_to_sort_key GLOB '*[^A-Z0-9]*'
+  OR NEW.serial_from_sort_key GLOB '*[^A-F0-9]*'
+  OR NEW.serial_to_sort_key GLOB '*[^A-F0-9]*'
+  OR substr(NEW.serial_from_sort_key, 1, 2) <> '01'
+  OR substr(NEW.serial_to_sort_key, 1, 2) <> '01'
+  OR substr(NEW.serial_from_sort_key, -2) <> '00'
+  OR substr(NEW.serial_to_sort_key, -2) <> '00'
+  OR NEW.serial_from_sort_key COLLATE BINARY
+       > NEW.serial_to_sort_key COLLATE BINARY
+  OR NOT EXISTS (
+    SELECT 1 FROM aircraft_serial_number_schemes scheme
+    WHERE scheme.id = NEW.aircraft_serial_number_scheme_id
+      AND scheme.normalization_version = 'natural_alphanumeric_segments_v1'
+  )
   OR (
     NEW.serial_prefix IS NOT NULL
     AND (
       NEW.serial_prefix <> upper(NEW.serial_prefix)
       OR NEW.serial_prefix GLOB '*[^A-Z0-9]*'
+      OR substr(NEW.serial_from_display, 1, length(NEW.serial_prefix))
+           <> NEW.serial_prefix
+      OR substr(NEW.serial_to_display, 1, length(NEW.serial_prefix))
+           <> NEW.serial_prefix
     )
   )
 )
 BEGIN SELECT RAISE(ABORT, 'reference serial applicability requires canonical sort keys'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_scope_key_recompute_insert
+AFTER INSERT ON aircraft_reference_applicability_scopes
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_serial_key_errors error
+  WHERE error.scope_id = NEW.id
+)
+BEGIN SELECT RAISE(ABORT, 'reference serial sort keys must be recomputed from canonical display values'); END;
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_price_building_insert
 BEFORE INSERT ON aircraft_reference_prices
 WHEN NOT EXISTS (
@@ -5405,12 +5512,10 @@ BEGIN
       AND (
         left_scope.applies_to_all_serials = 1
         OR right_scope.applies_to_all_serials = 1
-        OR (
-          left_scope.aircraft_serial_number_scheme_id = right_scope.aircraft_serial_number_scheme_id
-          AND coalesce(left_scope.serial_prefix, '') = coalesce(right_scope.serial_prefix, '')
-          AND left_scope.serial_from_sort_key <= right_scope.serial_to_sort_key
-          AND right_scope.serial_from_sort_key <= left_scope.serial_to_sort_key
-        )
+        OR (left_scope.serial_from_sort_key COLLATE BINARY
+              <= right_scope.serial_to_sort_key COLLATE BINARY
+          AND right_scope.serial_from_sort_key COLLATE BINARY
+              <= left_scope.serial_to_sort_key COLLATE BINARY)
       )
   );
   SELECT RAISE(ABORT, 'published reference profile applicability overlaps an existing version')
@@ -5429,12 +5534,10 @@ BEGIN
       AND (
         candidate.applies_to_all_serials = 1
         OR existing.applies_to_all_serials = 1
-        OR (
-          candidate.aircraft_serial_number_scheme_id = existing.aircraft_serial_number_scheme_id
-          AND coalesce(candidate.serial_prefix, '') = coalesce(existing.serial_prefix, '')
-          AND candidate.serial_from_sort_key <= existing.serial_to_sort_key
-          AND existing.serial_from_sort_key <= candidate.serial_to_sort_key
-        )
+        OR (candidate.serial_from_sort_key COLLATE BINARY
+              <= existing.serial_to_sort_key COLLATE BINARY
+          AND existing.serial_from_sort_key COLLATE BINARY
+              <= candidate.serial_to_sort_key COLLATE BINARY)
       )
   );
 END;

@@ -140,10 +140,15 @@ then supersedes the predecessor and publishes the successor atomically. A
 failed publication restores the predecessor and removes the attempted version.
 Published facts are not edited in place. Overlapping published versions that
 would make a listing ambiguous are rejected by publication and fail closed at
-resolution. Bounded serial displays are canonicalized once through their
-declared make-specific serial scheme; inconsistent caller sort keys are
-rejected, and storage, overlap checks, and runtime matching use the same
-uppercase alphanumeric keys.
+resolution. A make-specific serial scheme validates the normalized serial
+shape; it does not define a separate ordering. The caller supplies only serial
+display bounds and an optional prefix. The application normalizes those values
+and derives a `natural_alphanumeric_segments_v1` key whose alphabetic and
+numeric segments preserve natural order across variable widths. Both database
+backends independently recompute the key from the stored canonical display and
+reject caller-defined keys or an unrelated prefix. Inclusive overlap checks use
+that one ordering across prefixes and scheme IDs; an all-serial scope overlaps
+every bounded scope in the same market/configuration/year.
 
 ## Curating A Reference Version
 

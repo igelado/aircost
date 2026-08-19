@@ -10,7 +10,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
-use crate::aircraft::catalog::normalize_aircraft_serial_retrieval_key;
+use crate::aircraft::catalog::{
+    aircraft_serial_sort_key, normalize_aircraft_serial_retrieval_key,
+    AIRCRAFT_SERIAL_SORT_KEY_VERSION,
+};
 use crate::db::{AppDb, DatabaseBackend};
 
 #[derive(Debug)]
@@ -100,9 +103,20 @@ pub struct ReferenceApplicabilityDraft {
     pub serial_prefix: Option<String>,
     pub serial_from_display: Option<String>,
     pub serial_to_display: Option<String>,
-    pub serial_from_sort_key: Option<String>,
-    pub serial_to_sort_key: Option<String>,
     pub evidence_claim_id: i64,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalReferenceApplicability {
+    aircraft_market_id: i64,
+    applies_to_all_serials: bool,
+    aircraft_serial_number_scheme_id: Option<i64>,
+    serial_prefix: Option<String>,
+    serial_from_display: Option<String>,
+    serial_to_display: Option<String>,
+    serial_from_sort_key: Option<String>,
+    serial_to_sort_key: Option<String>,
+    evidence_claim_id: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -255,8 +269,6 @@ struct SerialSchemeRow {
     normalization_version: String,
     validation_pattern: String,
 }
-
-const SERIAL_NORMALIZATION_VERSION: &str = "ascii_alphanumeric_upper_v1";
 
 macro_rules! query_as_optional {
     ($db:expr, $row:ty, $sql:expr $(, $bind:expr)* $(,)?) => {{
@@ -437,6 +449,7 @@ pub async fn listing_reference_status(
         ));
         return Ok(status_with_gaps(listing_id, building_version_count, gaps));
     }
+    let serial_sort_key = aircraft_serial_sort_key(&serial);
 
     let scopes = query_as_all!(
         db,
@@ -472,7 +485,7 @@ pub async fn listing_reference_status(
     )?;
     let mut candidates = BTreeMap::<i64, (CandidateScopeRow, BTreeSet<String>)>::new();
     for scope in scopes {
-        if !scope_matches_serial(&scope, &serial) {
+        if !scope_matches_serial(&scope, &serial, &serial_sort_key) {
             continue;
         }
         candidates
@@ -1127,7 +1140,7 @@ async fn assemble_reference_version(
 async fn canonicalize_applicability(
     db: &AppDb,
     draft: &ApprovedReferenceVersionDraft,
-) -> Result<Vec<ReferenceApplicabilityDraft>, ReferencePublicationError> {
+) -> Result<Vec<CanonicalReferenceApplicability>, ReferencePublicationError> {
     let mut canonical = Vec::with_capacity(draft.applicability.len());
     for scope in &draft.applicability {
         if scope.aircraft_market_id <= 0 || scope.evidence_claim_id <= 0 {
@@ -1140,15 +1153,23 @@ async fn canonicalize_applicability(
                 || scope.serial_prefix.is_some()
                 || scope.serial_from_display.is_some()
                 || scope.serial_to_display.is_some()
-                || scope.serial_from_sort_key.is_some()
-                || scope.serial_to_sort_key.is_some()
             {
                 return Err(ReferencePublicationError::InvalidDraft(
                     "all-serial applicability cannot carry a serial scheme, prefix, or range"
                         .to_string(),
                 ));
             }
-            canonical.push(scope.clone());
+            canonical.push(CanonicalReferenceApplicability {
+                aircraft_market_id: scope.aircraft_market_id,
+                applies_to_all_serials: true,
+                aircraft_serial_number_scheme_id: None,
+                serial_prefix: None,
+                serial_from_display: None,
+                serial_to_display: None,
+                serial_from_sort_key: None,
+                serial_to_sort_key: None,
+                evidence_claim_id: scope.evidence_claim_id,
+            });
             continue;
         }
         let scheme_id = scope.aircraft_serial_number_scheme_id.ok_or_else(|| {
@@ -1174,7 +1195,7 @@ async fn canonicalize_applicability(
                 "serial scheme {scheme_id} does not belong to the reference aircraft make"
             ))
         })?;
-        if scheme.normalization_version != SERIAL_NORMALIZATION_VERSION {
+        if scheme.normalization_version != AIRCRAFT_SERIAL_SORT_KEY_VERSION {
             return Err(ReferencePublicationError::InvalidDraft(format!(
                 "serial scheme {scheme_id} uses unsupported normalization version {}",
                 scheme.normalization_version
@@ -1205,16 +1226,11 @@ async fn canonicalize_applicability(
                     "bounded serial applicability requires an upper display value".to_string(),
                 )
             })?;
-        let from_key = normalize_aircraft_serial_retrieval_key(from_display);
-        let to_key = normalize_aircraft_serial_retrieval_key(to_display);
-        if from_key.is_empty()
-            || to_key.is_empty()
-            || scope.serial_from_sort_key.as_deref() != Some(from_key.as_str())
-            || scope.serial_to_sort_key.as_deref() != Some(to_key.as_str())
-        {
+        let from_serial = normalize_aircraft_serial_retrieval_key(from_display);
+        let to_serial = normalize_aircraft_serial_retrieval_key(to_display);
+        if from_serial.is_empty() || to_serial.is_empty() {
             return Err(ReferencePublicationError::InvalidDraft(
-                "serial range display values and caller-supplied canonical sort keys are inconsistent"
-                    .to_string(),
+                "serial range display values must normalize to alphanumeric serials".to_string(),
             ));
         }
         let full_match = |value: &str| {
@@ -1222,7 +1238,7 @@ async fn canonicalize_applicability(
                 .find(value)
                 .is_some_and(|matched| matched.start() == 0 && matched.end() == value.len())
         };
-        if !full_match(&from_key) || !full_match(&to_key) {
+        if !full_match(&from_serial) || !full_match(&to_serial) {
             return Err(ReferencePublicationError::InvalidDraft(format!(
                 "serial range does not satisfy declared scheme {scheme_id}"
             )));
@@ -1232,25 +1248,26 @@ async fn canonicalize_applicability(
             .as_deref()
             .map(normalize_aircraft_serial_retrieval_key)
             .filter(|value| !value.is_empty());
-        if prefix
-            .as_deref()
-            .is_some_and(|prefix| !from_key.starts_with(prefix) || !to_key.starts_with(prefix))
-            || from_key > to_key
+        let from_sort_key = aircraft_serial_sort_key(&from_serial);
+        let to_sort_key = aircraft_serial_sort_key(&to_serial);
+        if prefix.as_deref().is_some_and(|prefix| {
+            !from_serial.starts_with(prefix) || !to_serial.starts_with(prefix)
+        }) || from_sort_key > to_sort_key
         {
             return Err(ReferencePublicationError::InvalidDraft(
                 "serial prefix/range is inconsistent or reversed after canonicalization"
                     .to_string(),
             ));
         }
-        canonical.push(ReferenceApplicabilityDraft {
+        canonical.push(CanonicalReferenceApplicability {
             aircraft_market_id: scope.aircraft_market_id,
             applies_to_all_serials: false,
             aircraft_serial_number_scheme_id: Some(scheme_id),
             serial_prefix: prefix,
-            serial_from_display: Some(from_display.to_string()),
-            serial_to_display: Some(to_display.to_string()),
-            serial_from_sort_key: Some(from_key),
-            serial_to_sort_key: Some(to_key),
+            serial_from_display: Some(from_serial),
+            serial_to_display: Some(to_serial),
+            serial_from_sort_key: Some(from_sort_key),
+            serial_to_sort_key: Some(to_sort_key),
             evidence_claim_id: scope.evidence_claim_id,
         });
     }
@@ -1353,23 +1370,27 @@ fn status_with_gaps(
     }
 }
 
-fn scope_matches_serial(scope: &CandidateScopeRow, serial: &str) -> bool {
+fn scope_matches_serial(
+    scope: &CandidateScopeRow,
+    normalized_serial: &str,
+    serial_sort_key: &str,
+) -> bool {
     if scope.applies_to_all_serials {
         return true;
     }
     let prefix_matches = scope
         .serial_prefix
         .as_deref()
-        .is_none_or(|prefix| serial.starts_with(&prefix));
+        .is_none_or(|prefix| normalized_serial.starts_with(prefix));
     prefix_matches
         && scope
             .serial_from_sort_key
             .as_deref()
-            .is_some_and(|from| serial >= from)
+            .is_some_and(|from| serial_sort_key >= from)
         && scope
             .serial_to_sort_key
             .as_deref()
-            .is_some_and(|to| serial <= to)
+            .is_some_and(|to| serial_sort_key <= to)
 }
 
 #[cfg(test)]
@@ -1386,18 +1407,29 @@ mod tests {
             market_code: "US".to_string(),
             applies_to_all_serials: from.is_none(),
             serial_prefix: None,
-            serial_from_sort_key: from.map(normalize_aircraft_serial_retrieval_key),
-            serial_to_sort_key: to.map(normalize_aircraft_serial_retrieval_key),
+            serial_from_sort_key: from.map(aircraft_serial_sort_key),
+            serial_to_sort_key: to.map(aircraft_serial_sort_key),
         }
     }
 
+    fn matches(scope: &CandidateScopeRow, serial: &str) -> bool {
+        let normalized = normalize_aircraft_serial_retrieval_key(serial);
+        scope_matches_serial(scope, &normalized, &aircraft_serial_sort_key(&normalized))
+    }
+
     #[test]
-    fn serial_applicability_is_inclusive_and_normalized() {
-        let bounded = scope(1, Some("SR-100"), Some("SR-200"));
-        assert!(scope_matches_serial(&bounded, "SR100"));
-        assert!(scope_matches_serial(&bounded, "SR150"));
-        assert!(scope_matches_serial(&bounded, "SR200"));
-        assert!(!scope_matches_serial(&bounded, "SR201"));
+    fn serial_applicability_uses_inclusive_natural_order() {
+        let bounded = scope(1, Some("SR-100"), Some("SR-1000"));
+        assert!(matches(&bounded, "SR100"));
+        assert!(matches(&bounded, "SR999"));
+        assert!(matches(&bounded, "SR1000"));
+        assert!(!matches(&bounded, "SR9"));
+        assert!(!matches(&bounded, "SR1001"));
+
+        let variable_width = scope(1, Some("SR-9"), Some("SR-100"));
+        assert!(matches(&variable_width, "SR9"));
+        assert!(matches(&variable_width, "SR10"));
+        assert!(matches(&variable_width, "SR100"));
     }
 
     #[test]
@@ -1405,7 +1437,7 @@ mod tests {
         let scopes = [scope(1, None, None), scope(2, None, None)];
         let matching = scopes
             .iter()
-            .filter(|scope| scope_matches_serial(scope, "SR150"))
+            .filter(|scope| matches(scope, "SR150"))
             .map(|scope| scope.version_id)
             .collect::<BTreeSet<_>>();
         assert_eq!(matching, BTreeSet::from([1, 2]));
@@ -1555,7 +1587,7 @@ mod tests {
             "#,
         )
         .bind(make_id)
-        .bind(SERIAL_NORMALIZATION_VERSION)
+        .bind(AIRCRAFT_SERIAL_SORT_KEY_VERSION)
         .bind(decisions["serial_scheme"])
         .fetch_one(pool)
         .await
@@ -1688,8 +1720,6 @@ mod tests {
                 serial_prefix: None,
                 serial_from_display: None,
                 serial_to_display: None,
-                serial_from_sort_key: None,
-                serial_to_sort_key: None,
                 evidence_claim_id: claim_id,
             }],
             price: ReferencePriceDraft {
@@ -1740,8 +1770,6 @@ mod tests {
                 serial_prefix: Some("SR-".to_string()),
                 serial_from_display: Some("SR-100".to_string()),
                 serial_to_display: Some("SR-100".to_string()),
-                serial_from_sort_key: Some("SR100".to_string()),
-                serial_to_sort_key: Some("SR100".to_string()),
                 evidence_claim_id: claim_id,
             },
             ReferenceApplicabilityDraft {
@@ -1751,8 +1779,6 @@ mod tests {
                 serial_prefix: Some("SR".to_string()),
                 serial_from_display: Some("SR100".to_string()),
                 serial_to_display: Some("SR100".to_string()),
-                serial_from_sort_key: Some("SR100".to_string()),
-                serial_to_sort_key: Some("SR100".to_string()),
                 evidence_claim_id: claim_id,
             },
         ];
@@ -1767,11 +1793,11 @@ mod tests {
             .await
             .expect_err("typographic-equivalent serial ranges must overlap after canonicalization");
 
-        let mut inconsistent = typographic_overlap.clone();
-        inconsistent.applicability[0].serial_from_sort_key = Some("SR-100".to_string());
-        preview_reference_version(&db, &inconsistent)
-            .await
-            .expect_err("noncanonical caller-supplied sort keys must be rejected");
+        let mut caller_supplied_key = serde_json::to_value(&typographic_overlap).unwrap();
+        caller_supplied_key["applicability"][0]["serial_from_sort_key"] =
+            serde_json::Value::String("SR100".to_string());
+        serde_json::from_value::<ApprovedReferenceVersionDraft>(caller_supplied_key)
+            .expect_err("callers cannot provide mechanical serial sort keys");
 
         let before: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_reference_configuration_versions")

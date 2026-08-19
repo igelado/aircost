@@ -1,4 +1,136 @@
 PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
+
+DROP VIEW IF EXISTS aircraft_reference_serial_key_errors;
+CREATE VIEW aircraft_reference_serial_key_errors AS
+WITH RECURSIVE
+bounds(scope_id, bound_name, serial_value, stored_key) AS (
+  SELECT id, 'from', serial_from_display, serial_from_sort_key
+  FROM aircraft_reference_applicability_scopes
+  WHERE applies_to_all_serials = 0
+  UNION ALL
+  SELECT id, 'to', serial_to_display, serial_to_sort_key
+  FROM aircraft_reference_applicability_scopes
+  WHERE applies_to_all_serials = 0
+),
+state(
+  scope_id, bound_name, serial_value, stored_key,
+  position, segment, alpha_hex, numeric_segment, encoded
+) AS (
+  SELECT
+    scope_id, bound_name, serial_value, stored_key, 2,
+    substr(serial_value, 1, 1),
+    CASE WHEN substr(serial_value, 1, 1) GLOB '[0-9]' THEN ''
+      ELSE printf('%02X', instr(
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, 1, 1)
+      )) END,
+    substr(serial_value, 1, 1) GLOB '[0-9]', '01'
+  FROM bounds
+  UNION ALL
+  SELECT
+    scope_id, bound_name, serial_value, stored_key, position + 1,
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN segment || substr(serial_value, position, 1)
+      ELSE substr(serial_value, position, 1) END,
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN alpha_hex || CASE WHEN numeric_segment THEN '' ELSE printf(
+        '%02X', instr('ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, position, 1))
+      ) END
+      ELSE CASE WHEN substr(serial_value, position, 1) GLOB '[0-9]' THEN ''
+        ELSE printf('%02X', instr(
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, position, 1)
+        )) END END,
+    substr(serial_value, position, 1) GLOB '[0-9]',
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN encoded
+      ELSE encoded || CASE WHEN numeric_segment THEN
+        '20'
+        || printf('%08X', length(CASE WHEN trim(segment, '0') = ''
+          THEN '0' ELSE ltrim(segment, '0') END))
+        || CASE WHEN trim(segment, '0') = '' THEN '0' ELSE ltrim(segment, '0') END
+        || printf('%08X', length(segment)) || segment
+      ELSE '10' || alpha_hex || '00' END END
+  FROM state
+  WHERE position <= length(serial_value)
+),
+expected(scope_id, bound_name, expected_key) AS (
+  SELECT scope_id, bound_name,
+    encoded || CASE WHEN numeric_segment THEN
+      '20'
+      || printf('%08X', length(CASE WHEN trim(segment, '0') = ''
+        THEN '0' ELSE ltrim(segment, '0') END))
+      || CASE WHEN trim(segment, '0') = '' THEN '0' ELSE ltrim(segment, '0') END
+      || printf('%08X', length(segment)) || segment
+    ELSE '10' || alpha_hex || '00' END || '00'
+  FROM state
+  WHERE position = length(serial_value) + 1
+)
+SELECT
+  bounds.scope_id, bounds.bound_name, bounds.serial_value,
+  bounds.stored_key, expected.expected_key
+FROM bounds
+LEFT JOIN expected
+  ON expected.scope_id = bounds.scope_id
+ AND expected.bound_name = bounds.bound_name
+WHERE bounds.serial_value IS NULL
+   OR bounds.serial_value = ''
+   OR bounds.serial_value <> upper(bounds.serial_value)
+   OR bounds.serial_value GLOB '*[^A-Z0-9]*'
+   OR expected.expected_key IS NULL
+   OR bounds.stored_key IS NOT expected.expected_key;
+
+CREATE TEMP TABLE reference_catalog_cutover_serial_preflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO reference_catalog_cutover_serial_preflight (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_serial_key_errors
+) OR EXISTS (
+  SELECT 1
+  FROM aircraft_reference_applicability_scopes scope
+  LEFT JOIN aircraft_serial_number_schemes scheme
+    ON scheme.id = scope.aircraft_serial_number_scheme_id
+  WHERE scope.applies_to_all_serials = 0
+    AND (
+      scheme.normalization_version IS NOT 'natural_alphanumeric_segments_v1'
+      OR scope.serial_from_sort_key <> upper(scope.serial_from_sort_key)
+      OR scope.serial_to_sort_key <> upper(scope.serial_to_sort_key)
+      OR scope.serial_from_sort_key GLOB '*[^A-F0-9]*'
+      OR scope.serial_to_sort_key GLOB '*[^A-F0-9]*'
+      OR substr(scope.serial_from_sort_key, 1, 2) <> '01'
+      OR substr(scope.serial_to_sort_key, 1, 2) <> '01'
+      OR substr(scope.serial_from_sort_key, -2) <> '00'
+      OR substr(scope.serial_to_sort_key, -2) <> '00'
+    )
+) THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_cutover_serial_preflight;
+
+DELETE FROM aircraft_serial_number_schemes AS old_scheme
+WHERE old_scheme.normalization_version <> 'natural_alphanumeric_segments_v1'
+  AND NOT EXISTS (
+    SELECT 1 FROM aircraft_reference_applicability_scopes scope
+    WHERE scope.aircraft_serial_number_scheme_id = old_scheme.id
+  )
+  AND EXISTS (
+    SELECT 1 FROM aircraft_serial_number_schemes replacement
+    WHERE replacement.aircraft_make_id = old_scheme.aircraft_make_id
+      AND replacement.name = old_scheme.name
+      AND replacement.normalization_version = 'natural_alphanumeric_segments_v1'
+  );
+UPDATE aircraft_serial_number_schemes
+SET normalization_version = 'natural_alphanumeric_segments_v1'
+WHERE normalization_version <> 'natural_alphanumeric_segments_v1';
+
+DROP TRIGGER IF EXISTS aircraft_serial_schemes_universal_order_insert;
+CREATE TRIGGER aircraft_serial_schemes_universal_order_insert
+BEFORE INSERT ON aircraft_serial_number_schemes
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+BEGIN SELECT RAISE(ABORT, 'serial schemes require the universal ordering version'); END;
+DROP TRIGGER IF EXISTS aircraft_serial_schemes_universal_order_update;
+CREATE TRIGGER aircraft_serial_schemes_universal_order_update
+BEFORE UPDATE OF normalization_version ON aircraft_serial_number_schemes
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+BEGIN SELECT RAISE(ABORT, 'serial schemes require the universal ordering version'); END;
 
 -- The reference catalog is the only aircraft configuration/value authority.
 -- Drop dependent triggers first so the surviving trigger bodies cannot retain
@@ -133,6 +265,52 @@ ALTER TABLE aircraft_reference_prices
     'full_standard_configuration', 'base_aircraft_only', 'unknown'
   ));
 
+DROP TRIGGER IF EXISTS aircraft_reference_scope_canonical_insert;
+CREATE TRIGGER aircraft_reference_scope_canonical_insert
+BEFORE INSERT ON aircraft_reference_applicability_scopes
+WHEN NEW.applies_to_all_serials = 0 AND (
+  NEW.serial_from_sort_key <> upper(NEW.serial_from_sort_key)
+  OR NEW.serial_to_sort_key <> upper(NEW.serial_to_sort_key)
+  OR NEW.serial_from_sort_key GLOB '*[^A-F0-9]*'
+  OR NEW.serial_to_sort_key GLOB '*[^A-F0-9]*'
+  OR substr(NEW.serial_from_sort_key, 1, 2) <> '01'
+  OR substr(NEW.serial_to_sort_key, 1, 2) <> '01'
+  OR substr(NEW.serial_from_sort_key, -2) <> '00'
+  OR substr(NEW.serial_to_sort_key, -2) <> '00'
+  OR NEW.serial_from_sort_key COLLATE BINARY
+       > NEW.serial_to_sort_key COLLATE BINARY
+  OR NOT EXISTS (
+    SELECT 1 FROM aircraft_serial_number_schemes scheme
+    WHERE scheme.id = NEW.aircraft_serial_number_scheme_id
+      AND scheme.normalization_version = 'natural_alphanumeric_segments_v1'
+  )
+  OR (
+    NEW.serial_prefix IS NOT NULL
+    AND (
+      NEW.serial_prefix <> upper(NEW.serial_prefix)
+      OR NEW.serial_prefix GLOB '*[^A-Z0-9]*'
+      OR substr(NEW.serial_from_display, 1, length(NEW.serial_prefix))
+           <> NEW.serial_prefix
+      OR substr(NEW.serial_to_display, 1, length(NEW.serial_prefix))
+           <> NEW.serial_prefix
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'reference serial applicability requires the universal natural-order key');
+END;
+
+DROP TRIGGER IF EXISTS aircraft_reference_scope_key_recompute_insert;
+CREATE TRIGGER aircraft_reference_scope_key_recompute_insert
+AFTER INSERT ON aircraft_reference_applicability_scopes
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_serial_key_errors error
+  WHERE error.scope_id = NEW.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'reference serial sort keys must be recomputed from canonical display values');
+END;
+
 DROP TRIGGER aircraft_reference_versions_require_approval;
 CREATE TRIGGER aircraft_reference_versions_require_approval
 BEFORE INSERT ON aircraft_reference_configuration_versions
@@ -178,23 +356,6 @@ CREATE TABLE aircraft_reference_fact_set_attestations (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
 );
-
-CREATE TRIGGER aircraft_reference_scope_canonical_insert
-BEFORE INSERT ON aircraft_reference_applicability_scopes
-WHEN NEW.applies_to_all_serials = 0 AND (
-  NEW.serial_from_sort_key <> upper(NEW.serial_from_sort_key)
-  OR NEW.serial_to_sort_key <> upper(NEW.serial_to_sort_key)
-  OR NEW.serial_from_sort_key GLOB '*[^A-Z0-9]*'
-  OR NEW.serial_to_sort_key GLOB '*[^A-Z0-9]*'
-  OR (
-    NEW.serial_prefix IS NOT NULL
-    AND (
-      NEW.serial_prefix <> upper(NEW.serial_prefix)
-      OR NEW.serial_prefix GLOB '*[^A-Z0-9]*'
-    )
-  )
-)
-BEGIN SELECT RAISE(ABORT, 'reference serial applicability requires canonical sort keys'); END;
 
 CREATE TABLE official_dollar_normalization_facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -345,10 +506,10 @@ BEGIN
      AND right_scope.aircraft_market_id = left_scope.aircraft_market_id
     WHERE left_scope.aircraft_reference_configuration_version_id = NEW.id
       AND (left_scope.applies_to_all_serials = 1 OR right_scope.applies_to_all_serials = 1 OR (
-        left_scope.aircraft_serial_number_scheme_id = right_scope.aircraft_serial_number_scheme_id
-        AND coalesce(left_scope.serial_prefix, '') = coalesce(right_scope.serial_prefix, '')
-        AND left_scope.serial_from_sort_key <= right_scope.serial_to_sort_key
-        AND right_scope.serial_from_sort_key <= left_scope.serial_to_sort_key
+        left_scope.serial_from_sort_key COLLATE BINARY
+          <= right_scope.serial_to_sort_key COLLATE BINARY
+        AND right_scope.serial_from_sort_key COLLATE BINARY
+          <= left_scope.serial_to_sort_key COLLATE BINARY
       ))
   );
   SELECT RAISE(ABORT, 'published reference profile applicability overlaps an existing version')
@@ -365,10 +526,10 @@ BEGIN
       AND existing_version.model_year = NEW.model_year
       AND existing_version.publication_state = 'published'
       AND (candidate.applies_to_all_serials = 1 OR existing.applies_to_all_serials = 1 OR (
-        candidate.aircraft_serial_number_scheme_id = existing.aircraft_serial_number_scheme_id
-        AND coalesce(candidate.serial_prefix, '') = coalesce(existing.serial_prefix, '')
-        AND candidate.serial_from_sort_key <= existing.serial_to_sort_key
-        AND existing.serial_from_sort_key <= candidate.serial_to_sort_key
+        candidate.serial_from_sort_key COLLATE BINARY
+          <= existing.serial_to_sort_key COLLATE BINARY
+        AND existing.serial_from_sort_key COLLATE BINARY
+          <= candidate.serial_to_sort_key COLLATE BINARY
       ))
   );
 END;
@@ -376,10 +537,12 @@ END;
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260819_reference_catalog_cutover', 2,
-  'e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f', CURRENT_TIMESTAMP
+  '20260819_reference_catalog_cutover', 1,
+  '6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,
   contract_fingerprint = excluded.contract_fingerprint,
   installed_at = excluded.installed_at;
+
+COMMIT;

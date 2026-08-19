@@ -1,3 +1,109 @@
+BEGIN;
+
+CREATE OR REPLACE FUNCTION aircraft_serial_natural_sort_key(serial_value TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $function$
+DECLARE
+  normalized TEXT := UPPER(regexp_replace(serial_value, '[^A-Za-z0-9]', '', 'g'));
+  encoded TEXT := '01';
+  segment TEXT;
+  significant TEXT;
+  segment_is_numeric BOOLEAN;
+  position INTEGER := 1;
+  segment_end INTEGER;
+  alpha_position INTEGER;
+BEGIN
+  IF normalized = '' THEN RETURN ''; END IF;
+  WHILE position <= length(normalized) LOOP
+    segment_is_numeric := substr(normalized, position, 1) ~ '^[0-9]$';
+    segment_end := position + 1;
+    WHILE segment_end <= length(normalized)
+      AND (substr(normalized, segment_end, 1) ~ '^[0-9]$') = segment_is_numeric
+    LOOP
+      segment_end := segment_end + 1;
+    END LOOP;
+    segment := substr(normalized, position, segment_end - position);
+    IF segment_is_numeric THEN
+      significant := ltrim(segment, '0');
+      IF significant = '' THEN significant := '0'; END IF;
+      encoded := encoded || '20'
+        || lpad(upper(to_hex(length(significant))), 8, '0') || significant
+        || lpad(upper(to_hex(length(segment))), 8, '0') || segment;
+    ELSE
+      encoded := encoded || '10';
+      alpha_position := 1;
+      WHILE alpha_position <= length(segment) LOOP
+        encoded := encoded || lpad(upper(to_hex(
+          ascii(substr(segment, alpha_position, 1)) - ascii('A') + 1
+        )), 2, '0');
+        alpha_position := alpha_position + 1;
+      END LOOP;
+      encoded := encoded || '00';
+    END IF;
+    position := segment_end;
+  END LOOP;
+  RETURN encoded || '00';
+END
+$function$;
+
+DO $serial_preflight$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM aircraft_reference_applicability_scopes scope
+    LEFT JOIN aircraft_serial_number_schemes scheme
+      ON scheme.id = scope.aircraft_serial_number_scheme_id
+    WHERE NOT scope.applies_to_all_serials
+      AND (
+        scheme.normalization_version IS DISTINCT FROM 'natural_alphanumeric_segments_v1'
+        OR scope.serial_from_display !~ '^[A-Z0-9]+$'
+        OR scope.serial_to_display !~ '^[A-Z0-9]+$'
+        OR scope.serial_from_sort_key IS DISTINCT FROM
+             aircraft_serial_natural_sort_key(scope.serial_from_display)
+        OR scope.serial_to_sort_key IS DISTINCT FROM
+             aircraft_serial_natural_sort_key(scope.serial_to_display)
+      )
+  ) THEN
+    RAISE EXCEPTION 'bounded reference applicability must be republished with universal natural-order serial keys before cutover';
+  END IF;
+END
+$serial_preflight$;
+
+DELETE FROM aircraft_serial_number_schemes old_scheme
+WHERE old_scheme.normalization_version <> 'natural_alphanumeric_segments_v1'
+  AND NOT EXISTS (
+    SELECT 1 FROM aircraft_reference_applicability_scopes scope
+    WHERE scope.aircraft_serial_number_scheme_id = old_scheme.id
+  )
+  AND EXISTS (
+    SELECT 1 FROM aircraft_serial_number_schemes replacement
+    WHERE replacement.aircraft_make_id = old_scheme.aircraft_make_id
+      AND replacement.name = old_scheme.name
+      AND replacement.normalization_version = 'natural_alphanumeric_segments_v1'
+  );
+UPDATE aircraft_serial_number_schemes
+SET normalization_version = 'natural_alphanumeric_segments_v1'
+WHERE normalization_version <> 'natural_alphanumeric_segments_v1';
+
+CREATE OR REPLACE FUNCTION validate_aircraft_serial_scheme_ordering()
+RETURNS TRIGGER AS $function$
+BEGIN
+  IF NEW.normalization_version <> 'natural_alphanumeric_segments_v1' THEN
+    RAISE EXCEPTION 'serial schemes require the universal ordering version';
+  END IF;
+  RETURN NEW;
+END
+$function$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS aircraft_serial_schemes_universal_order
+  ON aircraft_serial_number_schemes;
+CREATE TRIGGER aircraft_serial_schemes_universal_order
+BEFORE INSERT OR UPDATE OF normalization_version ON aircraft_serial_number_schemes
+FOR EACH ROW EXECUTE FUNCTION validate_aircraft_serial_scheme_ordering();
+
 -- The reference catalog is the only aircraft configuration/value authority.
 -- Replace surviving functions first so PostgreSQL releases their dependencies
 -- on the relations removed below.
@@ -476,9 +582,24 @@ BEGIN
   END IF;
   IF TG_TABLE_NAME = 'aircraft_reference_applicability_scopes' THEN
     IF NOT NEW.applies_to_all_serials AND (
-      NEW.serial_from_sort_key !~ '^[A-Z0-9]+$'
-      OR NEW.serial_to_sort_key !~ '^[A-Z0-9]+$'
-      OR (NEW.serial_prefix IS NOT NULL AND NEW.serial_prefix !~ '^[A-Z0-9]+$')
+      NEW.serial_from_display !~ '^[A-Z0-9]+$'
+      OR NEW.serial_to_display !~ '^[A-Z0-9]+$'
+      OR NEW.serial_from_sort_key IS DISTINCT FROM
+           aircraft_serial_natural_sort_key(NEW.serial_from_display)
+      OR NEW.serial_to_sort_key IS DISTINCT FROM
+           aircraft_serial_natural_sort_key(NEW.serial_to_display)
+      OR NEW.serial_from_sort_key COLLATE "C"
+           > NEW.serial_to_sort_key COLLATE "C"
+      OR (NEW.serial_prefix IS NOT NULL AND (
+        NEW.serial_prefix !~ '^[A-Z0-9]+$'
+        OR NEW.serial_from_display NOT LIKE NEW.serial_prefix || '%'
+        OR NEW.serial_to_display NOT LIKE NEW.serial_prefix || '%'
+      ))
+      OR NOT EXISTS (
+        SELECT 1 FROM aircraft_serial_number_schemes scheme
+        WHERE scheme.id = NEW.aircraft_serial_number_scheme_id
+          AND scheme.normalization_version = 'natural_alphanumeric_segments_v1'
+      )
     ) THEN
       RAISE EXCEPTION 'reference serial applicability requires canonical sort keys';
     END IF;
@@ -594,10 +715,10 @@ BEGIN
        AND right_scope.id > left_scope.id AND right_scope.aircraft_market_id = left_scope.aircraft_market_id
       WHERE left_scope.aircraft_reference_configuration_version_id = NEW.id
         AND (left_scope.applies_to_all_serials OR right_scope.applies_to_all_serials OR (
-          left_scope.aircraft_serial_number_scheme_id = right_scope.aircraft_serial_number_scheme_id
-          AND COALESCE(left_scope.serial_prefix, '') = COALESCE(right_scope.serial_prefix, '')
-          AND left_scope.serial_from_sort_key <= right_scope.serial_to_sort_key
-          AND right_scope.serial_from_sort_key <= left_scope.serial_to_sort_key)))
+          left_scope.serial_from_sort_key COLLATE "C"
+            <= right_scope.serial_to_sort_key COLLATE "C"
+          AND right_scope.serial_from_sort_key COLLATE "C"
+            <= left_scope.serial_to_sort_key COLLATE "C")))
     THEN RAISE EXCEPTION 'reference profile contains overlapping applicability scopes'; END IF;
     IF EXISTS (
       SELECT 1 FROM aircraft_reference_applicability_scopes candidate
@@ -608,10 +729,10 @@ BEGIN
         AND existing_version.aircraft_reference_configuration_id = NEW.aircraft_reference_configuration_id
         AND existing_version.model_year = NEW.model_year AND existing_version.publication_state = 'published'
         AND (candidate.applies_to_all_serials OR existing.applies_to_all_serials OR (
-          candidate.aircraft_serial_number_scheme_id = existing.aircraft_serial_number_scheme_id
-          AND COALESCE(candidate.serial_prefix, '') = COALESCE(existing.serial_prefix, '')
-          AND candidate.serial_from_sort_key <= existing.serial_to_sort_key
-          AND existing.serial_from_sort_key <= candidate.serial_to_sort_key)))
+          candidate.serial_from_sort_key COLLATE "C"
+            <= existing.serial_to_sort_key COLLATE "C"
+          AND existing.serial_from_sort_key COLLATE "C"
+            <= candidate.serial_to_sort_key COLLATE "C")))
     THEN RAISE EXCEPTION 'reference profile applicability overlaps an existing published version'; END IF;
   ELSIF NEW.publication_state <> 'building' THEN
     RAISE EXCEPTION 'invalid building profile state transition';
@@ -623,10 +744,12 @@ $$ LANGUAGE plpgsql;
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260819_reference_catalog_cutover', 2,
-  'e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f', CURRENT_TIMESTAMP
+  '20260819_reference_catalog_cutover', 1,
+  '6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = EXCLUDED.contract_version,
   contract_fingerprint = EXCLUDED.contract_fingerprint,
   installed_at = EXCLUDED.installed_at;
+
+COMMIT;

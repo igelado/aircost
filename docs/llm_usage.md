@@ -548,6 +548,13 @@ primary evidence:
 - Marketplace listings provide exact observations about their own advertised
   aircraft only. They cannot define factory defaults or approve catalog facts.
 
+For bounded factory applicability, Gemini may identify the approved
+make-specific serial-shape scheme and return source-visible display bounds and
+an optional prefix. It never supplies database sort keys. The application
+normalizes the displays and derives the universal natural-order key; SQLite and
+PostgreSQL recompute it independently before accepting the row. Different
+scheme IDs or prefixes therefore cannot create separate overlap domains.
+
 Alongside the local FAA evidence, Google Search and URL Context remain necessary
 for facts outside registry scope. Grounded citations, successful tool traces,
 live catalog candidate searches, exact source observations, and the FAA

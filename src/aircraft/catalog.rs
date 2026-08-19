@@ -52,6 +52,66 @@ pub fn normalize_aircraft_serial_retrieval_key(value: &str) -> String {
         .collect()
 }
 
+/// Version of the one canonical serial ordering shared by every aircraft make.
+/// Make-specific schemes still validate which normalized serials are legal;
+/// they do not define a competing ordering domain.
+pub const AIRCRAFT_SERIAL_SORT_KEY_VERSION: &str = "natural_alphanumeric_segments_v1";
+
+/// Encode a normalized alphanumeric serial into a lexicographically sortable
+/// natural-order key. Alphabetic segments use terminated ordinal bytes;
+/// numeric segments compare by significant digit count, digits, then their
+/// original representation as a deterministic leading-zero tie breaker.
+///
+/// The `01` prefix versions the stored encoding. The result contains only
+/// uppercase hexadecimal characters so SQLite binary comparison, PostgreSQL
+/// text comparison, and Rust string comparison share the same total order.
+pub fn aircraft_serial_sort_key(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let normalized = normalize_aircraft_serial_retrieval_key(value);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let bytes = normalized.as_bytes();
+    let mut key = String::with_capacity(bytes.len() * 3 + 24);
+    key.push_str("01");
+    let mut start = 0;
+    while start < bytes.len() {
+        let numeric = bytes[start].is_ascii_digit();
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() == numeric {
+            end += 1;
+        }
+        let segment = &normalized[start..end];
+        if numeric {
+            key.push_str("20");
+            let significant = segment.trim_start_matches('0');
+            let significant = if significant.is_empty() {
+                "0"
+            } else {
+                significant
+            };
+            write!(
+                &mut key,
+                "{:08X}{significant}{:08X}{segment}",
+                significant.len(),
+                segment.len()
+            )
+            .expect("writing a serial sort key cannot fail");
+        } else {
+            key.push_str("10");
+            for byte in &bytes[start..end] {
+                write!(&mut key, "{:02X}", byte - b'A' + 1)
+                    .expect("writing a serial sort key cannot fail");
+            }
+            key.push_str("00");
+        }
+        start = end;
+    }
+    key.push_str("00");
+    key
+}
+
 fn normalize_market_code(value: &str) -> String {
     value
         .chars()
@@ -1030,6 +1090,28 @@ fn optional_dimension_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_sort_key_preserves_natural_alphanumeric_order() {
+        let ordered = [
+            "S9", "S10", "SR1", "SR01", "SR9", "SR100", "SR999", "SR1000",
+        ];
+        let keys = ordered
+            .iter()
+            .map(|serial| aircraft_serial_sort_key(serial))
+            .collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            aircraft_serial_sort_key("sr-100"),
+            aircraft_serial_sort_key("SR 100")
+        );
+        assert!(keys.iter().all(|key| {
+            key.starts_with("01")
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+        }));
+    }
 
     #[test]
     fn source_authority_is_claim_specific() {

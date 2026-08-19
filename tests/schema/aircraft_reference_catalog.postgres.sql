@@ -221,6 +221,264 @@ BEGIN
 END
 $test$;
 
+INSERT INTO aircraft_identity_decisions (
+  resolution_case_id, entity_kind, decision_action, decision_status,
+  decision_payload_json, deterministic_validation_json,
+  deterministic_validation_passed, rationale, decided_at
+) VALUES
+  (1, 'serial_scheme', 'approve_new', 'approved', '{}', '{}', TRUE,
+    'natural serial scheme A', '2026-08-19'),
+  (1, 'serial_scheme', 'approve_new', 'approved', '{}', '{}', TRUE,
+    'natural serial scheme B', '2026-08-19');
+
+INSERT INTO aircraft_identity_decision_claims (
+  decision_id, evidence_claim_id, evidence_role
+)
+SELECT id, 1, 'identity'
+FROM aircraft_identity_decisions
+WHERE rationale IN ('natural serial scheme A', 'natural serial scheme B');
+
+INSERT INTO aircraft_serial_number_schemes (
+  aircraft_make_id, name, normalization_version,
+  validation_pattern, approval_decision_id
+)
+SELECT 1, 'Natural A', 'natural_alphanumeric_segments_v1',
+  '^[A-Z]+[0-9]+$', id
+FROM aircraft_identity_decisions WHERE rationale = 'natural serial scheme A';
+
+INSERT INTO aircraft_serial_number_schemes (
+  aircraft_make_id, name, normalization_version,
+  validation_pattern, approval_decision_id
+)
+SELECT 1, 'Natural B', 'natural_alphanumeric_segments_v1',
+  '^[A-Z]+[0-9]+$', id
+FROM aircraft_identity_decisions WHERE rationale = 'natural serial scheme B';
+
+INSERT INTO aircraft_identity_decisions (
+  resolution_case_id, entity_kind, decision_action, decision_status,
+  decision_payload_json, deterministic_validation_json,
+  deterministic_validation_passed, rationale, decided_at
+) VALUES (
+  1, 'reference_profile', 'approve_new', 'approved', '{}', '{}', TRUE,
+  'direct serial key guard', '2026-08-19'
+);
+INSERT INTO aircraft_identity_decision_claims (
+  decision_id, evidence_claim_id, evidence_role
+)
+SELECT id, 1, 'identity' FROM aircraft_identity_decisions
+WHERE rationale = 'direct serial key guard';
+INSERT INTO aircraft_reference_configuration_versions (
+  aircraft_reference_configuration_id, model_year, revision,
+  approval_decision_id
+)
+SELECT 1, 2022, 1, id FROM aircraft_identity_decisions
+WHERE rationale = 'direct serial key guard';
+
+DO $serial_guard$
+DECLARE
+  failure_message TEXT;
+BEGIN
+  BEGIN
+    INSERT INTO aircraft_reference_applicability_scopes (
+      aircraft_reference_configuration_version_id, aircraft_market_id,
+      applies_to_all_serials, aircraft_serial_number_scheme_id,
+      serial_prefix, serial_from_display, serial_to_display,
+      serial_from_sort_key, serial_to_sort_key, evidence_claim_id
+    ) VALUES (
+      (SELECT id FROM aircraft_reference_configuration_versions WHERE model_year = 2022),
+      1, FALSE,
+      (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+      'SR', 'SR100', 'SR199',
+      '0110130020000000031000000000310000',
+      '011013120020000000031990000000319900', 1
+    );
+    RAISE EXCEPTION 'caller-defined serial key domain unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <> 'reference serial applicability requires canonical sort keys' THEN
+      RAISE;
+    END IF;
+  END;
+  BEGIN
+    INSERT INTO aircraft_reference_applicability_scopes (
+      aircraft_reference_configuration_version_id, aircraft_market_id,
+      applies_to_all_serials, aircraft_serial_number_scheme_id,
+      serial_prefix, serial_from_display, serial_to_display,
+      serial_from_sort_key, serial_to_sort_key, evidence_claim_id
+    ) VALUES (
+      (SELECT id FROM aircraft_reference_configuration_versions WHERE model_year = 2022),
+      1, FALSE,
+      (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+      'ZZ', 'SR100', 'SR199',
+      '011013120020000000031000000000310000',
+      '011013120020000000031990000000319900', 1
+    );
+    RAISE EXCEPTION 'unrelated serial prefix unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <> 'reference serial applicability requires canonical sort keys' THEN
+      RAISE;
+    END IF;
+  END;
+END
+$serial_guard$;
+
+CREATE OR REPLACE FUNCTION pg_temp.assert_reference_serial_pair(
+  case_label TEXT,
+  left_all BOOLEAN, left_scheme BIGINT, left_prefix TEXT,
+  left_from_display TEXT, left_to_display TEXT,
+  left_from_key TEXT, left_to_key TEXT,
+  right_all BOOLEAN, right_scheme BIGINT, right_prefix TEXT,
+  right_from_display TEXT, right_to_display TEXT,
+  right_from_key TEXT, right_to_key TEXT,
+  expects_overlap BOOLEAN
+) RETURNS VOID
+LANGUAGE plpgsql
+AS $serial_test$
+DECLARE
+  profile_decision_id BIGINT;
+  version_id BIGINT;
+  failure_message TEXT;
+BEGIN
+  BEGIN
+    INSERT INTO aircraft_identity_decisions (
+      resolution_case_id, entity_kind, decision_action, decision_status,
+      decision_payload_json, deterministic_validation_json,
+      deterministic_validation_passed, rationale, decided_at
+    ) VALUES (
+      1, 'reference_profile', 'approve_new', 'approved', '{}', '{}', TRUE,
+      case_label, '2026-08-19'
+    ) RETURNING id INTO profile_decision_id;
+    INSERT INTO aircraft_identity_decision_claims (
+      decision_id, evidence_claim_id, evidence_role
+    ) VALUES (profile_decision_id, 1, 'identity');
+    INSERT INTO aircraft_reference_configuration_versions (
+      aircraft_reference_configuration_id, model_year, revision,
+      approval_decision_id
+    ) VALUES (1, 2021, 1, profile_decision_id)
+    RETURNING id INTO version_id;
+    INSERT INTO aircraft_reference_applicability_scopes (
+      aircraft_reference_configuration_version_id, aircraft_market_id,
+      applies_to_all_serials, aircraft_serial_number_scheme_id,
+      serial_prefix, serial_from_display, serial_to_display,
+      serial_from_sort_key, serial_to_sort_key, evidence_claim_id
+    ) VALUES
+      (version_id, 1, left_all, left_scheme, left_prefix,
+        left_from_display, left_to_display, left_from_key, left_to_key, 1),
+      (version_id, 1, right_all, right_scheme, right_prefix,
+        right_from_display, right_to_display, right_from_key, right_to_key, 1);
+    INSERT INTO aircraft_reference_prices (
+      aircraft_reference_configuration_version_id, price_kind, amount, currency,
+      price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+    ) VALUES (
+      version_id, 'equipped_msrp', 799900, 'USD', 2021,
+      'full_standard_configuration', 'direct_model_year', 1
+    );
+    INSERT INTO aircraft_reference_fact_set_attestations (
+      aircraft_reference_configuration_version_id, fact_set_kind,
+      evidence_claim_id
+    ) VALUES
+      (version_id, 'avionics', 1), (version_id, 'engines', 1),
+      (version_id, 'propellers', 1), (version_id, 'features', 1);
+    UPDATE aircraft_reference_configuration_versions
+    SET publication_state = 'published', published_at = '2026-08-19'
+    WHERE id = version_id;
+    IF expects_overlap THEN
+      RAISE EXCEPTION 'overlapping serial scopes unexpectedly published';
+    END IF;
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF NOT expects_overlap
+      OR failure_message <> 'reference profile contains overlapping applicability scopes'
+    THEN
+      RAISE;
+    END IF;
+    RETURN;
+  END;
+END
+$serial_test$;
+
+SELECT pg_temp.assert_reference_serial_pair(
+  'overlap across S and SR prefixes',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'S', 'S100', 'SR200',
+  '0110130020000000031000000000310000',
+  '011013120020000000032000000000320000',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR100', 'SR300',
+  '011013120020000000031000000000310000',
+  '011013120020000000033000000000330000',
+  TRUE
+);
+SELECT pg_temp.assert_reference_serial_pair(
+  'overlap across null and SR prefixes',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  NULL, 'S100', 'SZ999',
+  '0110130020000000031000000000310000',
+  '0110131A0020000000039990000000399900',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR100', 'SR200',
+  '011013120020000000031000000000310000',
+  '011013120020000000032000000000320000',
+  TRUE
+);
+SELECT pg_temp.assert_reference_serial_pair(
+  'overlap across serial schemes',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR100', 'SR200',
+  '011013120020000000031000000000310000',
+  '011013120020000000032000000000320000',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural B'),
+  'SR', 'SR100', 'SR200',
+  '011013120020000000031000000000310000',
+  '011013120020000000032000000000320000',
+  TRUE
+);
+SELECT pg_temp.assert_reference_serial_pair(
+  'overlap at inclusive serial boundary',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR100', 'SR200',
+  '011013120020000000031000000000310000',
+  '011013120020000000032000000000320000',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR200', 'SR300',
+  '011013120020000000032000000000320000',
+  '011013120020000000033000000000330000',
+  TRUE
+);
+SELECT pg_temp.assert_reference_serial_pair(
+  'all serials overlaps bounded serials',
+  TRUE, NULL, NULL, NULL, NULL, NULL, NULL,
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR100', 'SR200',
+  '011013120020000000031000000000310000',
+  '011013120020000000032000000000320000',
+  TRUE
+);
+SELECT pg_temp.assert_reference_serial_pair(
+  'disjoint adjacent serial ranges',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural A'),
+  'SR', 'SR100', 'SR199',
+  '011013120020000000031000000000310000',
+  '011013120020000000031990000000319900',
+  FALSE, (SELECT id FROM aircraft_serial_number_schemes WHERE name = 'Natural B'),
+  'SR', 'SR200', 'SR300',
+  '011013120020000000032000000000320000',
+  '011013120020000000033000000000330000',
+  FALSE
+);
+
+DO $serial_test$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM aircraft_reference_configuration_versions
+    WHERE model_year = 2021 AND publication_state = 'published'
+  ) THEN
+    RAISE EXCEPTION 'disjoint serial ranges did not publish';
+  END IF;
+END
+$serial_test$;
+
 DO $test$
 DECLARE
   failure_message TEXT;

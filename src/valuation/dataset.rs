@@ -1523,8 +1523,6 @@ mod tests {
                     serial_prefix: None,
                     serial_from_display: None,
                     serial_to_display: None,
-                    serial_from_sort_key: None,
-                    serial_to_sort_key: None,
                     evidence_claim_id: claim_id,
                 }],
                 price: ReferencePriceDraft {
