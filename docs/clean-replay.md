@@ -51,14 +51,21 @@ All operational commands are dry-run unless `--apply` is supplied.
    approved avionics products and capabilities, their current reuse
    attestations and exact authority origins, and the approved aircraft
    hierarchy with the minimal decisions, claims, detached observations, and
-   historical target-scoped FAA snapshot that authorize it. It never copies
-   listings, pending/rejected candidates, reviews, usage accounting, valuation
-   artifacts, reference-profile versions, raw listing values, or Gemini
-   dossiers. Referenced reviewer users must already exist from capture import.
+   historical FAA snapshot metadata that authorize it. From that snapshot it
+   selects only each binding's exact claim-backed representative aircraft,
+   their matched coverage rows, referenced ACFTREF rows, and distinct non-null
+   ENGINE rows; unrelated listing-derived registry records are excluded. It
+   never copies listings, pending/rejected candidates, reviews, usage
+   accounting, valuation artifacts, reference-profile versions, raw listing
+   values, or Gemini dossiers. Referenced reviewer users must already exist
+   from capture import.
 
-   Apply is transactional and refuses a non-clean or incompatible target. The
-   reported fingerprint is rechecked after commit. Import the current FAA
-   release separately after this historical provenance seed.
+   Apply is transactional and refuses a non-clean or incompatible target.
+   SQLite takes its writer slot before the in-transaction freshness check;
+   PostgreSQL serializes seeders and locks every clean-target table against
+   competing writes through commit. The reported fingerprint is rechecked
+   after commit. Import the current FAA release separately after this
+   historical provenance seed.
 
 4. Create and inspect the extraction checkpoint:
 

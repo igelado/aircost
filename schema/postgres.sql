@@ -3955,10 +3955,10 @@ CREATE OR REPLACE FUNCTION
   invalidate_listing_avionics_authorization_for_capture()
 RETURNS TRIGGER LANGUAGE plpgsql AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations authorization
+  DELETE FROM aircraft_sale_listing_avionics_authorizations authorization_row
   USING aircraft_sale_listing_avionics link
-  WHERE link.id = authorization.listing_link_id
-    AND authorization.evidence_capture_sha256 = OLD.rendered_html_sha256
+  WHERE link.id = authorization_row.listing_link_id
+    AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
     AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
     AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
     AND position(link.source_notes IN OLD.rendered_html) > 0
@@ -3967,7 +3967,7 @@ BEGIN
       WHERE retained_capture.canonical_listing_id =
               link.aircraft_sale_listing_id
         AND retained_capture.rendered_html_sha256 =
-              authorization.evidence_capture_sha256
+              authorization_row.evidence_capture_sha256
         AND position(link.source_notes IN retained_capture.rendered_html) > 0
     );
   IF TG_OP = 'DELETE' THEN
@@ -5602,21 +5602,23 @@ BEGIN
 
   IF TG_TABLE_NAME IN (
     'aircraft_engine_catalog_models', 'aircraft_propeller_catalog_models'
-  ) AND NOT EXISTS (
-    SELECT 1
-    FROM aircraft_identity_decision_claims decision_claim
-    JOIN curation_evidence_claims claim
-      ON claim.id = decision_claim.evidence_claim_id
-    JOIN curation_evidence_sources source
-      ON source.id = claim.evidence_source_id
-    WHERE decision_claim.decision_id = NEW.approval_decision_id
-      AND decision_claim.evidence_claim_id = NEW.identity_evidence_claim_id
-      AND decision_claim.evidence_role IN ('identity', 'specification')
-      AND claim.claim_kind IN ('identity', 'specification')
-      AND claim.validation_status = 'validated'
-      AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
   ) THEN
-    RAISE EXCEPTION '% requires its exact primary-source identifier claim', TG_TABLE_NAME;
+    IF NOT EXISTS (
+      SELECT 1
+      FROM aircraft_identity_decision_claims decision_claim
+      JOIN curation_evidence_claims claim
+        ON claim.id = decision_claim.evidence_claim_id
+      JOIN curation_evidence_sources source
+        ON source.id = claim.evidence_source_id
+      WHERE decision_claim.decision_id = NEW.approval_decision_id
+        AND decision_claim.evidence_claim_id = NEW.identity_evidence_claim_id
+        AND decision_claim.evidence_role IN ('identity', 'specification')
+        AND claim.claim_kind IN ('identity', 'specification')
+        AND claim.validation_status = 'validated'
+        AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
+    ) THEN
+      RAISE EXCEPTION '% requires its exact primary-source identifier claim', TG_TABLE_NAME;
+    END IF;
   END IF;
 
   RETURN NEW;

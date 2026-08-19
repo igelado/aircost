@@ -177,6 +177,12 @@ impl SeedRow {
         }
     }
 
+    fn string(&self, column: &str) -> Result<&str> {
+        self.value(column)
+            .and_then(Value::as_str)
+            .with_context(|| format!("{}.{} is not text", self.table, column))
+    }
+
     fn with_value(mut self, column: &str, value: Value) -> Result<Self> {
         let index = self
             .columns
@@ -244,6 +250,7 @@ pub async fn seed_verified_catalog(
     let (applied_rows, generated, generated_origin_timestamps) = match target.backend() {
         DatabaseBackend::Sqlite(pool) => {
             let mut transaction = pool.begin().await?;
+            acquire_sqlite_seed_write_lock(&mut transaction).await?;
             validate_target_empty_sqlite(&mut transaction).await?;
             validate_required_users_sqlite(&mut transaction, &bundle.required_users).await?;
             // This lets exact source origin rows precede manufacturer identities.
@@ -260,6 +267,7 @@ pub async fn seed_verified_catalog(
         }
         DatabaseBackend::Postgres(pool) => {
             let mut transaction = pool.begin().await?;
+            acquire_postgres_seed_locks(&mut transaction).await?;
             validate_target_empty_postgres(&mut transaction).await?;
             validate_required_users_postgres(&mut transaction, &bundle.required_users).await?;
             let result = apply_postgres(&mut transaction, &bundle).await?;
@@ -279,6 +287,42 @@ pub async fn seed_verified_catalog(
         generated,
         generated_origin_timestamps,
     ))
+}
+
+async fn acquire_sqlite_seed_write_lock(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+) -> Result<()> {
+    // A write statement upgrades the deferred transaction to SQLite's single
+    // writer slot before the in-transaction emptiness check. The zero-row
+    // update changes no data, but no competing writer can enter between that
+    // check and commit.
+    sqlx::query("UPDATE schema_migration_contracts SET installed_at = installed_at WHERE 0")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn acquire_postgres_seed_locks(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<()> {
+    // Serialize seeders, then exclude arbitrary writers from every table whose
+    // freshness is part of the clean-target contract. SHARE also stabilizes
+    // the pre-existing users referenced by signed approval provenance.
+    sqlx::query("SELECT pg_advisory_xact_lock(4709470037844619588)")
+        .execute(&mut **transaction)
+        .await?;
+    let tables = EMPTY_TARGET_TABLES
+        .iter()
+        .map(|table| quoted_identifier(table))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!("LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"))
+        .execute(&mut **transaction)
+        .await?;
+    sqlx::query("LOCK TABLE users IN SHARE MODE")
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
 }
 
 fn report(
@@ -451,10 +495,7 @@ async fn build_bundle_from_snapshot(
         bail!("a selected avionics reuse attestation references a revoked authoritative origin");
     }
 
-    let mut aircraft_roots = BTreeMap::new();
-    for table in ROOT_AIRCRAFT_TABLES {
-        aircraft_roots.insert((*table).to_string(), snapshot.fetch(table, "1 = 1").await?);
-    }
+    let mut aircraft_roots = selected_aircraft_roots(&mut snapshot).await?;
     let mut decision_ids = BTreeSet::new();
     for rows in aircraft_roots.values() {
         for row in rows {
@@ -544,30 +585,49 @@ async fn build_bundle_from_snapshot(
     let snapshots = snapshot
         .fetch("faa_registry_snapshots", &in_predicate("id", &snapshot_ids))
         .await?;
-    let faa_aircraft = snapshot
-        .fetch(
-            "faa_registry_aircraft",
-            &in_predicate("snapshot_id", &snapshot_ids),
-        )
-        .await?;
+    if snapshots.len() != snapshot_ids.len() {
+        bail!("approved aircraft catalog references a missing FAA snapshot");
+    }
+    let faa_aircraft =
+        selected_faa_aircraft(&mut snapshot, faa_binding_rows, tcds_rows, &claims).await?;
+    let faa_aircraft_codes = row_text_pairs(&faa_aircraft, "aircraft_code")?;
     let faa_aircraft_references = snapshot
         .fetch(
             "faa_registry_aircraft_references",
-            &in_predicate("snapshot_id", &snapshot_ids),
+            &text_pair_predicate(
+                "snapshot_id",
+                "aircraft_code",
+                &faa_aircraft,
+                "aircraft_code",
+            )?,
         )
         .await?;
+    if faa_aircraft_references.len() != faa_aircraft_codes.len() {
+        bail!("selected FAA aircraft do not have one exact ACFTREF row per aircraft code");
+    }
+    let faa_engine_codes = row_text_pairs(&faa_aircraft, "engine_code")?;
     let faa_engine_references = snapshot
         .fetch(
             "faa_registry_engine_references",
-            &in_predicate("snapshot_id", &snapshot_ids),
+            &text_pair_predicate("snapshot_id", "engine_code", &faa_aircraft, "engine_code")?,
         )
         .await?;
+    if faa_engine_references.len() != faa_engine_codes.len() {
+        bail!("selected FAA aircraft do not have one exact ENGINE row per engine code");
+    }
     let faa_coverage = snapshot
         .fetch(
             "faa_registry_coverage",
-            &in_predicate("snapshot_id", &snapshot_ids),
+            &row_pair_predicate("snapshot_id", "n_number", &faa_aircraft, "n_number")?,
         )
         .await?;
+    if faa_coverage.len() != faa_aircraft.len()
+        || faa_coverage
+            .iter()
+            .any(|row| row.value("lookup_status").and_then(Value::as_str) != Some("matched"))
+    {
+        bail!("selected representative FAA aircraft must have exact matched coverage rows");
+    }
 
     let mut source_ids = ids(&claims, "evidence_source_id")?
         .into_iter()
@@ -703,6 +763,7 @@ async fn build_bundle_from_snapshot(
         &mut snapshot,
         approved_models.len(),
         selected_decision_count,
+        &source_counts,
     )
     .await?;
     let mut bundle = SeedBundle {
@@ -716,6 +777,305 @@ async fn build_bundle_from_snapshot(
     };
     bundle.fingerprint_sha256 = fingerprint(&bundle.fingerprint_rows())?;
     Ok(bundle)
+}
+
+async fn selected_aircraft_roots(
+    source: &mut SourceSnapshot<'_, '_>,
+) -> Result<BTreeMap<String, Vec<SeedRow>>> {
+    let mut roots = BTreeMap::new();
+
+    let makes = source.fetch("aircraft_makes", "1 = 1").await?;
+    let make_ids = ids(&makes, "id")?;
+    roots.insert("aircraft_makes".into(), makes);
+
+    let families = source
+        .fetch(
+            "aircraft_model_families",
+            &in_predicate("aircraft_make_id", &make_ids),
+        )
+        .await?;
+    let family_ids = ids(&families, "id")?;
+    roots.insert("aircraft_model_families".into(), families);
+
+    let designations = source
+        .fetch(
+            "aircraft_designations",
+            &in_predicate("aircraft_model_family_id", &family_ids),
+        )
+        .await?;
+    let designation_ids = ids(&designations, "id")?;
+    roots.insert("aircraft_designations".into(), designations);
+
+    roots.insert(
+        "aircraft_make_aliases".into(),
+        source
+            .fetch(
+                "aircraft_make_aliases",
+                &in_predicate("aircraft_make_id", &make_ids),
+            )
+            .await?,
+    );
+    roots.insert(
+        "aircraft_family_aliases".into(),
+        source
+            .fetch(
+                "aircraft_family_aliases",
+                &in_predicate("aircraft_model_family_id", &family_ids),
+            )
+            .await?,
+    );
+    roots.insert(
+        "aircraft_designation_aliases".into(),
+        source
+            .fetch(
+                "aircraft_designation_aliases",
+                &in_predicate("aircraft_designation_id", &designation_ids),
+            )
+            .await?,
+    );
+    roots.insert(
+        "aircraft_designation_identifiers".into(),
+        source
+            .fetch(
+                "aircraft_designation_identifiers",
+                &in_predicate("aircraft_designation_id", &designation_ids),
+            )
+            .await?,
+    );
+
+    let generations = source
+        .fetch(
+            "aircraft_generations",
+            &in_predicate("aircraft_model_family_id", &family_ids),
+        )
+        .await?;
+    let generation_ids = ids(&generations, "id")?;
+    roots.insert("aircraft_generations".into(), generations);
+    roots.insert(
+        "aircraft_generation_designations".into(),
+        source
+            .fetch(
+                "aircraft_generation_designations",
+                &format!(
+                    "{} AND {}",
+                    in_predicate("aircraft_generation_id", &generation_ids),
+                    in_predicate("aircraft_designation_id", &designation_ids)
+                ),
+            )
+            .await?,
+    );
+
+    let packages = source
+        .fetch(
+            "aircraft_factory_packages",
+            &in_predicate("aircraft_model_family_id", &family_ids),
+        )
+        .await?;
+    let package_ids = ids(&packages, "id")?;
+    roots.insert("aircraft_factory_packages".into(), packages);
+    roots.insert(
+        "aircraft_package_applicability".into(),
+        source
+            .fetch(
+                "aircraft_package_applicability",
+                &format!(
+                    "{} AND (aircraft_designation_id IS NULL OR {}) AND (aircraft_generation_id IS NULL OR {})",
+                    in_predicate("aircraft_factory_package_id", &package_ids),
+                    in_predicate("aircraft_designation_id", &designation_ids),
+                    in_predicate("aircraft_generation_id", &generation_ids)
+                ),
+            )
+            .await?,
+    );
+
+    roots.insert(
+        "aircraft_serial_number_schemes".into(),
+        source
+            .fetch(
+                "aircraft_serial_number_schemes",
+                &in_predicate("aircraft_make_id", &make_ids),
+            )
+            .await?,
+    );
+    // These catalogs are only reusable through a selected reference
+    // configuration. Reference configurations are deliberately outside this
+    // seed, so copying their independent rows would not be a dependency
+    // closure of the selected hierarchy.
+    for table in [
+        "aircraft_engine_catalog_models",
+        "aircraft_propeller_catalog_models",
+        "aircraft_feature_definitions",
+    ] {
+        roots.insert(table.into(), source.fetch(table, "1 = 0").await?);
+    }
+    roots.insert(
+        "aircraft_designation_faa_bindings".into(),
+        source
+            .fetch(
+                "aircraft_designation_faa_bindings",
+                &in_predicate("aircraft_designation_id", &designation_ids),
+            )
+            .await?,
+    );
+    roots.insert(
+        "aircraft_tcds_make_lineage_bindings".into(),
+        source
+            .fetch(
+                "aircraft_tcds_make_lineage_bindings",
+                &format!(
+                    "{} AND {}",
+                    in_predicate("aircraft_make_id", &make_ids),
+                    in_predicate("aircraft_designation_id", &designation_ids)
+                ),
+            )
+            .await?,
+    );
+    Ok(roots)
+}
+
+async fn selected_faa_aircraft(
+    source: &mut SourceSnapshot<'_, '_>,
+    bindings: &[SeedRow],
+    tcds_bindings: &[SeedRow],
+    claims: &[SeedRow],
+) -> Result<Vec<SeedRow>> {
+    let claims_by_id = claims
+        .iter()
+        .map(|claim| Ok((claim.integer("id")?, claim)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let mut predicates = BTreeSet::new();
+    let mut expected_keys = BTreeSet::new();
+
+    for binding in tcds_bindings {
+        expected_keys.insert((
+            binding.integer("representative_faa_registry_snapshot_id")?,
+            binding.string("representative_faa_n_number")?.to_string(),
+        ));
+        predicates.insert(format!(
+            "snapshot_id = {} AND n_number = {} AND source_record_sha256 = {} AND manufacturer_serial_key = {} AND aircraft_code = {}",
+            binding.integer("representative_faa_registry_snapshot_id")?,
+            sql_literal(binding.value("representative_faa_n_number").context("TCDS binding has no representative N-number")?)?,
+            sql_literal(binding.value("representative_faa_source_record_sha256").context("TCDS binding has no representative source record")?)?,
+            sql_literal(binding.value("representative_faa_manufacturer_serial_key").context("TCDS binding has no representative serial key")?)?,
+            sql_literal(binding.value("faa_aircraft_code").context("TCDS binding has no FAA aircraft code")?)?,
+        ));
+    }
+
+    for binding in bindings {
+        let claim_id = binding.integer("identity_evidence_claim_id")?;
+        let claim = claims_by_id
+            .get(&claim_id)
+            .with_context(|| format!("FAA binding evidence claim {claim_id} was not selected"))?;
+        let object = serde_json::from_str::<Value>(claim.string("object_text")?)?;
+        let object = object
+            .as_object()
+            .context("FAA binding identity claim object_text is not JSON object evidence")?;
+        let claimed_code = object
+            .get("aircraft_code")
+            .and_then(Value::as_str)
+            .context("FAA binding identity claim omits aircraft_code")?;
+        let claimed_sha = object
+            .get("source_record_sha256")
+            .and_then(Value::as_str)
+            .context("FAA binding identity claim omits source_record_sha256")?;
+        if claimed_code != binding.string("faa_aircraft_code")? {
+            bail!("FAA binding identity claim {claim_id} disagrees with its aircraft code");
+        }
+        let n_number = claim.string("subject_text")?;
+        if !n_number.starts_with('N') {
+            bail!("FAA binding identity claim {claim_id} has no exact N-number subject");
+        }
+        expected_keys.insert((
+            binding.integer("representative_faa_registry_snapshot_id")?,
+            n_number.to_string(),
+        ));
+        predicates.insert(format!(
+            "snapshot_id = {} AND n_number = {} AND source_record_sha256 = {} AND aircraft_code = {}",
+            binding.integer("representative_faa_registry_snapshot_id")?,
+            sql_literal(&Value::String(n_number.into()))?,
+            sql_literal(&Value::String(claimed_sha.into()))?,
+            sql_literal(&Value::String(claimed_code.into()))?,
+        ));
+    }
+
+    let rows = source
+        .fetch(
+            "faa_registry_aircraft",
+            &if predicates.is_empty() {
+                "1 = 0".into()
+            } else {
+                predicates
+                    .iter()
+                    .map(|predicate| format!("({predicate})"))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            },
+        )
+        .await?;
+    if rows.len() != expected_keys.len() {
+        bail!(
+            "approved aircraft catalog requires {} exact FAA representative rows, but {} were found",
+            expected_keys.len(),
+            rows.len()
+        );
+    }
+    Ok(rows)
+}
+
+fn row_text_pairs(rows: &[SeedRow], column: &str) -> Result<BTreeSet<(i64, String)>> {
+    let mut pairs = BTreeSet::new();
+    for row in rows {
+        match row.value(column) {
+            Some(Value::Null) => {}
+            Some(Value::String(value)) => {
+                pairs.insert((row.integer("snapshot_id")?, value.clone()));
+            }
+            _ => bail!("{}.{} is neither text nor null", row.table, column),
+        }
+    }
+    Ok(pairs)
+}
+
+fn row_pair_predicate(
+    left_column: &str,
+    right_column: &str,
+    rows: &[SeedRow],
+    row_right_column: &str,
+) -> Result<String> {
+    let mut predicates = BTreeSet::new();
+    for row in rows {
+        let value = row
+            .value(row_right_column)
+            .with_context(|| format!("{}.{} is missing", row.table, row_right_column))?;
+        if value.is_null() {
+            continue;
+        }
+        predicates.insert(format!(
+            "{} = {} AND {} = {}",
+            quoted_identifier(left_column),
+            row.integer("snapshot_id")?,
+            quoted_identifier(right_column),
+            sql_literal(value)?
+        ));
+    }
+    Ok(if predicates.is_empty() {
+        "1 = 0".into()
+    } else {
+        predicates
+            .into_iter()
+            .map(|predicate| format!("({predicate})"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+fn text_pair_predicate(
+    left_column: &str,
+    right_column: &str,
+    rows: &[SeedRow],
+    row_right_column: &str,
+) -> Result<String> {
+    row_pair_predicate(left_column, right_column, rows, row_right_column)
 }
 
 async fn selected_aircraft_markets(
@@ -757,6 +1117,7 @@ async fn excluded_counts(
     source: &mut SourceSnapshot<'_, '_>,
     approved_models: usize,
     decisions: usize,
+    selected_counts: &BTreeMap<String, usize>,
 ) -> Result<BTreeMap<String, i64>> {
     let mut counts = BTreeMap::new();
     counts.insert(
@@ -790,6 +1151,27 @@ async fn excluded_counts(
         source.count("gemini_api_usage", "1 = 1").await?,
     );
     counts.insert("approved_avionics_selected".into(), approved_models as i64);
+    for table in [
+        "faa_registry_aircraft",
+        "faa_registry_aircraft_references",
+        "faa_registry_engine_references",
+        "faa_registry_coverage",
+    ] {
+        counts.insert(
+            format!("{table}_not_selected"),
+            source.count(table, "1 = 1").await?
+                - selected_counts.get(table).copied().unwrap_or_default() as i64,
+        );
+    }
+    let mut unselected_aircraft_catalog_rows = 0;
+    for table in ROOT_AIRCRAFT_TABLES {
+        unselected_aircraft_catalog_rows += source.count(table, "1 = 1").await?
+            - selected_counts.get(*table).copied().unwrap_or_default() as i64;
+    }
+    counts.insert(
+        "aircraft_catalog_rows_not_selected".into(),
+        unselected_aircraft_catalog_rows,
+    );
     Ok(counts)
 }
 
@@ -1619,9 +2001,10 @@ fn decode_json_rows(
         let values = columns
             .iter()
             .map(|column| {
-                object
+                let value = object
                     .remove(&column.name)
-                    .with_context(|| format!("database JSON omitted {}.{}", table, column.name))
+                    .with_context(|| format!("database JSON omitted {}.{}", table, column.name))?;
+                canonicalize_logical_value(table, &column.name, value)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(SeedRow {
@@ -1631,6 +2014,31 @@ fn decode_json_rows(
         })
     })
     .collect()
+}
+
+fn canonicalize_logical_value(table: &str, column: &str, value: Value) -> Result<Value> {
+    // SQLite persists logical values as constrained INTEGERs while PostgreSQL
+    // exposes native BOOLEANs. This closed schema map keeps both insertion
+    // binding and fingerprints on one backend-independent representation.
+    if (table, column)
+        != (
+            "aircraft_identity_decisions",
+            "deterministic_validation_passed",
+        )
+    {
+        return Ok(value);
+    }
+    match value {
+        Value::Bool(value) => Ok(Value::Bool(value)),
+        Value::Number(value) if value.as_i64() == Some(0) => Ok(Value::Bool(false)),
+        Value::Number(value) if value.as_i64() == Some(1) => Ok(Value::Bool(true)),
+        value => bail!(
+            "{}.{} contains non-boolean database JSON value {}",
+            table,
+            column,
+            value
+        ),
+    }
 }
 
 fn ids(rows: &[SeedRow], column: &str) -> Result<Vec<i64>> {
@@ -1750,6 +2158,110 @@ mod tests {
                 updated_at = '2000-01-01 00:00:00'
             WHERE id = 1;
 
+            INSERT INTO curation_evidence_sources (
+              id, source_url, resolved_url, source_title, publisher,
+              source_domain, source_tier, content_sha256, retrieved_at, created_at
+            ) VALUES (
+              1, 'https://fixture.example/aircraft', NULL,
+              'Fixture Aviation aircraft catalog', 'Fixture Aviation',
+              'fixture.example', 'manufacturer_primary',
+              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+              '2026-01-01', '2026-01-01'
+            );
+            INSERT INTO curation_evidence_claims (
+              id, evidence_source_id, claim_kind, subject_text,
+              predicate_text, object_text, quoted_evidence,
+              validation_status, validated_at, created_at
+            ) VALUES (
+              1, 1, 'identity', 'Fixture Aviation', 'manufacturer identity',
+              '{"name":"Fixture Aviation"}',
+              'Fixture Aviation publishes aircraft under this manufacturer name.',
+              'validated', '2026-01-01', '2026-01-01'
+            );
+            INSERT INTO aircraft_identity_observations (
+              id, observed_make, exact_source_evidence, observation_sha256, created_at
+            ) VALUES (
+              1, 'Fixture Aviation', 'Fixture Aviation manufacturer catalog',
+              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+              '2026-01-01'
+            );
+            INSERT INTO aircraft_identity_resolution_cases (
+              id, observation_id, resolution_scope, job_fingerprint,
+              catalog_revision, case_status, created_at, updated_at
+            ) VALUES (
+              1, 1, 'make',
+              'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+              'fixture-v1', 'resolved', '2026-01-01', '2026-01-01'
+            );
+            INSERT INTO aircraft_identity_decisions (
+              id, resolution_case_id, entity_kind, decision_action,
+              decision_status, selected_entity_id, decision_payload_json,
+              deterministic_validation_json, deterministic_validation_passed,
+              rationale, decided_by_user_id, decided_at, created_at
+            ) VALUES (
+              1, 1, 'make', 'approve_new', 'approved', NULL,
+              '{"name":"Fixture Aviation"}', '{"passed":true}', 1,
+              'Primary manufacturer evidence establishes the canonical make.',
+              NULL, '2026-01-01', '2026-01-01'
+            );
+            INSERT INTO aircraft_identity_decision_claims (
+              decision_id, evidence_claim_id, evidence_role
+            ) VALUES (1, 1, 'identity');
+            INSERT INTO aircraft_makes (
+              id, name, normalized_name, approval_decision_id, created_at, updated_at
+            ) VALUES (
+              1, 'Fixture Aviation', 'fixture aviation', 1,
+              '2026-01-01', '2026-01-01'
+            );
+
+            INSERT INTO curation_evidence_sources (
+              id, source_url, source_title, publisher, source_domain,
+              source_tier, content_sha256, retrieved_at, created_at
+            ) VALUES (
+              2, 'https://www.faa.gov/fixture-registry',
+              'Unrelated FAA registry fixture',
+              'Federal Aviation Administration', 'faa.gov',
+              'regulator_primary',
+              'abababababababababababababababababababababababababababababababab',
+              '2026-01-02', '2026-01-02'
+            );
+            INSERT INTO faa_registry_snapshots (
+              id, evidence_source_id, snapshot_date, source_url,
+              archive_sha256, source_manifest_sha256, target_set_sha256,
+              master_member_name, master_member_sha256,
+              aircraft_member_name, aircraft_member_sha256,
+              engine_member_name, engine_member_sha256, imported_at
+            ) VALUES (
+              1, 2, '2026-01-02', 'https://www.faa.gov/fixture-registry',
+              'abababababababababababababababababababababababababababababababab',
+              'acacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacac',
+              'adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad',
+              'MASTER.txt',
+              'aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae',
+              'ACFTREF.txt',
+              'afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf',
+              'ENGINE.txt',
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              '2026-01-02'
+            );
+            INSERT INTO faa_registry_aircraft (
+              snapshot_id, n_number, manufacturer_serial_raw,
+              manufacturer_serial_key, aircraft_code, engine_code,
+              year_manufactured, source_record_sha256
+            ) VALUES (
+              1, 'N123', 'FX-001', 'FX001', 'FIXTURE1', 'ENGINE1', 2025,
+              'bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc'
+            );
+            INSERT INTO faa_registry_aircraft_references (
+              snapshot_id, aircraft_code, manufacturer_name, model_name
+            ) VALUES (1, 'FIXTURE1', 'UNRELATED AVIATION', 'MODEL 1');
+            INSERT INTO faa_registry_engine_references (
+              snapshot_id, engine_code, manufacturer_name, model_name
+            ) VALUES (1, 'ENGINE1', 'UNRELATED ENGINES', 'ENGINE 1');
+            INSERT INTO faa_registry_coverage (
+              snapshot_id, n_number, lookup_status
+            ) VALUES (1, 'N123', 'matched');
+
             INSERT INTO avionics_manufacturers (
               id, name, normalized_name, created_at, updated_at
             ) VALUES (1, 'Garmin', 'garmin', '2026-01-01', '2026-01-01');
@@ -1854,6 +2366,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sqlite_boolean_is_canonicalized_for_cross_backend_fingerprints() {
+        assert_eq!(
+            canonicalize_logical_value(
+                "aircraft_identity_decisions",
+                "deterministic_validation_passed",
+                Value::from(1)
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            canonicalize_logical_value(
+                "aircraft_identity_decisions",
+                "deterministic_validation_passed",
+                Value::from(0)
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+        assert!(canonicalize_logical_value(
+            "aircraft_identity_decisions",
+            "deterministic_validation_passed",
+            Value::from(2)
+        )
+        .is_err());
+    }
+
     #[tokio::test]
     async fn fresh_target_dry_run_and_apply_seed_only_the_approved_graph() {
         let source = approved_fixture().await;
@@ -1865,6 +2405,11 @@ mod tests {
         assert!(dry_run.dry_run);
         assert_eq!(dry_run.provider_calls, 0);
         assert_eq!(dry_run.source_counts["avionics_models"], 1);
+        assert_eq!(dry_run.source_counts["faa_registry_aircraft"], 0);
+        assert_eq!(
+            dry_run.excluded_counts["faa_registry_aircraft_not_selected"],
+            1
+        );
         assert_eq!(count(&target, "avionics_models", "1 = 1").await.unwrap(), 0);
 
         let applied = seed_verified_catalog(&source, &target, true).await.unwrap();
@@ -1883,8 +2428,123 @@ mod tests {
             0
         );
         assert_eq!(
+            count(
+                &target,
+                "aircraft_identity_decisions",
+                "deterministic_validation_passed = 1"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
             count(&target, "gemini_api_usage", "1 = 1").await.unwrap(),
             0
+        );
+        assert_eq!(
+            count(&target, "faa_registry_aircraft", "n_number = 'N123'")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_seed_lock_closes_the_empty_check_write_gap() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!();
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        acquire_sqlite_seed_write_lock(&mut transaction)
+            .await
+            .unwrap();
+
+        let competing_write = sqlx::query(
+            r#"
+            INSERT INTO aircraft_identity_observations (
+              observed_make, exact_source_evidence, observation_sha256
+            ) VALUES (
+              'Concurrent Aviation', 'concurrent writer fixture',
+              'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+            )
+            "#,
+        )
+        .execute(pool);
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), competing_write).await
+        {
+            panic!("competing SQLite writer entered after the seed freshness lock");
+        }
+
+        transaction.rollback().await.unwrap();
+        execute(
+            &db,
+            r#"
+            INSERT INTO aircraft_identity_observations (
+              observed_make, exact_source_evidence, observation_sha256
+            ) VALUES (
+              'Concurrent Aviation', 'writer succeeds after rollback',
+              'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+            )
+            "#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_target_seeds_native_booleans_and_verifies_exact_rows() {
+        let Ok(url) = std::env::var("AIRCOST_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let source = approved_fixture().await;
+        let target = AppDb::connect(&url).await.unwrap();
+
+        let DatabaseBackend::Postgres(pool) = target.backend() else {
+            unreachable!();
+        };
+        let mut lock_transaction = pool.begin().await.unwrap();
+        acquire_postgres_seed_locks(&mut lock_transaction)
+            .await
+            .unwrap();
+        let competing_write = sqlx::query(
+            r#"
+            INSERT INTO aircraft_identity_observations (
+              observed_make, exact_source_evidence, observation_sha256
+            ) VALUES (
+              'Concurrent Aviation', 'concurrent PostgreSQL writer fixture',
+              'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+            )
+            "#,
+        )
+        .execute(pool);
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), competing_write).await
+        {
+            panic!("competing PostgreSQL writer entered after the seed freshness locks");
+        }
+        lock_transaction.rollback().await.unwrap();
+
+        let report = seed_verified_catalog(&source, &target, true).await.unwrap();
+        assert_eq!(report.provider_calls, 0);
+        assert_eq!(report.generated_identity_rows_verified, 1);
+        assert_eq!(report.source_counts["aircraft_identity_decisions"], 1);
+        assert_eq!(
+            count(
+                &target,
+                "aircraft_identity_decisions",
+                "deterministic_validation_passed IS TRUE"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let rows = fetch_rows(&target, "aircraft_identity_decisions", "id = 1")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].value("deterministic_validation_passed"),
+            Some(&Value::Bool(true))
         );
     }
 }
