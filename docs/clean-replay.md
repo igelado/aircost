@@ -74,6 +74,47 @@ All operational commands are dry-run unless `--apply` is supplied.
    and finalizes the same listing. Uncorrected replay failures still compensate
    the newly created listing and binding.
 
+For a manifest-sized replay, use the durable batch coordinator instead of a
+shell loop:
+
+```text
+aircost-admin replay-captures --database SHADOW --manifest captures.json \
+  --phase extraction
+aircost-admin replay-captures --database SHADOW --manifest captures.json \
+  --phase extraction --apply
+aircost-admin replay-captures --database SHADOW --manifest captures.json \
+  --phase materialization --apply
+```
+
+The default is provider-free and read-only. `--submission-id ID` restricts one
+invocation without changing the manifest-backed run membership. Apply records
+independent extraction and materialization states, attempts, and timestamps.
+Before any provider-backed retry, it derives an already-committed checkpoint or
+capture binding from the authoritative submission and completes the ledger
+without repeating that work.
+
+Only one replay run may own mutations at a time. Its opaque owner token is
+heartbeated during long operations and fences every item completion. There is
+no automatic time-only takeover. If a worker was killed, first confirm it is no
+longer running; after one hour without a heartbeat, repeat the apply command
+with `--recover-stale`. The displaced token cannot commit a later ledger
+transition.
+
+Each report includes `gemini_usage` with the explicit
+`manifest_phase_cumulative` scope. A stable correlation ID is derived from the
+manifest fingerprint and phase, while each accounting row retains its exact
+submission source ID. The totals therefore include every request across
+resumptions of that phase: logical requests, transport attempts, retries,
+provider token/search counters, and estimated cost when the provider supplied
+complete billable usage. A retry that only reconciles an already-committed
+checkpoint makes no new request, but still reports the phase's earlier cost
+instead of losing durable attribution.
+
+The ledger stores no HTML, extraction JSON, Gemini response, or raw rejection
+message. Terminal rejection stage and reason use a closed vocabulary; FAA
+admission failures retain the stable FAA policy reason code. Retryable database
+or operation failures remain distinct from terminal rejection.
+
 ## Avionics terminal state
 
 Each current extraction occurrence component is exactly one of:

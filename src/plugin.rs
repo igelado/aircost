@@ -195,8 +195,17 @@ pub enum PluginListingReplayOutcome {
     Rejected {
         submission_id: i64,
         stage: &'static str,
+        reason_code: String,
         reason: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct PluginReplayCaptureState {
+    pub submission_id: i64,
+    pub rendered_html_sha256: String,
+    pub checkpoint: Option<PluginExtractionCheckpoint>,
+    pub canonical_listing_id: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1540,6 +1549,46 @@ pub async fn preflight_plugin_submission_extraction(
     })
 }
 
+/// Provider-free inspection used by resumable replay coordination. Unlike the
+/// extraction-only preflight, this accepts an already-bound capture so a
+/// worker can reconcile a domain write that committed before its run ledger
+/// transition was recorded.
+pub async fn inspect_plugin_replay_capture_state(
+    db: &AppDb,
+    user_id: i64,
+    submission_id: i64,
+) -> StoreResult<PluginReplayCaptureState> {
+    let stored = load_checkpoint_capture(db, user_id, submission_id).await?;
+    validate_stored_checkpoint_capture(&stored)?;
+    if stored.extraction_error.is_some() {
+        return Err(PluginStoreError::Validation(
+            "capture has an extraction error instead of a replayable checkpoint".to_string(),
+        ));
+    }
+    let checkpoint = stored
+        .extracted_listing_json
+        .as_deref()
+        .map(|extracted| {
+            parse_current_checkpoint_payload(extracted)?;
+            let occurrences =
+                validate_unbound_current_avionics_extraction(extracted, &stored.rendered_html)
+                    .map_err(PluginStoreError::Validation)?;
+            Ok::<_, PluginStoreError>(PluginExtractionCheckpoint {
+                submission_id,
+                rendered_html_sha256: stored.rendered_html_sha256.clone(),
+                extracted_listing_sha256: sha256_hex(extracted.as_bytes()),
+                avionics_occurrence_count: occurrences.len(),
+            })
+        })
+        .transpose()?;
+    Ok(PluginReplayCaptureState {
+        submission_id,
+        rendered_html_sha256: stored.rendered_html_sha256,
+        checkpoint,
+        canonical_listing_id: stored.canonical_listing_id,
+    })
+}
+
 /// Materialize one exact extraction checkpoint through the ordinary listing
 /// admission, aircraft, avionics, review, and finalization workflow. Listing
 /// extraction is never called. The final capture binding and historical
@@ -1659,9 +1708,11 @@ pub async fn materialize_plugin_submission_checkpoint(
         Ok(created) => created,
         Err(ListingStoreError::Validation(reason) | ListingStoreError::State(reason)) => {
             cleanup_new_replay_listings(db, &stored, &existing_listing_ids).await?;
+            let (stage, reason_code) = replay_rejection_identity(&reason);
             return Ok(PluginListingReplayOutcome::Rejected {
                 submission_id,
-                stage: "listing_admission",
+                stage,
+                reason_code,
                 reason,
             });
         }
@@ -1754,6 +1805,43 @@ pub async fn materialize_plugin_submission_checkpoint(
         submission_id,
         listing,
     })
+}
+
+fn replay_rejection_identity(reason: &str) -> (&'static str, String) {
+    const FAA_BLOCK_CODES: &[&str] = &[
+        "missing_registration",
+        "non_n_registration",
+        "invalid_n_number",
+        "registry_snapshot_unavailable",
+        "registration_not_found",
+        "registration_not_covered",
+        "ambiguous_registration",
+        "serial_conflict",
+        "registry_aircraft_identity_unavailable",
+        "aircraft_manufacturer_mismatch",
+        "aircraft_model_mismatch",
+        "canonical_identity_assignment_missing",
+        "canonical_identity_assignment_mismatch",
+    ];
+    if reason.starts_with("FAA aircraft admission rejected") {
+        let exact_code = reason.split_once(": ").and_then(|(_, suffix)| {
+            let token = suffix
+                .split(|character: char| character.is_ascii_whitespace() || character == '(')
+                .next()?;
+            FAA_BLOCK_CODES.contains(&token).then_some(token)
+        });
+        if let Some(code) = exact_code {
+            return ("faa_aircraft_admission", code.to_string());
+        }
+        return (
+            "faa_aircraft_admission",
+            "faa_aircraft_admission_rejected".to_string(),
+        );
+    }
+    (
+        "listing_admission",
+        "listing_admission_rejected".to_string(),
+    )
 }
 
 async fn bind_replay_capture_and_timestamp(
@@ -2438,9 +2526,9 @@ mod tests {
     use super::{
         bind_replay_capture_and_timestamp, compensate_replay_listing,
         materialize_plugin_submission_checkpoint, parse_current_checkpoint_payload,
-        reprocess_plugin_submission, sha256_hex, signature_message, submit_plugin_html,
-        update_plugin_submission_result, verify_submission_signature, ListingIdRow,
-        PluginCheckpointRow, PluginListingReplayOutcome,
+        replay_rejection_identity, reprocess_plugin_submission, sha256_hex, signature_message,
+        submit_plugin_html, update_plugin_submission_result, verify_submission_signature,
+        ListingIdRow, PluginCheckpointRow, PluginListingReplayOutcome,
     };
     use crate::aircraft::faa::{
         require_listing_faa_admission, store_release, AircraftRecord, AircraftReference,
@@ -2448,6 +2536,40 @@ mod tests {
     };
     use crate::db::{AppDb, DatabaseBackend};
     use crate::models::{PluginSubmissionRequest, User};
+
+    #[test]
+    fn replay_rejection_identity_accepts_only_exact_closed_faa_codes() {
+        let codes = [
+            "missing_registration",
+            "non_n_registration",
+            "invalid_n_number",
+            "registry_snapshot_unavailable",
+            "registration_not_found",
+            "registration_not_covered",
+            "ambiguous_registration",
+            "serial_conflict",
+            "registry_aircraft_identity_unavailable",
+            "aircraft_manufacturer_mismatch",
+            "aircraft_model_mismatch",
+            "canonical_identity_assignment_missing",
+            "canonical_identity_assignment_mismatch",
+        ];
+        for code in codes {
+            assert_eq!(
+                replay_rejection_identity(&format!(
+                    "FAA aircraft admission rejected for listing 23: {code} (snapshot 2)"
+                )),
+                ("faa_aircraft_admission", code.to_string())
+            );
+        }
+        assert_eq!(
+            replay_rejection_identity("FAA aircraft admission rejected: serial_conflict_unbounded"),
+            (
+                "faa_aircraft_admission",
+                "faa_aircraft_admission_rejected".to_string()
+            )
+        );
+    }
 
     fn serial_correction_extraction() -> Value {
         json!({
@@ -2792,8 +2914,14 @@ mod tests {
                 .expect("FAA rejection should be an inspectable replay outcome");
         assert!(matches!(
             outcome,
-            PluginListingReplayOutcome::Rejected { stage: "listing_admission", ref reason, .. }
-                if reason.contains("FAA aircraft admission rejected")
+            PluginListingReplayOutcome::Rejected {
+                stage: "faa_aircraft_admission",
+                ref reason_code,
+                ref reason,
+                ..
+            }
+                if reason_code == "registry_snapshot_unavailable"
+                    && reason.contains("FAA aircraft admission rejected")
         ));
         let retained: (Option<i64>, Option<String>, Option<String>) = match db.backend() {
             DatabaseBackend::Sqlite(pool) => sqlx::query_as(

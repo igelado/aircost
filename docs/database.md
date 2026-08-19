@@ -122,6 +122,23 @@ Store Chrome extension registrations and submitted rendered HTML. Submissions
 retain the HTML, extraction result or error, and the canonical listing created
 from the submission when extraction succeeds.
 
+`listing_replay_runs`, `listing_replay_run_items`
+
+Coordinate manifest-backed clean replay without copying capture or provider
+payloads. A run pins the trusted-manifest version, SHA-256, and member count and
+holds an owner-token heartbeat while active. Each unique run/submission member
+stores the expected capture SHA-256, independent typed extraction and
+materialization state, attempts/timestamps, an optional resulting listing ID,
+and closed terminal rejection or retry-failure codes. A partial unique index
+permits one active replay owner across processes. Explicit stale recovery
+fences the prior token; checkpoint and binding state are re-derived from
+`plugin_submissions` before a provider-backed retry. The optional resulting
+listing foreign key uses `ON DELETE SET NULL`, so this operational history does
+not prevent ordinary listing deletion. Startup structurally attests the
+running-only unique fence, the ordered phase index, and both run/member
+uniqueness constraints on SQLite and PostgreSQL; same-name weakened indexes do
+not satisfy the migration contract.
+
 `gemini_api_usage`
 
 Stores one accounting row per logical Gemini provider request, including its
@@ -1306,6 +1323,37 @@ sqlite3 -readonly data/aircost.sqlite3 \
 
 The migration does not create a run, alter a listing, call a provider, or add
 usage rows.
+
+## Durable Listing Replay Runs
+
+Fresh databases receive the manifest replay ledger from the canonical schema.
+Existing databases must apply the matching additive migration before starting
+the new binary:
+
+```text
+migrations/20260819_listing_replay_runs.sqlite.sql
+migrations/20260819_listing_replay_runs.postgres.sql
+```
+
+The migration refuses a mismatched contract and refuses partially pre-existing
+replay objects without the exact installed contract. It is safe to apply a
+second time only after the exact contract and complete objects exist. For
+SQLite, back up the database, run it in fail-fast mode, then check the contract,
+foreign keys, and integrity:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260819_listing_replay_runs.sqlite.sql"
+sqlite3 -readonly data/aircost.sqlite3 \
+  "SELECT contract_version, contract_fingerprint
+     FROM schema_migration_contracts
+    WHERE migration_name = '20260819_listing_replay_runs';
+   PRAGMA foreign_key_check;
+   PRAGMA integrity_check;"
+```
+
+The migration creates no replay run, listing, provider call, or copied capture
+payload.
 
 ## Aircraft Reference Catalog And FAA Projection Migration
 

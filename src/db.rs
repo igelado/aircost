@@ -186,6 +186,10 @@ const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION: &str =
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
     "589a0716726d2ffd34bf84c08583198383c003228b769c88f094ac6bd9f677b8";
+const LISTING_REPLAY_RUNS_MIGRATION: &str = "20260819_listing_replay_runs";
+const LISTING_REPLAY_RUNS_CONTRACT_VERSION: i64 = 1;
+const LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT: &str =
+    "8efc70b938e9937d22ae5532ea19f93ce51cc322b2c99f5a2b52e79212c92c3c";
 const SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update
 BEFORE UPDATE ON aircraft_listing_identity_correction_decisions
@@ -515,35 +519,10 @@ impl AppDb {
         }
     }
 
-    /// Open an existing SQLite database without migrations, schema creation,
-    /// seed writes, or a writable connection. Administrative export/replay
-    /// sources must use this boundary so even application startup cannot
-    /// mutate the source database.
-    pub async fn connect_read_only(database_url: &str) -> Result<Self> {
-        let database_url = normalize_database_url(database_url);
-        if is_postgres_url(&database_url) {
-            bail!("read-only administrative sources currently require SQLite");
-        }
-        let options = SqliteConnectOptions::from_str(&database_url)
-            .with_context(|| format!("invalid SQLite database URL {database_url}"))?
-            .create_if_missing(false)
-            .read_only(true)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .with_context(|| format!("could not open read-only SQLite database {database_url}"))?;
-        Ok(Self {
-            backend: DatabaseBackend::Sqlite(pool),
-        })
-    }
-
-    /// Opens an existing database for diagnostic commands without schema
-    /// initialization, migrations, seed writes, or writable transactions.
-    /// Unlike an export source, this boundary supports both backends: SQLite
-    /// opens the file read-only and PostgreSQL makes read-only the default for
-    /// every connection in the pool.
+    /// Opens an existing database for diagnostic and export commands without
+    /// schema initialization, migrations, seed writes, or writable
+    /// transactions. SQLite opens the file read-only and PostgreSQL makes
+    /// read-only the default for every connection in the pool.
     pub async fn connect_diagnostic(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
         if is_postgres_url(&database_url) {
@@ -3294,7 +3273,327 @@ impl AppDb {
         if missing_aircraft_listing_identity_corrections {
             bail!(aircraft_listing_identity_corrections_migration_required_message(self.kind()));
         }
+        let missing_listing_replay_objects = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                SELECT EXISTS (
+                  SELECT 1 FROM sqlite_schema
+                  WHERE type = 'table' AND name = 'plugin_submissions'
+                ) AND (
+                  NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'listing_replay_runs'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table' AND name = 'listing_replay_run_items'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'index' AND name = 'idx_listing_replay_runs_one_running'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'index' AND name = 'idx_listing_replay_run_items_phase'
+                  ) OR (
+                    SELECT COUNT(*) FROM pragma_table_info('listing_replay_runs')
+                    WHERE name IN ('manifest_sha256', 'status', 'active_phase',
+                      'owner_token', 'heartbeat_at_epoch_seconds')
+                  ) <> 5 OR (
+                    SELECT COUNT(*) FROM pragma_table_info('listing_replay_run_items')
+                    WHERE name IN ('plugin_submission_id', 'expected_rendered_html_sha256',
+                      'extraction_state', 'materialization_state', 'resulting_listing_id',
+                      'terminal_rejection_stage', 'terminal_rejection_reason_code')
+                  ) <> 7 OR NOT EXISTS (
+                    SELECT 1 FROM pragma_foreign_key_list('listing_replay_run_items')
+                    WHERE [from] = 'resulting_listing_id' AND [table] = 'aircraft_sale_listings'
+                      AND [on_delete] = 'SET NULL'
+                  )
+                )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                SELECT pg_catalog.to_regclass('public.plugin_submissions') IS NOT NULL
+                  AND (
+                    pg_catalog.to_regclass('public.listing_replay_runs') IS NULL
+                    OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NULL
+                    OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NULL
+                    OR pg_catalog.to_regclass('public.idx_listing_replay_run_items_phase') IS NULL
+                    OR (
+                      SELECT COUNT(*) FROM pg_catalog.pg_attribute
+                      WHERE attrelid = pg_catalog.to_regclass('public.listing_replay_runs')
+                        AND attname IN ('manifest_sha256', 'status', 'active_phase',
+                          'owner_token', 'heartbeat_at_epoch_seconds')
+                        AND NOT attisdropped
+                    ) <> 5
+                    OR (
+                      SELECT COUNT(*) FROM pg_catalog.pg_attribute
+                      WHERE attrelid = pg_catalog.to_regclass('public.listing_replay_run_items')
+                        AND attname IN ('plugin_submission_id', 'expected_rendered_html_sha256',
+                          'extraction_state', 'materialization_state', 'resulting_listing_id',
+                          'terminal_rejection_stage', 'terminal_rejection_reason_code')
+                        AND NOT attisdropped
+                    ) <> 7
+                    OR NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_constraint
+                      WHERE conrelid = pg_catalog.to_regclass('public.listing_replay_run_items')
+                        AND contype = 'f'
+                        AND pg_catalog.pg_get_constraintdef(oid) LIKE
+                          'FOREIGN KEY (resulting_listing_id)%ON DELETE SET NULL%'
+                    )
+                  )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        let listing_replay_schema_started = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                SELECT EXISTS (
+                  SELECT 1 FROM sqlite_schema
+                  WHERE name IN (
+                    'listing_replay_runs', 'listing_replay_run_items',
+                    'idx_listing_replay_runs_one_running',
+                    'idx_listing_replay_run_items_phase'
+                  )
+                )
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                SELECT pg_catalog.to_regclass('public.listing_replay_runs') IS NOT NULL
+                  OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NOT NULL
+                  OR pg_catalog.to_regclass(
+                    'public.idx_listing_replay_runs_one_running'
+                  ) IS NOT NULL
+                  OR pg_catalog.to_regclass(
+                    'public.idx_listing_replay_run_items_phase'
+                  ) IS NOT NULL
+                "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        let invalid_listing_replay_definitions =
+            if missing_listing_replay_objects || !listing_replay_schema_started {
+                false
+            } else {
+                !self.listing_replay_definitions_valid().await?
+            };
+        let missing_listing_replay_runs = missing_listing_replay_objects
+            || invalid_listing_replay_definitions
+            || self
+                .migration_contract_missing(
+                    match self.kind() {
+                        DatabaseKind::Sqlite => "listing_replay_runs",
+                        DatabaseKind::Postgres => "public.listing_replay_runs",
+                    },
+                    LISTING_REPLAY_RUNS_MIGRATION,
+                    LISTING_REPLAY_RUNS_CONTRACT_VERSION,
+                    LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT,
+                )
+                .await?;
+        if missing_listing_replay_runs {
+            bail!(listing_replay_runs_migration_required_message(self.kind()));
+        }
         Ok(())
+    }
+
+    async fn listing_replay_definitions_valid(&self) -> Result<bool> {
+        match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let running_index = sqlx::query_as::<_, (i64, i64, Option<String>)>(
+                    r#"
+                    SELECT "unique", partial, (
+                      SELECT sql FROM sqlite_schema
+                      WHERE type = 'index'
+                        AND name = 'idx_listing_replay_runs_one_running'
+                        AND tbl_name = 'listing_replay_runs'
+                    )
+                    FROM pragma_index_list('listing_replay_runs')
+                    WHERE name = 'idx_listing_replay_runs_one_running'
+                    "#,
+                )
+                .fetch_optional(pool)
+                .await?;
+                let running_columns = sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT group_concat(name, ',') FROM (
+                      SELECT name
+                      FROM pragma_index_info('idx_listing_replay_runs_one_running')
+                      ORDER BY seqno
+                    )
+                    "#,
+                )
+                .fetch_optional(pool)
+                .await?;
+                let phase_index = sqlx::query_as::<_, (i64, i64)>(
+                    r#"
+                    SELECT "unique", partial
+                    FROM pragma_index_list('listing_replay_run_items')
+                    WHERE name = 'idx_listing_replay_run_items_phase'
+                    "#,
+                )
+                .fetch_optional(pool)
+                .await?;
+                let phase_columns = sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT group_concat(name, ',') FROM (
+                      SELECT name
+                      FROM pragma_index_info('idx_listing_replay_run_items_phase')
+                      ORDER BY seqno
+                    )
+                    "#,
+                )
+                .fetch_optional(pool)
+                .await?;
+                let unique_indexes = sqlx::query_as::<_, (String, i64, String, i64)>(
+                    r#"
+                    SELECT name, "unique", origin, partial
+                    FROM pragma_index_list('listing_replay_run_items')
+                    WHERE "unique" = 1 AND origin = 'u'
+                    ORDER BY name
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?;
+                let mut unique_column_sets = Vec::with_capacity(unique_indexes.len());
+                for (name, unique, origin, partial) in unique_indexes {
+                    if unique != 1 || origin != "u" || partial != 0 {
+                        return Ok(false);
+                    }
+                    let sql = format!(
+                        "SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info('{}') ORDER BY seqno)",
+                        name.replace('\'', "''")
+                    );
+                    let columns = sqlx::query_scalar::<_, String>(&sql)
+                        .fetch_optional(pool)
+                        .await?;
+                    if let Some(columns) = columns {
+                        unique_column_sets.push(columns);
+                    }
+                }
+                unique_column_sets.sort();
+
+                let running_predicate_is_exact = running_index
+                    .as_ref()
+                    .and_then(|(_, _, definition)| definition.as_deref())
+                    .map(canonical_sql_definition)
+                    .and_then(|definition| {
+                        definition
+                            .split_once("where")
+                            .map(|(_, predicate)| predicate.to_string())
+                    })
+                    .is_some_and(|predicate| predicate == "status='running'");
+                Ok(running_index
+                    .as_ref()
+                    .is_some_and(|(unique, partial, _)| *unique == 1 && *partial == 1)
+                    && running_columns.as_deref() == Some("status")
+                    && running_predicate_is_exact
+                    && phase_index == Some((0, 0))
+                    && phase_columns.as_deref()
+                        == Some("run_id,extraction_state,materialization_state,position")
+                    && unique_column_sets == ["run_id,plugin_submission_id", "run_id,position"])
+            }
+            DatabaseBackend::Postgres(pool) => sqlx::query_scalar::<_, bool>(
+                r#"
+                    WITH replay_indexes AS (
+                      SELECT
+                        index_relation.relname AS index_name,
+                        indexed_relation.oid AS relation_oid,
+                        index_definition.indisunique AS is_unique,
+                        index_definition.indisvalid AS is_valid,
+                        index_definition.indisready AS is_ready,
+                        index_definition.indpred IS NOT NULL AS is_partial,
+                        lower(pg_catalog.pg_get_expr(
+                          index_definition.indpred,
+                          index_definition.indrelid
+                        )) AS predicate,
+                        (
+                          SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                          FROM unnest(index_definition.indkey) WITH ORDINALITY
+                            AS key(attnum, ordinality)
+                          JOIN pg_catalog.pg_attribute attribute
+                            ON attribute.attrelid = index_definition.indrelid
+                           AND attribute.attnum = key.attnum
+                        ) AS columns
+                      FROM pg_catalog.pg_index index_definition
+                      JOIN pg_catalog.pg_class index_relation
+                        ON index_relation.oid = index_definition.indexrelid
+                      JOIN pg_catalog.pg_namespace index_namespace
+                        ON index_namespace.oid = index_relation.relnamespace
+                      JOIN pg_catalog.pg_class indexed_relation
+                        ON indexed_relation.oid = index_definition.indrelid
+                      WHERE index_namespace.nspname = 'public'
+                        AND index_relation.relname IN (
+                          'idx_listing_replay_runs_one_running',
+                          'idx_listing_replay_run_items_phase'
+                        )
+                    ), replay_unique_constraints AS (
+                      SELECT (
+                        SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                        FROM unnest(constraint_definition.conkey) WITH ORDINALITY
+                          AS key(attnum, ordinality)
+                        JOIN pg_catalog.pg_attribute attribute
+                          ON attribute.attrelid = constraint_definition.conrelid
+                         AND attribute.attnum = key.attnum
+                      ) AS columns
+                      FROM pg_catalog.pg_constraint constraint_definition
+                      WHERE constraint_definition.conrelid =
+                        pg_catalog.to_regclass('public.listing_replay_run_items')
+                        AND constraint_definition.contype = 'u'
+                    )
+                    SELECT
+                      (SELECT COUNT(*) = 1 FROM replay_indexes
+                       WHERE index_name = 'idx_listing_replay_runs_one_running'
+                         AND relation_oid = pg_catalog.to_regclass(
+                           'public.listing_replay_runs'
+                         )
+                         AND is_unique AND is_valid AND is_ready AND is_partial
+                         AND columns = ARRAY['status']::text[]
+                         AND pg_catalog.translate(
+                           predicate, E' \n\r\t()', ''
+                         ) IN ('status=''running''', 'status=''running''::text'))
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_indexes
+                       WHERE index_name = 'idx_listing_replay_run_items_phase'
+                         AND relation_oid = pg_catalog.to_regclass(
+                           'public.listing_replay_run_items'
+                         )
+                         AND NOT is_unique AND is_valid AND is_ready AND NOT is_partial
+                         AND columns = ARRAY[
+                           'run_id', 'extraction_state',
+                           'materialization_state', 'position'
+                         ]::text[])
+                      AND
+                      (SELECT COUNT(*) = 2 FROM replay_unique_constraints)
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE columns = ARRAY['run_id', 'position']::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE columns = ARRAY[
+                         'run_id', 'plugin_submission_id'
+                       ]::text[])
+                    "#,
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(Into::into),
+        }
     }
 
     async fn aircraft_listing_identity_correction_definitions_valid(&self) -> Result<bool> {
@@ -5079,6 +5378,17 @@ fn faa_record_hash_domain_migration_required_message(kind: DatabaseKind) -> Stri
     )
 }
 
+fn listing_replay_runs_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: apply \
+         `migrations/{LISTING_REPLAY_RUNS_MIGRATION}.{backend}.sql`, then restart aircost"
+    )
+}
+
 pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
     if is_database_url(database_url) || !database_url.trim().is_empty() {
         Ok(())
@@ -5148,7 +5458,8 @@ mod tests {
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
+        LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT, LISTING_REPLAY_RUNS_CONTRACT_VERSION,
+        LISTING_REPLAY_RUNS_MIGRATION, POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
         POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
         POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
         POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
@@ -5224,6 +5535,10 @@ mod tests {
         include_str!("../migrations/20260819_aircraft_listing_identity_corrections.sqlite.sql");
     const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260819_aircraft_listing_identity_corrections.postgres.sql");
+    const LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260819_listing_replay_runs.sqlite.sql");
+    const LISTING_REPLAY_RUNS_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260819_listing_replay_runs.postgres.sql");
     async fn sqlite_db_with_statements(statements: &[&str]) -> AppDb {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -5316,6 +5631,279 @@ mod tests {
             .to_string();
         assert!(error.contains("read-only"), "{error}");
         pool.close().await;
+    }
+
+    async fn legacy_replay_migration_connection() -> SqliteConnection {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE schema_migration_contracts (
+              migration_name TEXT PRIMARY KEY,
+              contract_version INTEGER NOT NULL,
+              contract_fingerprint TEXT NOT NULL,
+              installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE users (id INTEGER PRIMARY KEY);
+            CREATE TABLE plugin_submissions (id INTEGER PRIMARY KEY);
+            CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY);
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection
+    }
+
+    #[tokio::test]
+    async fn sqlite_listing_replay_migration_upgrades_once_and_is_idempotent() {
+        let mut connection = legacy_replay_migration_connection().await;
+        sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let contract: (i64, String) = sqlx::query_as(
+            "SELECT contract_version, contract_fingerprint FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_REPLAY_RUNS_MIGRATION)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(contract.0, LISTING_REPLAY_RUNS_CONTRACT_VERSION);
+        assert_eq!(contract.1, LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT);
+        let foreign_key_failures: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(foreign_key_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_schema_accepts_the_exact_listing_replay_migration_again() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_tampered_listing_replay_concurrency_index() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("DROP INDEX idx_listing_replay_runs_one_running")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE INDEX idx_listing_replay_runs_one_running ON listing_replay_runs (status)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        assert!(!db.listing_replay_definitions_valid().await.unwrap());
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("20260819_listing_replay_runs.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_missing_listing_replay_item_uniqueness() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let table_start = LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL
+            .find("CREATE TABLE IF NOT EXISTS listing_replay_run_items (")
+            .unwrap();
+        let table_tail = &LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL[table_start..];
+        let table_end = table_tail
+            .find("\n);\n\nCREATE INDEX IF NOT EXISTS idx_listing_replay_run_items_phase")
+            .unwrap()
+            + 3;
+        let replacement_definition = table_tail[..table_end]
+            .replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+            .replace(
+                "  UNIQUE (run_id, position),\n  UNIQUE (run_id, plugin_submission_id),\n",
+                "",
+            );
+        let mut connection = pool.acquire().await.unwrap();
+        connection
+            .execute("PRAGMA foreign_keys = OFF")
+            .await
+            .unwrap();
+        connection
+            .execute("ALTER TABLE listing_replay_run_items RENAME TO listing_replay_run_items_old")
+            .await
+            .unwrap();
+        connection
+            .execute("DROP INDEX idx_listing_replay_run_items_phase")
+            .await
+            .unwrap();
+        sqlx::raw_sql(&replacement_definition)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "CREATE INDEX idx_listing_replay_run_items_phase ON listing_replay_run_items (run_id, extraction_state, materialization_state, position)",
+            )
+            .await
+            .unwrap();
+        connection
+            .execute("DROP TABLE listing_replay_run_items_old")
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert!(!db.listing_replay_definitions_valid().await.unwrap());
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("20260819_listing_replay_runs.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn listing_replay_migration_rejects_mismatched_contract_and_partial_objects() {
+        let mut mismatched = legacy_replay_migration_connection().await;
+        sqlx::query(
+            "INSERT INTO schema_migration_contracts (migration_name, contract_version, contract_fingerprint) VALUES (?, 99, ?)",
+        )
+        .bind(LISTING_REPLAY_RUNS_MIGRATION)
+        .bind("f".repeat(64))
+        .execute(&mut mismatched)
+        .await
+        .unwrap();
+        assert!(sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(&mut mismatched)
+            .await
+            .is_err());
+        let _ = sqlx::query("ROLLBACK").execute(&mut mismatched).await;
+        let created: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'listing_replay_runs'",
+        )
+        .fetch_one(&mut mismatched)
+        .await
+        .unwrap();
+        assert_eq!(created, 0);
+
+        let mut partial = legacy_replay_migration_connection().await;
+        sqlx::query("CREATE TABLE listing_replay_runs (id INTEGER PRIMARY KEY)")
+            .execute(&mut partial)
+            .await
+            .unwrap();
+        assert!(sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(&mut partial)
+            .await
+            .is_err());
+        let _ = sqlx::query("ROLLBACK").execute(&mut partial).await;
+        let item_created: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'listing_replay_run_items'",
+        )
+        .fetch_one(&mut partial)
+        .await
+        .unwrap();
+        let contract_created: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_REPLAY_RUNS_MIGRATION)
+        .fetch_one(&mut partial)
+        .await
+        .unwrap();
+        assert_eq!((item_created, contract_created), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn listing_replay_result_does_not_block_listing_deletion() {
+        let mut connection = legacy_replay_migration_connection().await;
+        sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO plugin_submissions (id) VALUES (1)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO aircraft_sale_listings (id) VALUES (7)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, ?, 1) RETURNING id",
+        )
+        .bind("a".repeat(64))
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO listing_replay_run_items (run_id, plugin_submission_id, position, expected_rendered_html_sha256, extraction_state, materialization_state, resulting_listing_id) VALUES (?, 1, 0, ?, 'succeeded', 'succeeded', 7)",
+        )
+        .bind(run_id)
+        .bind("b".repeat(64))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM aircraft_sale_listings WHERE id = 7")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let resulting_listing_id: Option<i64> = sqlx::query_scalar(
+            "SELECT resulting_listing_id FROM listing_replay_run_items WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(resulting_listing_id, None);
+    }
+
+    #[test]
+    fn postgres_listing_replay_migration_is_public_qualified() {
+        for required in [
+            "public.schema_migration_contracts",
+            "public.listing_replay_runs",
+            "public.listing_replay_run_items",
+            "public.plugin_submissions",
+            "public.aircraft_sale_listings",
+        ] {
+            assert!(
+                LISTING_REPLAY_RUNS_POSTGRES_MIGRATION_SQL.contains(required),
+                "Postgres replay migration must qualify {required}"
+            );
+        }
+        assert!(LISTING_REPLAY_RUNS_POSTGRES_MIGRATION_SQL
+            .contains("listing replay objects exist without the exact migration contract"));
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL,
+            LISTING_REPLAY_RUNS_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains(LISTING_REPLAY_RUNS_MIGRATION));
+            assert!(definition.contains(LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT));
+            assert!(definition.contains("listing_replay_runs"));
+            assert!(definition.contains("listing_replay_run_items"));
+        }
     }
 
     async fn assert_corrupt_identity_correction_schema_rejected(label: &str, statements: &[&str]) {
