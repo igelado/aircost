@@ -37,6 +37,7 @@ toml = "1"
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2"
 xml-rs = "0.8"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2"] }
 
 [dependencies.burn]
 version = "0.21"

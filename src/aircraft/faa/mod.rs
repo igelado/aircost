@@ -18,7 +18,9 @@ pub use admission::{
     AircraftAdmissionError, FaaSerialCorrection, ListingAdmissionEvidence, ListingAdmissionReport,
     SourceAircraftAdmission,
 };
-pub use import::{parse_release, ReleaseReaders};
+pub use import::parse_release_archive;
+#[cfg(test)]
+pub(crate) use import::{parse_release, ReleaseReaders};
 pub use lookup::{
     lookup_current, normalize_n_number, normalize_serial_key, require_eligible, BlockReason,
     Eligibility, LookupOutcome, NotApplicableReason, SerialMatch,
@@ -37,14 +39,15 @@ pub const MASTER_MEMBER_NAME: &str = "MASTER.txt";
 pub const AIRCRAFT_MEMBER_NAME: &str = "ACFTREF.txt";
 pub const ENGINE_MEMBER_NAME: &str = "ENGINE.txt";
 
-/// Provenance supplied by the downloader for one FAA release archive.
+/// Provenance computed from one FAA release archive.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseMetadata {
     /// Calendar date represented by the daily FAA release, in `YYYY-MM-DD`.
     pub snapshot_date: String,
     /// Official download-page URL (or an immutable official archive URL).
     pub source_url: String,
-    /// SHA-256 of the original FAA ZIP, before extracting its members.
+    /// SHA-256 computed from the exact original FAA ZIP bytes before reading
+    /// the required members.
     pub archive_sha256: String,
 }
 

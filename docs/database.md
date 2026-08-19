@@ -572,10 +572,19 @@ Use `--apply` only after reviewing the report.
 Aircraft hierarchy curation requires a current, privacy-minimized projection
 of the FAA releasable registry. Download the official ZIP from the
 [FAA Releasable Aircraft Database Download](https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/releasable_aircraft_download),
-calculate the SHA-256 of the ZIP before extraction, verify the release date,
-and extract only `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`. The application
-does not download or extract the archive and cannot independently prove that
-operator-supplied member files came from the supplied archive hash.
+verify the release date, and give that complete archive directly to the
+importer. Do not extract its members for import. The application computes the
+SHA-256 of the exact ZIP bytes, validates the central directory, and streams
+the required members from that same archive.
+
+The importer accepts a conventional single-disk, non-ZIP64 archive with at
+most 256 uniquely named, safe-path entries. It requires exactly one root
+`MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`; each must be a nonempty,
+unencrypted regular file using stored or deflated compression and remain below
+its source-specific size limit. Duplicate names, nested substitutes, unsafe
+paths, unsupported compression, inconsistent directory metadata, oversized
+archives or members, and malformed ZIPs abort the import before any database
+write.
 
 The importer projects these exact source columns:
 
@@ -597,18 +606,20 @@ and submission reprocessing can then pass admission. Malformed pending JSON and
 missing, foreign, or invalid pending registration candidates are counted but
 never become targets. Explicit targets allow the same pre-coverage flow for a
 source-proven registration recovered by an operator. Neither source mutates the
-listing. The importer computes member, manifest, target-set, and exact
-logical-record digests while discarding registrant fields. `DEREG.txt` is not
-imported, and an older release is never a fallback for the admission gate.
+listing. The importer computes the archive digest, each exact uncompressed
+member digest, the source manifest, the target set, and exact logical-record
+digests while discarding registrant fields. `DEREG.txt` is not imported, and an
+older release is never a fallback for the admission gate.
 
-Inspect and extract one release outside the repository:
+Optionally inspect the complete release outside the repository:
 
 ```sh
 sha256sum /tmp/ReleasableAircraft.zip
 unzip -l /tmp/ReleasableAircraft.zip
-unzip /tmp/ReleasableAircraft.zip MASTER.txt ACFTREF.txt ENGINE.txt \
-  -d /tmp/aircost-faa-release
 ```
+
+The external digest is useful for an operator comparison only; it is not an
+input to the command or trusted as import provenance.
 
 Run the importer without `--apply` first. Dry run is the default and performs
 all parsing, schema, target-coverage, and digest checks without writing:
@@ -616,11 +627,8 @@ all parsing, schema, target-coverage, and digest checks without writing:
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
-  --master /tmp/aircost-faa-release/MASTER.txt \
-  --aircraft-reference /tmp/aircost-faa-release/ACFTREF.txt \
-  --engine-reference /tmp/aircost-faa-release/ENGINE.txt \
+  --archive /tmp/ReleasableAircraft.zip \
   --snapshot-date YYYY-MM-DD \
-  --archive-sha256 64_CHARACTER_ZIP_SHA256 \
   --dry-run
 ```
 
@@ -628,17 +636,14 @@ cargo run --bin aircost-admin -- import-faa-registry \
 listing model year or an arbitrary import date. Review the JSON report's
 separate `listing_counts` and `pending_submission_counts`, requested and
 accepted explicit targets, target count, matched and absent counts, member
-hashes, manifest hash, and target-set hash. Apply the same validated input
-explicitly:
+hashes, archive hash, manifest hash, and target-set hash. Apply the same
+validated archive explicitly:
 
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
-  --master /tmp/aircost-faa-release/MASTER.txt \
-  --aircraft-reference /tmp/aircost-faa-release/ACFTREF.txt \
-  --engine-reference /tmp/aircost-faa-release/ENGINE.txt \
+  --archive /tmp/ReleasableAircraft.zip \
   --snapshot-date YYYY-MM-DD \
-  --archive-sha256 64_CHARACTER_ZIP_SHA256 \
   --apply
 ```
 
@@ -648,11 +653,8 @@ add the flag once per aircraft to both the dry run and the corresponding apply:
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
-  --master /tmp/aircost-faa-release/MASTER.txt \
-  --aircraft-reference /tmp/aircost-faa-release/ACFTREF.txt \
-  --engine-reference /tmp/aircost-faa-release/ENGINE.txt \
+  --archive /tmp/ReleasableAircraft.zip \
   --snapshot-date YYYY-MM-DD \
-  --archive-sha256 64_CHARACTER_ZIP_SHA256 \
   --include-n-number N1925X \
   --dry-run
 ```

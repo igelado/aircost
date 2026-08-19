@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Component;
 
 use anyhow::{bail, Context, Result};
 use csv::{Reader, ReaderBuilder, StringRecord};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zip::read::ZipArchive;
+use zip::CompressionMethod;
 
 use super::{
     normalize_n_number, normalize_serial_key, AircraftRecord, AircraftReference, EngineReference,
@@ -12,16 +15,45 @@ use super::{
     ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
 };
 
-/// Extracted FAA release members. ZIP extraction is intentionally left to the
-/// caller so this domain never needs to ingest unrelated registrant files.
-pub struct ReleaseReaders<M, A, E> {
+const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 256;
+const MAX_ARCHIVE_MEMBER_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_MASTER_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_AIRCRAFT_REFERENCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ENGINE_REFERENCE_BYTES: u64 = 16 * 1024 * 1024;
+const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0605_4b50;
+const ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
+const CENTRAL_DIRECTORY_ENTRY_SIGNATURE: u32 = 0x0201_4b50;
+const END_OF_CENTRAL_DIRECTORY_BYTES: usize = 22;
+const MAX_ZIP_COMMENT_BYTES: usize = u16::MAX as usize;
+const CENTRAL_DIRECTORY_ENTRY_BYTES: usize = 46;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CentralDirectoryPreflight {
+    entry_count: usize,
+    member_names: BTreeSet<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequiredArchiveMembers {
+    master: usize,
+    aircraft_reference: usize,
+    engine_reference: usize,
+}
+
+/// Test-only injection boundary for deterministic CSV projection tests. The
+/// production importer accepts only one complete FAA ZIP through
+/// [`parse_release_archive`].
+#[cfg(test)]
+pub(crate) struct ReleaseReaders<M, A, E> {
     pub master: M,
     pub aircraft_reference: A,
     pub engine_reference: E,
 }
 
+#[cfg(test)]
 impl<M, A, E> ReleaseReaders<M, A, E> {
-    pub fn new(master: M, aircraft_reference: A, engine_reference: E) -> Self {
+    pub(crate) fn new(master: M, aircraft_reference: A, engine_reference: E) -> Self {
         Self {
             master,
             aircraft_reference,
@@ -30,12 +62,90 @@ impl<M, A, E> ReleaseReaders<M, A, E> {
     }
 }
 
-/// Parses exactly the three non-PII inputs needed for registry grounding.
+/// Hash and validate one official FAA release ZIP, then stream exactly one
+/// root `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt` member into the
+/// privacy-minimizing registry projection.
 ///
-/// Member digests are computed while parsing. The caller must provide the
-/// digest of the original archive, retaining a complete provenance chain even
-/// though the archive itself is not stored in the database.
-pub fn parse_release<M, A, E, I, S>(
+/// The complete archive hash and each uncompressed member hash are derived
+/// from the same supplied bytes. No production caller can pair extracted
+/// member files with an unrelated operator-supplied archive digest.
+pub fn parse_release_archive<R, I, S>(
+    mut archive_reader: R,
+    snapshot_date: impl Into<String>,
+    target_n_numbers: I,
+) -> Result<Release>
+where
+    R: Read + Seek,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let archive_sha256 = hash_archive(&mut archive_reader)?;
+    let mut metadata = ReleaseMetadata::official(snapshot_date, archive_sha256);
+    validate_snapshot_metadata(&mut metadata)?;
+    let targets = normalize_targets(target_n_numbers)?;
+    let target_set_sha256 = target_set_digest(&targets);
+
+    archive_reader
+        .seek(SeekFrom::Start(0))
+        .context("FAA release ZIP could not be rewound for structural validation")?;
+    let preflight = preflight_central_directory(&mut archive_reader)?;
+    archive_reader
+        .seek(SeekFrom::Start(0))
+        .context("FAA release ZIP could not be rewound after structural validation")?;
+    let mut archive = ZipArchive::new(archive_reader).context("FAA release is not a valid ZIP")?;
+    let members = validate_archive(&mut archive, preflight)?;
+
+    let (aircraft, coverage, master_sha256) = {
+        let master = archive_member(
+            &mut archive,
+            members.master,
+            MASTER_MEMBER_NAME,
+            MAX_MASTER_BYTES,
+        )?;
+        parse_master(master, &targets)?
+    };
+    let aircraft_codes = aircraft
+        .iter()
+        .map(|record| record.aircraft_code.as_str())
+        .collect::<BTreeSet<_>>();
+    let engine_codes = aircraft
+        .iter()
+        .filter_map(|record| record.engine_code.as_deref())
+        .collect::<BTreeSet<_>>();
+    let (aircraft_references, aircraft_sha256) = {
+        let aircraft_reference = archive_member(
+            &mut archive,
+            members.aircraft_reference,
+            AIRCRAFT_MEMBER_NAME,
+            MAX_AIRCRAFT_REFERENCE_BYTES,
+        )?;
+        parse_aircraft_references(aircraft_reference, &aircraft_codes)?
+    };
+    let (engine_references, engine_sha256) = {
+        let engine_reference = archive_member(
+            &mut archive,
+            members.engine_reference,
+            ENGINE_MEMBER_NAME,
+            MAX_ENGINE_REFERENCE_BYTES,
+        )?;
+        parse_engine_references(engine_reference, &engine_codes)?
+    };
+
+    Ok(assemble_release(
+        metadata,
+        target_set_sha256,
+        aircraft,
+        coverage,
+        aircraft_references,
+        engine_references,
+        master_sha256,
+        aircraft_sha256,
+        engine_sha256,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_release<M, A, E, I, S>(
     mut metadata: ReleaseMetadata,
     readers: ReleaseReaders<M, A, E>,
     target_n_numbers: I,
@@ -47,9 +157,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    validate_snapshot_date(&metadata.snapshot_date)?;
-    validate_faa_source_url(&metadata.source_url)?;
-    metadata.archive_sha256 = normalize_digest(&metadata.archive_sha256, "archive")?;
+    validate_snapshot_metadata(&mut metadata)?;
 
     let targets = normalize_targets(target_n_numbers)?;
     let target_set_sha256 = target_set_digest(&targets);
@@ -67,6 +175,30 @@ where
     let (engine_references, engine_sha256) =
         parse_engine_references(readers.engine_reference, &engine_codes)?;
 
+    Ok(assemble_release(
+        metadata,
+        target_set_sha256,
+        aircraft,
+        coverage,
+        aircraft_references,
+        engine_references,
+        master_sha256,
+        aircraft_sha256,
+        engine_sha256,
+    ))
+}
+
+fn assemble_release(
+    metadata: ReleaseMetadata,
+    target_set_sha256: String,
+    aircraft: Vec<AircraftRecord>,
+    coverage: Vec<TargetCoverage>,
+    aircraft_references: Vec<AircraftReference>,
+    engine_references: Vec<EngineReference>,
+    master_sha256: String,
+    aircraft_sha256: String,
+    engine_sha256: String,
+) -> Release {
     let master = MemberProvenance {
         member_name: MASTER_MEMBER_NAME.to_string(),
         sha256: master_sha256,
@@ -82,7 +214,7 @@ where
     let source_manifest_sha256 =
         source_manifest_digest(&metadata, [&master, &aircraft_reference, &engine_reference]);
 
-    Ok(Release {
+    Release {
         metadata,
         source_manifest_sha256,
         target_set_sha256,
@@ -93,7 +225,340 @@ where
         aircraft,
         aircraft_references,
         engine_references,
+    }
+}
+
+fn hash_archive<R: Read + Seek>(reader: &mut R) -> Result<String> {
+    let archive_size = reader
+        .seek(SeekFrom::End(0))
+        .context("FAA release ZIP size could not be inspected")?;
+    if archive_size == 0 {
+        bail!("FAA release ZIP is empty");
+    }
+    if archive_size > MAX_ARCHIVE_BYTES {
+        bail!(
+            "FAA release ZIP is {archive_size} bytes; maximum accepted size is {MAX_ARCHIVE_BYTES}"
+        );
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .context("FAA release ZIP could not be rewound for hashing")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .context("FAA release ZIP could not be hashed")?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn preflight_central_directory<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<CentralDirectoryPreflight> {
+    let archive_size = reader
+        .seek(SeekFrom::End(0))
+        .context("FAA release ZIP size could not be inspected")?;
+    let tail_size = archive_size
+        .min(u64::try_from(END_OF_CENTRAL_DIRECTORY_BYTES + MAX_ZIP_COMMENT_BYTES).unwrap());
+    if tail_size < u64::try_from(END_OF_CENTRAL_DIRECTORY_BYTES).unwrap() {
+        bail!("FAA release ZIP is too short to contain a central directory");
+    }
+    reader
+        .seek(SeekFrom::End(-i64::try_from(tail_size).unwrap()))
+        .context("FAA release ZIP end record could not be located")?;
+    let mut tail = vec![0_u8; usize::try_from(tail_size).unwrap()];
+    reader
+        .read_exact(&mut tail)
+        .context("FAA release ZIP end record could not be read")?;
+
+    let eocd_tail_offset = (0..=tail.len().saturating_sub(END_OF_CENTRAL_DIRECTORY_BYTES))
+        .rev()
+        .find(|offset| {
+            little_u32(&tail[*offset..*offset + 4]) == END_OF_CENTRAL_DIRECTORY_SIGNATURE
+                && *offset
+                    + END_OF_CENTRAL_DIRECTORY_BYTES
+                    + usize::from(little_u16(&tail[*offset + 20..*offset + 22]))
+                    == tail.len()
+        })
+        .context("FAA release ZIP has no valid end-of-central-directory record")?;
+    if eocd_tail_offset >= 20
+        && little_u32(&tail[eocd_tail_offset - 20..eocd_tail_offset - 16])
+            == ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE
+    {
+        bail!("FAA release ZIP64 archives are not supported");
+    }
+    let eocd = &tail[eocd_tail_offset..eocd_tail_offset + END_OF_CENTRAL_DIRECTORY_BYTES];
+    let disk_number = little_u16(&eocd[4..6]);
+    let central_directory_disk = little_u16(&eocd[6..8]);
+    let entries_on_disk = little_u16(&eocd[8..10]);
+    let total_entries = little_u16(&eocd[10..12]);
+    let central_directory_size = little_u32(&eocd[12..16]);
+    let central_directory_offset = little_u32(&eocd[16..20]);
+    if disk_number == u16::MAX
+        || central_directory_disk == u16::MAX
+        || entries_on_disk == u16::MAX
+        || total_entries == u16::MAX
+        || central_directory_size == u32::MAX
+        || central_directory_offset == u32::MAX
+    {
+        bail!("FAA release ZIP64 archives are not supported");
+    }
+    if disk_number != 0 || central_directory_disk != 0 || entries_on_disk != total_entries {
+        bail!("FAA release ZIP must be a single-disk archive");
+    }
+    let entry_count = usize::from(total_entries);
+    if entry_count == 0 {
+        bail!("FAA release ZIP contains no entries");
+    }
+    if entry_count > MAX_ARCHIVE_ENTRIES {
+        bail!(
+            "FAA release ZIP contains {entry_count} entries; maximum accepted count is {MAX_ARCHIVE_ENTRIES}"
+        );
+    }
+
+    let tail_start = archive_size - tail_size;
+    let eocd_offset = tail_start + u64::try_from(eocd_tail_offset).unwrap();
+    let directory_offset = u64::from(central_directory_offset);
+    let directory_size = u64::from(central_directory_size);
+    if directory_offset
+        .checked_add(directory_size)
+        .filter(|end| *end == eocd_offset)
+        .is_none()
+    {
+        bail!("FAA release ZIP central-directory bounds are inconsistent");
+    }
+    reader
+        .seek(SeekFrom::Start(directory_offset))
+        .context("FAA release ZIP central directory could not be opened")?;
+    let mut names = BTreeSet::new();
+    for index in 0..entry_count {
+        let mut header = [0_u8; CENTRAL_DIRECTORY_ENTRY_BYTES];
+        reader
+            .read_exact(&mut header)
+            .with_context(|| format!("FAA release ZIP central entry {index} is truncated"))?;
+        if little_u32(&header[0..4]) != CENTRAL_DIRECTORY_ENTRY_SIGNATURE {
+            bail!("FAA release ZIP central entry {index} has an invalid signature");
+        }
+        if little_u16(&header[34..36]) != 0 {
+            bail!("FAA release ZIP must be a single-disk archive");
+        }
+        let name_length = usize::from(little_u16(&header[28..30]));
+        let extra_length = u64::from(little_u16(&header[30..32]));
+        let comment_length = u64::from(little_u16(&header[32..34]));
+        if name_length == 0 {
+            bail!("FAA release ZIP central entry {index} has an empty name");
+        }
+        let mut raw_name = vec![0_u8; name_length];
+        reader
+            .read_exact(&mut raw_name)
+            .with_context(|| format!("FAA release ZIP central entry {index} name is truncated"))?;
+        let name = std::str::from_utf8(&raw_name)
+            .with_context(|| format!("FAA release ZIP central entry {index} name is not UTF-8"))?;
+        validate_archive_member_path(name)?;
+        if names.contains(&raw_name) {
+            bail!("FAA release ZIP contains duplicate member {name:?}");
+        }
+        names.insert(raw_name);
+        let variable_metadata = extra_length
+            .checked_add(comment_length)
+            .context("FAA release ZIP central entry metadata length overflowed")?;
+        reader
+            .seek(SeekFrom::Current(i64::try_from(variable_metadata).unwrap()))
+            .with_context(|| format!("FAA release ZIP central entry {index} is truncated"))?;
+    }
+    let directory_end = reader
+        .stream_position()
+        .context("FAA release ZIP central-directory position could not be inspected")?;
+    if directory_end != eocd_offset {
+        bail!("FAA release ZIP central-directory size does not match its entries");
+    }
+
+    Ok(CentralDirectoryPreflight {
+        entry_count,
+        member_names: names,
     })
+}
+
+fn little_u16(bytes: &[u8]) -> u16 {
+    u16::from_le_bytes(bytes.try_into().expect("two-byte ZIP field"))
+}
+
+fn little_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().expect("four-byte ZIP field"))
+}
+
+fn validate_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    preflight: CentralDirectoryPreflight,
+) -> Result<RequiredArchiveMembers> {
+    if archive.len() != preflight.entry_count {
+        bail!(
+            "FAA release ZIP reader exposed {} entries after structural validation found {}",
+            archive.len(),
+            preflight.entry_count
+        );
+    }
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!(
+            "FAA release ZIP contains {} entries; maximum accepted count is {MAX_ARCHIVE_ENTRIES}",
+            archive.len()
+        );
+    }
+
+    let mut master = None;
+    let mut aircraft_reference = None;
+    let mut engine_reference = None;
+    let mut exposed_names = BTreeSet::new();
+    for index in 0..archive.len() {
+        let member = archive
+            .by_index_raw(index)
+            .with_context(|| format!("FAA release ZIP entry {index} could not be inspected"))?;
+        exposed_names.insert(member.name_raw().to_vec());
+        validate_archive_member_path(member.name())?;
+        if member.encrypted() {
+            bail!("FAA release ZIP member {:?} is encrypted", member.name());
+        }
+        if member.size() > MAX_ARCHIVE_MEMBER_BYTES {
+            bail!(
+                "FAA release ZIP member {:?} is {} bytes; maximum accepted member size is {MAX_ARCHIVE_MEMBER_BYTES}",
+                member.name(),
+                member.size()
+            );
+        }
+        let required = match member.name() {
+            MASTER_MEMBER_NAME => Some((&mut master, MAX_MASTER_BYTES)),
+            AIRCRAFT_MEMBER_NAME => Some((&mut aircraft_reference, MAX_AIRCRAFT_REFERENCE_BYTES)),
+            ENGINE_MEMBER_NAME => Some((&mut engine_reference, MAX_ENGINE_REFERENCE_BYTES)),
+            _ => None,
+        };
+        let Some((slot, maximum_size)) = required else {
+            continue;
+        };
+        if !member.is_file() || member.is_symlink() {
+            bail!(
+                "FAA release ZIP required member {:?} is not a regular file",
+                member.name()
+            );
+        }
+        if member.size() == 0 || member.size() > maximum_size {
+            bail!(
+                "FAA release ZIP required member {:?} is {} bytes; accepted range is 1..={maximum_size}",
+                member.name(),
+                member.size()
+            );
+        }
+        if !matches!(
+            member.compression(),
+            CompressionMethod::Stored | CompressionMethod::Deflated
+        ) {
+            bail!(
+                "FAA release ZIP required member {:?} uses unsupported compression {:?}",
+                member.name(),
+                member.compression()
+            );
+        }
+        if slot.replace(index).is_some() {
+            bail!(
+                "FAA release ZIP contains duplicate root member {:?}",
+                member.name()
+            );
+        }
+    }
+    if exposed_names != preflight.member_names {
+        bail!("FAA release ZIP member names changed between structural validation and reading");
+    }
+
+    Ok(RequiredArchiveMembers {
+        master: master.context("FAA release ZIP is missing root MASTER.txt")?,
+        aircraft_reference: aircraft_reference
+            .context("FAA release ZIP is missing root ACFTREF.txt")?,
+        engine_reference: engine_reference.context("FAA release ZIP is missing root ENGINE.txt")?,
+    })
+}
+
+fn validate_archive_member_path(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('\0')
+        || name.contains('\\')
+        || name.split('/').any(|component| component == "..")
+        || std::path::Path::new(name)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("FAA release ZIP contains unsafe member path {name:?}");
+    }
+    Ok(())
+}
+
+fn archive_member<'a, R: Read + Seek>(
+    archive: &'a mut ZipArchive<R>,
+    index: usize,
+    expected_name: &str,
+    maximum_size: u64,
+) -> Result<SizeLimitedReader<zip::read::ZipFile<'a, R>>> {
+    let member = archive
+        .by_index(index)
+        .with_context(|| format!("FAA release ZIP member {expected_name} could not be opened"))?;
+    if member.name() != expected_name {
+        bail!(
+            "FAA release ZIP member index {index} changed from {expected_name:?} to {:?}",
+            member.name()
+        );
+    }
+    Ok(SizeLimitedReader::new(member, maximum_size, expected_name))
+}
+
+struct SizeLimitedReader<R> {
+    inner: R,
+    remaining: u64,
+    member_name: String,
+}
+
+impl<R> SizeLimitedReader<R> {
+    fn new(inner: R, maximum_size: u64, member_name: impl Into<String>) -> Self {
+        Self {
+            inner,
+            remaining: maximum_size,
+            member_name: member_name.into(),
+        }
+    }
+}
+
+impl<R: Read> Read for SizeLimitedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0_u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FAA release ZIP member {:?} exceeds its accepted uncompressed size",
+                        self.member_name
+                    ),
+                )),
+            };
+        }
+        let accepted = usize::try_from(self.remaining.min(buffer.len() as u64)).unwrap();
+        let count = self.inner.read(&mut buffer[..accepted])?;
+        self.remaining -= u64::try_from(count).unwrap();
+        Ok(count)
+    }
+}
+
+fn validate_snapshot_metadata(metadata: &mut ReleaseMetadata) -> Result<()> {
+    validate_snapshot_date(&metadata.snapshot_date)?;
+    validate_faa_source_url(&metadata.source_url)?;
+    metadata.archive_sha256 = normalize_digest(&metadata.archive_sha256, "archive")?;
+    Ok(())
 }
 
 fn parse_master<R: Read>(
@@ -514,9 +979,11 @@ impl<R: Read> Read for DigestReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     use super::*;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
 
     const MASTER: &str = "\u{feff}N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR,NAME,STREET,MODE S CODE\n123AB, 182-01234 ,2072738,41528,2006,PRIVATE OWNER,SECRET ADDRESS,50000000\n456,ABC-99,0001234,00001,0000,ANOTHER OWNER,ANOTHER ADDRESS,50000001\n";
     const AIRCRAFT: &str = "\u{feff}CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED,TC-DATA-SHEET,TC-DATA-HOLDER\n2072738,CESSNA AIRCRAFT CO,182T,4,1,1,0,01,004,CLASS 1,0145,3A13,TEXTRON AVIATION INC\n0001234,EXAMPLE,MODEL,4,1,1,1,01,002,CLASS 1,0100,,\n";
@@ -524,6 +991,203 @@ mod tests {
 
     fn metadata() -> ReleaseMetadata {
         ReleaseMetadata::official("2026-07-20", "A".repeat(64))
+    }
+
+    fn archive(entries: &[(&str, &[u8])]) -> Cursor<Vec<u8>> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, bytes) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap()
+    }
+
+    fn official_archive() -> Cursor<Vec<u8>> {
+        archive(&[
+            (MASTER_MEMBER_NAME, MASTER.as_bytes()),
+            (AIRCRAFT_MEMBER_NAME, AIRCRAFT.as_bytes()),
+            (ENGINE_MEMBER_NAME, ENGINE.as_bytes()),
+            ("README.txt", b"FAA release fixture"),
+        ])
+    }
+
+    fn mark_all_entries_encrypted(bytes: &mut [u8]) {
+        for index in 0..bytes.len().saturating_sub(10) {
+            let flag_offset = if bytes[index..].starts_with(b"PK\x03\x04") {
+                Some(index + 6)
+            } else if bytes[index..].starts_with(b"PK\x01\x02") {
+                Some(index + 8)
+            } else {
+                None
+            };
+            if let Some(flag_offset) = flag_offset {
+                let flags = u16::from_le_bytes([bytes[flag_offset], bytes[flag_offset + 1]]) | 1;
+                bytes[flag_offset..flag_offset + 2].copy_from_slice(&flags.to_le_bytes());
+            }
+        }
+    }
+
+    fn declare_first_member_oversized(bytes: &mut [u8]) {
+        let oversized = u32::try_from(MAX_MASTER_BYTES + 1).unwrap().to_le_bytes();
+        let local = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x03\x04")
+            .unwrap();
+        bytes[local + 22..local + 26].copy_from_slice(&oversized);
+        let central = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&oversized);
+    }
+
+    fn rename_archive_members(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len());
+        for offset in 0..=bytes.len().saturating_sub(from.len()) {
+            if &bytes[offset..offset + from.len()] == from {
+                bytes[offset..offset + to.len()].copy_from_slice(to);
+            }
+        }
+    }
+
+    fn end_of_central_directory_offset(bytes: &[u8]) -> usize {
+        bytes
+            .windows(4)
+            .rposition(|window| window == END_OF_CENTRAL_DIRECTORY_SIGNATURE.to_le_bytes())
+            .unwrap()
+    }
+
+    #[test]
+    fn archive_parser_binds_complete_zip_and_exact_member_hashes() {
+        let archive = official_archive();
+        let expected_archive_sha256 = format!("{:x}", Sha256::digest(archive.get_ref()));
+        let release =
+            parse_release_archive(archive, "2026-07-20", ["N123AB", "N456", "N999ZZ"]).unwrap();
+
+        assert_eq!(release.metadata.archive_sha256, expected_archive_sha256);
+        assert_eq!(
+            release.master.sha256,
+            format!("{:x}", Sha256::digest(MASTER.as_bytes()))
+        );
+        assert_eq!(
+            release.aircraft_reference.sha256,
+            format!("{:x}", Sha256::digest(AIRCRAFT.as_bytes()))
+        );
+        assert_eq!(
+            release.engine_reference.sha256,
+            format!("{:x}", Sha256::digest(ENGINE.as_bytes()))
+        );
+        assert_eq!(release.aircraft.len(), 2);
+        assert_eq!(release.coverage.len(), 3);
+    }
+
+    #[test]
+    fn archive_parser_rejects_missing_and_duplicate_required_root_members() {
+        let missing = archive(&[
+            (MASTER_MEMBER_NAME, MASTER.as_bytes()),
+            (AIRCRAFT_MEMBER_NAME, AIRCRAFT.as_bytes()),
+        ]);
+        assert!(parse_release_archive(missing, "2026-07-20", ["N123AB"])
+            .unwrap_err()
+            .to_string()
+            .contains("missing root ENGINE.txt"));
+
+        let mut duplicate = archive(&[
+            (MASTER_MEMBER_NAME, MASTER.as_bytes()),
+            ("MASTEX.txt", MASTER.as_bytes()),
+            (AIRCRAFT_MEMBER_NAME, AIRCRAFT.as_bytes()),
+            (ENGINE_MEMBER_NAME, ENGINE.as_bytes()),
+        ]);
+        rename_archive_members(duplicate.get_mut(), b"MASTEX.txt", b"MASTER.txt");
+        assert!(parse_release_archive(duplicate, "2026-07-20", ["N123AB"])
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate member \"MASTER.txt\""));
+
+        let nested_only = archive(&[
+            ("nested/MASTER.txt", MASTER.as_bytes()),
+            (AIRCRAFT_MEMBER_NAME, AIRCRAFT.as_bytes()),
+            (ENGINE_MEMBER_NAME, ENGINE.as_bytes()),
+        ]);
+        assert!(parse_release_archive(nested_only, "2026-07-20", ["N123AB"])
+            .unwrap_err()
+            .to_string()
+            .contains("missing root MASTER.txt"));
+    }
+
+    #[test]
+    fn archive_parser_rejects_encryption_traversal_and_oversized_members() {
+        let mut encrypted = official_archive().into_inner();
+        mark_all_entries_encrypted(&mut encrypted);
+        assert!(
+            parse_release_archive(Cursor::new(encrypted), "2026-07-20", ["N123AB"])
+                .unwrap_err()
+                .to_string()
+                .contains("is encrypted")
+        );
+
+        let traversal = archive(&[
+            (MASTER_MEMBER_NAME, MASTER.as_bytes()),
+            (AIRCRAFT_MEMBER_NAME, AIRCRAFT.as_bytes()),
+            (ENGINE_MEMBER_NAME, ENGINE.as_bytes()),
+            ("../outside.txt", b"unsafe"),
+        ]);
+        assert!(parse_release_archive(traversal, "2026-07-20", ["N123AB"])
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe member path"));
+
+        let mut oversized = official_archive().into_inner();
+        declare_first_member_oversized(&mut oversized);
+        assert!(
+            parse_release_archive(Cursor::new(oversized), "2026-07-20", ["N123AB"])
+                .unwrap_err()
+                .to_string()
+                .contains("accepted range")
+        );
+    }
+
+    #[test]
+    fn archive_parser_rejects_multi_disk_and_zip64_archives() {
+        assert!(
+            parse_release_archive(Cursor::new(b"not a zip"), "2026-07-20", ["N123AB"])
+                .unwrap_err()
+                .to_string()
+                .contains("too short")
+        );
+
+        let mut multi_disk = official_archive().into_inner();
+        let eocd = end_of_central_directory_offset(&multi_disk);
+        multi_disk[eocd + 4..eocd + 6].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(
+            parse_release_archive(Cursor::new(multi_disk), "2026-07-20", ["N123AB"])
+                .unwrap_err()
+                .to_string()
+                .contains("single-disk")
+        );
+
+        let mut zip64 = official_archive().into_inner();
+        let eocd = end_of_central_directory_offset(&zip64);
+        zip64[eocd + 10..eocd + 12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(
+            parse_release_archive(Cursor::new(zip64), "2026-07-20", ["N123AB"])
+                .unwrap_err()
+                .to_string()
+                .contains("ZIP64")
+        );
+    }
+
+    #[test]
+    fn member_reader_enforces_actual_uncompressed_size() {
+        let mut exact = SizeLimitedReader::new(Cursor::new(b"abc"), 3, "fixture.txt");
+        let mut contents = Vec::new();
+        exact.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"abc");
+
+        let mut oversized = SizeLimitedReader::new(Cursor::new(b"abcd"), 3, "fixture.txt");
+        let error = oversized.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
     }
 
     #[test]

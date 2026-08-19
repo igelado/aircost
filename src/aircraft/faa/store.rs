@@ -699,12 +699,15 @@ impl StoredRow {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::aircraft::faa::{
-        lookup_current, parse_release, LookupOutcome, ReleaseMetadata, ReleaseReaders,
+        lookup_current, parse_release_archive, LookupOutcome, AIRCRAFT_MEMBER_NAME,
+        ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
     };
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     use super::*;
 
@@ -713,16 +716,17 @@ mod tests {
     const ENGINE: &str = "CODE,MFR,MODEL,TYPE,HORSEPOWER,THRUST\n41528,LYCOMING,IO-540-AB1A5,1,00230,000000\n99999,UNRELATED,ENGINE,1,00100,000000\n";
 
     fn release(targets: &[&str]) -> Release {
-        parse_release(
-            ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
-            ReleaseReaders::new(
-                Cursor::new(MASTER),
-                Cursor::new(AIRCRAFT),
-                Cursor::new(ENGINE),
-            ),
-            targets,
-        )
-        .unwrap()
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, contents) in [
+            (MASTER_MEMBER_NAME, MASTER),
+            (AIRCRAFT_MEMBER_NAME, AIRCRAFT),
+            (ENGINE_MEMBER_NAME, ENGINE),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        parse_release_archive(writer.finish().unwrap(), "2026-07-20", targets).unwrap()
     }
 
     async fn temporary_db() -> (AppDb, std::path::PathBuf) {
@@ -803,6 +807,22 @@ mod tests {
         .unwrap();
         assert_eq!(registry_rows, 2, "only one matched target per projection");
         assert_eq!(evidence_rows, 1, "same archive reuses exact FAA evidence");
+        let stored_digests = sqlx::query_as::<_, (String, String, String, String)>(
+            r#"
+            SELECT archive_sha256, master_member_sha256,
+                   aircraft_member_sha256, engine_member_sha256
+            FROM faa_registry_snapshots
+            WHERE id = ?
+            "#,
+        )
+        .bind(expanded.snapshot.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_digests.0, expanded_release.metadata.archive_sha256);
+        assert_eq!(stored_digests.1, expanded_release.master.sha256);
+        assert_eq!(stored_digests.2, expanded_release.aircraft_reference.sha256);
+        assert_eq!(stored_digests.3, expanded_release.engine_reference.sha256);
         assert!(
             sqlx::query("UPDATE faa_registry_aircraft SET aircraft_code = 'x'")
                 .execute(pool)
