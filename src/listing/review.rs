@@ -42,8 +42,13 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::CURATED_AVIONICS_TYPES;
 use crate::gemini::curation::workflow::MAX_DIRECT_SOURCE_RELEVANCE_ANCHOR_CHARACTERS;
 use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
+use crate::listing::avionics::disposition::{
+    bounded_decision_reason, coordinates_from_aspect_id, extraction_sha256, occurrence_fingerprint,
+    DISPOSITION_POLICY_VERSION, INSERT_DISPOSITION_SQL,
+};
 use crate::listing::avionics::extraction::{
-    validate_current_avionics_extraction, CurrentAvionicsExtraction,
+    parse_current_avionics_extraction_json, validate_current_avionics_extraction,
+    CurrentAvionicsExtraction,
 };
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
@@ -87,6 +92,7 @@ const REVIEWER_CORRECTED_AVIONICS_KIND: &str = "avionics_reviewer_correction";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
     LOCK TABLE aircraft_sale_listing_avionics,
                aircraft_sale_listing_avionics_authorizations,
+               aircraft_sale_listing_avionics_dispositions,
                aircraft_sale_listing_pending_reviews
     IN SHARE ROW EXCLUSIVE MODE
 "#;
@@ -966,6 +972,7 @@ struct ReviewRow {
     listing_id: i64,
     owner_user_id: i64,
     plugin_submission_id: Option<i64>,
+    extracted_listing_json: Option<String>,
     source_url: Option<String>,
     model_year: i64,
     registration_number: Option<String>,
@@ -4352,6 +4359,7 @@ const REVIEW_SELECT_SQL: &str = r#"
       listing.id AS listing_id,
       listing.created_by_user_id AS owner_user_id,
       review.plugin_submission_id,
+      capture.extracted_listing_json,
       listing.source_url,
       listing.model_year,
       listing.registration_number,
@@ -4367,6 +4375,7 @@ const REVIEW_SELECT_SQL: &str = r#"
     FROM aircraft_sale_listings listing
     JOIN aircraft_sale_listing_pending_reviews review
       ON review.listing_id = listing.id
+    LEFT JOIN plugin_submissions capture ON capture.id = review.plugin_submission_id
     JOIN aircraft_model_variants variant
       ON variant.id = listing.aircraft_model_variant_id
     JOIN aircraft_models model ON model.id = variant.aircraft_model_id
@@ -8632,6 +8641,7 @@ pub async fn resolve_listing_review(
     );
     let select_approved =
         db.sql("SELECT id FROM avionics_models WHERE id = ? AND catalog_status = 'approved'");
+    let insert_occurrence_disposition = db.sql(INSERT_DISPOSITION_SQL);
     let select_approved_identity = db.sql(
         r#"
         SELECT avionics_manufacturer_identity_id, canonical_product_key
@@ -9637,6 +9647,98 @@ pub async fn resolve_listing_review(
                     ReviewDecision::Discard { .. } => None,
                 };
                 resolved.insert(aspect.id.clone(), product_id);
+            }
+
+            // Fresh current-schema review aspects have a deterministic source
+            // slot. Record their terminal result in the same transaction as
+            // the link/review mutation. Covered associations already have a
+            // prior terminal receipt and are not rewritten.
+            if let (Some(plugin_submission_id), Some(extracted_listing_json)) =
+                (row.plugin_submission_id, row.extracted_listing_json.as_deref())
+            {
+                let extracted_occurrences =
+                    parse_current_avionics_extraction_json(extracted_listing_json)
+                        .map_err(ReviewError::Stale)?;
+                let extraction_sha256 = extraction_sha256(extracted_listing_json);
+                for aspect in payload
+                    .aspects
+                    .iter()
+                    .filter(|aspect| aspect.covered_associations.is_empty())
+                {
+                    let Some((occurrence_index, occurrence_role)) =
+                        coordinates_from_aspect_id(&aspect.id)
+                    else {
+                        continue;
+                    };
+                    let occurrence = extracted_occurrences.get(occurrence_index).ok_or_else(|| {
+                        ReviewError::Stale(format!(
+                            "review aspect {} no longer identifies a retained extraction occurrence",
+                            aspect.id
+                        ))
+                    })?;
+                    if occurrence_role.as_str() == "replacement" && occurrence.replaces.is_none() {
+                        return Err(ReviewError::Stale(format!(
+                            "review aspect {} identifies a missing replacement occurrence",
+                            aspect.id
+                        )));
+                    }
+                    let decision = decisions
+                        .get(&aspect.id)
+                        .expect("decision coverage was validated");
+                    let (outcome, avionics_model_id, reason_code, decision_reason) = match decision {
+                        ReviewDecision::Discard { reason, .. } => (
+                            "discarded",
+                            None,
+                            "reviewer_discarded",
+                            bounded_decision_reason(reason).map_err(ReviewError::Validation)?,
+                        ),
+                        _ => (
+                            "linked",
+                            resolved.get(&aspect.id).copied().flatten(),
+                            "reviewer_verified_product",
+                            "Reviewer linked this occurrence to a verified catalog product.",
+                        ),
+                    };
+                    let avionics_model_id = if outcome == "linked" {
+                        Some(avionics_model_id.ok_or_else(|| {
+                            ReviewError::Stale(format!(
+                                "review aspect {} has no resolved catalog product",
+                                aspect.id
+                            ))
+                        })?)
+                    } else {
+                        None
+                    };
+                    let fingerprint = occurrence_fingerprint(
+                        &extraction_sha256,
+                        occurrence_index,
+                        occurrence_role,
+                    )
+                    .map_err(ReviewError::Validation)?;
+                    let inserted = sqlx::query(&insert_occurrence_disposition)
+                        .bind(listing_id)
+                        .bind(plugin_submission_id)
+                        .bind(&extraction_sha256)
+                        .bind(occurrence_index as i64)
+                        .bind(occurrence_role.as_str())
+                        .bind(fingerprint)
+                        .bind(outcome)
+                        .bind(avionics_model_id)
+                        .bind(reason_code)
+                        .bind(decision_reason)
+                        .bind("manual")
+                        .bind(owner_user_id)
+                        .bind(DISPOSITION_POLICY_VERSION)
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected();
+                    if inserted != 1 {
+                        return Err(ReviewError::Stale(format!(
+                            "review aspect {} already has a terminal occurrence disposition",
+                            aspect.id
+                        )));
+                    }
+                }
             }
 
             let replacement_aspects = payload

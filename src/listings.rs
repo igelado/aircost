@@ -27,6 +27,7 @@ use crate::avionics::{
 use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{optional_f64, optional_i64, optional_string, GeminiListingExtractor};
+use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
@@ -166,6 +167,24 @@ pub type ListingProgressSender = tokio::sync::mpsc::UnboundedSender<Value>;
 pub enum ListingFinalizationOutcome {
     Ready,
     PendingReference { reason: String },
+}
+
+#[derive(Debug)]
+pub(crate) struct ListingCreationResult {
+    pub(crate) listing: SaleListing,
+    pub(crate) occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ListingCreationMode {
+    Ordinary,
+    CreateOnly,
+}
+
+#[derive(Debug)]
+struct ResolvedListingAvionics {
+    pending_review_aspects: Vec<PendingReviewAspect>,
+    occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
 }
 
 const AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON: &str =
@@ -364,17 +383,40 @@ pub async fn create_listing_with_progress(
     extractor: Option<&GeminiListingExtractor>,
     progress: Option<&ListingProgressSender>,
 ) -> StoreResult<SaleListing> {
+    Ok(create_listing_with_progress_and_occurrence_dispositions(
+        db,
+        user_id,
+        preview,
+        original_listing,
+        extractor,
+        progress,
+        ListingCreationMode::Ordinary,
+    )
+    .await?
+    .listing)
+}
+
+pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
+    db: &AppDb,
+    user_id: i64,
+    preview: &ListingPreview,
+    original_listing: Option<&Value>,
+    extractor: Option<&GeminiListingExtractor>,
+    progress: Option<&ListingProgressSender>,
+    creation_mode: ListingCreationMode,
+) -> StoreResult<ListingCreationResult> {
     emit_listing_progress(
         progress,
         "verifying_listing",
         "Verifying extracted listing fields",
     );
     let mut values = values_from_preview(preview, original_listing)?;
-    let missing_identity_source_candidate = match values.source_url.as_deref() {
-        Some(source_url) => {
+    let missing_identity_source_candidate = match (creation_mode, values.source_url.as_deref()) {
+        (ListingCreationMode::CreateOnly, _) => None,
+        (ListingCreationMode::Ordinary, Some(source_url)) => {
             unverified_listing_for_missing_identity_source(db, user_id, source_url).await?
         }
-        None => None,
+        (ListingCreationMode::Ordinary, None) => None,
     };
     let admission_serial = serial_evidence_for_identity_repair_admission(
         values.serial_number.as_deref(),
@@ -412,7 +454,7 @@ pub async fn create_listing_with_progress(
         "normalizing_avionics",
         "Normalizing avionics units",
     );
-    let pending_review_aspects = resolve_listing_avionics_values(
+    let resolved_avionics = resolve_listing_avionics_values(
         db,
         &mut values,
         extractor,
@@ -424,45 +466,16 @@ pub async fn create_listing_with_progress(
     // Prefer the exact source row repaired above. Looking it up again by tail
     // could select a different, newer listing if the user has retained more
     // than one observation for the same aircraft.
-    if let Some(listing_id) = identity_repair_listing_id {
-        emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
-        update_listing_values(db, listing_id, &values, true, true).await?;
-        replace_listing_pending_review(db, listing_id, &pending_review_aspects).await?;
-        emit_listing_progress(
-            progress,
-            "refreshing_estimates",
-            "Refreshing valuation inputs",
-        );
-        finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
-            .await?;
-        return get_listing(db, user_id, listing_id).await;
-    }
-
-    if let Some(registration_number) = &values.registration_number {
-        if let Some(listing_id) =
-            unverified_listing_id_for_tail(db, user_id, registration_number).await?
-        {
-            emit_listing_progress(progress, "saving_listing", "Updating existing listing");
-            update_listing_values(db, listing_id, &values, true, true).await?;
-            replace_listing_pending_review(db, listing_id, &pending_review_aspects).await?;
-            emit_listing_progress(
-                progress,
-                "refreshing_estimates",
-                "Refreshing valuation inputs",
-            );
-            finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
-                .await?;
-            return get_listing(db, user_id, listing_id).await;
-        }
-    }
-
-    if let Some(source_url) = values.source_url.as_deref() {
-        if let Some(listing_id) =
-            unverified_listing_id_for_missing_identity_source(db, user_id, source_url).await?
-        {
+    if creation_mode == ListingCreationMode::Ordinary {
+        if let Some(listing_id) = identity_repair_listing_id {
             emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
             update_listing_values(db, listing_id, &values, true, true).await?;
-            replace_listing_pending_review(db, listing_id, &pending_review_aspects).await?;
+            replace_listing_pending_review(
+                db,
+                listing_id,
+                &resolved_avionics.pending_review_aspects,
+            )
+            .await?;
             emit_listing_progress(
                 progress,
                 "refreshing_estimates",
@@ -470,11 +483,82 @@ pub async fn create_listing_with_progress(
             );
             finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
                 .await?;
-            return get_listing(db, user_id, listing_id).await;
+            return Ok(ListingCreationResult {
+                listing: get_listing(db, user_id, listing_id).await?,
+                occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+            });
         }
     }
 
-    if pending_review_aspects.is_empty() {
+    if creation_mode == ListingCreationMode::Ordinary {
+        if let Some(registration_number) = &values.registration_number {
+            if let Some(listing_id) =
+                unverified_listing_id_for_tail(db, user_id, registration_number).await?
+            {
+                emit_listing_progress(progress, "saving_listing", "Updating existing listing");
+                update_listing_values(db, listing_id, &values, true, true).await?;
+                replace_listing_pending_review(
+                    db,
+                    listing_id,
+                    &resolved_avionics.pending_review_aspects,
+                )
+                .await?;
+                emit_listing_progress(
+                    progress,
+                    "refreshing_estimates",
+                    "Refreshing valuation inputs",
+                );
+                finalize_listing_ingestion(
+                    db,
+                    listing_id,
+                    extractor,
+                    preview.context_text.as_deref(),
+                )
+                .await?;
+                return Ok(ListingCreationResult {
+                    listing: get_listing(db, user_id, listing_id).await?,
+                    occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+                });
+            }
+        }
+    }
+
+    if creation_mode == ListingCreationMode::Ordinary {
+        if let Some(source_url) = values.source_url.as_deref() {
+            if let Some(listing_id) =
+                unverified_listing_id_for_missing_identity_source(db, user_id, source_url).await?
+            {
+                emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
+                update_listing_values(db, listing_id, &values, true, true).await?;
+                replace_listing_pending_review(
+                    db,
+                    listing_id,
+                    &resolved_avionics.pending_review_aspects,
+                )
+                .await?;
+                emit_listing_progress(
+                    progress,
+                    "refreshing_estimates",
+                    "Refreshing valuation inputs",
+                );
+                finalize_listing_ingestion(
+                    db,
+                    listing_id,
+                    extractor,
+                    preview.context_text.as_deref(),
+                )
+                .await?;
+                return Ok(ListingCreationResult {
+                    listing: get_listing(db, user_id, listing_id).await?,
+                    occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+                });
+            }
+        }
+    }
+
+    if creation_mode == ListingCreationMode::Ordinary
+        && resolved_avionics.pending_review_aspects.is_empty()
+    {
         if let Some(listing_id) = matching_verified_listing_id(db, &values).await? {
             emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
             refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
@@ -486,20 +570,27 @@ pub async fn create_listing_with_progress(
             mark_listing_incomplete(db, listing_id).await?;
             finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
                 .await?;
-            return get_listing(db, user_id, listing_id).await;
+            return Ok(ListingCreationResult {
+                listing: get_listing(db, user_id, listing_id).await?,
+                occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+            });
         }
     }
 
     emit_listing_progress(progress, "saving_listing", "Saving listing");
     let listing_id = insert_listing(db, user_id, &values).await?;
-    replace_listing_pending_review(db, listing_id, &pending_review_aspects).await?;
+    replace_listing_pending_review(db, listing_id, &resolved_avionics.pending_review_aspects)
+        .await?;
     emit_listing_progress(
         progress,
         "refreshing_estimates",
         "Refreshing valuation inputs",
     );
     finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
-    get_listing(db, user_id, listing_id).await
+    Ok(ListingCreationResult {
+        listing: get_listing(db, user_id, listing_id).await?,
+        occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+    })
 }
 
 fn emit_listing_progress(progress: Option<&ListingProgressSender>, stage: &str, message: &str) {
@@ -646,7 +737,8 @@ pub async fn update_listing(
                 source_url.as_deref(),
                 None,
             )
-            .await?,
+            .await?
+            .pending_review_aspects,
         )
     } else {
         None
@@ -1004,12 +1096,13 @@ async fn resolve_listing_avionics_values(
     extractor: Option<&GeminiListingExtractor>,
     source_url: Option<&str>,
     listing_context: Option<&str>,
-) -> StoreResult<Vec<PendingReviewAspect>> {
+) -> StoreResult<ResolvedListingAvionics> {
     let listing_context = listing_context
         .map(listing_context_excerpt)
         .unwrap_or_default();
     let mut resolved: Vec<ListingAvionicsValue> = Vec::new();
     let mut pending = Vec::new();
+    let mut dispositions = Vec::new();
 
     for (index, item) in values.avionics.clone().into_iter().enumerate() {
         let identity_request = listing_avionics_identity_request(
@@ -1033,6 +1126,16 @@ async fn resolve_listing_avionics_values(
             ListingAvionicsIdentityResolution::Rejected { .. } => {
                 // High-confidence garbage never enters either the canonical
                 // catalog or the review queue.
+                dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                    index,
+                    OccurrenceRole::Primary,
+                ));
+                if item.replaces.is_some() {
+                    dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                        index,
+                        OccurrenceRole::Replacement,
+                    ));
+                }
             }
             ListingAvionicsIdentityResolution::Pending {
                 reason,
@@ -1051,6 +1154,11 @@ async fn resolve_listing_avionics_values(
                 let (replaces_product_id, replacement_aspect_id) = match &replacement {
                     ListingAvionicsReplacementResolution::None => (None, None),
                     ListingAvionicsReplacementResolution::Approved(identity) => {
+                        dispositions.push(AutomaticOccurrenceDisposition::linked(
+                            index,
+                            OccurrenceRole::Replacement,
+                            identity.id,
+                        ));
                         (Some(identity.id), None)
                     }
                     ListingAvionicsReplacementResolution::Pending(aspect) => {
@@ -1082,9 +1190,24 @@ async fn resolve_listing_avionics_values(
                 .await?;
                 match replacement {
                     ListingAvionicsReplacementResolution::None => {
+                        dispositions.push(AutomaticOccurrenceDisposition::linked(
+                            index,
+                            OccurrenceRole::Primary,
+                            identity.id,
+                        ));
                         resolved.push(listing_avionics_value_from_catalog(&item, &identity));
                     }
                     ListingAvionicsReplacementResolution::Approved(replaced) => {
+                        dispositions.push(AutomaticOccurrenceDisposition::linked(
+                            index,
+                            OccurrenceRole::Primary,
+                            identity.id,
+                        ));
+                        dispositions.push(AutomaticOccurrenceDisposition::linked(
+                            index,
+                            OccurrenceRole::Replacement,
+                            replaced.id,
+                        ));
                         let mut resolved_item =
                             listing_avionics_value_from_catalog(&item, &identity);
                         resolved_item.replaces = Some(ParsedAvionicsReference {
@@ -1115,7 +1238,10 @@ async fn resolve_listing_avionics_values(
     }
 
     values.avionics = coalesce_resolved_listing_avionics(resolved)?;
-    Ok(pending)
+    Ok(ResolvedListingAvionics {
+        pending_review_aspects: pending,
+        occurrence_dispositions: dispositions,
+    })
 }
 
 enum ListingAvionicsIdentityResolution {
@@ -4387,6 +4513,7 @@ mod tests {
         )
         .await
         .expect("unknown equipment should be staged for explicit review");
+        let pending = pending.pending_review_aspects;
         assert_eq!(pending.len(), 2);
         assert!(pending
             .iter()
@@ -4407,7 +4534,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_attested_label_resolves_without_a_listing_part_number_or_gemini_client() {
+    async fn normalized_attested_label_records_the_resolved_product_without_typography_rematching()
+    {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -4418,7 +4546,7 @@ mod tests {
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
-            "GTX 345R",
+            "GTX-345R",
         ))];
 
         let pending = resolve_listing_avionics_values(
@@ -4426,12 +4554,17 @@ mod tests {
             &mut values,
             None,
             Some("https://example.com/listing"),
-            Some("The aircraft has a Garmin GTX 345R transponder installed."),
+            Some("The aircraft has a Garmin GTX-345R transponder installed."),
         )
         .await
-        .expect("the exact label should resolve locally without Gemini");
+        .expect("the normalized label should resolve locally without Gemini");
 
-        assert!(pending.is_empty());
+        assert!(pending.pending_review_aspects.is_empty());
+        assert_eq!(pending.occurrence_dispositions.len(), 1);
+        assert_eq!(
+            pending.occurrence_dispositions[0].avionics_model_id,
+            Some(approved_id)
+        );
         assert_eq!(values.avionics.len(), 1);
         assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
         assert_eq!(
@@ -4552,6 +4685,7 @@ mod tests {
         .await
         .expect("provider failure should become review work");
 
+        let pending = pending.pending_review_aspects;
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0].reason,

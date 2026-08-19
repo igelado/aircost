@@ -57,6 +57,7 @@ pub struct AircraftObservationLoadReport {
 pub struct AircraftObservationStageReport {
     pub eligible: usize,
     pub inserted: usize,
+    pub reattached: usize,
     pub already_present: usize,
     pub skipped: usize,
     pub skipped_listing_ids: Vec<i64>,
@@ -101,6 +102,25 @@ struct ObservationSourceRow {
     rendered_html_sha256: Option<String>,
     rendered_html: Option<String>,
     extracted_listing_json: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct StoredObservationRow {
+    id: i64,
+    aircraft_sale_listing_id: Option<i64>,
+    source_url: Option<String>,
+    observed_make: Option<String>,
+    observed_family: Option<String>,
+    observed_designation: Option<String>,
+    observed_generation: Option<String>,
+    observed_package: Option<String>,
+    model_year: Option<i64>,
+    serial_number: Option<String>,
+    registration_number: Option<String>,
+    market_code: Option<String>,
+    exact_source_evidence: String,
+    observation_sha256: String,
+    legacy_hint_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -302,12 +322,135 @@ pub async fn stage_aircraft_identity_observations(
                 .rows_affected(),
         };
         if affected == 0 {
-            report.already_present += 1;
+            let existing = load_stored_observation(db, &observation.observation_sha256).await?;
+            validate_stored_observation(
+                &existing,
+                observation,
+                exact_source_evidence,
+                &legacy_hint_json,
+            )?;
+            match existing.aircraft_sale_listing_id {
+                Some(listing_id) if listing_id == observation.listing_id => {
+                    report.already_present += 1;
+                }
+                None => {
+                    let update = db.sql(
+                        r#"
+                        UPDATE aircraft_identity_observations
+                        SET aircraft_sale_listing_id = ?
+                        WHERE id = ?
+                          AND aircraft_sale_listing_id IS NULL
+                          AND observation_sha256 = ?
+                        "#,
+                    );
+                    let changed = match db.backend() {
+                        DatabaseBackend::Sqlite(pool) => sqlx::query(&update)
+                            .bind(observation.listing_id)
+                            .bind(existing.id)
+                            .bind(&observation.observation_sha256)
+                            .execute(pool)
+                            .await?
+                            .rows_affected(),
+                        DatabaseBackend::Postgres(pool) => sqlx::query(&update)
+                            .bind(observation.listing_id)
+                            .bind(existing.id)
+                            .bind(&observation.observation_sha256)
+                            .execute(pool)
+                            .await?
+                            .rows_affected(),
+                    };
+                    if changed == 1 {
+                        report.reattached += 1;
+                    } else {
+                        let current =
+                            load_stored_observation(db, &observation.observation_sha256).await?;
+                        if current.aircraft_sale_listing_id == Some(observation.listing_id) {
+                            report.already_present += 1;
+                        } else {
+                            return Err(AircraftObservationError::InvalidRequest(format!(
+                                "aircraft observation {} was concurrently attached to a different listing",
+                                observation.observation_sha256
+                            )));
+                        }
+                    }
+                }
+                Some(listing_id) => {
+                    return Err(AircraftObservationError::InvalidRequest(format!(
+                        "aircraft observation {} is already attached to listing {listing_id}, not replay listing {}",
+                        observation.observation_sha256, observation.listing_id
+                    )));
+                }
+            }
         } else {
             report.inserted += 1;
         }
     }
     Ok(report)
+}
+
+async fn load_stored_observation(
+    db: &AppDb,
+    observation_sha256: &str,
+) -> Result<StoredObservationRow, AircraftObservationError> {
+    let sql = db.sql(
+        r#"
+        SELECT id, aircraft_sale_listing_id, source_url, observed_make,
+               observed_family, observed_designation, observed_generation,
+               observed_package, model_year, serial_number,
+               registration_number, market_code, exact_source_evidence,
+               observation_sha256, legacy_hint_json
+        FROM aircraft_identity_observations
+        WHERE observation_sha256 = ?
+        "#,
+    );
+    let row = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, StoredObservationRow>(&sql)
+                .bind(observation_sha256)
+                .fetch_optional(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, StoredObservationRow>(&sql)
+                .bind(observation_sha256)
+                .fetch_optional(pool)
+                .await?
+        }
+    };
+    row.ok_or_else(|| {
+        AircraftObservationError::Database(
+            "aircraft observation conflict disappeared before validation".to_string(),
+        )
+    })
+}
+
+fn validate_stored_observation(
+    stored: &StoredObservationRow,
+    expected: &AircraftIdentityObservation,
+    exact_source_evidence: &str,
+    legacy_hint_json: &str,
+) -> Result<(), AircraftObservationError> {
+    let exact_match = stored.source_url == expected.source_url
+        && stored.observed_make.as_deref() == Some(expected.manufacturer.as_str())
+        && stored.observed_family.as_deref() == Some(expected.model.as_str())
+        && stored.observed_designation.as_deref() == Some(expected.variant.as_str())
+        && stored.observed_generation.is_none()
+        && stored.observed_package.is_none()
+        && stored.model_year == Some(expected.model_year)
+        && stored.serial_number == expected.serial_number
+        && stored.registration_number == expected.registration_number
+        && stored.market_code.is_none()
+        && stored.exact_source_evidence == exact_source_evidence
+        && stored.observation_sha256 == expected.observation_sha256
+        && stored.legacy_hint_json.as_deref() == Some(legacy_hint_json);
+    if exact_match {
+        Ok(())
+    } else {
+        Err(AircraftObservationError::InvalidRequest(format!(
+            "aircraft observation hash {} collides with different immutable observation material",
+            expected.observation_sha256
+        )))
+    }
 }
 
 fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservation {
@@ -1021,10 +1164,11 @@ mod tests {
         group_observations_by_cluster, identity_excerpt, observation_cluster_key,
         observation_fingerprint, observation_from_row, parse_literal_fields,
         resolve_identity_evidence, retained_source_identity_evidence_matches,
-        AircraftIdentityObservation, IdentityEvidenceStatus, ObservationSourceRow,
-        BASE_MODEL_VARIANT_SPAN_RESOLVER, COMPOSITE_FAMILY_SPAN_RESOLVER,
+        stage_aircraft_identity_observations, AircraftIdentityObservation, IdentityEvidenceStatus,
+        ObservationSourceRow, BASE_MODEL_VARIANT_SPAN_RESOLVER, COMPOSITE_FAMILY_SPAN_RESOLVER,
         LITERAL_IDENTITY_SPAN_RESOLVER,
     };
+    use crate::db::{AppDb, DatabaseBackend};
 
     #[test]
     fn retained_literal_fields_are_not_mechanically_rewritten() {
@@ -1505,5 +1649,99 @@ mod tests {
             observation("cessna:182:t182t:2005", 2),
         ];
         assert_eq!(group_observations_by_cluster(&observations).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn replay_reattaches_only_an_identical_detached_observation() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let variant_id: i64 = match db.backend() {
+            DatabaseBackend::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        };
+        let listing_id: i64 = match db.backend() {
+            DatabaseBackend::Sqlite(pool) => sqlx::query_scalar(
+                r#"
+                INSERT INTO aircraft_sale_listings (
+                  aircraft_model_variant_id, created_by_user_id, source_url,
+                  model_year, asking_price_usd, airframe_hours
+                ) VALUES (?, ?, 'https://example.test/replay', 2020, 100000, 500)
+                RETURNING id
+                "#,
+            )
+            .bind(variant_id)
+            .bind(user.id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        };
+        let observation = AircraftIdentityObservation {
+            listing_id,
+            submission_id: Some(77),
+            source_url: Some("https://example.test/replay".to_string()),
+            rendered_html_sha256: Some("a".repeat(64)),
+            manufacturer: "Cessna".to_string(),
+            model: "182".to_string(),
+            variant: "182T".to_string(),
+            model_year: 2020,
+            serial_number: Some("18200001".to_string()),
+            registration_number: Some("N123AB".to_string()),
+            source_excerpt: Some("Cessna 182T".to_string()),
+            source_excerpt_is_exact: true,
+            source_kind: "retained_submission".to_string(),
+            observation_sha256: "b".repeat(64),
+            cluster_key: "cessna:182:182t:2020".to_string(),
+            requires_human_review: false,
+            review_reasons: Vec::new(),
+        };
+        let inserted = stage_aircraft_identity_observations(&db, &[observation.clone()])
+            .await
+            .unwrap();
+        assert_eq!(inserted.inserted, 1);
+        if let DatabaseBackend::Sqlite(pool) = db.backend() {
+            sqlx::query(
+                "UPDATE aircraft_identity_observations SET aircraft_sale_listing_id = NULL WHERE observation_sha256 = ?",
+            )
+            .bind(&observation.observation_sha256)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let reattached = stage_aircraft_identity_observations(&db, &[observation.clone()])
+            .await
+            .unwrap();
+        assert_eq!(reattached.reattached, 1);
+        let attached_listing: Option<i64> = match db.backend() {
+            DatabaseBackend::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT aircraft_sale_listing_id FROM aircraft_identity_observations WHERE observation_sha256 = ?",
+            )
+            .bind(&observation.observation_sha256)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            DatabaseBackend::Postgres(_) => unreachable!(),
+        };
+        assert_eq!(attached_listing, Some(listing_id));
+
+        if let DatabaseBackend::Sqlite(pool) = db.backend() {
+            sqlx::query(
+                "UPDATE aircraft_identity_observations SET aircraft_sale_listing_id = NULL, exact_source_evidence = 'different' WHERE observation_sha256 = ?",
+            )
+            .bind(&observation.observation_sha256)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let collision = stage_aircraft_identity_observations(&db, &[observation])
+            .await
+            .unwrap_err();
+        assert!(collision.to_string().contains("different immutable"));
     }
 }

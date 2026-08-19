@@ -164,7 +164,7 @@ pub enum VisualIdentifierStatus {
     NoExplicitIdentifierVisible,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisualIdentifierImageEvidence {
     pub image_id: String,
     pub visible_text: String,
@@ -176,7 +176,7 @@ pub struct VisualIdentifierImageEvidence {
     pub location_description: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisibleAircraftIdentifier {
     pub kind: VisibleIdentifierKind,
     /// Exact trimmed transcription selected from the visible evidence. This is
@@ -186,7 +186,7 @@ pub struct VisibleAircraftIdentifier {
     pub evidence: Vec<VisualIdentifierImageEvidence>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisualConsensusStatus {
     AutoAccept,
@@ -194,7 +194,7 @@ pub enum VisualConsensusStatus {
     Conflict,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisualConsensusBasis {
     TwoIndependentRegistrationImages,
@@ -209,7 +209,7 @@ pub enum VisualConsensusBasis {
 ///
 /// `AutoAccept` is only a visual-consensus decision. It is not FAA admission
 /// and does not authorize a database write.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisualRegistrationConsensus {
     pub status: VisualConsensusStatus,
     pub basis: VisualConsensusBasis,
@@ -222,7 +222,7 @@ pub struct VisualRegistrationConsensus {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisualPhotoAudit {
     pub image_id: String,
     pub mime_type: String,
@@ -230,7 +230,7 @@ pub struct VisualPhotoAudit {
     pub sha256: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VisualIdentifierResolution {
     pub status: VisualIdentifierStatus,
     pub candidates: Vec<VisibleAircraftIdentifier>,

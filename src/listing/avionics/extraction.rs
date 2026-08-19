@@ -53,6 +53,31 @@ pub(crate) fn validate_current_avionics_extraction(
     Ok(observations)
 }
 
+/// Validate an extraction before a canonical listing exists. This is the
+/// extraction-only checkpoint shared by ordinary ingestion and clean replay.
+/// Capture ownership and canonical binding are checked later, when the
+/// checkpoint is attached to a listing.
+pub(crate) fn validate_unbound_current_avionics_extraction(
+    extracted_listing_json: &str,
+    rendered_html: &str,
+) -> Result<Vec<ParsedAvionics>, String> {
+    let observations = parse_current_avionics_extraction_json(extracted_listing_json)?;
+    let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
+    validate_current_avionics_identity_evidence(&observations, &listing_context)?;
+    for (index, observation) in observations.iter().enumerate() {
+        let evidence = observation
+            .source_evidence_text
+            .as_deref()
+            .expect("the canonical parser requires occurrence evidence");
+        if !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence) {
+            return Err(format!(
+                "avionics[{index}].source_evidence_text is not one exact structurally visible span in the retained capture"
+            ));
+        }
+    }
+    Ok(observations)
+}
+
 pub(crate) fn parse_current_avionics_extraction_json(
     extracted_listing_json: &str,
 ) -> Result<Vec<ParsedAvionics>, String> {
