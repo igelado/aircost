@@ -126,11 +126,6 @@ const VERIFICATION_RUN_IDLE_POLL: Duration = Duration::from_secs(10);
 static VERIFICATION_RUN_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
-struct AircraftVariantQuery {
-    annual_hours: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct PluginSubmissionStatusQuery {
     source_url: String,
 }
@@ -2264,24 +2259,12 @@ async fn aircraft_variant_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(variant_id): Path<i64>,
-    Query(query): Query<AircraftVariantQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let user = load_current_user(&state.db, &headers).await?;
-    let annual_hours = match query.annual_hours {
-        Some(value) if value.is_finite() && (0.0..=2_000.0).contains(&value) => Some(value),
-        Some(_) => {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "annual_hours must be between 0 and 2000".to_string(),
-            ));
-        }
-        None => None,
-    };
     let detail = aircraft_variant_detail_with_model(
         &state.db,
         user.id,
         variant_id,
-        annual_hours,
         state.valuation_model.as_ref(),
     )
     .await

@@ -31,6 +31,32 @@ BEGIN
 END;
 $function$;
 
+CREATE OR REPLACE FUNCTION
+  invalidate_listing_avionics_authorization_for_capture()
+RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations authorization_row
+  USING aircraft_sale_listing_avionics link
+  WHERE link.id = authorization_row.listing_link_id
+    AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
+    AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
+    AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
+    AND position(link.source_notes IN OLD.rendered_html) > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM plugin_submissions retained_capture
+      WHERE retained_capture.canonical_listing_id =
+              link.aircraft_sale_listing_id
+        AND retained_capture.rendered_html_sha256 =
+              authorization_row.evidence_capture_sha256
+        AND position(link.source_notes IN retained_capture.rendered_html) > 0
+    );
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
 CREATE OR REPLACE FUNCTION validate_aircraft_valuation_compatibility_projection()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -163,6 +189,217 @@ ALTER TABLE aircraft_reference_prices
     'full_standard_configuration', 'base_aircraft_only', 'unknown'
   ));
 
+-- PostgreSQL resolves NEW fields while planning boolean expressions, even when
+-- a TG_TABLE_NAME predicate would make the field unreachable. Keep the exact
+-- component-identifier check inside its table-specific branch so this shared
+-- trigger also works for canonical tables without identity_evidence_claim_id.
+CREATE OR REPLACE FUNCTION require_aircraft_catalog_approval()
+RETURNS TRIGGER AS $$
+DECLARE
+  expected_kind TEXT;
+  require_claim BOOLEAN := TRUE;
+  require_primary BOOLEAN := FALSE;
+BEGIN
+  CASE TG_TABLE_NAME
+    WHEN 'aircraft_engine_catalog_models' THEN expected_kind := 'engine_model'; require_primary := TRUE;
+    WHEN 'aircraft_propeller_catalog_models' THEN expected_kind := 'propeller_model'; require_primary := TRUE;
+    WHEN 'aircraft_makes' THEN expected_kind := 'make'; require_primary := TRUE;
+    WHEN 'aircraft_model_families' THEN expected_kind := 'family'; require_primary := TRUE;
+    WHEN 'aircraft_designations' THEN expected_kind := 'designation'; require_primary := TRUE;
+    WHEN 'aircraft_make_aliases' THEN expected_kind := 'alias';
+    WHEN 'aircraft_family_aliases' THEN expected_kind := 'alias';
+    WHEN 'aircraft_designation_aliases' THEN expected_kind := 'alias';
+    WHEN 'aircraft_designation_identifiers' THEN expected_kind := 'identifier'; require_primary := TRUE;
+    WHEN 'aircraft_generations' THEN expected_kind := 'generation'; require_primary := TRUE;
+    WHEN 'aircraft_generation_designations' THEN expected_kind := 'generation_designation'; require_claim := FALSE;
+    WHEN 'aircraft_factory_packages' THEN expected_kind := 'package'; require_primary := TRUE;
+    WHEN 'aircraft_package_applicability' THEN expected_kind := 'package_applicability'; require_claim := FALSE;
+    WHEN 'aircraft_reference_configurations' THEN expected_kind := 'reference_configuration'; require_primary := TRUE;
+    WHEN 'aircraft_serial_number_schemes' THEN expected_kind := 'serial_scheme';
+    WHEN 'aircraft_feature_definitions' THEN expected_kind := 'feature_definition'; require_claim := FALSE;
+    WHEN 'aircraft_reference_configuration_versions' THEN expected_kind := 'reference_profile'; require_primary := TRUE;
+    ELSE RAISE EXCEPTION 'unsupported canonical aircraft table %', TG_TABLE_NAME;
+  END CASE;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM aircraft_identity_decisions decision
+    WHERE decision.id = NEW.approval_decision_id
+      AND decision.decision_status = 'approved'
+      AND decision.decision_action = 'approve_new'
+      AND decision.entity_kind = expected_kind
+  ) THEN
+    RAISE EXCEPTION '% requires an approved % decision', TG_TABLE_NAME, expected_kind;
+  END IF;
+
+  IF require_claim AND NOT EXISTS (
+    SELECT 1
+    FROM aircraft_identity_decision_claims decision_claim
+    JOIN curation_evidence_claims claim
+      ON claim.id = decision_claim.evidence_claim_id
+    JOIN curation_evidence_sources source
+      ON source.id = claim.evidence_source_id
+    WHERE decision_claim.decision_id = NEW.approval_decision_id
+      AND claim.validation_status = 'validated'
+      AND (
+        NOT require_primary
+        OR source.source_tier IN ('manufacturer_primary', 'regulator_primary')
+      )
+  ) THEN
+    RAISE EXCEPTION '% requires validated evidence for its approved decision', TG_TABLE_NAME;
+  END IF;
+
+  IF TG_TABLE_NAME IN (
+    'aircraft_engine_catalog_models', 'aircraft_propeller_catalog_models'
+  ) THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM aircraft_identity_decision_claims decision_claim
+      JOIN curation_evidence_claims claim
+        ON claim.id = decision_claim.evidence_claim_id
+      JOIN curation_evidence_sources source
+        ON source.id = claim.evidence_source_id
+      WHERE decision_claim.decision_id = NEW.approval_decision_id
+        AND decision_claim.evidence_claim_id = NEW.identity_evidence_claim_id
+        AND decision_claim.evidence_role IN ('identity', 'specification')
+        AND claim.claim_kind IN ('identity', 'specification')
+        AND claim.validation_status = 'validated'
+        AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
+    ) THEN
+      RAISE EXCEPTION '% requires its exact primary-source identifier claim', TG_TABLE_NAME;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION validate_aircraft_reference_version_insert()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.publication_state <> 'building' THEN
+    RAISE EXCEPTION 'reference profile versions must be assembled in building state';
+  END IF;
+  IF (NEW.revision = 1) <> (NEW.supersedes_version_id IS NULL) THEN
+    RAISE EXCEPTION 'reference profile revisions require their exact predecessor';
+  END IF;
+  IF NEW.supersedes_version_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+    FROM aircraft_reference_configuration_versions previous
+    WHERE previous.id = NEW.supersedes_version_id
+      AND previous.aircraft_reference_configuration_id = NEW.aircraft_reference_configuration_id
+      AND previous.model_year = NEW.model_year
+      AND previous.revision = NEW.revision - 1
+      AND previous.publication_state = 'published'
+  ) THEN
+    RAISE EXCEPTION 'reference profile predecessor must be the exact published prior revision of the same configuration/year';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Keep shared trigger bodies table-specific. PostgreSQL's NEW/OLD records only
+-- expose columns from the relation that fired the trigger.
+CREATE OR REPLACE FUNCTION validate_faa_reference_reachability()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'faa_registry_aircraft_references' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM faa_registry_aircraft aircraft
+      WHERE aircraft.snapshot_id = NEW.snapshot_id
+        AND aircraft.aircraft_code = NEW.aircraft_code
+    ) THEN
+      RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
+    END IF;
+  END IF;
+  IF TG_TABLE_NAME = 'faa_registry_engine_references' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM faa_registry_aircraft aircraft
+      WHERE aircraft.snapshot_id = NEW.snapshot_id
+        AND aircraft.engine_code = NEW.engine_code
+    ) THEN
+      RAISE EXCEPTION 'FAA engine reference must be reachable from a target match';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION preserve_assigned_aircraft_applicability()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'aircraft_generation_designations' THEN
+    IF EXISTS (
+      SELECT 1 FROM aircraft_sale_listing_identity_assignments assignment
+      WHERE assignment.aircraft_generation_id = OLD.aircraft_generation_id
+        AND assignment.aircraft_designation_id = OLD.aircraft_designation_id
+    ) THEN
+      RAISE EXCEPTION 'assigned generation/designation applicability is immutable';
+    END IF;
+  END IF;
+  IF TG_TABLE_NAME = 'aircraft_package_applicability' THEN
+    IF EXISTS (
+      SELECT 1 FROM aircraft_sale_listing_identity_assignments assignment
+      WHERE assignment.aircraft_factory_package_id = OLD.aircraft_factory_package_id
+        AND assignment.aircraft_designation_id = OLD.aircraft_designation_id
+        AND (OLD.aircraft_generation_id IS NULL
+          OR assignment.aircraft_generation_id = OLD.aircraft_generation_id)
+    ) THEN
+      RAISE EXCEPTION 'assigned package applicability is immutable';
+    END IF;
+  END IF;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION prevent_new_unresolved_aircraft_dimension()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_TABLE_NAME = 'aircraft_generation_designations' THEN
+    IF EXISTS (
+      SELECT 1
+      FROM aircraft_sale_listing_current_identity_assignments current_assignment
+      JOIN aircraft_sale_listing_identity_assignments assignment
+        ON assignment.id = current_assignment.identity_assignment_id
+       AND assignment.aircraft_sale_listing_id = current_assignment.aircraft_sale_listing_id
+      JOIN aircraft_sale_listings listing
+        ON listing.id = current_assignment.aircraft_sale_listing_id
+      WHERE listing.ingestion_state = 'ready'
+        AND assignment.aircraft_designation_id = NEW.aircraft_designation_id
+        AND assignment.aircraft_generation_id IS NULL
+    ) THEN
+      RAISE EXCEPTION 'adding a generation dimension requires resolving affected ready listing assignments first';
+    END IF;
+  END IF;
+  IF TG_TABLE_NAME = 'aircraft_package_applicability' THEN
+    IF EXISTS (
+      SELECT 1
+      FROM aircraft_factory_packages package
+      CROSS JOIN aircraft_sale_listing_current_identity_assignments current_assignment
+      JOIN aircraft_sale_listing_identity_assignments assignment
+        ON assignment.id = current_assignment.identity_assignment_id
+       AND assignment.aircraft_sale_listing_id = current_assignment.aircraft_sale_listing_id
+      JOIN aircraft_sale_listings listing
+        ON listing.id = current_assignment.aircraft_sale_listing_id
+      WHERE package.id = NEW.aircraft_factory_package_id
+        AND package.package_kind = 'trim_tier'
+        AND listing.ingestion_state = 'ready'
+        AND assignment.aircraft_designation_id = NEW.aircraft_designation_id
+        AND assignment.aircraft_factory_package_id IS NULL
+        AND (NEW.aircraft_generation_id IS NULL
+          OR assignment.aircraft_generation_id = NEW.aircraft_generation_id)
+        AND (NEW.valid_from_model_year IS NULL
+          OR NEW.valid_from_model_year <= listing.model_year)
+        AND (NEW.valid_to_model_year IS NULL
+          OR NEW.valid_to_model_year >= listing.model_year)
+    ) THEN
+      RAISE EXCEPTION 'adding a trim-tier dimension requires resolving affected ready listing assignments first';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE TABLE aircraft_reference_fact_set_attestations (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   aircraft_reference_configuration_version_id BIGINT NOT NULL
@@ -176,6 +413,55 @@ CREATE TABLE aircraft_reference_fact_set_attestations (
   UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
 );
 
+CREATE TABLE official_dollar_normalization_facts (
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  source_year BIGINT NOT NULL CHECK (source_year BETWEEN 1900 AND 2200),
+  target_year BIGINT NOT NULL CHECK (target_year BETWEEN 1900 AND 2200),
+  index_series TEXT NOT NULL CHECK (length(BTRIM(index_series)) > 0),
+  source_index_value DOUBLE PRECISION NOT NULL CHECK (source_index_value > 0),
+  target_index_value DOUBLE PRECISION NOT NULL CHECK (target_index_value > 0),
+  normalization_factor DOUBLE PRECISION NOT NULL CHECK (normalization_factor > 0),
+  evidence_claim_id BIGINT NOT NULL UNIQUE
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (source_year, target_year),
+  CHECK (source_year <> target_year),
+  CHECK (
+    abs(normalization_factor - (target_index_value / source_index_value))
+      <= 0.000000001
+  )
+);
+
+CREATE OR REPLACE FUNCTION validate_official_dollar_normalization_fact()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM curation_evidence_claims claim
+    JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
+    WHERE claim.id = NEW.evidence_claim_id
+      AND claim.validation_status = 'validated'
+      AND claim.claim_kind IN ('price', 'specification')
+      AND source.source_tier = 'regulator_primary'
+  ) THEN
+    RAISE EXCEPTION 'dollar normalization requires validated official regulator evidence';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER official_dollar_normalization_require_evidence
+BEFORE INSERT ON official_dollar_normalization_facts
+FOR EACH ROW EXECUTE FUNCTION validate_official_dollar_normalization_fact();
+CREATE OR REPLACE FUNCTION prevent_official_dollar_normalization_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'official dollar normalization facts are immutable';
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER official_dollar_normalization_immutable
+BEFORE UPDATE OR DELETE ON official_dollar_normalization_facts
+FOR EACH ROW EXECUTE FUNCTION prevent_official_dollar_normalization_mutation();
+
 CREATE OR REPLACE FUNCTION validate_aircraft_reference_child_insert()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -188,15 +474,35 @@ BEGIN
   IF parent_state IS DISTINCT FROM 'building' THEN
     RAISE EXCEPTION 'reference profile children require a building version';
   END IF;
-  IF TG_TABLE_NAME = 'aircraft_reference_avionics' AND NOT EXISTS (
-    SELECT 1 FROM avionics_models WHERE id = NEW.avionics_model_id AND catalog_status = 'approved'
-  ) THEN RAISE EXCEPTION 'reference avionics requires an approved catalog product';
-  ELSIF TG_TABLE_NAME = 'aircraft_reference_engines' AND NOT EXISTS (
-    SELECT 1 FROM aircraft_engine_catalog_models WHERE id = NEW.aircraft_engine_catalog_model_id AND catalog_status = 'approved'
-  ) THEN RAISE EXCEPTION 'reference engine requires an approved catalog model';
-  ELSIF TG_TABLE_NAME = 'aircraft_reference_propellers' AND NOT EXISTS (
-    SELECT 1 FROM aircraft_propeller_catalog_models WHERE id = NEW.aircraft_propeller_catalog_model_id AND catalog_status = 'approved'
-  ) THEN RAISE EXCEPTION 'reference propeller requires an approved catalog model';
+  IF TG_TABLE_NAME = 'aircraft_reference_applicability_scopes' THEN
+    IF NOT NEW.applies_to_all_serials AND (
+      NEW.serial_from_sort_key !~ '^[A-Z0-9]+$'
+      OR NEW.serial_to_sort_key !~ '^[A-Z0-9]+$'
+      OR (NEW.serial_prefix IS NOT NULL AND NEW.serial_prefix !~ '^[A-Z0-9]+$')
+    ) THEN
+      RAISE EXCEPTION 'reference serial applicability requires canonical sort keys';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'aircraft_reference_avionics' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM avionics_models
+      WHERE id = NEW.avionics_model_id AND catalog_status = 'approved'
+    ) THEN
+      RAISE EXCEPTION 'reference avionics requires an approved catalog product';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'aircraft_reference_engines' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM aircraft_engine_catalog_models
+      WHERE id = NEW.aircraft_engine_catalog_model_id AND catalog_status = 'approved'
+    ) THEN
+      RAISE EXCEPTION 'reference engine requires an approved catalog model';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'aircraft_reference_propellers' THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM aircraft_propeller_catalog_models
+      WHERE id = NEW.aircraft_propeller_catalog_model_id AND catalog_status = 'approved'
+    ) THEN
+      RAISE EXCEPTION 'reference propeller requires an approved catalog model';
+    END IF;
   ELSIF TG_TABLE_NAME = 'aircraft_reference_features' THEN
     SELECT value_type INTO expected_value_type FROM aircraft_feature_definitions
     WHERE id = NEW.aircraft_feature_definition_id;
@@ -317,8 +623,8 @@ $$ LANGUAGE plpgsql;
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260819_reference_catalog_cutover', 1,
-  'b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988', CURRENT_TIMESTAMP
+  '20260819_reference_catalog_cutover', 2,
+  'e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = EXCLUDED.contract_version,

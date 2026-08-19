@@ -133,6 +133,39 @@ ALTER TABLE aircraft_reference_prices
     'full_standard_configuration', 'base_aircraft_only', 'unknown'
   ));
 
+DROP TRIGGER aircraft_reference_versions_require_approval;
+CREATE TRIGGER aircraft_reference_versions_require_approval
+BEFORE INSERT ON aircraft_reference_configuration_versions
+WHEN NEW.publication_state <> 'building'
+OR NOT EXISTS (
+  SELECT 1 FROM aircraft_identity_decisions decision
+  JOIN aircraft_identity_decision_claims dc ON dc.decision_id = decision.id
+  JOIN curation_evidence_claims claim ON claim.id = dc.evidence_claim_id
+  JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
+  WHERE decision.id = NEW.approval_decision_id
+    AND decision.decision_status = 'approved'
+    AND decision.decision_action = 'approve_new'
+    AND decision.entity_kind = 'reference_profile'
+    AND claim.validation_status = 'validated'
+    AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
+)
+OR (NEW.revision = 1) <> (NEW.supersedes_version_id IS NULL)
+OR (
+  NEW.supersedes_version_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM aircraft_reference_configuration_versions previous
+    WHERE previous.id = NEW.supersedes_version_id
+      AND previous.aircraft_reference_configuration_id = NEW.aircraft_reference_configuration_id
+      AND previous.model_year = NEW.model_year
+      AND previous.revision = NEW.revision - 1
+      AND previous.publication_state = 'published'
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'reference profile requires building state, approved evidence, and its exact predecessor');
+END;
+
 CREATE TABLE aircraft_reference_fact_set_attestations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   aircraft_reference_configuration_version_id INTEGER NOT NULL
@@ -145,6 +178,61 @@ CREATE TABLE aircraft_reference_fact_set_attestations (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
 );
+
+CREATE TRIGGER aircraft_reference_scope_canonical_insert
+BEFORE INSERT ON aircraft_reference_applicability_scopes
+WHEN NEW.applies_to_all_serials = 0 AND (
+  NEW.serial_from_sort_key <> upper(NEW.serial_from_sort_key)
+  OR NEW.serial_to_sort_key <> upper(NEW.serial_to_sort_key)
+  OR NEW.serial_from_sort_key GLOB '*[^A-Z0-9]*'
+  OR NEW.serial_to_sort_key GLOB '*[^A-Z0-9]*'
+  OR (
+    NEW.serial_prefix IS NOT NULL
+    AND (
+      NEW.serial_prefix <> upper(NEW.serial_prefix)
+      OR NEW.serial_prefix GLOB '*[^A-Z0-9]*'
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'reference serial applicability requires canonical sort keys'); END;
+
+CREATE TABLE official_dollar_normalization_facts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_year INTEGER NOT NULL CHECK (source_year BETWEEN 1900 AND 2200),
+  target_year INTEGER NOT NULL CHECK (target_year BETWEEN 1900 AND 2200),
+  index_series TEXT NOT NULL CHECK (length(trim(index_series)) > 0),
+  source_index_value REAL NOT NULL CHECK (source_index_value > 0),
+  target_index_value REAL NOT NULL CHECK (target_index_value > 0),
+  normalization_factor REAL NOT NULL CHECK (normalization_factor > 0),
+  evidence_claim_id INTEGER NOT NULL UNIQUE
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (source_year, target_year),
+  CHECK (source_year <> target_year),
+  CHECK (
+    abs(normalization_factor - (target_index_value / source_index_value))
+      <= 0.000000001
+  )
+);
+
+CREATE TRIGGER official_dollar_normalization_require_evidence
+BEFORE INSERT ON official_dollar_normalization_facts
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM curation_evidence_claims claim
+  JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
+  WHERE claim.id = NEW.evidence_claim_id
+    AND claim.validation_status = 'validated'
+    AND claim.claim_kind IN ('price', 'specification')
+    AND source.source_tier = 'regulator_primary'
+)
+BEGIN SELECT RAISE(ABORT, 'dollar normalization requires validated official regulator evidence'); END;
+CREATE TRIGGER official_dollar_normalization_immutable_update
+BEFORE UPDATE ON official_dollar_normalization_facts
+BEGIN SELECT RAISE(ABORT, 'official dollar normalization facts are immutable'); END;
+CREATE TRIGGER official_dollar_normalization_immutable_delete
+BEFORE DELETE ON official_dollar_normalization_facts
+BEGIN SELECT RAISE(ABORT, 'official dollar normalization facts are immutable'); END;
 
 DROP TRIGGER aircraft_reference_price_building_insert;
 CREATE TRIGGER aircraft_reference_price_building_insert
@@ -288,8 +376,8 @@ END;
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
-  '20260819_reference_catalog_cutover', 1,
-  'b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988', CURRENT_TIMESTAMP
+  '20260819_reference_catalog_cutover', 2,
+  'e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,

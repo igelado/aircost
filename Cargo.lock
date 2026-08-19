@@ -75,6 +75,7 @@ dependencies = [
  "eoka",
  "html-escape",
  "lopdf",
+ "regex",
  "reqwest 0.13.4",
  "ring",
  "scraper",

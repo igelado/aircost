@@ -288,9 +288,9 @@ BEGIN
 END;
 "#;
 const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
-const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
+const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 2;
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
-    "b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988";
+    "e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -3333,6 +3333,11 @@ impl AppDb {
                           WHERE type = 'table'
                             AND name = 'aircraft_reference_fact_set_attestations'
                         )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table'
+                            AND name = 'official_dollar_normalization_facts'
+                        )
                         OR EXISTS (
                           SELECT 1 FROM sqlite_schema
                           WHERE type = 'table'
@@ -3366,6 +3371,7 @@ impl AppDb {
                             AND column_name = 'configuration_basis'
                         )
                         OR to_regclass('aircraft_reference_fact_set_attestations') IS NULL
+                        OR to_regclass('official_dollar_normalization_facts') IS NULL
                         OR EXISTS (
                           SELECT 1
                           FROM unnest(ARRAY[

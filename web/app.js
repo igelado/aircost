@@ -48,9 +48,6 @@ const state = {
   listings: [],
   aircraftOptions: [],
   aircraftDetail: null,
-  aircraftAnnualHours: null,
-  aircraftAnnualHoursVariantId: null,
-  aircraftAnnualHoursTimer: null,
   editingListingId: null,
   valuationStatus: null,
 };
@@ -130,8 +127,6 @@ function collectElements() {
     aircraftManufacturer: "#aircraft-manufacturer",
     aircraftModel: "#aircraft-model",
     aircraftVariant: "#aircraft-variant",
-    aircraftAnnualHours: "#aircraft-annual-hours",
-    aircraftAnnualHoursValue: "#aircraft-annual-hours-value",
     refreshAircraft: "#refresh-aircraft",
     aircraftMessage: "#aircraft-message",
     aircraftParams: "#aircraft-params",
@@ -231,24 +226,16 @@ function bindEvents() {
   elements.listingTableBody.addEventListener("click", handleTableClick);
   elements.refreshAircraft.addEventListener("click", loadAircraftOptions);
   elements.aircraftManufacturer.addEventListener("change", () => {
-    resetAircraftAnnualHours();
     populateAircraftModelSelect();
     populateAircraftVariantSelect();
     loadSelectedAircraftDetail();
   });
   elements.aircraftModel.addEventListener("change", () => {
-    resetAircraftAnnualHours();
     populateAircraftVariantSelect();
     loadSelectedAircraftDetail();
   });
   elements.aircraftVariant.addEventListener("change", () => {
-    resetAircraftAnnualHours();
     loadSelectedAircraftDetail();
-  });
-  elements.aircraftAnnualHours.addEventListener("input", () => {
-    state.aircraftAnnualHours = sliderAnnualHoursValue();
-    renderAircraftAnnualHoursValue();
-    scheduleSelectedAircraftDetailLoad();
   });
 }
 
@@ -323,66 +310,14 @@ async function loadSelectedAircraftDetail() {
   }
   setAircraftMessage("Loading model...");
   try {
-    const annualHours = selectedAircraftAnnualHoursForRequest(variantId);
-    const query = Number.isFinite(annualHours) ? `?annual_hours=${annualHours}` : "";
-    const payload = await api(`/api/aircraft/variants/${variantId}${query}`);
+    const payload = await api(`/api/aircraft/variants/${variantId}`);
     state.aircraftDetail = payload.aircraft || null;
-    syncAircraftAnnualHoursControl(state.aircraftDetail);
     renderAircraftDetail();
   } catch (error) {
     state.aircraftDetail = null;
     clearAircraftDetail();
     setAircraftMessage(error.message, true);
   }
-}
-
-function resetAircraftAnnualHours() {
-  state.aircraftAnnualHours = null;
-  state.aircraftAnnualHoursVariantId = null;
-  if (state.aircraftAnnualHoursTimer) {
-    window.clearTimeout(state.aircraftAnnualHoursTimer);
-    state.aircraftAnnualHoursTimer = null;
-  }
-}
-
-function scheduleSelectedAircraftDetailLoad() {
-  if (state.aircraftAnnualHoursTimer) {
-    window.clearTimeout(state.aircraftAnnualHoursTimer);
-  }
-  state.aircraftAnnualHoursTimer = window.setTimeout(() => {
-    state.aircraftAnnualHoursTimer = null;
-    loadSelectedAircraftDetail();
-  }, 180);
-}
-
-function sliderAnnualHoursValue() {
-  const value = Number(elements.aircraftAnnualHours.value);
-  return Number.isFinite(value) ? value : null;
-}
-
-function selectedAircraftAnnualHoursForRequest(variantId) {
-  if (state.aircraftAnnualHoursVariantId !== variantId) {
-    return null;
-  }
-  return state.aircraftAnnualHours;
-}
-
-function syncAircraftAnnualHoursControl(detail) {
-  const variantId = detail?.option?.variant_id || selectedInteger(elements.aircraftVariant);
-  if (state.aircraftAnnualHoursVariantId !== variantId || state.aircraftAnnualHours === null) {
-    state.aircraftAnnualHours = 200;
-    state.aircraftAnnualHoursVariantId = variantId;
-  }
-  elements.aircraftAnnualHours.disabled = false;
-  elements.aircraftAnnualHours.value = String(state.aircraftAnnualHours);
-  renderAircraftAnnualHoursValue();
-}
-
-function renderAircraftAnnualHoursValue() {
-  const value = sliderAnnualHoursValue();
-  elements.aircraftAnnualHoursValue.textContent = Number.isFinite(value)
-    ? formatUnit(value, "h", 0)
-    : "-";
 }
 
 function populateAircraftManufacturerSelect() {
@@ -464,14 +399,6 @@ function renderAircraftDetail() {
   renderAircraftParams(detail);
   renderAircraftChart(detail);
   renderAircraftValueTable(detail);
-  const listingOnly = (detail.listings || []).some((listing) => listing.valuation_model_kind);
-  const valuationUnavailable = state.valuationStatus?.state === "unavailable";
-  elements.aircraftAnnualHours.disabled = listingOnly || valuationUnavailable;
-  elements.aircraftAnnualHours.title = valuationUnavailable
-    ? "Market valuation is unavailable until an approved model or eligible snapshot is loaded."
-    : listingOnly
-      ? "Future utilization is learned from the frozen listing snapshot."
-      : "Set projected annual airframe hours.";
   const listingCount = detail.listings?.length || 0;
   setAircraftMessage(detail.message || `${listingCount} listing values modeled.`);
 }
@@ -1498,11 +1425,11 @@ function formatFitScope(profile) {
 
 function aircraftValuationYear(detail) {
   const listing = (detail?.listings || []).find(
-    (candidate) => candidate.reference_valuation_basis || candidate.factory_reference,
+    (candidate) => candidate.reference_valuation_basis || candidate.value_curve?.length,
   );
   const year =
     listing?.reference_valuation_basis?.nominal_dollar_year ??
-    listing?.factory_reference?.price_reference_year;
+    listing?.value_curve?.[0]?.valuation_year;
   return Number.isInteger(Number(year)) ? Number(year) : new Date().getFullYear();
 }
 

@@ -833,10 +833,14 @@ in rollback-only mode by default:
 
 The draft's `direct_cited_amount_usd` and
 `direct_cited_nominal_dollar_year` fields must reproduce the cited nominal
-MSRP. They must never contain a model-generated inflation adjustment. No typed
-official normalization fact/pipeline exists yet, so a reference/market-year
-mismatch is a deterministic `reference_price_dollar_normalization_missing`
-readiness gap rather than another Gemini task.
+MSRP. They must never contain a model-generated inflation adjustment. A
+separate optional `dollar_normalization` fact contains the source/target years,
+official index series, both official index values, their exact factor, and a
+validated regulator-primary claim ID. Gemini may structure already-grounded
+values, but database gates—not model confidence—admit the fact. Serving and
+snapshot creation consume it directly; a missing pair is the deterministic
+`reference_price_dollar_normalization_missing` gap rather than another Gemini
+task.
 
 ```sh
 cargo run --bin aircost-admin -- \
@@ -846,14 +850,18 @@ cargo run --bin aircost-admin -- \
 `--apply` persists and publishes the version only after database gates recheck
 all primary evidence, complete fact sets, the exact-model-year full-configuration
 price, valuation-ready avionics, and non-overlapping applicability. A correction
-creates a successor rather than editing published facts.
+atomically supersedes its exact published predecessor and publishes the higher
+revision; any failure rolls both state changes back.
 
 Confidence alone is not valuation eligibility. Avionics identities must resolve
 to approved concrete products or named suites; integrated suite membership must
 be explicit so bundled units are not counted twice. Installed contribution and
 replacement cost remain separate facts. Reference and avionics dollar values
-retain their actual nominal year; serving fails closed when no approved
-valuation-year normalization exists instead of inventing an inflation factor.
+retain their actual nominal year. Official regulator-backed index facts perform
+the only accepted valuation-year conversion; serving fails closed when the
+exact pair is absent. Installed-contribution values are current resale values:
+the full listing delta is applied after factory-aircraft age/hour scaling and
+held constant in valuation-year dollars across the displayed curve.
 
 LLM completion does not make a listing ready by itself. Deterministic readiness
 rechecks the current exact FAA assignment, listing-specific avionics, and the

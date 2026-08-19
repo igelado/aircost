@@ -74,9 +74,13 @@ aircraft's starting configuration value at request time. The published
 reference catalog supplies that anchor:
 
 ```text
-configuration_basis =
-  full_standard_configuration_price
-  + listing_configuration_delta
+factory_reference_scale =
+  normalized_full_standard_configuration_price
+  / learned_configuration_anchor
+
+reference_grounded_estimate =
+  learned_estimate * factory_reference_scale
+  + listing_current_avionics_delta
 ```
 
 The listing delta compares high-confidence listing avionics actions with the
@@ -88,8 +92,8 @@ the delta; a missing or differently denominated value stops valuation instead
 of invoking an inferred inflation adjustment.
 
 After the model produces a market estimate, the serving adapter removes its
-learned identity/configuration anchor and rescales the estimate and projection
-range to the exact reference basis:
+learned identity/configuration anchor and rescales the aircraft estimate and
+projection range to the exact factory reference price:
 
 ```text
 learned_configuration_anchor =
@@ -100,15 +104,24 @@ learned_configuration_anchor =
   * variant_factor
   * optional_features_factor
 
-reference_scale = configuration_basis / learned_configuration_anchor
+reference_scale =
+  normalized_full_standard_configuration_price
+  / learned_configuration_anchor
 
-reference_grounded_estimate = learned_estimate * reference_scale
+factory_aircraft_estimate = learned_estimate * reference_scale
+reference_grounded_estimate =
+  factory_aircraft_estimate + listing_current_avionics_delta
 ```
 
 The age and hour behavior, uncertainty, support grade, and model version remain
 model outputs. The identity/configuration anchor exposed in the breakdown is
-the published reference basis. Listing equipment tokens are not also passed to
-the model during serving, which prevents counting the same upgrade twice.
+the published factory reference price. Installed-contribution amounts are
+current resale values, so the full listing delta is added after aircraft
+age/hour scaling; it is never inserted into MSRP and depreciated with the
+aircraft. Until a separate approved avionics curve exists, that delta is held
+constant in valuation-year dollars across displayed projection horizons.
+Listing equipment tokens are not also passed to the model during serving,
+which prevents counting the same upgrade twice.
 
 ## Identity And Applicability
 
@@ -121,10 +134,16 @@ Each immutable published version then declares:
 - one or more market scopes (`US` or `GLOBAL` for the current policy); and
 - either all serials or an explicit normalized serial prefix/range.
 
-A correction creates and publishes a successor version. Published versions
-and their facts are not edited in place. Overlapping published versions that
+A correction creates a successor version. Its transaction locks and validates
+the exact published predecessor, configuration, model year, and lower revision,
+then supersedes the predecessor and publishes the successor atomically. A
+failed publication restores the predecessor and removes the attempted version.
+Published facts are not edited in place. Overlapping published versions that
 would make a listing ambiguous are rejected by publication and fail closed at
-resolution.
+resolution. Bounded serial displays are canonicalized once through their
+declared make-specific serial scheme; inconsistent caller sort keys are
+rejected, and storage, overlap checks, and runtime matching use the same
+uppercase alphanumeric keys.
 
 ## Curating A Reference Version
 
@@ -137,10 +156,14 @@ reference profile.
 The price object is deliberately named `direct_cited_amount_usd` and
 `direct_cited_nominal_dollar_year`. It must reproduce the primary source's
 nominal full-configuration MSRP; it cannot carry an inflation-adjusted amount.
-There is currently no typed official dollar-normalization fact or normalization
-pipeline. When that direct nominal year differs from the active model's market
-year, serving reports `reference_price_dollar_normalization_missing` and leaves
-the estimate unavailable.
+An optional `dollar_normalization` object carries the source and target nominal
+years, official index series, source and target index values, their exact
+factor, and a validated evidence-claim ID. The database accepts it only from a
+validated regulator-primary price/specification claim and stores no source
+dossier. Serving and snapshot creation multiply direct MSRP by that exact
+official factor. If no fact exists for the source/market-year pair, they report
+`reference_price_dollar_normalization_missing` and exclude the estimate rather
+than inventing a factor.
 
 Preview the exact publication transaction, including database triggers, with:
 

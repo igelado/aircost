@@ -16,7 +16,8 @@ use sqlx::FromRow;
 
 use self::faa::{audit_listing_admission, require_listing_admission, AircraftAdmissionError};
 use self::reference::persistence::{
-    listing_reference_status, PublishedReferenceConfiguration, ReferenceGap,
+    listing_reference_status, normalized_reference_price, PublishedReferenceConfiguration,
+    ReferenceGap,
 };
 use crate::db::{AppDb, DatabaseBackend};
 use crate::valuation::dataset::{require_snapshot_faa_admission, technical_field_count};
@@ -230,9 +231,13 @@ pub struct AircraftListingValuePoint {
 #[derive(Clone, Debug, Serialize)]
 pub struct AircraftReferenceValuationBasis {
     pub reference_configuration_version_id: i64,
+    pub direct_cited_standard_configuration_price_usd: f64,
+    pub direct_cited_nominal_dollar_year: i64,
+    pub dollar_normalization_factor: f64,
+    pub dollar_normalization_fact_id: Option<i64>,
     pub full_standard_configuration_price_usd: f64,
-    pub listing_configuration_delta_usd: f64,
-    pub valuation_basis_usd: f64,
+    pub listing_current_avionics_delta_usd: f64,
+    pub avionics_delta_curve_policy: String,
     pub nominal_dollar_year: i64,
 }
 
@@ -330,17 +335,14 @@ pub async fn aircraft_variant_detail(
     db: &AppDb,
     user_id: i64,
     variant_id: i64,
-    curve_annual_airframe_hours: Option<f64>,
 ) -> StoreResult<AircraftVariantDetail> {
-    aircraft_variant_detail_with_model(db, user_id, variant_id, curve_annual_airframe_hours, None)
-        .await
+    aircraft_variant_detail_with_model(db, user_id, variant_id, None).await
 }
 
 pub async fn aircraft_variant_detail_with_model(
     db: &AppDb,
     user_id: i64,
     variant_id: i64,
-    _curve_annual_airframe_hours: Option<f64>,
     valuation_model: Option<&Arc<dyn ValuationModel>>,
 ) -> StoreResult<AircraftVariantDetail> {
     require_valuation_model_faa_admission(db, valuation_model.map(Arc::as_ref)).await?;
@@ -656,8 +658,9 @@ async fn listing_value_point(
             factory_reference: Some(FactoryReferenceFeature {
                 configuration_id: published_reference.configuration_id,
                 version_id: published_reference.version_id,
-                full_standard_configuration_price_usd: published_reference.price_usd,
-                nominal_dollar_year: published_reference.price_reference_year,
+                full_standard_configuration_price_usd: reference_basis
+                    .full_standard_configuration_price_usd,
+                nominal_dollar_year: reference_basis.nominal_dollar_year,
             }),
         };
         match model.estimate(&query) {
@@ -722,9 +725,10 @@ async fn reference_valuation_basis(
     reference: &PublishedReferenceConfiguration,
     valuation_year: i64,
 ) -> StoreResult<Result<AircraftReferenceValuationBasis, ReferenceGap>> {
-    if let Some(gap) = reference_price_year_gap(reference.price_reference_year, valuation_year) {
-        return Ok(Err(gap));
-    }
+    let normalized_price = match normalized_reference_price(db, reference, valuation_year).await? {
+        Ok(price) => price,
+        Err(gap) => return Ok(Err(gap)),
+    };
     let factory = reference_avionics_estimates(db, reference.version_id).await?;
     let listing = listing_avionics_estimates(db, listing_id).await?;
     let memberships = avionics_suite_memberships(db).await?;
@@ -783,35 +787,26 @@ async fn reference_valuation_basis(
         }
         delta += value * quantity_change as f64;
     }
-    let valuation_basis = reference.price_usd + delta;
-    if !valuation_basis.is_finite() || valuation_basis <= 0.0 {
+    if !normalized_price.normalized_amount_usd.is_finite()
+        || normalized_price.normalized_amount_usd <= 0.0
+        || !delta.is_finite()
+    {
         return Ok(Err(ReferenceGap::new(
             "reference_valuation_basis_invalid",
-            "factory price plus listing configuration delta is not positive",
+            "factory standard-configuration price or current avionics delta is invalid",
         )));
     }
     Ok(Ok(AircraftReferenceValuationBasis {
         reference_configuration_version_id: reference.version_id,
-        full_standard_configuration_price_usd: reference.price_usd,
-        listing_configuration_delta_usd: delta,
-        valuation_basis_usd: valuation_basis,
+        direct_cited_standard_configuration_price_usd: reference.price_usd,
+        direct_cited_nominal_dollar_year: reference.price_reference_year,
+        dollar_normalization_factor: normalized_price.normalization_factor,
+        dollar_normalization_fact_id: normalized_price.official_normalization_fact_id,
+        full_standard_configuration_price_usd: normalized_price.normalized_amount_usd,
+        listing_current_avionics_delta_usd: delta,
+        avionics_delta_curve_policy: "constant_valuation_year_dollars".to_string(),
         nominal_dollar_year: valuation_year,
     }))
-}
-
-fn reference_price_year_gap(
-    price_reference_year: i64,
-    valuation_year: i64,
-) -> Option<ReferenceGap> {
-    (price_reference_year != valuation_year).then(|| {
-        ReferenceGap::new(
-            "reference_price_dollar_normalization_missing",
-            format!(
-                "published direct factory MSRP is expressed in {} nominal dollars, but the valuation market year is {}; no approved dollar-normalization fact is published",
-                price_reference_year, valuation_year
-            ),
-        )
-    })
 }
 
 fn ground_estimate_to_reference(
@@ -829,7 +824,7 @@ fn ground_estimate_to_reference(
             "valuation model produced an invalid configuration anchor".to_string(),
         ));
     }
-    let scale = reference.valuation_basis_usd / modeled_configuration_anchor;
+    let scale = reference.full_standard_configuration_price_usd / modeled_configuration_anchor;
     for value in [
         &mut estimate.estimated_value_usd,
         &mut estimate.low_value_usd,
@@ -843,12 +838,50 @@ fn ground_estimate_to_reference(
         point.high_value_usd *= scale;
         point.depreciation_usd *= scale;
     }
-    estimate.breakdown.global_anchor_usd = reference.valuation_basis_usd;
+    estimate.breakdown.global_anchor_usd = reference.full_standard_configuration_price_usd;
     estimate.breakdown.category_factor = 1.0;
     estimate.breakdown.manufacturer_factor = 1.0;
     estimate.breakdown.model_factor = 1.0;
     estimate.breakdown.variant_factor = 1.0;
     estimate.breakdown.optional_features_factor = 1.0;
+    apply_current_avionics_delta(estimate, reference.listing_current_avionics_delta_usd)?;
+    Ok(())
+}
+
+/// Installed-contribution values are current resale contributions, not new
+/// aircraft MSRP. The delta is therefore applied after aircraft age/hour
+/// scaling and held constant in valuation-year dollars across the displayed
+/// curve until a separate avionics depreciation model is approved.
+fn apply_current_avionics_delta(
+    estimate: &mut crate::valuation::ValuationEstimate,
+    delta_usd: f64,
+) -> StoreResult<()> {
+    for value in [
+        &mut estimate.estimated_value_usd,
+        &mut estimate.low_value_usd,
+        &mut estimate.high_value_usd,
+    ] {
+        *value += delta_usd;
+        if !value.is_finite() || *value <= 0.0 {
+            return Err(AircraftStoreError::Model(
+                "current-dollar avionics delta produced an invalid valuation".to_string(),
+            ));
+        }
+    }
+    for point in &mut estimate.depreciation {
+        for value in [
+            &mut point.estimated_value_usd,
+            &mut point.low_value_usd,
+            &mut point.high_value_usd,
+        ] {
+            *value += delta_usd;
+            if !value.is_finite() || *value <= 0.0 {
+                return Err(AircraftStoreError::Model(
+                    "current-dollar avionics delta produced an invalid curve point".to_string(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1111,9 +1144,9 @@ mod tests {
     use super::{
         aircraft_listing_value_with_model, aircraft_option_for_variant, aircraft_options,
         avionics_suite_memberships, ground_estimate_to_reference, listing_avionics_estimates,
-        listing_value_point, reference_price_year_gap, require_valuation_model_faa_admission,
-        resolve_avionics_configuration, AircraftListingPointRow, AircraftReferenceValuationBasis,
-        AvionicsConfigurationLink, AvionicsSuiteMembership,
+        listing_value_point, require_valuation_model_faa_admission, resolve_avionics_configuration,
+        AircraftListingPointRow, AircraftReferenceValuationBasis, AvionicsConfigurationLink,
+        AvionicsSuiteMembership,
     };
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
     use crate::db::{AppDb, DatabaseBackend};
@@ -1474,7 +1507,7 @@ mod tests {
     }
 
     #[test]
-    fn published_full_configuration_price_replaces_the_models_identity_anchor() {
+    fn current_avionics_upgrades_and_removals_are_not_aircraft_depreciated() {
         let mut estimate = ValuationEstimate {
             estimated_value_usd: 100_000.0,
             low_value_usd: 80_000.0,
@@ -1511,34 +1544,37 @@ mod tests {
                 support: SupportGrade::High,
             }],
         };
+        let mut removal_estimate = estimate.clone();
         let reference = AircraftReferenceValuationBasis {
             reference_configuration_version_id: 42,
+            direct_cited_standard_configuration_price_usd: 480_000.0,
+            direct_cited_nominal_dollar_year: 2026,
+            dollar_normalization_factor: 1.0,
+            dollar_normalization_fact_id: None,
             full_standard_configuration_price_usd: 480_000.0,
-            listing_configuration_delta_usd: 20_000.0,
-            valuation_basis_usd: 500_000.0,
+            listing_current_avionics_delta_usd: 10_000.0,
+            avionics_delta_curve_policy: "constant_valuation_year_dollars".to_string(),
             nominal_dollar_year: 2026,
+        };
+        let removal_reference = AircraftReferenceValuationBasis {
+            listing_current_avionics_delta_usd: -10_000.0,
+            ..reference.clone()
         };
 
         ground_estimate_to_reference(&mut estimate, &reference).unwrap();
+        ground_estimate_to_reference(&mut removal_estimate, &removal_reference).unwrap();
 
         assert_eq!(estimate.estimated_value_usd, 250_000.0);
-        assert_eq!(estimate.breakdown.global_anchor_usd, 500_000.0);
+        assert_eq!(removal_estimate.estimated_value_usd, 230_000.0);
+        assert_eq!(estimate.breakdown.global_anchor_usd, 480_000.0);
         assert_eq!(estimate.breakdown.manufacturer_factor, 1.0);
         assert_eq!(estimate.depreciation[0].estimated_value_usd, 250_000.0);
-    }
-
-    #[test]
-    fn historical_direct_msrp_requires_an_explicit_normalization_fact() {
-        let gap = reference_price_year_gap(2019, 2026)
-            .expect("historical nominal dollars must not be treated as current dollars");
-
-        assert_eq!(gap.code, "reference_price_dollar_normalization_missing");
-        assert!(gap.message.contains("2019 nominal dollars"));
-        assert!(gap.message.contains("valuation market year is 2026"));
-        assert!(gap
-            .message
-            .contains("no approved dollar-normalization fact"));
-        assert!(reference_price_year_gap(2026, 2026).is_none());
+        assert_eq!(
+            removal_estimate.depreciation[0].estimated_value_usd,
+            230_000.0
+        );
+        assert_eq!(estimate.depreciation[0].depreciation_usd, 240_000.0);
+        assert_eq!(removal_estimate.depreciation[0].depreciation_usd, 240_000.0);
     }
 
     #[tokio::test]

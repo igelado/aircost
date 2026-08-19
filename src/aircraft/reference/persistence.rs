@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
@@ -116,6 +117,18 @@ pub struct ReferencePriceDraft {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ReferenceDollarNormalizationDraft {
+    pub source_nominal_dollar_year: i64,
+    pub target_nominal_dollar_year: i64,
+    pub official_index_series: String,
+    pub source_index_value: f64,
+    pub target_index_value: f64,
+    pub normalization_factor: f64,
+    pub evidence_claim_id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceComponentDraft {
     pub catalog_id: i64,
     pub quantity: i64,
@@ -153,6 +166,7 @@ pub struct ApprovedReferenceVersionDraft {
     pub profile_approval_decision_id: i64,
     pub applicability: Vec<ReferenceApplicabilityDraft>,
     pub price: ReferencePriceDraft,
+    pub dollar_normalization: Option<ReferenceDollarNormalizationDraft>,
     pub avionics: Vec<ReferenceComponentDraft>,
     pub engines: Vec<ReferenceComponentDraft>,
     pub propellers: Vec<ReferenceComponentDraft>,
@@ -162,6 +176,20 @@ pub struct ApprovedReferenceVersionDraft {
     pub engines_set_evidence_claim_id: i64,
     pub propellers_set_evidence_claim_id: i64,
     pub features_set_evidence_claim_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct NormalizedReferencePrice {
+    pub direct_cited_amount_usd: f64,
+    pub source_nominal_dollar_year: i64,
+    pub target_nominal_dollar_year: i64,
+    pub normalization_factor: f64,
+    pub normalized_amount_usd: f64,
+    pub official_normalization_fact_id: Option<i64>,
+    pub official_index_series: Option<String>,
+    pub source_index_value: Option<f64>,
+    pub target_index_value: Option<f64>,
+    pub evidence_claim_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -211,6 +239,24 @@ struct ReferenceFactCounts {
     features_complete: bool,
     invalid_avionics_value_count: i64,
 }
+
+#[derive(Debug, FromRow)]
+struct DollarNormalizationRow {
+    id: i64,
+    index_series: String,
+    source_index_value: f64,
+    target_index_value: f64,
+    normalization_factor: f64,
+    evidence_claim_id: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct SerialSchemeRow {
+    normalization_version: String,
+    validation_pattern: String,
+}
+
+const SERIAL_NORMALIZATION_VERSION: &str = "ascii_alphanumeric_upper_v1";
 
 macro_rules! query_as_optional {
     ($db:expr, $row:ty, $sql:expr $(, $bind:expr)* $(,)?) => {{
@@ -580,6 +626,79 @@ pub async fn listing_reference_status(
     })
 }
 
+/// Convert a direct cited nominal MSRP into the requested market year's
+/// dollars using one immutable, validated regulator-backed index fact.
+/// Same-year amounts are identity conversions and need no stored fact.
+pub async fn normalized_reference_price(
+    db: &AppDb,
+    reference: &PublishedReferenceConfiguration,
+    target_nominal_dollar_year: i64,
+) -> Result<Result<NormalizedReferencePrice, ReferenceGap>, sqlx::Error> {
+    if reference.price_reference_year == target_nominal_dollar_year {
+        return Ok(Ok(NormalizedReferencePrice {
+            direct_cited_amount_usd: reference.price_usd,
+            source_nominal_dollar_year: reference.price_reference_year,
+            target_nominal_dollar_year,
+            normalization_factor: 1.0,
+            normalized_amount_usd: reference.price_usd,
+            official_normalization_fact_id: None,
+            official_index_series: None,
+            source_index_value: None,
+            target_index_value: None,
+            evidence_claim_id: None,
+        }));
+    }
+    let fact = query_as_optional!(
+        db,
+        DollarNormalizationRow,
+        r#"
+        SELECT fact.id, fact.index_series, fact.source_index_value,
+               fact.target_index_value, fact.normalization_factor,
+               fact.evidence_claim_id
+        FROM official_dollar_normalization_facts fact
+        JOIN curation_evidence_claims claim
+          ON claim.id = fact.evidence_claim_id
+        JOIN curation_evidence_sources source
+          ON source.id = claim.evidence_source_id
+        WHERE fact.source_year = ?
+          AND fact.target_year = ?
+          AND claim.validation_status = 'validated'
+          AND claim.claim_kind IN ('price', 'specification')
+          AND source.source_tier = 'regulator_primary'
+        "#,
+        reference.price_reference_year,
+        target_nominal_dollar_year
+    )?;
+    let Some(fact) = fact else {
+        return Ok(Err(ReferenceGap::new(
+            "reference_price_dollar_normalization_missing",
+            format!(
+                "published direct factory MSRP is expressed in {} nominal dollars, but the valuation market year is {}; no validated official dollar-normalization fact is published",
+                reference.price_reference_year, target_nominal_dollar_year
+            ),
+        )));
+    };
+    let normalized_amount_usd = reference.price_usd * fact.normalization_factor;
+    if !normalized_amount_usd.is_finite() || normalized_amount_usd <= 0.0 {
+        return Ok(Err(ReferenceGap::new(
+            "reference_price_dollar_normalization_invalid",
+            "the approved official dollar-normalization fact produced an invalid amount",
+        )));
+    }
+    Ok(Ok(NormalizedReferencePrice {
+        direct_cited_amount_usd: reference.price_usd,
+        source_nominal_dollar_year: reference.price_reference_year,
+        target_nominal_dollar_year,
+        normalization_factor: fact.normalization_factor,
+        normalized_amount_usd,
+        official_normalization_fact_id: Some(fact.id),
+        official_index_series: Some(fact.index_series),
+        source_index_value: Some(fact.source_index_value),
+        target_index_value: Some(fact.target_index_value),
+        evidence_claim_id: Some(fact.evidence_claim_id),
+    }))
+}
+
 /// Atomically publish one fully assembled immutable version.
 ///
 /// All facts must already have been admitted through the existing approved
@@ -591,48 +710,92 @@ pub async fn publish_reference_version(
     db: &AppDb,
     version_id: i64,
 ) -> Result<(), ReferencePublicationError> {
-    let statement = db.sql(
+    let sqlite_select = db.sql(
+        r#"
+        SELECT aircraft_reference_configuration_id, model_year, revision,
+               supersedes_version_id
+        FROM aircraft_reference_configuration_versions
+        WHERE id = ? AND publication_state = 'building'
+        "#,
+    );
+    let postgres_select = db.sql(
+        r#"
+        SELECT aircraft_reference_configuration_id, model_year, revision,
+               supersedes_version_id
+        FROM aircraft_reference_configuration_versions
+        WHERE id = ? AND publication_state = 'building'
+        FOR UPDATE
+        "#,
+    );
+    let supersede = db.sql(
+        r#"
+        UPDATE aircraft_reference_configuration_versions
+        SET publication_state = 'superseded', superseded_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND aircraft_reference_configuration_id = ?
+          AND model_year = ?
+          AND publication_state = 'published'
+          AND revision = (? - 1)
+        "#,
+    );
+    let publish = db.sql(
         r#"
         UPDATE aircraft_reference_configuration_versions
         SET publication_state = 'published', published_at = CURRENT_TIMESTAMP
         WHERE id = ? AND publication_state = 'building'
         "#,
     );
-    let affected = match db.backend() {
+
+    macro_rules! publish_locked {
+        ($transaction:expr, $select:expr) => {{
+            let version = sqlx::query_as::<_, (i64, i64, i64, Option<i64>)>($select)
+                .bind(version_id)
+                .fetch_optional(&mut **$transaction)
+                .await?;
+            let Some((configuration_id, model_year, revision, predecessor_id)) = version else {
+                return Err(ReferencePublicationError::NotBuilding(version_id));
+            };
+            if let Some(predecessor_id) = predecessor_id {
+                let affected = sqlx::query(&supersede)
+                    .bind(predecessor_id)
+                    .bind(configuration_id)
+                    .bind(model_year)
+                    .bind(revision)
+                    .execute(&mut **$transaction)
+                    .await?
+                    .rows_affected();
+                if affected != 1 {
+                    return Err(ReferencePublicationError::InvalidDraft(format!(
+                        "reference version {version_id} predecessor {predecessor_id} is not the published lower revision of the same configuration and model year"
+                    )));
+                }
+            }
+            if sqlx::query(&publish)
+                .bind(version_id)
+                .execute(&mut **$transaction)
+                .await?
+                .rows_affected()
+                != 1
+            {
+                return Err(ReferencePublicationError::NotBuilding(version_id));
+            }
+            Ok::<(), ReferencePublicationError>(())
+        }};
+    }
+
+    match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
             let mut transaction = pool.begin().await?;
-            let affected = sqlx::query(&statement)
-                .bind(version_id)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected();
-            if affected == 1 {
-                transaction.commit().await?;
-            } else {
-                transaction.rollback().await?;
-            }
-            affected
+            publish_locked!(&mut transaction, &sqlite_select)?;
+            transaction.commit().await?;
         }
         DatabaseBackend::Postgres(pool) => {
             let mut transaction = pool.begin().await?;
-            let affected = sqlx::query(&statement)
-                .bind(version_id)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected();
-            if affected == 1 {
-                transaction.commit().await?;
-            } else {
-                transaction.rollback().await?;
-            }
-            affected
+            publish_locked!(&mut transaction, &postgres_select)?;
+            transaction.commit().await?;
         }
-    };
-    if affected == 1 {
-        Ok(())
-    } else {
-        Err(ReferencePublicationError::NotBuilding(version_id))
     }
+    Ok(())
 }
 
 /// Atomically create/reuse the shared hierarchy configuration, assemble one
@@ -662,6 +825,7 @@ async fn assemble_reference_version(
     apply: bool,
 ) -> Result<PublishedReferenceVersionIds, ReferencePublicationError> {
     validate_write_draft(draft)?;
+    let applicability = canonicalize_applicability(db, draft).await?;
     let select_configuration = db.sql(
         r#"
         SELECT id FROM aircraft_reference_configurations
@@ -725,8 +889,36 @@ async fn assemble_reference_version(
     let insert_attestation = db.sql(
         "INSERT INTO aircraft_reference_fact_set_attestations (aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id) VALUES (?, ?, ?)",
     );
+    let insert_normalization = db.sql(
+        r#"
+        INSERT INTO official_dollar_normalization_facts (
+          source_year, target_year, index_series, source_index_value,
+          target_index_value, normalization_factor, evidence_claim_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (source_year, target_year) DO NOTHING
+        "#,
+    );
+    let select_normalization = db.sql(
+        r#"
+        SELECT id, index_series, source_index_value, target_index_value,
+               normalization_factor, evidence_claim_id
+        FROM official_dollar_normalization_facts
+        WHERE source_year = ? AND target_year = ?
+        "#,
+    );
     let publish = db.sql(
         "UPDATE aircraft_reference_configuration_versions SET publication_state = 'published', published_at = CURRENT_TIMESTAMP WHERE id = ? AND publication_state = 'building'",
+    );
+    let supersede = db.sql(
+        r#"
+        UPDATE aircraft_reference_configuration_versions
+        SET publication_state = 'superseded', superseded_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+          AND aircraft_reference_configuration_id = ?
+          AND model_year = ?
+          AND publication_state = 'published'
+          AND revision = (? - 1)
+        "#,
     );
 
     macro_rules! assemble {
@@ -757,6 +949,44 @@ async fn assemble_reference_version(
                 );
             }
             let configuration_id = configuration_id.expect("configuration selected or inserted");
+            if let Some(normalization) = &draft.dollar_normalization {
+                sqlx::query(&insert_normalization)
+                    .bind(normalization.source_nominal_dollar_year)
+                    .bind(normalization.target_nominal_dollar_year)
+                    .bind(normalization.official_index_series.trim())
+                    .bind(normalization.source_index_value)
+                    .bind(normalization.target_index_value)
+                    .bind(normalization.normalization_factor)
+                    .bind(normalization.evidence_claim_id)
+                    .execute(&mut **$transaction)
+                    .await?;
+                let stored = sqlx::query_as::<_, DollarNormalizationRow>(&select_normalization)
+                    .bind(normalization.source_nominal_dollar_year)
+                    .bind(normalization.target_nominal_dollar_year)
+                    .fetch_one(&mut **$transaction)
+                    .await?;
+                if stored.index_series != normalization.official_index_series.trim()
+                    || !normalization_values_match(
+                        stored.source_index_value,
+                        normalization.source_index_value,
+                    )
+                    || !normalization_values_match(
+                        stored.target_index_value,
+                        normalization.target_index_value,
+                    )
+                    || !normalization_values_match(
+                        stored.normalization_factor,
+                        normalization.normalization_factor,
+                    )
+                    || stored.evidence_claim_id != normalization.evidence_claim_id
+                {
+                    return Err(ReferencePublicationError::InvalidDraft(format!(
+                        "official dollar-normalization fact for {} to {} conflicts with the immutable published fact",
+                        normalization.source_nominal_dollar_year,
+                        normalization.target_nominal_dollar_year
+                    )));
+                }
+            }
             let version_id = sqlx::query_scalar::<_, i64>(&insert_version)
                 .bind(configuration_id)
                 .bind(draft.model_year)
@@ -765,7 +995,7 @@ async fn assemble_reference_version(
                 .bind(draft.profile_approval_decision_id)
                 .fetch_one(&mut **$transaction)
                 .await?;
-            for scope in &draft.applicability {
+            for scope in &applicability {
                 sqlx::query(&insert_scope)
                     .bind(version_id)
                     .bind(scope.aircraft_market_id)
@@ -836,6 +1066,22 @@ async fn assemble_reference_version(
                     .execute(&mut **$transaction)
                     .await?;
             }
+            if let Some(predecessor_id) = draft.supersedes_version_id {
+                let affected = sqlx::query(&supersede)
+                    .bind(predecessor_id)
+                    .bind(configuration_id)
+                    .bind(draft.model_year)
+                    .bind(draft.revision)
+                    .execute(&mut **$transaction)
+                    .await?
+                    .rows_affected();
+                if affected != 1 {
+                    return Err(ReferencePublicationError::InvalidDraft(format!(
+                        "reference predecessor {predecessor_id} is not the published lower revision of configuration {configuration_id} for model year {}",
+                        draft.model_year
+                    )));
+                }
+            }
             if sqlx::query(&publish)
                 .bind(version_id)
                 .execute(&mut **$transaction)
@@ -878,6 +1124,143 @@ async fn assemble_reference_version(
     }
 }
 
+async fn canonicalize_applicability(
+    db: &AppDb,
+    draft: &ApprovedReferenceVersionDraft,
+) -> Result<Vec<ReferenceApplicabilityDraft>, ReferencePublicationError> {
+    let mut canonical = Vec::with_capacity(draft.applicability.len());
+    for scope in &draft.applicability {
+        if scope.aircraft_market_id <= 0 || scope.evidence_claim_id <= 0 {
+            return Err(ReferencePublicationError::InvalidDraft(
+                "reference applicability requires positive market and evidence IDs".to_string(),
+            ));
+        }
+        if scope.applies_to_all_serials {
+            if scope.aircraft_serial_number_scheme_id.is_some()
+                || scope.serial_prefix.is_some()
+                || scope.serial_from_display.is_some()
+                || scope.serial_to_display.is_some()
+                || scope.serial_from_sort_key.is_some()
+                || scope.serial_to_sort_key.is_some()
+            {
+                return Err(ReferencePublicationError::InvalidDraft(
+                    "all-serial applicability cannot carry a serial scheme, prefix, or range"
+                        .to_string(),
+                ));
+            }
+            canonical.push(scope.clone());
+            continue;
+        }
+        let scheme_id = scope.aircraft_serial_number_scheme_id.ok_or_else(|| {
+            ReferencePublicationError::InvalidDraft(
+                "bounded serial applicability requires a declared serial scheme".to_string(),
+            )
+        })?;
+        let scheme = query_as_optional!(
+            db,
+            SerialSchemeRow,
+            r#"
+            SELECT scheme.normalization_version, scheme.validation_pattern
+            FROM aircraft_serial_number_schemes scheme
+            JOIN aircraft_model_families family
+              ON family.aircraft_make_id = scheme.aircraft_make_id
+            WHERE scheme.id = ? AND family.id = ?
+            "#,
+            scheme_id,
+            draft.identity.aircraft_model_family_id
+        )?
+        .ok_or_else(|| {
+            ReferencePublicationError::InvalidDraft(format!(
+                "serial scheme {scheme_id} does not belong to the reference aircraft make"
+            ))
+        })?;
+        if scheme.normalization_version != SERIAL_NORMALIZATION_VERSION {
+            return Err(ReferencePublicationError::InvalidDraft(format!(
+                "serial scheme {scheme_id} uses unsupported normalization version {}",
+                scheme.normalization_version
+            )));
+        }
+        let validation = Regex::new(&scheme.validation_pattern).map_err(|error| {
+            ReferencePublicationError::InvalidDraft(format!(
+                "serial scheme {scheme_id} has an invalid validation pattern: {error}"
+            ))
+        })?;
+        let from_display = scope
+            .serial_from_display
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ReferencePublicationError::InvalidDraft(
+                    "bounded serial applicability requires a lower display value".to_string(),
+                )
+            })?;
+        let to_display = scope
+            .serial_to_display
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ReferencePublicationError::InvalidDraft(
+                    "bounded serial applicability requires an upper display value".to_string(),
+                )
+            })?;
+        let from_key = normalize_aircraft_serial_retrieval_key(from_display);
+        let to_key = normalize_aircraft_serial_retrieval_key(to_display);
+        if from_key.is_empty()
+            || to_key.is_empty()
+            || scope.serial_from_sort_key.as_deref() != Some(from_key.as_str())
+            || scope.serial_to_sort_key.as_deref() != Some(to_key.as_str())
+        {
+            return Err(ReferencePublicationError::InvalidDraft(
+                "serial range display values and caller-supplied canonical sort keys are inconsistent"
+                    .to_string(),
+            ));
+        }
+        let full_match = |value: &str| {
+            validation
+                .find(value)
+                .is_some_and(|matched| matched.start() == 0 && matched.end() == value.len())
+        };
+        if !full_match(&from_key) || !full_match(&to_key) {
+            return Err(ReferencePublicationError::InvalidDraft(format!(
+                "serial range does not satisfy declared scheme {scheme_id}"
+            )));
+        }
+        let prefix = scope
+            .serial_prefix
+            .as_deref()
+            .map(normalize_aircraft_serial_retrieval_key)
+            .filter(|value| !value.is_empty());
+        if prefix
+            .as_deref()
+            .is_some_and(|prefix| !from_key.starts_with(prefix) || !to_key.starts_with(prefix))
+            || from_key > to_key
+        {
+            return Err(ReferencePublicationError::InvalidDraft(
+                "serial prefix/range is inconsistent or reversed after canonicalization"
+                    .to_string(),
+            ));
+        }
+        canonical.push(ReferenceApplicabilityDraft {
+            aircraft_market_id: scope.aircraft_market_id,
+            applies_to_all_serials: false,
+            aircraft_serial_number_scheme_id: Some(scheme_id),
+            serial_prefix: prefix,
+            serial_from_display: Some(from_display.to_string()),
+            serial_to_display: Some(to_display.to_string()),
+            serial_from_sort_key: Some(from_key),
+            serial_to_sort_key: Some(to_key),
+            evidence_claim_id: scope.evidence_claim_id,
+        });
+    }
+    Ok(canonical)
+}
+
+fn normalization_values_match(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 0.000000001
+}
+
 fn validate_write_draft(
     draft: &ApprovedReferenceVersionDraft,
 ) -> Result<(), ReferencePublicationError> {
@@ -897,6 +1280,10 @@ fn validate_write_draft(
         || !(1900..=2200).contains(&draft.model_year)
         || !(1900..=2200).contains(&draft.price.direct_cited_nominal_dollar_year)
         || draft.revision < 1
+        || (draft.revision == 1) != draft.supersedes_version_id.is_none()
+        || draft
+            .supersedes_version_id
+            .is_some_and(|predecessor_id| predecessor_id <= 0)
         || !draft.price.direct_cited_amount_usd.is_finite()
         || draft.price.direct_cited_amount_usd <= 0.0
         || draft.applicability.is_empty()
@@ -927,6 +1314,28 @@ fn validate_write_draft(
             "reference draft has an invalid component or feature fact".to_string(),
         ));
     }
+    if let Some(normalization) = &draft.dollar_normalization {
+        let derived_factor = normalization.target_index_value / normalization.source_index_value;
+        if normalization.source_nominal_dollar_year != draft.price.direct_cited_nominal_dollar_year
+            || !(1900..=2200).contains(&normalization.source_nominal_dollar_year)
+            || !(1900..=2200).contains(&normalization.target_nominal_dollar_year)
+            || normalization.source_nominal_dollar_year == normalization.target_nominal_dollar_year
+            || normalization.official_index_series.trim().is_empty()
+            || normalization.evidence_claim_id <= 0
+            || !normalization.source_index_value.is_finite()
+            || normalization.source_index_value <= 0.0
+            || !normalization.target_index_value.is_finite()
+            || normalization.target_index_value <= 0.0
+            || !normalization.normalization_factor.is_finite()
+            || normalization.normalization_factor <= 0.0
+            || !normalization_values_match(normalization.normalization_factor, derived_factor)
+        {
+            return Err(ReferencePublicationError::InvalidDraft(
+                "dollar normalization must use the cited source year, a distinct valid target year, positive official index values, their exact factor, and validated evidence"
+                    .to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -951,17 +1360,16 @@ fn scope_matches_serial(scope: &CandidateScopeRow, serial: &str) -> bool {
     let prefix_matches = scope
         .serial_prefix
         .as_deref()
-        .map(normalize_aircraft_serial_retrieval_key)
         .is_none_or(|prefix| serial.starts_with(&prefix));
     prefix_matches
         && scope
             .serial_from_sort_key
             .as_deref()
-            .is_some_and(|from| serial >= normalize_aircraft_serial_retrieval_key(from).as_str())
+            .is_some_and(|from| serial >= from)
         && scope
             .serial_to_sort_key
             .as_deref()
-            .is_some_and(|to| serial <= normalize_aircraft_serial_retrieval_key(to).as_str())
+            .is_some_and(|to| serial <= to)
 }
 
 #[cfg(test)]
@@ -978,8 +1386,8 @@ mod tests {
             market_code: "US".to_string(),
             applies_to_all_serials: from.is_none(),
             serial_prefix: None,
-            serial_from_sort_key: from.map(str::to_string),
-            serial_to_sort_key: to.map(str::to_string),
+            serial_from_sort_key: from.map(normalize_aircraft_serial_retrieval_key),
+            serial_to_sort_key: to.map(normalize_aircraft_serial_retrieval_key),
         }
     }
 
@@ -1038,6 +1446,35 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let official_index_source_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, source_title, source_domain, source_tier, retrieved_at
+            ) VALUES (
+              'https://www.bls.gov/cpi/test-series', 'Official CPI test series',
+              'bls.gov', 'regulator_primary', '2026-08-19'
+            ) RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let official_index_claim_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'price', 'official CPI test series', 'reports index values',
+              '2020=250; 2026=300',
+              'Official government series reports index values 250 and 300.',
+              'validated', '2026-08-19')
+            RETURNING id
+            "#,
+        )
+        .bind(official_index_source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         let observation_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO aircraft_identity_observations (
@@ -1070,6 +1507,7 @@ mod tests {
             "designation",
             "reference_configuration",
             "reference_profile",
+            "serial_scheme",
             "engine_model",
             "propeller_model",
         ] {
@@ -1104,6 +1542,21 @@ mod tests {
             "INSERT INTO aircraft_makes (name, normalized_name, approval_decision_id) VALUES ('Test Aircraft', 'test aircraft', ?) RETURNING id",
         )
         .bind(decisions["make"])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let serial_scheme_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_serial_number_schemes (
+              aircraft_make_id, name, normalization_version,
+              validation_pattern, approval_decision_id
+            ) VALUES (?, 'Test serials', ?, '^[A-Z]{2}[0-9]+$', ?)
+            RETURNING id
+            "#,
+        )
+        .bind(make_id)
+        .bind(SERIAL_NORMALIZATION_VERSION)
+        .bind(decisions["serial_scheme"])
         .fetch_one(pool)
         .await
         .unwrap();
@@ -1241,9 +1694,18 @@ mod tests {
             }],
             price: ReferencePriceDraft {
                 direct_cited_amount_usd: 500_000.0,
-                direct_cited_nominal_dollar_year: 2026,
+                direct_cited_nominal_dollar_year: 2020,
                 evidence_claim_id: claim_id,
             },
+            dollar_normalization: Some(ReferenceDollarNormalizationDraft {
+                source_nominal_dollar_year: 2020,
+                target_nominal_dollar_year: 2026,
+                official_index_series: "BLS CPI test series".to_string(),
+                source_index_value: 250.0,
+                target_index_value: 300.0,
+                normalization_factor: 1.2,
+                evidence_claim_id: official_index_claim_id,
+            }),
             avionics: vec![ReferenceComponentDraft {
                 catalog_id: avionics_id,
                 quantity: 2,
@@ -1269,6 +1731,48 @@ mod tests {
             features_set_evidence_claim_id: claim_id,
         };
 
+        let mut typographic_overlap = draft.clone();
+        typographic_overlap.applicability = vec![
+            ReferenceApplicabilityDraft {
+                aircraft_market_id: market_id,
+                applies_to_all_serials: false,
+                aircraft_serial_number_scheme_id: Some(serial_scheme_id),
+                serial_prefix: Some("SR-".to_string()),
+                serial_from_display: Some("SR-100".to_string()),
+                serial_to_display: Some("SR-100".to_string()),
+                serial_from_sort_key: Some("SR100".to_string()),
+                serial_to_sort_key: Some("SR100".to_string()),
+                evidence_claim_id: claim_id,
+            },
+            ReferenceApplicabilityDraft {
+                aircraft_market_id: market_id,
+                applies_to_all_serials: false,
+                aircraft_serial_number_scheme_id: Some(serial_scheme_id),
+                serial_prefix: Some("SR".to_string()),
+                serial_from_display: Some("SR100".to_string()),
+                serial_to_display: Some("SR100".to_string()),
+                serial_from_sort_key: Some("SR100".to_string()),
+                serial_to_sort_key: Some("SR100".to_string()),
+                evidence_claim_id: claim_id,
+            },
+        ];
+        let canonical_scopes = canonicalize_applicability(&db, &typographic_overlap)
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical_scopes[0].serial_from_sort_key,
+            canonical_scopes[1].serial_from_sort_key
+        );
+        preview_reference_version(&db, &typographic_overlap)
+            .await
+            .expect_err("typographic-equivalent serial ranges must overlap after canonicalization");
+
+        let mut inconsistent = typographic_overlap.clone();
+        inconsistent.applicability[0].serial_from_sort_key = Some("SR-100".to_string());
+        preview_reference_version(&db, &inconsistent)
+            .await
+            .expect_err("noncanonical caller-supplied sort keys must be rejected");
+
         let before: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_reference_configuration_versions")
                 .fetch_one(pool)
@@ -1293,6 +1797,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, "published");
+        let normalized = normalized_reference_price(
+            &db,
+            &PublishedReferenceConfiguration {
+                version_id: ids.version_id,
+                configuration_id: ids.configuration_id,
+                display_name: draft.identity.display_name.clone(),
+                model_year: draft.model_year,
+                market_codes: vec!["GLOBAL".to_string()],
+                price_usd: draft.price.direct_cited_amount_usd,
+                price_reference_year: draft.price.direct_cited_nominal_dollar_year,
+                avionics_count: 1,
+                engine_count: 1,
+                propeller_count: 1,
+                feature_count: 0,
+            },
+            2026,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.normalization_factor, 1.2);
+        assert_eq!(normalized.normalized_amount_usd, 600_000.0);
+        assert!(normalized.official_normalization_fact_id.is_some());
         for (table, expected) in [
             ("aircraft_reference_avionics", 1_i64),
             ("aircraft_reference_engines", 1),
@@ -1333,6 +1860,150 @@ mod tests {
         assert_eq!(
             (engine_quantity, propeller_quantity, avionics_quantity),
             (1, 1, 2)
+        );
+
+        let replacement_decision_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_decisions (
+              resolution_case_id, entity_kind, decision_action,
+              decision_status, decision_payload_json,
+              deterministic_validation_json, deterministic_validation_passed,
+              rationale, decided_at
+            ) VALUES (?, 'reference_profile', 'approve_new', 'approved', '{}',
+              '{}', TRUE, 'approved correction', '2026-08-19')
+            RETURNING id
+            "#,
+        )
+        .bind(case_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_identity_decision_claims (decision_id, evidence_claim_id, evidence_role) VALUES (?, ?, 'identity')",
+        )
+        .bind(replacement_decision_id)
+        .bind(claim_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut replacement = draft.clone();
+        replacement.revision = 2;
+        replacement.supersedes_version_id = Some(ids.version_id);
+        replacement.profile_approval_decision_id = replacement_decision_id;
+        replacement.price.direct_cited_amount_usd = 510_000.0;
+
+        let replacement_ids = assemble_and_publish_reference_version(&db, &replacement)
+            .await
+            .unwrap();
+        let states = sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, publication_state FROM aircraft_reference_configuration_versions WHERE id IN (?, ?) ORDER BY id",
+        )
+        .bind(ids.version_id)
+        .bind(replacement_ids.version_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (ids.version_id, "superseded".to_string()),
+                (replacement_ids.version_id, "published".to_string()),
+            ]
+        );
+
+        let weak_source_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, source_title, source_domain, source_tier, retrieved_at
+            ) VALUES ('https://secondary.example/reference', 'Secondary price',
+              'secondary.example', 'recognized_secondary', '2026-08-19')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let weak_price_claim_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'identity', 'test aircraft', 'lists price', '$520000',
+              'Secondary source lists a price.', 'validated', '2026-08-19')
+            RETURNING id
+            "#,
+        )
+        .bind(weak_source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let failed_decision_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_decisions (
+              resolution_case_id, entity_kind, decision_action,
+              decision_status, decision_payload_json,
+              deterministic_validation_json, deterministic_validation_passed,
+              rationale, decided_at
+            ) VALUES (?, 'reference_profile', 'approve_new', 'approved', '{}',
+              '{}', TRUE, 'approved attempted correction', '2026-08-19')
+            RETURNING id
+            "#,
+        )
+        .bind(case_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_identity_decision_claims (decision_id, evidence_claim_id, evidence_role) VALUES (?, ?, 'identity')",
+        )
+        .bind(failed_decision_id)
+        .bind(claim_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut skipped_revision = replacement.clone();
+        skipped_revision.revision = 4;
+        skipped_revision.supersedes_version_id = Some(replacement_ids.version_id);
+        skipped_revision.profile_approval_decision_id = failed_decision_id;
+        assemble_and_publish_reference_version(&db, &skipped_revision)
+            .await
+            .expect_err("a correction must name the exact prior revision");
+        let retained_after_skip: String = sqlx::query_scalar(
+            "SELECT publication_state FROM aircraft_reference_configuration_versions WHERE id = ?",
+        )
+        .bind(replacement_ids.version_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_after_skip, "published");
+
+        let mut rejected = replacement.clone();
+        rejected.revision = 3;
+        rejected.supersedes_version_id = Some(replacement_ids.version_id);
+        rejected.profile_approval_decision_id = failed_decision_id;
+        rejected.price.evidence_claim_id = weak_price_claim_id;
+
+        assemble_and_publish_reference_version(&db, &rejected)
+            .await
+            .expect_err("a non-primary price claim must reject publication");
+        let retained_state: String = sqlx::query_scalar(
+            "SELECT publication_state FROM aircraft_reference_configuration_versions WHERE id = ?",
+        )
+        .bind(replacement_ids.version_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let rejected_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_reference_configuration_versions WHERE aircraft_reference_configuration_id = ? AND model_year = 2026 AND revision = 3",
+        )
+        .bind(replacement_ids.configuration_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_state, "published");
+        assert_eq!(
+            rejected_count, 0,
+            "failed correction must roll back as a unit"
         );
     }
 }

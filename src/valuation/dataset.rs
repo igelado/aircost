@@ -8,7 +8,9 @@ use sqlx::FromRow;
 use crate::aircraft::faa::{
     audit_listing_admission, ListingAdmissionEvidence, ListingAdmissionReport,
 };
-use crate::aircraft::reference::persistence::listing_reference_status;
+use crate::aircraft::reference::persistence::{
+    listing_reference_status, normalized_reference_price,
+};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::models::is_plausible_asking_price_usd;
 
@@ -212,16 +214,23 @@ pub async fn create_snapshot(
     let mut prepared = Vec::with_capacity(listings.len());
     for listing in listings {
         let reference_status = listing_reference_status(db, listing.id).await?;
-        let factory_reference =
-            reference_status
-                .published
-                .as_ref()
-                .map(|reference| FactoryReferenceFeature {
-                    configuration_id: reference.configuration_id,
-                    version_id: reference.version_id,
-                    full_standard_configuration_price_usd: reference.price_usd,
-                    nominal_dollar_year: reference.price_reference_year,
-                });
+        let (factory_reference, normalization_gap) =
+            if let Some(reference) = reference_status.published.as_ref() {
+                match normalized_reference_price(db, reference, snapshot_year).await? {
+                    Ok(price) => (
+                        Some(FactoryReferenceFeature {
+                            configuration_id: reference.configuration_id,
+                            version_id: reference.version_id,
+                            full_standard_configuration_price_usd: price.normalized_amount_usd,
+                            nominal_dollar_year: snapshot_year,
+                        }),
+                        None,
+                    ),
+                    Err(gap) => (None, Some(gap)),
+                }
+            } else {
+                (None, None)
+            };
         let compatibility_projection = compatibility_projections
             .get(&listing.id)
             .filter(|projection| projection.aircraft_model_variant_id == listing.variant_id);
@@ -251,6 +260,11 @@ pub async fn create_snapshot(
                         .map(|gap| format!("factory_reference_{}", gap.code))
                         .unwrap_or_else(|| "factory_reference_incomplete".to_string())
                 })
+            })
+            .or_else(|| {
+                normalization_gap
+                    .as_ref()
+                    .map(|gap| format!("factory_reference_{}", gap.code))
             })
             .or_else(|| exclusion_reason(&listing, policy, capture_day, snapshot_year));
         let technical_field_count = technical_field_count(
@@ -1518,6 +1532,7 @@ mod tests {
                     direct_cited_nominal_dollar_year: 2026,
                     evidence_claim_id: claim_id,
                 },
+                dollar_normalization: None,
                 avionics: vec![],
                 engines: vec![],
                 propellers: vec![],

@@ -58,6 +58,34 @@ expect_failure "$test_database" \
 expect_failure "$test_database" \
   "UPDATE aircraft_engine_catalog_models SET model_name = 'mutated' WHERE id = 1" \
   "approved engine catalog models are immutable"
+expect_failure "$test_database" \
+  "INSERT INTO official_dollar_normalization_facts (source_year, target_year, index_series, source_index_value, target_index_value, normalization_factor, evidence_claim_id) VALUES (2019, 2026, 'unapproved index', 250, 300, 1.2, 1)" \
+  "dollar normalization requires validated official regulator evidence"
+sqlite3 -bail "$test_database" "
+  INSERT INTO curation_evidence_sources (
+    source_url, source_title, source_domain, source_tier, retrieved_at
+  ) VALUES (
+    'https://www.bls.gov/cpi/schema-test', 'Official CPI schema test',
+    'bls.gov', 'regulator_primary', '2026-08-19'
+  );
+  INSERT INTO curation_evidence_claims (
+    evidence_source_id, claim_kind, subject_text, predicate_text, object_text,
+    quoted_evidence, validation_status, validated_at
+  ) VALUES (
+    2, 'price', 'official CPI', 'reports index values', '2019=250; 2026=300',
+    'Official government series reports 250 and 300.',
+    'validated', '2026-08-19'
+  );
+  INSERT INTO official_dollar_normalization_facts (
+    source_year, target_year, index_series, source_index_value,
+    target_index_value, normalization_factor, evidence_claim_id
+  ) VALUES (2019, 2026, 'Official CPI', 250, 300, 1.2, 2);
+"
+test "$(sqlite3 "$test_database" \
+  "SELECT normalization_factor FROM official_dollar_normalization_facts WHERE source_year=2019 AND target_year=2026")" = "1.2"
+expect_failure "$test_database" \
+  "UPDATE official_dollar_normalization_facts SET normalization_factor = 1 WHERE id = 1" \
+  "official dollar normalization facts are immutable"
 
 cp "$test_database" "$approval_database"
 expect_failure "$approval_database" "

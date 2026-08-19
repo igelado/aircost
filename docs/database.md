@@ -1746,10 +1746,13 @@ boundary and are not stored.
 
 The draft price fields are `direct_cited_amount_usd` and
 `direct_cited_nominal_dollar_year`; they represent the primary source's nominal
-MSRP, not an inflation-adjusted value. The current schema has no approved
-dollar-normalization fact. A different serving market year therefore produces
-the explicit `reference_price_dollar_normalization_missing` readiness gap and
-no estimate.
+MSRP, not an inflation-adjusted value. `official_dollar_normalization_facts`
+stores only an immutable source year, target year, official index series,
+source/target index values, their checked factor, and a validated
+regulator-primary evidence-claim ID. The normalized draft can publish that
+fact transactionally; no prompt, response, search transcript, or URL dossier
+is retained. Serving and snapshots consume the exact factor. A missing pair
+produces `reference_price_dollar_normalization_missing` and no estimate.
 
 Verify the installed contract with:
 
@@ -1776,8 +1779,8 @@ WHERE type = 'table'
   );
 ```
 
-The contract must be version `1` with fingerprint
-`b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988`.
+The contract must be version `2` with fingerprint
+`e3b9d29ec2b2a7b8139b8e46cd2d69c00f91513ec9c79588b6b10dde1771ec0f`.
 Listing reference resolution uses only one complete published version matching
 the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
 scope. Missing and ambiguous matches remain ineligible for snapshots, training,

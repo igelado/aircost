@@ -18,6 +18,31 @@ INSERT INTO curation_evidence_claims (
   'validated', '2026-07-21'
 );
 
+INSERT INTO curation_evidence_sources (
+  source_url, source_title, source_domain, source_tier, retrieved_at
+) VALUES (
+  'https://www.bls.gov/cpi/test-series', 'Official CPI test series',
+  'bls.gov', 'regulator_primary', '2026-08-19'
+);
+
+INSERT INTO curation_evidence_claims (
+  evidence_source_id, claim_kind, subject_text, predicate_text, object_text,
+  quoted_evidence, validation_status, validated_at
+) VALUES (
+  2, 'price', 'official CPI test series', 'reports index values',
+  '2019=250; 2026=300',
+  'Official government series reports index values 250 and 300.',
+  'validated', '2026-08-19'
+);
+
+INSERT INTO official_dollar_normalization_facts (
+  source_year, target_year, index_series,
+  source_index_value, target_index_value, normalization_factor,
+  evidence_claim_id
+) VALUES (
+  2019, 2026, 'BLS CPI test series', 250, 300, 1.2, 2
+);
+
 INSERT INTO aircraft_identity_observations (
   observed_make, observed_family, observed_designation, observed_generation,
   observed_package, model_year, exact_source_evidence, observation_sha256
@@ -149,3 +174,90 @@ INSERT INTO aircraft_reference_fact_set_attestations (
 UPDATE aircraft_reference_configuration_versions
 SET publication_state = 'published', published_at = '2026-07-21'
 WHERE id = 1;
+
+INSERT INTO aircraft_identity_decisions (
+  resolution_case_id, entity_kind, decision_action, decision_status,
+  decision_payload_json, deterministic_validation_json,
+  deterministic_validation_passed, rationale, decided_at
+) VALUES (
+  1, 'reference_profile', 'approve_new', 'approved', '{}', '{}', TRUE,
+  'replacement rollback test', '2026-08-19'
+);
+INSERT INTO aircraft_identity_decision_claims (
+  decision_id, evidence_claim_id, evidence_role
+) VALUES (12, 1, 'identity');
+
+DO $test$
+DECLARE
+  failure_message TEXT;
+BEGIN
+  BEGIN
+    INSERT INTO aircraft_reference_configuration_versions (
+      aircraft_reference_configuration_id, model_year, revision,
+      supersedes_version_id, approval_decision_id
+    ) VALUES (1, 2020, 2, 1, 12);
+    UPDATE aircraft_reference_configuration_versions
+    SET publication_state = 'superseded', superseded_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+    UPDATE aircraft_reference_configuration_versions
+    SET publication_state = 'published', published_at = CURRENT_TIMESTAMP
+    WHERE revision = 2;
+    RAISE SQLSTATE 'P0002' USING MESSAGE =
+      'incomplete replacement publication unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <> 'published reference profile requires applicability' THEN
+      RAISE;
+    END IF;
+  END;
+  IF NOT EXISTS (
+    SELECT 1 FROM aircraft_reference_configuration_versions
+    WHERE id = 1 AND publication_state = 'published'
+  ) OR EXISTS (
+    SELECT 1 FROM aircraft_reference_configuration_versions WHERE revision = 2
+  ) THEN
+    RAISE EXCEPTION 'failed replacement did not roll back atomically';
+  END IF;
+END
+$test$;
+
+DO $test$
+DECLARE
+  failure_message TEXT;
+BEGIN
+  BEGIN
+    INSERT INTO aircraft_reference_configuration_versions (
+      aircraft_reference_configuration_id, model_year, revision,
+      supersedes_version_id, approval_decision_id
+    ) VALUES (1, 2020, 3, 1, 12);
+    RAISE SQLSTATE 'P0002' USING MESSAGE =
+      'skipped reference revision unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <>
+      'reference profile predecessor must be the exact published prior revision of the same configuration/year'
+    THEN
+      RAISE;
+    END IF;
+  END;
+END
+$test$;
+
+DO $test$
+DECLARE
+  failure_message TEXT;
+BEGIN
+  BEGIN
+    UPDATE official_dollar_normalization_facts
+    SET normalization_factor = 1
+    WHERE source_year = 2019 AND target_year = 2026;
+    RAISE SQLSTATE 'P0002' USING MESSAGE =
+      'official dollar-normalization mutation unexpectedly succeeded';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <> 'official dollar normalization facts are immutable' THEN
+      RAISE;
+    END IF;
+  END;
+END
+$test$;
