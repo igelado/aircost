@@ -36,7 +36,31 @@ All operational commands are dry-run unless `--apply` is supplied.
    submission timestamps, and resets extraction, error, and canonical-listing
    fields.
 
-3. Create and inspect the extraction checkpoint:
+3. Seed the verified reusable catalog closure:
+
+   ```text
+   aircost-admin seed-verified-catalog --source-database SOURCE \
+     --database SHADOW
+   aircost-admin seed-verified-catalog --source-database SOURCE \
+     --database SHADOW --apply
+   ```
+
+   Dry-run opens both databases read-only, validates the complete dependency
+   closure and the clean target, and reports deterministic source, exclusion,
+   and fingerprint counts with `provider_calls: 0`. Apply preserves only
+   approved avionics products and capabilities, their current reuse
+   attestations and exact authority origins, and the approved aircraft
+   hierarchy with the minimal decisions, claims, detached observations, and
+   historical target-scoped FAA snapshot that authorize it. It never copies
+   listings, pending/rejected candidates, reviews, usage accounting, valuation
+   artifacts, reference-profile versions, raw listing values, or Gemini
+   dossiers. Referenced reviewer users must already exist from capture import.
+
+   Apply is transactional and refuses a non-clean or incompatible target. The
+   reported fingerprint is rechecked after commit. Import the current FAA
+   release separately after this historical provenance seed.
+
+4. Create and inspect the extraction checkpoint:
 
    ```text
    aircost-admin replay-extraction --database SHADOW --submission-id ID
@@ -49,7 +73,7 @@ All operational commands are dry-run unless `--apply` is supplied.
    finalization. The checkpoint retains the pinned visual-identity report when
    visual recovery was used.
 
-4. Materialize the exact checkpoint:
+5. Materialize the exact checkpoint:
 
    ```text
    aircost-admin replay-listing --database SHADOW --submission-id ID
@@ -79,4 +103,3 @@ writes the corresponding immutable receipt when it resolves the aspect.
 `reconcile-replay-avionics` is a provider-free audit/backfill for already-bound
 captures. It records only unambiguous, provable retained associations and never
 infers a discard because a listing link is absent.
-

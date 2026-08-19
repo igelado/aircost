@@ -1,5 +1,6 @@
 pub mod aircraft;
 pub mod avionics;
+pub mod catalog;
 pub mod cleanup;
 pub mod db;
 pub mod depreciation;

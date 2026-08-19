@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, PgPool, SqlitePool};
 
@@ -153,14 +153,25 @@ impl AppDb {
         }
     }
 
-    /// Open an existing SQLite database without migrations, schema creation,
-    /// seed writes, or a writable connection. Administrative export/replay
-    /// sources must use this boundary so even application startup cannot
-    /// mutate the source database.
+    /// Open an existing database without migrations, schema creation, seed
+    /// writes, or a writable connection. Administrative export/replay sources
+    /// must use this boundary so even application startup cannot mutate them.
     pub async fn connect_read_only(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
         if is_postgres_url(&database_url) {
-            bail!("read-only administrative sources currently require SQLite");
+            let options = PgConnectOptions::from_str(&database_url)
+                .with_context(|| format!("invalid Postgres database URL {database_url}"))?
+                .options([("default_transaction_read_only", "on")]);
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .with_context(|| {
+                    format!("could not open read-only Postgres database {database_url}")
+                })?;
+            return Ok(Self {
+                backend: DatabaseBackend::Postgres(pool),
+            });
         }
         let options = SqliteConnectOptions::from_str(&database_url)
             .with_context(|| format!("invalid SQLite database URL {database_url}"))?
