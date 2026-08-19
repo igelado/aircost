@@ -60,6 +60,23 @@ All operational commands are dry-run unless `--apply` is supplied.
    values, or Gemini dossiers. Referenced reviewer users must already exist
    from capture import.
 
+   Detached approval observations preserve the source observation digest only
+   in a fixed catalog-provenance marker, then recompute `observation_sha256`
+   over the versioned projected row. Listing URLs, extracted labels, years,
+   registrations, serials, quoted listing text, and legacy hints are cleared.
+   Decision and validation JSON is replaced with a small deterministic record
+   of the retained catalog-row hashes plus hashes of the source decision; model
+   payloads and model-written rationale do not cross the boundary. SQLite
+   REAL values and PostgreSQL DOUBLE values in selected avionics price columns
+   are canonicalized to the same semantic JSON number before fingerprinting.
+
+   Apply discovers every application base table from the target schema and
+   refuses any row outside the selected seed graph, imported users and signed
+   captures, migration metadata, and exact schema-owned bootstrap rows. This
+   includes valuation snapshots/models, reference versions, listing/review
+   runtime state, and provider accounting even when a new table was not known
+   when the seeder was written. Imported captures must still be at their clean
+   replay checkpoint with no extraction, error, or canonical-listing fields.
    Apply is transactional and refuses a non-clean or incompatible target.
    SQLite takes its writer slot before the in-transaction freshness check;
    PostgreSQL serializes seeders and locks every clean-target table against

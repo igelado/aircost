@@ -30,102 +30,59 @@ const ROOT_AIRCRAFT_TABLES: &[&str] = &[
     "aircraft_tcds_make_lineage_bindings",
 ];
 
-const EMPTY_TARGET_TABLES: &[&str] = &[
-    "avionics_models",
-    "avionics_types",
-    "avionics_manufacturers",
-    "avionics_manufacturer_identities",
-    "avionics_authoritative_source_origins",
-    "avionics_authoritative_source_origin_revocations",
-    "avionics_manufacturer_identity_memberships",
-    "avionics_manufacturer_identity_merges",
-    "avionics_approved_product_identities",
-    "avionics_model_types",
-    "avionics_suite_components",
-    "avionics_product_reuse_attestations",
-    "avionics_manufacturer_alias_candidates",
-    "avionics_catalog_consolidation_guard",
-    "avionics_catalog_grounded_consolidation_authorizations",
-    "avionics_catalog_grounded_consolidation_claim",
-    "avionics_catalog_grounded_consolidation_guard",
-    "avionics_catalog_human_consolidation_authorizations",
-    "avionics_catalog_human_consolidation_claim",
-    "avionics_catalog_human_consolidation_guard",
-    "avionics_catalog_human_consolidation_members",
-    "aircraft_identity_observations",
-    "aircraft_identity_resolution_cases",
-    "aircraft_identity_resolution_candidates",
-    "aircraft_identity_decisions",
-    "aircraft_identity_decision_claims",
-    "aircraft_reference_profile_proposals",
-    "curation_evidence_sources",
-    "curation_evidence_claims",
-    "faa_registry_snapshots",
-    "faa_registry_aircraft",
-    "faa_registry_aircraft_references",
-    "faa_registry_engine_references",
-    "faa_registry_coverage",
-    "aircraft_makes",
-    "aircraft_model_families",
-    "aircraft_designations",
-    "aircraft_make_aliases",
-    "aircraft_family_aliases",
-    "aircraft_designation_aliases",
-    "aircraft_designation_identifiers",
-    "aircraft_generations",
-    "aircraft_generation_designations",
-    "aircraft_factory_packages",
-    "aircraft_package_applicability",
-    "aircraft_engine_catalog_models",
-    "aircraft_propeller_catalog_models",
-    "aircraft_serial_number_schemes",
-    "aircraft_feature_definitions",
-    "aircraft_designation_faa_bindings",
-    "aircraft_tcds_make_lineage_bindings",
-    "aircraft_reference_configurations",
-    "aircraft_reference_configuration_versions",
-    "aircraft_reference_applicability_scopes",
-    "aircraft_reference_prices",
-    "aircraft_reference_avionics",
-    "aircraft_reference_engines",
-    "aircraft_reference_propellers",
-    "aircraft_reference_features",
-    "aircraft_sale_listings",
-    "aircraft_sale_listing_identity_assignments",
-    "aircraft_sale_listing_avionics",
-    "aircraft_sale_listing_avionics_authorizations",
-    "aircraft_sale_listing_avionics_dispositions",
-    "aircraft_sale_listing_pending_reviews",
-    "gemini_api_usage",
+// A clean replay shadow may already contain only schema-owned bootstrap rows
+// and the signed capture boundary imported by the preceding replay phase.
+// Every other base table is discovered from the live schema and must be empty.
+const PREEXISTING_TABLE_ALLOWLIST: &[&str] = &[
+    "users",
+    "schema_migration_contracts",
+    "plugin_installs",
+    "plugin_submissions",
+    "depreciation_profiles",
+    "component_depreciation_profiles",
+    "aircraft_markets",
+    "aircraft_manufacturers",
+    "aircraft_models",
+    "aircraft_model_variants",
+    "aircraft_sale_listing_pending_compatibility_placeholder",
 ];
 
-const FORBIDDEN_ARTIFACT_TABLES: &[&str] = &[
-    "avionics_manufacturer_alias_candidates",
-    "avionics_catalog_consolidation_guard",
-    "avionics_catalog_grounded_consolidation_authorizations",
-    "avionics_catalog_grounded_consolidation_claim",
-    "avionics_catalog_grounded_consolidation_guard",
-    "avionics_catalog_human_consolidation_authorizations",
-    "avionics_catalog_human_consolidation_claim",
-    "avionics_catalog_human_consolidation_guard",
-    "avionics_catalog_human_consolidation_members",
-    "aircraft_identity_resolution_candidates",
-    "aircraft_reference_profile_proposals",
-    "aircraft_reference_configurations",
-    "aircraft_reference_configuration_versions",
-    "aircraft_reference_applicability_scopes",
-    "aircraft_reference_prices",
-    "aircraft_reference_avionics",
-    "aircraft_reference_engines",
-    "aircraft_reference_propellers",
-    "aircraft_reference_features",
-    "aircraft_sale_listings",
-    "aircraft_sale_listing_identity_assignments",
-    "aircraft_sale_listing_avionics",
-    "aircraft_sale_listing_avionics_authorizations",
-    "aircraft_sale_listing_avionics_dispositions",
-    "aircraft_sale_listing_pending_reviews",
-    "gemini_api_usage",
+const SCHEMA_BOOTSTRAP_ROW_CONTRACTS: &[(&str, &str, i64)] = &[
+    (
+        "depreciation_profiles",
+        "name = 'generic:all' AND age_decay_rate = 0.05 AND long_run_residual_fraction = 0.28 AND new_to_used_discount_fraction = 0.08 AND new_to_used_discount_years = 1.0 AND airframe_doubling_discount = 0.15 AND max_airframe_premium = 0.12 AND max_airframe_discount = 0.30 AND replacement_floor_fraction = 0.0 AND minimum_value_fraction = 0.05 AND high_time_threshold_hours = 10000.0 AND high_time_discount_at_double_threshold = 0.12 AND is_system_profile",
+        1,
+    ),
+    (
+        "component_depreciation_profiles",
+        "(component_type = 'engine' AND age_decay_rate IS NULL AND long_run_residual_fraction IS NULL AND baseline_life_fraction = 0.5 AND sample_count = 0) OR (component_type = 'propeller' AND age_decay_rate IS NULL AND long_run_residual_fraction IS NULL AND baseline_life_fraction = 0.5 AND sample_count = 0) OR (component_type = 'avionics' AND age_decay_rate = 0.12 AND long_run_residual_fraction = 0.18 AND baseline_life_fraction IS NULL AND sample_count = 0)",
+        3,
+    ),
+    (
+        "aircraft_markets",
+        "(id = 1 AND code = 'GLOBAL' AND name = 'Global' AND parent_market_id IS NULL) OR (id = 2 AND code = 'US' AND name = 'United States' AND parent_market_id = 1)",
+        2,
+    ),
+    (
+        "aircraft_manufacturers",
+        "id = -1 AND name = 'Pending FAA curation' AND normalized_name = '__aircost_pending_faa_make__'",
+        1,
+    ),
+    (
+        "aircraft_models",
+        "id = -1 AND aircraft_manufacturer_id = -1 AND name = 'Pending FAA curation' AND normalized_name = '__aircost_pending_faa_family__'",
+        1,
+    ),
+    (
+        "aircraft_model_variants",
+        "id = -1 AND aircraft_model_id = -1 AND name = 'Pending FAA curation' AND normalized_name = '__aircost_pending_faa_identity__'",
+        1,
+    ),
+    (
+        "aircraft_sale_listing_pending_compatibility_placeholder",
+        "singleton_id = 1 AND aircraft_manufacturer_id = -1 AND aircraft_model_id = -1 AND aircraft_model_variant_id = -1",
+        1,
+    ),
 ];
 
 const BOOTSTRAP_ORIGINS: &[(&str, &str)] = &[
@@ -251,7 +208,9 @@ pub async fn seed_verified_catalog(
         DatabaseBackend::Sqlite(pool) => {
             let mut transaction = pool.begin().await?;
             acquire_sqlite_seed_write_lock(&mut transaction).await?;
-            validate_target_empty_sqlite(&mut transaction).await?;
+            let required_empty = required_empty_tables_sqlite(&mut transaction).await?;
+            validate_target_empty_sqlite(&mut transaction, &required_empty).await?;
+            validate_allowed_preexisting_sqlite(&mut transaction).await?;
             validate_required_users_sqlite(&mut transaction, &bundle.required_users).await?;
             // This lets exact source origin rows precede manufacturer identities.
             // The identity insert then observes the bootstrap origin conflicts and
@@ -267,8 +226,9 @@ pub async fn seed_verified_catalog(
         }
         DatabaseBackend::Postgres(pool) => {
             let mut transaction = pool.begin().await?;
-            acquire_postgres_seed_locks(&mut transaction).await?;
-            validate_target_empty_postgres(&mut transaction).await?;
+            let required_empty = acquire_postgres_seed_locks(&mut transaction).await?;
+            validate_target_empty_postgres(&mut transaction, &required_empty).await?;
+            validate_allowed_preexisting_postgres(&mut transaction).await?;
             validate_required_users_postgres(&mut transaction, &bundle.required_users).await?;
             let result = apply_postgres(&mut transaction, &bundle).await?;
             validate_seeded_postgres(&mut transaction, &bundle).await?;
@@ -304,25 +264,34 @@ async fn acquire_sqlite_seed_write_lock(
 
 async fn acquire_postgres_seed_locks(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     // Serialize seeders, then exclude arbitrary writers from every table whose
     // freshness is part of the clean-target contract. SHARE also stabilizes
-    // the pre-existing users referenced by signed approval provenance.
+    // every allowed capture, provenance-user, and schema-bootstrap row while
+    // its exact pre-existing-state contract is checked.
     sqlx::query("SELECT pg_advisory_xact_lock(4709470037844619588)")
         .execute(&mut **transaction)
         .await?;
-    let tables = EMPTY_TARGET_TABLES
+    let required_empty = required_empty_tables_postgres(transaction).await?;
+    let tables = required_empty
         .iter()
         .map(|table| quoted_identifier(table))
         .collect::<Vec<_>>()
         .join(", ");
-    sqlx::query(&format!("LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"))
+    if !tables.is_empty() {
+        sqlx::query(&format!("LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"))
+            .execute(&mut **transaction)
+            .await?;
+    }
+    let allowed_tables = PREEXISTING_TABLE_ALLOWLIST
+        .iter()
+        .map(|table| quoted_identifier(table))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!("LOCK TABLE {allowed_tables} IN SHARE MODE"))
         .execute(&mut **transaction)
         .await?;
-    sqlx::query("LOCK TABLE users IN SHARE MODE")
-        .execute(&mut **transaction)
-        .await?;
-    Ok(())
+    Ok(required_empty)
 }
 
 fn report(
@@ -507,7 +476,7 @@ async fn build_bundle_from_snapshot(
         }
     }
     let decision_ids = decision_ids.into_iter().collect::<Vec<_>>();
-    let decisions = snapshot
+    let mut decisions = snapshot
         .fetch(
             "aircraft_identity_decisions",
             &in_predicate("id", &decision_ids),
@@ -522,6 +491,10 @@ async fn build_bundle_from_snapshot(
     {
         bail!("aircraft catalog closure contains a non-approved decision");
     }
+    decisions = decisions
+        .into_iter()
+        .map(|row| project_catalog_safe_decision(row, &aircraft_roots))
+        .collect::<Result<Vec<_>>>()?;
     let cases = snapshot
         .fetch(
             "aircraft_identity_resolution_cases",
@@ -536,7 +509,7 @@ async fn build_bundle_from_snapshot(
         .await?;
     observations = observations
         .into_iter()
-        .map(|row| row.with_value("aircraft_sale_listing_id", Value::Null))
+        .map(project_catalog_safe_observation)
         .collect::<Result<Vec<_>>>()?;
     let decision_claims = snapshot
         .fetch(
@@ -777,6 +750,120 @@ async fn build_bundle_from_snapshot(
     };
     bundle.fingerprint_sha256 = fingerprint(&bundle.fingerprint_rows())?;
     Ok(bundle)
+}
+
+fn project_catalog_safe_observation(mut row: SeedRow) -> Result<SeedRow> {
+    let source_observation_sha256 = row.string("observation_sha256")?.to_string();
+    for column in [
+        "aircraft_sale_listing_id",
+        "source_url",
+        "observed_make",
+        "observed_family",
+        "observed_designation",
+        "observed_generation",
+        "observed_package",
+        "model_year",
+        "serial_number",
+        "registration_number",
+        "market_code",
+        "legacy_hint_json",
+    ] {
+        row = row.with_value(column, Value::Null)?;
+    }
+    row = row.with_value(
+        "exact_source_evidence",
+        Value::String(format!(
+            "catalog-provenance-source-observation-sha256:{source_observation_sha256}"
+        )),
+    )?;
+    let projected_sha256 = catalog_projection_observation_fingerprint(&row)?;
+    row.with_value("observation_sha256", Value::String(projected_sha256))
+}
+
+fn catalog_projection_observation_fingerprint(row: &SeedRow) -> Result<String> {
+    let mut fields = serde_json::Map::new();
+    for column in [
+        "aircraft_sale_listing_id",
+        "source_url",
+        "observed_make",
+        "observed_family",
+        "observed_designation",
+        "observed_generation",
+        "observed_package",
+        "model_year",
+        "serial_number",
+        "registration_number",
+        "market_code",
+        "exact_source_evidence",
+        "legacy_hint_json",
+    ] {
+        fields.insert(
+            column.to_string(),
+            row.value(column)
+                .with_context(|| format!("{}.{} is missing", row.table, column))?
+                .clone(),
+        );
+    }
+    let material = serde_json::json!({
+        "projection_schema": "verified_catalog_observation_v1",
+        "fields": fields,
+    });
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&material)?)
+    ))
+}
+
+fn project_catalog_safe_decision(
+    mut row: SeedRow,
+    roots: &BTreeMap<String, Vec<SeedRow>>,
+) -> Result<SeedRow> {
+    let decision_id = row.integer("id")?;
+    let source_payload_sha256 = sha256_text(row.string("decision_payload_json")?);
+    let source_validation_sha256 = sha256_text(row.string("deterministic_validation_json")?);
+    let source_rationale_sha256 = sha256_text(row.string("rationale")?);
+    let mut catalog_rows = Vec::new();
+    for catalog_row in roots.values().flatten() {
+        if catalog_row.nullable_integer("approval_decision_id")? == Some(decision_id) {
+            catalog_rows.push(serde_json::json!({
+                "table": catalog_row.table,
+                "row_sha256": sha256_text(&canonical_row(catalog_row)),
+            }));
+        }
+    }
+    catalog_rows.sort_by_key(Value::to_string);
+    if catalog_rows.is_empty() {
+        bail!("selected aircraft decision {decision_id} approves no retained catalog row");
+    }
+
+    let payload = serde_json::json!({
+        "catalog_seed_version": 1,
+        "entity_kind": row.string("entity_kind")?,
+        "decision_action": row.string("decision_action")?,
+        "selected_entity_id": row.value("selected_entity_id").cloned().unwrap_or(Value::Null),
+        "catalog_rows": catalog_rows,
+        "source_payload_sha256": source_payload_sha256,
+    });
+    let validation = serde_json::json!({
+        "catalog_seed_version": 1,
+        "passed": true,
+        "source_validation_sha256": source_validation_sha256,
+    });
+    row = row.with_value("decision_payload_json", Value::String(payload.to_string()))?;
+    row = row.with_value(
+        "deterministic_validation_json",
+        Value::String(validation.to_string()),
+    )?;
+    row.with_value(
+        "rationale",
+        Value::String(format!(
+            "Approved catalog provenance projection; source-rationale-sha256:{source_rationale_sha256}"
+        )),
+    )
+}
+
+fn sha256_text(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 async fn selected_aircraft_roots(
@@ -1176,10 +1263,162 @@ async fn excluded_counts(
 }
 
 async fn validate_target_empty(target: &AppDb) -> Result<()> {
-    for table in EMPTY_TARGET_TABLES {
-        let existing = count(target, table, "1 = 1").await?;
+    for table in required_empty_tables(target).await? {
+        let existing = count(target, &table, "1 = 1").await?;
         if existing != 0 {
             bail!("verified catalog seed target is not clean: {table} contains {existing} rows");
+        }
+    }
+    validate_allowed_preexisting(target).await
+}
+
+async fn application_tables(target: &AppDb) -> Result<Vec<String>> {
+    match target.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let rows = sqlx::query(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .fetch_all(pool)
+            .await?;
+            Ok(rows.into_iter().map(|row| row.get("name")).collect())
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let rows = sqlx::query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name",
+            )
+            .fetch_all(pool)
+            .await?;
+            Ok(rows.into_iter().map(|row| row.get("table_name")).collect())
+        }
+    }
+}
+
+fn required_empty_from_tables(tables: Vec<String>) -> Vec<String> {
+    tables
+        .into_iter()
+        .filter(|table| !PREEXISTING_TABLE_ALLOWLIST.contains(&table.as_str()))
+        .collect()
+}
+
+async fn required_empty_tables(target: &AppDb) -> Result<Vec<String>> {
+    Ok(required_empty_from_tables(
+        application_tables(target).await?,
+    ))
+}
+
+async fn required_empty_tables_sqlite(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(required_empty_from_tables(
+        rows.into_iter().map(|row| row.get("name")).collect(),
+    ))
+}
+
+async fn required_empty_tables_postgres(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name",
+    )
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(required_empty_from_tables(
+        rows.into_iter().map(|row| row.get("table_name")).collect(),
+    ))
+}
+
+async fn validate_allowed_preexisting(target: &AppDb) -> Result<()> {
+    let dirty_captures = count(
+        target,
+        "plugin_submissions",
+        "extracted_listing_json IS NOT NULL OR extraction_error IS NOT NULL OR canonical_listing_id IS NOT NULL",
+    )
+    .await?;
+    if dirty_captures != 0 {
+        bail!("verified catalog seed target has {dirty_captures} plugin captures outside the clean replay checkpoint");
+    }
+    for (table, predicate, expected) in SCHEMA_BOOTSTRAP_ROW_CONTRACTS {
+        let total = count(target, table, "1 = 1").await?;
+        let matching = count(target, table, predicate).await?;
+        if total != *expected || matching != *expected {
+            bail!(
+                "verified catalog seed target has non-canonical schema bootstrap rows in {table}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn validate_allowed_preexisting_sqlite(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+) -> Result<()> {
+    let dirty: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plugin_submissions WHERE extracted_listing_json IS NOT NULL OR extraction_error IS NOT NULL OR canonical_listing_id IS NOT NULL",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    if dirty != 0 {
+        bail!("verified catalog seed target has {dirty} plugin captures outside the clean replay checkpoint");
+    }
+    validate_schema_bootstrap_sqlite(transaction).await?;
+    Ok(())
+}
+
+async fn validate_allowed_preexisting_postgres(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<()> {
+    let dirty: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM plugin_submissions WHERE extracted_listing_json IS NOT NULL OR extraction_error IS NOT NULL OR canonical_listing_id IS NOT NULL",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    if dirty != 0 {
+        bail!("verified catalog seed target has {dirty} plugin captures outside the clean replay checkpoint");
+    }
+    validate_schema_bootstrap_postgres(transaction).await?;
+    Ok(())
+}
+
+async fn validate_schema_bootstrap_sqlite(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+) -> Result<()> {
+    for (table, predicate, expected) in SCHEMA_BOOTSTRAP_ROW_CONTRACTS {
+        let total = count_sqlite(&mut **transaction, table).await?;
+        let matching: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE {predicate}",
+            quoted_identifier(table)
+        ))
+        .fetch_one(&mut **transaction)
+        .await?;
+        if total != *expected || matching != *expected {
+            bail!(
+                "verified catalog seed target has non-canonical schema bootstrap rows in {table}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn validate_schema_bootstrap_postgres(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<()> {
+    for (table, predicate, expected) in SCHEMA_BOOTSTRAP_ROW_CONTRACTS {
+        let total = count_postgres(&mut **transaction, table).await?;
+        let matching: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {} WHERE {predicate}",
+            quoted_identifier(table)
+        ))
+        .fetch_one(&mut **transaction)
+        .await?;
+        if total != *expected || matching != *expected {
+            bail!(
+                "verified catalog seed target has non-canonical schema bootstrap rows in {table}"
+            );
         }
     }
     Ok(())
@@ -1213,8 +1452,9 @@ fn required_user_matches(actual: &SeedRow, expected: &SeedRow) -> bool {
 
 async fn validate_target_empty_sqlite(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    required_empty: &[String],
 ) -> Result<()> {
-    for table in EMPTY_TARGET_TABLES {
+    for table in required_empty {
         let existing = count_sqlite(&mut **transaction, table).await?;
         if existing != 0 {
             bail!("verified catalog seed target is not clean: {table} contains {existing} rows");
@@ -1225,8 +1465,9 @@ async fn validate_target_empty_sqlite(
 
 async fn validate_target_empty_postgres(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
+    required_empty: &[String],
 ) -> Result<()> {
-    for table in EMPTY_TARGET_TABLES {
+    for table in required_empty {
         let existing = count_postgres(&mut **transaction, table).await?;
         if existing != 0 {
             bail!("verified catalog seed target is not clean: {table} contains {existing} rows");
@@ -1707,12 +1948,8 @@ async fn validate_seeded_target(target: &AppDb, bundle: &SeedBundle) -> Result<(
             );
         }
     }
-    for table in FORBIDDEN_ARTIFACT_TABLES {
-        let actual = count(target, table, "1 = 1").await?;
-        if actual != 0 {
-            bail!("seeded target unexpectedly contains {actual} forbidden {table} rows");
-        }
-    }
+    validate_no_unseeded_artifacts(target, bundle).await?;
+    validate_allowed_preexisting(target).await?;
     Ok(())
 }
 
@@ -1748,12 +1985,17 @@ async fn validate_seeded_sqlite(
             );
         }
     }
-    for table in FORBIDDEN_ARTIFACT_TABLES {
-        let actual = count_sqlite(&mut **transaction, table).await?;
+    let seeded = seeded_table_names(bundle);
+    for table in required_empty_tables_sqlite(transaction).await? {
+        if seeded.contains(&table) {
+            continue;
+        }
+        let actual = count_sqlite(&mut **transaction, &table).await?;
         if actual != 0 {
-            bail!("seeded target unexpectedly contains {actual} forbidden {table} rows");
+            bail!("seeded target unexpectedly contains {actual} unseeded {table} rows");
         }
     }
+    validate_allowed_preexisting_sqlite(transaction).await?;
     Ok(())
 }
 
@@ -1792,10 +2034,37 @@ async fn validate_seeded_postgres(
             );
         }
     }
-    for table in FORBIDDEN_ARTIFACT_TABLES {
-        let actual = count_postgres(&mut **transaction, table).await?;
+    let seeded = seeded_table_names(bundle);
+    for table in required_empty_tables_postgres(transaction).await? {
+        if seeded.contains(&table) {
+            continue;
+        }
+        let actual = count_postgres(&mut **transaction, &table).await?;
         if actual != 0 {
-            bail!("seeded target unexpectedly contains {actual} forbidden {table} rows");
+            bail!("seeded target unexpectedly contains {actual} unseeded {table} rows");
+        }
+    }
+    validate_allowed_preexisting_postgres(transaction).await?;
+    Ok(())
+}
+
+fn seeded_table_names(bundle: &SeedBundle) -> BTreeSet<String> {
+    bundle
+        .fingerprint_rows()
+        .into_iter()
+        .map(|row| row.table)
+        .collect()
+}
+
+async fn validate_no_unseeded_artifacts(target: &AppDb, bundle: &SeedBundle) -> Result<()> {
+    let seeded = seeded_table_names(bundle);
+    for table in required_empty_tables(target).await? {
+        if seeded.contains(&table) {
+            continue;
+        }
+        let actual = count(target, &table, "1 = 1").await?;
+        if actual != 0 {
+            bail!("seeded target unexpectedly contains {actual} unseeded {table} rows");
         }
     }
     Ok(())
@@ -2017,27 +2286,53 @@ fn decode_json_rows(
 }
 
 fn canonicalize_logical_value(table: &str, column: &str, value: Value) -> Result<Value> {
-    // SQLite persists logical values as constrained INTEGERs while PostgreSQL
-    // exposes native BOOLEANs. This closed schema map keeps both insertion
-    // binding and fingerprints on one backend-independent representation.
-    if (table, column)
-        != (
-            "aircraft_identity_decisions",
-            "deterministic_validation_passed",
-        )
-    {
-        return Ok(value);
+    // SQLite persists logical values as constrained INTEGER/REAL values while
+    // PostgreSQL exposes native BOOLEAN/DOUBLE values. This closed schema map
+    // keeps both insertion binding and fingerprints backend-independent.
+    match (table, column) {
+        ("aircraft_identity_decisions", "deterministic_validation_passed") => match value {
+            Value::Bool(value) => Ok(Value::Bool(value)),
+            Value::Number(value) if value.as_i64() == Some(0) => Ok(Value::Bool(false)),
+            Value::Number(value) if value.as_i64() == Some(1) => Ok(Value::Bool(true)),
+            value => bail!(
+                "{}.{} contains non-boolean database JSON value {}",
+                table,
+                column,
+                value
+            ),
+        },
+        ("avionics_models", "estimated_unit_value_usd" | "replacement_cost_usd") => {
+            canonicalize_floating_number(table, column, value)
+        }
+        _ => Ok(value),
     }
-    match value {
-        Value::Bool(value) => Ok(Value::Bool(value)),
-        Value::Number(value) if value.as_i64() == Some(0) => Ok(Value::Bool(false)),
-        Value::Number(value) if value.as_i64() == Some(1) => Ok(Value::Bool(true)),
-        value => bail!(
-            "{}.{} contains non-boolean database JSON value {}",
+}
+
+fn canonicalize_floating_number(table: &str, column: &str, value: Value) -> Result<Value> {
+    let Value::Number(number) = value else {
+        if value.is_null() {
+            return Ok(value);
+        }
+        bail!(
+            "{}.{} contains non-numeric database JSON value {}",
             table,
             column,
             value
-        ),
+        );
+    };
+    let numeric = number
+        .as_f64()
+        .with_context(|| format!("{table}.{column} is not a finite database number"))?;
+    if !numeric.is_finite() {
+        bail!("{table}.{column} contains a non-finite database number");
+    }
+    if numeric.fract() == 0.0 && numeric >= i64::MIN as f64 && numeric <= i64::MAX as f64 {
+        Ok(Value::from(numeric as i64))
+    } else {
+        Ok(Value::Number(
+            serde_json::Number::from_f64(numeric)
+                .with_context(|| format!("{table}.{column} is not valid canonical JSON"))?,
+        ))
     }
 }
 
@@ -2148,6 +2443,22 @@ mod tests {
         }
     }
 
+    async fn execute_without_sqlite_foreign_keys(db: &AppDb, sql: &str) {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("SQLite fixture")
+        };
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::raw_sql(sql).execute(&mut *connection).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+
     async fn approved_fixture() -> AppDb {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         execute(
@@ -2179,10 +2490,14 @@ mod tests {
               'validated', '2026-01-01', '2026-01-01'
             );
             INSERT INTO aircraft_identity_observations (
-              id, observed_make, exact_source_evidence, observation_sha256, created_at
+              id, source_url, observed_make, observed_designation,
+              exact_source_evidence, observation_sha256, legacy_hint_json, created_at
             ) VALUES (
-              1, 'Fixture Aviation', 'Fixture Aviation manufacturer catalog',
+              1, 'https://listing.example/SECRET_LISTING_URL',
+              'Fixture Aviation', 'SECRET_LISTING_DESIGNATION',
+              'SECRET_LISTING_TEXT must never cross the catalog boundary',
               'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+              '{"legacy_secret":"SECRET_LEGACY_HINT"}',
               '2026-01-01'
             );
             INSERT INTO aircraft_identity_resolution_cases (
@@ -2200,8 +2515,9 @@ mod tests {
               rationale, decided_by_user_id, decided_at, created_at
             ) VALUES (
               1, 1, 'make', 'approve_new', 'approved', NULL,
-              '{"name":"Fixture Aviation"}', '{"passed":true}', 1,
-              'Primary manufacturer evidence establishes the canonical make.',
+              '{"gemini_dossier":"GEMINI_DOSSIER_SECRET"}',
+              '{"passed":true,"provider_trace":"GEMINI_VALIDATION_SECRET"}', 1,
+              'GEMINI_RATIONALE_SECRET',
               NULL, '2026-01-01', '2026-01-01'
             );
             INSERT INTO aircraft_identity_decision_claims (
@@ -2322,7 +2638,9 @@ mod tests {
               identity_source_url, identity_source_title,
               identity_evidence_text, identity_evidence_kind,
               identity_confidence, catalog_reviewed_at,
-              value_basis, valuation_scope, created_at, updated_at
+              estimated_unit_value_usd, value_basis, replacement_cost_usd,
+              value_reference_year, value_source, valuation_scope,
+              created_at, updated_at
             ) VALUES (
               1, 1, 'GTN 650Xi', 'gtn 650xi', 'unreviewed',
               'manufacturer_model_number', 'GTN 650Xi', 'gtn 650xi',
@@ -2330,7 +2648,9 @@ mod tests {
               'Garmin GTN 650Xi',
               'Garmin identifies the GTN 650Xi by this exact model name.',
               'authoritative_reference', 'very_high', '2026-01-03',
-              'unreviewed', 'unit', '2026-01-01', '2026-01-03'
+              10000.0, 'installed_contribution', 12345.67,
+              2026, 'Garmin fixture pricing', 'unit',
+              '2026-01-01', '2026-01-03'
             );
             INSERT INTO avionics_model_types VALUES (1, 1);
             UPDATE avionics_models SET catalog_status = 'approved' WHERE id = 1;
@@ -2351,6 +2671,84 @@ mod tests {
     #[test]
     fn empty_in_predicate_never_selects_rows() {
         assert_eq!(in_predicate("id", &[]), "1 = 0");
+    }
+
+    #[test]
+    fn clean_shadow_contract_covers_every_representative_derived_domain() {
+        let required = required_empty_from_tables(
+            [
+                "users",
+                "plugin_installs",
+                "plugin_submissions",
+                "schema_migration_contracts",
+                "valuation_snapshots",
+                "valuation_model_versions",
+                "aircraft_reference_configuration_versions",
+                "gemini_api_usage",
+                "aircraft_sale_listing_pending_reviews",
+                "aircraft_sale_listings",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
+        assert_eq!(
+            required,
+            [
+                "valuation_snapshots",
+                "valuation_model_versions",
+                "aircraft_reference_configuration_versions",
+                "gemini_api_usage",
+                "aircraft_sale_listing_pending_reviews",
+                "aircraft_sale_listings",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_domains_are_each_rejected_by_the_clean_shadow_contract() {
+        let cases = [
+            (
+                "depreciation_profiles",
+                "INSERT INTO depreciation_profiles (name, age_decay_rate, long_run_residual_fraction, new_to_used_discount_fraction, new_to_used_discount_years, airframe_doubling_discount, max_airframe_premium, max_airframe_discount, replacement_floor_fraction, minimum_value_fraction, high_time_threshold_hours, high_time_discount_at_double_threshold, is_system_profile) SELECT 'stale:profile', age_decay_rate, long_run_residual_fraction, new_to_used_discount_fraction, new_to_used_discount_years, airframe_doubling_discount, max_airframe_premium, max_airframe_discount, replacement_floor_fraction, minimum_value_fraction, high_time_threshold_hours, high_time_discount_at_double_threshold, 0 FROM depreciation_profiles WHERE name = 'generic:all'",
+            ),
+            (
+                "valuation_snapshots",
+                "INSERT INTO valuation_snapshots (capture_time, input_sha256, selection_policy_json, feature_schema_version, included_count, excluded_count) VALUES ('2026-01-01', 'stale-valuation', '{}', 1, 0, 0)",
+            ),
+            (
+                "valuation_model_versions",
+                "INSERT INTO valuation_model_versions (snapshot_id, model_kind, artifact_format_version, state, metrics_json, configuration_json) VALUES (999, 'structural', 1, 'candidate', '{}', '{}')",
+            ),
+            (
+                "aircraft_reference_profile_proposals",
+                "INSERT INTO aircraft_reference_profile_proposals (resolution_case_id, proposed_identity_json, proposed_profile_json, deterministic_validation_json, validation_status, catalog_revision) VALUES (999, '{}', '{}', '{}', 'pending', 'stale-reference')",
+            ),
+            (
+                "gemini_api_usage",
+                "INSERT INTO gemini_api_usage (task, purpose, api_family, model) VALUES ('stale', 'stale', 'generate_content', 'stale-model')",
+            ),
+            (
+                "aircraft_sale_listing_pending_reviews",
+                "INSERT INTO aircraft_sale_listing_pending_reviews (listing_id, extraction_sha256, catalog_revision_sha256, pending_aspect_count, review_payload_json, review_payload_sha256) VALUES (999, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 1, '{}', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')",
+            ),
+            (
+                "aircraft_sale_listings",
+                "INSERT INTO aircraft_sale_listings (aircraft_model_variant_id, created_by_user_id, model_year, asking_price_usd, airframe_hours) VALUES (-1, 1, 2020, 100000, 100)",
+            ),
+        ];
+        for (table, sql) in cases {
+            let target = AppDb::connect("sqlite::memory:").await.unwrap();
+            execute_without_sqlite_foreign_keys(&target, sql).await;
+            let error = validate_target_empty(&target)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(table), "{table} was not rejected: {error}");
+        }
     }
 
     #[test]
@@ -2392,12 +2790,48 @@ mod tests {
             Value::from(2)
         )
         .is_err());
+        assert_eq!(
+            canonicalize_logical_value(
+                "avionics_models",
+                "estimated_unit_value_usd",
+                serde_json::from_str("10000.0").unwrap()
+            )
+            .unwrap(),
+            Value::from(10000)
+        );
+        assert_eq!(
+            canonicalize_logical_value(
+                "avionics_models",
+                "replacement_cost_usd",
+                serde_json::from_str("12345.67").unwrap()
+            )
+            .unwrap(),
+            serde_json::from_str::<Value>("12345.67").unwrap()
+        );
     }
 
     #[tokio::test]
     async fn fresh_target_dry_run_and_apply_seed_only_the_approved_graph() {
         let source = approved_fixture().await;
         let target = AppDb::connect("sqlite::memory:").await.unwrap();
+        execute(
+            &target,
+            r#"
+            INSERT INTO plugin_installs (
+              id, user_id, public_key_base64, created_at
+            ) VALUES (9, 1, 'signed-capture-key', '2026-01-01');
+            INSERT INTO plugin_submissions (
+              id, user_id, plugin_install_id, source_url, submitted_at,
+              rendered_html, rendered_html_sha256, signature_base64
+            ) VALUES (
+              9, 1, 9, 'https://listing.example/retained-capture',
+              '2026-01-01', '<html>retained signed capture</html>',
+              'abababababababababababababababababababababababababababababababab',
+              'signed-capture'
+            );
+            "#,
+        )
+        .await;
 
         let dry_run = seed_verified_catalog(&source, &target, false)
             .await
@@ -2442,10 +2876,65 @@ mod tests {
             0
         );
         assert_eq!(
+            count(&target, "plugin_submissions", "1 = 1").await.unwrap(),
+            1
+        );
+        assert_eq!(
             count(&target, "faa_registry_aircraft", "n_number = 'N123'")
                 .await
                 .unwrap(),
             0
+        );
+        let observations = fetch_rows(&target, "aircraft_identity_observations", "id = 1")
+            .await
+            .unwrap();
+        for column in [
+            "aircraft_sale_listing_id",
+            "source_url",
+            "observed_make",
+            "observed_designation",
+            "legacy_hint_json",
+        ] {
+            assert_eq!(observations[0].value(column), Some(&Value::Null));
+        }
+        assert_eq!(
+            observations[0]
+                .value("exact_source_evidence")
+                .and_then(Value::as_str),
+            Some("catalog-provenance-source-observation-sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+        assert_eq!(
+            observations[0].string("observation_sha256").unwrap(),
+            catalog_projection_observation_fingerprint(&observations[0]).unwrap()
+        );
+        let decisions = fetch_rows(&target, "aircraft_identity_decisions", "id = 1")
+            .await
+            .unwrap();
+        let projected_decision = [
+            "decision_payload_json",
+            "deterministic_validation_json",
+            "rationale",
+        ]
+        .into_iter()
+        .map(|column| decisions[0].string(column).unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
+        let projected = format!("{} {}", canonical_row(&observations[0]), projected_decision);
+        for forbidden in [
+            "SECRET_LISTING",
+            "SECRET_LEGACY_HINT",
+            "GEMINI_DOSSIER_SECRET",
+            "GEMINI_VALIDATION_SECRET",
+            "GEMINI_RATIONALE_SECRET",
+        ] {
+            assert!(!projected.contains(forbidden));
+        }
+        assert_eq!(
+            fetch_rows(&target, "avionics_models", "id = 1")
+                .await
+                .unwrap()[0]
+                .value("estimated_unit_value_usd"),
+            Some(&Value::from(10000))
         );
     }
 
@@ -2545,6 +3034,19 @@ mod tests {
         assert_eq!(
             rows[0].value("deterministic_validation_passed"),
             Some(&Value::Bool(true))
+        );
+        let models = fetch_rows(&target, "avionics_models", "id = 1")
+            .await
+            .unwrap();
+        assert_eq!(
+            models[0].value("estimated_unit_value_usd"),
+            Some(&Value::from(10000))
+        );
+        assert_eq!(
+            models[0]
+                .value("replacement_cost_usd")
+                .and_then(Value::as_f64),
+            Some(12345.67)
         );
     }
 }
