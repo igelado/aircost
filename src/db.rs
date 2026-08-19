@@ -98,6 +98,10 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
     "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
+const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
+const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
+const FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT: &str =
+    "dccd6ae9208a650fe5381000fc485e7700fb113bc23520a183e305b49d64ec15";
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION: &str =
     "20260819_aircraft_listing_identity_corrections";
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
@@ -2803,6 +2807,18 @@ impl AppDb {
                 LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
             ));
         }
+        if matches!(self.backend(), DatabaseBackend::Postgres(_))
+            && self
+                .migration_contract_missing(
+                    "public.faa_registry_aircraft_references",
+                    FAA_REFERENCE_REACHABILITY_MIGRATION,
+                    FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
+                    FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+                )
+                .await?
+        {
+            bail!(faa_reference_reachability_migration_required_message());
+        }
         let missing_aircraft_listing_identity_correction_objects = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
@@ -4075,6 +4091,15 @@ fn aircraft_listing_identity_corrections_migration_required_message(kind: Databa
     )
 }
 
+fn faa_reference_reachability_migration_required_message() -> String {
+    format!(
+        "database migration required before startup: PostgreSQL FAA aircraft and engine reference \
+         reachability triggers must use table-specific, namespace-locked functions; back up the \
+         database, apply `migrations/{FAA_REFERENCE_REACHABILITY_MIGRATION}.postgres.sql`, then \
+         restart aircost"
+    )
+}
+
 pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
     if is_database_url(database_url) || !database_url.trim().is_empty() {
         Ok(())
@@ -4101,6 +4126,7 @@ mod tests {
         avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
         avionics_product_reuse_attestations_migration_required_message, canonical_sql_definition,
+        faa_reference_reachability_migration_required_message,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
@@ -4134,6 +4160,8 @@ mod tests {
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
+        FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+        FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION, FAA_REFERENCE_REACHABILITY_MIGRATION,
         IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
@@ -4160,6 +4188,8 @@ mod tests {
         include_str!("../migrations/20260730_aircraft_tcds_make_lineage.sqlite.sql");
     const AIRCRAFT_TCDS_MAKE_LINEAGE_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260730_aircraft_tcds_make_lineage.postgres.sql");
+    const FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260819_faa_reference_reachability.postgres.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260731_avionics_human_reviewed_consolidation.sqlite.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
@@ -6634,6 +6664,33 @@ mod tests {
     }
 
     #[test]
+    fn postgres_faa_reference_reachability_uses_table_specific_contracts() {
+        assert_eq!(FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION, 1);
+        for contract_value in [
+            FAA_REFERENCE_REACHABILITY_MIGRATION,
+            FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+        ] {
+            assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
+            assert!(FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL.contains(contract_value));
+        }
+        for function in [
+            "public.validate_faa_aircraft_reference_reachability()",
+            "public.validate_faa_engine_reference_reachability()",
+        ] {
+            assert!(POSTGRES_SCHEMA_SQL.contains(function));
+            assert!(FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL.contains(function));
+        }
+        for sql in [
+            POSTGRES_SCHEMA_SQL,
+            FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(sql.contains("FROM public.faa_registry_aircraft aircraft"));
+            assert!(sql.contains("SET search_path = pg_catalog"));
+            assert!(!sql.contains("EXECUTE FUNCTION public.validate_faa_reference_reachability()"));
+        }
+    }
+
+    #[test]
     fn migration_messages_select_the_backend_specific_script() {
         let sqlite = migration_required_message(
             DatabaseKind::Sqlite,
@@ -6710,5 +6767,10 @@ mod tests {
             avionics_descriptive_consolidation_migration_required_message(DatabaseKind::Postgres);
         assert!(descriptive_consolidation
             .contains("20260808_avionics_descriptive_consolidation.postgres.sql"));
+
+        let faa_reference_reachability = faa_reference_reachability_migration_required_message();
+        assert!(
+            faa_reference_reachability.contains("20260819_faa_reference_reachability.postgres.sql")
+        );
     }
 }

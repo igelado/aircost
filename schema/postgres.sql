@@ -6369,18 +6369,32 @@ CREATE TRIGGER faa_registry_snapshots_require_exact_evidence
 BEFORE INSERT ON faa_registry_snapshots
 FOR EACH ROW EXECUTE FUNCTION validate_faa_snapshot_evidence();
 
-CREATE OR REPLACE FUNCTION validate_faa_reference_reachability()
+DROP TRIGGER IF EXISTS faa_registry_aircraft_references_reachable
+  ON public.faa_registry_aircraft_references;
+DROP TRIGGER IF EXISTS faa_registry_engine_references_reachable
+  ON public.faa_registry_engine_references;
+DROP FUNCTION IF EXISTS public.validate_faa_reference_reachability();
+
+CREATE OR REPLACE FUNCTION public.validate_faa_aircraft_reference_reachability()
 RETURNS TRIGGER AS $$
 BEGIN
-  IF TG_TABLE_NAME = 'faa_registry_aircraft_references' AND NOT EXISTS (
-    SELECT 1 FROM faa_registry_aircraft aircraft
+  IF NOT EXISTS (
+    SELECT 1 FROM public.faa_registry_aircraft aircraft
     WHERE aircraft.snapshot_id = NEW.snapshot_id
       AND aircraft.aircraft_code = NEW.aircraft_code
   ) THEN
     RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
   END IF;
-  IF TG_TABLE_NAME = 'faa_registry_engine_references' AND NOT EXISTS (
-    SELECT 1 FROM faa_registry_aircraft aircraft
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog;
+
+CREATE OR REPLACE FUNCTION public.validate_faa_engine_reference_reachability()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.faa_registry_aircraft aircraft
     WHERE aircraft.snapshot_id = NEW.snapshot_id
       AND aircraft.engine_code = NEW.engine_code
   ) THEN
@@ -6388,16 +6402,33 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog;
 
-DROP TRIGGER IF EXISTS faa_registry_aircraft_references_reachable ON faa_registry_aircraft_references;
 CREATE TRIGGER faa_registry_aircraft_references_reachable
-BEFORE INSERT ON faa_registry_aircraft_references
-FOR EACH ROW EXECUTE FUNCTION validate_faa_reference_reachability();
-DROP TRIGGER IF EXISTS faa_registry_engine_references_reachable ON faa_registry_engine_references;
+BEFORE INSERT ON public.faa_registry_aircraft_references
+FOR EACH ROW
+EXECUTE FUNCTION public.validate_faa_aircraft_reference_reachability();
 CREATE TRIGGER faa_registry_engine_references_reachable
-BEFORE INSERT ON faa_registry_engine_references
-FOR EACH ROW EXECUTE FUNCTION validate_faa_reference_reachability();
+BEFORE INSERT ON public.faa_registry_engine_references
+FOR EACH ROW
+EXECUTE FUNCTION public.validate_faa_engine_reference_reachability();
+
+INSERT INTO public.schema_migration_contracts AS installed_contract (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260819_faa_reference_reachability',
+  1,
+  'dccd6ae9208a650fe5381000fc485e7700fb113bc23520a183e305b49d64ec15',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = EXCLUDED.contract_version,
+  contract_fingerprint = EXCLUDED.contract_fingerprint,
+  installed_at = EXCLUDED.installed_at
+WHERE installed_contract.contract_version = EXCLUDED.contract_version
+  AND installed_contract.contract_fingerprint =
+      EXCLUDED.contract_fingerprint;
 
 CREATE OR REPLACE FUNCTION validate_faa_coverage()
 RETURNS TRIGGER AS $$
