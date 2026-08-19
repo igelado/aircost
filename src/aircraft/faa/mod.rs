@@ -13,9 +13,10 @@ mod store;
 mod target;
 
 pub use admission::{
-    audit_listing_admission, block_reason_code, require_aircraft_admission,
-    require_listing_admission, require_listing_faa_admission, AircraftAdmissionError,
-    ListingAdmissionEvidence, ListingAdmissionReport,
+    admit_aircraft_source_identity, audit_listing_admission, block_reason_code,
+    require_aircraft_admission, require_listing_admission, require_listing_faa_admission,
+    AircraftAdmissionError, FaaSerialCorrection, ListingAdmissionEvidence, ListingAdmissionReport,
+    SourceAircraftAdmission,
 };
 pub use import::{parse_release, ReleaseReaders};
 pub use lookup::{

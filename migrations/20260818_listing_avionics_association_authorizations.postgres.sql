@@ -462,10 +462,10 @@ CREATE OR REPLACE FUNCTION
   invalidate_listing_avionics_authorization_for_capture()
 RETURNS TRIGGER LANGUAGE plpgsql AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations authorization
+  DELETE FROM aircraft_sale_listing_avionics_authorizations authorization_row
   USING aircraft_sale_listing_avionics link
-  WHERE link.id = authorization.listing_link_id
-    AND authorization.evidence_capture_sha256 = OLD.rendered_html_sha256
+  WHERE link.id = authorization_row.listing_link_id
+    AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
     AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
     AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
     AND position(link.source_notes IN OLD.rendered_html) > 0
@@ -474,7 +474,7 @@ BEGIN
       WHERE retained_capture.canonical_listing_id =
               link.aircraft_sale_listing_id
         AND retained_capture.rendered_html_sha256 =
-              authorization.evidence_capture_sha256
+              authorization_row.evidence_capture_sha256
         AND position(link.source_notes IN retained_capture.rendered_html) > 0
     );
   IF TG_OP = 'DELETE' THEN

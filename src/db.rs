@@ -98,6 +98,111 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
     "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
+const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION: &str =
+    "20260819_aircraft_listing_identity_corrections";
+const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
+const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
+    "589a0716726d2ffd34bf84c08583198383c003228b769c88f094ac6bd9f677b8";
+const SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update
+BEFORE UPDATE ON aircraft_listing_identity_correction_decisions
+BEGIN SELECT RAISE(ABORT, 'aircraft listing identity correction decisions are immutable'); END
+"#;
+const SQLITE_CORRECTION_DECISION_DELETE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_listing_identity_corrections_immutable_delete
+BEFORE DELETE ON aircraft_listing_identity_correction_decisions
+BEGIN SELECT RAISE(ABORT, 'aircraft listing identity correction decisions are immutable'); END
+"#;
+const SQLITE_CORRECTION_OBSERVATION_UPDATE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_identity_correction_observation_immutable_update
+BEFORE UPDATE ON aircraft_identity_observations
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_listing_identity_correction_decisions decision
+  WHERE decision.observation_id = OLD.id
+)
+BEGIN SELECT RAISE(ABORT, 'aircraft identity observations referenced by correction decisions are immutable'); END
+"#;
+const SQLITE_CORRECTION_OBSERVATION_DELETE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_identity_correction_observation_immutable_delete
+BEFORE DELETE ON aircraft_identity_observations
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_listing_identity_correction_decisions decision
+  WHERE decision.observation_id = OLD.id
+)
+BEGIN SELECT RAISE(ABORT, 'aircraft identity observations referenced by correction decisions are immutable'); END
+"#;
+const SQLITE_SOURCE_IDENTITY_RECEIPT_GATE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_source_identity_receipt_gate
+BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified
+ON aircraft_sale_listings
+WHEN OLD.ingestion_error = 'source_identity_correction_receipt_pending'
+ AND (
+   NEW.ingestion_error IS NOT OLD.ingestion_error
+   OR NEW.ingestion_state IS NOT OLD.ingestion_state
+   OR NEW.is_verified IS NOT OLD.is_verified
+ )
+ AND NOT EXISTS (
+   SELECT 1
+   FROM aircraft_listing_identity_correction_decisions decision
+   JOIN plugin_submissions submission
+     ON submission.id = decision.plugin_submission_id
+   WHERE decision.aircraft_sale_listing_id = OLD.id
+     AND decision.correction_kind = 'faa_serial'
+     AND decision.rendered_html_sha256 = submission.rendered_html_sha256
+     AND submission.user_id = OLD.created_by_user_id
+     AND submission.canonical_listing_id = OLD.id
+     AND submission.extraction_error IS NULL
+     AND NEW.registration_number IS decision.corrected_registration_number
+     AND NEW.serial_number IS decision.corrected_serial_number
+ )
+BEGIN SELECT RAISE(ABORT, 'source identity correction receipt is required before leaving the receipt gate'); END
+"#;
+const POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  RAISE EXCEPTION 'aircraft listing identity correction decisions are immutable';
+END;
+"#;
+const POSTGRES_CORRECTION_OBSERVATION_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.aircraft_listing_identity_correction_decisions decision
+    WHERE decision.observation_id = OLD.id
+  ) THEN
+    RAISE EXCEPTION 'aircraft identity observations referenced by correction decisions are immutable';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_SOURCE_IDENTITY_RECEIPT_GATE_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF OLD.ingestion_error = 'source_identity_correction_receipt_pending'
+     AND (
+       NEW.ingestion_error IS DISTINCT FROM OLD.ingestion_error
+       OR NEW.ingestion_state IS DISTINCT FROM OLD.ingestion_state
+       OR NEW.is_verified IS DISTINCT FROM OLD.is_verified
+     )
+     AND NOT EXISTS (
+       SELECT 1
+       FROM public.aircraft_listing_identity_correction_decisions decision
+       JOIN public.plugin_submissions submission
+         ON submission.id = decision.plugin_submission_id
+       WHERE decision.aircraft_sale_listing_id = OLD.id
+         AND decision.correction_kind = 'faa_serial'
+         AND decision.rendered_html_sha256 = submission.rendered_html_sha256
+         AND submission.user_id = OLD.created_by_user_id
+         AND submission.canonical_listing_id = OLD.id
+         AND submission.extraction_error IS NULL
+         AND NEW.registration_number IS NOT DISTINCT FROM decision.corrected_registration_number
+         AND NEW.serial_number IS NOT DISTINCT FROM decision.corrected_serial_number
+     ) THEN
+    RAISE EXCEPTION 'source identity correction receipt is required before leaving the receipt gate';
+  END IF;
+  RETURN NEW;
+END;
+"#;
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -116,6 +221,55 @@ pub(crate) enum DatabaseKind {
     Postgres,
 }
 
+#[derive(sqlx::FromRow)]
+struct PostgresCorrectionTriggerDefinition {
+    trigger_name: String,
+    trigger_type: i16,
+    has_no_when_clause: bool,
+    update_columns: String,
+    trigger_enabled: String,
+    relation_schema: String,
+    relation_name: String,
+    relation_oid_matches: bool,
+    function_name: String,
+    function_schema: String,
+    function_oid_matches: bool,
+    function_source: String,
+    function_configuration: String,
+    function_language: String,
+    returns_trigger: bool,
+    argument_count: i16,
+    security_definer: bool,
+    strict: bool,
+    volatility: String,
+}
+
+fn canonical_sql_definition(value: &str) -> String {
+    let mut canonical = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            canonical.push(character);
+            if character == active_quote {
+                if characters.peek() == Some(&active_quote) {
+                    canonical.push(characters.next().expect("peeked quote must exist"));
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        if character == '\'' || character == '"' {
+            quote = Some(character);
+            canonical.push(character);
+        } else if !character.is_whitespace() {
+            canonical.extend(character.to_lowercase());
+        }
+    }
+    canonical
+}
+
 impl AppDb {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
@@ -132,6 +286,7 @@ impl AppDb {
             };
             db.ensure_required_migrations().await?;
             db.initialize().await?;
+            db.ensure_required_migrations().await?;
             Ok(db)
         } else {
             ensure_sqlite_parent_directory(&database_url)?;
@@ -149,6 +304,7 @@ impl AppDb {
             };
             db.ensure_required_migrations().await?;
             db.initialize().await?;
+            db.ensure_required_migrations().await?;
             Ok(db)
         }
     }
@@ -1669,7 +1825,7 @@ impl AppDb {
                     required_triggers(parent_name, trigger_name) AS (
                       VALUES
                         ('avionics_catalog_grounded_consolidation_authorizations',
-                          'avionics_catalog_grounded_consolidation_authorization_validate_insert'),
+                          'avionics_catalog_grounded_consolidation_authorization_validate_'),
                         ('avionics_catalog_grounded_consolidation_authorizations',
                           'avionics_catalog_grounded_consolidation_authorization_immutable'),
                         ('avionics_catalog_grounded_consolidation_guard',
@@ -2647,7 +2803,406 @@ impl AppDb {
                 LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
             ));
         }
+        let missing_aircraft_listing_identity_correction_objects = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE type = 'table' AND name = 'aircraft_sale_listings'
+                    ) AND (
+                      NOT EXISTS (
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table'
+                          AND name = 'aircraft_listing_identity_correction_decisions'
+                      ) OR NOT EXISTS (
+                        SELECT 1 FROM pragma_index_list('plugin_submissions') actual
+                        WHERE actual.name = 'uq_plugin_submissions_signed_capture'
+                          AND actual.[unique] = 1
+                          AND (
+                            SELECT group_concat(name, ',') FROM (
+                              SELECT name FROM pragma_index_info(actual.name)
+                              ORDER BY seqno
+                            )
+                          ) = 'user_id,plugin_install_id,source_url,rendered_html_sha256'
+                      ) OR NOT EXISTS (
+                        SELECT 1 FROM pragma_index_list(
+                          'aircraft_listing_identity_correction_decisions'
+                        ) actual
+                        WHERE actual.name = 'uq_aircraft_listing_identity_correction_receipt'
+                          AND actual.[unique] = 1
+                          AND (
+                            SELECT group_concat(name, ',') FROM (
+                              SELECT name FROM pragma_index_info(actual.name)
+                              ORDER BY seqno
+                            )
+                          ) = 'plugin_submission_id,correction_kind'
+                      )
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT pg_catalog.to_regclass('public.aircraft_sale_listings') IS NOT NULL AND (
+                      pg_catalog.to_regclass(
+                        'public.aircraft_listing_identity_correction_decisions'
+                      ) IS NULL
+                      OR NOT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_class index_class
+                        JOIN pg_catalog.pg_index actual
+                          ON actual.indexrelid = index_class.oid
+                        WHERE index_class.oid = pg_catalog.to_regclass(
+                          'public.uq_plugin_submissions_signed_capture'
+                        )
+                          AND actual.indrelid = pg_catalog.to_regclass(
+                            'public.plugin_submissions'
+                          )
+                          AND actual.indisunique
+                          AND (
+                            SELECT array_agg(
+                              attribute.attname::text ORDER BY index_key.ordinality
+                            )
+                            FROM unnest(actual.indkey) WITH ORDINALITY
+                              AS index_key(attnum, ordinality)
+                            JOIN pg_catalog.pg_attribute attribute
+                              ON attribute.attrelid = actual.indrelid
+                             AND attribute.attnum = index_key.attnum
+                          ) = ARRAY[
+                            'user_id', 'plugin_install_id', 'source_url',
+                            'rendered_html_sha256'
+                          ]::text[]
+                      )
+                      OR NOT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_class index_class
+                        JOIN pg_catalog.pg_index actual
+                          ON actual.indexrelid = index_class.oid
+                        WHERE index_class.oid = pg_catalog.to_regclass(
+                          'public.uq_aircraft_listing_identity_correction_receipt'
+                        )
+                          AND actual.indrelid = pg_catalog.to_regclass(
+                            'public.aircraft_listing_identity_correction_decisions'
+                          )
+                          AND actual.indisunique
+                          AND (
+                            SELECT array_agg(
+                              attribute.attname::text ORDER BY index_key.ordinality
+                            )
+                            FROM unnest(actual.indkey) WITH ORDINALITY
+                              AS index_key(attnum, ordinality)
+                            JOIN pg_catalog.pg_attribute attribute
+                              ON attribute.attrelid = actual.indrelid
+                             AND attribute.attnum = index_key.attnum
+                          ) = ARRAY['plugin_submission_id', 'correction_kind']::text[]
+                      )
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        let aircraft_listing_identity_correction_schema_started = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE (type = 'table' AND name =
+                        'aircraft_listing_identity_correction_decisions')
+                         OR (type = 'index' AND name IN (
+                           'uq_plugin_submissions_signed_capture',
+                           'uq_aircraft_listing_identity_correction_receipt'
+                         ))
+                         OR (type = 'trigger' AND name IN (
+                           'aircraft_listing_identity_corrections_immutable_update',
+                           'aircraft_listing_identity_corrections_immutable_delete',
+                           'aircraft_identity_correction_observation_immutable_update',
+                           'aircraft_identity_correction_observation_immutable_delete',
+                           'aircraft_source_identity_receipt_gate'
+                         ))
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT
+                      pg_catalog.to_regclass(
+                        'public.aircraft_listing_identity_correction_decisions'
+                      ) IS NOT NULL
+                      OR pg_catalog.to_regclass(
+                        'public.uq_plugin_submissions_signed_capture'
+                      ) IS NOT NULL
+                      OR pg_catalog.to_regclass(
+                        'public.uq_aircraft_listing_identity_correction_receipt'
+                      ) IS NOT NULL
+                      OR EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_trigger
+                        WHERE NOT tgisinternal
+                          AND tgname IN (
+                            'aircraft_listing_identity_corrections_immutable',
+                            'aircraft_identity_correction_observation_immutable',
+                            'aircraft_source_identity_receipt_gate'
+                          )
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        let invalid_aircraft_listing_identity_correction_definitions =
+            if missing_aircraft_listing_identity_correction_objects
+                || !aircraft_listing_identity_correction_schema_started
+            {
+                false
+            } else {
+                !self
+                    .aircraft_listing_identity_correction_definitions_valid()
+                    .await?
+            };
+        let missing_aircraft_listing_identity_corrections =
+            missing_aircraft_listing_identity_correction_objects
+                || invalid_aircraft_listing_identity_correction_definitions
+                || self
+                    .migration_contract_missing(
+                        match self.kind() {
+                            DatabaseKind::Sqlite => {
+                                "aircraft_listing_identity_correction_decisions"
+                            }
+                            DatabaseKind::Postgres => {
+                                "public.aircraft_listing_identity_correction_decisions"
+                            }
+                        },
+                        AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
+                        AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION,
+                        AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
+                    )
+                    .await?;
+        if missing_aircraft_listing_identity_corrections {
+            bail!(aircraft_listing_identity_corrections_migration_required_message(self.kind()));
+        }
         Ok(())
+    }
+
+    async fn aircraft_listing_identity_correction_definitions_valid(&self) -> Result<bool> {
+        match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let definitions = sqlx::query_as::<_, (String, Option<String>)>(
+                    r#"
+                    SELECT name, sql
+                    FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name IN (
+                        'aircraft_listing_identity_corrections_immutable_update',
+                        'aircraft_listing_identity_corrections_immutable_delete',
+                        'aircraft_identity_correction_observation_immutable_update',
+                        'aircraft_identity_correction_observation_immutable_delete',
+                        'aircraft_source_identity_receipt_gate'
+                      )
+                    ORDER BY name
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?;
+                let expected = [
+                    (
+                        "aircraft_identity_correction_observation_immutable_delete",
+                        SQLITE_CORRECTION_OBSERVATION_DELETE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_identity_correction_observation_immutable_update",
+                        SQLITE_CORRECTION_OBSERVATION_UPDATE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_listing_identity_corrections_immutable_delete",
+                        SQLITE_CORRECTION_DECISION_DELETE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_listing_identity_corrections_immutable_update",
+                        SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_source_identity_receipt_gate",
+                        SQLITE_SOURCE_IDENTITY_RECEIPT_GATE_TRIGGER,
+                    ),
+                ];
+                Ok(definitions.len() == expected.len()
+                    && definitions.iter().zip(expected).all(
+                        |(
+                            (actual_name, actual_definition),
+                            (expected_name, expected_definition),
+                        )| {
+                            actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    canonical_sql_definition(actual)
+                                        == canonical_sql_definition(expected_definition)
+                                })
+                        },
+                    ))
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let definitions = sqlx::query_as::<_, PostgresCorrectionTriggerDefinition>(
+                    r#"
+                    SELECT
+                      actual_trigger.tgname AS trigger_name,
+                      actual_trigger.tgtype::smallint AS trigger_type,
+                      actual_trigger.tgqual IS NULL AS has_no_when_clause,
+                      COALESCE((
+                        SELECT string_agg(attribute.attname, ',' ORDER BY attribute.attname)
+                        FROM unnest(actual_trigger.tgattr) AS update_column(attnum)
+                        JOIN pg_attribute attribute
+                          ON attribute.attrelid = actual_trigger.tgrelid
+                         AND attribute.attnum = update_column.attnum
+                      ), '') AS update_columns,
+                      actual_trigger.tgenabled::text AS trigger_enabled,
+                      relation_namespace.nspname AS relation_schema,
+                      relation.relname AS relation_name,
+                      actual_trigger.tgrelid IS NOT DISTINCT FROM CASE actual_trigger.tgname
+                        WHEN 'aircraft_listing_identity_corrections_immutable'
+                          THEN pg_catalog.to_regclass(
+                            'public.aircraft_listing_identity_correction_decisions'
+                          )
+                        WHEN 'aircraft_identity_correction_observation_immutable'
+                          THEN pg_catalog.to_regclass(
+                            'public.aircraft_identity_observations'
+                          )
+                        WHEN 'aircraft_source_identity_receipt_gate'
+                          THEN pg_catalog.to_regclass('public.aircraft_sale_listings')
+                      END AS relation_oid_matches,
+                      routine.proname AS function_name,
+                      routine_namespace.nspname AS function_schema,
+                      routine.oid IS NOT DISTINCT FROM CASE actual_trigger.tgname
+                        WHEN 'aircraft_listing_identity_corrections_immutable'
+                          THEN pg_catalog.to_regprocedure(
+                            'public.preserve_aircraft_listing_identity_correction()'
+                          )
+                        WHEN 'aircraft_identity_correction_observation_immutable'
+                          THEN pg_catalog.to_regprocedure(
+                            'public.preserve_correction_identity_observation()'
+                          )
+                        WHEN 'aircraft_source_identity_receipt_gate'
+                          THEN pg_catalog.to_regprocedure(
+                            'public.require_source_identity_correction_receipt()'
+                          )
+                      END AS function_oid_matches,
+                      routine.prosrc AS function_source,
+                      COALESCE(
+                        pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+                      ) AS function_configuration,
+                      language.lanname AS function_language,
+                      routine.prorettype = 'trigger'::regtype AS returns_trigger,
+                      routine.pronargs::smallint AS argument_count,
+                      routine.prosecdef AS security_definer,
+                      routine.proisstrict AS strict,
+                      routine.provolatile::text AS volatility
+                    FROM pg_catalog.pg_trigger actual_trigger
+                    JOIN pg_catalog.pg_class relation
+                      ON relation.oid = actual_trigger.tgrelid
+                    JOIN pg_catalog.pg_namespace relation_namespace
+                      ON relation_namespace.oid = relation.relnamespace
+                    JOIN pg_catalog.pg_proc routine ON routine.oid = actual_trigger.tgfoid
+                    JOIN pg_catalog.pg_namespace routine_namespace
+                      ON routine_namespace.oid = routine.pronamespace
+                    JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+                    WHERE NOT actual_trigger.tgisinternal
+                      AND (
+                        (
+                          actual_trigger.tgname =
+                            'aircraft_listing_identity_corrections_immutable'
+                          AND relation_namespace.nspname = 'public'
+                          AND relation.relname =
+                            'aircraft_listing_identity_correction_decisions'
+                        ) OR (
+                          actual_trigger.tgname =
+                            'aircraft_identity_correction_observation_immutable'
+                          AND relation_namespace.nspname = 'public'
+                          AND relation.relname = 'aircraft_identity_observations'
+                        ) OR (
+                          actual_trigger.tgname = 'aircraft_source_identity_receipt_gate'
+                          AND relation_namespace.nspname = 'public'
+                          AND relation.relname = 'aircraft_sale_listings'
+                        )
+                      )
+                    ORDER BY actual_trigger.tgname
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?;
+                let expected = [
+                    (
+                        "aircraft_identity_correction_observation_immutable",
+                        27_i16,
+                        "",
+                        "aircraft_identity_observations",
+                        "preserve_correction_identity_observation",
+                        POSTGRES_CORRECTION_OBSERVATION_FUNCTION_SOURCE,
+                    ),
+                    (
+                        "aircraft_listing_identity_corrections_immutable",
+                        27_i16,
+                        "",
+                        "aircraft_listing_identity_correction_decisions",
+                        "preserve_aircraft_listing_identity_correction",
+                        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
+                    ),
+                    (
+                        "aircraft_source_identity_receipt_gate",
+                        19_i16,
+                        "ingestion_error,ingestion_state,is_verified",
+                        "aircraft_sale_listings",
+                        "require_source_identity_correction_receipt",
+                        POSTGRES_SOURCE_IDENTITY_RECEIPT_GATE_FUNCTION_SOURCE,
+                    ),
+                ];
+                Ok(definitions.len() == expected.len()
+                    && definitions.iter().zip(expected).all(
+                        |(
+                            actual,
+                            (
+                                expected_name,
+                                expected_type,
+                                expected_columns,
+                                expected_relation,
+                                expected_function,
+                                expected_source,
+                            ),
+                        )| {
+                            actual.trigger_name == expected_name
+                                && actual.trigger_type == expected_type
+                                && actual.has_no_when_clause
+                                && actual.update_columns == expected_columns
+                                && actual.trigger_enabled == "O"
+                                && actual.relation_schema == "public"
+                                && actual.relation_name == expected_relation
+                                && actual.relation_oid_matches
+                                && actual.function_name == expected_function
+                                && actual.function_schema == "public"
+                                && actual.function_oid_matches
+                                && canonical_sql_definition(&actual.function_source)
+                                    == canonical_sql_definition(expected_source)
+                                && actual.function_configuration == "search_path=pg_catalog"
+                                && actual.function_language == "plpgsql"
+                                && actual.returns_trigger
+                                && actual.argument_count == 0
+                                && !actual.security_definer
+                                && !actual.strict
+                                && actual.volatility == "v"
+                        },
+                    ))
+            }
+        }
     }
 
     async fn migration_contract_missing(
@@ -2668,7 +3223,7 @@ impl AppDb {
                     != 0
             }
             DatabaseBackend::Postgres(pool) => {
-                sqlx::query_scalar::<_, bool>("SELECT to_regclass($1::text) IS NOT NULL")
+                sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regclass($1::text) IS NOT NULL")
                     .bind(anchor_object)
                     .fetch_one(pool)
                     .await?
@@ -2707,8 +3262,10 @@ impl AppDb {
                     SELECT
                       EXISTS (
                         SELECT 1
-                        FROM pg_class actual
-                        WHERE actual.oid = to_regclass('schema_migration_contracts')
+                        FROM pg_catalog.pg_class actual
+                        WHERE actual.oid = pg_catalog.to_regclass(
+                          'public.schema_migration_contracts'
+                        )
                           AND actual.relkind = 'r'
                       )
                       AND NOT EXISTS (
@@ -2722,8 +3279,10 @@ impl AppDb {
                         ) required(column_name, type_oid)
                         WHERE NOT EXISTS (
                           SELECT 1
-                          FROM pg_attribute actual
-                          WHERE actual.attrelid = to_regclass('schema_migration_contracts')
+                          FROM pg_catalog.pg_attribute actual
+                          WHERE actual.attrelid = pg_catalog.to_regclass(
+                            'public.schema_migration_contracts'
+                          )
                             AND actual.attname = required.column_name
                             AND actual.atttypid = required.type_oid::oid
                             AND NOT actual.attisdropped
@@ -2764,7 +3323,7 @@ impl AppDb {
                     r#"
                     SELECT EXISTS (
                       SELECT 1
-                      FROM schema_migration_contracts
+                      FROM public.schema_migration_contracts
                       WHERE migration_name = $1
                         AND contract_version = $2
                         AND contract_fingerprint = $3
@@ -3503,6 +4062,19 @@ fn listing_avionics_authorization_hash_domain_reset_migration_required_message(
     )
 }
 
+fn aircraft_listing_identity_corrections_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: existing listing data is missing immutable \
+         aircraft identity correction decisions; back up the database, apply \
+         `migrations/{AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION}.{backend}.sql`, then \
+         restart aircost"
+    )
+}
+
 pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
     if is_database_url(database_url) || !database_url.trim().is_empty() {
         Ok(())
@@ -3516,6 +4088,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use sqlx::postgres::PgPoolOptions;
     use sqlx::sqlite::{SqliteConnection, SqlitePoolOptions};
     use sqlx::{Connection, Executor};
 
@@ -3527,7 +4100,7 @@ mod tests {
         avionics_authoritative_source_origins_migration_required_message,
         avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
-        avionics_product_reuse_attestations_migration_required_message,
+        avionics_product_reuse_attestations_migration_required_message, canonical_sql_definition,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
@@ -3535,7 +4108,11 @@ mod tests {
         split_sql_statements, AppDb, DatabaseBackend, DatabaseKind,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
-        AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION, AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_FINGERPRINT,
+        AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
+        AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
+        AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION,
+        AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
+        AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_FINGERPRINT,
         AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_VERSION, AIRCRAFT_TCDS_MAKE_LINEAGE_MIGRATION,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_FINGERPRINT,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION,
@@ -3562,8 +4139,9 @@ mod tests {
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
-        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION, POSTGRES_SCHEMA_SQL,
-        SQLITE_SCHEMA_SQL, VALUATION_DATA_HARDENING_MIGRATION,
+        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
+        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE, POSTGRES_SCHEMA_SQL, SQLITE_SCHEMA_SQL,
+        VALUATION_DATA_HARDENING_MIGRATION,
     };
 
     const LISTING_PENDING_REVIEWS_SQLITE_MIGRATION_SQL: &str =
@@ -3624,6 +4202,10 @@ mod tests {
     const LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL: &str = include_str!(
         "../migrations/20260818_listing_avionics_authorization_hash_domain_reset.postgres.sql"
     );
+    const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260819_aircraft_listing_identity_corrections.sqlite.sql");
+    const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260819_aircraft_listing_identity_corrections.postgres.sql");
     async fn sqlite_db_with_statements(statements: &[&str]) -> AppDb {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -3651,6 +4233,329 @@ mod tests {
         ));
         let url = format!("sqlite://{}", path.display());
         (path, url)
+    }
+
+    async fn assert_corrupt_identity_correction_schema_rejected(label: &str, statements: &[&str]) {
+        let (database_path, database_url) = unique_sqlite_test_database(label);
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let mut connection = pool.acquire().await.unwrap();
+        for statement in statements {
+            connection.execute(*statement).await.unwrap();
+        }
+        drop(connection);
+        drop(db);
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("startup must reject corrupt aircraft correction schema"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("immutable aircraft identity correction decisions"));
+        assert!(error.contains("20260819_aircraft_listing_identity_corrections.sqlite.sql"));
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_same_name_nonunique_or_reordered_correction_indexes() {
+        assert_corrupt_identity_correction_schema_rejected(
+            "aircraft-correction-nonunique-capture-index",
+            &[
+                "DROP INDEX uq_plugin_submissions_signed_capture",
+                "CREATE INDEX uq_plugin_submissions_signed_capture ON plugin_submissions (source_url)",
+            ],
+        )
+        .await;
+        assert_corrupt_identity_correction_schema_rejected(
+            "aircraft-correction-reordered-receipt-index",
+            &[
+                "DROP INDEX uq_aircraft_listing_identity_correction_receipt",
+                "CREATE UNIQUE INDEX uq_aircraft_listing_identity_correction_receipt ON aircraft_listing_identity_correction_decisions (correction_kind, plugin_submission_id)",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn correction_preflight_does_not_treat_a_partial_anchor_set_as_fresh() {
+        let db = sqlite_db_with_statements(&[
+            "CREATE TABLE aircraft_listing_identity_correction_decisions (id INTEGER PRIMARY KEY)",
+        ])
+        .await;
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("immutable aircraft identity correction decisions"));
+        assert!(error.contains("20260819_aircraft_listing_identity_corrections.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_noop_correction_immutability_and_receipt_triggers() {
+        for (label, statements) in [
+            (
+                "aircraft-correction-noop-decision-update",
+                [
+                    "DROP TRIGGER aircraft_listing_identity_corrections_immutable_update",
+                    "CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update BEFORE UPDATE ON aircraft_listing_identity_correction_decisions BEGIN SELECT 1; END",
+                ],
+            ),
+            (
+                "aircraft-correction-noop-decision-delete",
+                [
+                    "DROP TRIGGER aircraft_listing_identity_corrections_immutable_delete",
+                    "CREATE TRIGGER aircraft_listing_identity_corrections_immutable_delete BEFORE DELETE ON aircraft_listing_identity_correction_decisions BEGIN SELECT 1; END",
+                ],
+            ),
+            (
+                "aircraft-correction-noop-observation-update",
+                [
+                    "DROP TRIGGER aircraft_identity_correction_observation_immutable_update",
+                    "CREATE TRIGGER aircraft_identity_correction_observation_immutable_update BEFORE UPDATE ON aircraft_identity_observations BEGIN SELECT 1; END",
+                ],
+            ),
+            (
+                "aircraft-correction-noop-observation-delete",
+                [
+                    "DROP TRIGGER aircraft_identity_correction_observation_immutable_delete",
+                    "CREATE TRIGGER aircraft_identity_correction_observation_immutable_delete BEFORE DELETE ON aircraft_identity_observations BEGIN SELECT 1; END",
+                ],
+            ),
+            (
+                "aircraft-correction-noop-receipt-gate",
+                [
+                    "DROP TRIGGER aircraft_source_identity_receipt_gate",
+                    "CREATE TRIGGER aircraft_source_identity_receipt_gate BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified ON aircraft_sale_listings BEGIN SELECT 1; END",
+                ],
+            ),
+        ] {
+            assert_corrupt_identity_correction_schema_rejected(label, &statements).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_semantically_weakened_correction_triggers() {
+        for (label, statements) in [
+            (
+                "aircraft-correction-decision-when-false",
+                [
+                    "DROP TRIGGER aircraft_listing_identity_corrections_immutable_update",
+                    "CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update BEFORE UPDATE ON aircraft_listing_identity_correction_decisions WHEN 0 BEGIN SELECT RAISE(ABORT, 'aircraft listing identity correction decisions are immutable'); END",
+                ],
+            ),
+            (
+                "aircraft-correction-observation-inverted",
+                [
+                    "DROP TRIGGER aircraft_identity_correction_observation_immutable_update",
+                    "CREATE TRIGGER aircraft_identity_correction_observation_immutable_update BEFORE UPDATE ON aircraft_identity_observations WHEN NOT EXISTS (SELECT 1 FROM aircraft_listing_identity_correction_decisions decision WHERE decision.observation_id = OLD.id) BEGIN SELECT RAISE(ABORT, 'aircraft identity observations referenced by correction decisions are immutable'); END",
+                ],
+            ),
+            (
+                "aircraft-correction-receipt-extra-bypass",
+                [
+                    "DROP TRIGGER aircraft_source_identity_receipt_gate",
+                    "CREATE TRIGGER aircraft_source_identity_receipt_gate BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified ON aircraft_sale_listings WHEN OLD.ingestion_error = 'source_identity_correction_receipt_pending' AND (NEW.ingestion_error IS NOT OLD.ingestion_error OR NEW.ingestion_state IS NOT OLD.ingestion_state OR NEW.is_verified IS NOT OLD.is_verified) AND 1 = 0 AND NOT EXISTS (SELECT 1 FROM aircraft_listing_identity_correction_decisions decision JOIN plugin_submissions submission ON submission.id = decision.plugin_submission_id WHERE decision.aircraft_sale_listing_id = OLD.id AND decision.correction_kind = 'faa_serial' AND decision.rendered_html_sha256 = submission.rendered_html_sha256 AND submission.user_id = OLD.created_by_user_id AND submission.canonical_listing_id = OLD.id AND submission.extraction_error IS NULL AND NEW.registration_number IS decision.corrected_registration_number AND NEW.serial_number IS decision.corrected_serial_number) BEGIN SELECT RAISE(ABORT, 'source identity correction receipt is required before leaving the receipt gate'); END",
+                ],
+            ),
+            (
+                "aircraft-correction-decision-altered-body",
+                [
+                    "DROP TRIGGER aircraft_listing_identity_corrections_immutable_delete",
+                    "CREATE TRIGGER aircraft_listing_identity_corrections_immutable_delete BEFORE DELETE ON aircraft_listing_identity_correction_decisions BEGIN SELECT RAISE(ABORT, 'a different error'); END",
+                ],
+            ),
+        ] {
+            assert_corrupt_identity_correction_schema_rejected(label, &statements).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_canonical_schema_passes_end_to_end_startup() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let db = AppDb::connect(&database_url).await.unwrap();
+        db.ensure_required_migrations().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_correction_validation_rejects_altered_search_path_and_namespace() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        for statement in split_sql_statements(POSTGRES_SCHEMA_SQL) {
+            connection.execute(statement).await.unwrap();
+        }
+        drop(connection);
+        let db = AppDb {
+            backend: DatabaseBackend::Postgres(pool.clone()),
+        };
+        assert!(db
+            .aircraft_listing_identity_correction_definitions_valid()
+            .await
+            .unwrap());
+        pool.execute("DROP SCHEMA IF EXISTS attacker_schema CASCADE")
+            .await
+            .unwrap();
+        pool.execute("CREATE SCHEMA attacker_schema").await.unwrap();
+        pool.execute(
+            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+             SET search_path = attacker_schema, public",
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .aircraft_listing_identity_correction_definitions_valid()
+            .await
+            .unwrap());
+        pool.execute(
+            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+             SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .aircraft_listing_identity_correction_definitions_valid()
+            .await
+            .unwrap());
+
+        pool.execute(
+            "ALTER FUNCTION public.require_source_identity_correction_receipt() \
+             SET SCHEMA attacker_schema",
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .aircraft_listing_identity_correction_definitions_valid()
+            .await
+            .unwrap());
+
+        pool.execute(
+            "ALTER FUNCTION attacker_schema.require_source_identity_correction_receipt() \
+             SET SCHEMA public",
+        )
+        .await
+        .unwrap();
+        pool.execute("DROP SCHEMA attacker_schema").await.unwrap();
+        assert!(db
+            .aircraft_listing_identity_correction_definitions_valid()
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn canonical_sql_definitions_ignore_formatting_but_not_semantics() {
+        let expected =
+            "CREATE TRIGGER t BEFORE UPDATE ON x BEGIN SELECT RAISE(ABORT, 'Keep Case'); END";
+        let reformatted =
+            "create\n trigger t before update on x begin select raise(abort, 'Keep Case'); end";
+        assert_eq!(
+            canonical_sql_definition(expected),
+            canonical_sql_definition(reformatted)
+        );
+        assert_ne!(
+            canonical_sql_definition(expected),
+            canonical_sql_definition(&expected.replace("BEGIN", "WHEN 0 BEGIN"))
+        );
+        assert_ne!(
+            canonical_sql_definition(POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE),
+            canonical_sql_definition("BEGIN RETURN NEW; END;")
+        );
+    }
+
+    #[test]
+    fn aircraft_listing_identity_correction_contract_has_backend_parity() {
+        assert_eq!(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION, 1);
+        for contract_value in [
+            AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
+            AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(contract_value));
+            assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
+            assert!(
+                AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL.contains(contract_value)
+            );
+            assert!(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL
+                .contains(contract_value));
+        }
+        for required_object in [
+            "uq_plugin_submissions_signed_capture",
+            "uq_aircraft_listing_identity_correction_receipt",
+            "aircraft_listing_identity_corrections_immutable",
+            "aircraft_identity_correction_observation_immutable",
+            "aircraft_source_identity_receipt_gate",
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(required_object));
+            assert!(POSTGRES_SCHEMA_SQL.contains(required_object));
+            assert!(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL
+                .contains(required_object));
+            assert!(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL
+                .contains(required_object));
+        }
+    }
+
+    #[tokio::test]
+    async fn aircraft_listing_identity_correction_migration_reapplies_on_sqlite() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        for _ in 0..2 {
+            let mut connection = pool.acquire().await.unwrap();
+            for statement in
+                split_sql_statements(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL)
+            {
+                connection.execute(statement).await.unwrap();
+            }
+        }
+        db.ensure_required_migrations()
+            .await
+            .expect("the exact correction migration must safely reapply");
+        let foreign_key_errors: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn aircraft_listing_identity_correction_migration_rejects_uncontracted_table() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        pool.execute(
+            "CREATE TABLE aircraft_listing_identity_correction_decisions (id INTEGER PRIMARY KEY)",
+        )
+        .await
+        .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        let mut rejected = None;
+        for statement in
+            split_sql_statements(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL)
+        {
+            if let Err(error) = connection.execute(statement).await {
+                rejected = Some(error.to_string());
+                break;
+            }
+        }
+        let error = rejected.expect("an uncontracted same-name table must abort first install");
+        assert!(error.contains("CHECK constraint failed"));
     }
 
     fn table_columns(schema: &str, table: &str) -> Vec<String> {

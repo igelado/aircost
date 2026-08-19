@@ -9,6 +9,7 @@ use sqlx::FromRow;
 use super::{lookup_current, require_eligible, AircraftGrounding, BlockReason, Eligibility};
 use crate::aircraft::identity::{require_listing_identity_assignment, IdentityAssignmentError};
 use crate::db::{AppDb, DatabaseBackend};
+use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
 
 /// A listing or raw aircraft observation that cannot be admitted through the
 /// current FAA projection. Rejections preserve the source listing; callers
@@ -70,6 +71,34 @@ pub struct ListingAdmissionEvidence {
     pub faa_snapshot_date: String,
     pub faa_archive_sha256: String,
     pub faa_source_record_sha256: String,
+}
+
+/// A source serial that disagreed with the current FAA MASTER row and was
+/// replaced only after the same N-number was admitted with the FAA serial.
+/// The observed value remains source evidence; callers may use the corrected
+/// value in a working materialization copy but must not rewrite the source
+/// extraction checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FaaSerialCorrection {
+    pub observed_serial_number: String,
+    pub corrected_serial_number: String,
+}
+
+/// Exact current-FAA admission for a source observation, with an optional
+/// narrow serial correction. No other FAA rejection is softened by this path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceAircraftAdmission {
+    pub grounding: AircraftGrounding,
+    pub serial_correction: Option<FaaSerialCorrection>,
+}
+
+impl SourceAircraftAdmission {
+    pub fn effective_serial_number(&self) -> Option<&str> {
+        self.serial_correction
+            .as_ref()
+            .map(|correction| correction.corrected_serial_number.as_str())
+            .or(self.grounding.manufacturer_serial_raw.as_deref())
+    }
 }
 
 impl AircraftAdmissionError {
@@ -186,6 +215,135 @@ pub async fn require_aircraft_admission(
             snapshot_id,
         }),
     }
+}
+
+/// Admit one raw source identity, correcting only an explicit serial conflict
+/// from the exact current FAA row for the supplied N-number.
+///
+/// This operation is provider-free and performs no writes. A caller that uses
+/// the corrected value must retain the source extraction unchanged and record
+/// the returned correction at its materialization boundary.
+pub async fn admit_aircraft_source_identity(
+    db: &AppDb,
+    registration: Option<&str>,
+    serial: Option<&str>,
+    retained_source: Option<&str>,
+) -> Result<SourceAircraftAdmission, AircraftAdmissionError> {
+    match require_aircraft_admission(db, registration, serial).await {
+        Ok(grounding) => Ok(SourceAircraftAdmission {
+            grounding,
+            serial_correction: None,
+        }),
+        Err(
+            conflict @ AircraftAdmissionError::Rejected {
+                reason: BlockReason::SerialConflict,
+                ..
+            },
+        ) => {
+            let Some(observed_serial_number) = serial
+                .map(str::trim)
+                .filter(|serial| !serial.is_empty())
+                .map(str::to_string)
+            else {
+                return Err(conflict);
+            };
+            let Some(observed_registration) = registration
+                .map(str::trim)
+                .filter(|registration| !registration.is_empty())
+            else {
+                return Err(conflict);
+            };
+            let Some(retained_source) = retained_source else {
+                return Err(conflict);
+            };
+            if !listing_body_contains_exact_structurally_visible_text_span(
+                retained_source,
+                observed_registration,
+            ) || !listing_body_contains_exact_structurally_visible_text_span(
+                retained_source,
+                &observed_serial_number,
+            ) {
+                return Err(conflict);
+            }
+            let registration_grounding = require_aircraft_admission(db, registration, None).await?;
+            let Some(corrected_serial_number) = registration_grounding
+                .manufacturer_serial_raw
+                .as_deref()
+                .map(str::trim)
+                .filter(|serial| !serial.is_empty())
+                .map(str::to_string)
+            else {
+                return Err(conflict);
+            };
+            if !is_narrow_serial_typo(&observed_serial_number, &corrected_serial_number) {
+                return Err(conflict);
+            }
+            let grounding = require_aircraft_admission(
+                db,
+                Some(&registration_grounding.n_number),
+                Some(&corrected_serial_number),
+            )
+            .await?;
+            Ok(SourceAircraftAdmission {
+                grounding,
+                serial_correction: Some(FaaSerialCorrection {
+                    observed_serial_number,
+                    corrected_serial_number,
+                }),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The automatic source correction is deliberately limited to one internal
+/// transcription edit. Both normalized serials must be substantial, retain
+/// the same first and last two characters, and differ by exactly one inserted,
+/// deleted, or substituted character, or one adjacent transposition. Prefix
+/// and suffix edits remain manual because they are more likely to identify a
+/// different aircraft than a typographical error.
+fn is_narrow_serial_typo(observed: &str, registry: &str) -> bool {
+    let Some(observed) = super::normalize_serial_key(observed) else {
+        return false;
+    };
+    let Some(registry) = super::normalize_serial_key(registry) else {
+        return false;
+    };
+    let observed = observed.as_bytes();
+    let registry = registry.as_bytes();
+    if observed == registry
+        || observed.len() < 5
+        || registry.len() < 5
+        || observed[..2] != registry[..2]
+        || observed[observed.len() - 2..] != registry[registry.len() - 2..]
+        || observed.len().abs_diff(registry.len()) > 1
+    {
+        return false;
+    }
+    if observed.len() == registry.len() {
+        let differences = observed
+            .iter()
+            .zip(registry)
+            .enumerate()
+            .filter_map(|(index, (left, right))| (left != right).then_some(index))
+            .collect::<Vec<_>>();
+        return differences.len() == 1
+            || (differences.len() == 2
+                && differences[1] == differences[0] + 1
+                && observed[differences[0]] == registry[differences[1]]
+                && observed[differences[1]] == registry[differences[0]]);
+    }
+    let (shorter, longer) = if observed.len() < registry.len() {
+        (observed, registry)
+    } else {
+        (registry, observed)
+    };
+    let mismatch = shorter
+        .iter()
+        .zip(longer)
+        .position(|(left, right)| left != right)
+        .unwrap_or(shorter.len());
+    shorter[mismatch..] == longer[mismatch + 1..]
 }
 
 /// Load registration and serial for an existing listing and require only the
@@ -408,6 +566,59 @@ struct ListingAdmissionRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aircraft::faa::{
+        store_release, AircraftRecord, AircraftReference, MemberProvenance, Release,
+        ReleaseMetadata, TargetCoverage,
+    };
+
+    fn release(n_number: &str, serial: &str) -> Release {
+        Release {
+            metadata: ReleaseMetadata::official("2026-08-19", "a".repeat(64)),
+            source_manifest_sha256: "b".repeat(64),
+            target_set_sha256: "c".repeat(64),
+            master: MemberProvenance {
+                member_name: "MASTER.txt".into(),
+                sha256: "d".repeat(64),
+            },
+            aircraft_reference: MemberProvenance {
+                member_name: "ACFTREF.txt".into(),
+                sha256: "e".repeat(64),
+            },
+            engine_reference: MemberProvenance {
+                member_name: "ENGINE.txt".into(),
+                sha256: "f".repeat(64),
+            },
+            coverage: vec![TargetCoverage {
+                n_number: n_number.into(),
+                matched: true,
+            }],
+            aircraft: vec![AircraftRecord {
+                n_number: n_number.into(),
+                manufacturer_serial_raw: Some(serial.into()),
+                manufacturer_serial_key: super::super::normalize_serial_key(serial),
+                aircraft_code: "2072738".into(),
+                engine_code: None,
+                year_manufactured: Some(2020),
+                source_record_sha256: "1".repeat(64),
+            }],
+            aircraft_references: vec![AircraftReference {
+                aircraft_code: "2072738".into(),
+                manufacturer_name: Some("CESSNA".into()),
+                model_name: Some("182T".into()),
+                aircraft_type_code: None,
+                engine_type_code: None,
+                category_code: None,
+                certification_indicator_code: None,
+                engine_count: Some(1),
+                seat_count: Some(4),
+                weight_class_code: None,
+                cruise_speed_mph: None,
+                type_certificate_data_sheet: Some("3A13".into()),
+                type_certificate_holder: Some("Textron Aviation Inc.".into()),
+            }],
+            engine_references: Vec::new(),
+        }
+    }
 
     #[tokio::test]
     async fn raw_admission_rejects_when_no_registry_snapshot_exists() {
@@ -425,5 +636,63 @@ mod tests {
         );
         assert_eq!(error.listing_id(), None);
         assert!(error.to_string().contains("registry_snapshot_unavailable"));
+    }
+
+    #[test]
+    fn automatic_serial_typo_is_one_internal_edit_only() {
+        assert!(is_narrow_serial_typo("1823006", "18283006"));
+        assert!(is_narrow_serial_typo("18280306", "18283006"));
+        assert!(is_narrow_serial_typo("18283106", "18283006"));
+        assert!(!is_narrow_serial_typo("X8283006", "18283006"));
+        assert!(!is_narrow_serial_typo("18283009", "18283006"));
+        assert!(!is_narrow_serial_typo("1823009", "18283006"));
+        assert!(!is_narrow_serial_typo("WRONG-SERIAL", "18283006"));
+    }
+
+    #[tokio::test]
+    async fn source_correction_requires_exact_visible_registration_and_serial() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        store_release(&db, &release("N482TW", "18283006"))
+            .await
+            .unwrap();
+
+        let wrong_registration = admit_aircraft_source_identity(
+            &db,
+            Some("N482TW"),
+            Some("1823006"),
+            Some("Registration N482TX; serial 1823006"),
+        )
+        .await
+        .expect_err("a model-supplied N-number absent from retained source must stay rejected");
+        assert_eq!(
+            wrong_registration.block_reason(),
+            Some(&BlockReason::SerialConflict)
+        );
+
+        let missing_serial = admit_aircraft_source_identity(
+            &db,
+            Some("N482TW"),
+            Some("1823006"),
+            Some("Registration N482TW; serial unavailable"),
+        )
+        .await
+        .expect_err("the observed serial must also be exact retained-source text");
+        assert_eq!(
+            missing_serial.block_reason(),
+            Some(&BlockReason::SerialConflict)
+        );
+
+        let unrelated_serial = admit_aircraft_source_identity(
+            &db,
+            Some("N482TW"),
+            Some("99999999"),
+            Some("Registration N482TW; serial 99999999"),
+        )
+        .await
+        .expect_err("an unrelated serial is not an automatic typo correction");
+        assert_eq!(
+            unrelated_serial.block_reason(),
+            Some(&BlockReason::SerialConflict)
+        );
     }
 }

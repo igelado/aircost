@@ -394,6 +394,40 @@ image hashes, byte counts, and token usage for audit. An FAA-confirmed identity
 repair is independent of later aircraft/avionics enrichment, so an unrelated
 enrichment review cannot erase the recovered identity or its evidence.
 
+Existing FAA-blocked listings use the same visual contract through an explicit
+reviewer repair action. Provider-free preflight returns a hash of the current
+listing identity and retained capture plus the allowlisted retained visual
+assets; it never downloads an image or calls Gemini. The reviewer selects one
+asset. The server downloads exactly that current asset through the guarded
+media path and sends only those bytes to the visual model. An applied decision
+stores that fresh download's SHA-256, byte count, MIME type, visible bounding
+evidence, interaction/model identity, and prompt/schema versions. A mutable CDN
+URL is not proof that the bytes equal an earlier ingestion download.
+
+Visual recovery is only a candidate. Missing, invalid, or currently unassigned
+registrations must still pass exact target-scoped admission in the latest FAA
+MASTER projection. A visually unchanged N-number absent from current MASTER
+returns `recovered_registration_not_found` and changes no listing data. A valid
+candidate outside the imported target set returns `faa_target_import_required`
+and likewise performs no listing mutation. The workflow does not store or use
+RESERVED or DEREG owner data. A narrow, exact-source serial typo on an already
+exact current FAA N-number uses the provider-free FAA serial correction instead
+of a photo. Other serial conflicts remain manual.
+
+Clean replay uses that same provider-free serial rule before materialization.
+Only a `serial_conflict` may be retried against the exact current FAA row for
+the same N-number. Both the N-number and observed serial must be exact visible
+retained-source spans. The observed and FAA serials must differ by only one
+internal insertion, deletion, substitution, or adjacent transposition while
+retaining their first and last two normalized characters. The working
+`ParsedListing` receives the FAA serial, while the extraction checkpoint
+remains byte-for-byte unchanged. After the capture is bound, the workflow
+rechecks the retained source, current FAA projection, exact submission binding,
+and raw extraction before recording the raw value, corrected FAA value,
+capture and extraction digests, snapshot, and FAA source-record digest as
+immutable history. This provider-free path does not ask Gemini to infer or
+repair an identifier.
+
 The model/variant split is important:
 
 - `model` is the broad economic family used for depreciation fitting.

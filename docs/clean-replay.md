@@ -60,8 +60,12 @@ All operational commands are dry-run unless `--apply` is supplied.
    aircraft, avionics, review, and finalization workflow in create-only mode, so
    it cannot refresh or repair a preexisting listing. The listing observation
    timestamp is restored from the capture's `submitted_at`. FAA rejection is a
-   typed result and leaves the checkpoint unbound. Any failure after creation
-   compensates the newly created listing and binding.
+   typed result and leaves the checkpoint unbound. For a narrow FAA serial
+   correction, listing insertion and checkpoint binding are one transaction.
+   A later failure retains that private receipt-gated pair, and an exact retry
+   deterministically resumes child projections, writes one correction receipt,
+   and finalizes the same listing. Uncorrected replay failures still compensate
+   the newly created listing and binding.
 
 ## Avionics terminal state
 
@@ -79,4 +83,3 @@ writes the corresponding immutable receipt when it resolves the aspect.
 `reconcile-replay-avionics` is a provider-free audit/backfill for already-bound
 captures. It records only unambiguous, provable retained associations and never
 infers a discard because a listing link is absent.
-

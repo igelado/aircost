@@ -6,8 +6,9 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::aircraft::faa::{
-    normalize_serial_key, require_aircraft_admission, require_listing_admission,
-    require_listing_faa_admission, AircraftAdmissionError, AircraftGrounding,
+    admit_aircraft_source_identity, normalize_serial_key, require_aircraft_admission,
+    require_listing_admission, require_listing_faa_admission, AircraftAdmissionError,
+    AircraftGrounding, FaaSerialCorrection,
 };
 use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
@@ -173,12 +174,39 @@ pub enum ListingFinalizationOutcome {
 pub(crate) struct ListingCreationResult {
     pub(crate) listing: SaleListing,
     pub(crate) occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
+    pub(crate) source_serial_correction: Option<FaaSerialCorrection>,
+    pub(crate) created_new_listing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ListingCreationMode {
     Ordinary,
+    SignedSource,
     CreateOnly,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SignedSourceListingBinding {
+    pub submission_id: i64,
+    pub observed_at: String,
+    pub checkpoint_replacement: Option<SignedSourceCheckpointReplacement>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SignedSourceCheckpointReplacement {
+    pub expected_extracted_listing_json: Option<String>,
+    pub expected_extraction_error: Option<String>,
+    pub extracted_listing_json: String,
+}
+
+impl ListingCreationMode {
+    fn may_reuse_listing(self) -> bool {
+        self != Self::CreateOnly
+    }
+
+    fn permits_source_serial_correction(self) -> bool {
+        matches!(self, Self::SignedSource | Self::CreateOnly)
+    }
 }
 
 #[derive(Debug)]
@@ -191,6 +219,8 @@ const AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON: &str =
     "Automated product verification could not complete safely. Confirm or discard this observation manually.";
 const AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON: &str =
     "The product identity was verified automatically, but the listing does not provide high-confidence evidence that this unit is installed.";
+pub(crate) const SOURCE_IDENTITY_RECEIPT_PENDING: &str =
+    "source_identity_correction_receipt_pending";
 
 #[derive(Clone, Debug)]
 struct ListingValues {
@@ -391,6 +421,7 @@ pub async fn create_listing_with_progress(
         extractor,
         progress,
         ListingCreationMode::Ordinary,
+        None,
     )
     .await?
     .listing)
@@ -404,6 +435,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
     extractor: Option<&GeminiListingExtractor>,
     progress: Option<&ListingProgressSender>,
     creation_mode: ListingCreationMode,
+    signed_source_binding: Option<&SignedSourceListingBinding>,
 ) -> StoreResult<ListingCreationResult> {
     emit_listing_progress(
         progress,
@@ -411,26 +443,57 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         "Verifying extracted listing fields",
     );
     let mut values = values_from_preview(preview, original_listing)?;
-    let missing_identity_source_candidate = match (creation_mode, values.source_url.as_deref()) {
+    let literal_identity_values = values.clone();
+    let mut missing_identity_source_candidate = match (creation_mode, values.source_url.as_deref())
+    {
         (ListingCreationMode::CreateOnly, _) => None,
-        (ListingCreationMode::Ordinary, Some(source_url)) => {
+        (_, Some(source_url)) => {
             unverified_listing_for_missing_identity_source(db, user_id, source_url).await?
         }
-        (ListingCreationMode::Ordinary, None) => None,
+        (_, None) => None,
     };
+    let retained_serial_evidence =
+        if creation_mode == ListingCreationMode::SignedSource && values.serial_number.is_some() {
+            None
+        } else {
+            missing_identity_source_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.serial_number.as_deref())
+        };
     let admission_serial = serial_evidence_for_identity_repair_admission(
         values.serial_number.as_deref(),
-        missing_identity_source_candidate
-            .as_ref()
-            .and_then(|candidate| candidate.serial_number.as_deref()),
+        retained_serial_evidence,
     )?;
-    let grounding = require_aircraft_admission(
-        db,
-        values.registration_number.as_deref(),
-        admission_serial.as_deref(),
-    )
-    .await
-    .map_err(listing_admission_error)?;
+    let (grounding, source_serial_correction) = if creation_mode.permits_source_serial_correction()
+    {
+        let admission = admit_aircraft_source_identity(
+            db,
+            values.registration_number.as_deref(),
+            admission_serial.as_deref(),
+            preview.context_text.as_deref(),
+        )
+        .await
+        .map_err(listing_admission_error)?;
+        (admission.grounding, admission.serial_correction)
+    } else {
+        (
+            require_aircraft_admission(
+                db,
+                values.registration_number.as_deref(),
+                admission_serial.as_deref(),
+            )
+            .await
+            .map_err(listing_admission_error)?,
+            None,
+        )
+    };
+    let may_reuse_listing = creation_mode.may_reuse_listing() && source_serial_correction.is_none();
+    if !may_reuse_listing {
+        // A source serial correction is materialized as an isolated observation.
+        // No existing row may change before the signed capture and immutable
+        // correction receipt have both been persisted.
+        missing_identity_source_candidate = None;
+    }
     apply_faa_grounding_identity(&mut values, &grounding);
     let identity_repair_listing_id = match (
         values.source_url.as_deref(),
@@ -466,14 +529,24 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
     // Prefer the exact source row repaired above. Looking it up again by tail
     // could select a different, newer listing if the user has retained more
     // than one observation for the same aircraft.
-    if creation_mode == ListingCreationMode::Ordinary {
+    if may_reuse_listing {
         if let Some(listing_id) = identity_repair_listing_id {
             emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
-            update_listing_values(db, listing_id, &values, true, true).await?;
+            update_listing_values(
+                db,
+                listing_id,
+                &values,
+                &literal_identity_values,
+                true,
+                true,
+                false,
+            )
+            .await?;
             replace_listing_pending_review(
                 db,
                 listing_id,
                 &resolved_avionics.pending_review_aspects,
+                false,
             )
             .await?;
             emit_listing_progress(
@@ -486,21 +559,33 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
             return Ok(ListingCreationResult {
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+                source_serial_correction,
+                created_new_listing: false,
             });
         }
     }
 
-    if creation_mode == ListingCreationMode::Ordinary {
+    if may_reuse_listing {
         if let Some(registration_number) = &values.registration_number {
             if let Some(listing_id) =
                 unverified_listing_id_for_tail(db, user_id, registration_number).await?
             {
                 emit_listing_progress(progress, "saving_listing", "Updating existing listing");
-                update_listing_values(db, listing_id, &values, true, true).await?;
+                update_listing_values(
+                    db,
+                    listing_id,
+                    &values,
+                    &literal_identity_values,
+                    true,
+                    true,
+                    false,
+                )
+                .await?;
                 replace_listing_pending_review(
                     db,
                     listing_id,
                     &resolved_avionics.pending_review_aspects,
+                    false,
                 )
                 .await?;
                 emit_listing_progress(
@@ -518,22 +603,34 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 return Ok(ListingCreationResult {
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+                    source_serial_correction,
+                    created_new_listing: false,
                 });
             }
         }
     }
 
-    if creation_mode == ListingCreationMode::Ordinary {
+    if may_reuse_listing {
         if let Some(source_url) = values.source_url.as_deref() {
             if let Some(listing_id) =
                 unverified_listing_id_for_missing_identity_source(db, user_id, source_url).await?
             {
                 emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
-                update_listing_values(db, listing_id, &values, true, true).await?;
+                update_listing_values(
+                    db,
+                    listing_id,
+                    &values,
+                    &literal_identity_values,
+                    true,
+                    true,
+                    false,
+                )
+                .await?;
                 replace_listing_pending_review(
                     db,
                     listing_id,
                     &resolved_avionics.pending_review_aspects,
+                    false,
                 )
                 .await?;
                 emit_listing_progress(
@@ -551,14 +648,14 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 return Ok(ListingCreationResult {
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+                    source_serial_correction,
+                    created_new_listing: false,
                 });
             }
         }
     }
 
-    if creation_mode == ListingCreationMode::Ordinary
-        && resolved_avionics.pending_review_aspects.is_empty()
-    {
+    if may_reuse_listing && resolved_avionics.pending_review_aspects.is_empty() {
         if let Some(listing_id) = matching_verified_listing_id(db, &values).await? {
             emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
             refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
@@ -573,14 +670,37 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
             return Ok(ListingCreationResult {
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+                source_serial_correction,
+                created_new_listing: false,
             });
         }
     }
 
     emit_listing_progress(progress, "saving_listing", "Saving listing");
-    let listing_id = insert_listing(db, user_id, &values).await?;
-    replace_listing_pending_review(db, listing_id, &resolved_avionics.pending_review_aspects)
-        .await?;
+    let listing_id = insert_listing(
+        db,
+        user_id,
+        &values,
+        &literal_identity_values,
+        source_serial_correction.is_some(),
+        signed_source_binding,
+    )
+    .await?;
+    replace_listing_pending_review(
+        db,
+        listing_id,
+        &resolved_avionics.pending_review_aspects,
+        source_serial_correction.is_some(),
+    )
+    .await?;
+    if source_serial_correction.is_some() {
+        return Ok(ListingCreationResult {
+            listing: get_listing(db, user_id, listing_id).await?,
+            occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+            source_serial_correction,
+            created_new_listing: true,
+        });
+    }
     emit_listing_progress(
         progress,
         "refreshing_estimates",
@@ -590,7 +710,125 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
     Ok(ListingCreationResult {
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+        source_serial_correction,
+        created_new_listing: true,
     })
+}
+
+/// Resume only the durable post-bind state of one corrected signed capture.
+/// The listing must still be in the database-enforced receipt gate and must
+/// already contain the exact current FAA correction represented by the raw
+/// retained extraction. All child projections are deterministic replacements,
+/// so a process restart can safely replay them before inserting the receipt.
+pub(crate) async fn resume_signed_source_correction_listing(
+    db: &AppDb,
+    user_id: i64,
+    listing_id: i64,
+    preview: &ListingPreview,
+    extractor: Option<&GeminiListingExtractor>,
+) -> StoreResult<ListingCreationResult> {
+    let mut values = values_from_preview(preview, None)?;
+    let literal_identity_values = values.clone();
+    let admission = admit_aircraft_source_identity(
+        db,
+        values.registration_number.as_deref(),
+        values.serial_number.as_deref(),
+        preview.context_text.as_deref(),
+    )
+    .await
+    .map_err(listing_admission_error)?;
+    let source_serial_correction = admission.serial_correction.ok_or_else(|| {
+        ListingStoreError::State(
+            "receipt-gated signed listing no longer has its exact FAA serial correction"
+                .to_string(),
+        )
+    })?;
+    apply_faa_grounding_identity(&mut values, &admission.grounding);
+    let current = get_listing(db, user_id, listing_id).await?;
+    if current.created_by_user_id != user_id
+        || current.source_url != values.source_url
+        || current.ingestion_state != "quarantined"
+        || current.ingestion_error.as_deref() != Some(SOURCE_IDENTITY_RECEIPT_PENDING)
+        || current.registration_number != values.registration_number
+        || current.serial_number != values.serial_number
+    {
+        return Err(ListingStoreError::State(format!(
+            "receipt-gated listing {listing_id} changed before deterministic recovery"
+        )));
+    }
+    let resolved_avionics = resolve_listing_avionics_values(
+        db,
+        &mut values,
+        extractor,
+        preview.source_url.as_deref(),
+        preview.context_text.as_deref(),
+    )
+    .await?;
+    update_listing_values(
+        db,
+        listing_id,
+        &values,
+        &literal_identity_values,
+        false,
+        true,
+        true,
+    )
+    .await?;
+    replace_listing_pending_review(
+        db,
+        listing_id,
+        &resolved_avionics.pending_review_aspects,
+        true,
+    )
+    .await?;
+    Ok(ListingCreationResult {
+        listing: get_listing(db, user_id, listing_id).await?,
+        occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+        source_serial_correction: Some(source_serial_correction),
+        created_new_listing: false,
+    })
+}
+
+pub(crate) async fn finalize_signed_source_listing_after_receipt(
+    db: &AppDb,
+    user_id: i64,
+    listing_id: i64,
+    submission_id: i64,
+    extractor: Option<&GeminiListingExtractor>,
+    listing_text: Option<&str>,
+) -> StoreResult<SaleListing> {
+    let receipt_count = query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT COUNT(*)
+        FROM aircraft_listing_identity_correction_decisions decision
+        JOIN plugin_submissions submission
+          ON submission.id = decision.plugin_submission_id
+        JOIN aircraft_sale_listings listing
+          ON listing.id = decision.aircraft_sale_listing_id
+        WHERE decision.aircraft_sale_listing_id = ?
+          AND decision.plugin_submission_id = ?
+          AND decision.correction_kind = 'faa_serial'
+          AND decision.rendered_html_sha256 = submission.rendered_html_sha256
+          AND submission.user_id = ?
+          AND submission.canonical_listing_id = decision.aircraft_sale_listing_id
+          AND submission.extraction_error IS NULL
+          AND listing.created_by_user_id = submission.user_id
+          AND listing.registration_number = decision.corrected_registration_number
+          AND listing.serial_number = decision.corrected_serial_number
+        "#,
+        listing_id,
+        submission_id,
+        user_id
+    )?;
+    if receipt_count != 1 {
+        return Err(ListingStoreError::State(format!(
+            "listing {listing_id} has no exact bound source identity correction receipt"
+        )));
+    }
+    finalize_listing_ingestion(db, listing_id, extractor, listing_text).await?;
+    get_listing(db, user_id, listing_id).await
 }
 
 fn emit_listing_progress(progress: Option<&ListingProgressSender>, stage: &str, message: &str) {
@@ -743,9 +981,18 @@ pub async fn update_listing(
     } else {
         None
     };
-    update_listing_values(db, listing_id, &values, false, explicitly_replaces_avionics).await?;
+    update_listing_values(
+        db,
+        listing_id,
+        &values,
+        &values,
+        false,
+        explicitly_replaces_avionics,
+        false,
+    )
+    .await?;
     if let Some(pending_review_aspects) = pending_review_aspects {
-        replace_listing_pending_review(db, listing_id, &pending_review_aspects).await?;
+        replace_listing_pending_review(db, listing_id, &pending_review_aspects, false).await?;
     }
     finalize_listing_ingestion(db, listing_id, extractor, None).await?;
     let updated = get_listing(db, user_id, listing_id).await?;
@@ -811,13 +1058,24 @@ async fn pending_aircraft_compatibility_variant_id(db: &AppDb) -> StoreResult<i6
     )?)
 }
 
-async fn insert_listing(db: &AppDb, user_id: i64, values: &ListingValues) -> StoreResult<i64> {
+async fn insert_listing(
+    db: &AppDb,
+    user_id: i64,
+    values: &ListingValues,
+    literal_identity_values: &ListingValues,
+    source_identity_receipt_pending: bool,
+    signed_source_binding: Option<&SignedSourceListingBinding>,
+) -> StoreResult<i64> {
+    if signed_source_binding.is_some() && !source_identity_receipt_pending {
+        return Err(ListingStoreError::State(
+            "a signed-source binding may be attached here only to a receipt-gated correction"
+                .to_string(),
+        ));
+    }
     let aircraft_model_variant_id = pending_aircraft_compatibility_variant_id(db).await?;
     let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
     let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;
-    let listing_id = query_scalar_one!(
-        db,
-        i64,
+    let insert_sql = db.sql(
         r#"
         INSERT INTO aircraft_sale_listings (
           aircraft_model_variant_id,
@@ -830,6 +1088,7 @@ async fn insert_listing(db: &AppDb, user_id: i64, values: &ListingValues) -> Sto
           added_at,
           status,
           ingestion_state,
+          ingestion_error,
           registration_number,
           serial_number,
           airframe_hours,
@@ -850,45 +1109,148 @@ async fn insert_listing(db: &AppDb, user_id: i64, values: &ListingValues) -> Sto
           installed_propeller_evidence_text,
           installed_propeller_confidence
         )
-        VALUES (?, ?, FALSE, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, 'incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, FALSE, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING id
         "#,
-        aircraft_model_variant_id,
-        user_id,
-        values.source_url.as_deref(),
-        values.model_year,
-        values.asking_price_usd,
-        values.currency.as_str(),
-        values.status.as_str(),
-        values.registration_number.as_deref(),
-        values.serial_number.as_deref(),
-        values.airframe_hours,
-        values.engine_hours,
-        values.engine_time_basis.as_str(),
-        values.engine_time_evidence.as_deref(),
-        values.engine_time_confidence.as_deref(),
-        values.propeller_hours,
-        values.propeller_time_basis.as_str(),
-        values.propeller_time_evidence.as_deref(),
-        values.propeller_time_confidence.as_deref(),
-        installed_engine_model_id,
-        installed_engine_model_id.and(values.source_url.as_deref()),
-        values.installed_engine_evidence_text.as_deref(),
-        values.installed_engine_confidence.as_deref(),
-        installed_propeller_model_id,
-        installed_propeller_model_id.and(values.source_url.as_deref()),
-        values.installed_propeller_evidence_text.as_deref(),
-        values.installed_propeller_confidence.as_deref()
-    )?;
+    );
+    let retain_checkpoint_and_bind_submission_sql = db.sql(
+        r#"
+        UPDATE plugin_submissions
+        SET canonical_listing_id = ?
+        WHERE id = ? AND user_id = ? AND source_url = ?
+          AND canonical_listing_id IS NULL
+          AND extracted_listing_json IS NOT NULL
+          AND extraction_error IS NULL
+        "#,
+    );
+    let replace_checkpoint_and_bind_submission_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            UPDATE plugin_submissions
+            SET canonical_listing_id = ?, extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ? AND user_id = ? AND source_url = ?
+              AND canonical_listing_id IS NULL
+              AND extracted_listing_json IS ?
+              AND extraction_error IS ?
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            UPDATE plugin_submissions
+            SET canonical_listing_id = ?, extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ? AND user_id = ? AND source_url = ?
+              AND canonical_listing_id IS NULL
+              AND extracted_listing_json IS NOT DISTINCT FROM ?
+              AND extraction_error IS NOT DISTINCT FROM ?
+            "#
+        }
+    });
+    macro_rules! insert_and_bind {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            let listing_id = sqlx::query_scalar::<_, i64>(&insert_sql)
+                .bind(aircraft_model_variant_id)
+                .bind(user_id)
+                .bind(values.source_url.as_deref())
+                .bind(values.model_year)
+                .bind(values.asking_price_usd)
+                .bind(values.currency.as_str())
+                .bind(signed_source_binding.map(|binding| binding.observed_at.as_str()))
+                .bind(values.status.as_str())
+                .bind(if source_identity_receipt_pending {
+                    "quarantined"
+                } else {
+                    "incomplete"
+                })
+                .bind(source_identity_receipt_pending.then_some(SOURCE_IDENTITY_RECEIPT_PENDING))
+                .bind(values.registration_number.as_deref())
+                .bind(values.serial_number.as_deref())
+                .bind(values.airframe_hours)
+                .bind(values.engine_hours)
+                .bind(values.engine_time_basis.as_str())
+                .bind(values.engine_time_evidence.as_deref())
+                .bind(values.engine_time_confidence.as_deref())
+                .bind(values.propeller_hours)
+                .bind(values.propeller_time_basis.as_str())
+                .bind(values.propeller_time_evidence.as_deref())
+                .bind(values.propeller_time_confidence.as_deref())
+                .bind(installed_engine_model_id)
+                .bind(installed_engine_model_id.and(values.source_url.as_deref()))
+                .bind(values.installed_engine_evidence_text.as_deref())
+                .bind(values.installed_engine_confidence.as_deref())
+                .bind(installed_propeller_model_id)
+                .bind(installed_propeller_model_id.and(values.source_url.as_deref()))
+                .bind(values.installed_propeller_evidence_text.as_deref())
+                .bind(values.installed_propeller_confidence.as_deref())
+                .fetch_one(&mut *transaction)
+                .await?;
+            if let Some(binding) = signed_source_binding {
+                let bound = if let Some(replacement) = &binding.checkpoint_replacement {
+                    sqlx::query(&replace_checkpoint_and_bind_submission_sql)
+                        .bind(listing_id)
+                        .bind(replacement.extracted_listing_json.as_str())
+                        .bind(binding.submission_id)
+                        .bind(user_id)
+                        .bind(values.source_url.as_deref())
+                        .bind(replacement.expected_extracted_listing_json.as_deref())
+                        .bind(replacement.expected_extraction_error.as_deref())
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected()
+                } else {
+                    sqlx::query(&retain_checkpoint_and_bind_submission_sql)
+                        .bind(listing_id)
+                        .bind(binding.submission_id)
+                        .bind(user_id)
+                        .bind(values.source_url.as_deref())
+                        .execute(&mut *transaction)
+                        .await?
+                        .rows_affected()
+                };
+                if bound != 1 {
+                    return Err(ListingStoreError::State(
+                        "signed source changed before its corrected listing could be atomically bound"
+                            .to_string(),
+                    ));
+                }
+            }
+            transaction.commit().await?;
+            Ok::<i64, ListingStoreError>(listing_id)
+        }};
+    }
+    let listing_id = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => insert_and_bind!(pool)?,
+        DatabaseBackend::Postgres(pool) => insert_and_bind!(pool)?,
+    };
 
-    if let Err(error) = stage_literal_aircraft_identity_observation(db, listing_id, values).await {
-        return quarantine_after_error(db, listing_id, error).await;
+    if let Err(error) =
+        stage_literal_aircraft_identity_observation(db, listing_id, literal_identity_values).await
+    {
+        return retain_receipt_gate_or_quarantine(
+            db,
+            listing_id,
+            error,
+            source_identity_receipt_pending,
+        )
+        .await;
     }
     if let Err(error) = replace_listing_avionics(db, listing_id, &values.avionics).await {
-        return quarantine_after_error(db, listing_id, error).await;
+        return retain_receipt_gate_or_quarantine(
+            db,
+            listing_id,
+            error,
+            source_identity_receipt_pending,
+        )
+        .await;
     }
     if let Err(error) = replace_listing_facts(db, listing_id, values).await {
-        return quarantine_after_error(db, listing_id, error).await;
+        return retain_receipt_gate_or_quarantine(
+            db,
+            listing_id,
+            error,
+            source_identity_receipt_pending,
+        )
+        .await;
     }
     Ok(listing_id)
 }
@@ -897,8 +1259,10 @@ async fn update_listing_values(
     db: &AppDb,
     listing_id: i64,
     values: &ListingValues,
+    literal_identity_values: &ListingValues,
     update_added_at: bool,
     replace_avionics_links: bool,
+    preserve_source_identity_receipt_gate: bool,
 ) -> StoreResult<()> {
     let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
     let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;
@@ -906,6 +1270,11 @@ async fn update_listing_values(
         ", added_at = CURRENT_TIMESTAMP"
     } else {
         ""
+    };
+    let ingestion_assignment = if preserve_source_identity_receipt_gate {
+        "ingestion_state = 'quarantined', ingestion_error = 'source_identity_correction_receipt_pending', is_verified = FALSE,"
+    } else {
+        "ingestion_state = 'incomplete', ingestion_error = NULL,"
     };
     let update_sql = format!(
         r#"
@@ -916,8 +1285,7 @@ async fn update_listing_values(
               asking_price_usd = ?,
               currency = ?,
               status = ?,
-              ingestion_state = 'incomplete',
-              ingestion_error = NULL,
+              {ingestion_assignment}
               ingestion_completed_at = NULL,
               registration_number = ?,
               serial_number = ?,
@@ -972,16 +1340,36 @@ async fn update_listing_values(
         values.installed_propeller_confidence.as_deref(),
         listing_id
     )?;
-    if let Err(error) = stage_literal_aircraft_identity_observation(db, listing_id, values).await {
-        return quarantine_after_error(db, listing_id, error).await;
+    if let Err(error) =
+        stage_literal_aircraft_identity_observation(db, listing_id, literal_identity_values).await
+    {
+        return retain_receipt_gate_or_quarantine(
+            db,
+            listing_id,
+            error,
+            preserve_source_identity_receipt_gate,
+        )
+        .await;
     }
     if replace_avionics_links {
         if let Err(error) = replace_listing_avionics(db, listing_id, &values.avionics).await {
-            return quarantine_after_error(db, listing_id, error).await;
+            return retain_receipt_gate_or_quarantine(
+                db,
+                listing_id,
+                error,
+                preserve_source_identity_receipt_gate,
+            )
+            .await;
         }
     }
     if let Err(error) = replace_listing_facts(db, listing_id, values).await {
-        return quarantine_after_error(db, listing_id, error).await;
+        return retain_receipt_gate_or_quarantine(
+            db,
+            listing_id,
+            error,
+            preserve_source_identity_receipt_gate,
+        )
+        .await;
     }
     Ok(())
 }
@@ -2967,6 +3355,11 @@ async fn finalize_listing_ingestion(
     extractor: Option<&GeminiListingExtractor>,
     listing_text: Option<&str>,
 ) -> StoreResult<()> {
+    if source_identity_receipt_is_pending(db, listing_id).await? {
+        return Err(ListingStoreError::State(format!(
+            "listing {listing_id} is waiting for its immutable source identity correction receipt"
+        )));
+    }
     // Establish an FAA-backed aircraft assignment independently of avionics
     // review when the approved catalog already contains one exact identity.
     // Missing canonical catalog data is itself review work, not an ingestion
@@ -3011,10 +3404,25 @@ async fn finalize_listing_ingestion(
     }
 }
 
+async fn source_identity_receipt_is_pending(db: &AppDb, listing_id: i64) -> StoreResult<bool> {
+    Ok(query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT COUNT(*)
+        FROM aircraft_sale_listings
+        WHERE id = ? AND ingestion_error = ?
+        "#,
+        listing_id,
+        SOURCE_IDENTITY_RECEIPT_PENDING
+    )? == 1)
+}
+
 async fn replace_listing_pending_review(
     db: &AppDb,
     listing_id: i64,
     aspects: &[PendingReviewAspect],
+    preserve_source_identity_receipt_gate: bool,
 ) -> StoreResult<()> {
     match replace_pending_review(db, listing_id, None, aspects).await {
         Ok(_) => Ok(()),
@@ -3030,7 +3438,13 @@ async fn replace_listing_pending_review(
                 ),
                 None => format!("could not persist pending listing review: {error}"),
             };
-            quarantine_after_error(db, listing_id, ListingStoreError::State(detail)).await
+            retain_receipt_gate_or_quarantine(
+                db,
+                listing_id,
+                ListingStoreError::State(detail),
+                preserve_source_identity_receipt_gate,
+            )
+            .await
         }
     }
 }
@@ -3046,6 +3460,11 @@ pub async fn finalize_reviewed_listing_ingestion(
     extractor: Option<&GeminiListingExtractor>,
     listing_text: Option<&str>,
 ) -> Result<ListingFinalizationOutcome, ListingStoreError> {
+    if source_identity_receipt_is_pending(db, listing_id).await? {
+        return Err(ListingStoreError::State(format!(
+            "listing {listing_id} is waiting for its immutable source identity correction receipt"
+        )));
+    }
     let state = query_as_optional!(
         db,
         (String, bool),
@@ -3245,6 +3664,7 @@ async fn mark_listing_ready(db: &AppDb, listing_id: i64) -> StoreResult<()> {
             is_verified = CASE WHEN source_url IS NOT NULL THEN TRUE ELSE FALSE END,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
+          AND COALESCE(ingestion_error, '') <> 'source_identity_correction_receipt_pending'
           AND NOT EXISTS (
             SELECT 1
             FROM aircraft_sale_listing_pending_reviews review
@@ -3274,6 +3694,7 @@ async fn mark_reviewed_listing_ready(db: &AppDb, listing_id: i64) -> StoreResult
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
           AND source_url IS NOT NULL
+          AND COALESCE(ingestion_error, '') <> 'source_identity_correction_receipt_pending'
           AND NOT EXISTS (
             SELECT 1
             FROM aircraft_sale_listing_pending_reviews review
@@ -3361,6 +3782,21 @@ async fn quarantine_after_error<T>(
         listing_id,
         message,
     })
+}
+
+async fn retain_receipt_gate_or_quarantine<T>(
+    db: &AppDb,
+    listing_id: i64,
+    error: ListingStoreError,
+    preserve_source_identity_receipt_gate: bool,
+) -> StoreResult<T> {
+    if preserve_source_identity_receipt_gate {
+        return Err(ListingStoreError::Ingestion {
+            listing_id,
+            message: error.to_string(),
+        });
+    }
+    quarantine_after_error(db, listing_id, error).await
 }
 
 async fn listing_missing_avionics_metadata_count(db: &AppDb, listing_id: i64) -> StoreResult<i64> {
@@ -6320,6 +6756,133 @@ mod tests {
             super::get_listing(&db, user.id, listing_id)
                 .await
                 .expect("conflicting legacy listing should remain"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_source_serial_correction_isolated_from_same_source_and_tail() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        let variant_id = seed_curated_test_aircraft_catalog(&db, user.id).await;
+        let source_url = "https://example.test/listing/signed-source-serial-correction";
+        let existing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, is_verified,
+              source_url, model_year, asking_price_usd, currency, status,
+              ingestion_state, ingestion_error, registration_number, serial_number,
+              airframe_hours
+            )
+            VALUES (?, ?, FALSE, ?, 2020, 111111, 'USD', 'active',
+                    'quarantined', 'retain exact legacy row', 'N123T',
+                    'LEGACY-WRONG', 777)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id,
+            source_url
+        )
+        .expect("legacy same-source and same-tail listing should seed");
+        let before = super::get_listing(&db, user.id, existing_id)
+            .await
+            .expect("legacy listing should load");
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2020,
+            "asking_price_usd": 400000,
+            "currency": "USD",
+            "airframe_hours": 900,
+            "status": "active",
+            "registration_number": "N123T",
+            "serial_number": "TESTSERAL",
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+        preview.context_text = Some("Registration N123T; serial TESTSERAL".to_string());
+
+        let ordinary_error = super::create_listing(&db, user.id, &preview, None, None)
+            .await
+            .expect_err("ordinary listing creation must remain strict");
+        assert!(ordinary_error.to_string().contains("conflict"));
+        assert_eq!(
+            super::get_listing(&db, user.id, existing_id)
+                .await
+                .expect("strict rejection must retain the existing listing"),
+            before
+        );
+
+        let created = super::create_listing_with_progress_and_occurrence_dispositions(
+            &db,
+            user.id,
+            &preview,
+            None,
+            None,
+            None,
+            super::ListingCreationMode::SignedSource,
+            None,
+        )
+        .await
+        .expect("signed source admission should isolate the corrected observation");
+        assert!(created.created_new_listing);
+        assert_ne!(created.listing.id, existing_id);
+        assert_eq!(created.listing.serial_number.as_deref(), Some("TESTSERIAL"));
+        assert_eq!(created.listing.ingestion_state, "quarantined");
+        assert_eq!(
+            created.listing.ingestion_error.as_deref(),
+            Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
+        );
+        assert!(!created.listing.is_verified);
+        assert!(created.listing.ingestion_completed_at.is_none());
+        let gated_before_finalize = created.listing.clone();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        assert!(sqlx::query(
+            "UPDATE aircraft_sale_listings SET ingestion_state = 'incomplete', ingestion_error = NULL WHERE id = ?",
+        )
+        .bind(created.listing.id)
+        .execute(pool)
+        .await
+        .is_err(), "the database must reject bypassing the receipt gate directly");
+        let finalize_error = super::finalize_reviewed_listing_ingestion(
+            &db,
+            created.listing.id,
+            None,
+            preview.context_text.as_deref(),
+        )
+        .await
+        .expect_err("a corrected listing must not finalize before its bound receipt exists");
+        assert!(finalize_error
+            .to_string()
+            .contains("immutable source identity correction receipt"));
+        assert_eq!(
+            super::get_listing(&db, user.id, created.listing.id)
+                .await
+                .expect("receipt-gated listing should remain private"),
+            gated_before_finalize
+        );
+        assert_eq!(
+            created.source_serial_correction.as_ref().map(|correction| (
+                correction.observed_serial_number.as_str(),
+                correction.corrected_serial_number.as_str()
+            )),
+            Some(("TESTSERAL", "TESTSERIAL"))
+        );
+        assert_eq!(
+            super::get_listing(&db, user.id, existing_id)
+                .await
+                .expect("legacy listing should remain byte-for-byte unchanged"),
             before
         );
     }

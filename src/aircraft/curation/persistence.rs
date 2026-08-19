@@ -34,7 +34,8 @@ use crate::aircraft::identity::{
     PromotionCandidate,
 };
 use crate::aircraft::observations::{
-    retained_source_identity_evidence_matches, AircraftIdentityObservation,
+    operator_source_identity_evidence_matches, retained_source_identity_evidence_matches,
+    AircraftIdentityObservation,
 };
 use crate::db::{AppDb, DatabaseBackend};
 
@@ -800,10 +801,19 @@ fn validate_current_listing_source(
         .as_deref()
         .or(row.listing_source_url.as_deref());
     let exact_excerpt = expected.source_excerpt.as_deref().unwrap_or_default();
-    let exact = expected.source_kind == "retained_submission"
+    let automatic_evidence = expected.source_kind == "retained_submission"
+        && retained_source_identity_evidence_matches(rendered_html, expected);
+    let operator_evidence = expected.source_kind == "reviewer_corroborated_retained_submission"
+        && operator_source_identity_evidence_matches(
+            rendered_html,
+            exact_excerpt,
+            &expected.manufacturer,
+            &expected.model,
+            &expected.variant,
+        );
+    let exact = (automatic_evidence || operator_evidence)
         && expected.source_excerpt_is_exact
         && !exact_excerpt.trim().is_empty()
-        && retained_source_identity_evidence_matches(rendered_html, expected)
         && row.submission_id == expected.submission_id
         && selected_source_url == expected.source_url.as_deref()
         && row.rendered_html_sha256.as_deref() == expected.rendered_html_sha256.as_deref()
@@ -1625,26 +1635,6 @@ fn decision_evidence_ids(reviewable: &ReviewableAircraftHierarchy) -> BTreeSet<&
     .collect()
 }
 
-fn observation_legacy_hint(observation: &AircraftIdentityObservation) -> String {
-    serde_json::to_string(&json!({
-        "source_kind": observation.source_kind,
-        "submission_id": observation.submission_id,
-        "rendered_html_sha256": observation.rendered_html_sha256,
-        "cluster_key": observation.cluster_key,
-        "requires_human_review": observation.requires_human_review,
-        "review_reasons": observation.review_reasons,
-        "literal_fields": {
-            "manufacturer": observation.manufacturer,
-            "model": observation.model,
-            "variant": observation.variant,
-            "model_year": observation.model_year,
-            "serial_number": observation.serial_number,
-            "registration_number": observation.registration_number,
-        }
-    }))
-    .expect("observation persistence payload serializes")
-}
-
 async fn stage_observation_sqlite(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     observation: &AircraftIdentityObservation,
@@ -1654,15 +1644,14 @@ async fn stage_observation_sqlite(
             "exact observation excerpt disappeared before persistence".to_string(),
         )
     })?;
-    let legacy_hint_json = observation_legacy_hint(observation);
     sqlx::query(
         r#"
         INSERT INTO aircraft_identity_observations (
           aircraft_sale_listing_id, source_url, observed_make, observed_family,
           observed_designation, observed_generation, observed_package,
           model_year, serial_number, registration_number, market_code,
-          exact_source_evidence, observation_sha256, legacy_hint_json
-        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'US', ?, ?, ?)
+          exact_source_evidence, observation_sha256
+        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 'US', ?, ?)
         ON CONFLICT (observation_sha256) DO NOTHING
         "#,
     )
@@ -1676,7 +1665,6 @@ async fn stage_observation_sqlite(
     .bind(observation.registration_number.as_deref())
     .bind(exact_source_evidence)
     .bind(&observation.observation_sha256)
-    .bind(&legacy_hint_json)
     .execute(&mut **transaction)
     .await?;
     let row = sqlx::query_as::<_, ObservationRow>(
@@ -1704,15 +1692,14 @@ async fn stage_observation_postgres(
             "exact observation excerpt disappeared before persistence".to_string(),
         )
     })?;
-    let legacy_hint_json = observation_legacy_hint(observation);
     sqlx::query(
         r#"
         INSERT INTO aircraft_identity_observations (
           aircraft_sale_listing_id, source_url, observed_make, observed_family,
           observed_designation, observed_generation, observed_package,
           model_year, serial_number, registration_number, market_code,
-          exact_source_evidence, observation_sha256, legacy_hint_json
-        ) VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, $7, $8, 'US', $9, $10, $11)
+          exact_source_evidence, observation_sha256
+        ) VALUES ($1, $2, $3, $4, $5, NULL, NULL, $6, $7, $8, 'US', $9, $10)
         ON CONFLICT (observation_sha256) DO NOTHING
         "#,
     )
@@ -1726,7 +1713,6 @@ async fn stage_observation_postgres(
     .bind(observation.registration_number.as_deref())
     .bind(exact_source_evidence)
     .bind(&observation.observation_sha256)
-    .bind(&legacy_hint_json)
     .execute(&mut **transaction)
     .await?;
     let row = sqlx::query_as::<_, ObservationRow>(

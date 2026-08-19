@@ -376,12 +376,38 @@ export function isAircraftIdentityStatus(value) {
   if (value.status === "verified" && value.reason_code != null) {
     return false;
   }
+  if (value.repair != null && !isAircraftRepairPreflight(value.repair)) {
+    return false;
+  }
   return (value.reason_code == null || typeof value.reason_code === "string")
     && (value.faa_n_number == null || typeof value.faa_n_number === "string")
     && (
       value.faa_snapshot_id == null
       || (Number.isInteger(value.faa_snapshot_id) && value.faa_snapshot_id > 0)
     );
+}
+
+export function isAircraftRepairPreflight(value) {
+  if (!value || typeof value !== "object" || value.status !== "available") {
+    return false;
+  }
+  const actions = new Set(["visual_identifier", "faa_serial", "publisher_hierarchy"]);
+  return positiveInteger(value.listing_id) !== null
+    && typeof value.expected_state_sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(value.expected_state_sha256)
+    && typeof value.reason_code === "string"
+    && Array.isArray(value.actions)
+    && value.actions.length > 0
+    && value.actions.every((action) => actions.has(action))
+    && Array.isArray(value.visual_assets)
+    && value.visual_assets.every((asset) => (
+      asset
+      && typeof asset === "object"
+      && typeof asset.asset_id === "string"
+      && asset.asset_id.trim()
+      && typeof asset.media_url === "string"
+      && asset.media_url.startsWith("https://")
+    ));
 }
 
 export function aircraftIdentityIsVerified(value) {

@@ -471,6 +471,9 @@ GET /api/review/avionics/products?limit=25&cursor={opaque_cursor}
 GET /api/review/avionics/products/{product_id}/associations?limit=25&cursor={opaque_cursor}
 POST /api/review/avionics/products/{product_id}/attest
 POST /api/review/listings/{listing_id}/restage
+POST /api/review/listings/{listing_id}/aircraft/visual-recovery
+POST /api/review/listings/{listing_id}/aircraft/faa-serial
+POST /api/review/listings/{listing_id}/aircraft/publisher-hierarchy
 POST /api/review/listings/{listing_id}/avionics/rebuild
 POST /api/review/listings/{listing_id}/avionics/consolidate
 POST /api/review/listings/{listing_id}/avionics/use-existing
@@ -479,6 +482,22 @@ POST /api/review/listings/{listing_id}/avionics/verify-existing
 POST /api/review/listings/{listing_id}/avionics/approve-replacement
 POST /api/review/listings/{listing_id}/resolve
 ```
+
+The aircraft tab exposes only repair actions returned by provider-free
+preflight. Every request carries `expected_state_sha256`, which binds current
+identifiers, hierarchy, owner, retained submission, source URL, and rendered
+HTML digest. A serial conflict on an exact current FAA N-number offers the
+zero-Gemini FAA serial correction only when the retained source contains the
+exact N-number and observed serial and the FAA value is a narrow internal
+one-edit typo. Other serial conflicts require explicit evidence and manual
+adjudication. Missing, invalid, or unassigned
+registrations offer a reviewer-selected one-photo visual recovery when a safe
+retained asset exists. The server applies the visual result only after exact
+current FAA admission; non-covered candidates return an import-required result
+and N-numbers absent from current MASTER return a terminal not-assigned result,
+both without changing the listing. `source_evidence_missing` offers an exact
+visible publisher-span form; it changes no hierarchy labels and must contain
+the current maker, model, and variant under the bounded token rules.
 
 Explicit restaging is the recovery boundary for a synthetic preserved-link
 card whose covered listing association has changed since staging. It removes

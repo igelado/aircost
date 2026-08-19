@@ -565,6 +565,8 @@ pub struct ReviewAircraftIdentityStatus {
     pub faa_n_number: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faa_snapshot_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<crate::aircraft::repair::AircraftRepairPreflight>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -4784,17 +4786,29 @@ async fn load_listing_evidence_provenance(
 
 async fn load_aircraft_identity_status(
     db: &AppDb,
+    owner_user_id: i64,
     listing_id: i64,
 ) -> ReviewResult<ReviewAircraftIdentityStatus> {
-    match require_listing_admission(db, listing_id).await {
-        Ok(grounding) => Ok(ReviewAircraftIdentityStatus {
+    let mut status = match require_listing_admission(db, listing_id).await {
+        Ok(grounding) => ReviewAircraftIdentityStatus {
             status: ReviewAircraftIdentityState::Verified,
             reason_code: None,
             faa_n_number: Some(grounding.n_number),
             faa_snapshot_id: Some(grounding.snapshot.id),
-        }),
-        Err(error) => aircraft_identity_status_from_error(listing_id, error),
+            repair: None,
+        },
+        Err(error) => aircraft_identity_status_from_error(listing_id, error)?,
+    };
+    let repair = crate::aircraft::repair::preflight_aircraft_repair(db, owner_user_id, listing_id)
+        .await
+        .map_err(|error| ReviewError::Database(error.to_string()))?;
+    if matches!(
+        repair,
+        crate::aircraft::repair::AircraftRepairPreflight::Available { .. }
+    ) {
+        status.repair = Some(repair);
     }
+    Ok(status)
 }
 
 fn aircraft_identity_status_from_error(
@@ -4812,6 +4826,7 @@ fn aircraft_identity_status_from_error(
             reason_code: Some(block_reason_code(&reason).to_string()),
             faa_n_number: n_number,
             faa_snapshot_id: snapshot_id,
+            repair: None,
         }),
         AircraftAdmissionError::LookupFailed { message, .. } => Err(ReviewError::Database(
             format!("could not check FAA aircraft identity for listing {listing_id}: {message}"),
@@ -7454,7 +7469,7 @@ pub async fn get_listing_review(
     // without mutating the staged provenance row. Resolution accepts only a
     // request that still matches this current revision.
     let current_catalog_revision = approved_catalog_revision_sha256(db).await?;
-    let aircraft_identity = load_aircraft_identity_status(db, listing_id).await?;
+    let aircraft_identity = load_aircraft_identity_status(db, owner_user_id, listing_id).await?;
     let payload = parse_payload(
         &row.review_payload_json,
         Some(&row.review_payload_sha256),
@@ -10787,6 +10802,7 @@ mod tests {
                 reason_code: Some("canonical_identity_assignment_missing".to_string()),
                 faa_n_number: Some("N89225".to_string()),
                 faa_snapshot_id: Some(2),
+                repair: None,
             }
         );
         assert_eq!(
@@ -16145,14 +16161,22 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
 
         let detail = get_listing_review(&db, user_id, listing_id).await.unwrap();
         assert_eq!(
-            detail.review.aircraft_identity,
-            ReviewAircraftIdentityStatus {
-                status: ReviewAircraftIdentityState::CurationRequired,
-                reason_code: Some("missing_registration".to_string()),
-                faa_n_number: None,
-                faa_snapshot_id: None,
-            }
+            detail.review.aircraft_identity.status,
+            ReviewAircraftIdentityState::CurationRequired
         );
+        assert_eq!(
+            detail.review.aircraft_identity.reason_code.as_deref(),
+            Some("missing_registration")
+        );
+        assert!(matches!(
+            detail.review.aircraft_identity.repair,
+            Some(crate::aircraft::repair::AircraftRepairPreflight::Available {
+                reason_code,
+                actions,
+                ..
+            }) if reason_code == "missing_registration"
+                && actions == vec![crate::aircraft::repair::AircraftRepairAction::VisualIdentifier]
+        ));
         let assignment_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM aircraft_sale_listing_identity_assignments WHERE aircraft_sale_listing_id = ?",
         )
@@ -16210,6 +16234,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 reason_code: None,
                 faa_n_number: Some(n_number.to_string()),
                 faa_snapshot_id: Some(grounding.snapshot.id),
+                repair: None,
             }
         );
     }

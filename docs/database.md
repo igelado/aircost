@@ -1028,6 +1028,64 @@ grounded curation; it never authorizes an association. Search and URL Context
 are therefore reserved for observations that the local catalog and bounded
 comparison cannot resolve.
 
+Existing-listing aircraft corrections are retained in
+`aircraft_listing_identity_correction_decisions`. Each immutable decision
+references one immutable `aircraft_identity_observations` row and one validated
+`curation_evidence_claims` row. It also binds the listing/capture state hash,
+plugin submission and HTML digest, old and corrected identifiers, reviewer,
+and—where identifiers change—the exact current FAA snapshot and source-record
+digest. Visual decisions additionally retain the complete one-photo resolution
+audit. The current listing is updated only in the same transaction after all
+guards pass; source-evidence corroboration advances observation history without
+rewriting the retained submission. Apply
+`migrations/20260819_aircraft_listing_identity_corrections.*.sql` before using
+the repair endpoints on an existing database.
+
+The migration is idempotent only for its exact initial version-1 contract. A
+preexisting same-name correction table without that contract is rejected
+instead of being adopted. Startup independently validates the contract, both
+unique indexes and their ordered columns, decision and referenced-observation
+immutability triggers, and the receipt-gate definition. PostgreSQL installs
+these routines and relations in `public`, fully qualifies every application
+relation referenced by the routines, and pins each routine to
+`search_path=pg_catalog`. Startup also checks the exact relation and routine
+namespaces/OIDs, function configuration, and complete function source.
+
+Correction-referenced identity observations are database-immutable; unrelated
+observations remain mutable. A unique submission/kind receipt key prevents a
+retry from recording a second decision for the same correction boundary.
+
+The same decision table records clean-replay serial corrections. The imported
+submission keeps its raw extraction JSON; only the in-memory materialization
+copy uses the current FAA serial. The source N-number and raw serial must both
+be exact visible retained-capture spans, and automatic correction is limited to
+one internal insertion, deletion, substitution, or adjacent transposition with
+the same two-character prefix and suffix. Recording is allowed after binding
+only when listing, submission, rendered HTML, extraction payload, FAA snapshot,
+and FAA source record all still match.
+
+A corrected signed-source listing is inserted directly into a private
+`quarantined` receipt-gate state; it is never committed as an ordinary
+`incomplete` row first. Listing insertion and exact-capture binding are one
+transaction. Child projection, review attachment, or receipt failures retain
+that bound gated pair, never an unbound canonical correction. The database
+rejects leaving the gate without the exact bound FAA correction receipt. An
+exact submit, reprocess, or replay retry deterministically replaces child
+projections, records at most one receipt, and finalizes the same listing.
+Exact signed captures are unique by owner, plugin install, source URL, and
+rendered-HTML digest. Reprocessing may also replace a prior failed extraction
+checkpoint, clear its error, insert the quarantined listing, and bind the two
+in one guarded transaction; a crash after that transaction resumes from the
+new exact checkpoint.
+
+Correction evidence remains source-scoped. A registration-only photo
+observation records no serial or aircraft hierarchy; its decision separately
+retains the FAA-derived serial and FAA snapshot binding. An FAA serial
+observation records only the FAA registration/serial claim and never invents
+make, family, designation, or model year. The obsolete
+`aircraft_identity_observations.legacy_hint_json` column remains null and is
+not used by the application.
+
 The default mode is a zero-Gemini preflight. Start with one listing or inspect
 the first ten pending listings:
 

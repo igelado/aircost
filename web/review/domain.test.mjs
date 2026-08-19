@@ -19,6 +19,7 @@ import {
   existingProductVerificationRequest,
   groupProductAssociationsByListing,
   isAircraftIdentityStatus,
+  isAircraftRepairPreflight,
   isCompletedReviewMaintenanceResponse,
   listingAssociationCanValidateLocally,
   preselectedReviewAction,
@@ -600,6 +601,33 @@ test("validates strict aircraft identity status and distinguishes verified revie
   assert.equal(isAircraftIdentityStatus({ status: "verified", reason_code: "mismatch" }), false);
   assert.equal(isAircraftIdentityStatus({ status: "future_status" }), false);
   assert.equal(isAircraftIdentityStatus(null), false);
+});
+
+test("accepts only hash-bound typed aircraft repair preflight", () => {
+  const repair = {
+    status: "available",
+    listing_id: 20,
+    expected_state_sha256: "a".repeat(64),
+    reason_code: "missing_registration",
+    actions: ["visual_identifier"],
+    visual_assets: [{
+      asset_id: "11002235856",
+      media_url: "https://media.sandhills.com/example.jpg",
+      label: "Aircraft photo",
+    }],
+  };
+  assert.equal(isAircraftRepairPreflight(repair), true);
+  assert.equal(isAircraftIdentityStatus({
+    status: "curation_required",
+    reason_code: "missing_registration",
+    repair,
+  }), true);
+  assert.equal(isAircraftRepairPreflight({ ...repair, expected_state_sha256: "stale" }), false);
+  assert.equal(isAircraftRepairPreflight({ ...repair, actions: ["legacy_repair"] }), false);
+  assert.equal(isAircraftRepairPreflight({
+    ...repair,
+    visual_assets: [{ asset_id: "1", media_url: "http://unsafe.test/image.jpg" }],
+  }), false);
 });
 
 test("recognizes only the terminal review-maintenance response", () => {

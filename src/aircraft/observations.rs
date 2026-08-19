@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
-use crate::html::clean::{clean_publisher_source_html, normalize_source_evidence_span};
+use crate::html::clean::{
+    clean_publisher_source_html, listing_body_contains_exact_structurally_visible_text_span,
+    normalize_source_evidence_span,
+};
 
 const MAX_SOURCE_EXCERPT: usize = 2_000;
 const MAX_IDENTITY_EVIDENCE_TOKENS: usize = 32;
@@ -102,6 +105,12 @@ struct ObservationSourceRow {
     rendered_html_sha256: Option<String>,
     rendered_html: Option<String>,
     extracted_listing_json: Option<String>,
+    publisher_correction_evidence: Option<String>,
+    publisher_correction_observation_sha256: Option<String>,
+    publisher_correction_submission_id: Option<i64>,
+    publisher_correction_rendered_html_sha256: Option<String>,
+    publisher_correction_registration_number: Option<String>,
+    publisher_correction_serial_number: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -120,7 +129,6 @@ struct StoredObservationRow {
     market_code: Option<String>,
     exact_source_evidence: String,
     observation_sha256: String,
-    legacy_hint_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -251,23 +259,6 @@ pub async fn stage_aircraft_identity_observations(
         };
         report.eligible += 1;
 
-        let legacy_hint_json = serde_json::to_string(&serde_json::json!({
-            "source_kind": observation.source_kind,
-            "submission_id": observation.submission_id,
-            "rendered_html_sha256": observation.rendered_html_sha256,
-            "cluster_key": observation.cluster_key,
-            "requires_human_review": observation.requires_human_review,
-            "review_reasons": observation.review_reasons,
-            "literal_fields": {
-                "manufacturer": observation.manufacturer,
-                "model": observation.model,
-                "variant": observation.variant,
-                "model_year": observation.model_year,
-                "serial_number": observation.serial_number,
-                "registration_number": observation.registration_number,
-            }
-        }))
-        .expect("observation staging payload serializes");
         let sql = db.sql(
             r#"
             INSERT INTO aircraft_identity_observations (
@@ -283,9 +274,8 @@ pub async fn stage_aircraft_identity_observations(
               registration_number,
               market_code,
               exact_source_evidence,
-              observation_sha256,
-              legacy_hint_json
-            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, ?, ?, ?)
+              observation_sha256
+            ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL, ?, ?)
             ON CONFLICT (observation_sha256) DO NOTHING
             "#,
         );
@@ -301,7 +291,6 @@ pub async fn stage_aircraft_identity_observations(
                 .bind(observation.registration_number.as_deref())
                 .bind(exact_source_evidence)
                 .bind(&observation.observation_sha256)
-                .bind(&legacy_hint_json)
                 .execute(pool)
                 .await?
                 .rows_affected(),
@@ -316,19 +305,13 @@ pub async fn stage_aircraft_identity_observations(
                 .bind(observation.registration_number.as_deref())
                 .bind(exact_source_evidence)
                 .bind(&observation.observation_sha256)
-                .bind(&legacy_hint_json)
                 .execute(pool)
                 .await?
                 .rows_affected(),
         };
         if affected == 0 {
             let existing = load_stored_observation(db, &observation.observation_sha256).await?;
-            validate_stored_observation(
-                &existing,
-                observation,
-                exact_source_evidence,
-                &legacy_hint_json,
-            )?;
+            validate_stored_observation(&existing, observation, exact_source_evidence)?;
             match existing.aircraft_sale_listing_id {
                 Some(listing_id) if listing_id == observation.listing_id => {
                     report.already_present += 1;
@@ -398,7 +381,7 @@ async fn load_stored_observation(
                observed_family, observed_designation, observed_generation,
                observed_package, model_year, serial_number,
                registration_number, market_code, exact_source_evidence,
-               observation_sha256, legacy_hint_json
+               observation_sha256
         FROM aircraft_identity_observations
         WHERE observation_sha256 = ?
         "#,
@@ -428,7 +411,6 @@ fn validate_stored_observation(
     stored: &StoredObservationRow,
     expected: &AircraftIdentityObservation,
     exact_source_evidence: &str,
-    legacy_hint_json: &str,
 ) -> Result<(), AircraftObservationError> {
     let exact_match = stored.source_url == expected.source_url
         && stored.observed_make.as_deref() == Some(expected.manufacturer.as_str())
@@ -441,8 +423,7 @@ fn validate_stored_observation(
         && stored.registration_number == expected.registration_number
         && stored.market_code.is_none()
         && stored.exact_source_evidence == exact_source_evidence
-        && stored.observation_sha256 == expected.observation_sha256
-        && stored.legacy_hint_json.as_deref() == Some(legacy_hint_json);
+        && stored.observation_sha256 == expected.observation_sha256;
     if exact_match {
         Ok(())
     } else {
@@ -479,7 +460,33 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
         .as_deref()
         .map(clean_publisher_source_html)
         .unwrap_or_default();
-    let evidence = resolve_identity_evidence(&publisher_text, &manufacturer, &model, &variant);
+    let mut evidence = resolve_identity_evidence(&publisher_text, &manufacturer, &model, &variant);
+    let operator_correction_is_current = !evidence.is_exact()
+        && row.publisher_correction_submission_id == row.submission_id
+        && row.publisher_correction_rendered_html_sha256 == row.rendered_html_sha256
+        && usable(row.publisher_correction_registration_number.clone()) == registration_number
+        && usable(row.publisher_correction_serial_number.clone()) == serial_number
+        && row
+            .publisher_correction_evidence
+            .as_deref()
+            .is_some_and(|excerpt| {
+                row.rendered_html.as_deref().is_some_and(|rendered_html| {
+                    operator_source_identity_evidence_matches(
+                        rendered_html,
+                        excerpt,
+                        &manufacturer,
+                        &model,
+                        &variant,
+                    )
+                })
+            });
+    if operator_correction_is_current {
+        evidence = IdentityEvidenceResolution {
+            excerpt: row.publisher_correction_evidence.clone(),
+            status: IdentityEvidenceStatus::Exact,
+            resolver: "operator_corroborated_publisher_span_v1",
+        };
+    }
     let source_excerpt = evidence.excerpt.clone();
     let source_excerpt_is_exact = evidence.is_exact();
 
@@ -518,21 +525,27 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
     }
 
     let cluster_key = observation_cluster_key(&manufacturer, &model, &variant, model_year);
-    let observation_sha256 = observation_fingerprint(
-        row.listing_id,
-        row.submission_id,
-        row.rendered_html_sha256.as_deref(),
-        &manufacturer,
-        &model,
-        &variant,
-        model_year,
-        serial_number.as_deref(),
-        registration_number.as_deref(),
-        source_excerpt
-            .as_deref()
-            .filter(|_| source_excerpt_is_exact),
-        evidence.resolver,
-    );
+    let observation_sha256 = if operator_correction_is_current {
+        row.publisher_correction_observation_sha256
+            .clone()
+            .expect("current operator correction has an observation fingerprint")
+    } else {
+        observation_fingerprint(
+            row.listing_id,
+            row.submission_id,
+            row.rendered_html_sha256.as_deref(),
+            &manufacturer,
+            &model,
+            &variant,
+            model_year,
+            serial_number.as_deref(),
+            registration_number.as_deref(),
+            source_excerpt
+                .as_deref()
+                .filter(|_| source_excerpt_is_exact),
+            evidence.resolver,
+        )
+    };
 
     AircraftIdentityObservation {
         listing_id: row.listing_id,
@@ -547,7 +560,9 @@ fn observation_from_row(row: &ObservationSourceRow) -> AircraftIdentityObservati
         registration_number,
         source_excerpt,
         source_excerpt_is_exact,
-        source_kind: if row.rendered_html.is_some() {
+        source_kind: if operator_correction_is_current {
+            "reviewer_corroborated_retained_submission".to_string()
+        } else if row.rendered_html.is_some() {
             "retained_submission".to_string()
         } else {
             "stored_listing_fallback".to_string()
@@ -603,6 +618,29 @@ pub(crate) fn retained_source_identity_evidence_matches(
     ) == expected.observation_sha256
 }
 
+/// Validate a reviewer-selected publisher span without mechanically changing
+/// the listing hierarchy. The span must be one exact structurally visible body
+/// occurrence and must itself contain all current hierarchy components under
+/// the same bounded token rules used by automatic observation staging.
+pub(crate) fn operator_source_identity_evidence_matches(
+    rendered_html: &str,
+    exact_evidence: &str,
+    manufacturer: &str,
+    model: &str,
+    variant: &str,
+) -> bool {
+    let exact_evidence = exact_evidence.trim();
+    if exact_evidence.is_empty()
+        || !listing_body_contains_exact_structurally_visible_text_span(
+            rendered_html,
+            exact_evidence,
+        )
+    {
+        return false;
+    }
+    resolve_identity_evidence(exact_evidence, manufacturer, model, variant).is_exact()
+}
+
 async fn load_rows(
     db: &AppDb,
     limit: i64,
@@ -628,7 +666,13 @@ async fn load_rows(
           submission.source_url AS submission_source_url,
           submission.rendered_html_sha256,
           submission.rendered_html,
-          submission.extracted_listing_json
+          submission.extracted_listing_json,
+          correction.exact_source_evidence AS publisher_correction_evidence,
+          correction.observation_sha256 AS publisher_correction_observation_sha256,
+          correction.plugin_submission_id AS publisher_correction_submission_id,
+          correction.rendered_html_sha256 AS publisher_correction_rendered_html_sha256,
+          correction.corrected_registration_number AS publisher_correction_registration_number,
+          correction.corrected_serial_number AS publisher_correction_serial_number
         FROM aircraft_sale_listings listing
         JOIN aircraft_model_variants variant
           ON variant.id = listing.aircraft_model_variant_id
@@ -652,6 +696,25 @@ async fn load_rows(
               candidate.id DESC
             LIMIT 1
           )
+        LEFT JOIN (
+          SELECT decision.aircraft_sale_listing_id,
+                 decision.plugin_submission_id,
+                 decision.rendered_html_sha256,
+                 decision.corrected_registration_number,
+                 decision.corrected_serial_number,
+                 observation.exact_source_evidence,
+                 observation.observation_sha256
+          FROM aircraft_listing_identity_correction_decisions decision
+          JOIN aircraft_identity_observations observation
+            ON observation.id = decision.observation_id
+          WHERE decision.correction_kind = 'publisher_hierarchy'
+            AND decision.id = (
+              SELECT max(candidate.id)
+              FROM aircraft_listing_identity_correction_decisions candidate
+              WHERE candidate.aircraft_sale_listing_id = decision.aircraft_sale_listing_id
+                AND candidate.correction_kind = 'publisher_hierarchy'
+            )
+        ) correction ON correction.aircraft_sale_listing_id = listing.id
         {predicate}
         ORDER BY listing.id
         LIMIT ?
@@ -1454,6 +1517,12 @@ mod tests {
             submission_id: Some(10),
             submission_source_url: None,
             rendered_html_sha256: Some("b".repeat(64)),
+            publisher_correction_evidence: None,
+            publisher_correction_observation_sha256: None,
+            publisher_correction_submission_id: None,
+            publisher_correction_rendered_html_sha256: None,
+            publisher_correction_registration_number: None,
+            publisher_correction_serial_number: None,
             rendered_html: Some(
                 r#"
                 <html>
@@ -1514,6 +1583,12 @@ mod tests {
             submission_id: Some(10),
             submission_source_url: None,
             rendered_html_sha256: Some("b".repeat(64)),
+            publisher_correction_evidence: None,
+            publisher_correction_observation_sha256: None,
+            publisher_correction_submission_id: None,
+            publisher_correction_rendered_html_sha256: None,
+            publisher_correction_registration_number: None,
+            publisher_correction_serial_number: None,
             rendered_html: Some(
                 r#"
                 <html><body>
@@ -1587,6 +1662,12 @@ mod tests {
             submission_id: Some(9),
             submission_source_url: None,
             rendered_html_sha256: Some("a".repeat(64)),
+            publisher_correction_evidence: None,
+            publisher_correction_observation_sha256: None,
+            publisher_correction_submission_id: None,
+            publisher_correction_rendered_html_sha256: None,
+            publisher_correction_registration_number: None,
+            publisher_correction_serial_number: None,
             rendered_html: Some(
                 "1966 Cessna 182 182J, registration C-FOREIGN, serial CURRENT-SERIAL".to_string(),
             ),
