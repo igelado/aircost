@@ -16,7 +16,7 @@ pub use comparable::{ComparableConfig, ComparableModel};
 pub use structural::{fit_structural, StructuralFitConfig, StructuralModel};
 pub use types::*;
 
-pub const FEATURE_SCHEMA_VERSION: u32 = 2;
+pub const FEATURE_SCHEMA_VERSION: u32 = 3;
 
 pub trait ValuationModel: Send + Sync {
     fn model_version_id(&self) -> i64;

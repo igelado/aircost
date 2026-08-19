@@ -111,7 +111,6 @@ pub struct AvionicsValuation {
 pub struct AvionicsUsageCounts {
     pub visible_listings: i64,
     pub valuation_eligible_listings: i64,
-    pub legacy_defaults: i64,
     pub reference_configurations: i64,
     pub suite_relationships: i64,
 }
@@ -129,7 +128,6 @@ pub struct AvionicsCatalogDetail {
     pub suite_components: Vec<AvionicsSuiteRelationship>,
     pub suite_memberships: Vec<AvionicsSuiteRelationship>,
     pub listing_occurrences: Vec<AvionicsListingOccurrence>,
-    pub legacy_defaults: Vec<AvionicsLegacyDefaultUsage>,
     pub reference_configurations: Vec<AvionicsReferenceConfigurationUsage>,
 }
 
@@ -170,19 +168,6 @@ pub struct AvionicsListingOccurrence {
     pub source_confidence: Option<String>,
     pub valuation_eligible: bool,
     pub valuation_blockers: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct AvionicsLegacyDefaultUsage {
-    pub id: i64,
-    pub aircraft_model_variant_id: i64,
-    pub model_year: i64,
-    pub aircraft: String,
-    pub quantity: i64,
-    pub source_url: String,
-    pub source_title: String,
-    pub source_notes: String,
-    pub source_confidence: String,
 }
 
 /// `aircraft_reference_avionics` rows are append-only/immutable in the schema.
@@ -447,7 +432,6 @@ struct RawSummary {
     canonical_capability_count: i64,
     visible_listing_count: i64,
     valuation_eligible_listing_count: i64,
-    legacy_default_count: i64,
     reference_configuration_count: i64,
     suite_relationship_count: i64,
     approved_suite_component_count: i64,
@@ -514,8 +498,6 @@ fn summary_sql() -> String {
           AND (listing.is_verified = TRUE OR listing.created_by_user_id = ?)
           AND {VALUATION_ELIGIBLE_LISTING_LINK_PREDICATE}
       ) AS valuation_eligible_listing_count,
-      (SELECT COUNT(*) FROM aircraft_model_variant_default_avionics default_link
-        WHERE default_link.avionics_model_id = model.id) AS legacy_default_count,
       (SELECT COUNT(*) FROM aircraft_reference_avionics reference_link
         WHERE reference_link.avionics_model_id = model.id) AS reference_configuration_count,
       (SELECT COUNT(*) FROM avionics_suite_components suite_link
@@ -751,7 +733,6 @@ fn summary_from_raw(
         usage: AvionicsUsageCounts {
             visible_listings: row.visible_listing_count,
             valuation_eligible_listings: row.valuation_eligible_listing_count,
-            legacy_defaults: row.legacy_default_count,
             reference_configurations: row.reference_configuration_count,
             suite_relationships: row.suite_relationship_count,
         },
@@ -1111,76 +1092,6 @@ async fn load_listing_occurrences(
 }
 
 #[derive(Clone, Debug, FromRow)]
-struct LegacyDefaultRow {
-    id: i64,
-    aircraft_model_variant_id: i64,
-    model_year: i64,
-    manufacturer_name: String,
-    model_name: String,
-    variant_name: String,
-    quantity: i64,
-    source_url: String,
-    source_title: String,
-    source_notes: String,
-    source_confidence: String,
-}
-
-async fn load_legacy_defaults(
-    db: &AppDb,
-    model_id: i64,
-) -> InspectionResult<Vec<AvionicsLegacyDefaultUsage>> {
-    let sql = db.sql(
-        r#"
-        SELECT default_link.id, default_link.aircraft_model_variant_id,
-          default_link.model_year, manufacturer.name AS manufacturer_name,
-          aircraft_model.name AS model_name, variant.name AS variant_name,
-          default_link.quantity, default_link.source_url, default_link.source_title,
-          default_link.source_notes, default_link.source_confidence
-        FROM aircraft_model_variant_default_avionics default_link
-        JOIN aircraft_model_variants variant
-          ON variant.id = default_link.aircraft_model_variant_id
-        JOIN aircraft_models aircraft_model ON aircraft_model.id = variant.aircraft_model_id
-        JOIN aircraft_manufacturers manufacturer
-          ON manufacturer.id = aircraft_model.aircraft_manufacturer_id
-        WHERE default_link.avionics_model_id = ?
-        ORDER BY default_link.model_year DESC, lower(manufacturer.name),
-          lower(aircraft_model.name), lower(variant.name), default_link.id
-        "#,
-    );
-    let rows = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as::<_, LegacyDefaultRow>(&sql)
-                .bind(model_id)
-                .fetch_all(pool)
-                .await?
-        }
-        DatabaseBackend::Postgres(pool) => {
-            sqlx::query_as::<_, LegacyDefaultRow>(&sql)
-                .bind(model_id)
-                .fetch_all(pool)
-                .await?
-        }
-    };
-    Ok(rows
-        .into_iter()
-        .map(|row| AvionicsLegacyDefaultUsage {
-            id: row.id,
-            aircraft_model_variant_id: row.aircraft_model_variant_id,
-            model_year: row.model_year,
-            aircraft: format!(
-                "{} {} {}",
-                row.manufacturer_name, row.model_name, row.variant_name
-            ),
-            quantity: row.quantity,
-            source_url: row.source_url,
-            source_title: row.source_title,
-            source_notes: row.source_notes,
-            source_confidence: row.source_confidence,
-        })
-        .collect())
-}
-
-#[derive(Clone, Debug, FromRow)]
 struct ReferenceUsageRow {
     id: i64,
     configuration_id: i64,
@@ -1306,11 +1217,10 @@ pub async fn get_avionics_catalog_detail(
     };
     let mut capabilities = load_capabilities(db, Some(model_id)).await?;
     let summary = summary_from_raw(row, capabilities.remove(&model_id).unwrap_or_default());
-    let (suite_components, suite_memberships, listing_occurrences, legacy_defaults, references) = tokio::try_join!(
+    let (suite_components, suite_memberships, listing_occurrences, references) = tokio::try_join!(
         load_suite_relationships(db, model_id, true),
         load_suite_relationships(db, model_id, false),
         load_listing_occurrences(db, user_id, model_id),
-        load_legacy_defaults(db, model_id),
         load_reference_configurations(db, model_id),
     )?;
     Ok(AvionicsCatalogDetail {
@@ -1319,7 +1229,6 @@ pub async fn get_avionics_catalog_detail(
         suite_components,
         suite_memberships,
         listing_occurrences,
-        legacy_defaults,
         reference_configurations: references,
     })
 }
@@ -1359,7 +1268,6 @@ mod tests {
             canonical_capability_count: 0,
             visible_listing_count: 0,
             valuation_eligible_listing_count: 0,
-            legacy_default_count: 0,
             reference_configuration_count: 0,
             suite_relationship_count: 0,
             approved_suite_component_count: 0,

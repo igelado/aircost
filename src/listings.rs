@@ -13,7 +13,7 @@ use crate::aircraft::faa::{
 use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
 };
-use crate::aircraft::{enrich_aircraft_spec_for_listing_if_missing, AircraftStoreError};
+use crate::aircraft::reference::persistence::listing_reference_status;
 use crate::avionics::catalog::{
     resolve_avionics_identity, resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity,
     AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
@@ -21,10 +21,7 @@ use crate::avionics::catalog::{
 use crate::avionics::reuse::{
     reuse_attestation_is_current_postgres, reuse_attestation_is_current_sqlite,
 };
-use crate::avionics::{
-    enrich_listing_avionics_metadata, enrich_model_year_avionics_and_price_point_for_listing,
-    AvionicsStoreError,
-};
+use crate::avionics::{enrich_listing_avionics_metadata, AvionicsStoreError};
 use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{optional_f64, optional_i64, optional_string, GeminiListingExtractor};
@@ -3390,44 +3387,8 @@ async fn complete_listing_ingestion(
     db: &AppDb,
     listing_id: i64,
     extractor: Option<&GeminiListingExtractor>,
-    listing_text: Option<&str>,
+    _listing_text: Option<&str>,
 ) -> StoreResult<ListingFinalizationOutcome> {
-    match enrich_aircraft_spec_for_listing_if_missing(db, extractor, listing_id, listing_text).await
-    {
-        Ok(()) => {}
-        Err(AircraftStoreError::Database(message)) => {
-            return Err(ListingStoreError::Database(message));
-        }
-        Err(AircraftStoreError::NotFound(message)) => {
-            return Err(ListingStoreError::NotFound(message));
-        }
-        Err(AircraftStoreError::Model(message)) => {
-            require_listing_admission(db, listing_id)
-                .await
-                .map_err(listing_admission_error)?;
-            return pending_factory_reference(
-                db,
-                listing_id,
-                format!("factory aircraft specification remains pending: {message}"),
-            )
-            .await;
-        }
-    }
-    if listing_aircraft_spec_is_pending(db, listing_id).await? {
-        return pending_factory_reference(
-            db,
-            listing_id,
-            if extractor.is_some() {
-                "factory aircraft specification enrichment completed without valuation-ready reference data"
-                    .to_string()
-            } else {
-                "Gemini extractor is not configured; factory aircraft specification remains pending"
-                    .to_string()
-            },
-        )
-        .await;
-    }
-
     if listing_missing_avionics_metadata_count(db, listing_id).await? > 0 {
         let Some(extractor) = extractor else {
             return pending_factory_reference(
@@ -3468,49 +3429,15 @@ async fn complete_listing_ingestion(
         }
     }
 
-    if listing_model_year_factory_reference_is_pending(db, listing_id).await? {
-        let Some(extractor) = extractor else {
-            return pending_factory_reference(
-                db,
-                listing_id,
-                    "Gemini extractor is not configured; model-year factory reference data remains pending"
-                        .to_string(),
-            )
-            .await;
-        };
-        match enrich_model_year_avionics_and_price_point_for_listing(
-            db, extractor, true, listing_id, None, false,
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(AvionicsStoreError::Database(message)) => {
-                return Err(ListingStoreError::Database(message));
-            }
-            Err(AvionicsStoreError::Model(message)) => {
-                // The reference workflow repeats FAA admission before doing
-                // provider work. If that admission changed concurrently, it
-                // remains a listing failure rather than shared reference work.
-                require_listing_admission(db, listing_id)
-                    .await
-                    .map_err(listing_admission_error)?;
-                return pending_factory_reference(
-                    db,
-                    listing_id,
-                    format!("model-year factory reference curation remains pending: {message}"),
-                )
-                .await;
-            }
-        }
-        if listing_model_year_factory_reference_is_pending(db, listing_id).await? {
-            return pending_factory_reference(
-                db,
-                listing_id,
-                    "model-year factory reference curation completed without valuation-ready price and default-avionics data"
-                        .to_string(),
-            )
-            .await;
-        }
+    let reference = listing_reference_status(db, listing_id).await?;
+    if !reference.ready {
+        let reason = reference
+            .gaps
+            .iter()
+            .map(|gap| format!("{}: {}", gap.code, gap.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return pending_factory_reference(db, listing_id, reason).await;
     }
 
     if let Ok(Some(identity)) = listing_aircraft_identity(db, listing_id).await {
@@ -4046,97 +3973,8 @@ pub(crate) async fn listing_factory_reference_is_pending(
             "listing {listing_id} not found"
         )));
     }
-    Ok(listing_aircraft_spec_is_pending(db, listing_id).await?
-        || listing_missing_avionics_metadata_count(db, listing_id).await? > 0
-        || listing_model_year_factory_reference_is_pending(db, listing_id).await?)
-}
-
-async fn listing_aircraft_spec_is_pending(db: &AppDb, listing_id: i64) -> StoreResult<bool> {
-    Ok(query_scalar_one!(
-        db,
-        i64,
-        r#"
-        SELECT COUNT(*)
-        FROM aircraft_sale_listings listing
-        JOIN aircraft_model_variants variant
-          ON variant.id = listing.aircraft_model_variant_id
-        WHERE listing.id = ?
-          AND NOT EXISTS (
-            SELECT 1
-            FROM aircraft_model_spec_versions spec
-            WHERE spec.aircraft_model_id = variant.aircraft_model_id
-              AND spec.aircraft_model_variant_id = variant.id
-              AND spec.configuration_scope = 'factory_default'
-              AND spec.is_valuation_eligible = TRUE
-              AND spec.source_confidence = 'high'
-              AND spec.evidence_kind = 'authoritative_reference'
-          )
-        "#,
-        listing_id
-    )? > 0)
-}
-
-async fn listing_model_year_factory_reference_is_pending(
-    db: &AppDb,
-    listing_id: i64,
-) -> StoreResult<bool> {
-    let missing_count = query_scalar_one!(
-        db,
-        i64,
-        r#"
-        SELECT COUNT(*)
-        FROM aircraft_sale_listings listing
-        WHERE listing.id = ?
-          AND (
-            NOT EXISTS (
-              SELECT 1
-              FROM aircraft_model_variant_price_points price_point
-              WHERE price_point.aircraft_model_variant_id = listing.aircraft_model_variant_id
-                AND price_point.model_year = listing.model_year
-                AND price_point.purchase_price_reference_year = price_point.model_year
-                AND price_point.source_confidence = 'high'
-                AND price_point.evidence_kind = 'direct_model_year'
-                AND price_point.is_valuation_eligible = TRUE
-            )
-            OR NOT EXISTS (
-              SELECT 1
-              FROM aircraft_model_variant_default_avionics default_avionics
-              JOIN avionics_models model
-                ON model.id = default_avionics.avionics_model_id
-              WHERE default_avionics.aircraft_model_variant_id = listing.aircraft_model_variant_id
-                AND default_avionics.model_year = listing.model_year
-                AND default_avionics.source_confidence = 'high'
-                AND default_avionics.quantity > 0
-                AND TRIM(default_avionics.source_url) <> ''
-                AND LOWER(default_avionics.source_url) NOT LIKE '%/listing/%'
-                AND LOWER(default_avionics.source_url) NOT LIKE '%/listings/%'
-                AND LOWER(default_avionics.source_url) NOT LIKE '%/aircraft-for-sale/%'
-                AND LOWER(default_avionics.source_url) NOT LIKE '%/classifieds/%'
-                AND model.catalog_status = 'approved'
-                AND model.introduced_year IS NOT NULL
-                AND model.estimated_unit_value_usd >= 0
-                AND model.value_basis = 'installed_contribution'
-                AND model.replacement_cost_usd >= model.estimated_unit_value_usd
-                AND model.value_reference_year BETWEEN 1900 AND 2200
-                AND model.value_source IS NOT NULL
-                AND TRIM(model.value_source) <> ''
-                AND (
-                  model.valuation_scope <> 'integrated_suite'
-                  OR EXISTS (
-                    SELECT 1
-                    FROM avionics_suite_components membership
-                    JOIN avionics_models component
-                      ON component.id = membership.component_model_id
-                    WHERE membership.suite_model_id = model.id
-                      AND component.catalog_status = 'approved'
-                  )
-                )
-            )
-          )
-        "#,
-        listing_id
-    )?;
-    Ok(missing_count > 0)
+    Ok(!listing_reference_status(db, listing_id).await?.ready
+        || listing_missing_avionics_metadata_count(db, listing_id).await? > 0)
 }
 
 async fn mark_valuation_snapshot_stale_best_effort(db: &AppDb, aircraft_model_id: i64) {
@@ -4952,7 +4790,6 @@ fn required_f64(value: Option<f64>, field_name: &str) -> StoreResult<f64> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -4973,7 +4810,7 @@ mod tests {
     use crate::db::{AppDb, DatabaseBackend};
     use crate::extract::preview_manual_listing;
     use crate::listing::review::{
-        stage_pending_review, ListingAssociationRole, PendingReviewAspect, ReviewProduct,
+        stage_pending_review, ListingAssociationRole, PendingReviewAspect,
     };
     use crate::models::ParsedAvionics;
 
@@ -8202,7 +8039,7 @@ mod tests {
             .await
             .expect("developer user should exist");
         seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
-        let variant_id = seed_curated_test_aircraft_catalog(&db, user.id).await;
+        seed_curated_test_aircraft_catalog(&db, user.id).await;
         let listing_id = seed_blank_identity_listing(
             &db,
             user.id,
@@ -8227,32 +8064,13 @@ mod tests {
         super::ensure_listing_canonical_aircraft_identity(&db, listing_id)
             .await
             .expect("exact curated aircraft identity should be assigned");
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_spec_versions (
-              aircraft_model_id, aircraft_model_variant_id, effective_from,
-              source_url, configuration_scope, source_confidence,
-              evidence_kind, is_valuation_eligible
-            )
-            SELECT
-              variant.aircraft_model_id, variant.id, '2023-01-01',
-              'https://manufacturer.example/aircraft-spec',
-              'factory_default', 'high', 'authoritative_reference', TRUE
-            FROM aircraft_model_variants variant
-            WHERE variant.id = ?
-            "#,
-            variant_id
-        )
-        .expect("valuation-ready aircraft spec should seed");
-
         let outcome = super::finalize_reviewed_listing_ingestion(&db, listing_id, None, None)
             .await
             .expect("missing shared factory reference must remain retryable");
         assert!(matches!(
             outcome,
             super::ListingFinalizationOutcome::PendingReference { ref reason }
-                if reason.contains("model-year factory reference")
+                if reason.contains("published_reference_configuration_missing")
         ));
         assert!(super::listing_factory_reference_is_pending(&db, listing_id)
             .await

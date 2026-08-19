@@ -4,11 +4,10 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 test_database="$(mktemp /tmp/aircost-identity-postconditions.XXXXXX.sqlite3)"
 upgrade_database="$(mktemp /tmp/aircost-identity-upgrade.XXXXXX.sqlite3)"
-repair_database="$(mktemp /tmp/aircost-identity-repair.XXXXXX.sqlite3)"
 invalid_membership_database="$(mktemp /tmp/aircost-identity-invalid-maker.XXXXXX.sqlite3)"
 invalid_product_database="$(mktemp /tmp/aircost-identity-invalid-product.XXXXXX.sqlite3)"
 unauthorized_scope_database="$(mktemp /tmp/aircost-identity-unauthorized-scope.XXXXXX.sqlite3)"
-trap 'rm -f "$test_database" "$upgrade_database" "$repair_database" "$invalid_membership_database" "$invalid_product_database" "$unauthorized_scope_database"' EXIT
+trap 'rm -f "$test_database" "$upgrade_database" "$invalid_membership_database" "$invalid_product_database" "$unauthorized_scope_database"' EXIT
 
 expect_failure() {
   local database="$1"
@@ -487,159 +486,6 @@ expect_failure "$test_database" \
   "guarded endpoint identities are immutable"
 test "$(sqlite3 "$test_database" "SELECT count(*) FROM avionics_catalog_authorized_consolidations")" = "1"
 sqlite3 -bail "$test_database" "DELETE FROM avionics_catalog_consolidation_guard"
-
-# Exercise repairability on a clean database. The main fixture intentionally
-# contains forged raw normalization rows, which v6 must reject rather than
-# silently bless during an otherwise unrelated trigger-repair rehearsal.
-sqlite3 -bail "$repair_database" <<SQL
-.read $repository_root/schema/sqlite.sql
-PRAGMA foreign_keys = ON;
-INSERT INTO users (email,display_name,auth_subject)
-VALUES ('repair@example.test','Repair','repair');
-INSERT INTO aircraft_manufacturers (name,normalized_name)
-VALUES ('Repair Aircraft','repair aircraft');
-INSERT INTO aircraft_models (aircraft_manufacturer_id,name,normalized_name)
-SELECT id,'Repair Model','repair model' FROM aircraft_manufacturers
-WHERE normalized_name='repair aircraft';
-INSERT INTO aircraft_model_variants (aircraft_model_id,name,normalized_name)
-SELECT id,'Repair Variant','repair variant' FROM aircraft_models
-WHERE normalized_name='repair model';
-INSERT INTO aircraft_sale_listings (
-  aircraft_model_variant_id,created_by_user_id,source_url,model_year,
-  asking_price_usd,registration_number,airframe_hours
-)
-SELECT placeholder.aircraft_model_variant_id,user.id,
-       'https://listing.example/repair-a',2020,
-       150000,'N60001',500
-FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder,
-     users user
-WHERE placeholder.singleton_id=1 AND user.auth_subject='repair';
-INSERT INTO aircraft_sale_listings (
-  aircraft_model_variant_id,created_by_user_id,source_url,model_year,
-  asking_price_usd,registration_number,airframe_hours
-)
-SELECT placeholder.aircraft_model_variant_id,user.id,
-       'https://listing.example/repair-b',2020,
-       150000,'N60002',500
-FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder,
-     users user
-WHERE placeholder.singleton_id=1 AND user.auth_subject='repair';
-INSERT INTO avionics_manufacturers (name,normalized_name)
-VALUES ('Repair Avionics','repair avionics');
-INSERT INTO avionics_manufacturer_identities (
-  canonical_name,normalized_identity_key,identity_evidence_kind,
-  identity_source_url,identity_source_title,identity_evidence_text,
-  identity_confidence
-) VALUES (
-  'Repair Avionics','repairavionics','authoritative_reference',
-  'https://manufacturer.example/repair','Repair manufacturer profile',
-  'The manufacturer identifies the Repair Avionics product brand.','very_high'
-);
-INSERT INTO avionics_manufacturer_identity_memberships (
-  avionics_manufacturer_id,avionics_manufacturer_identity_id,
-  membership_basis,normalized_name_key,evidence_source_url,
-  evidence_source_title,evidence_text,evidence_confidence
-)
-SELECT manufacturer.id,identity.id,'authoritative_primary','repairavionics',
-       identity.identity_source_url,identity.identity_source_title,
-       identity.identity_evidence_text,'very_high'
-FROM avionics_manufacturers manufacturer,avionics_manufacturer_identities identity
-WHERE manufacturer.normalized_name='repair avionics'
-  AND identity.normalized_identity_key='repairavionics';
-INSERT INTO avionics_types (name,normalized_name)
-VALUES ('Repair Navigator','repair navigator');
-INSERT INTO avionics_models (
-  avionics_manufacturer_id,name,normalized_name,
-  manufacturer_identifier_kind,manufacturer_identifier,
-  normalized_manufacturer_identifier,identity_source_url,
-  identity_source_title,identity_evidence_text,identity_evidence_kind,
-  identity_confidence,catalog_reviewed_at
-)
-SELECT id,'Repair Approved','repair approved',
-       'manufacturer_model_number','REPAIR-1','repair-1',
-       'https://manufacturer.example/repair-1','Repair Approved data sheet',
-       'The manufacturer identifies the model and model number.',
-       'authoritative_reference','very_high',CURRENT_TIMESTAMP
-FROM avionics_manufacturers WHERE normalized_name='repair avionics';
-INSERT INTO avionics_models (
-  avionics_manufacturer_id,name,normalized_name,
-  manufacturer_identifier_kind,manufacturer_identifier,
-  normalized_manufacturer_identifier,identity_source_url,
-  identity_source_title,identity_evidence_text,identity_evidence_kind,
-  identity_confidence,catalog_reviewed_at
-)
-SELECT id,'Repair Legacy A','repair legacy a',
-       'manufacturer_model_number','REPAIR-2','repair-2',
-       'https://manufacturer.example/repair-2','Repair Legacy A data sheet',
-       'The manufacturer identifies the model and model number.',
-       'authoritative_reference','very_high',CURRENT_TIMESTAMP
-FROM avionics_manufacturers WHERE normalized_name='repair avionics';
-INSERT INTO avionics_models (
-  avionics_manufacturer_id,name,normalized_name,
-  manufacturer_identifier_kind,manufacturer_identifier,
-  normalized_manufacturer_identifier,identity_source_url,
-  identity_source_title,identity_evidence_text,identity_evidence_kind,
-  identity_confidence,catalog_reviewed_at
-)
-SELECT id,'Repair Legacy B','repair legacy b',
-       'manufacturer_model_number','REPAIR-3','repair-3',
-       'https://manufacturer.example/repair-3','Repair Legacy B data sheet',
-       'The manufacturer identifies the model and model number.',
-       'authoritative_reference','very_high',CURRENT_TIMESTAMP
-FROM avionics_manufacturers WHERE normalized_name='repair avionics';
-INSERT INTO avionics_model_types (avionics_model_id,avionics_type_id)
-SELECT model.id,type.id FROM avionics_models model,avionics_types type;
-UPDATE avionics_models SET catalog_status='approved'
-WHERE name='Repair Approved';
-SQL
-
-# Simulate missing enforcement plus one legacy unreviewed association. The
-# v6 migration must reinstall every preflight-owned guard without deleting it.
-sqlite3 -bail "$repair_database" \
-  "DROP TRIGGER aircraft_sale_listing_avionics_approved_insert" \
-  "DROP TRIGGER avionics_approved_identity_preserve_delete" \
-  "DELETE FROM avionics_approved_product_identities WHERE avionics_model_id=(SELECT id FROM avionics_models WHERE name='Repair Approved')" \
-  "DROP TRIGGER avionics_models_approved_types_insert" \
-  "DROP TRIGGER avionics_models_approved_types_update" \
-  "DROP TRIGGER avionics_models_referenced_status_update" \
-  "DROP TRIGGER avionics_model_types_preserve_approved_delete" \
-  "DROP TRIGGER avionics_model_types_preserve_approved_update" \
-  "DROP TRIGGER avionics_suite_components_approved_insert" \
-  "DROP TRIGGER avionics_suite_components_approved_update" \
-  "DROP TRIGGER aircraft_model_variant_default_avionics_approved_insert" \
-  "DROP TRIGGER aircraft_model_variant_default_avionics_approved_update" \
-  "DROP TRIGGER aircraft_reference_avionics_building_insert" \
-  "DROP TRIGGER aircraft_reference_avionics_immutable_update" \
-  "DROP TRIGGER aircraft_reference_avionics_immutable_delete" \
-  "DROP VIEW avionics_manufacturer_normalization_contract" \
-  "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id,avionics_model_id,source_confidence) SELECT listing.id,model.id,'medium' FROM aircraft_sale_listings listing,avionics_models model WHERE listing.source_url='https://listing.example/repair-a' AND model.name='Repair Legacy A'" \
-  ".read $repository_root/migrations/20260725_identity_deduplication_postconditions.sqlite.sql"
-test "$(sqlite3 "$repair_database" \
-  "SELECT count(*) FROM sqlite_schema WHERE type='view' AND name='avionics_manufacturer_normalization_contract'")" = "1"
-test "$(sqlite3 "$repair_database" \
-  "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('avionics_models_approved_types_insert','avionics_models_approved_types_update','avionics_models_referenced_status_update','avionics_model_types_preserve_approved_delete','avionics_model_types_preserve_approved_update','avionics_suite_components_approved_insert','avionics_suite_components_approved_update','aircraft_model_variant_default_avionics_approved_insert','aircraft_model_variant_default_avionics_approved_update','aircraft_sale_listing_avionics_approved_insert','aircraft_reference_avionics_building_insert','aircraft_reference_avionics_immutable_update','aircraft_reference_avionics_immutable_delete')")" = "13"
-approved_count="$(sqlite3 "$repair_database" \
-  "SELECT count(*) FROM avionics_models WHERE catalog_status='approved'")"
-matching_registry_count="$(sqlite3 "$repair_database" \
-  "SELECT count(*) FROM avionics_models model JOIN avionics_approved_product_identities identity ON identity.avionics_model_id=model.id JOIN avionics_manufacturer_effective_memberships manufacturer_identity ON manufacturer_identity.avionics_manufacturer_id=model.avionics_manufacturer_id AND manufacturer_identity.avionics_manufacturer_identity_id=identity.avionics_manufacturer_identity_id WHERE model.catalog_status='approved' AND identity.canonical_product_key=lower(replace(replace(replace(replace(replace(trim(model.normalized_name),' ',''),'-',''),'/',''),'.',''),'_','')) AND identity.manufacturer_identifier_kind=model.manufacturer_identifier_kind AND identity.canonical_identifier_key=lower(replace(replace(replace(replace(replace(trim(model.normalized_manufacturer_identifier),' ',''),'-',''),'/',''),'.',''),'_',''))")"
-test "$matching_registry_count" = "$approved_count"
-expect_failure "$repair_database" \
-  "INSERT INTO aircraft_sale_listing_avionics (aircraft_sale_listing_id,avionics_model_id,source_confidence) SELECT listing.id,model.id,'medium' FROM aircraft_sale_listings listing,avionics_models model WHERE listing.source_url='https://listing.example/repair-b' AND model.name='Repair Legacy B'" \
-  "migration repair reinstalls approved-only listing avionics insertion"
-expect_failure "$repair_database" \
-  "INSERT INTO avionics_suite_components (suite_model_id,component_model_id) SELECT suite.id,component.id FROM avionics_models suite,avionics_models component WHERE suite.name='Repair Legacy A' AND component.name='Repair Legacy B'" \
-  "migration repair reinstalls approved-only suite insertion"
-expect_failure "$repair_database" \
-  "INSERT INTO aircraft_model_variant_default_avionics (aircraft_model_variant_id,model_year,avionics_model_id,quantity,source_url,source_title,source_notes,source_confidence) SELECT variant.id,2020,model.id,1,'https://manufacturer.example/default','Default avionics','Test fixture','high' FROM aircraft_model_variants variant,avionics_models model WHERE variant.normalized_name='repair variant' AND model.name='Repair Legacy B'" \
-  "migration repair reinstalls approved-only default avionics insertion"
-sqlite3 -bail "$repair_database" \
-  "INSERT INTO avionics_models (avionics_manufacturer_id,name,normalized_name,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_text,identity_evidence_kind,identity_confidence,catalog_reviewed_at) SELECT id,'Typeless Product','typeless product','manufacturer_model_number','TYPELESS-1','typeless-1','https://manufacturer.example/typeless','Typeless data sheet','Manufacturer identifies product and model number.','authoritative_reference','very_high',CURRENT_TIMESTAMP FROM avionics_manufacturers WHERE normalized_name='repair avionics'"
-expect_failure "$repair_database" \
-  "UPDATE avionics_models SET catalog_status='approved' WHERE name='Typeless Product'" \
-  "migration repair reinstalls approval type requirements"
-expect_failure "$repair_database" \
-  "DELETE FROM avionics_model_types WHERE avionics_model_id=(SELECT id FROM avionics_models WHERE name='Repair Approved')" \
-  "migration repair reinstalls approved product type preservation"
 
 # Isolate the avionics ready-state contract from the independent FAA aircraft
 # identity contract in this schema test.

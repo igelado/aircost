@@ -124,8 +124,9 @@ INSERT INTO aircraft_reference_applicability_scopes (
 
 INSERT INTO aircraft_reference_prices (
   aircraft_reference_configuration_version_id, price_kind, amount, currency,
-  price_reference_year, evidence_kind, evidence_claim_id
-) VALUES (1, 'equipped_msrp', 779900, 'USD', 2020, 'direct_model_year', 1);
+  price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+) VALUES (1, 'equipped_msrp', 779900, 'USD', 2019,
+  'full_standard_configuration', 'direct_model_year', 1);
 
 INSERT INTO aircraft_reference_engines (
   aircraft_reference_configuration_version_id,
@@ -138,6 +139,12 @@ INSERT INTO aircraft_reference_propellers (
   aircraft_propeller_catalog_model_id, quantity, equipment_role,
   evidence_claim_id
 ) VALUES (1, 1, 1, 'standard', 1);
+
+INSERT INTO aircraft_reference_fact_set_attestations (
+  aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id
+) VALUES
+  (1, 'avionics', 1), (1, 'engines', 1),
+  (1, 'propellers', 1), (1, 'features', 1);
 
 UPDATE aircraft_reference_configuration_versions
 SET publication_state = 'published', published_at = '2026-07-21'

@@ -1215,7 +1215,8 @@ mod tests {
     use super::*;
     use crate::db::DEVELOPER_EMAIL;
     use crate::listing::verification::{
-        ListingAvionicsVerificationStage, ListingVerificationStage,
+        ListingAvionicsVerificationStage, ListingReferenceVerificationStage,
+        ListingVerificationStage,
     };
 
     fn sqlite_pool(db: &AppDb) -> &sqlx::SqlitePool {
@@ -1320,6 +1321,17 @@ mod tests {
                 safely_discarded: 0,
                 remaining_review_aspects: usize::from(status == "pending_review"),
                 gemini_used: false,
+            },
+            reference: ListingReferenceVerificationStage {
+                status: if matches!(status, "verified" | "already_verified") {
+                    "ready".to_string()
+                } else {
+                    "pending_reference".to_string()
+                },
+                configuration_version_id: None,
+                configuration_name: None,
+                building_version_count: 0,
+                gaps: Vec::new(),
             },
             finalization: ListingVerificationStage {
                 status: if matches!(status, "verified" | "already_verified") {

@@ -6,8 +6,9 @@ test_database="$(mktemp /tmp/aircost-reference-schema.XXXXXX.sqlite3)"
 approval_database="$(mktemp /tmp/aircost-reference-approval.XXXXXX.sqlite3)"
 component_database="$(mktemp /tmp/aircost-reference-component.XXXXXX.sqlite3)"
 overlap_database="$(mktemp /tmp/aircost-reference-overlap.XXXXXX.sqlite3)"
+incomplete_database="$(mktemp /tmp/aircost-reference-incomplete.XXXXXX.sqlite3)"
 cleanup_database="$(mktemp /tmp/aircost-reference-cleanup.XXXXXX.sqlite3)"
-trap 'rm -f "$test_database" "$approval_database" "$component_database" "$overlap_database" "$cleanup_database"' EXIT
+trap 'rm -f "$test_database" "$approval_database" "$component_database" "$overlap_database" "$incomplete_database" "$cleanup_database"' EXIT
 
 sqlite3 -bail "$test_database" \
   ".read $repository_root/schema/sqlite.sql" \
@@ -16,6 +17,8 @@ sqlite3 -bail "$test_database" \
 published_state="$(sqlite3 "$test_database" \
   "SELECT publication_state FROM aircraft_reference_configuration_versions WHERE id = 1")"
 test "$published_state" = "published"
+test "$(sqlite3 "$test_database" \
+  "SELECT model_year || ':' || price_reference_year || ':' || configuration_basis FROM aircraft_reference_configuration_versions version JOIN aircraft_reference_prices price ON price.aircraft_reference_configuration_version_id=version.id WHERE version.id=1")" = "2020:2019:full_standard_configuration"
 
 engine_catalog_target="$(sqlite3 "$test_database" \
   "SELECT \"table\" FROM pragma_foreign_key_list('aircraft_reference_engines') WHERE \"from\" = 'aircraft_engine_catalog_model_id'")"
@@ -29,6 +32,8 @@ test "$(sqlite3 "$test_database" \
   "SELECT count(*) FROM pragma_table_info('aircraft_identity_decisions') WHERE name='interaction_run_id'")" = "0"
 test "$(sqlite3 "$test_database" \
   "SELECT count(*) FROM pragma_table_info('aircraft_reference_profile_proposals') WHERE name='interaction_run_id'")" = "0"
+test "$(sqlite3 "$test_database" \
+  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('aircraft_model_spec_versions','aircraft_model_variant_price_points','aircraft_model_variant_default_avionics','aircraft_model_variant_default_avionics_candidates','depreciation_profiles','depreciation_profile_fit_metadata','component_depreciation_profiles')")" = "0"
 
 expect_failure() {
   local database="$1"
@@ -112,12 +117,49 @@ expect_failure "$overlap_database" "
   ) VALUES (2, 1, 1, 1);
   INSERT INTO aircraft_reference_prices (
     aircraft_reference_configuration_version_id, price_kind, amount, currency,
-    price_reference_year, evidence_kind, evidence_claim_id
-  ) VALUES (2, 'equipped_msrp', 789900, 'USD', 2020, 'direct_model_year', 1);
+    price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+  ) VALUES (2, 'equipped_msrp', 789900, 'USD', 2019,
+    'full_standard_configuration', 'direct_model_year', 1);
+  INSERT INTO aircraft_reference_fact_set_attestations (
+    aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id
+  ) VALUES
+    (2, 'avionics', 1), (2, 'engines', 1),
+    (2, 'propellers', 1), (2, 'features', 1);
   UPDATE aircraft_reference_configuration_versions
   SET publication_state = 'published', published_at = '2026-07-21'
   WHERE id = 2;
 " "published reference profile applicability overlaps an existing version"
+
+cp "$test_database" "$incomplete_database"
+sqlite3 -bail "$incomplete_database" "
+  INSERT INTO aircraft_identity_decisions (
+    resolution_case_id, entity_kind, decision_action, decision_status,
+    decision_payload_json, deterministic_validation_json,
+    deterministic_validation_passed, rationale, decided_at
+  ) VALUES (1, 'reference_profile', 'approve_new', 'approved', '{}', '{}', 1, 'next year', '2026-07-21');
+  INSERT INTO aircraft_identity_decision_claims
+    (decision_id, evidence_claim_id, evidence_role)
+  SELECT max(id), 1, 'identity' FROM aircraft_identity_decisions;
+  INSERT INTO aircraft_reference_configuration_versions (
+    aircraft_reference_configuration_id, model_year, revision, approval_decision_id
+  ) SELECT 1, 2021, 1, max(id) FROM aircraft_identity_decisions;
+  INSERT INTO aircraft_reference_applicability_scopes (
+    aircraft_reference_configuration_version_id, aircraft_market_id,
+    applies_to_all_serials, evidence_claim_id
+  ) VALUES (2, 1, 1, 1);
+  INSERT INTO aircraft_reference_prices (
+    aircraft_reference_configuration_version_id, price_kind, amount, currency,
+    price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+  ) VALUES (2, 'equipped_msrp', 799900, 'USD', 2020,
+    'full_standard_configuration', 'direct_model_year', 1);
+"
+expect_failure "$incomplete_database" "
+  UPDATE aircraft_reference_configuration_versions
+  SET publication_state = 'published', published_at = '2026-07-21'
+  WHERE id = 2;
+" "published reference profile requires complete factory fact-set attestations"
+test "$(sqlite3 "$incomplete_database" \
+  "SELECT publication_state FROM aircraft_reference_configuration_versions WHERE id=2")" = "building"
 
 cp "$test_database" "$cleanup_database"
 sqlite3 -bail "$cleanup_database" "

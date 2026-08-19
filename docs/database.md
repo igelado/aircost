@@ -49,6 +49,15 @@ version; it does not rewrite a published version. Legacy model specs, price
 points, and default-avionics rows are not promoted into this catalog by the
 migration.
 
+`aircraft_reference_fact_set_attestations` proves that the avionics, engines,
+propellers, and material-feature sets were each reviewed for completeness. An
+empty set is therefore distinguishable from an unresearched set. Publication
+requires all four attestations, exactly one direct exact-model-year USD price
+for the full standard configuration, validated primary evidence for every fact,
+valuation-ready factory avionics, and non-overlapping applicability. A fact's
+nominal dollar year is retained as published and is not forced to equal the
+aircraft model year.
+
 `faa_registry_snapshots`, `faa_registry_aircraft`,
 `faa_registry_aircraft_references`, `faa_registry_engine_references`,
 `faa_registry_coverage`
@@ -175,24 +184,6 @@ samples only retained source submissions linked to canonical listings. With
 `--execute`, its only database writes are these usage-accounting rows; it never
 updates a listing, plugin submission, catalog, or other domain row.
 
-`aircraft_model_spec_versions`
-
-Stores variant-level operating and component metadata. This includes fuel burn,
-oil assumptions, linked engine and propeller models, component counts, TBOs,
-overhaul costs, component baseline-life fractions, annual inspection, variable
-maintenance, source URL, and the depreciation profile assigned to the variant.
-Only authoritative, high-confidence `factory_default` rows can be marked
-valuation-eligible. A component configuration seen on one sale listing remains
-listing-specific and cannot seed this shared metadata.
-
-`aircraft_model_variant_price_points`
-
-Stores nominal new-price points for a variant/model year. These are used as the
-airframe basis for valuations after subtracting default avionics.
-Evidence kind and eligibility are stored separately from confidence. Serving
-uses only high-confidence direct exact-model-year points; inferred and
-interpolated rows remain available for curation.
-
 `engine_manufacturers`, `engine_models`
 
 Store reusable engine metadata: manufacturer, model, TBO, overhaul cost, value
@@ -286,8 +277,8 @@ response or URL-context dossier is retained.
 Links concrete avionics units to a specific sale listing. The link stores
 quantity, provenance, evidence confidence, and an explicit `installed`,
 `replaces`, or `removes` configuration action with an optional replacement
-target. Valuation starts from factory defaults and applies these links as
-deltas. New primary and replacement links require approved catalog identities;
+target. Valuation starts from the applicable published reference profile and
+applies these links as deltas. New primary and replacement links require approved catalog identities;
 the installation-evidence confidence on the link is independent from catalog
 identity confidence. A listing cannot contain the same canonical product twice
 or install and replace the same product. Ready or verified listing associations
@@ -319,24 +310,6 @@ transaction, and leaves the pending review byte-for-byte unchanged rather than
 reconstructing or guessing review state. Reviews containing non-avionics state
 are also refused before review mutation because this reset has an avionics-only
 public contract.
-
-`aircraft_model_variant_default_avionics`
-
-Stores factory/default avionics for a variant/model year. This is used when a
-listing panel is valued; high-confidence listing actions are then applied as
-additions, replacements, or removals from this baseline.
-
-`depreciation_profiles`, `depreciation_profile_fit_metadata`
-
-Store fitted airframe depreciation coefficients and fit-quality metadata. The
-current production path uses `generic:all` plus per-model fitted profiles when
-enough samples exist.
-
-`component_depreciation_profiles`
-
-Stores generic component model parameters. Engine and propeller use
-`baseline_life_fraction`; avionics use an age decay rate and long-run residual
-fraction.
 
 `valuation_snapshots`, `valuation_snapshot_rows`
 
@@ -596,9 +569,6 @@ cargo run --bin aircost-admin -- curate-avionics --dry-run
 cargo run --bin aircost-admin -- verify-listings --limit 10 --preview
 cargo run --bin aircost-admin -- stage-listing-reviews --limit 100 --dry-run
 cargo run --bin aircost-admin -- enrich-avionics --dry-run
-cargo run --bin aircost-admin -- enrich-model-year-avionics --dry-run
-cargo run --bin aircost-admin -- enrich-aircraft-specs --dry-run
-cargo run --bin aircost-admin -- fit-depreciation --dry-run
 ```
 
 Use `--apply` only after reviewing the report.
@@ -1724,6 +1694,94 @@ The contract query must return both migrations at version 2. The placeholder
 query must return exactly `1/-1/-1/-1`; both count queries must return zero;
 the duplicate query must return no rows. SQLite must additionally return no
 rows from `PRAGMA foreign_key_check` and `ok` from `PRAGMA integrity_check`.
+
+## Reference Catalog Publication Cutover
+
+Fresh databases include the strict reference publication contract. Upgrade an
+existing database with the backend-specific migration:
+
+```text
+migrations/20260819_reference_catalog_cutover.sqlite.sql
+migrations/20260819_reference_catalog_cutover.postgres.sql
+```
+
+The migration adds the price configuration-basis discriminator and the four
+fact-set completeness attestations, then replaces the publication gates. It
+permanently drops the old specification, variant-price, default-avionics,
+airframe-depreciation, fit-metadata, and component-depreciation tables; none of
+their rows are copied into the immutable catalog. Rehearse the SQLite migration
+on a disposable copy with writers stopped:
+
+```sh
+rehearsal_db="$(mktemp /tmp/aircost-reference-cutover.XXXXXX.sqlite3)"
+cp data/aircost.sqlite3 "$rehearsal_db"
+sqlite3 -bail "$rehearsal_db" \
+  ".read migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+rm -f "$rehearsal_db"
+```
+
+For PostgreSQL, restore a backup into a rehearsal database and run:
+
+```sh
+psql -v ON_ERROR_STOP=1 "$REHEARSAL_DATABASE_URL" \
+  -f migrations/20260819_reference_catalog_cutover.postgres.sql
+```
+
+After the migration, grounded research and adjudication hand off a normalized
+JSON draft containing only approved decision IDs, validated evidence-claim
+IDs, catalog IDs, applicability, and normalized facts. Preview the exact
+database assembly/publication transaction (it always rolls back) with:
+
+```sh
+cargo run --bin aircost-admin -- \
+  publish-aircraft-reference --draft normalized-reference.json
+```
+
+Add `--apply` to atomically create or reuse the reference configuration, insert
+the building version and facts, and publish it. Provider prompts, responses,
+Search transcripts, and complete URL-context dossiers are not accepted by this
+boundary and are not stored.
+
+The draft price fields are `direct_cited_amount_usd` and
+`direct_cited_nominal_dollar_year`; they represent the primary source's nominal
+MSRP, not an inflation-adjusted value. The current schema has no approved
+dollar-normalization fact. A different serving market year therefore produces
+the explicit `reference_price_dollar_normalization_missing` readiness gap and
+no estimate.
+
+Verify the installed contract with:
+
+```sql
+SELECT contract_version, contract_fingerprint
+FROM schema_migration_contracts
+WHERE migration_name = '20260819_reference_catalog_cutover';
+
+SELECT publication_state, count(*)
+FROM aircraft_reference_configuration_versions
+GROUP BY publication_state;
+
+SELECT name
+FROM sqlite_schema
+WHERE type = 'table'
+  AND name IN (
+    'aircraft_model_spec_versions',
+    'aircraft_model_variant_price_points',
+    'aircraft_model_variant_default_avionics',
+    'aircraft_model_variant_default_avionics_candidates',
+    'depreciation_profiles',
+    'depreciation_profile_fit_metadata',
+    'component_depreciation_profiles'
+  );
+```
+
+The contract must be version `1` with fingerprint
+`b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988`.
+Listing reference resolution uses only one complete published version matching
+the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
+scope. Missing and ambiguous matches remain ineligible for snapshots, training,
+and serving. The final query must return no rows.
 
 ## Gemini Usage Accounting Migration
 

@@ -8,11 +8,13 @@ use sqlx::FromRow;
 use crate::aircraft::faa::{
     audit_listing_admission, ListingAdmissionEvidence, ListingAdmissionReport,
 };
+use crate::aircraft::reference::persistence::listing_reference_status;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::models::is_plausible_asking_price_usd;
 
 use super::types::{
-    source_backed_component_observation, SourceBackedValuationFact, TrainingListing, ValuationError,
+    source_backed_component_observation, FactoryReferenceFeature, SourceBackedValuationFact,
+    TrainingListing, ValuationError,
 };
 use super::FEATURE_SCHEMA_VERSION;
 
@@ -209,6 +211,17 @@ pub async fn create_snapshot(
     let facts = load_facts(db).await?;
     let mut prepared = Vec::with_capacity(listings.len());
     for listing in listings {
+        let reference_status = listing_reference_status(db, listing.id).await?;
+        let factory_reference =
+            reference_status
+                .published
+                .as_ref()
+                .map(|reference| FactoryReferenceFeature {
+                    configuration_id: reference.configuration_id,
+                    version_id: reference.version_id,
+                    full_standard_configuration_price_usd: reference.price_usd,
+                    nominal_dollar_year: reference.price_reference_year,
+                });
         let compatibility_projection = compatibility_projections
             .get(&listing.id)
             .filter(|projection| projection.aircraft_model_variant_id == listing.variant_id);
@@ -229,6 +242,15 @@ pub async fn create_snapshot(
                 compatibility_projection.is_none().then_some(
                     "aircraft_compatibility_projection_missing_or_mismatched".to_string(),
                 )
+            })
+            .or_else(|| {
+                (!reference_status.ready).then(|| {
+                    reference_status
+                        .gaps
+                        .first()
+                        .map(|gap| format!("factory_reference_{}", gap.code))
+                        .unwrap_or_else(|| "factory_reference_incomplete".to_string())
+                })
             })
             .or_else(|| exclusion_reason(&listing, policy, capture_day, snapshot_year));
         let technical_field_count = technical_field_count(
@@ -266,6 +288,7 @@ pub async fn create_snapshot(
             equipment_tokens: tokens,
             valuation_facts,
             technical_field_count,
+            factory_reference,
         };
         let feature_json = serde_json::to_string(&training)?;
         let target = is_plausible_asking_price_usd(listing.asking_price_usd)
@@ -1225,6 +1248,10 @@ mod tests {
         require_listing_faa_admission, store_release, ReleaseFixtureBuilder, ReleaseMetadata,
     };
     use crate::aircraft::identity::seed_test_curated_identity_assignment;
+    use crate::aircraft::reference::persistence::{
+        assemble_and_publish_reference_version, ApprovedReferenceVersionDraft,
+        ReferenceApplicabilityDraft, ReferenceConfigurationIdentityDraft, ReferencePriceDraft,
+    };
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
 
     use super::*;
@@ -1332,6 +1359,175 @@ mod tests {
         )
         .bind(listing_id)
         .execute(pool)
+        .await
+        .unwrap();
+        publish_listing_reference(db, listing_id).await;
+    }
+
+    async fn publish_listing_reference(db: &AppDb, listing_id: i64) {
+        if listing_reference_status(db, listing_id)
+            .await
+            .unwrap()
+            .ready
+        {
+            return;
+        }
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let hierarchy: (i64, i64, Option<i64>, Option<i64>, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT designation.aircraft_model_family_id,
+                   assignment.aircraft_designation_id,
+                   assignment.aircraft_generation_id,
+                   assignment.aircraft_factory_package_id,
+                   assignment.id,
+                   listing.model_year
+            FROM aircraft_sale_listing_current_identity_assignments current_assignment
+            JOIN aircraft_sale_listing_identity_assignments assignment
+              ON assignment.id = current_assignment.identity_assignment_id
+            JOIN aircraft_designations designation
+              ON designation.id = assignment.aircraft_designation_id
+            JOIN aircraft_sale_listings listing
+              ON listing.id = current_assignment.aircraft_sale_listing_id
+            WHERE current_assignment.aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let source_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, source_title, source_domain, source_tier, retrieved_at
+            ) VALUES (?, 'Dataset factory reference', 'manufacturer.example',
+              'manufacturer_primary', '2026-07-20') RETURNING id
+            "#,
+        )
+        .bind(format!(
+            "https://manufacturer.example/dataset-reference/{listing_id}"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let claim_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'specification', 'fixture aircraft', 'defines',
+              'factory configuration',
+              'Primary fixture source defines the complete factory configuration.',
+              'validated', '2026-07-20') RETURNING id
+            "#,
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let observation_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_observations (
+              observed_make, observed_family, observed_designation, model_year,
+              exact_source_evidence, observation_sha256
+            ) VALUES ('Dataset Maker', 'Dataset Family', 'Dataset Designation', ?,
+              'dataset reference fixture', ?) RETURNING id
+            "#,
+        )
+        .bind(hierarchy.5)
+        .bind(format!("dataset-reference-{listing_id}-{}", hierarchy.4))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let case_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_resolution_cases (
+              observation_id, resolution_scope, job_fingerprint, catalog_revision
+            ) VALUES (?, 'reference_profile', ?, 'dataset-test') RETURNING id
+            "#,
+        )
+        .bind(observation_id)
+        .bind(format!(
+            "dataset-reference-job-{listing_id}-{}",
+            hierarchy.4
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut decision_ids = Vec::new();
+        for entity_kind in ["reference_configuration", "reference_profile"] {
+            let decision_id: i64 = sqlx::query_scalar(
+                r#"
+                INSERT INTO aircraft_identity_decisions (
+                  resolution_case_id, entity_kind, decision_action, decision_status,
+                  decision_payload_json, deterministic_validation_json,
+                  deterministic_validation_passed, rationale, decided_at
+                ) VALUES (?, ?, 'approve_new', 'approved', '{}', '{}', TRUE,
+                  'dataset test reference', '2026-07-20') RETURNING id
+                "#,
+            )
+            .bind(case_id)
+            .bind(entity_kind)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO aircraft_identity_decision_claims (decision_id, evidence_claim_id, evidence_role) VALUES (?, ?, 'identity')",
+            )
+            .bind(decision_id)
+            .bind(claim_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            decision_ids.push(decision_id);
+        }
+        let market_id: i64 =
+            sqlx::query_scalar("SELECT id FROM aircraft_markets WHERE code = 'GLOBAL'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assemble_and_publish_reference_version(
+            db,
+            &ApprovedReferenceVersionDraft {
+                identity: ReferenceConfigurationIdentityDraft {
+                    aircraft_model_family_id: hierarchy.0,
+                    aircraft_designation_id: hierarchy.1,
+                    aircraft_generation_id: hierarchy.2,
+                    tier_package_id: hierarchy.3,
+                    display_name: format!("Dataset reference {listing_id}"),
+                    approval_decision_id: decision_ids[0],
+                },
+                model_year: hierarchy.5,
+                revision: 1,
+                supersedes_version_id: None,
+                profile_approval_decision_id: decision_ids[1],
+                applicability: vec![ReferenceApplicabilityDraft {
+                    aircraft_market_id: market_id,
+                    applies_to_all_serials: true,
+                    aircraft_serial_number_scheme_id: None,
+                    serial_prefix: None,
+                    serial_from_display: None,
+                    serial_to_display: None,
+                    serial_from_sort_key: None,
+                    serial_to_sort_key: None,
+                    evidence_claim_id: claim_id,
+                }],
+                price: ReferencePriceDraft {
+                    direct_cited_amount_usd: 250_000.0,
+                    direct_cited_nominal_dollar_year: 2026,
+                    evidence_claim_id: claim_id,
+                },
+                avionics: vec![],
+                engines: vec![],
+                propellers: vec![],
+                features: vec![],
+                avionics_set_evidence_claim_id: claim_id,
+                engines_set_evidence_claim_id: claim_id,
+                propellers_set_evidence_claim_id: claim_id,
+                features_set_evidence_claim_id: claim_id,
+            },
+        )
         .await
         .unwrap();
     }

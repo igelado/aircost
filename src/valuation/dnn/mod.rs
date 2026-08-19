@@ -327,6 +327,12 @@ mod tests {
             equipment_tokens: vec!["Garmin GNS 430W".to_string()],
             valuation_facts: vec![],
             technical_field_count: 6,
+            factory_reference: Some(crate::valuation::FactoryReferenceFeature {
+                configuration_id: 1,
+                version_id: 1,
+                full_standard_configuration_price_usd: 300_000.0,
+                nominal_dollar_year: 2026,
+            }),
         }
     }
 

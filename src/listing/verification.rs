@@ -10,6 +10,9 @@ use std::fmt;
 use serde::Serialize;
 use sqlx::FromRow;
 
+use crate::aircraft::reference::persistence::{
+    listing_reference_status, ListingReferenceStatus, ReferenceGap,
+};
 use crate::aircraft::verification::{
     apply_listing_aircraft_verification, preflight_listing_aircraft_verification,
     preview_listing_aircraft_verification, AircraftVerificationMethod, AircraftVerificationOutcome,
@@ -230,7 +233,35 @@ pub struct ListingVerificationOutcome {
     pub final_ingestion_state: String,
     pub aircraft: ListingVerificationStage,
     pub avionics: ListingAvionicsVerificationStage,
+    pub reference: ListingReferenceVerificationStage,
     pub finalization: ListingVerificationStage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ListingReferenceVerificationStage {
+    pub status: String,
+    pub configuration_version_id: Option<i64>,
+    pub configuration_name: Option<String>,
+    pub building_version_count: i64,
+    pub gaps: Vec<ReferenceGap>,
+}
+
+fn reference_stage(status: &ListingReferenceStatus) -> ListingReferenceVerificationStage {
+    ListingReferenceVerificationStage {
+        status: if status.ready {
+            "ready"
+        } else {
+            "pending_reference"
+        }
+        .to_string(),
+        configuration_version_id: status.published.as_ref().map(|value| value.version_id),
+        configuration_name: status
+            .published
+            .as_ref()
+            .map(|value| value.display_name.clone()),
+        building_version_count: status.building_version_count,
+        gaps: status.gaps.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -334,6 +365,9 @@ pub async fn verify_listing(
         return Err(ListingVerificationError::NotFound(listing_id));
     }
     let initial = load_listing_state(db, listing_id).await?;
+    let initial_reference = listing_reference_status(db, listing_id)
+        .await
+        .map_err(|error| ListingVerificationError::Database(error.to_string()))?;
     if initial.ingestion_state == "ready" && initial.is_verified {
         return Ok(ListingVerificationOutcome {
             listing_id,
@@ -342,6 +376,7 @@ pub async fn verify_listing(
             final_ingestion_state: initial.ingestion_state,
             aircraft: ListingVerificationStage::new("already_verified"),
             avionics: ListingAvionicsVerificationStage::no_pending_review(),
+            reference: reference_stage(&initial_reference),
             finalization: ListingVerificationStage::new("ready"),
         });
     }
@@ -499,6 +534,9 @@ pub async fn verify_listing(
     }
 
     let final_state = load_listing_state(db, listing_id).await?;
+    let final_reference = listing_reference_status(db, listing_id)
+        .await
+        .map_err(|error| ListingVerificationError::Database(error.to_string()))?;
     preserve_pending_review_over_reference(&final_state, &mut finalization);
     let status = listing_outcome_status(&final_state, &finalization, aircraft_rejected);
     Ok(ListingVerificationOutcome {
@@ -508,6 +546,7 @@ pub async fn verify_listing(
         final_ingestion_state: final_state.ingestion_state,
         aircraft,
         avionics,
+        reference: reference_stage(&final_reference),
         finalization,
     })
 }
@@ -680,7 +719,7 @@ async fn verify_listing_page(
             aircraft_grounding_candidates,
             avionics: avionics_provider_plan,
             finalization_enrichment_requests_included: false,
-            finalization_note: "Aircraft-spec, installed-avionics metadata, and model-year reference enrichment are data-dependent finalization work and are not included in the aircraft/avionics identity request envelope. Every actual request is still recorded in gemini_api_usage."
+            finalization_note: "Published aircraft references are resolved locally and never curated implicitly during listing finalization. Installed-avionics value metadata remains separate data-dependent catalog work; every actual provider request is recorded in gemini_api_usage."
                 .to_string(),
         },
         summary,
@@ -1009,6 +1048,13 @@ fn failed_listing_outcome(
             safely_discarded: 0,
             remaining_review_aspects: 0,
             gemini_used: false,
+        },
+        reference: ListingReferenceVerificationStage {
+            status: "unknown".to_string(),
+            configuration_version_id: None,
+            configuration_name: None,
+            building_version_count: 0,
+            gaps: Vec::new(),
         },
         finalization: ListingVerificationStage::blocked(
             "failed",
@@ -1600,6 +1646,13 @@ mod tests {
             final_ingestion_state: "incomplete".to_string(),
             aircraft: ListingVerificationStage::new("current"),
             avionics: ListingAvionicsVerificationStage::no_pending_review(),
+            reference: ListingReferenceVerificationStage {
+                status: "pending_reference".to_string(),
+                configuration_version_id: None,
+                configuration_name: None,
+                building_version_count: 0,
+                gaps: Vec::new(),
+            },
             finalization,
         }];
 

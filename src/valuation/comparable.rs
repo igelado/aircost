@@ -302,6 +302,12 @@ mod tests {
             equipment_tokens: vec![],
             valuation_facts: vec![],
             technical_field_count: 4,
+            factory_reference: Some(crate::valuation::FactoryReferenceFeature {
+                configuration_id: 1,
+                version_id: 1,
+                full_standard_configuration_price_usd: price,
+                nominal_dollar_year: 2026,
+            }),
         }
     }
 
@@ -326,7 +332,7 @@ mod tests {
             ComparableConfig::default(),
         )
         .unwrap();
-        let estimate = model.estimate(&row(3, 0.0).as_query()).unwrap();
+        let estimate = model.estimate(&row(3, 110_000.0).as_query()).unwrap();
         assert!(estimate.estimated_value_usd <= 110_000.0);
     }
 

@@ -131,7 +131,7 @@ export function pipelineRowsFromResponse(payload) {
     const context = contexts.get(listingId) || {};
     const aircraft = stageView("aircraft", listing?.aircraft);
     const avionics = stageView("avionics", listing?.avionics);
-    const reference = stageView("reference", listing?.finalization);
+    const reference = referenceStageView(listing?.reference, listing?.finalization);
     const gemini = geminiRequirement(listing);
     const reason = listingReason(listing, aircraft, avionics, reference);
     return [{
@@ -149,6 +149,26 @@ export function pipelineRowsFromResponse(payload) {
       reason,
     }];
   });
+}
+
+function referenceStageView(reference, finalization) {
+  if (!reference || typeof reference !== "object") {
+    return stageView("reference", finalization);
+  }
+  const view = stageView("reference", reference);
+  const gaps = Array.isArray(reference.gaps)
+    ? reference.gaps
+      .map((gap) => nonBlank(gap?.message))
+      .filter(Boolean)
+    : [];
+  return {
+    ...view,
+    reason: gaps.length > 0 ? gaps.join("; ") : view.reason,
+    configurationVersionId: positiveInteger(reference.configuration_version_id),
+    configurationName: nonBlank(reference.configuration_name) || "",
+    buildingVersionCount: nonnegativeInteger(reference.building_version_count),
+    gaps: Array.isArray(reference.gaps) ? reference.gaps : [],
+  };
 }
 
 export function pipelineCheckpoint(payload) {

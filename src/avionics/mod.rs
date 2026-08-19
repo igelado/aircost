@@ -20,10 +20,7 @@ use crate::avionics::catalog::{
     AvionicsIdentityOutcome, AvionicsIdentityRequest,
 };
 use crate::db::{AppDb, DatabaseBackend};
-use crate::extract::{
-    AircraftPricePointContext, AvionicsMetadataContext, DefaultAvionicsContext,
-    GeminiListingExtractor,
-};
+use crate::extract::{AvionicsMetadataContext, GeminiListingExtractor};
 use crate::normalize::normalize_avionics_manufacturer_name;
 use crate::normalize::{is_usable_avionics_label, normalize_avionics_model_name, normalize_name};
 
@@ -219,28 +216,6 @@ fn hydrate_reference_rows(
         .collect()
 }
 
-#[derive(Debug, FromRow)]
-struct AircraftModelYearProfileRow {
-    aircraft_model_variant_id: i64,
-    manufacturer: String,
-    model: String,
-    variant: String,
-    model_year: i64,
-    source_url: Option<String>,
-    listing_count: i64,
-}
-
-#[derive(Debug, FromRow)]
-struct AircraftModelYearProfileCandidateRow {
-    listing_id: i64,
-    aircraft_model_variant_id: i64,
-    manufacturer: String,
-    model: String,
-    variant: String,
-    model_year: i64,
-    source_url: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 struct AvionicsIdentityAircraftContext {
     manufacturer: String,
@@ -262,33 +237,62 @@ impl AvionicsIdentityAircraftContext {
     }
 }
 
-impl From<AircraftModelYearProfileRow> for AvionicsIdentityAircraftContext {
-    fn from(row: AircraftModelYearProfileRow) -> Self {
-        Self {
-            manufacturer: row.manufacturer,
-            model: row.model,
-            variant: row.variant,
-            model_year: row.model_year,
-            source_url: row.source_url.unwrap_or_default(),
-        }
-    }
-}
-
-#[derive(Debug, FromRow)]
-struct NearbyAircraftPricePointRow {
+#[derive(FromRow)]
+struct ListingAircraftIdentityContextRow {
+    manufacturer: String,
+    model: String,
     variant: String,
     model_year: i64,
-    purchase_price_new_usd: f64,
-    purchase_price_reference_year: i64,
-    source_title: String,
-    source_confidence: String,
+    source_url: String,
 }
 
-#[derive(Debug, FromRow)]
-struct StoredPricePointQualityRow {
-    source_confidence: String,
-    evidence_kind: String,
-    is_valuation_eligible: bool,
+async fn listing_aircraft_identity_context(
+    db: &AppDb,
+    listing_id: i64,
+) -> StoreResult<AvionicsIdentityAircraftContext> {
+    let rows = query_as_all!(
+        db,
+        ListingAircraftIdentityContextRow,
+        r#"
+        SELECT make.name AS manufacturer,
+               family.name AS model,
+               designation.official_designation
+                 || CASE WHEN generation.id IS NULL
+                      THEN '' ELSE ' / ' || generation.name END
+                 || CASE WHEN package.id IS NULL
+                      THEN '' ELSE ' / ' || package.name END AS variant,
+               listing.model_year,
+               COALESCE(listing.source_url, '') AS source_url
+        FROM aircraft_sale_listings listing
+        JOIN aircraft_sale_listing_identity_assignments assignment
+          ON assignment.id = listing.selected_aircraft_identity_assignment_id
+         AND assignment.aircraft_sale_listing_id = listing.id
+        JOIN aircraft_makes make ON make.id = assignment.aircraft_make_id
+        JOIN aircraft_model_families family
+          ON family.id = assignment.aircraft_model_family_id
+        JOIN aircraft_designations designation
+          ON designation.id = assignment.aircraft_designation_id
+        LEFT JOIN aircraft_generations generation
+          ON generation.id = assignment.aircraft_generation_id
+        LEFT JOIN aircraft_factory_packages package
+          ON package.id = assignment.aircraft_factory_package_id
+        WHERE listing.id = ?
+        "#,
+        listing_id,
+    )?;
+    let [row]: [ListingAircraftIdentityContextRow; 1] = rows.try_into().map_err(|rows: Vec<_>| {
+        AvionicsStoreError::Model(format!(
+            "listing {listing_id} must have exactly one selected canonical aircraft identity, found {}",
+            rows.len()
+        ))
+    })?;
+    Ok(AvionicsIdentityAircraftContext {
+        manufacturer: row.manufacturer,
+        model: row.model,
+        variant: row.variant,
+        model_year: row.model_year,
+        source_url: row.source_url,
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -366,56 +370,6 @@ pub struct AvionicsNormalizationItem {
     pub resolution_reason: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct AvionicsModelYearProfileReport {
-    pub applied: bool,
-    pub value_reference_year: i64,
-    pub faa_admitted_candidate_count: usize,
-    pub faa_rejected_candidate_count: usize,
-    pub faa_rejections: Vec<String>,
-    pub items: Vec<AvionicsModelYearProfileItem>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct AvionicsModelYearProfileItem {
-    pub aircraft_model_variant_id: i64,
-    pub manufacturer: String,
-    pub model: String,
-    pub variant: String,
-    pub model_year: i64,
-    pub listing_count: i64,
-    pub purchase_price_new_usd: f64,
-    pub purchase_price_reference_year: i64,
-    pub price_source_url: String,
-    pub price_source_title: String,
-    pub price_source_notes: String,
-    pub price_source_confidence: String,
-    pub price_evidence_kind: String,
-    pub price_discontinuity_explanation: Option<String>,
-    pub is_price_valuation_eligible: bool,
-    pub price_eligibility_notes: Vec<String>,
-    pub avionics: Vec<AvionicsModelYearProfileAvionicsItem>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct AvionicsModelYearProfileAvionicsItem {
-    pub avionics_model_id: i64,
-    pub manufacturer: String,
-    pub model: String,
-    pub avionics_types: Vec<String>,
-    pub quantity: i64,
-    pub introduced_year: i64,
-    pub installed_value_contribution_usd: f64,
-    pub replacement_cost_usd: f64,
-    pub valuation_scope: String,
-    pub included_components: Vec<AvionicsIncludedComponentItem>,
-    pub identity: AvionicsIdentityEvidenceItem,
-    pub confidence: String,
-    pub source_url: String,
-    pub source_title: String,
-    pub notes: String,
-}
-
 pub async fn enrich_missing_avionics_metadata(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
@@ -471,10 +425,7 @@ pub async fn enrich_listing_avionics_metadata(
         .await
         .map_err(aircraft_admission_store_error)?;
     let rows = listing_avionics_models_to_enrich(db, listing_id, refresh_existing).await?;
-    let aircraft_context = aircraft_model_year_profile_for_listing(db, listing_id, true)
-        .await?
-        .map(AvionicsIdentityAircraftContext::from)
-        .unwrap_or_else(|| AvionicsIdentityAircraftContext::unknown(value_reference_year));
+    let aircraft_context = listing_aircraft_identity_context(db, listing_id).await?;
     let mut items = Vec::with_capacity(rows.len());
 
     for row in rows {
@@ -715,153 +666,6 @@ fn normalization_item_from_identity(
     }
 }
 
-pub async fn enrich_model_year_avionics_and_price_points(
-    db: &AppDb,
-    extractor: &GeminiListingExtractor,
-    apply: bool,
-    limit: i64,
-    value_reference_year: Option<i64>,
-    refresh_existing: bool,
-) -> StoreResult<AvionicsModelYearProfileReport> {
-    if limit < 1 {
-        return Err(AvionicsStoreError::Model(
-            "limit must be at least 1".to_string(),
-        ));
-    }
-    let value_reference_year = value_reference_year.unwrap_or(DEFAULT_VALUE_REFERENCE_YEAR);
-    let candidates = aircraft_model_year_profile_candidates_to_enrich(db, refresh_existing).await?;
-    let mut faa_admitted_candidate_count = 0usize;
-    let mut faa_rejections = Vec::new();
-    let mut grouped = BTreeMap::<(i64, i64), AircraftModelYearProfileRow>::new();
-    for candidate in candidates {
-        match require_listing_admission(db, candidate.listing_id).await {
-            Ok(_) => {
-                faa_admitted_candidate_count += 1;
-                let key = (candidate.aircraft_model_variant_id, candidate.model_year);
-                let row = grouped
-                    .entry(key)
-                    .or_insert_with(|| AircraftModelYearProfileRow {
-                        aircraft_model_variant_id: candidate.aircraft_model_variant_id,
-                        manufacturer: candidate.manufacturer,
-                        model: candidate.model,
-                        variant: candidate.variant,
-                        model_year: candidate.model_year,
-                        source_url: candidate.source_url.clone(),
-                        listing_count: 0,
-                    });
-                row.listing_count += 1;
-                if row.source_url.is_none() {
-                    row.source_url = candidate.source_url;
-                }
-            }
-            Err(error) => faa_rejections.push(error.to_string()),
-        }
-    }
-    let mut rows = grouped.into_values().collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .listing_count
-            .cmp(&left.listing_count)
-            .then_with(|| left.manufacturer.cmp(&right.manufacturer))
-            .then_with(|| left.model.cmp(&right.model))
-            .then_with(|| left.variant.cmp(&right.variant))
-            .then_with(|| left.model_year.cmp(&right.model_year))
-    });
-    rows.truncate(limit as usize);
-    let mut items = Vec::with_capacity(rows.len());
-
-    for row in rows {
-        let nearby_price_points =
-            nearby_model_family_price_points(db, row.aircraft_model_variant_id, row.model_year)
-                .await?;
-        let response = extractor
-            .estimate_default_aircraft_avionics(&DefaultAvionicsContext {
-                manufacturer: &row.manufacturer,
-                model: &row.model,
-                variant: &row.variant,
-                model_year: row.model_year,
-                value_reference_year,
-                source_url: row.source_url.as_deref(),
-                nearby_price_points: &nearby_price_points,
-            })
-            .await?;
-        let mut item =
-            model_year_profile_item_from_response(&row, &nearby_price_points, &response)?;
-        resolve_default_profile_identities(db, extractor, apply, &row, &mut item).await?;
-        if apply {
-            upsert_model_year_price_point(db, &item).await?;
-            for avionics in &mut item.avionics {
-                upsert_default_avionics_profile_item(
-                    db,
-                    row.aircraft_model_variant_id,
-                    row.model_year,
-                    value_reference_year,
-                    avionics,
-                )
-                .await?;
-            }
-        }
-        items.push(item);
-    }
-
-    Ok(AvionicsModelYearProfileReport {
-        applied: apply,
-        value_reference_year,
-        faa_admitted_candidate_count,
-        faa_rejected_candidate_count: faa_rejections.len(),
-        faa_rejections,
-        items,
-    })
-}
-
-pub async fn enrich_model_year_avionics_and_price_point_for_listing(
-    db: &AppDb,
-    extractor: &GeminiListingExtractor,
-    apply: bool,
-    listing_id: i64,
-    value_reference_year: Option<i64>,
-    refresh_existing: bool,
-) -> StoreResult<Option<AvionicsModelYearProfileItem>> {
-    let value_reference_year = value_reference_year.unwrap_or(DEFAULT_VALUE_REFERENCE_YEAR);
-    require_listing_admission(db, listing_id)
-        .await
-        .map_err(aircraft_admission_store_error)?;
-    let Some(row) =
-        aircraft_model_year_profile_for_listing(db, listing_id, refresh_existing).await?
-    else {
-        return Ok(None);
-    };
-    let nearby_price_points =
-        nearby_model_family_price_points(db, row.aircraft_model_variant_id, row.model_year).await?;
-    let response = extractor
-        .estimate_default_aircraft_avionics(&DefaultAvionicsContext {
-            manufacturer: &row.manufacturer,
-            model: &row.model,
-            variant: &row.variant,
-            model_year: row.model_year,
-            value_reference_year,
-            source_url: row.source_url.as_deref(),
-            nearby_price_points: &nearby_price_points,
-        })
-        .await?;
-    let mut item = model_year_profile_item_from_response(&row, &nearby_price_points, &response)?;
-    resolve_default_profile_identities(db, extractor, apply, &row, &mut item).await?;
-    if apply {
-        upsert_model_year_price_point(db, &item).await?;
-        for avionics in &mut item.avionics {
-            upsert_default_avionics_profile_item(
-                db,
-                row.aircraft_model_variant_id,
-                row.model_year,
-                value_reference_year,
-                avionics,
-            )
-            .await?;
-        }
-    }
-    Ok(Some(item))
-}
-
 async fn avionics_models_for_gemini_normalization(
     db: &AppDb,
     limit: i64,
@@ -908,607 +712,6 @@ async fn avionics_models_for_gemini_normalization(
             })
         })
         .collect()
-}
-
-async fn aircraft_model_year_profile_candidates_to_enrich(
-    db: &AppDb,
-    refresh_existing: bool,
-) -> StoreResult<Vec<AircraftModelYearProfileCandidateRow>> {
-    let predicate = if refresh_existing {
-        "1 = 1"
-    } else {
-        r#"
-        (
-          NOT EXISTS (
-            SELECT 1
-            FROM aircraft_model_variant_price_points price_point
-            WHERE price_point.aircraft_model_variant_id = variant.id
-              AND price_point.model_year = listing.model_year
-              AND price_point.source_confidence = 'high'
-              AND price_point.evidence_kind = 'direct_model_year'
-              AND price_point.is_valuation_eligible = TRUE
-              AND price_point.purchase_price_reference_year = price_point.model_year
-          )
-          OR NOT EXISTS (
-            SELECT 1
-            FROM aircraft_model_variant_default_avionics default_avionics
-            JOIN avionics_models model
-              ON model.id = default_avionics.avionics_model_id
-            WHERE default_avionics.aircraft_model_variant_id = variant.id
-              AND default_avionics.model_year = listing.model_year
-              AND default_avionics.source_confidence = 'high'
-              AND default_avionics.quantity > 0
-              AND TRIM(default_avionics.source_url) <> ''
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/listing/%'
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/listings/%'
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/aircraft-for-sale/%'
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/classifieds/%'
-              AND model.introduced_year IS NOT NULL
-              AND model.estimated_unit_value_usd >= 0
-              AND model.value_basis = 'installed_contribution'
-              AND model.replacement_cost_usd >= model.estimated_unit_value_usd
-              AND model.value_reference_year BETWEEN 1900 AND 2200
-              AND model.value_source IS NOT NULL
-              AND TRIM(model.value_source) <> ''
-              AND (
-                model.valuation_scope = 'unit'
-                OR (
-                  model.valuation_scope = 'integrated_suite'
-                  AND EXISTS (
-                    SELECT 1
-                    FROM avionics_suite_components suite_component
-                    WHERE suite_component.suite_model_id = model.id
-                  )
-                )
-              )
-          )
-        )
-        "#
-    };
-    let sql = format!(
-        r#"
-        SELECT
-          listing.id AS listing_id,
-          variant.id AS aircraft_model_variant_id,
-          mfr.name AS manufacturer,
-          model.name AS model,
-          variant.name AS variant,
-          listing.model_year,
-          listing.source_url
-        FROM aircraft_sale_listings listing
-        JOIN aircraft_model_variants variant
-          ON variant.id = listing.aircraft_model_variant_id
-        JOIN aircraft_models model
-          ON model.id = variant.aircraft_model_id
-        JOIN aircraft_manufacturers mfr
-          ON mfr.id = model.aircraft_manufacturer_id
-        WHERE listing.ingestion_state = 'ready'
-          AND {predicate}
-        ORDER BY mfr.name, model.name, variant.name, listing.model_year, listing.id
-        "#
-    );
-    Ok(query_as_all!(
-        db,
-        AircraftModelYearProfileCandidateRow,
-        &sql
-    )?)
-}
-
-async fn aircraft_model_year_profile_for_listing(
-    db: &AppDb,
-    listing_id: i64,
-    refresh_existing: bool,
-) -> StoreResult<Option<AircraftModelYearProfileRow>> {
-    let predicate = if refresh_existing {
-        "1 = 1"
-    } else {
-        r#"
-        (
-          NOT EXISTS (
-            SELECT 1
-            FROM aircraft_model_variant_price_points price_point
-            WHERE price_point.aircraft_model_variant_id = variant.id
-              AND price_point.model_year = listing.model_year
-              AND price_point.source_confidence = 'high'
-              AND price_point.evidence_kind = 'direct_model_year'
-              AND price_point.is_valuation_eligible = TRUE
-              AND price_point.purchase_price_reference_year = price_point.model_year
-          )
-          OR NOT EXISTS (
-            SELECT 1
-            FROM aircraft_model_variant_default_avionics default_avionics
-            JOIN avionics_models model
-              ON model.id = default_avionics.avionics_model_id
-            WHERE default_avionics.aircraft_model_variant_id = variant.id
-              AND default_avionics.model_year = listing.model_year
-              AND default_avionics.source_confidence = 'high'
-              AND default_avionics.quantity > 0
-              AND TRIM(default_avionics.source_url) <> ''
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/listing/%'
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/listings/%'
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/aircraft-for-sale/%'
-              AND LOWER(default_avionics.source_url) NOT LIKE '%/classifieds/%'
-              AND model.introduced_year IS NOT NULL
-              AND model.estimated_unit_value_usd >= 0
-              AND model.value_basis = 'installed_contribution'
-              AND model.replacement_cost_usd >= model.estimated_unit_value_usd
-              AND model.value_reference_year BETWEEN 1900 AND 2200
-              AND model.value_source IS NOT NULL
-              AND TRIM(model.value_source) <> ''
-              AND (
-                model.valuation_scope = 'unit'
-                OR (
-                  model.valuation_scope = 'integrated_suite'
-                  AND EXISTS (
-                    SELECT 1
-                    FROM avionics_suite_components suite_component
-                    WHERE suite_component.suite_model_id = model.id
-                  )
-                )
-              )
-          )
-        )
-        "#
-    };
-    let sql = format!(
-        r#"
-        SELECT
-          variant.id AS aircraft_model_variant_id,
-          mfr.name AS manufacturer,
-          model.name AS model,
-          variant.name AS variant,
-          listing.model_year,
-          listing.source_url,
-          1 AS listing_count
-        FROM aircraft_sale_listings listing
-        JOIN aircraft_model_variants variant
-          ON variant.id = listing.aircraft_model_variant_id
-        JOIN aircraft_models model
-          ON model.id = variant.aircraft_model_id
-        JOIN aircraft_manufacturers mfr
-          ON mfr.id = model.aircraft_manufacturer_id
-        WHERE listing.id = ?
-          AND listing.ingestion_state <> 'quarantined'
-          AND {predicate}
-        LIMIT 1
-        "#
-    );
-    Ok(
-        query_as_all!(db, AircraftModelYearProfileRow, &sql, listing_id)?
-            .into_iter()
-            .next(),
-    )
-}
-
-async fn nearby_model_family_price_points(
-    db: &AppDb,
-    aircraft_model_variant_id: i64,
-    model_year: i64,
-) -> StoreResult<Vec<AircraftPricePointContext>> {
-    let rows = query_as_all!(
-        db,
-        NearbyAircraftPricePointRow,
-        r#"
-        SELECT
-          variant.name AS variant,
-          price_point.model_year,
-          price_point.purchase_price_new_usd,
-          price_point.purchase_price_reference_year,
-          price_point.source_title,
-          price_point.source_confidence
-        FROM aircraft_model_variant_price_points price_point
-        JOIN aircraft_model_variants variant
-          ON variant.id = price_point.aircraft_model_variant_id
-        WHERE variant.aircraft_model_id = (
-            SELECT source_variant.aircraft_model_id
-            FROM aircraft_model_variants source_variant
-            WHERE source_variant.id = ?
-          )
-          AND NOT (
-            price_point.aircraft_model_variant_id = ?
-            AND price_point.model_year = ?
-          )
-          AND price_point.model_year BETWEEN ? AND ?
-          AND price_point.source_confidence = 'high'
-          AND price_point.evidence_kind = 'direct_model_year'
-          AND price_point.is_valuation_eligible = TRUE
-        ORDER BY ABS(price_point.model_year - ?), price_point.model_year
-        LIMIT 8
-        "#,
-        aircraft_model_variant_id,
-        aircraft_model_variant_id,
-        model_year,
-        model_year - 5,
-        model_year + 5,
-        model_year
-    )?;
-    Ok(rows
-        .into_iter()
-        .map(|row| AircraftPricePointContext {
-            variant: row.variant,
-            model_year: row.model_year,
-            purchase_price_new_usd: row.purchase_price_new_usd,
-            purchase_price_reference_year: row.purchase_price_reference_year,
-            source_title: row.source_title,
-            source_confidence: row.source_confidence,
-        })
-        .collect())
-}
-
-fn model_year_profile_item_from_response(
-    row: &AircraftModelYearProfileRow,
-    nearby_price_points: &[AircraftPricePointContext],
-    response: &Value,
-) -> StoreResult<AvionicsModelYearProfileItem> {
-    let purchase_price_new_usd = required_min_f64(response, "purchase_price_new_usd", 10_000.0)?;
-    let purchase_price_reference_year = required_year(response, "purchase_price_reference_year")?;
-    let price_source_url = required_string(response, "price_source_url")?;
-    if !(price_source_url.starts_with("https://") || price_source_url.starts_with("http://")) {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini model-year profile price_source_url must be http(s): {price_source_url}"
-        )));
-    }
-    if row.source_url.as_deref() == Some(price_source_url.as_str())
-        || looks_like_used_listing_url(&price_source_url)
-    {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini model-year profile price_source_url must cite a new-price reference, not an ordinary listing URL: {price_source_url}"
-        )));
-    }
-    let price_source_title = required_string(response, "price_source_title")?;
-    let price_source_notes = required_string(response, "price_source_notes")?;
-    let price_source_confidence = required_confidence(response, "price_source_confidence")?;
-    let price_evidence_kind = required_price_evidence_kind(response, "price_evidence_kind")?;
-    let price_discontinuity_explanation = response
-        .get("price_discontinuity_explanation")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let mut price_eligibility_notes = Vec::new();
-    if price_source_confidence != "high" {
-        price_eligibility_notes.push("source confidence is not high".to_string());
-    }
-    if price_evidence_kind != "direct_model_year" {
-        price_eligibility_notes.push(format!(
-            "evidence kind is {price_evidence_kind}, not direct_model_year"
-        ));
-    }
-    if purchase_price_reference_year != row.model_year {
-        price_eligibility_notes.push(format!(
-            "price reference year {purchase_price_reference_year} does not equal model year {}",
-            row.model_year
-        ));
-    }
-    if price_evidence_kind == "direct_model_year"
-        && !format!("{price_source_title} {price_source_notes}")
-            .contains(&row.model_year.to_string())
-    {
-        price_eligibility_notes.push(
-            "direct evidence title/notes do not identify the requested model year".to_string(),
-        );
-    }
-    if price_evidence_kind == "direct_model_year"
-        && url::Url::parse(&price_source_url)
-            .ok()
-            .is_none_or(|url| url.path().trim_matches('/').is_empty())
-    {
-        price_eligibility_notes.push("direct evidence URL is only a site homepage".to_string());
-    }
-    if has_material_price_discontinuity(
-        &row.variant,
-        row.model_year,
-        purchase_price_new_usd,
-        nearby_price_points,
-    ) && price_discontinuity_explanation.is_none()
-    {
-        price_eligibility_notes.push(
-            "price has an unexplained greater than 35% annualized discontinuity versus an adjacent eligible point"
-                .to_string(),
-        );
-    }
-    let avionics = response
-        .get("avionics")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            AvionicsStoreError::Model(
-                "Gemini model-year profile response missing avionics".to_string(),
-            )
-        })?
-        .iter()
-        .map(|value| default_avionics_item_from_response(value, row.model_year))
-        .collect::<StoreResult<Vec<_>>>()?;
-    Ok(AvionicsModelYearProfileItem {
-        aircraft_model_variant_id: row.aircraft_model_variant_id,
-        manufacturer: row.manufacturer.clone(),
-        model: row.model.clone(),
-        variant: row.variant.clone(),
-        model_year: row.model_year,
-        listing_count: row.listing_count,
-        purchase_price_new_usd,
-        purchase_price_reference_year,
-        price_source_url,
-        price_source_title,
-        price_source_notes,
-        price_source_confidence,
-        price_evidence_kind,
-        price_discontinuity_explanation,
-        is_price_valuation_eligible: price_eligibility_notes.is_empty(),
-        price_eligibility_notes,
-        avionics,
-    })
-}
-
-fn has_material_price_discontinuity(
-    variant: &str,
-    model_year: i64,
-    purchase_price_new_usd: f64,
-    nearby_price_points: &[AircraftPricePointContext],
-) -> bool {
-    nearby_price_points.iter().any(|point| {
-        if normalize_name(&point.variant) != normalize_name(variant) {
-            return false;
-        }
-        let year_gap = (point.model_year - model_year).abs();
-        if !(1..=3).contains(&year_gap) || point.purchase_price_new_usd <= 0.0 {
-            return false;
-        }
-        let ratio = (purchase_price_new_usd / point.purchase_price_new_usd)
-            .max(point.purchase_price_new_usd / purchase_price_new_usd);
-        ratio.powf(1.0 / year_gap as f64) - 1.0 > 0.35
-    })
-}
-
-fn looks_like_used_listing_url(url: &str) -> bool {
-    let path = url::Url::parse(url)
-        .ok()
-        .map(|url| url.path().to_ascii_lowercase())
-        .unwrap_or_else(|| url.to_ascii_lowercase());
-    path.contains("/listing/")
-        || path.contains("/listings/")
-        || path.contains("/aircraft-for-sale/")
-        || path.contains("/classifieds/")
-}
-
-fn default_avionics_item_from_response(
-    value: &Value,
-    model_year: i64,
-) -> StoreResult<AvionicsModelYearProfileAvionicsItem> {
-    let quantity = required_i64(value, "quantity")?;
-    if quantity < 1 {
-        return Err(AvionicsStoreError::Model(
-            "Gemini default avionics quantity must be at least 1".to_string(),
-        ));
-    }
-    let introduced_year = required_year(value, "introduced_year")?;
-    if introduced_year > model_year {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini default avionics introduction year {introduced_year} is after aircraft model year {model_year}"
-        )));
-    }
-    let compatibility_value = required_min_f64(value, "estimated_unit_value_usd", 0.0)?;
-    let installed_value_contribution_usd =
-        required_min_f64(value, "installed_value_contribution_usd", 0.0)?;
-    let replacement_cost_usd = required_min_f64(value, "replacement_cost_usd", 0.0)?;
-    validate_avionics_values(
-        compatibility_value,
-        installed_value_contribution_usd,
-        replacement_cost_usd,
-    )?;
-    let valuation_scope = required_valuation_scope(value, "valuation_scope")?;
-    let manufacturer = required_string(value, "manufacturer")?;
-    let model = required_string(value, "model")?;
-    let identity = identity_evidence_from_response(value)?;
-    let included_components =
-        included_components_from_response(value, &manufacturer, &model, valuation_scope.as_str())?;
-    let source_url = required_string(value, "source_url")?;
-    if !(source_url.starts_with("https://") || source_url.starts_with("http://")) {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini default avionics source_url must be http(s): {source_url}"
-        )));
-    }
-    if looks_like_used_listing_url(&source_url) {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini default avionics source_url must cite factory/reference evidence, not an ordinary sale listing: {source_url}"
-        )));
-    }
-    Ok(AvionicsModelYearProfileAvionicsItem {
-        avionics_model_id: 0,
-        manufacturer,
-        model,
-        avionics_types: required_string_array(value, "types")?,
-        quantity,
-        introduced_year,
-        installed_value_contribution_usd,
-        replacement_cost_usd,
-        valuation_scope,
-        included_components,
-        identity,
-        confidence: required_confidence(value, "confidence")?,
-        source_url,
-        source_title: required_string(value, "source_title")?,
-        notes: required_string(value, "notes")?,
-    })
-}
-
-async fn upsert_model_year_price_point(
-    db: &AppDb,
-    item: &AvionicsModelYearProfileItem,
-) -> StoreResult<()> {
-    let existing = query_as_all!(
-        db,
-        StoredPricePointQualityRow,
-        r#"
-        SELECT source_confidence, evidence_kind, is_valuation_eligible
-        FROM aircraft_model_variant_price_points
-        WHERE aircraft_model_variant_id = ? AND model_year = ?
-        LIMIT 1
-        "#,
-        item.aircraft_model_variant_id,
-        item.model_year
-    )?
-    .into_iter()
-    .next();
-    if existing.is_some_and(|existing| {
-        !price_evidence_is_stronger(
-            item.price_source_confidence.as_str(),
-            item.price_evidence_kind.as_str(),
-            item.is_price_valuation_eligible,
-            existing.source_confidence.as_str(),
-            existing.evidence_kind.as_str(),
-            existing.is_valuation_eligible,
-        )
-    }) {
-        return Ok(());
-    }
-    let source_notes = match &item.price_discontinuity_explanation {
-        Some(explanation) => format!(
-            "{} Discontinuity evidence: {explanation}",
-            item.price_source_notes
-        ),
-        None => item.price_source_notes.clone(),
-    };
-    execute_query!(
-        db,
-        r#"
-        INSERT INTO aircraft_model_variant_price_points (
-          aircraft_model_variant_id,
-          model_year,
-          purchase_price_new_usd,
-          purchase_price_reference_year,
-          source_url,
-          source_title,
-          source_notes,
-          source_confidence,
-          evidence_kind,
-          is_valuation_eligible
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (aircraft_model_variant_id, model_year) DO UPDATE SET
-          purchase_price_new_usd = excluded.purchase_price_new_usd,
-          purchase_price_reference_year = excluded.purchase_price_reference_year,
-          source_url = excluded.source_url,
-          source_title = excluded.source_title,
-          source_notes = excluded.source_notes,
-          source_confidence = excluded.source_confidence,
-          evidence_kind = excluded.evidence_kind,
-          is_valuation_eligible = excluded.is_valuation_eligible,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE aircraft_model_variant_price_points.is_valuation_eligible = FALSE
-        "#,
-        item.aircraft_model_variant_id,
-        item.model_year,
-        item.purchase_price_new_usd,
-        item.purchase_price_reference_year,
-        item.price_source_url.as_str(),
-        item.price_source_title.as_str(),
-        source_notes.as_str(),
-        item.price_source_confidence.as_str(),
-        item.price_evidence_kind.as_str(),
-        item.is_price_valuation_eligible,
-    )?;
-    Ok(())
-}
-
-fn price_evidence_is_stronger(
-    candidate_confidence: &str,
-    candidate_evidence_kind: &str,
-    candidate_eligible: bool,
-    existing_confidence: &str,
-    existing_evidence_kind: &str,
-    existing_eligible: bool,
-) -> bool {
-    let quality = |confidence: &str, evidence_kind: &str, eligible: bool| {
-        (
-            u8::from(eligible),
-            match confidence {
-                "high" => 3_u8,
-                "medium" => 2,
-                "low" => 1,
-                _ => 0,
-            },
-            match evidence_kind {
-                "direct_model_year" => 4_u8,
-                "direct_other_year" => 3,
-                "interpolated" => 2,
-                "inferred" => 1,
-                _ => 0,
-            },
-        )
-    };
-    quality(
-        candidate_confidence,
-        candidate_evidence_kind,
-        candidate_eligible,
-    ) > quality(
-        existing_confidence,
-        existing_evidence_kind,
-        existing_eligible,
-    )
-}
-
-async fn upsert_default_avionics_profile_item(
-    db: &AppDb,
-    aircraft_model_variant_id: i64,
-    model_year: i64,
-    value_reference_year: i64,
-    item: &mut AvionicsModelYearProfileAvionicsItem,
-) -> StoreResult<()> {
-    let avionics_model_id = item.avionics_model_id;
-    require_approved_catalog_model(db, avionics_model_id).await?;
-    update_avionics_model_metadata(
-        db,
-        avionics_model_id,
-        item.introduced_year,
-        item.installed_value_contribution_usd,
-        item.replacement_cost_usd,
-        item.valuation_scope.as_str(),
-        value_reference_year,
-        "gemini-grounded",
-        item.confidence.as_str(),
-    )
-    .await?;
-    execute_query!(
-        db,
-        r#"
-        INSERT INTO aircraft_model_variant_default_avionics (
-          aircraft_model_variant_id,
-          model_year,
-          avionics_model_id,
-          quantity,
-          source_url,
-          source_title,
-          source_notes,
-          source_confidence
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (aircraft_model_variant_id, model_year, avionics_model_id) DO UPDATE SET
-          quantity = excluded.quantity,
-          source_url = excluded.source_url,
-          source_title = excluded.source_title,
-          source_notes = excluded.source_notes,
-          source_confidence = excluded.source_confidence,
-          updated_at = CURRENT_TIMESTAMP
-        "#,
-        aircraft_model_variant_id,
-        model_year,
-        avionics_model_id,
-        item.quantity,
-        item.source_url.as_str(),
-        item.source_title.as_str(),
-        item.notes.as_str(),
-        item.confidence.as_str(),
-    )?;
-    if item.confidence == "high" {
-        replace_suite_memberships(
-            db,
-            avionics_model_id,
-            item.valuation_scope.as_str(),
-            &item.included_components,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 async fn avionics_models_to_enrich(
@@ -1773,71 +976,6 @@ async fn resolve_enrichment_item_identities(
     .await
 }
 
-async fn resolve_default_profile_identities(
-    db: &AppDb,
-    extractor: &GeminiListingExtractor,
-    persist: bool,
-    row: &AircraftModelYearProfileRow,
-    profile: &mut AvionicsModelYearProfileItem,
-) -> StoreResult<()> {
-    let aircraft = AvionicsIdentityAircraftContext {
-        manufacturer: row.manufacturer.clone(),
-        model: row.model.clone(),
-        variant: row.variant.clone(),
-        model_year: row.model_year,
-        source_url: row.source_url.clone().unwrap_or_default(),
-    };
-    let mut approved_items = Vec::with_capacity(profile.avionics.len());
-    for mut item in std::mem::take(&mut profile.avionics) {
-        let labels_are_concrete = is_usable_avionics_label(&item.manufacturer, &item.model);
-        let outcome = resolve_or_preview_identity(
-            db,
-            extractor,
-            persist,
-            identity_request(
-                &aircraft,
-                "factory/default aircraft avionics profile",
-                (
-                    &item.manufacturer,
-                    &item.model,
-                    &item.avionics_types,
-                    item.quantity,
-                ),
-                &item.identity,
-                json!({
-                    "factory_default_source_url": item.source_url,
-                    "factory_default_source_title": item.source_title,
-                    "factory_default_notes": item.notes,
-                }),
-            ),
-        )
-        .await?;
-        let approved = match outcome {
-            AvionicsIdentityOutcome::Approved(approved) => approved,
-            AvionicsIdentityOutcome::Rejected { .. } if !labels_are_concrete => {
-                // A generic default is omitted only after the identity classifier
-                // explicitly rejects it. Local label heuristics alone never skip it.
-                continue;
-            }
-            other => require_approved_identity(other, &item.manufacturer, &item.model)?,
-        };
-        apply_approved_default_identity(&mut item, &approved);
-        resolve_component_identities(
-            db,
-            extractor,
-            persist,
-            &aircraft,
-            "factory/default integrated avionics suite component",
-            item.avionics_model_id,
-            &mut item.included_components,
-        )
-        .await?;
-        approved_items.push(item);
-    }
-    profile.avionics = approved_items;
-    Ok(())
-}
-
 async fn resolve_component_identities(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
@@ -1973,17 +1111,6 @@ fn require_approved_identity(
 
 fn apply_approved_enrichment_identity(
     item: &mut AvionicsEnrichmentItem,
-    approved: &ApprovedAvionicsIdentity,
-) {
-    item.avionics_model_id = approved.id;
-    item.manufacturer = approved.manufacturer.clone();
-    item.model = approved.model.clone();
-    item.avionics_types = approved.avionics_types.clone();
-    item.identity = approved_identity_evidence(approved);
-}
-
-fn apply_approved_default_identity(
-    item: &mut AvionicsModelYearProfileAvionicsItem,
     approved: &ApprovedAvionicsIdentity,
 ) {
     item.avionics_model_id = approved.id;
@@ -2181,52 +1308,6 @@ async fn require_approved_catalog_model(db: &AppDb, avionics_model_id: i64) -> S
     }
 }
 
-async fn update_avionics_model_metadata(
-    db: &AppDb,
-    avionics_model_id: i64,
-    introduced_year: i64,
-    installed_value_contribution_usd: f64,
-    replacement_cost_usd: f64,
-    valuation_scope: &str,
-    value_reference_year: i64,
-    value_source: &str,
-    confidence: &str,
-) -> StoreResult<()> {
-    if confidence != "high" {
-        return Ok(());
-    }
-    require_approved_catalog_model(db, avionics_model_id).await?;
-    execute_query!(
-        db,
-        r#"
-        UPDATE avionics_models
-        SET
-          introduced_year = COALESCE(introduced_year, ?),
-          estimated_unit_value_usd = CASE
-            WHEN value_basis = 'installed_contribution'
-              AND estimated_unit_value_usd IS NOT NULL
-            THEN estimated_unit_value_usd
-            ELSE ?
-          END,
-          value_basis = 'installed_contribution',
-          replacement_cost_usd = COALESCE(replacement_cost_usd, ?),
-          value_reference_year = COALESCE(value_reference_year, ?),
-          value_source = COALESCE(value_source, ?),
-          valuation_scope = ?,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND catalog_status = 'approved'
-        "#,
-        introduced_year,
-        installed_value_contribution_usd,
-        replacement_cost_usd,
-        value_reference_year,
-        value_source,
-        valuation_scope,
-        avionics_model_id
-    )?;
-    Ok(())
-}
-
 fn identity_evidence_from_response(value: &Value) -> StoreResult<AvionicsIdentityEvidenceItem> {
     let manufacturer_identifier_kind =
         required_present_string(value, "manufacturer_identifier_kind")?.to_ascii_lowercase();
@@ -2273,6 +1354,17 @@ fn identity_evidence_from_response(value: &Value) -> StoreResult<AvionicsIdentit
         identity_evidence: required_present_string(value, "identity_evidence")?,
         identity_confidence: required_identity_confidence(value, "identity_confidence")?,
     })
+}
+
+fn looks_like_used_listing_url(url: &str) -> bool {
+    let path = url::Url::parse(url)
+        .ok()
+        .map(|url| url.path().to_ascii_lowercase())
+        .unwrap_or_else(|| url.to_ascii_lowercase());
+    path.contains("/listing/")
+        || path.contains("/listings/")
+        || path.contains("/aircraft-for-sale/")
+        || path.contains("/classifieds/")
 }
 
 fn fact_evidence_from_response(
@@ -2414,19 +1506,6 @@ fn required_confidence(value: &Value, field: &str) -> StoreResult<String> {
     Ok(confidence)
 }
 
-fn required_price_evidence_kind(value: &Value, field: &str) -> StoreResult<String> {
-    let evidence_kind = required_string(value, field)?.to_ascii_lowercase();
-    if !matches!(
-        evidence_kind.as_str(),
-        "direct_model_year" | "direct_other_year" | "interpolated" | "inferred"
-    ) {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini avionics response {field} has unsupported value {evidence_kind}"
-        )));
-    }
-    Ok(evidence_kind)
-}
-
 fn required_valuation_scope(value: &Value, field: &str) -> StoreResult<String> {
     let scope = required_string(value, field)?.to_ascii_lowercase();
     if !matches!(scope.as_str(), "unit" | "integrated_suite") {
@@ -2540,16 +1619,6 @@ fn required_i64(value: &Value, field: &str) -> StoreResult<i64> {
     })
 }
 
-fn required_year(value: &Value, field: &str) -> StoreResult<i64> {
-    let year = required_i64(value, field)?;
-    if !(1900..=2100).contains(&year) {
-        return Err(AvionicsStoreError::Model(format!(
-            "Gemini avionics response {field} out of range: {year}"
-        )));
-    }
-    Ok(year)
-}
-
 fn required_min_f64(value: &Value, field: &str, minimum: f64) -> StoreResult<f64> {
     let number = value.get(field).and_then(Value::as_f64).ok_or_else(|| {
         AvionicsStoreError::Model(format!(
@@ -2567,20 +1636,17 @@ fn required_min_f64(value: &Value, field: &str, minimum: f64) -> StoreResult<f64
 #[cfg(test)]
 mod tests {
     use super::{
-        default_avionics_item_from_response, enrich_listing_avionics_metadata,
-        enrich_model_year_avionics_and_price_point_for_listing, enrichment_item_from_response,
-        has_material_price_discontinuity, included_components_from_response,
-        model_year_profile_item_from_response, parse_with_one_evidence_correction,
-        price_evidence_is_stronger, validate_avionics_values, AircraftModelYearProfileRow,
-        AvionicsModelReferenceRow, AvionicsStoreError,
+        enrich_listing_avionics_metadata, enrichment_item_from_response,
+        included_components_from_response, parse_with_one_evidence_correction,
+        validate_avionics_values, AvionicsModelReferenceRow, AvionicsStoreError,
     };
     use crate::db::{AppDb, DatabaseBackend};
-    use crate::extract::{AircraftPricePointContext, GeminiListingExtractor};
+    use crate::extract::GeminiListingExtractor;
     use serde_json::json;
     use std::cell::Cell;
 
     #[tokio::test]
-    async fn listing_enrichment_paths_reject_before_gemini_and_persistence() {
+    async fn listing_enrichment_rejects_before_gemini_and_persistence() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
@@ -2613,44 +1679,6 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(metadata_error.to_string().contains("missing_registration"));
-
-        let profile_error = enrich_model_year_avionics_and_price_point_for_listing(
-            &db, &extractor, true, listing_id, None, true,
-        )
-        .await
-        .unwrap_err();
-        assert!(profile_error.to_string().contains("missing_registration"));
-
-        let price_points: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_model_variant_price_points")
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        let default_avionics: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_model_variant_default_avionics")
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        assert_eq!((price_points, default_avionics), (0, 0));
-    }
-
-    #[test]
-    fn chronology_check_flags_large_adjacent_same_variant_jump() {
-        let nearby = vec![AircraftPricePointContext {
-            variant: "Model A".to_string(),
-            model_year: 2000,
-            purchase_price_new_usd: 100_000.0,
-            purchase_price_reference_year: 2000,
-            source_title: "Direct guide".to_string(),
-            source_confidence: "high".to_string(),
-        }];
-
-        assert!(has_material_price_discontinuity(
-            "Model A", 2001, 150_000.0, &nearby
-        ));
-        assert!(!has_material_price_discontinuity(
-            "Model B", 2001, 150_000.0, &nearby
-        ));
     }
 
     #[test]
@@ -2823,96 +1851,5 @@ mod tests {
             included_components_from_response(&response, "Suite Maker", "Suite 1000", "unit")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn default_avionics_rejects_sale_listing_evidence_and_invalid_quantity() {
-        let mut response = json!({
-            "manufacturer": "Garmin",
-            "model": "G500 TXi",
-            "types": ["Flight Display"],
-            "manufacturer_identifier_kind": "manufacturer_part_number",
-            "manufacturer_identifier": "011-00000-00",
-            "identity_source_url": "https://static.garmin.com/manuals/g500-txi.pdf",
-            "identity_source_title": "G500 TXi installation manual",
-            "identity_evidence": "The manual identifies G500 TXi part 011-00000-00.",
-            "identity_confidence": "very_high",
-            "quantity": 1,
-            "introduced_year": 2017,
-            "estimated_unit_value_usd": 12000.0,
-            "installed_value_contribution_usd": 12000.0,
-            "replacement_cost_usd": 25000.0,
-            "valuation_scope": "unit",
-            "included_components": [],
-            "confidence": "high",
-            "source_url": "https://market.example/aircraft-for-sale/123",
-            "source_title": "Aircraft listing",
-            "notes": "Listing equipment panel"
-        });
-        assert!(default_avionics_item_from_response(&response, 2020).is_err());
-
-        response["source_url"] = json!("https://manufacturer.example/g500-txi");
-        response["quantity"] = json!(0);
-        assert!(default_avionics_item_from_response(&response, 2020).is_err());
-    }
-
-    #[test]
-    fn price_evidence_updates_are_quality_monotonic() {
-        assert!(!price_evidence_is_stronger(
-            "low",
-            "inferred",
-            false,
-            "medium",
-            "direct_other_year",
-            false,
-        ));
-        assert!(!price_evidence_is_stronger(
-            "high",
-            "direct_model_year",
-            true,
-            "high",
-            "direct_model_year",
-            true,
-        ));
-        assert!(price_evidence_is_stronger(
-            "high",
-            "direct_model_year",
-            true,
-            "medium",
-            "direct_other_year",
-            false,
-        ));
-    }
-
-    #[test]
-    fn only_high_confidence_direct_exact_year_price_is_eligible() {
-        let row = AircraftModelYearProfileRow {
-            aircraft_model_variant_id: 7,
-            manufacturer: "Maker".to_string(),
-            model: "Family".to_string(),
-            variant: "Variant".to_string(),
-            model_year: 2001,
-            source_url: Some("https://market.example/listing/7".to_string()),
-            listing_count: 1,
-        };
-        let mut response = json!({
-            "purchase_price_new_usd": 150000.0,
-            "purchase_price_reference_year": 2001,
-            "price_source_url": "https://reference.example/guides/2001-variant",
-            "price_source_title": "2001 Variant price guide",
-            "price_source_notes": "Direct 2001 model-year base price.",
-            "price_source_confidence": "high",
-            "price_evidence_kind": "direct_model_year",
-            "price_discontinuity_explanation": null,
-            "avionics": []
-        });
-        let direct = model_year_profile_item_from_response(&row, &[], &response).unwrap();
-        assert!(direct.is_price_valuation_eligible);
-
-        response["price_source_confidence"] = json!("low");
-        response["price_evidence_kind"] = json!("inferred");
-        let inferred = model_year_profile_item_from_response(&row, &[], &response).unwrap();
-        assert!(!inferred.is_price_valuation_eligible);
-        assert_eq!(inferred.price_eligibility_notes.len(), 2);
     }
 }

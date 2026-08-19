@@ -24,55 +24,6 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 
-CREATE TABLE IF NOT EXISTS depreciation_profiles (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE,
-  age_decay_rate REAL NOT NULL,
-  long_run_residual_fraction REAL NOT NULL,
-  new_to_used_discount_fraction REAL NOT NULL,
-  new_to_used_discount_years REAL NOT NULL,
-  airframe_doubling_discount REAL NOT NULL,
-  max_airframe_premium REAL NOT NULL,
-  max_airframe_discount REAL NOT NULL,
-  replacement_floor_fraction REAL NOT NULL DEFAULT 0,
-  minimum_value_fraction REAL NOT NULL,
-  high_time_threshold_hours REAL,
-  high_time_discount_at_double_threshold REAL NOT NULL,
-  is_system_profile INTEGER NOT NULL DEFAULT 0 CHECK (is_system_profile IN (0, 1)),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS depreciation_profile_fit_metadata (
-  depreciation_profile_id INTEGER PRIMARY KEY
-    REFERENCES depreciation_profiles(id) ON DELETE CASCADE,
-  fit_scope TEXT NOT NULL CHECK (fit_scope IN ('global', 'category', 'model')),
-  fit_scope_key TEXT NOT NULL,
-  fit_category TEXT NOT NULL,
-  sample_count INTEGER NOT NULL,
-  rmse_usd REAL NOT NULL,
-  mae_fraction REAL NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (fit_scope, fit_scope_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_depreciation_profile_fit_metadata_category
-  ON depreciation_profile_fit_metadata (fit_category);
-
-CREATE TABLE IF NOT EXISTS component_depreciation_profiles (
-  component_type TEXT PRIMARY KEY
-    CHECK (component_type IN ('engine', 'propeller', 'avionics')),
-  age_decay_rate REAL,
-  long_run_residual_fraction REAL,
-  baseline_life_fraction REAL,
-  sample_count INTEGER NOT NULL DEFAULT 0,
-  rmse_usd REAL,
-  mae_fraction REAL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE TABLE IF NOT EXISTS engine_manufacturers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -189,93 +140,6 @@ CREATE TABLE IF NOT EXISTS aircraft_model_variants (
 
 CREATE INDEX IF NOT EXISTS idx_aircraft_model_variants_model
   ON aircraft_model_variants (aircraft_model_id);
-
-CREATE TABLE IF NOT EXISTS aircraft_model_spec_versions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  aircraft_model_id INTEGER NOT NULL REFERENCES aircraft_models(id),
-  aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
-  effective_from TEXT NOT NULL,
-  effective_to TEXT,
-  depreciation_profile_id INTEGER REFERENCES depreciation_profiles(id),
-  average_inflation_rate REAL NOT NULL DEFAULT 0.025,
-  fuel_burn_gph REAL,
-  oil_quarts_per_hour REAL,
-  oil_price_per_quart_usd REAL,
-  engine_model_id INTEGER REFERENCES engine_models(id),
-  engine_count INTEGER NOT NULL DEFAULT 1,
-  engine_tbo_hours REAL,
-  engine_overhaul_cost_usd REAL,
-  engine_value_baseline_life_fraction REAL NOT NULL DEFAULT 0.5,
-  propeller_model_id INTEGER REFERENCES propeller_models(id),
-  propeller_count INTEGER NOT NULL DEFAULT 1,
-  propeller_tbo_hours REAL,
-  propeller_overhaul_cost_usd REAL,
-  propeller_value_baseline_life_fraction REAL NOT NULL DEFAULT 0.5,
-  annual_inspection_usd REAL,
-  other_maintenance_per_hour REAL,
-  source_url TEXT,
-  configuration_scope TEXT NOT NULL DEFAULT 'unreviewed'
-    CHECK (configuration_scope IN ('factory_default', 'listing_specific', 'unreviewed')),
-  source_confidence TEXT
-    CHECK (source_confidence IS NULL OR source_confidence IN ('high', 'medium', 'low')),
-  evidence_kind TEXT NOT NULL DEFAULT 'unreviewed'
-    CHECK (evidence_kind IN ('authoritative_reference', 'listing_only', 'unreviewed')),
-  is_valuation_eligible INTEGER NOT NULL DEFAULT 0
-    CHECK (is_valuation_eligible IN (0, 1)),
-  created_by_user_id INTEGER REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CHECK (effective_to IS NULL OR effective_to > effective_from),
-  CHECK (
-    is_valuation_eligible = 0
-    OR (
-      configuration_scope = 'factory_default'
-      AND source_confidence = 'high'
-      AND evidence_kind = 'authoritative_reference'
-      AND source_url IS NOT NULL
-      AND length(trim(source_url)) > 0
-    )
-  )
-);
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_model_spec_versions_model
-  ON aircraft_model_spec_versions (
-    aircraft_model_id,
-    aircraft_model_variant_id,
-    effective_from
-  );
-
-CREATE TABLE IF NOT EXISTS aircraft_model_variant_price_points (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
-  model_year INTEGER NOT NULL,
-  purchase_price_new_usd REAL NOT NULL,
-  purchase_price_reference_year INTEGER NOT NULL,
-  source_url TEXT NOT NULL,
-  source_title TEXT NOT NULL,
-  source_notes TEXT NOT NULL,
-  source_confidence TEXT NOT NULL,
-  evidence_kind TEXT NOT NULL DEFAULT 'unreviewed'
-    CHECK (evidence_kind IN (
-      'direct_model_year', 'direct_other_year', 'interpolated', 'inferred', 'unreviewed'
-    )),
-  is_valuation_eligible INTEGER NOT NULL DEFAULT 0
-    CHECK (is_valuation_eligible IN (0, 1)),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (aircraft_model_variant_id, model_year),
-  CHECK (
-    is_valuation_eligible = 0
-    OR (
-      source_confidence = 'high'
-      AND evidence_kind = 'direct_model_year'
-      AND purchase_price_reference_year = model_year
-    )
-  )
-);
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_model_variant_price_points_lookup
-  ON aircraft_model_variant_price_points (aircraft_model_variant_id, model_year);
 
 CREATE TABLE IF NOT EXISTS avionics_manufacturers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2164,6 +2028,18 @@ JOIN avionics_catalog_human_consolidation_claim claim
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
+  '20260819_reference_catalog_cutover', 1,
+  'b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO UPDATE SET
+  contract_version = excluded.contract_version,
+  contract_fingerprint = excluded.contract_fingerprint,
+  installed_at = excluded.installed_at;
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
   '20260810_avionics_grounded_exact_model_consolidation',
   1,
   '36f9ff06bf42fc769508ecfe578f4b4a11f2e0072b81efebed1dee8958654f2a',
@@ -2497,160 +2373,6 @@ OR (
 )
 BEGIN
   SELECT RAISE(ABORT, 'avionics suite membership requires approved catalog entries');
-END;
-
-CREATE TABLE IF NOT EXISTS aircraft_model_variant_default_avionics (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
-  model_year INTEGER NOT NULL,
-  avionics_model_id INTEGER NOT NULL REFERENCES avionics_models(id),
-  quantity INTEGER NOT NULL DEFAULT 1,
-  source_url TEXT NOT NULL,
-  source_title TEXT NOT NULL,
-  source_notes TEXT NOT NULL,
-  source_confidence TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (aircraft_model_variant_id, model_year, avionics_model_id)
-);
-
-CREATE TRIGGER IF NOT EXISTS aircraft_model_variant_default_avionics_approved_insert
-BEFORE INSERT ON aircraft_model_variant_default_avionics
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM avionics_models model
-  WHERE model.id = NEW.avionics_model_id
-    AND model.catalog_status = 'approved'
-)
-BEGIN
-  SELECT RAISE(ABORT, 'default avionics association requires an approved catalog entry');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_model_variant_default_avionics_approved_update
-BEFORE UPDATE OF avionics_model_id ON aircraft_model_variant_default_avionics
-WHEN NEW.avionics_model_id IS NOT OLD.avionics_model_id
-AND NOT EXISTS (
-  SELECT 1
-  FROM avionics_models model
-  WHERE model.id = NEW.avionics_model_id
-    AND model.catalog_status = 'approved'
-)
-AND NOT EXISTS (
-  SELECT 1
-  FROM avionics_catalog_authorized_consolidations guard
-  JOIN avionics_models survivor ON survivor.id = guard.survivor_model_id
-  JOIN avionics_models legacy ON legacy.id = OLD.avionics_model_id
-  WHERE guard.duplicate_model_id = OLD.avionics_model_id
-    AND guard.survivor_model_id = NEW.avionics_model_id
-    AND survivor.catalog_status = 'unreviewed'
-    AND legacy.catalog_status = 'unreviewed'
-)
-BEGIN
-  SELECT RAISE(ABORT, 'default avionics association requires an approved catalog entry');
-END;
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_model_variant_default_avionics_lookup
-  ON aircraft_model_variant_default_avionics (aircraft_model_variant_id, model_year);
-
--- Unverified factory-default claims are deliberately separate from canonical
--- defaults. This table itself means pending; rejection deletes the row, while
--- exact insertion into the canonical table atomically admits and removes it.
-CREATE TABLE IF NOT EXISTS aircraft_model_variant_default_avionics_candidates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  quarantined_default_avionics_id INTEGER UNIQUE,
-  aircraft_model_variant_id INTEGER NOT NULL
-    REFERENCES aircraft_model_variants(id) ON DELETE RESTRICT,
-  model_year INTEGER NOT NULL,
-  avionics_model_id INTEGER NOT NULL
-    REFERENCES avionics_models(id) ON DELETE RESTRICT,
-  quantity INTEGER NOT NULL,
-  source_url TEXT NOT NULL,
-  source_title TEXT NOT NULL,
-  source_notes TEXT NOT NULL,
-  source_confidence TEXT NOT NULL,
-  pending_reason TEXT NOT NULL DEFAULT 'factory_default_claim_unverified',
-  quarantined_created_at TEXT,
-  quarantined_updated_at TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (aircraft_model_variant_id, model_year, avionics_model_id),
-  CHECK (pending_reason IN (
-    'catalog_product_unverified', 'factory_default_claim_unverified'
-  )),
-  CHECK (
-    (
-      quarantined_default_avionics_id IS NULL
-      AND quarantined_created_at IS NULL
-      AND quarantined_updated_at IS NULL
-    )
-    OR (
-      quarantined_default_avionics_id > 0
-      AND quarantined_created_at IS NOT NULL
-      AND quarantined_updated_at IS NOT NULL
-    )
-  )
-);
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_default_avionics_candidates_product
-  ON aircraft_model_variant_default_avionics_candidates (
-    avionics_model_id, aircraft_model_variant_id, model_year, id
-  );
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_active_conflict_insert
-BEFORE INSERT ON aircraft_model_variant_default_avionics_candidates
-WHEN EXISTS (
-  SELECT 1
-  FROM aircraft_model_variant_default_avionics active
-  WHERE active.aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND active.model_year = NEW.model_year
-    AND active.avionics_model_id = NEW.avionics_model_id
-)
-BEGIN
-  SELECT RAISE(ABORT, 'default avionics claim already exists in the canonical table');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_claim_immutable
-BEFORE UPDATE ON aircraft_model_variant_default_avionics_candidates
-BEGIN
-  SELECT RAISE(ABORT, 'pending default avionics claims must be replaced, admitted, or rejected explicitly');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_admission_guard
-BEFORE INSERT ON aircraft_model_variant_default_avionics
-WHEN EXISTS (
-  SELECT 1
-  FROM aircraft_model_variant_default_avionics_candidates candidate
-  WHERE candidate.aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND candidate.model_year = NEW.model_year
-    AND candidate.avionics_model_id = NEW.avionics_model_id
-)
-AND NOT EXISTS (
-  SELECT 1
-  FROM aircraft_model_variant_default_avionics_candidates candidate
-  WHERE candidate.aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND candidate.model_year = NEW.model_year
-    AND candidate.avionics_model_id = NEW.avionics_model_id
-    AND candidate.quantity = NEW.quantity
-    AND candidate.source_url = NEW.source_url
-    AND candidate.source_title = NEW.source_title
-    AND candidate.source_notes = NEW.source_notes
-    AND candidate.source_confidence = NEW.source_confidence
-)
-BEGIN
-  SELECT RAISE(ABORT, 'canonical default admission must exactly match its pending claim');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_admission_move
-AFTER INSERT ON aircraft_model_variant_default_avionics
-BEGIN
-  DELETE FROM aircraft_model_variant_default_avionics_candidates
-  WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND model_year = NEW.model_year
-    AND avionics_model_id = NEW.avionics_model_id
-    AND quantity = NEW.quantity
-    AND source_url = NEW.source_url
-    AND source_title = NEW.source_title
-    AND source_notes = NEW.source_notes
-    AND source_confidence = NEW.source_confidence;
 END;
 
 CREATE TABLE IF NOT EXISTS aircraft_sale_listings (
@@ -3810,11 +3532,6 @@ AND (
   )
   OR EXISTS (
     SELECT 1
-    FROM aircraft_model_variant_default_avionics default_link
-    WHERE default_link.avionics_model_id = OLD.id
-  )
-  OR EXISTS (
-    SELECT 1
     FROM avionics_suite_components suite_link
     WHERE suite_link.suite_model_id = OLD.id
        OR suite_link.component_model_id = OLD.id
@@ -4894,6 +4611,9 @@ CREATE TABLE IF NOT EXISTS aircraft_reference_prices (
   amount REAL NOT NULL CHECK (amount > 0),
   currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   price_reference_year INTEGER NOT NULL CHECK (price_reference_year BETWEEN 1900 AND 2200),
+  configuration_basis TEXT NOT NULL DEFAULT 'unknown' CHECK (configuration_basis IN (
+    'full_standard_configuration', 'base_aircraft_only', 'unknown'
+  )),
   evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
     'direct_model_year', 'direct_other_year', 'interpolated', 'inferred'
   )),
@@ -4981,6 +4701,19 @@ CREATE TABLE IF NOT EXISTS aircraft_reference_features (
   CHECK (
     (boolean_value IS NOT NULL) + (number_value IS NOT NULL) + (text_value IS NOT NULL) = 1
   )
+);
+
+CREATE TABLE IF NOT EXISTS aircraft_reference_fact_set_attestations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  aircraft_reference_configuration_version_id INTEGER NOT NULL
+    REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE,
+  fact_set_kind TEXT NOT NULL CHECK (fact_set_kind IN (
+    'avionics', 'engines', 'propellers', 'features'
+  )),
+  evidence_claim_id INTEGER NOT NULL
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
 );
 
 -- Component catalog entries require an exact validated primary-source
@@ -5341,14 +5074,7 @@ WHEN NOT EXISTS (
   WHERE version.id = NEW.aircraft_reference_configuration_version_id
     AND version.publication_state = 'building'
 )
-OR (
-  NEW.evidence_kind = 'direct_model_year'
-  AND NEW.price_reference_year <> (
-    SELECT model_year FROM aircraft_reference_configuration_versions
-    WHERE id = NEW.aircraft_reference_configuration_version_id
-  )
-)
-BEGIN SELECT RAISE(ABORT, 'reference price requires a building version and consistent year'); END;
+BEGIN SELECT RAISE(ABORT, 'reference price requires a building version'); END;
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_avionics_building_insert
 BEFORE INSERT ON aircraft_reference_avionics
 WHEN NOT EXISTS (
@@ -5404,6 +5130,14 @@ OR NOT EXISTS (
     )
 )
 BEGIN SELECT RAISE(ABORT, 'reference feature value does not match its definition'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_fact_set_building_insert
+BEFORE INSERT ON aircraft_reference_fact_set_attestations
+WHEN NOT EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = NEW.aircraft_reference_configuration_version_id
+    AND version.publication_state = 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'reference fact-set attestation requires a building version'); END;
 
 -- No profile fact can be changed after insertion. Correct data by publishing a
 -- replacement version rather than mutating a historical configuration.
@@ -5492,6 +5226,17 @@ WHEN EXISTS (
     AND version.publication_state <> 'building'
 )
 BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_fact_set_immutable_update
+BEFORE UPDATE ON aircraft_reference_fact_set_attestations
+BEGIN SELECT RAISE(ABORT, 'reference profile facts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_fact_set_immutable_delete
+BEFORE DELETE ON aircraft_reference_fact_set_attestations
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = OLD.aircraft_reference_configuration_version_id
+    AND version.publication_state <> 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
 
 -- Publication requires a complete exact-year price and at least one applicable
 -- market/serial scope. It also rejects overlap with any already-published
@@ -5509,6 +5254,11 @@ BEGIN
     SELECT 1 FROM aircraft_reference_applicability_scopes scope
     WHERE scope.aircraft_reference_configuration_version_id = NEW.id
   );
+  SELECT RAISE(ABORT, 'published reference profile requires complete factory fact-set attestations')
+  WHERE 4 <> (
+    SELECT COUNT(*) FROM aircraft_reference_fact_set_attestations attestation
+    WHERE attestation.aircraft_reference_configuration_version_id = NEW.id
+  );
   SELECT RAISE(ABORT, 'published reference profile requires direct exact-year primary price evidence')
   WHERE NOT EXISTS (
     SELECT 1
@@ -5518,7 +5268,7 @@ BEGIN
     WHERE price.aircraft_reference_configuration_version_id = NEW.id
       AND price.price_kind IN ('base_msrp', 'equipped_msrp')
       AND price.evidence_kind = 'direct_model_year'
-      AND price.price_reference_year = NEW.model_year
+      AND price.configuration_basis = 'full_standard_configuration'
       AND claim.validation_status = 'validated'
       AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
   );
@@ -5542,6 +5292,21 @@ BEGIN
     WHERE propeller.aircraft_reference_configuration_version_id = NEW.id
       AND model.id IS NULL
   );
+  SELECT RAISE(ABORT, 'published reference profile requires valuation-ready factory avionics')
+  WHERE EXISTS (
+    SELECT 1 FROM aircraft_reference_avionics fact
+    JOIN avionics_models model ON model.id = fact.avionics_model_id
+    WHERE fact.aircraft_reference_configuration_version_id = NEW.id
+      AND (model.catalog_status <> 'approved'
+        OR model.introduced_year IS NULL
+        OR model.estimated_unit_value_usd IS NULL
+        OR model.estimated_unit_value_usd < 0
+        OR model.value_basis <> 'installed_contribution'
+        OR model.replacement_cost_usd IS NULL
+        OR model.replacement_cost_usd < model.estimated_unit_value_usd
+        OR model.value_reference_year NOT BETWEEN 1900 AND 2200
+        OR trim(coalesce(model.value_source, '')) = '')
+  );
   SELECT RAISE(ABORT, 'published reference profile facts require validated primary evidence')
   WHERE EXISTS (
     SELECT 1
@@ -5562,6 +5327,9 @@ BEGIN
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
       SELECT evidence_claim_id FROM aircraft_reference_features
+      WHERE aircraft_reference_configuration_version_id = NEW.id
+      UNION ALL
+      SELECT evidence_claim_id FROM aircraft_reference_fact_set_attestations
       WHERE aircraft_reference_configuration_version_id = NEW.id
     ) fact
     JOIN curation_evidence_claims claim ON claim.id = fact.evidence_claim_id
@@ -7119,18 +6887,6 @@ WHEN NOT EXISTS (
       SELECT 1 FROM rental_aircraft_offerings child
       WHERE child.aircraft_model_variant_id = legacy_variant.id
     )
-    AND NOT EXISTS (
-      SELECT 1 FROM aircraft_model_spec_versions child
-      WHERE child.aircraft_model_variant_id = legacy_variant.id
-    )
-    AND NOT EXISTS (
-      SELECT 1 FROM aircraft_model_variant_price_points child
-      WHERE child.aircraft_model_variant_id = legacy_variant.id
-    )
-    AND NOT EXISTS (
-      SELECT 1 FROM aircraft_model_variant_default_avionics child
-      WHERE child.aircraft_model_variant_id = legacy_variant.id
-    )
 )
 BEGIN
   SELECT RAISE(ABORT, 'aircraft compatibility projection requires the active command, exact copied assignment provenance, and its fresh reserved hierarchy');
@@ -7706,43 +7462,6 @@ WHEN NEW.ingestion_state = 'ready'
 BEGIN
   SELECT RAISE(ABORT, 'pending aircraft compatibility placeholder cannot become ready');
 END;
-
--- Existing valuation rows may be inserted for a projected variant, but an
--- UPDATE cannot silently move evidence into or out of a canonical projection.
-CREATE TRIGGER IF NOT EXISTS projected_aircraft_spec_variant_move
-BEFORE UPDATE OF aircraft_model_variant_id ON aircraft_model_spec_versions
-WHEN NEW.aircraft_model_variant_id <> OLD.aircraft_model_variant_id
- AND (
-   EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-           WHERE aircraft_model_variant_id = OLD.aircraft_model_variant_id)
-   OR EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id)
- )
-BEGIN SELECT RAISE(ABORT, 'aircraft spec evidence cannot move into or out of a projected variant'); END;
-
-CREATE TRIGGER IF NOT EXISTS projected_aircraft_price_variant_move
-BEFORE UPDATE OF aircraft_model_variant_id
-ON aircraft_model_variant_price_points
-WHEN NEW.aircraft_model_variant_id <> OLD.aircraft_model_variant_id
- AND (
-   EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-           WHERE aircraft_model_variant_id = OLD.aircraft_model_variant_id)
-   OR EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id)
- )
-BEGIN SELECT RAISE(ABORT, 'aircraft price evidence cannot move into or out of a projected variant'); END;
-
-CREATE TRIGGER IF NOT EXISTS projected_aircraft_default_avionics_variant_move
-BEFORE UPDATE OF aircraft_model_variant_id
-ON aircraft_model_variant_default_avionics
-WHEN NEW.aircraft_model_variant_id <> OLD.aircraft_model_variant_id
- AND (
-   EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-           WHERE aircraft_model_variant_id = OLD.aircraft_model_variant_id)
-   OR EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id)
- )
-BEGIN SELECT RAISE(ABORT, 'default avionics evidence cannot move into or out of a projected variant'); END;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at

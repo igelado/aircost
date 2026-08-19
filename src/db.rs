@@ -8,7 +8,6 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, PgPool, SqlitePool};
 
-use crate::depreciation::default_avionics_profile;
 use crate::models::User;
 
 pub const DEFAULT_DATABASE_PATH: &str = "data/aircost.sqlite3";
@@ -69,11 +68,6 @@ const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION: &str =
 const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION: i64 = 2;
 const AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_FINGERPRINT: &str =
     "f78087f6354d93d78dc8cebc895f285e38a91ca6f72dc2351acaaa88b49f9620";
-const DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION: &str =
-    "20260802_default_avionics_candidate_quarantine";
-const DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION: i64 = 2;
-const DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT: &str =
-    "b8a6ecd15acc0ce14f67bf37ff4387c0ded4d1c6669d2fc4698b6c0a6c209ba4";
 const AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION: &str =
     "20260803_avionics_product_reuse_attestations";
 const AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION: i64 = 2;
@@ -293,6 +287,10 @@ BEGIN
   RETURN NEW;
 END;
 "#;
+const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
+const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
+const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
+    "b38a8330c4d9cdf85fc431ad8643eb9f0bdc122b4c93e472a1b6cac76bdf3988";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -1022,10 +1020,6 @@ impl AppDb {
                           'avionics_suite_components'),
                         ('trigger', 'avionics_suite_components_approved_update',
                           'avionics_suite_components'),
-                        ('trigger', 'aircraft_model_variant_default_avionics_approved_insert',
-                          'aircraft_model_variant_default_avionics'),
-                        ('trigger', 'aircraft_model_variant_default_avionics_approved_update',
-                          'aircraft_model_variant_default_avionics'),
                         ('trigger', 'avionics_models_canonical_identity_validate_update',
                           'avionics_models'),
                         ('trigger', 'avionics_models_canonical_identity_sync_update',
@@ -1174,10 +1168,6 @@ impl AppDb {
                           'avionics_suite_components_approved_insert'),
                         ('avionics_suite_components',
                           'avionics_suite_components_approved_update'),
-                        ('aircraft_model_variant_default_avionics',
-                          'aircraft_model_variant_default_avionics_approved_insert'),
-                        ('aircraft_model_variant_default_avionics',
-                          'aircraft_model_variant_default_avionics_approved_update'),
                         ('avionics_models',
                           'avionics_models_canonical_identity_validate_update'),
                         ('avionics_models',
@@ -1245,7 +1235,6 @@ impl AppDb {
                               AND NOT actual.tgisinternal
                           )
                         )
-                      )
                     "#,
                 )
                 .fetch_one(pool)
@@ -1568,7 +1557,6 @@ impl AppDb {
                               AND NOT actual.tgisinternal
                           )
                         )
-                      )
                     "#,
                 )
                 .fetch_one(pool)
@@ -2236,207 +2224,6 @@ impl AppDb {
                 .await?;
         if missing_avionics_source_origins {
             bail!(avionics_authoritative_source_origins_migration_required_message(self.kind()));
-        }
-
-        let default_avionics_table_exists = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_scalar::<_, i64>(
-                    r#"
-                    SELECT EXISTS (
-                      SELECT 1
-                      FROM sqlite_schema
-                      WHERE type = 'table'
-                        AND name = 'aircraft_model_variant_default_avionics'
-                    )
-                    "#,
-                )
-                .fetch_one(pool)
-                .await?
-                    != 0
-            }
-            DatabaseBackend::Postgres(pool) => {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT to_regclass('aircraft_model_variant_default_avionics') IS NOT NULL",
-                )
-                .fetch_one(pool)
-                .await?
-            }
-        };
-        let missing_default_avionics_candidate_objects = if !default_avionics_table_exists {
-            false
-        } else {
-            match self.backend() {
-                DatabaseBackend::Sqlite(pool) => {
-                    sqlx::query_scalar::<_, i64>(
-                        r#"
-                    WITH required_objects(object_type, object_name) AS (
-                      VALUES
-                        ('table', 'aircraft_model_variant_default_avionics_candidates'),
-                        ('trigger', 'aircraft_default_avionics_candidate_active_conflict_insert'),
-                        ('trigger', 'aircraft_default_avionics_candidate_claim_immutable'),
-                        ('trigger', 'aircraft_default_avionics_candidate_admission_guard'),
-                        ('trigger', 'aircraft_default_avionics_candidate_admission_move')
-                    )
-                    SELECT
-                      EXISTS (
-                        SELECT 1
-                        FROM required_objects required
-                        WHERE NOT EXISTS (
-                          SELECT 1
-                          FROM sqlite_schema actual
-                          WHERE actual.type = required.object_type
-                            AND actual.name = required.object_name
-                        )
-                      )
-                    "#,
-                    )
-                    .fetch_one(pool)
-                    .await?
-                        != 0
-                }
-                DatabaseBackend::Postgres(pool) => {
-                    sqlx::query_scalar::<_, bool>(
-                        r#"
-                    WITH required_relations(object_name) AS (
-                      VALUES
-                        ('aircraft_model_variant_default_avionics_candidates')
-                    ),
-                    required_triggers(
-                      parent_name, trigger_name, function_signature, trigger_type,
-                      definition_fragment, requires_semantic_lock
-                    ) AS (
-                      VALUES
-                        ('aircraft_model_variant_default_avionics_candidates',
-                          'aircraft_default_avionics_candidate_active_conflict_insert',
-                          'reject_active_default_avionics_candidate()', 7,
-                          'default avionics claim already exists in the canonical table',
-                          TRUE),
-                        ('aircraft_model_variant_default_avionics_candidates',
-                          'aircraft_default_avionics_candidate_claim_immutable',
-                          'preserve_pending_default_avionics_claim()', 19,
-                          'pending default avionics claims must be replaced',
-                          FALSE),
-                        ('aircraft_model_variant_default_avionics',
-                          'aircraft_default_avionics_candidate_admission_guard',
-                          'require_exact_pending_default_avionics_admission()', 7,
-                          'canonical default admission must exactly match its pending claim',
-                          TRUE),
-                        ('aircraft_model_variant_default_avionics',
-                          'aircraft_default_avionics_candidate_admission_move',
-                          'move_admitted_default_avionics_candidate()', 5,
-                          'DELETE FROM aircraft_model_variant_default_avionics_candidates',
-                          FALSE)
-                    )
-                    SELECT
-                      EXISTS (
-                        SELECT 1 FROM required_relations required
-                        WHERE to_regclass(required.object_name) IS NULL
-                      )
-                      OR EXISTS (
-                        SELECT 1 FROM required_triggers required
-                        WHERE NOT EXISTS (
-                          SELECT 1
-                          FROM pg_trigger actual
-                          WHERE actual.tgrelid = to_regclass(required.parent_name)
-                            AND actual.tgname = required.trigger_name
-                            AND actual.tgfoid =
-                              to_regprocedure(required.function_signature)
-                            AND actual.tgtype = required.trigger_type
-                            AND actual.tgenabled IN ('O', 'A')
-                            AND NOT actual.tgisinternal
-                            AND POSITION(
-                              required.definition_fragment
-                              IN pg_get_functiondef(actual.tgfoid)
-                            ) > 0
-                            AND (
-                              NOT required.requires_semantic_lock
-                              OR POSITION(
-                                'pg_advisory_xact_lock'
-                                IN pg_get_functiondef(actual.tgfoid)
-                              ) > 0
-                            )
-                        )
-                      )
-                    "#,
-                    )
-                    .fetch_one(pool)
-                    .await?
-                }
-            }
-        };
-        let invalid_default_avionics_candidate_state =
-            if !default_avionics_table_exists || missing_default_avionics_candidate_objects {
-                false
-            } else {
-                match self.backend() {
-                    DatabaseBackend::Sqlite(pool) => {
-                        sqlx::query_scalar::<_, i64>(
-                            r#"
-                            SELECT
-                              EXISTS (
-                                SELECT 1
-                                FROM aircraft_model_variant_default_avionics default_avionics
-                                JOIN avionics_models model
-                                  ON model.id = default_avionics.avionics_model_id
-                                WHERE model.catalog_status <> 'approved'
-                              )
-                              OR EXISTS (
-                                SELECT 1
-                                FROM aircraft_model_variant_default_avionics active
-                                JOIN aircraft_model_variant_default_avionics_candidates candidate
-                                  ON candidate.aircraft_model_variant_id =
-                                     active.aircraft_model_variant_id
-                                 AND candidate.model_year = active.model_year
-                                 AND candidate.avionics_model_id =
-                                     active.avionics_model_id
-                              )
-                            "#,
-                        )
-                        .fetch_one(pool)
-                        .await?
-                            != 0
-                    }
-                    DatabaseBackend::Postgres(pool) => {
-                        sqlx::query_scalar::<_, bool>(
-                            r#"
-                            SELECT
-                              EXISTS (
-                                SELECT 1
-                                FROM aircraft_model_variant_default_avionics default_avionics
-                                JOIN avionics_models model
-                                  ON model.id = default_avionics.avionics_model_id
-                                WHERE model.catalog_status <> 'approved'
-                              )
-                              OR EXISTS (
-                                SELECT 1
-                                FROM aircraft_model_variant_default_avionics active
-                                JOIN aircraft_model_variant_default_avionics_candidates candidate
-                                  ON candidate.aircraft_model_variant_id =
-                                     active.aircraft_model_variant_id
-                                 AND candidate.model_year = active.model_year
-                                 AND candidate.avionics_model_id =
-                                     active.avionics_model_id
-                              )
-                            "#,
-                        )
-                        .fetch_one(pool)
-                        .await?
-                    }
-                }
-            };
-        let missing_default_avionics_candidate_quarantine =
-            missing_default_avionics_candidate_objects
-                || invalid_default_avionics_candidate_state
-                || self
-                    .migration_contract_missing(
-                        "aircraft_model_variant_default_avionics",
-                        DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
-                        DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION,
-                        DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
-                    )
-                    .await?;
-        if missing_default_avionics_candidate_quarantine {
-            bail!(default_avionics_candidate_quarantine_migration_required_message(self.kind()));
         }
 
         let missing_avionics_reuse_attestation_objects = match self.backend() {
@@ -3525,6 +3312,93 @@ impl AppDb {
                 .await?;
         if missing_listing_replay_runs {
             bail!(listing_replay_runs_migration_required_message(self.kind()));
+        }
+        let invalid_reference_catalog_cutover_shape = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT
+                      EXISTS (
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table'
+                          AND name = 'aircraft_reference_configuration_versions'
+                      )
+                      AND (
+                        NOT EXISTS (
+                          SELECT 1 FROM pragma_table_info('aircraft_reference_prices')
+                          WHERE name = 'configuration_basis'
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table'
+                            AND name = 'aircraft_reference_fact_set_attestations'
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table'
+                            AND name IN (
+                              'aircraft_model_spec_versions',
+                              'aircraft_model_variant_price_points',
+                              'aircraft_model_variant_default_avionics',
+                              'aircraft_model_variant_default_avionics_candidates',
+                              'depreciation_profiles',
+                              'depreciation_profile_fit_metadata',
+                              'component_depreciation_profiles'
+                            )
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT
+                      to_regclass('aircraft_reference_configuration_versions') IS NOT NULL
+                      AND (
+                        NOT EXISTS (
+                          SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = current_schema()
+                            AND table_name = 'aircraft_reference_prices'
+                            AND column_name = 'configuration_basis'
+                        )
+                        OR to_regclass('aircraft_reference_fact_set_attestations') IS NULL
+                        OR EXISTS (
+                          SELECT 1
+                          FROM unnest(ARRAY[
+                            'aircraft_model_spec_versions',
+                            'aircraft_model_variant_price_points',
+                            'aircraft_model_variant_default_avionics',
+                            'aircraft_model_variant_default_avionics_candidates',
+                            'depreciation_profiles',
+                            'depreciation_profile_fit_metadata',
+                            'component_depreciation_profiles'
+                          ]) AS legacy(table_name)
+                          WHERE to_regclass(legacy.table_name) IS NOT NULL
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if invalid_reference_catalog_cutover_shape
+            || self
+                .migration_contract_missing(
+                    "aircraft_reference_configuration_versions",
+                    REFERENCE_CATALOG_CUTOVER_MIGRATION,
+                    REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION,
+                    REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT,
+                )
+                .await?
+        {
+            bail!(reference_catalog_cutover_migration_required_message(
+                self.kind()
+            ));
         }
         Ok(())
     }
@@ -5739,8 +5613,6 @@ impl AppDb {
             }
         }
         self.seed_developer_user().await?;
-        self.seed_depreciation_profile().await?;
-        self.seed_component_depreciation_profiles().await?;
         Ok(())
     }
 
@@ -5775,137 +5647,6 @@ impl AppDb {
                     .bind(DEVELOPER_AUTH_SUBJECT)
                     .execute(pool)
                     .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn seed_depreciation_profile(&self) -> Result<()> {
-        let profile = crate::depreciation::AircraftProfile {
-            name: "generic:all".to_string(),
-            age_decay_rate: 0.05,
-            long_run_residual_fraction: 0.28,
-            new_to_used_discount_fraction: 0.08,
-            new_to_used_discount_years: 1.0,
-            airframe_doubling_discount: 0.15,
-            max_airframe_premium: 0.12,
-            max_airframe_discount: 0.30,
-            replacement_floor_fraction: 0.0,
-            minimum_value_fraction: 0.05,
-            high_time_threshold_hours: Some(10_000.0),
-            high_time_discount_at_double_threshold: 0.12,
-        };
-        for profile in [profile] {
-            let sql = self.sql(
-                r#"
-                INSERT INTO depreciation_profiles (
-                  name,
-                  age_decay_rate,
-                  long_run_residual_fraction,
-                  new_to_used_discount_fraction,
-                  new_to_used_discount_years,
-                  airframe_doubling_discount,
-                  max_airframe_premium,
-                  max_airframe_discount,
-                  replacement_floor_fraction,
-                  minimum_value_fraction,
-                  high_time_threshold_hours,
-                  high_time_discount_at_double_threshold,
-                  is_system_profile
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (name) DO NOTHING
-                "#,
-            );
-            match self.backend() {
-                DatabaseBackend::Sqlite(pool) => {
-                    sqlx::query(&sql)
-                        .bind(profile.name.as_str())
-                        .bind(profile.age_decay_rate)
-                        .bind(profile.long_run_residual_fraction)
-                        .bind(profile.new_to_used_discount_fraction)
-                        .bind(profile.new_to_used_discount_years)
-                        .bind(profile.airframe_doubling_discount)
-                        .bind(profile.max_airframe_premium)
-                        .bind(profile.max_airframe_discount)
-                        .bind(profile.replacement_floor_fraction)
-                        .bind(profile.minimum_value_fraction)
-                        .bind(profile.high_time_threshold_hours)
-                        .bind(profile.high_time_discount_at_double_threshold)
-                        .bind(true)
-                        .execute(pool)
-                        .await?;
-                }
-                DatabaseBackend::Postgres(pool) => {
-                    sqlx::query(&sql)
-                        .bind(profile.name.as_str())
-                        .bind(profile.age_decay_rate)
-                        .bind(profile.long_run_residual_fraction)
-                        .bind(profile.new_to_used_discount_fraction)
-                        .bind(profile.new_to_used_discount_years)
-                        .bind(profile.airframe_doubling_discount)
-                        .bind(profile.max_airframe_premium)
-                        .bind(profile.max_airframe_discount)
-                        .bind(profile.replacement_floor_fraction)
-                        .bind(profile.minimum_value_fraction)
-                        .bind(profile.high_time_threshold_hours)
-                        .bind(profile.high_time_discount_at_double_threshold)
-                        .bind(true)
-                        .execute(pool)
-                        .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn seed_component_depreciation_profiles(&self) -> Result<()> {
-        let avionics = default_avionics_profile();
-        let rows = [
-            ("engine", None, None, Some(0.5)),
-            ("propeller", None, None, Some(0.5)),
-            (
-                "avionics",
-                Some(avionics.age_decay_rate),
-                Some(avionics.long_run_residual_fraction),
-                None,
-            ),
-        ];
-
-        for (component_type, age_decay_rate, long_run_residual_fraction, baseline_life_fraction) in
-            rows
-        {
-            let sql = self.sql(
-                r#"
-                INSERT INTO component_depreciation_profiles (
-                  component_type,
-                  age_decay_rate,
-                  long_run_residual_fraction,
-                  baseline_life_fraction
-                )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (component_type) DO NOTHING
-                "#,
-            );
-            match self.backend() {
-                DatabaseBackend::Sqlite(pool) => {
-                    sqlx::query(&sql)
-                        .bind(component_type)
-                        .bind(age_decay_rate)
-                        .bind(long_run_residual_fraction)
-                        .bind(baseline_life_fraction)
-                        .execute(pool)
-                        .await?;
-                }
-                DatabaseBackend::Postgres(pool) => {
-                    sqlx::query(&sql)
-                        .bind(component_type)
-                        .bind(age_decay_rate)
-                        .bind(long_run_residual_fraction)
-                        .bind(baseline_life_fraction)
-                        .execute(pool)
-                        .await?;
-                }
             }
         }
         Ok(())
@@ -6227,6 +5968,18 @@ fn aircraft_reference_catalog_migration_required_message(kind: DatabaseKind) -> 
     )
 }
 
+fn reference_catalog_cutover_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: the immutable aircraft reference catalog is \
+         missing the canonical price-basis and complete-fact-set contract; back up the database, \
+         apply `migrations/{REFERENCE_CATALOG_CUTOVER_MIGRATION}.{backend}.sql`, then restart aircost"
+    )
+}
+
 fn listing_pending_reviews_migration_required_message(kind: DatabaseKind) -> String {
     let backend = match kind {
         DatabaseKind::Sqlite => "sqlite",
@@ -6371,19 +6124,6 @@ fn avionics_authoritative_source_origins_migration_required_message(kind: Databa
         "database migration required before startup: the avionics catalog is missing immutable \
          exact-origin authority approvals or auditable revocations; back up the database, apply \
          `migrations/{AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION}.{backend}.sql`, then \
-         restart aircost"
-    )
-}
-
-fn default_avionics_candidate_quarantine_migration_required_message(kind: DatabaseKind) -> String {
-    let backend = match kind {
-        DatabaseKind::Sqlite => "sqlite",
-        DatabaseKind::Postgres => "postgres",
-    };
-    format!(
-        "database migration required before startup: unapproved factory-default avionics claims \
-         must be isolated from canonical valuation inputs; back up the database, apply \
-         `migrations/{DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION}.{backend}.sql`, then \
          restart aircost"
     )
 }
@@ -6617,10 +6357,6 @@ mod tests {
         include_str!("../migrations/20260801_avionics_authoritative_source_origins.sqlite.sql");
     const AVIONICS_SOURCE_ORIGINS_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260801_avionics_authoritative_source_origins.postgres.sql");
-    const DEFAULT_AVIONICS_CANDIDATES_SQLITE_MIGRATION_SQL: &str =
-        include_str!("../migrations/20260802_default_avionics_candidate_quarantine.sqlite.sql");
-    const DEFAULT_AVIONICS_CANDIDATES_POSTGRES_MIGRATION_SQL: &str =
-        include_str!("../migrations/20260802_default_avionics_candidate_quarantine.postgres.sql");
     const AVIONICS_REUSE_ATTESTATIONS_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260803_avionics_product_reuse_attestations.sqlite.sql");
     const AVIONICS_REUSE_ATTESTATIONS_POSTGRES_MIGRATION_SQL: &str =
@@ -10323,51 +10059,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_default_avionics_candidate_contract_fails_migration_preflight() {
-        let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
-        sqlx::query(
-            r#"
-            DELETE FROM schema_migration_contracts
-            WHERE migration_name = '20260802_default_avionics_candidate_quarantine'
-            "#,
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        let error = db
-            .ensure_required_migrations()
-            .await
-            .expect_err("a missing default-candidate contract must fail preflight")
-            .to_string();
-        assert!(error.contains("isolated from canonical valuation inputs"));
-        assert!(error.contains("20260802_default_avionics_candidate_quarantine.sqlite.sql"));
-    }
-
-    #[tokio::test]
-    async fn missing_default_avionics_admission_guard_fails_migration_preflight() {
-        let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
-        sqlx::query("DROP TRIGGER aircraft_default_avionics_candidate_admission_guard")
-            .execute(pool)
-            .await
-            .unwrap();
-
-        let error = db
-            .ensure_required_migrations()
-            .await
-            .expect_err("a missing candidate admission guard must fail preflight")
-            .to_string();
-        assert!(error.contains("isolated from canonical valuation inputs"));
-        assert!(error.contains("20260802_default_avionics_candidate_quarantine.sqlite.sql"));
-    }
-
-    #[tokio::test]
     async fn corrupted_reuse_trigger_and_index_fail_preflight() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -10405,161 +10096,6 @@ mod tests {
             .to_string();
         assert!(error.contains("target-aware current-policy reuse-attestation gate"));
         assert!(error.contains("20260807_avionics_product_reuse_v2.sqlite.sql"));
-    }
-
-    #[tokio::test]
-    async fn canonical_and_pending_default_overlap_fails_migration_preflight() {
-        let (path, url) = unique_sqlite_test_database("default-avionics-overlap");
-        let db = AppDb::connect(&url).await.unwrap();
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
-        let mut connection = pool.acquire().await.unwrap();
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TRIGGER aircraft_model_variant_default_avionics_approved_insert")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TRIGGER aircraft_default_avionics_candidate_admission_move")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_model_variant_default_avionics_candidates (
-              aircraft_model_variant_id, model_year, avionics_model_id,
-              quantity, source_url, source_title, source_notes,
-              source_confidence
-            ) VALUES (
-              987001, 2010, 987002, 1, 'https://example.test/default',
-              'Pending default', 'Pending source claim', 'high'
-            )
-            "#,
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_model_variant_default_avionics (
-              aircraft_model_variant_id, model_year, avionics_model_id,
-              quantity, source_url, source_title, source_notes,
-              source_confidence
-            ) VALUES (
-              987001, 2010, 987002, 1, 'https://example.test/default',
-              'Pending default', 'Pending source claim', 'high'
-            )
-            "#,
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TRIGGER aircraft_model_variant_default_avionics_approved_insert
-            BEFORE INSERT ON aircraft_model_variant_default_avionics
-            WHEN NOT EXISTS (
-              SELECT 1
-              FROM avionics_models model
-              WHERE model.id = NEW.avionics_model_id
-                AND model.catalog_status = 'approved'
-            )
-            BEGIN
-              SELECT RAISE(
-                ABORT,
-                'default avionics association requires an approved catalog entry'
-              );
-            END
-            "#,
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TRIGGER aircraft_default_avionics_candidate_admission_move
-            AFTER INSERT ON aircraft_model_variant_default_avionics
-            BEGIN
-              DELETE FROM aircraft_model_variant_default_avionics_candidates
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id
-                AND model_year = NEW.model_year
-                AND avionics_model_id = NEW.avionics_model_id
-                AND quantity = NEW.quantity
-                AND source_url = NEW.source_url
-                AND source_title = NEW.source_title
-                AND source_notes = NEW.source_notes
-                AND source_confidence = NEW.source_confidence;
-            END
-            "#,
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        drop(connection);
-
-        let error = db
-            .ensure_required_migrations()
-            .await
-            .expect_err("canonical/pending semantic overlap must fail preflight")
-            .to_string();
-        assert!(error.contains("isolated from canonical valuation inputs"));
-        assert!(error.contains("20260802_default_avionics_candidate_quarantine.sqlite.sql"));
-
-        drop(db);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn default_avionics_candidate_table_and_contract_have_backend_parity() {
-        let table = "aircraft_model_variant_default_avionics_candidates";
-        assert_eq!(
-            table_columns(SQLITE_SCHEMA_SQL, table),
-            table_columns(POSTGRES_SCHEMA_SQL, table),
-            "SQLite/Postgres schema column mismatch for {table}"
-        );
-        assert_eq!(
-            table_columns(DEFAULT_AVIONICS_CANDIDATES_SQLITE_MIGRATION_SQL, table),
-            table_columns(DEFAULT_AVIONICS_CANDIDATES_POSTGRES_MIGRATION_SQL, table),
-            "SQLite/Postgres migration column mismatch for {table}"
-        );
-        for contract in [
-            DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
-            DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
-            "catalog_product_unverified",
-            "factory_default_claim_unverified",
-            "aircraft_default_avionics_candidate_admission_guard",
-            "aircraft_default_avionics_candidate_admission_move",
-        ] {
-            assert!(SQLITE_SCHEMA_SQL.contains(contract));
-            assert!(POSTGRES_SCHEMA_SQL.contains(contract));
-            assert!(DEFAULT_AVIONICS_CANDIDATES_SQLITE_MIGRATION_SQL.contains(contract));
-            assert!(DEFAULT_AVIONICS_CANDIDATES_POSTGRES_MIGRATION_SQL.contains(contract));
-        }
-        assert_eq!(DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION, 2);
-        let postgres_lock =
-            "LOCK TABLE avionics_models, aircraft_model_variant_default_avionics,\n  aircraft_model_variant_default_avionics_candidates\n  IN SHARE ROW EXCLUSIVE MODE";
-        let lock_position = DEFAULT_AVIONICS_CANDIDATES_POSTGRES_MIGRATION_SQL
-            .find(postgres_lock)
-            .expect("Postgres migration must take the shared catalog lock order");
-        let copy_position = DEFAULT_AVIONICS_CANDIDATES_POSTGRES_MIGRATION_SQL
-            .find("INSERT INTO aircraft_model_variant_default_avionics_candidates")
-            .expect("Postgres migration must copy pending candidates");
-        assert!(lock_position < copy_position);
-        assert!(DEFAULT_AVIONICS_CANDIDATES_POSTGRES_MIGRATION_SQL
-            .contains("default avionics claim exists in both canonical and pending tables"));
-        assert!(DEFAULT_AVIONICS_CANDIDATES_SQLITE_MIGRATION_SQL
-            .contains("JOIN aircraft_model_variant_default_avionics_candidates candidate"));
-        assert_eq!(
-            POSTGRES_SCHEMA_SQL.matches("pg_advisory_xact_lock").count(),
-            2,
-        );
     }
 
     #[test]

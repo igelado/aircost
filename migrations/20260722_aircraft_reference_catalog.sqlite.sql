@@ -673,6 +673,9 @@ CREATE TABLE aircraft_reference_prices (
   amount REAL NOT NULL CHECK (amount > 0),
   currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   price_reference_year INTEGER NOT NULL CHECK (price_reference_year BETWEEN 1900 AND 2200),
+  configuration_basis TEXT NOT NULL DEFAULT 'unknown' CHECK (configuration_basis IN (
+    'full_standard_configuration', 'base_aircraft_only', 'unknown'
+  )),
   evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
     'direct_model_year', 'direct_other_year', 'interpolated', 'inferred'
   )),
@@ -760,6 +763,22 @@ CREATE TABLE aircraft_reference_features (
   CHECK (
     (boolean_value IS NOT NULL) + (number_value IS NOT NULL) + (text_value IS NOT NULL) = 1
   )
+);
+
+-- A complete researched set may legitimately be empty (for example, an old
+-- aircraft with no factory avionics). These attestations distinguish that
+-- conclusion from an unfinished building version without storing a dossier.
+CREATE TABLE aircraft_reference_fact_set_attestations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  aircraft_reference_configuration_version_id INTEGER NOT NULL
+    REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE,
+  fact_set_kind TEXT NOT NULL CHECK (fact_set_kind IN (
+    'avionics', 'engines', 'propellers', 'features'
+  )),
+  evidence_claim_id INTEGER NOT NULL
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
 );
 
 -- Clean component-catalog rows are accepted only when the exact authoritative
@@ -1122,14 +1141,7 @@ WHEN NOT EXISTS (
   WHERE version.id = NEW.aircraft_reference_configuration_version_id
     AND version.publication_state = 'building'
 )
-OR (
-  NEW.evidence_kind = 'direct_model_year'
-  AND NEW.price_reference_year <> (
-    SELECT model_year FROM aircraft_reference_configuration_versions
-    WHERE id = NEW.aircraft_reference_configuration_version_id
-  )
-)
-BEGIN SELECT RAISE(ABORT, 'reference price requires a building version and consistent year'); END;
+BEGIN SELECT RAISE(ABORT, 'reference price requires a building version'); END;
 CREATE TRIGGER aircraft_reference_avionics_building_insert
 BEFORE INSERT ON aircraft_reference_avionics
 WHEN NOT EXISTS (
@@ -1185,6 +1197,14 @@ OR NOT EXISTS (
     )
 )
 BEGIN SELECT RAISE(ABORT, 'reference feature value does not match its definition'); END;
+CREATE TRIGGER aircraft_reference_fact_set_building_insert
+BEFORE INSERT ON aircraft_reference_fact_set_attestations
+WHEN NOT EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = NEW.aircraft_reference_configuration_version_id
+    AND version.publication_state = 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'reference fact-set attestation requires a building version'); END;
 
 -- No profile fact can be changed after insertion. Correct data by publishing a
 -- replacement version rather than mutating a historical configuration.
@@ -1255,6 +1275,17 @@ WHEN EXISTS (
     AND version.publication_state <> 'building'
 )
 BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
+CREATE TRIGGER aircraft_reference_fact_set_immutable_update
+BEFORE UPDATE ON aircraft_reference_fact_set_attestations
+BEGIN SELECT RAISE(ABORT, 'reference profile facts are immutable'); END;
+CREATE TRIGGER aircraft_reference_fact_set_immutable_delete
+BEFORE DELETE ON aircraft_reference_fact_set_attestations
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = OLD.aircraft_reference_configuration_version_id
+    AND version.publication_state <> 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
 
 -- Publication requires a complete exact-year price and at least one applicable
 -- market/serial scope. It also rejects overlap with any already-published
@@ -1272,6 +1303,11 @@ BEGIN
     SELECT 1 FROM aircraft_reference_applicability_scopes scope
     WHERE scope.aircraft_reference_configuration_version_id = NEW.id
   );
+  SELECT RAISE(ABORT, 'published reference profile requires complete factory fact-set attestations')
+  WHERE 4 <> (
+    SELECT COUNT(*) FROM aircraft_reference_fact_set_attestations attestation
+    WHERE attestation.aircraft_reference_configuration_version_id = NEW.id
+  );
   SELECT RAISE(ABORT, 'published reference profile requires direct exact-year primary price evidence')
   WHERE NOT EXISTS (
     SELECT 1
@@ -1281,7 +1317,7 @@ BEGIN
     WHERE price.aircraft_reference_configuration_version_id = NEW.id
       AND price.price_kind IN ('base_msrp', 'equipped_msrp')
       AND price.evidence_kind = 'direct_model_year'
-      AND price.price_reference_year = NEW.model_year
+      AND price.configuration_basis = 'full_standard_configuration'
       AND claim.validation_status = 'validated'
       AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
   );
@@ -1305,6 +1341,21 @@ BEGIN
     WHERE propeller.aircraft_reference_configuration_version_id = NEW.id
       AND model.id IS NULL
   );
+  SELECT RAISE(ABORT, 'published reference profile requires valuation-ready factory avionics')
+  WHERE EXISTS (
+    SELECT 1 FROM aircraft_reference_avionics fact
+    JOIN avionics_models model ON model.id = fact.avionics_model_id
+    WHERE fact.aircraft_reference_configuration_version_id = NEW.id
+      AND (model.catalog_status <> 'approved'
+        OR model.introduced_year IS NULL
+        OR model.estimated_unit_value_usd IS NULL
+        OR model.estimated_unit_value_usd < 0
+        OR model.value_basis <> 'installed_contribution'
+        OR model.replacement_cost_usd IS NULL
+        OR model.replacement_cost_usd < model.estimated_unit_value_usd
+        OR model.value_reference_year NOT BETWEEN 1900 AND 2200
+        OR trim(coalesce(model.value_source, '')) = '')
+  );
   SELECT RAISE(ABORT, 'published reference profile facts require validated primary evidence')
   WHERE EXISTS (
     SELECT 1
@@ -1325,6 +1376,9 @@ BEGIN
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
       SELECT evidence_claim_id FROM aircraft_reference_features
+      WHERE aircraft_reference_configuration_version_id = NEW.id
+      UNION ALL
+      SELECT evidence_claim_id FROM aircraft_reference_fact_set_attestations
       WHERE aircraft_reference_configuration_version_id = NEW.id
     ) fact
     JOIN curation_evidence_claims claim ON claim.id = fact.evidence_claim_id
