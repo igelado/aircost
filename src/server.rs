@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
@@ -55,13 +55,14 @@ use crate::listing::review::{
     corroborate_existing_product_association_and_restage, evaluate_existing_product_association,
     get_listing_review, list_listing_reviews, list_pending_product_associations,
     list_pending_product_reviews, preflight_listing_review_resolution,
-    preflight_pending_product_attestation, prepare_pending_product_reviews, resolve_listing_review,
-    resolved_review_response, restage_unattested_preserved_products,
-    revise_avionics_observation_and_restage, use_existing_product_for_aspect_and_restage,
-    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingReview,
-    ListingReviewDetail, ListingReviewQueue, PendingProductAssociationPage,
-    PendingProductReviewPage, ProductReviewPageQuery, ResolveReviewRequest, ResolveReviewResponse,
-    ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery,
+    preflight_pending_product_attestation, prepare_pending_product_reviews,
+    rebuild_pending_avionics_review_if_current, resolve_listing_review, resolved_review_response,
+    restage_unattested_preserved_products, revise_avionics_observation_and_restage,
+    use_existing_product_for_aspect_and_restage, ExistingProductAssociationCommit,
+    ExistingProductAssociationEvaluation, ListingReview, ListingReviewDetail, ListingReviewQueue,
+    PendingProductAssociationPage, PendingProductReviewPage, ProductReviewPageQuery,
+    RebuildPendingAvionicsReview, RebuildPendingAvionicsReviewBlockReason, ResolveReviewRequest,
+    ResolveReviewResponse, ReviewAspectId, ReviewDecision, ReviewError, ReviewQueueQuery,
     ReviseAvionicsObservationRequest, StagedPendingReview,
 };
 use crate::listing::run::{
@@ -213,6 +214,28 @@ struct UseExistingReviewAvionicsRequest {
     avionics_model_id: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebuildPendingAvionicsReviewRequest {
+    review_payload_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum RebuildPendingAvionicsReviewResponse {
+    Rebuilt {
+        listing_id: i64,
+        review: Option<Box<ListingReview>>,
+        review_complete: bool,
+    },
+    Blocked {
+        listing_id: i64,
+        reason_code: RebuildPendingAvionicsReviewBlockReason,
+        message: &'static str,
+        review_complete: bool,
+    },
+}
+
 pub async fn run_server(config: ServerConfig) -> Result<()> {
     let db = AppDb::connect(&config.database_url).await?;
     let serving_valuation = load_serving_valuation(&db).await?;
@@ -327,6 +350,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/restage",
             post(restage_listing_review_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/avionics/rebuild",
+            post(rebuild_listing_avionics_review_handler),
         )
         .route(
             "/api/review/listings/{id}/avionics/verify-existing",
@@ -997,6 +1024,48 @@ async fn restage_listing_review_handler(
     require_listing_reviewer(&user)?;
     let staged = restage_unattested_preserved_products(&state.db, user.id, listing_id).await?;
     review_maintenance_response(&state.db, user.id, listing_id, staged).await
+}
+
+async fn rebuild_listing_avionics_review_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<RebuildPendingAvionicsReviewRequest>,
+) -> Result<Json<RebuildPendingAvionicsReviewResponse>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    match rebuild_pending_avionics_review_if_current(
+        &state.db,
+        user.id,
+        listing_id,
+        &payload.review_payload_sha256,
+    )
+    .await?
+    {
+        RebuildPendingAvionicsReview::Blocked { reason_code, .. } => {
+            Ok(Json(RebuildPendingAvionicsReviewResponse::Blocked {
+                listing_id,
+                reason_code,
+                message: reason_code.message(),
+                review_complete: false,
+            }))
+        }
+        RebuildPendingAvionicsReview::Rebuilt { review: Some(_) } => {
+            let detail = get_listing_review(&state.db, user.id, listing_id).await?;
+            Ok(Json(RebuildPendingAvionicsReviewResponse::Rebuilt {
+                listing_id,
+                review: Some(Box::new(detail.review)),
+                review_complete: false,
+            }))
+        }
+        RebuildPendingAvionicsReview::Rebuilt { review: None } => {
+            Ok(Json(RebuildPendingAvionicsReviewResponse::Rebuilt {
+                listing_id,
+                review: None,
+                review_complete: true,
+            }))
+        }
+    }
 }
 
 async fn reviewer_listing_preflight_handler(
@@ -2410,12 +2479,14 @@ mod tests {
         get_listing_review, get_verification_run_handler, grounded_review_identity_evidence,
         list_avionics_handler, list_verification_run_items_handler,
         process_claimed_verification_run_item, proposed_identity_matches_consolidation_members,
-        require_current_review_revisions, required_idempotency_key, start_plugin_submission_job,
+        rebuild_listing_avionics_review_handler, require_current_review_revisions,
+        required_idempotency_key, start_plugin_submission_job,
         use_existing_review_avionics_handler, verification_run_api_error,
         verification_run_failure_reason, verify_existing_review_avionics_handler, AppState,
         AttestReviewAvionicsProductRequest, CreateVerificationRunHttpRequest,
-        ReviewerListingPreflightQuery, UseExistingReviewAvionicsRequest,
-        VerificationRunItemsHttpQuery, VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
+        RebuildPendingAvionicsReviewRequest, ReviewerListingPreflightQuery,
+        UseExistingReviewAvionicsRequest, VerificationRunItemsHttpQuery,
+        VerifyExistingReviewAvionicsRequest, REVIEW_AUTOMATION_JS,
     };
     use crate::avionics::catalog::{ApprovedAvionicsIdentity, ReviewDirectSourceVerification};
     use crate::avionics::inspection::AvionicsCatalogQuery;
@@ -2428,8 +2499,8 @@ mod tests {
         ApproveReplacementProductsRequest, ReplacementProductSelection,
     };
     use crate::listing::review::{
-        restage_unattested_preserved_products, stage_pending_review, ListingReview,
-        PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
+        restage_unattested_preserved_products, stage_pending_review, ListingAssociationRole,
+        ListingReview, PendingReviewAspect, ResolveReviewRequest, ReviewAircraftIdentityState,
         ReviewAircraftIdentityStatus, ReviewAircraftSummary, ReviewAspectId,
     };
     use crate::listing::run::{
@@ -3193,6 +3264,176 @@ mod tests {
             allowed_capabilities: vec![],
             aspects: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_avionics_rebuild_http_contract_is_hash_guarded_and_typed() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlite_pool(&db);
+        let (owner_user_id, listing_id) = insert_review_listing(&db).await;
+        let evidence = "Garmin GNS 430W installed";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            owner_user_id,
+            listing_id,
+            &format!("<p>{evidence}</p>"),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(
+            serde_json::json!({"avionics": [{
+                "manufacturer": "Garmin",
+                "model": "GNS 430W",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]})
+            .to_string(),
+        )
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let product_id = insert_approved_garmin_product(&db).await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(evidence)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let staged = stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[PendingReviewAspect::avionics(
+                "legacy-gps",
+                "avionics",
+                "Garmin GNS 430W",
+                "Garmin GNS 430W",
+                "legacy_machine_reason",
+                1,
+                "installed",
+                Some(evidence.to_string()),
+                Some("high".to_string()),
+            )
+            .with_covered_association(
+                link_id,
+                ListingAssociationRole::Installed,
+                product_id,
+            )],
+        )
+        .await
+        .unwrap();
+        let state = test_state(db.clone());
+
+        let stale = rebuild_listing_avionics_review_handler(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(RebuildPendingAvionicsReviewRequest {
+                review_payload_sha256: "0".repeat(64),
+            }),
+        )
+        .await
+        .expect_err("the endpoint must reject a stale review revision");
+        assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+
+        let Json(rebuilt) = rebuild_listing_avionics_review_handler(
+            State(state),
+            HeaderMap::new(),
+            Path(listing_id),
+            Json(RebuildPendingAvionicsReviewRequest {
+                review_payload_sha256: staged.review_payload_sha256,
+            }),
+        )
+        .await
+        .unwrap();
+        let rebuilt = serde_json::to_value(rebuilt).unwrap();
+        assert_eq!(rebuilt["status"], "rebuilt");
+        assert_eq!(rebuilt["listing_id"], listing_id);
+        assert_eq!(rebuilt["review_complete"], false);
+        assert_eq!(rebuilt["review"]["aspects"].as_array().unwrap().len(), 1);
+        assert_eq!(rebuilt["review"]["aspects"][0]["id"], "avionics:0:primary");
+
+        let (owner_user_id, legacy_listing_id) = insert_review_listing(&db).await;
+        let legacy_submission_id = insert_review_bound_submission(
+            &db,
+            owner_user_id,
+            legacy_listing_id,
+            &format!("<p>{evidence}</p>"),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(
+            serde_json::json!({"avionics": [{
+                "manufacturer": "Garmin",
+                "model": "GNS 430W",
+                "types": ["GPS"],
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]})
+            .to_string(),
+        )
+        .bind(legacy_submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let legacy = stage_pending_review(
+            &db,
+            legacy_listing_id,
+            Some(legacy_submission_id),
+            &[PendingReviewAspect::avionics(
+                "legacy-defaults",
+                "avionics",
+                "Garmin GNS 430W",
+                "Garmin GNS 430W",
+                "legacy_machine_reason",
+                1,
+                "installed",
+                Some(evidence.to_string()),
+                Some("high".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let Json(refused) = rebuild_listing_avionics_review_handler(
+            State(test_state(db)),
+            HeaderMap::new(),
+            Path(legacy_listing_id),
+            Json(RebuildPendingAvionicsReviewRequest {
+                review_payload_sha256: legacy.review_payload_sha256,
+            }),
+        )
+        .await
+        .unwrap();
+        let refused = serde_json::to_value(refused).unwrap();
+        assert_eq!(refused["status"], "blocked");
+        assert_eq!(refused["listing_id"], legacy_listing_id);
+        assert_eq!(refused["review_complete"], false);
+        assert_eq!(refused["reason_code"], "extraction_not_current");
+        assert_eq!(
+            refused["message"],
+            "The retained extraction does not satisfy the current avionics schema. Run a validated re-extraction before rebuilding its review."
+        );
+        assert!(refused.get("reason").is_none());
+        assert!(!refused.to_string().contains("quantity must be an explicit"));
+        assert!(refused.get("review").is_none());
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@ use std::collections::HashSet;
 
 use crate::normalize::{normalize_avionics_manufacturer_name, normalize_avionics_model_name};
 
+pub(crate) mod extraction;
+
 #[derive(Clone, Debug)]
 pub(crate) struct CanonicalAvionicsAction {
     pub subject_key: String,

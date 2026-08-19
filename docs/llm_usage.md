@@ -701,6 +701,15 @@ corroboration and collision scope, the same transaction reissues both proofs
 for the repaired exact slice. Restage does not mint a new occurrence conclusion
 when no current pre-repair corroboration exists.
 
+The explicitly confirmed avionics review rebuild is also provider-free. It
+reprojects machine-owned cards from a strict, capture-bound retained extraction
+and current database facts; it neither invokes Gemini nor changes ordinary
+restage behavior. Without a durable discard receipt, an extraction occurrence
+that lacks a one-to-one current link or residual-review claim produces the
+typed `blocked`/`occurrence_disposition_unknown` result with no review mutation.
+The API and browser use fixed copy for all rebuild block codes and never expose
+provider, parser, or database error details.
+
 All three actions remain available for every avionics aspect, including an
 aspect with a suggested match or legacy candidate. The reviewer must make
 exactly one decision for every aspect in the bundle:

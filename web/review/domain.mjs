@@ -4,6 +4,27 @@ export const REVIEW_PRODUCT_IDENTITY_LIMITS = Object.freeze({
   evidenceText: 128,
 });
 
+const AVIONICS_REBUILD_BLOCK_MESSAGES = Object.freeze({
+  retained_source_missing:
+    "The retained listing source is unavailable. Capture the listing again before rebuilding its avionics review.",
+  extraction_not_current:
+    "The retained extraction does not satisfy the current avionics schema. Run a validated re-extraction before rebuilding its review.",
+  occurrence_disposition_unknown:
+    "At least one retained avionics occurrence has no current review or listing-link disposition. Run a validated re-extraction before rebuilding its review.",
+  unsupported_review_state:
+    "This review includes state outside the avionics workflow. No review state was changed.",
+});
+
+export function avionicsRebuildBlockMessage(reasonCode) {
+  if (Object.prototype.hasOwnProperty.call(
+    AVIONICS_REBUILD_BLOCK_MESSAGES,
+    reasonCode,
+  )) {
+    return AVIONICS_REBUILD_BLOCK_MESSAGES[reasonCode];
+  }
+  return "The avionics cards could not be rebuilt safely. No review state was changed.";
+}
+
 // Build the single source-free request contract used for both preserved
 // associations and ordinary hash-bound extraction aspects.
 export function existingProductVerificationRequest(
@@ -70,6 +91,10 @@ const REASON_DESCRIPTIONS = Object.freeze({
   raw_observation_unlinked: reason(
     "No catalog match",
     "No catalog product is linked to this listing item.",
+  ),
+  catalog_product_unresolved: reason(
+    "No verified product match",
+    "Select an existing verified product, create the confirmed product, or discard this listing item.",
   ),
   catalog_product_unverified: reason(
     "Product is not verified",

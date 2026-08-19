@@ -333,7 +333,12 @@ impl ListingEvidenceContext {
 
     fn normalized_spans(&self, value: &str) -> Vec<SourceRange> {
         let value = normalize_locator(value);
-        if value.len() < 3 {
+        let short_letter_digit_model = value.len() == 2
+            && value
+                .chars()
+                .any(|character| character.is_ascii_alphabetic())
+            && value.chars().any(|character| character.is_ascii_digit());
+        if value.len() < 3 && !short_letter_digit_model {
             return Vec::new();
         }
         self.normalized
@@ -795,6 +800,22 @@ mod tests {
         .unique_exact_model_slice("GFC 700");
 
         assert_eq!(recovered.as_deref(), Some("GFC700"));
+    }
+
+    #[test]
+    fn exact_model_recovery_accepts_a_bounded_short_letter_digit_model() {
+        let context = ListingEvidenceContext::from_cleaned_text(
+            "G5 installed. A separate G5X spare is also advertised.",
+        );
+
+        assert_eq!(
+            context.unique_exact_model_slice("G5").as_deref(),
+            Some("G5")
+        );
+        assert_eq!(
+            context.unique_exact_model_slice("G5X").as_deref(),
+            Some("G5X")
+        );
     }
 
     #[test]

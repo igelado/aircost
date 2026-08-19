@@ -5,7 +5,9 @@
 //! and a complete, server-owned capability used as a trailing description.
 
 use crate::extract::CURATED_AVIONICS_TYPES;
-use crate::normalize::{normalize_avionics_identifier, normalize_name};
+use crate::normalize::{
+    normalize_avionics_identifier, normalize_avionics_manufacturer_name, normalize_name,
+};
 
 const MINIMUM_PREFIX_MODEL_KEY_LENGTH: usize = 4;
 
@@ -14,6 +16,27 @@ pub(crate) enum AvionicsModelIdentityRelation {
     TypographyExact,
     DescriptiveExpansion,
     MeaningfulVariant,
+}
+
+pub(crate) fn avionics_identities_are_typography_exact(
+    left_manufacturer: &str,
+    left_model: &str,
+    right_manufacturer: &str,
+    right_model: &str,
+) -> bool {
+    let left_manufacturer = normalize_avionics_manufacturer_name(left_manufacturer);
+    let right_manufacturer = normalize_avionics_manufacturer_name(right_manufacturer);
+    !left_manufacturer.is_empty()
+        && !right_manufacturer.is_empty()
+        && left_manufacturer == right_manufacturer
+        && avionics_model_identity_relation(
+            &left_manufacturer,
+            left_model,
+            &[],
+            &right_manufacturer,
+            right_model,
+            &[],
+        ) == Some(AvionicsModelIdentityRelation::TypographyExact)
 }
 
 /// Classify the structural relationship between two same-manufacturer model
