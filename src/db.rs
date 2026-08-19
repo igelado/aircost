@@ -97,6 +97,7 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION: &str =
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1;
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
     "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
+const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 
 #[derive(Clone)]
 pub struct AppDb {
@@ -150,6 +151,30 @@ impl AppDb {
             db.initialize().await?;
             Ok(db)
         }
+    }
+
+    /// Open an existing SQLite database without migrations, schema creation,
+    /// seed writes, or a writable connection. Administrative export/replay
+    /// sources must use this boundary so even application startup cannot
+    /// mutate the source database.
+    pub async fn connect_read_only(database_url: &str) -> Result<Self> {
+        let database_url = normalize_database_url(database_url);
+        if is_postgres_url(&database_url) {
+            bail!("read-only administrative sources currently require SQLite");
+        }
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .with_context(|| format!("invalid SQLite database URL {database_url}"))?
+            .create_if_missing(false)
+            .read_only(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .with_context(|| format!("could not open read-only SQLite database {database_url}"))?;
+        Ok(Self {
+            backend: DatabaseBackend::Sqlite(pool),
+        })
     }
 
     pub(crate) fn backend(&self) -> &DatabaseBackend {
@@ -2585,6 +2610,43 @@ impl AppDb {
                 )
             );
         }
+        let missing_occurrence_dispositions = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE type = 'table' AND name = 'plugin_submissions'
+                    ) AND NOT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE type = 'table'
+                        AND name = 'aircraft_sale_listing_avionics_dispositions'
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT to_regclass('plugin_submissions') IS NOT NULL
+                       AND to_regclass('aircraft_sale_listing_avionics_dispositions') IS NULL
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if missing_occurrence_dispositions {
+            bail!(migration_required_message(
+                self.kind(),
+                "aircraft_sale_listing_avionics_dispositions",
+                "occurrence_fingerprint",
+                LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
+            ));
+        }
         Ok(())
     }
 
@@ -2921,6 +2983,38 @@ pub fn database_url_from_arg(value: Option<String>) -> String {
             std::env::var("AIRCOST_DATABASE_URL")
                 .unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string())
         })
+}
+
+pub fn sqlite_database_urls_equal(left: &str, right: &str) -> Result<bool> {
+    fn identity(value: &str) -> Result<PathBuf> {
+        let value = normalize_database_url(value);
+        if value == "sqlite::memory:" || is_postgres_url(&value) {
+            bail!("clean replay requires two distinct file-backed SQLite databases");
+        }
+        let path = value
+            .strip_prefix("sqlite://")
+            .context("clean replay database URL must be a file-backed SQLite URL")?;
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path.canonicalize().with_context(|| {
+                format!("could not canonicalize database path {}", path.display())
+            });
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .context("SQLite target path has no file name")?;
+        Ok(parent
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "could not canonicalize database parent {}",
+                    parent.display()
+                )
+            })?
+            .join(file_name))
+    }
+    Ok(identity(left)? == identity(right)?)
 }
 
 fn normalize_database_url(value: &str) -> String {

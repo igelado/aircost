@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -38,8 +39,17 @@ use aircost_rs::gemini::interactions::GeminiInteractionsClient;
 use aircost_rs::gemini::live_benchmark::LiveBenchmarkRunner;
 use aircost_rs::gemini::usage::Store as GeminiUsageStore;
 use aircost_rs::listing::backfill::{default_stage_limit, stage_legacy_listing_reviews};
+use aircost_rs::listing::replay::{
+    build_trusted_capture_manifest, import_trusted_capture_manifest,
+    reconcile_replay_occurrence_dispositions, trusted_bound_capture_ids, TrustedCaptureManifest,
+};
 use aircost_rs::listing::verification::{
     verify_listings, ListingVerificationMode, ListingVerificationScope, ListingVerificationServices,
+};
+use aircost_rs::plugin::{
+    checkpoint_plugin_submission_extraction, inspect_plugin_submission_extraction,
+    materialize_plugin_submission_checkpoint, plugin_submission_owner,
+    preflight_plugin_submission_extraction,
 };
 #[cfg(feature = "dnn")]
 use aircost_rs::valuation::dataset::load_snapshot;
@@ -56,6 +66,140 @@ use anyhow::{bail, Context, Result};
 async fn main() -> Result<()> {
     let command = parse_args(env::args().skip(1))?;
     match command {
+        AdminCommand::ExportReplayManifest {
+            database,
+            output,
+            submission_ids,
+            all_bound,
+            apply,
+        } => {
+            let db = aircost_rs::db::AppDb::connect_read_only(&database).await?;
+            let selected = if all_bound {
+                trusted_bound_capture_ids(&db)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            } else {
+                submission_ids
+            };
+            let manifest = build_trusted_capture_manifest(&db, &selected)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if apply {
+                let bytes = serde_json::to_vec_pretty(&manifest)?;
+                fs::write(&output, bytes).with_context(|| {
+                    format!("could not write replay manifest {}", output.display())
+                })?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": !apply,
+                    "output": output,
+                    "capture_count": manifest.captures.len(),
+                    "manifest_sha256": manifest.manifest_sha256,
+                    "submission_ids": manifest.captures.iter().map(|row| row.submission_id).collect::<Vec<_>>(),
+                }))?
+            );
+        }
+        AdminCommand::ImportReplayManifest {
+            source_database,
+            database,
+            manifest,
+            apply,
+        } => {
+            if aircost_rs::db::sqlite_database_urls_equal(&source_database, &database)? {
+                bail!("source and replay target databases must be different");
+            }
+            let manifest: TrustedCaptureManifest =
+                serde_json::from_slice(&fs::read(&manifest).with_context(|| {
+                    format!("could not read replay manifest {}", manifest.display())
+                })?)?;
+            let source = aircost_rs::db::AppDb::connect_read_only(&source_database).await?;
+            let target = aircost_rs::db::AppDb::connect(&database).await?;
+            let report = import_trusted_capture_manifest(&source, &target, &manifest, apply)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AdminCommand::ReplayExtraction {
+            database,
+            submission_id,
+            apply,
+        } => {
+            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let user = plugin_submission_owner(&db, submission_id).await?;
+            if apply {
+                let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
+                let checkpoint =
+                    checkpoint_plugin_submission_extraction(&db, &user, submission_id, &extractor)
+                        .await?;
+                println!("{}", serde_json::to_string_pretty(&checkpoint)?);
+            } else {
+                let preflight =
+                    preflight_plugin_submission_extraction(&db, user.id, submission_id).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": true,
+                        "submission_id": submission_id,
+                        "provider_calls": 0,
+                        "capture_valid": preflight.capture_valid,
+                        "current_checkpoint": preflight.current_checkpoint,
+                        "next_action": "rerun with --apply to perform extraction only; no aircraft, avionics catalog, listing, or finalization writes will run"
+                    }))?
+                );
+            }
+        }
+        AdminCommand::ReconcileReplayAvionics {
+            database,
+            listing_id,
+            submission_id,
+            apply,
+        } => {
+            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let owner = plugin_submission_owner(&db, submission_id).await?;
+            let report = reconcile_replay_occurrence_dispositions(
+                &db,
+                listing_id,
+                submission_id,
+                owner.id,
+                apply,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AdminCommand::ReplayListing {
+            database,
+            submission_id,
+            apply,
+        } => {
+            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let owner = plugin_submission_owner(&db, submission_id).await?;
+            if apply {
+                let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
+                let outcome = materialize_plugin_submission_checkpoint(
+                    &db,
+                    &owner,
+                    submission_id,
+                    &extractor,
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                let checkpoint =
+                    inspect_plugin_submission_extraction(&db, owner.id, submission_id).await?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": true,
+                        "provider_calls": 0,
+                        "checkpoint": checkpoint,
+                        "next_action": "rerun with --apply to materialize this exact checkpoint through normal listing analysis without repeating extraction"
+                    }))?
+                );
+            }
+        }
         AdminCommand::ImportFaaRegistry {
             database,
             master,
@@ -572,6 +716,35 @@ async fn main() -> Result<()> {
 
 #[derive(Debug)]
 enum AdminCommand {
+    ExportReplayManifest {
+        database: String,
+        output: PathBuf,
+        submission_ids: Vec<i64>,
+        all_bound: bool,
+        apply: bool,
+    },
+    ImportReplayManifest {
+        source_database: String,
+        database: String,
+        manifest: PathBuf,
+        apply: bool,
+    },
+    ReplayExtraction {
+        database: String,
+        submission_id: i64,
+        apply: bool,
+    },
+    ReconcileReplayAvionics {
+        database: String,
+        listing_id: i64,
+        submission_id: i64,
+        apply: bool,
+    },
+    ReplayListing {
+        database: String,
+        submission_id: i64,
+        apply: bool,
+    },
     ImportFaaRegistry {
         database: String,
         master: PathBuf,
@@ -767,6 +940,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     };
 
     match command.as_str() {
+        "export-replay-manifest" => parse_export_replay_manifest_args(args),
+        "import-replay-manifest" => parse_import_replay_manifest_args(args),
+        "replay-extraction" => parse_replay_extraction_args(args),
+        "reconcile-replay-avionics" => parse_reconcile_replay_avionics_args(args),
+        "replay-listing" => parse_replay_listing_args(args),
         "import-faa-registry" => parse_import_faa_registry_args(args),
         "curate-aircraft-hierarchy" => parse_curate_aircraft_hierarchy_args(args),
         "benchmark-gemini" => parse_benchmark_gemini_args(args),
@@ -790,6 +968,222 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         }
         _ => bail!("unknown admin command: {command}"),
     }
+}
+
+fn parse_export_replay_manifest_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut output = None;
+    let mut submission_ids = Vec::new();
+    let mut all_bound = false;
+    let mut apply = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--output" => {
+                output = Some(PathBuf::from(
+                    args.next().context("--output requires a value")?,
+                ));
+            }
+            "--submission-id" => {
+                let value = args.next().context("--submission-id requires a value")?;
+                submission_ids.push(
+                    value
+                        .parse::<i64>()
+                        .with_context(|| format!("invalid --submission-id value: {value}"))?,
+                );
+            }
+            "--all-bound" => all_bound = true,
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown export-replay-manifest argument: {arg}"),
+        }
+    }
+    if all_bound == !submission_ids.is_empty() {
+        bail!("choose exactly one of --all-bound or one or more --submission-id values");
+    }
+    Ok(AdminCommand::ExportReplayManifest {
+        database: database_url_from_arg(database),
+        output: output.context("--output is required")?,
+        submission_ids,
+        all_bound,
+        apply,
+    })
+}
+
+fn parse_import_replay_manifest_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<AdminCommand> {
+    let mut source_database = None;
+    let mut database = None;
+    let mut manifest = None;
+    let mut apply = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--source-database" | "--source-database-url" => {
+                source_database = Some(args.next().context("--source-database requires a value")?);
+            }
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--manifest" => {
+                manifest = Some(PathBuf::from(
+                    args.next().context("--manifest requires a value")?,
+                ));
+            }
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown import-replay-manifest argument: {arg}"),
+        }
+    }
+    Ok(AdminCommand::ImportReplayManifest {
+        source_database: database_url_from_arg(Some(
+            source_database.context("--source-database is required")?,
+        )),
+        database: database_url_from_arg(database),
+        manifest: manifest.context("--manifest is required")?,
+        apply,
+    })
+}
+
+fn parse_replay_extraction_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut submission_id = None;
+    let mut apply = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--submission-id" => {
+                let value = args.next().context("--submission-id requires a value")?;
+                submission_id = Some(
+                    value
+                        .parse::<i64>()
+                        .with_context(|| format!("invalid --submission-id value: {value}"))?,
+                );
+            }
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown replay-extraction argument: {arg}"),
+        }
+    }
+    let submission_id = submission_id.context("--submission-id is required")?;
+    if submission_id <= 0 {
+        bail!("--submission-id must be positive");
+    }
+    Ok(AdminCommand::ReplayExtraction {
+        database: database_url_from_arg(database),
+        submission_id,
+        apply,
+    })
+}
+
+fn parse_reconcile_replay_avionics_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut listing_id = None;
+    let mut submission_id = None;
+    let mut apply = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--listing-id" => {
+                let value = args.next().context("--listing-id requires a value")?;
+                listing_id = Some(
+                    value
+                        .parse::<i64>()
+                        .with_context(|| format!("invalid --listing-id value: {value}"))?,
+                );
+            }
+            "--submission-id" => {
+                let value = args.next().context("--submission-id requires a value")?;
+                submission_id = Some(
+                    value
+                        .parse::<i64>()
+                        .with_context(|| format!("invalid --submission-id value: {value}"))?,
+                );
+            }
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown reconcile-replay-avionics argument: {arg}"),
+        }
+    }
+    let listing_id = listing_id.context("--listing-id is required")?;
+    let submission_id = submission_id.context("--submission-id is required")?;
+    if listing_id <= 0 || submission_id <= 0 {
+        bail!("--listing-id and --submission-id must be positive");
+    }
+    Ok(AdminCommand::ReconcileReplayAvionics {
+        database: database_url_from_arg(database),
+        listing_id,
+        submission_id,
+        apply,
+    })
+}
+
+fn parse_replay_listing_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut submission_id = None;
+    let mut apply = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--submission-id" => {
+                let value = args.next().context("--submission-id requires a value")?;
+                submission_id = Some(
+                    value
+                        .parse::<i64>()
+                        .with_context(|| format!("invalid --submission-id value: {value}"))?,
+                );
+            }
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown replay-listing argument: {arg}"),
+        }
+    }
+    let submission_id = submission_id.context("--submission-id is required")?;
+    if submission_id <= 0 {
+        bail!("--submission-id must be positive");
+    }
+    Ok(AdminCommand::ReplayListing {
+        database: database_url_from_arg(database),
+        submission_id,
+        apply,
+    })
 }
 
 fn parse_import_faa_registry_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
@@ -1775,13 +2169,16 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin import-faa-registry --master MASTER.txt --aircraft-reference ACFTREF.txt --engine-reference ENGINE.txt --snapshot-date YYYY-MM-DD --archive-sha256 HEX [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Scans the official files and stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission and compensates the new row on any bind or receipt failure.\n  aircost-admin import-faa-registry --master MASTER.txt --aircraft-reference ACFTREF.txt --engine-reference ENGINE.txt --snapshot-date YYYY-MM-DD --archive-sha256 HEX [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Scans the official files and stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
     );
     println!(
         "  aircost-admin audit-avionics-duplicates [--database {DEFAULT_DATABASE_PATH}]\n    Reports model collisions by stored keys, current canonical maker/product keys, and exact maker-scoped stable-identifier kind/value pairs without writing.\n  aircost-admin consolidate-legacy-avionics [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Previews or applies explicitly verified unreviewed product duplicates. Automatic product consolidation requires every pair in a component to share the same non-null manufacturer identifier kind and normalized value inside one evidence-authorized manufacturer identity scope. Raw manufacturer spellings remain immutable source history; manufacturer aliases are resolved only through identity membership or redirect. Dry-run is the default."
+    );
+    println!(
+        "  aircost-admin reconcile-replay-avionics --listing-id ID --submission-id ID [--apply] [--database TARGET]\n    Provider-free audit of occurrence coverage. --apply records only provable current links; missing components remain unknown and are never inferred as discards."
     );
 }
 
@@ -2420,6 +2817,90 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         assert!(matches!(
             apply,
             AdminCommand::ConsolidateLegacyAvionics { apply: true, .. }
+        ));
+    }
+
+    #[test]
+    fn replay_phase_commands_are_dry_run_by_default() {
+        let export = parse_args(
+            [
+                "export-replay-manifest",
+                "--all-bound",
+                "--output",
+                "/tmp/captures.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            export,
+            AdminCommand::ExportReplayManifest { apply: false, .. }
+        ));
+        let import = parse_args(
+            [
+                "import-replay-manifest",
+                "--source-database",
+                "/tmp/source.sqlite3",
+                "--manifest",
+                "/tmp/captures.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            import,
+            AdminCommand::ImportReplayManifest { apply: false, .. }
+        ));
+        let extraction = parse_args(
+            ["replay-extraction", "--submission-id", "7"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            extraction,
+            AdminCommand::ReplayExtraction {
+                submission_id: 7,
+                apply: false,
+                ..
+            }
+        ));
+        let listing = parse_args(
+            ["replay-listing", "--submission-id", "7"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            listing,
+            AdminCommand::ReplayListing {
+                submission_id: 7,
+                apply: false,
+                ..
+            }
+        ));
+        let reconcile = parse_args(
+            [
+                "reconcile-replay-avionics",
+                "--listing-id",
+                "11",
+                "--submission-id",
+                "7",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            reconcile,
+            AdminCommand::ReconcileReplayAvionics {
+                listing_id: 11,
+                submission_id: 7,
+                apply: false,
+                ..
+            }
         ));
     }
 }

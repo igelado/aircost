@@ -40,6 +40,8 @@ preview, listing CRUD, and Chrome extension submission endpoints. Details are in
 The current database-backed aircraft value model is documented in
 [docs/depreciation_model.md](docs/depreciation_model.md). The schema and
 listing/plugin write lifecycle are documented in [docs/database.md](docs/database.md).
+The signed-capture shadow rebuild workflow is documented in
+[docs/clean-replay.md](docs/clean-replay.md).
 Gemini extraction, grounding, validation, and correction rules are documented in
 [docs/llm_usage.md](docs/llm_usage.md).
 

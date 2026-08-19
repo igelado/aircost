@@ -1592,6 +1592,15 @@ request.
 
 ## Schema Design Rules
 
+`aircraft_sale_listing_avionics_dispositions` is the immutable terminal receipt
+table for current retained avionics occurrences. Its stable coordinate is the
+exact extraction hash plus occurrence array index and primary/replacement role.
+It stores only a verified product link or a bounded discard decision; unresolved
+observations remain solely in the pending-review bundle. Existing databases
+must apply the matching
+`20260819_listing_avionics_dispositions.{sqlite,postgres}.sql` migration before
+starting a binary that writes these receipts.
+
 - Prefer non-null columns only for facts actually required and known at write
   time. Preserve unavailable observations as null; never turn an unknown
   component time into zero.
