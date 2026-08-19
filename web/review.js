@@ -2385,7 +2385,178 @@ function renderAircraftSummary(review) {
   notice.className = "review-aircraft-notice";
   notice.textContent = identityDescription.detail;
   card.append(header, metadata, notice);
+  const repair = renderAircraftRepair(review, identity?.repair);
+  if (repair) {
+    card.append(repair);
+  }
   elements.reviewAircraftSummary.replaceChildren(card);
+}
+
+function renderAircraftRepair(review, repair) {
+  if (
+    !repair
+    || repair.status !== "available"
+    || positiveInteger(repair.listing_id) !== positiveInteger(review.listing_id)
+    || !nonBlank(repair.expected_state_sha256)
+    || !Array.isArray(repair.actions)
+  ) {
+    return null;
+  }
+  const section = document.createElement("section");
+  section.className = "review-aircraft-repair";
+  const heading = document.createElement("h4");
+  heading.textContent = "Correct this aircraft identity";
+  const intro = document.createElement("p");
+  intro.textContent = "The correction is checked against the current retained source and latest FAA projection before it is saved.";
+  section.append(heading, intro);
+
+  if (repair.actions.includes("faa_serial")) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button button-primary";
+    button.textContent = "Replace with current FAA serial";
+    button.addEventListener("click", () => submitAircraftRepair(
+      review,
+      repair,
+      "faa-serial",
+      {},
+      "Replace the conflicting listing serial with the exact manufacturer serial in the current FAA record?",
+    ));
+    section.append(button);
+  }
+
+  if (repair.actions.includes("visual_identifier")) {
+    const assets = Array.isArray(repair.visual_assets)
+      ? repair.visual_assets.filter((asset) => nonBlank(asset?.asset_id) && nonBlank(asset?.media_url))
+      : [];
+    if (assets.length) {
+      const label = document.createElement("label");
+      label.textContent = "Listing photo";
+      const select = document.createElement("select");
+      for (const asset of assets) {
+        const option = document.createElement("option");
+        option.value = asset.asset_id;
+        option.textContent = nonBlank(asset.label) ? asset.label : `Photo ${select.length + 1}`;
+        select.append(option);
+      }
+      label.append(select);
+      const preview = document.createElement("a");
+      preview.className = "button";
+      preview.target = "_blank";
+      preview.rel = "noopener noreferrer";
+      preview.textContent = "Open selected photo";
+      const updatePreview = () => {
+        const selected = assets.find((asset) => asset.asset_id === select.value);
+        preview.href = selected?.media_url || "";
+      };
+      select.addEventListener("change", updatePreview);
+      updatePreview();
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "button button-primary";
+      button.textContent = "Recover identity from this photo";
+      button.addEventListener("click", () => submitAircraftRepair(
+        review,
+        repair,
+        "visual-recovery",
+        { asset_id: select.value },
+        "Use Gemini to transcribe one selected photo, then apply a correction only if the current FAA projection admits it exactly?",
+      ));
+      const controls = document.createElement("div");
+      controls.className = "review-aircraft-repair-controls";
+      controls.append(label, preview, button);
+      section.append(controls);
+    } else {
+      const unavailable = document.createElement("p");
+      unavailable.className = "review-aircraft-repair-warning";
+      unavailable.textContent = "No supported retained listing photo is available for visual recovery.";
+      section.append(unavailable);
+    }
+  }
+
+  if (repair.actions.includes("publisher_hierarchy")) {
+    const label = document.createElement("label");
+    label.textContent = "Exact visible publisher text containing maker, model, and variant";
+    const evidence = document.createElement("textarea");
+    evidence.rows = 3;
+    evidence.maxLength = 2000;
+    evidence.placeholder = `${review.model_year} ${review.aircraft?.manufacturer || ""} ${review.aircraft?.model || ""} ${review.aircraft?.variant || ""}`.trim();
+    label.append(evidence);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "button button-primary";
+    button.textContent = "Corroborate publisher hierarchy";
+    button.addEventListener("click", () => {
+      if (!nonBlank(evidence.value)) {
+        setWorkspaceMessage("Paste one exact visible span from the listing source.", true);
+        return;
+      }
+      submitAircraftRepair(
+        review,
+        repair,
+        "publisher-hierarchy",
+        { exact_evidence_text: evidence.value.trim() },
+        "Save this exact retained publisher span as the reviewed aircraft-hierarchy evidence?",
+      );
+    });
+    section.append(label, button);
+  }
+  return section;
+}
+
+async function submitAircraftRepair(review, repair, endpoint, body, confirmation) {
+  if (state.automating || state.resolving || state.stale || !confirm(confirmation)) {
+    return;
+  }
+  setAutomaticVerificationBusy(true);
+  setWorkspaceMessage("Checking the aircraft correction against retained evidence and current FAA data…");
+  try {
+    const outcome = await api(
+      `/api/review/listings/${review.listing_id}/aircraft/${endpoint}`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          expected_state_sha256: repair.expected_state_sha256,
+          ...body,
+        }),
+      },
+    );
+    if (outcome?.status === "import_required") {
+      setWorkspaceMessage(
+        `FAA target import required for ${outcome.candidate_n_number}. The listing was not changed.`,
+        true,
+      );
+      return;
+    }
+    if (outcome?.status === "inconclusive") {
+      setWorkspaceMessage("The selected evidence did not show one unambiguous complete identity. The listing was not changed.", true);
+      return;
+    }
+    if (outcome?.status === "blocked") {
+      const message = outcome.reason_code === "recovered_registration_not_found"
+        ? "The visible N-number is not assigned in the current FAA registry. The listing was not changed."
+        : "The correction did not pass the current evidence and FAA gates. The listing was not changed.";
+      setWorkspaceMessage(message, true);
+      return;
+    }
+    if (outcome?.status !== "applied") {
+      throw new Error("The server returned an invalid aircraft correction result.");
+    }
+    await openReview(review.listing_id, {
+      historyMode: "none",
+      discardDraft: true,
+      force: true,
+    });
+    setWorkspaceMessage("The evidence-backed aircraft correction was saved. Automatic verification can now continue.");
+  } catch (error) {
+    if (isStaleError(error)) {
+      markStale(error.message);
+    } else {
+      setWorkspaceMessage(`Could not correct aircraft identity: ${error.message}`, true);
+    }
+  } finally {
+    setAutomaticVerificationBusy(false);
+  }
 }
 
 function renderListingReasons(aspects) {

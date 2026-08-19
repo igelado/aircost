@@ -18,6 +18,11 @@ use tokio::sync::Notify;
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use tower_http::cors::CorsLayer;
 
+use crate::aircraft::repair::{
+    correct_serial_from_current_faa, corroborate_publisher_hierarchy,
+    recover_aircraft_from_visual_asset, AircraftRepairError, AircraftRepairOutcome,
+    FaaSerialAircraftRepairRequest, PublisherAircraftRepairRequest, VisualAircraftRepairRequest,
+};
 use crate::aircraft::{
     aircraft_listing_value_with_model, aircraft_options, aircraft_variant_detail_with_model,
     AircraftStoreError,
@@ -354,6 +359,18 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/review/listings/{id}/avionics/rebuild",
             post(rebuild_listing_avionics_review_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/aircraft/visual-recovery",
+            post(visual_aircraft_repair_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/aircraft/faa-serial",
+            post(faa_serial_aircraft_repair_handler),
+        )
+        .route(
+            "/api/review/listings/{id}/aircraft/publisher-hierarchy",
+            post(publisher_aircraft_repair_handler),
         )
         .route(
             "/api/review/listings/{id}/avionics/verify-existing",
@@ -1064,6 +1081,102 @@ async fn rebuild_listing_avionics_review_handler(
                 review: None,
                 review_complete: true,
             }))
+        }
+    }
+}
+
+async fn visual_aircraft_repair_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<VisualAircraftRepairRequest>,
+) -> Result<Json<AircraftRepairOutcome>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    let client = state.automatic_aircraft_gemini.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Aircraft visual recovery is not configured.",
+        )
+        .with_code("aircraft_visual_recovery_unavailable")
+    })?;
+    let runtime = state.automatic_runtime_config.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Aircraft visual recovery is not configured.",
+        )
+        .with_code("aircraft_visual_recovery_unavailable")
+    })?;
+    recover_aircraft_from_visual_asset(&state.db, user.id, listing_id, &payload, client, runtime)
+        .await
+        .map(Json)
+        .map_err(aircraft_repair_api_error)
+}
+
+async fn faa_serial_aircraft_repair_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<FaaSerialAircraftRepairRequest>,
+) -> Result<Json<AircraftRepairOutcome>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    correct_serial_from_current_faa(&state.db, user.id, listing_id, &payload)
+        .await
+        .map(Json)
+        .map_err(aircraft_repair_api_error)
+}
+
+async fn publisher_aircraft_repair_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(listing_id): Path<i64>,
+    Json(payload): Json<PublisherAircraftRepairRequest>,
+) -> Result<Json<AircraftRepairOutcome>, ApiError> {
+    let user = load_current_user(&state.db, &headers).await?;
+    require_listing_reviewer(&user)?;
+    corroborate_publisher_hierarchy(&state.db, user.id, listing_id, &payload)
+        .await
+        .map(Json)
+        .map_err(aircraft_repair_api_error)
+}
+
+fn aircraft_repair_api_error(error: AircraftRepairError) -> ApiError {
+    match error {
+        AircraftRepairError::NotFound(_) => ApiError::new(
+            StatusCode::NOT_FOUND,
+            "The listing is no longer available for aircraft repair.",
+        )
+        .with_code("aircraft_repair_not_found"),
+        AircraftRepairError::Permission => {
+            ApiError::new(StatusCode::FORBIDDEN, "You cannot repair this listing.")
+                .with_code("aircraft_repair_forbidden")
+        }
+        AircraftRepairError::Stale => ApiError::new(
+            StatusCode::CONFLICT,
+            "The aircraft or retained source changed. Reload the review before trying again.",
+        )
+        .with_code("aircraft_repair_stale"),
+        AircraftRepairError::Validation(_) => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "The requested aircraft correction did not satisfy the evidence and FAA checks.",
+        )
+        .with_code("aircraft_repair_invalid"),
+        AircraftRepairError::Service(message) => {
+            eprintln!("aircraft repair service failed: {message}");
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "Aircraft visual recovery could not inspect the selected photo.",
+            )
+            .with_code("aircraft_repair_service_failed")
+        }
+        AircraftRepairError::Database(message) => {
+            eprintln!("aircraft repair database failed: {message}");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The aircraft correction could not be saved.",
+            )
+            .with_code("aircraft_repair_failed")
         }
     }
 }
@@ -3256,6 +3369,7 @@ mod tests {
                 reason_code: None,
                 faa_n_number: Some("N1".to_string()),
                 faa_snapshot_id: Some(1),
+                repair: None,
             },
             registration_number: Some("N1".to_string()),
             model_year: 2000,

@@ -105,9 +105,9 @@ BEGIN
   RETURN NEW;
 END;
 $function$;
-DROP TRIGGER IF EXISTS avionics_catalog_grounded_consolidation_authorization_validate_insert
-  ON avionics_catalog_grounded_consolidation_authorizations;
-CREATE TRIGGER avionics_catalog_grounded_consolidation_authorization_validate_insert
+DROP TRIGGER IF EXISTS avionics_catalog_grounded_consolidation_authorization_validate_
+ON avionics_catalog_grounded_consolidation_authorizations;
+CREATE TRIGGER avionics_catalog_grounded_consolidation_authorization_validate_
 BEFORE INSERT ON avionics_catalog_grounded_consolidation_authorizations
 FOR EACH ROW EXECUTE FUNCTION validate_grounded_avionics_consolidation_authorization();
 

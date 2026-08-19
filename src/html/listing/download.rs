@@ -108,6 +108,41 @@ pub async fn download_identity_images(
     Ok(report)
 }
 
+/// Download exactly one reviewer-selected visual asset through the same
+/// allowlist, DNS, redirect, MIME, and byte boundary used by ingestion.
+pub async fn download_identity_image(
+    discovery: &ListingMediaDiscovery,
+    asset_id: &str,
+) -> Result<DownloadedListingImage> {
+    let asset_id = asset_id.trim();
+    if asset_id.is_empty() {
+        bail!("identity image asset ID is blank");
+    }
+    let matches = discovery
+        .aircraft_photos
+        .iter()
+        .chain(discovery.logbook_attachments.iter())
+        .filter(|reference| reference.asset_id == asset_id && reference.is_visual_image())
+        .collect::<Vec<_>>();
+    let [reference] = matches.as_slice() else {
+        bail!("identity image asset ID does not select exactly one retained visual asset");
+    };
+    if reference.fetch_policy.maximum_redirects != 0 || !reference.fetch_policy.require_public_ip {
+        bail!("identity image does not retain the strict download policy");
+    }
+    let client = public_dns_pinned_client(&reference.media_host).await?;
+    download_one(
+        &client,
+        reference,
+        reference
+            .fetch_policy
+            .maximum_bytes
+            .min(MAX_IDENTITY_SINGLE_IMAGE_BYTES)
+            .min(MAX_IDENTITY_TOTAL_IMAGE_BYTES),
+    )
+    .await
+}
+
 fn select_identity_references(discovery: &ListingMediaDiscovery) -> (Vec<&MediaReference>, bool) {
     let photos = discovery
         .aircraft_photos
