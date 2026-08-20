@@ -6347,11 +6347,11 @@ CREATE TABLE IF NOT EXISTS faa_registry_coverage (
 CREATE INDEX IF NOT EXISTS idx_faa_registry_coverage_lookup
   ON faa_registry_coverage (n_number, snapshot_id);
 
-CREATE OR REPLACE FUNCTION validate_faa_snapshot_evidence()
+CREATE OR REPLACE FUNCTION public.validate_faa_snapshot_evidence()
 RETURNS TRIGGER AS $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM curation_evidence_sources source
+    SELECT 1 FROM public.curation_evidence_sources source
     WHERE source.id = NEW.evidence_source_id
       AND source.source_domain = 'faa.gov'
       AND source.source_tier = 'regulator_primary'
@@ -6362,12 +6362,13 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog;
 
 DROP TRIGGER IF EXISTS faa_registry_snapshots_require_exact_evidence ON faa_registry_snapshots;
 CREATE TRIGGER faa_registry_snapshots_require_exact_evidence
 BEFORE INSERT ON faa_registry_snapshots
-FOR EACH ROW EXECUTE FUNCTION validate_faa_snapshot_evidence();
+FOR EACH ROW EXECUTE FUNCTION public.validate_faa_snapshot_evidence();
 
 DROP TRIGGER IF EXISTS faa_registry_aircraft_references_reachable
   ON public.faa_registry_aircraft_references;
@@ -6379,11 +6380,13 @@ CREATE OR REPLACE FUNCTION public.validate_faa_aircraft_reference_reachability()
 RETURNS TRIGGER AS $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM public.faa_registry_aircraft aircraft
+    SELECT 1
+    FROM public.faa_registry_aircraft aircraft
     WHERE aircraft.snapshot_id = NEW.snapshot_id
       AND aircraft.aircraft_code = NEW.aircraft_code
   ) THEN
-    RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
+    RAISE EXCEPTION
+      'FAA aircraft reference must be reachable from a target match';
   END IF;
   RETURN NEW;
 END;
@@ -6394,11 +6397,13 @@ CREATE OR REPLACE FUNCTION public.validate_faa_engine_reference_reachability()
 RETURNS TRIGGER AS $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM public.faa_registry_aircraft aircraft
+    SELECT 1
+    FROM public.faa_registry_aircraft aircraft
     WHERE aircraft.snapshot_id = NEW.snapshot_id
       AND aircraft.engine_code = NEW.engine_code
   ) THEN
-    RAISE EXCEPTION 'FAA engine reference must be reachable from a target match';
+    RAISE EXCEPTION
+      'FAA engine reference must be reachable from a target match';
   END IF;
   RETURN NEW;
 END;
@@ -6419,7 +6424,7 @@ INSERT INTO public.schema_migration_contracts AS installed_contract (
 ) VALUES (
   '20260819_faa_reference_reachability',
   1,
-  '6d06f3af7b5633cb3cd095d1ba9c7b7e7e348159e31d64a007a6addefe43fb62',
+  'fc6451ffe8e1ee2034e76480767d16d6c37463461d9e684687448b4d43f96bef',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
@@ -6430,54 +6435,58 @@ WHERE installed_contract.contract_version = EXCLUDED.contract_version
   AND installed_contract.contract_fingerprint =
       EXCLUDED.contract_fingerprint;
 
-CREATE OR REPLACE FUNCTION validate_faa_coverage()
+CREATE OR REPLACE FUNCTION public.validate_faa_coverage()
 RETURNS TRIGGER AS $$
 BEGIN
   IF (NEW.lookup_status = 'matched' AND NOT EXISTS (
-        SELECT 1 FROM faa_registry_aircraft aircraft
-        WHERE aircraft.snapshot_id = NEW.snapshot_id AND aircraft.n_number = NEW.n_number
+        SELECT 1 FROM public.faa_registry_aircraft aircraft
+        WHERE aircraft.snapshot_id = NEW.snapshot_id
+          AND aircraft.n_number = NEW.n_number
       )) OR (NEW.lookup_status = 'absent' AND EXISTS (
-        SELECT 1 FROM faa_registry_aircraft aircraft
-        WHERE aircraft.snapshot_id = NEW.snapshot_id AND aircraft.n_number = NEW.n_number
+        SELECT 1 FROM public.faa_registry_aircraft aircraft
+        WHERE aircraft.snapshot_id = NEW.snapshot_id
+          AND aircraft.n_number = NEW.n_number
       )) THEN
     RAISE EXCEPTION 'FAA coverage must agree with its target match';
   END IF;
   RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog;
 
 DROP TRIGGER IF EXISTS faa_registry_coverage_consistent ON faa_registry_coverage;
 CREATE TRIGGER faa_registry_coverage_consistent
 BEFORE INSERT ON faa_registry_coverage
-FOR EACH ROW EXECUTE FUNCTION validate_faa_coverage();
+FOR EACH ROW EXECUTE FUNCTION public.validate_faa_coverage();
 
-CREATE OR REPLACE FUNCTION preserve_faa_registry_data()
+CREATE OR REPLACE FUNCTION public.preserve_faa_registry_data()
 RETURNS TRIGGER AS $$
 BEGIN
   RAISE EXCEPTION 'FAA registry snapshots and projections are immutable';
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog;
 
 DROP TRIGGER IF EXISTS faa_registry_snapshots_immutable ON faa_registry_snapshots;
 CREATE TRIGGER faa_registry_snapshots_immutable
 BEFORE UPDATE OR DELETE ON faa_registry_snapshots
-FOR EACH ROW EXECUTE FUNCTION preserve_faa_registry_data();
+FOR EACH ROW EXECUTE FUNCTION public.preserve_faa_registry_data();
 DROP TRIGGER IF EXISTS faa_registry_aircraft_immutable ON faa_registry_aircraft;
 CREATE TRIGGER faa_registry_aircraft_immutable
 BEFORE UPDATE OR DELETE ON faa_registry_aircraft
-FOR EACH ROW EXECUTE FUNCTION preserve_faa_registry_data();
+FOR EACH ROW EXECUTE FUNCTION public.preserve_faa_registry_data();
 DROP TRIGGER IF EXISTS faa_registry_aircraft_references_immutable ON faa_registry_aircraft_references;
 CREATE TRIGGER faa_registry_aircraft_references_immutable
 BEFORE UPDATE OR DELETE ON faa_registry_aircraft_references
-FOR EACH ROW EXECUTE FUNCTION preserve_faa_registry_data();
+FOR EACH ROW EXECUTE FUNCTION public.preserve_faa_registry_data();
 DROP TRIGGER IF EXISTS faa_registry_engine_references_immutable ON faa_registry_engine_references;
 CREATE TRIGGER faa_registry_engine_references_immutable
 BEFORE UPDATE OR DELETE ON faa_registry_engine_references
-FOR EACH ROW EXECUTE FUNCTION preserve_faa_registry_data();
+FOR EACH ROW EXECUTE FUNCTION public.preserve_faa_registry_data();
 DROP TRIGGER IF EXISTS faa_registry_coverage_immutable ON faa_registry_coverage;
 CREATE TRIGGER faa_registry_coverage_immutable
 BEFORE UPDATE OR DELETE ON faa_registry_coverage
-FOR EACH ROW EXECUTE FUNCTION preserve_faa_registry_data();
+FOR EACH ROW EXECUTE FUNCTION public.preserve_faa_registry_data();
 
 
 

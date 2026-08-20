@@ -21,6 +21,49 @@ DROP FUNCTION public.validate_faa_engine_reference_reachability();
 DELETE FROM public.schema_migration_contracts
 WHERE migration_name = '20260819_faa_reference_reachability';
 
+CREATE OR REPLACE FUNCTION public.validate_faa_snapshot_evidence()
+RETURNS TRIGGER AS $function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM curation_evidence_sources source
+    WHERE source.id = NEW.evidence_source_id
+      AND source.source_domain = 'faa.gov'
+      AND source.source_tier = 'regulator_primary'
+      AND source.source_url = NEW.source_url
+      AND source.content_sha256 = NEW.archive_sha256
+  ) THEN
+    RAISE EXCEPTION 'FAA snapshot requires exact regulator evidence provenance';
+  END IF;
+  RETURN NEW;
+END;
+$function$ LANGUAGE plpgsql;
+ALTER FUNCTION public.validate_faa_snapshot_evidence() RESET ALL;
+
+CREATE OR REPLACE FUNCTION public.validate_faa_coverage()
+RETURNS TRIGGER AS $function$
+BEGIN
+  IF (NEW.lookup_status = 'matched' AND NOT EXISTS (
+        SELECT 1 FROM faa_registry_aircraft aircraft
+        WHERE aircraft.snapshot_id = NEW.snapshot_id AND aircraft.n_number = NEW.n_number
+      )) OR (NEW.lookup_status = 'absent' AND EXISTS (
+        SELECT 1 FROM faa_registry_aircraft aircraft
+        WHERE aircraft.snapshot_id = NEW.snapshot_id AND aircraft.n_number = NEW.n_number
+      )) THEN
+    RAISE EXCEPTION 'FAA coverage must agree with its target match';
+  END IF;
+  RETURN NEW;
+END;
+$function$ LANGUAGE plpgsql;
+ALTER FUNCTION public.validate_faa_coverage() RESET ALL;
+
+CREATE OR REPLACE FUNCTION public.preserve_faa_registry_data()
+RETURNS TRIGGER AS $function$
+BEGIN
+  RAISE EXCEPTION 'FAA registry snapshots and projections are immutable';
+END;
+$function$ LANGUAGE plpgsql;
+ALTER FUNCTION public.preserve_faa_registry_data() RESET ALL;
+
 CREATE FUNCTION public.validate_faa_reference_reachability()
 RETURNS TRIGGER AS $function$
 BEGIN
@@ -106,6 +149,42 @@ SQL
 reset_current_schema
 psql "$database_url" -v ON_ERROR_STOP=1 -q \
   -f tests/schema/faa_reference_reachability.postgres.sql
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -f migrations/20260819_faa_reference_reachability.postgres.sql
+
+# A marker-present current schema is accepted only while its objects remain
+# exact. Tampering fails before the migration can replace the damaged object.
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'ALTER TABLE public.faa_registry_coverage DISABLE TRIGGER faa_registry_coverage_consistent'
+expect_migration_failure disabled-current-trigger
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx 'D:1'
+SELECT trigger_row.tgenabled::text || ':' || (EXISTS (
+  SELECT 1 FROM public.schema_migration_contracts
+  WHERE migration_name = '20260819_faa_reference_reachability'
+))::int
+FROM pg_catalog.pg_trigger trigger_row
+WHERE trigger_row.tgname = 'faa_registry_coverage_consistent'
+  AND trigger_row.tgrelid = pg_catalog.to_regclass('public.faa_registry_coverage');
+SQL
+
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE OR REPLACE FUNCTION public.validate_faa_coverage()
+RETURNS TRIGGER LANGUAGE plpgsql
+AS $function$BEGIN RETURN NEW; END;$function$
+SET search_path = pg_catalog;
+SQL
+expect_migration_failure altered-current-function
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1:1'
+SELECT
+  (routine.prosrc = 'BEGIN RETURN NEW; END;')::int || ':' || (EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_faa_reference_reachability'
+  ))::int
+FROM pg_catalog.pg_proc routine
+WHERE routine.oid = pg_catalog.to_regprocedure('public.validate_faa_coverage()');
+SQL
 
 # Exact main/pre-v1 shape upgrades, remains usable, and is idempotent.
 reset_current_schema
@@ -139,6 +218,24 @@ psql "$database_url" -v ON_ERROR_STOP=1 -q \
   -c 'ALTER TABLE public.faa_registry_aircraft_references DISABLE TRIGGER faa_registry_aircraft_references_reachable'
 expect_migration_failure disabled-old-trigger
 assert_pre_v1_survived_rollback
+
+# Marker absence does not authorize repairing unrelated weakened provenance
+# functions; the entire historical FAA object contract must be exact.
+reset_current_schema
+downgrade_to_pre_v1
+psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE OR REPLACE FUNCTION public.validate_faa_coverage()
+RETURNS TRIGGER LANGUAGE plpgsql
+AS $function$BEGIN RETURN NEW; END;$function$;
+ALTER FUNCTION public.validate_faa_coverage() RESET ALL;
+SQL
+expect_migration_failure altered-old-coverage-function
+assert_pre_v1_survived_rollback
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1'
+SELECT (routine.prosrc = 'BEGIN RETURN NEW; END;')::int
+FROM pg_catalog.pg_proc routine
+WHERE routine.oid = pg_catalog.to_regprocedure('public.validate_faa_coverage()');
+SQL
 
 # Shadow objects and caller search_path cannot redirect the migration.
 reset_current_schema

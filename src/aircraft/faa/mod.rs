@@ -84,9 +84,9 @@ pub struct AircraftRecord {
     pub engine_code: Option<String>,
     /// FAA `YEAR MFR`; deliberately not named or treated as model year.
     pub year_manufactured: Option<u16>,
-    /// SHA-256 of the full logical MASTER CSV record (all parsed fields,
-    /// length-delimited in source order). This cites the exact source
-    /// observation without retaining its registrant/owner fields.
+    /// SHA-256 of only this retained non-PII aircraft projection under a
+    /// versioned domain. Exact archive and member hashes bind the source bytes;
+    /// discarded owner, address, and other MASTER fields never enter this hash.
     pub source_record_sha256: String,
 }
 

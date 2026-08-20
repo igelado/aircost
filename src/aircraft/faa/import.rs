@@ -241,6 +241,7 @@ where
         )?;
         parse_engine_references(engine_reference, &engine_codes)?
     };
+    ensure_reference_coverage(&aircraft, &aircraft_references, &engine_references)?;
 
     Ok(assemble_release(
         metadata,
@@ -287,6 +288,7 @@ where
         parse_aircraft_references(aircraft_reference, &aircraft_codes)?;
     let (engine_references, engine_sha256) =
         parse_engine_references(engine_reference, &engine_codes)?;
+    ensure_reference_coverage(&aircraft, &aircraft_references, &engine_references)?;
 
     Ok(assemble_release(
         metadata,
@@ -1046,14 +1048,23 @@ fn parse_master<R: Read>(
             let year_manufactured = parse_year(field(&record, year))
                 .with_context(|| format!("FAA MASTER row {} YEAR MFR", offset.saturating_add(2)))?;
 
+            let engine_code = optional_text(&record, engine_code);
+            let source_record_sha256 = aircraft_projection_digest(
+                &normalized_registration,
+                manufacturer_serial_raw.as_deref(),
+                manufacturer_serial_key.as_deref(),
+                &aircraft_code,
+                engine_code.as_deref(),
+                year_manufactured,
+            );
             rows.push(AircraftRecord {
                 n_number: normalized_registration,
                 manufacturer_serial_raw,
                 manufacturer_serial_key,
                 aircraft_code,
-                engine_code: optional_text(&record, engine_code),
+                engine_code,
                 year_manufactured,
-                source_record_sha256: logical_record_digest(&record),
+                source_record_sha256,
             });
         }
     }
@@ -1189,6 +1200,62 @@ fn parse_engine_references<R: Read>(
         }
     }
     Ok((rows, source.finalize()))
+}
+
+fn ensure_reference_coverage(
+    aircraft: &[AircraftRecord],
+    aircraft_references: &[AircraftReference],
+    engine_references: &[EngineReference],
+) -> Result<()> {
+    let required_aircraft = aircraft
+        .iter()
+        .map(|row| row.aircraft_code.as_str())
+        .collect::<BTreeSet<_>>();
+    let retained_aircraft = aircraft_references
+        .iter()
+        .map(|row| row.aircraft_code.as_str())
+        .collect::<BTreeSet<_>>();
+    if retained_aircraft != required_aircraft {
+        let missing = required_aircraft
+            .difference(&retained_aircraft)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        let unexpected = retained_aircraft
+            .difference(&required_aircraft)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        bail!(
+            "FAA ACFTREF retained codes do not exactly cover matched MASTER aircraft codes; missing=[{missing}] unexpected=[{unexpected}]"
+        );
+    }
+
+    let required_engines = aircraft
+        .iter()
+        .filter_map(|row| row.engine_code.as_deref())
+        .filter(|code| !code.is_empty())
+        .collect::<BTreeSet<_>>();
+    let retained_engines = engine_references
+        .iter()
+        .map(|row| row.engine_code.as_str())
+        .collect::<BTreeSet<_>>();
+    if retained_engines != required_engines {
+        let missing = required_engines
+            .difference(&retained_engines)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        let unexpected = retained_engines
+            .difference(&required_engines)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(",");
+        bail!(
+            "FAA ENGINE retained codes do not exactly cover matched MASTER engine codes; missing=[{missing}] unexpected=[{unexpected}]"
+        );
+    }
+    Ok(())
 }
 
 fn csv_reader<R: Read>(reader: R) -> Reader<R> {
@@ -1358,16 +1425,30 @@ fn hash_manifest_value(digest: &mut Sha256, value: &str) {
     digest.update(value.as_bytes());
 }
 
-fn logical_record_digest(record: &StringRecord) -> String {
+fn aircraft_projection_digest(
+    n_number: &str,
+    manufacturer_serial_raw: Option<&str>,
+    manufacturer_serial_key: Option<&str>,
+    aircraft_code: &str,
+    engine_code: Option<&str>,
+    year_manufactured: Option<u16>,
+) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"aircost-faa-master-logical-record-v1\0");
-    digest.update((record.len() as u64).to_be_bytes());
-    for field in record {
-        // Preserve padding and source field order. Length prefixes make the
-        // digest independent of separator escaping while remaining unambiguous.
-        hash_manifest_value(&mut digest, field);
-    }
+    digest.update(b"aircost-faa-master-retained-aircraft-projection-v1\0");
+    hash_manifest_value(&mut digest, n_number);
+    hash_optional_manifest_value(&mut digest, manufacturer_serial_raw);
+    hash_optional_manifest_value(&mut digest, manufacturer_serial_key);
+    hash_manifest_value(&mut digest, aircraft_code);
+    hash_optional_manifest_value(&mut digest, engine_code);
+    digest.update(year_manufactured.map(u16::to_be_bytes).unwrap_or([0, 0]));
     format!("{:x}", digest.finalize())
+}
+
+fn hash_optional_manifest_value(digest: &mut Sha256, value: Option<&str>) {
+    digest.update([u8::from(value.is_some())]);
+    if let Some(value) = value {
+        hash_manifest_value(digest, value);
+    }
 }
 
 struct DigestReader<R> {
@@ -1895,6 +1976,77 @@ mod tests {
         assert!(!debug.contains("PRIVATE OWNER"));
         assert!(!debug.contains("SECRET ADDRESS"));
         assert!(!debug.contains("50000000"));
+    }
+
+    #[test]
+    fn retained_aircraft_hash_excludes_discarded_pii_but_binds_projection_fields() {
+        let pii_changed = MASTER
+            .replace("PRIVATE OWNER", "A DIFFERENT OWNER")
+            .replace("SECRET ADDRESS", "A DIFFERENT ADDRESS")
+            .replace("50000000", "57777777");
+        let retained_changed = MASTER.replace("182-01234", "182-99999");
+        let original = ReleaseFixtureBuilder::from_csv(
+            metadata(),
+            Cursor::new(MASTER),
+            Cursor::new(AIRCRAFT),
+            Cursor::new(ENGINE),
+            ["N123AB"],
+        )
+        .unwrap();
+        let pii_changed = ReleaseFixtureBuilder::from_csv(
+            metadata(),
+            Cursor::new(pii_changed),
+            Cursor::new(AIRCRAFT),
+            Cursor::new(ENGINE),
+            ["N123AB"],
+        )
+        .unwrap();
+        let retained_changed = ReleaseFixtureBuilder::from_csv(
+            metadata(),
+            Cursor::new(retained_changed),
+            Cursor::new(AIRCRAFT),
+            Cursor::new(ENGINE),
+            ["N123AB"],
+        )
+        .unwrap();
+        assert_eq!(
+            original.aircraft[0].source_record_sha256,
+            pii_changed.aircraft[0].source_record_sha256
+        );
+        assert_ne!(
+            original.aircraft[0].source_record_sha256,
+            retained_changed.aircraft[0].source_record_sha256
+        );
+    }
+
+    #[test]
+    fn matched_master_codes_require_exact_reference_rows() {
+        let missing_aircraft = AIRCRAFT.replace(
+            "2072738,CESSNA AIRCRAFT CO,182T,4,1,1,0,01,004,CLASS 1,0145,3A13,TEXTRON AVIATION INC\n",
+            "",
+        );
+        let error = ReleaseFixtureBuilder::from_csv(
+            metadata(),
+            Cursor::new(MASTER),
+            Cursor::new(missing_aircraft),
+            Cursor::new(ENGINE),
+            ["N123AB"],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ACFTREF retained codes"));
+        assert!(error.to_string().contains("2072738"));
+
+        let missing_engine = ENGINE.replace("41528,LYCOMING,IO-540-AB1A5,1,00230,000000\n", "");
+        let error = ReleaseFixtureBuilder::from_csv(
+            metadata(),
+            Cursor::new(MASTER),
+            Cursor::new(AIRCRAFT),
+            Cursor::new(missing_engine),
+            ["N123AB"],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ENGINE retained codes"));
+        assert!(error.to_string().contains("41528"));
     }
 
     #[test]

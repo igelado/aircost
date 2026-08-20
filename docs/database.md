@@ -690,7 +690,10 @@ observation in a cluster passes the FAA gate, Gemini is not called.
 Every new valuation snapshot freezes a versioned FAA admission manifest inside
 `selection_policy_json`. For each included listing it records the canonical
 N-number, normalized observed serial, FAA projection and release, archive hash,
-and exact FAA source-record hash. That manifest participates in both snapshot
+and exact FAA retained-projection record hash. The record hash uses only the
+stored non-PII aircraft fields under a versioned domain; archive and member
+hashes bind the original release bytes without putting discarded registrant or
+address fields into a row identifier. That manifest participates in both snapshot
 and row hashes. Snapshot creation repeats the exact admission audit immediately
 before persistence; loading, model activation, comparable fallback, and serving
 reject a pre-manifest snapshot or any identity/provenance mismatch instead of

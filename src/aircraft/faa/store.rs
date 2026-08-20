@@ -648,24 +648,30 @@ fn validate_release_projection(release: &Release) -> Result<()> {
         .iter()
         .map(|aircraft| aircraft.aircraft_code.as_str())
         .collect::<BTreeSet<_>>();
-    if release
+    let retained_aircraft = release
         .aircraft_references
         .iter()
-        .any(|reference| !reachable_aircraft.contains(reference.aircraft_code.as_str()))
+        .map(|reference| reference.aircraft_code.as_str())
+        .collect::<BTreeSet<_>>();
+    if retained_aircraft.len() != release.aircraft_references.len()
+        || retained_aircraft != reachable_aircraft
     {
-        bail!("FAA projection contains an unreachable aircraft reference");
+        bail!("FAA projection aircraft references must exactly cover every matched aircraft code");
     }
     let reachable_engines = release
         .aircraft
         .iter()
         .filter_map(|aircraft| aircraft.engine_code.as_deref())
         .collect::<BTreeSet<_>>();
-    if release
+    let retained_engines = release
         .engine_references
         .iter()
-        .any(|reference| !reachable_engines.contains(reference.engine_code.as_str()))
+        .map(|reference| reference.engine_code.as_str())
+        .collect::<BTreeSet<_>>();
+    if retained_engines.len() != release.engine_references.len()
+        || retained_engines != reachable_engines
     {
-        bail!("FAA projection contains an unreachable engine reference");
+        bail!("FAA projection engine references must exactly cover every matched engine code");
     }
     Ok(())
 }
