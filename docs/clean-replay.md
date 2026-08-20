@@ -112,8 +112,8 @@ exact materialization-completion receipt from the authoritative stores and
 completes the ledger without repeating that work. A capture binding alone is
 only a resumable ownership anchor: if its receipt is absent, replay rebuilds
 the deterministic child projections and records completion last. Each
-successful extraction also pins the exact
-checkpoint SHA-256 in the run member; materialization refuses a different
+successful extraction also pins both the exact normalized extraction JSON and
+its checkpoint SHA-256 in the run member; materialization refuses a different
 payload even when the signed capture itself is unchanged.
 
 Only one replay run may own mutations at a time. Its opaque owner token is
@@ -136,9 +136,12 @@ complete billable usage. A retry that only reconciles an already-committed
 checkpoint makes no new request, but still reports the phase's earlier cost
 instead of losing durable attribution.
 
-The ledger stores no HTML, extraction JSON, Gemini response, or raw rejection
-message. Terminal rejection stage and reason use a closed vocabulary; FAA
-source-policy rejections retain a stable policy reason code. Transient FAA
+The ledger stores no HTML, raw provider response envelope, or raw rejection
+message. For a successful extraction, it intentionally stores the exact
+normalized extraction JSON alongside its SHA-256. That immutable pair lets a
+resumed materialization prove it is using the checkpoint that the extraction
+phase committed. Terminal rejection stage and reason use a closed vocabulary;
+FAA source-policy rejections retain a stable policy reason code. Transient FAA
 lookup and mutable catalog/snapshot readiness failures use a separate closed
 retry-failure vocabulary; database and other operation failures likewise remain
 distinct from terminal rejection.

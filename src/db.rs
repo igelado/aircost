@@ -7348,6 +7348,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listing_replay_rerun_rejects_weakened_same_name_sqlite_trigger_without_healing() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        pool.execute("DROP TRIGGER listing_replay_run_items_checkpoint_exact_insert")
+            .await
+            .unwrap();
+        pool.execute(
+            "CREATE TRIGGER listing_replay_run_items_checkpoint_exact_insert \
+             BEFORE INSERT ON listing_replay_run_items BEGIN SELECT 1; END",
+        )
+        .await
+        .unwrap();
+
+        assert_sqlite_replay_migration_rerun_rejected_without_changes(
+            &db,
+            "weakened-same-name-trigger",
+        )
+        .await;
+
+        let retained_definition: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema \
+             WHERE type = 'trigger' \
+               AND name = 'listing_replay_run_items_checkpoint_exact_insert'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(retained_definition.ends_with("BEGIN SELECT 1; END"));
+        assert!(!db.listing_replay_definitions_valid().await.unwrap());
+    }
+
+    #[tokio::test]
     async fn startup_rejects_weakened_replay_columns_defaults_checks_and_foreign_keys() {
         assert_weakened_replay_item_rejected(
             "nullable-plugin-submission",
