@@ -87,16 +87,18 @@ test "$(sqlite3 "$migration_database" \
 test -z "$(sqlite3 "$migration_database" "PRAGMA foreign_key_check")"
 
 sqlite3 -bail "$schema_database" ".read $repository_root/schema/sqlite.sql"
+
+# This migration remains executable as the verified predecessor for upgrades,
+# but the canonical schema completed the authorization cutover and must not
+# recreate its retired collision-scope objects.
 test "$(sqlite3 "$schema_database" \
-  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='aircraft_sale_listing_avionics_corroboration_scopes'")" = "1"
+  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='aircraft_sale_listing_avionics_corroboration_scopes'")" = "0"
 test "$(sqlite3 "$schema_database" \
-  "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='listing_avionics_corroboration_scopes_immutable_update'")" = "1"
+  "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='listing_avionics_corroboration_scopes_immutable_update'")" = "0"
 
 for definition in \
   "$repository_root/migrations/20260806_listing_avionics_collision_closure.sqlite.sql" \
-  "$repository_root/migrations/20260806_listing_avionics_collision_closure.postgres.sql" \
-  "$repository_root/schema/sqlite.sql" \
-  "$repository_root/schema/postgres.sql"
+  "$repository_root/migrations/20260806_listing_avionics_collision_closure.postgres.sql"
 do
   rg -q 'aircraft_sale_listing_avionics_corroboration_scopes' "$definition"
   rg -q 'listing_avionics_collision_closure_v1' "$definition"
