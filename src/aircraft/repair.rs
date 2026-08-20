@@ -1641,31 +1641,33 @@ mod tests {
     use super::*;
     use crate::aircraft::faa::{
         store_release, AircraftRecord, AircraftReference, MemberProvenance, Release,
-        ReleaseMetadata, TargetCoverage,
+        ReleaseFixtureBuilder, ReleaseMetadata, TargetCoverage,
     };
 
     fn release(n_number: &str, serial: &str, matched: bool) -> Release {
-        Release {
-            metadata: ReleaseMetadata::official("2026-08-19", "a".repeat(64)),
-            source_manifest_sha256: "b".repeat(64),
-            target_set_sha256: "c".repeat(64),
-            master: MemberProvenance {
+        ReleaseFixtureBuilder::new(
+            ReleaseMetadata::official("2026-08-19", "a".repeat(64)),
+            "b".repeat(64),
+            "c".repeat(64),
+            MemberProvenance {
                 member_name: "MASTER.txt".to_string(),
                 sha256: "d".repeat(64),
             },
-            aircraft_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: "ACFTREF.txt".to_string(),
                 sha256: "e".repeat(64),
             },
-            engine_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: "ENGINE.txt".to_string(),
                 sha256: "f".repeat(64),
             },
-            coverage: vec![TargetCoverage {
-                n_number: n_number.to_string(),
-                matched,
-            }],
-            aircraft: matched
+        )
+        .coverage(vec![TargetCoverage {
+            n_number: n_number.to_string(),
+            matched,
+        }])
+        .aircraft(
+            matched
                 .then(|| AircraftRecord {
                     n_number: n_number.to_string(),
                     manufacturer_serial_raw: Some(serial.to_string()),
@@ -1677,7 +1679,9 @@ mod tests {
                 })
                 .into_iter()
                 .collect(),
-            aircraft_references: matched
+        )
+        .aircraft_references(
+            matched
                 .then(|| AircraftReference {
                     aircraft_code: "2072738".to_string(),
                     manufacturer_name: Some("CESSNA".to_string()),
@@ -1695,8 +1699,8 @@ mod tests {
                 })
                 .into_iter()
                 .collect(),
-            engine_references: Vec::new(),
-        }
+        )
+        .build()
     }
 
     async fn repair_fixture(registration: Option<&str>, serial: Option<&str>) -> (AppDb, i64, i64) {

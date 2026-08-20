@@ -572,10 +572,19 @@ Use `--apply` only after reviewing the report.
 Aircraft hierarchy curation requires a current, privacy-minimized projection
 of the FAA releasable registry. Download the official ZIP from the
 [FAA Releasable Aircraft Database Download](https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/releasable_aircraft_download),
-calculate the SHA-256 of the ZIP before extraction, verify the release date,
-and extract only `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`. The application
-does not download or extract the archive and cannot independently prove that
-operator-supplied member files came from the supplied archive hash.
+verify the release date, and give that complete archive directly to the
+importer. Do not extract its members for import. The application computes the
+SHA-256 of the exact ZIP bytes, validates the central directory, and streams
+the required members from that same archive.
+
+The importer accepts a conventional single-disk, non-ZIP64 archive with at
+most 256 uniquely named, safe-path entries. It requires exactly one root
+`MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`; each must be a nonempty,
+unencrypted regular file using stored or deflated compression and remain below
+its source-specific size limit. Duplicate names, nested substitutes, unsafe
+paths, unsupported compression, inconsistent directory metadata, oversized
+archives or members, and malformed ZIPs abort the import before any database
+write.
 
 The importer projects these exact source columns:
 
@@ -597,18 +606,20 @@ and submission reprocessing can then pass admission. Malformed pending JSON and
 missing, foreign, or invalid pending registration candidates are counted but
 never become targets. Explicit targets allow the same pre-coverage flow for a
 source-proven registration recovered by an operator. Neither source mutates the
-listing. The importer computes member, manifest, target-set, and exact
-logical-record digests while discarding registrant fields. `DEREG.txt` is not
-imported, and an older release is never a fallback for the admission gate.
+listing. The importer computes the archive digest, each exact uncompressed
+member digest, the source manifest, the target set, and exact logical-record
+digests while discarding registrant fields. `DEREG.txt` is not imported, and an
+older release is never a fallback for the admission gate.
 
-Inspect and extract one release outside the repository:
+Optionally inspect the complete release outside the repository:
 
 ```sh
 sha256sum /tmp/ReleasableAircraft.zip
 unzip -l /tmp/ReleasableAircraft.zip
-unzip /tmp/ReleasableAircraft.zip MASTER.txt ACFTREF.txt ENGINE.txt \
-  -d /tmp/aircost-faa-release
 ```
+
+The external digest is useful for an operator comparison only; it is not an
+input to the command or trusted as import provenance.
 
 Run the importer without `--apply` first. Dry run is the default and performs
 all parsing, schema, target-coverage, and digest checks without writing:
@@ -616,29 +627,30 @@ all parsing, schema, target-coverage, and digest checks without writing:
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
-  --master /tmp/aircost-faa-release/MASTER.txt \
-  --aircraft-reference /tmp/aircost-faa-release/ACFTREF.txt \
-  --engine-reference /tmp/aircost-faa-release/ENGINE.txt \
-  --snapshot-date YYYY-MM-DD \
-  --archive-sha256 64_CHARACTER_ZIP_SHA256 \
+  --archive /tmp/ReleasableAircraft.zip \
   --dry-run
 ```
 
-`--snapshot-date` is the date represented by that daily FAA release, not the
-listing model year or an arbitrary import date. Review the JSON report's
-separate `listing_counts` and `pending_submission_counts`, requested and
-accepted explicit targets, target count, matched and absent counts, member
-hashes, manifest hash, and target-set hash. Apply the same validated input
-explicitly:
+Dry run uses a diagnostic database connection rather than the normal startup
+path. SQLite must already exist and is opened read-only without schema
+initialization, migrations, WAL creation, or seed writes. PostgreSQL sessions
+set `default_transaction_read_only=on` before the first query and likewise do
+not initialize or migrate the schema. A dry run therefore diagnoses the exact
+installed contract; it cannot create a missing SQLite database or repair an
+old one as a side effect.
+
+The importer derives the release date from the shared, validated ZIP member
+date for `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`; there is no operator
+date override. Review the derived date and the JSON report's separate
+`listing_counts` and `pending_submission_counts`, requested and accepted
+explicit targets, target count, matched and absent counts, member hashes,
+archive hash, manifest hash, and target-set hash. Apply the same validated
+archive explicitly:
 
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
-  --master /tmp/aircost-faa-release/MASTER.txt \
-  --aircraft-reference /tmp/aircost-faa-release/ACFTREF.txt \
-  --engine-reference /tmp/aircost-faa-release/ENGINE.txt \
-  --snapshot-date YYYY-MM-DD \
-  --archive-sha256 64_CHARACTER_ZIP_SHA256 \
+  --archive /tmp/ReleasableAircraft.zip \
   --apply
 ```
 
@@ -648,11 +660,7 @@ add the flag once per aircraft to both the dry run and the corresponding apply:
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
-  --master /tmp/aircost-faa-release/MASTER.txt \
-  --aircraft-reference /tmp/aircost-faa-release/ACFTREF.txt \
-  --engine-reference /tmp/aircost-faa-release/ENGINE.txt \
-  --snapshot-date YYYY-MM-DD \
-  --archive-sha256 64_CHARACTER_ZIP_SHA256 \
+  --archive /tmp/ReleasableAircraft.zip \
   --include-n-number N1925X \
   --dry-run
 ```
@@ -668,27 +676,35 @@ The apply transaction is atomic. Reimporting the same archive and target set is
 idempotent; adding listings can require another target-scoped projection. Each
 projection is immutable, and several projections may refer to the same daily
 archive. For one curation case, all selected observations must resolve through
-projections with the same snapshot date, source URL, archive hash, and manifest
-hash.
+projections with the same snapshot date, source URL, archive hash, manifest
+hash, and the exact retained-record hash domain. The current immutable domain
+is `aircost-faa-master-retained-aircraft-projection-v1`; it participates in the
+source-manifest digest and every retained aircraft source-record digest, so a
+projection produced under another algorithm cannot alias a current one.
 
 The curation lookup always starts from the newest imported release. "Newest"
-means the greatest operator-supplied snapshot date and projection ID; the code
+means the greatest parser-derived snapshot date and projection ID; the code
 does not impose a maximum age or contact the FAA during lookup. Operations must
-therefore verify the date against the downloaded members and refresh the import
-on the intended cadence. A target must have a coverage row in a projection of
-that exact release. No snapshot, no current-release coverage, an `absent`
-result, an ambiguous result, or a serial conflict blocks every listing-backed
-workflow. Missing, foreign, and malformed registrations are also blocked. New
-and updated listings are rejected before mutation. Pre-policy rows are not
-deleted automatically, but they are excluded from avionics/reference curation,
-valuation snapshot creation, training, and comparable serving. The curation
-report records why an existing observation was excluded. If no source-exact
-observation in a cluster passes the FAA gate, Gemini is not called.
+therefore verify that the derived date matches the official download and
+refresh the import on the intended cadence. A target must have a coverage row
+in a projection of that exact release. No snapshot, no current-release
+coverage, an `absent` result, an ambiguous result, or a serial conflict blocks
+every listing-backed workflow. Missing, foreign, and malformed registrations
+are also blocked. New and updated listings are rejected before mutation.
+Pre-policy rows are not deleted automatically, but they are excluded from
+avionics/reference curation, valuation snapshot creation, training, and
+comparable serving. The curation report records why an existing observation was
+excluded. If no source-exact observation in a cluster passes the FAA gate,
+Gemini is not called.
 
 Every new valuation snapshot freezes a versioned FAA admission manifest inside
 `selection_policy_json`. For each included listing it records the canonical
 N-number, normalized observed serial, FAA projection and release, archive hash,
-and exact FAA source-record hash. That manifest participates in both snapshot
+and exact FAA retained-projection record hash. The record hash uses only the
+stored non-PII aircraft fields under the immutable domain
+`aircost-faa-master-retained-aircraft-projection-v1`; archive and member
+hashes bind the original release bytes without putting discarded registrant or
+address fields into a row identifier. That manifest participates in both snapshot
 and row hashes. Snapshot creation repeats the exact admission audit immediately
 before persistence; loading, model activation, comparable fallback, and serving
 reject a pre-manifest snapshot or any identity/provenance mismatch instead of
@@ -1307,6 +1323,26 @@ avionics. Existing listings therefore do not need to be re-added. The FAA
 tables start empty and must be populated with `import-faa-registry` after the
 migration. Existing databases must be migrated before starting a binary that
 expects the clean catalog; fresh databases receive the same schema directly.
+
+After the base catalog migration, install the FAA projection reachability and
+record-hash-domain contracts in order:
+
+```text
+migrations/20260819_faa_reference_reachability.postgres.sql
+migrations/20260820_faa_record_hash_domain.postgres.sql
+migrations/20260820_faa_record_hash_domain.sqlite.sql
+```
+
+PostgreSQL databases apply both PostgreSQL files in that order. SQLite applies
+the SQLite record-domain file; the reachability contract is already enforced
+by the SQLite base objects. Each migration accepts only its exact predecessor
+shape and preserves the original `installed_at` on an exact rerun. A missing,
+nonempty legacy FAA projection is deliberately rejected: delete only those
+derived FAA projection rows and regenerate them by importing the exact retained
+FAA ZIP. Do not add the domain with ad hoc SQL, mechanically rehash rows, or
+relabel a legacy projection. The archive bytes and domain are both inputs to
+the authoritative hashes, so only importer regeneration establishes the new
+identity.
 
 Back up the database and test the matching migration on a copy. For SQLite,
 representative clean-catalog and FAA tables should all be absent before the

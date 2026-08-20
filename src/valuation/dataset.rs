@@ -1222,8 +1222,7 @@ mod tests {
     use std::io::Cursor;
 
     use crate::aircraft::faa::{
-        parse_release, require_listing_faa_admission, store_release, ReleaseMetadata,
-        ReleaseReaders,
+        require_listing_faa_admission, store_release, ReleaseFixtureBuilder, ReleaseMetadata,
     };
     use crate::aircraft::identity::seed_test_curated_identity_assignment;
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
@@ -1236,13 +1235,11 @@ mod tests {
 
     async fn seed_faa_aircraft(db: &AppDb) {
         let master = "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n123,S123,2072738,41528,2010\n124,S124,2072738,41528,2011\n";
-        let release = parse_release(
+        let release = ReleaseFixtureBuilder::from_csv(
             ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
-            ReleaseReaders::new(
-                Cursor::new(master),
-                Cursor::new(FAA_AIRCRAFT_REFERENCE),
-                Cursor::new(FAA_ENGINE_REFERENCE),
-            ),
+            Cursor::new(master),
+            Cursor::new(FAA_AIRCRAFT_REFERENCE),
+            Cursor::new(FAA_ENGINE_REFERENCE),
             ["N123", "N124"],
         )
         .unwrap();
@@ -1484,13 +1481,11 @@ mod tests {
         let listing_id = insert_listing(&db).await;
         let master = "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n123,S123,2072738,41528,2010\n124,S124,2072738,41528,2011\n";
         let metadata = ReleaseMetadata::official("2026-07-20", "a".repeat(64));
-        let initial_projection = parse_release(
+        let initial_projection = ReleaseFixtureBuilder::from_csv(
             metadata.clone(),
-            ReleaseReaders::new(
-                Cursor::new(master),
-                Cursor::new(FAA_AIRCRAFT_REFERENCE),
-                Cursor::new(FAA_ENGINE_REFERENCE),
-            ),
+            Cursor::new(master),
+            Cursor::new(FAA_AIRCRAFT_REFERENCE),
+            Cursor::new(FAA_ENGINE_REFERENCE),
             ["N123"],
         )
         .unwrap();
@@ -1508,13 +1503,11 @@ mod tests {
             .snapshot_id
             .unwrap();
 
-        let expanded_projection = parse_release(
+        let expanded_projection = ReleaseFixtureBuilder::from_csv(
             metadata,
-            ReleaseReaders::new(
-                Cursor::new(master),
-                Cursor::new(FAA_AIRCRAFT_REFERENCE),
-                Cursor::new(FAA_ENGINE_REFERENCE),
-            ),
+            Cursor::new(master),
+            Cursor::new(FAA_AIRCRAFT_REFERENCE),
+            Cursor::new(FAA_ENGINE_REFERENCE),
             ["N123", "N124"],
         )
         .unwrap();

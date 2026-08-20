@@ -642,6 +642,7 @@ mod tests {
                 archive_sha256: "a".repeat(64),
                 source_manifest_sha256: "b".repeat(64),
                 target_set_sha256: "c".repeat(64),
+                record_hash_domain: crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN.to_string(),
             },
             n_number: "N89225".to_string(),
             manufacturer_serial_raw: Some("SERIAL".to_string()),

@@ -2359,63 +2359,63 @@ mod tests {
     use super::*;
     use crate::aircraft::faa::{
         require_listing_admission, require_listing_faa_admission, store_release, AircraftRecord,
-        AircraftReference, MemberProvenance, Release, ReleaseMetadata, TargetCoverage,
-        AIRCRAFT_MEMBER_NAME, ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
+        AircraftReference, MemberProvenance, Release, ReleaseFixtureBuilder, ReleaseMetadata,
+        TargetCoverage, AIRCRAFT_MEMBER_NAME, ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
     };
 
     fn faa_release(snapshot_date: &str, digest: char, target_digest: char) -> Release {
         let digest_string = digest.to_string().repeat(64);
         let source_record = if digest == 'a' { '1' } else { '2' };
-        Release {
-            metadata: ReleaseMetadata::official(snapshot_date, digest_string),
-            source_manifest_sha256: if digest == 'a' {
+        ReleaseFixtureBuilder::new(
+            ReleaseMetadata::official(snapshot_date, digest_string),
+            if digest == 'a' {
                 "b".repeat(64)
             } else {
                 "3".repeat(64)
             },
-            target_set_sha256: target_digest.to_string().repeat(64),
-            master: MemberProvenance {
+            target_digest.to_string().repeat(64),
+            MemberProvenance {
                 member_name: MASTER_MEMBER_NAME.to_string(),
                 sha256: "d".repeat(64),
             },
-            aircraft_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: AIRCRAFT_MEMBER_NAME.to_string(),
                 sha256: "e".repeat(64),
             },
-            engine_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: ENGINE_MEMBER_NAME.to_string(),
                 sha256: "f".repeat(64),
             },
-            coverage: vec![TargetCoverage {
-                n_number: "N123AB".to_string(),
-                matched: true,
-            }],
-            aircraft: vec![AircraftRecord {
-                n_number: "N123AB".to_string(),
-                manufacturer_serial_raw: Some("182-01234".to_string()),
-                manufacturer_serial_key: Some("18201234".to_string()),
-                aircraft_code: "2072738".to_string(),
-                engine_code: None,
-                year_manufactured: Some(2006),
-                source_record_sha256: source_record.to_string().repeat(64),
-            }],
-            aircraft_references: vec![AircraftReference {
-                aircraft_code: "2072738".to_string(),
-                manufacturer_name: Some("CESSNA AIRCRAFT CO".to_string()),
-                model_name: Some("182T".to_string()),
-                aircraft_type_code: None,
-                engine_type_code: None,
-                category_code: None,
-                certification_indicator_code: None,
-                engine_count: Some(1),
-                seat_count: Some(4),
-                weight_class_code: None,
-                cruise_speed_mph: None,
-                type_certificate_data_sheet: Some("3A13".to_string()),
-                type_certificate_holder: Some("TEXTRON AVIATION INC".to_string()),
-            }],
-            engine_references: Vec::new(),
-        }
+        )
+        .coverage(vec![TargetCoverage {
+            n_number: "N123AB".to_string(),
+            matched: true,
+        }])
+        .aircraft(vec![AircraftRecord {
+            n_number: "N123AB".to_string(),
+            manufacturer_serial_raw: Some("182-01234".to_string()),
+            manufacturer_serial_key: Some("18201234".to_string()),
+            aircraft_code: "2072738".to_string(),
+            engine_code: None,
+            year_manufactured: Some(2006),
+            source_record_sha256: source_record.to_string().repeat(64),
+        }])
+        .aircraft_references(vec![AircraftReference {
+            aircraft_code: "2072738".to_string(),
+            manufacturer_name: Some("CESSNA AIRCRAFT CO".to_string()),
+            model_name: Some("182T".to_string()),
+            aircraft_type_code: None,
+            engine_type_code: None,
+            category_code: None,
+            certification_indicator_code: None,
+            engine_count: Some(1),
+            seat_count: Some(4),
+            weight_class_code: None,
+            cruise_speed_mph: None,
+            type_certificate_data_sheet: Some("3A13".to_string()),
+            type_certificate_holder: Some("TEXTRON AVIATION INC".to_string()),
+        }])
+        .build()
     }
 
     async fn listing_and_faa(db: &AppDb) -> (i64, AircraftGrounding) {

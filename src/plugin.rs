@@ -2444,7 +2444,7 @@ mod tests {
     };
     use crate::aircraft::faa::{
         require_listing_faa_admission, store_release, AircraftRecord, AircraftReference,
-        MemberProvenance, Release, ReleaseMetadata, TargetCoverage,
+        MemberProvenance, Release, ReleaseFixtureBuilder, ReleaseMetadata, TargetCoverage,
     };
     use crate::db::{AppDb, DatabaseBackend};
     use crate::models::{PluginSubmissionRequest, User};
@@ -2519,52 +2519,52 @@ mod tests {
     }
 
     fn replay_release(n_number: &str, serial: &str) -> Release {
-        Release {
-            metadata: ReleaseMetadata::official("2026-08-19", "a".repeat(64)),
-            source_manifest_sha256: "b".repeat(64),
-            target_set_sha256: "c".repeat(64),
-            master: MemberProvenance {
+        ReleaseFixtureBuilder::new(
+            ReleaseMetadata::official("2026-08-19", "a".repeat(64)),
+            "b".repeat(64),
+            "c".repeat(64),
+            MemberProvenance {
                 member_name: "MASTER.txt".to_string(),
                 sha256: "d".repeat(64),
             },
-            aircraft_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: "ACFTREF.txt".to_string(),
                 sha256: "e".repeat(64),
             },
-            engine_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: "ENGINE.txt".to_string(),
                 sha256: "f".repeat(64),
             },
-            coverage: vec![TargetCoverage {
-                n_number: n_number.to_string(),
-                matched: true,
-            }],
-            aircraft: vec![AircraftRecord {
-                n_number: n_number.to_string(),
-                manufacturer_serial_raw: Some(serial.to_string()),
-                manufacturer_serial_key: crate::aircraft::faa::normalize_serial_key(serial),
-                aircraft_code: "2072738".to_string(),
-                engine_code: None,
-                year_manufactured: Some(2020),
-                source_record_sha256: "1".repeat(64),
-            }],
-            aircraft_references: vec![AircraftReference {
-                aircraft_code: "2072738".to_string(),
-                manufacturer_name: Some("CESSNA".to_string()),
-                model_name: Some("182T".to_string()),
-                aircraft_type_code: None,
-                engine_type_code: None,
-                category_code: None,
-                certification_indicator_code: None,
-                engine_count: Some(1),
-                seat_count: Some(4),
-                weight_class_code: None,
-                cruise_speed_mph: None,
-                type_certificate_data_sheet: Some("3A13".to_string()),
-                type_certificate_holder: Some("Textron Aviation Inc.".to_string()),
-            }],
-            engine_references: Vec::new(),
-        }
+        )
+        .coverage(vec![TargetCoverage {
+            n_number: n_number.to_string(),
+            matched: true,
+        }])
+        .aircraft(vec![AircraftRecord {
+            n_number: n_number.to_string(),
+            manufacturer_serial_raw: Some(serial.to_string()),
+            manufacturer_serial_key: crate::aircraft::faa::normalize_serial_key(serial),
+            aircraft_code: "2072738".to_string(),
+            engine_code: None,
+            year_manufactured: Some(2020),
+            source_record_sha256: "1".repeat(64),
+        }])
+        .aircraft_references(vec![AircraftReference {
+            aircraft_code: "2072738".to_string(),
+            manufacturer_name: Some("CESSNA".to_string()),
+            model_name: Some("182T".to_string()),
+            aircraft_type_code: None,
+            engine_type_code: None,
+            category_code: None,
+            certification_indicator_code: None,
+            engine_count: Some(1),
+            seat_count: Some(4),
+            weight_class_code: None,
+            cruise_speed_mph: None,
+            type_certificate_data_sheet: Some("3A13".to_string()),
+            type_certificate_holder: Some("Textron Aviation Inc.".to_string()),
+        }])
+        .build()
     }
 
     async fn seed_replay_curated_aircraft(db: &AppDb, user_id: i64) {

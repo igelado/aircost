@@ -6611,8 +6611,8 @@ mod tests {
     };
     use crate::aircraft::faa::{
         require_listing_faa_admission, store_release, AircraftRecord, AircraftReference,
-        MemberProvenance, Release, ReleaseMetadata, TargetCoverage, AIRCRAFT_MEMBER_NAME,
-        ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
+        MemberProvenance, Release, ReleaseFixtureBuilder, ReleaseMetadata, TargetCoverage,
+        AIRCRAFT_MEMBER_NAME, ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
     };
     use crate::aircraft::observations::load_aircraft_identity_observations;
     use crate::gemini::curation::workflow::{SourceEvidenceProof, SourceEvidenceSpanProof};
@@ -6686,61 +6686,58 @@ mod tests {
         faa_model: &str,
         snapshot_digest: char,
     ) -> Release {
-        Release {
-            metadata: ReleaseMetadata::official(
-                snapshot_date,
-                snapshot_digest.to_string().repeat(64),
-            ),
-            source_manifest_sha256: "b".repeat(64),
-            target_set_sha256: "c".repeat(64),
-            master: MemberProvenance {
+        ReleaseFixtureBuilder::new(
+            ReleaseMetadata::official(snapshot_date, snapshot_digest.to_string().repeat(64)),
+            "b".repeat(64),
+            "c".repeat(64),
+            MemberProvenance {
                 member_name: MASTER_MEMBER_NAME.to_string(),
                 sha256: "d".repeat(64),
             },
-            aircraft_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: AIRCRAFT_MEMBER_NAME.to_string(),
                 sha256: "e".repeat(64),
             },
-            engine_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: ENGINE_MEMBER_NAME.to_string(),
                 sha256: "f".repeat(64),
             },
-            coverage: vec![TargetCoverage {
-                n_number: n_number.to_string(),
-                matched: true,
-            }],
-            aircraft: vec![AircraftRecord {
-                n_number: n_number.to_string(),
-                manufacturer_serial_raw: Some(serial.to_string()),
-                manufacturer_serial_key: Some(
-                    serial
-                        .chars()
-                        .filter(|character| character.is_ascii_alphanumeric())
-                        .map(|character| character.to_ascii_uppercase())
-                        .collect(),
-                ),
-                aircraft_code: "2072723".to_string(),
-                engine_code: None,
-                year_manufactured: Some(2022),
-                source_record_sha256: "1".repeat(64),
-            }],
-            aircraft_references: vec![AircraftReference {
-                aircraft_code: "2072723".to_string(),
-                manufacturer_name: Some(faa_make.to_string()),
-                model_name: Some(faa_model.to_string()),
-                aircraft_type_code: None,
-                engine_type_code: None,
-                category_code: None,
-                certification_indicator_code: None,
-                engine_count: Some(1),
-                seat_count: Some(4),
-                weight_class_code: None,
-                cruise_speed_mph: None,
-                type_certificate_data_sheet: Some("3A13".to_string()),
-                type_certificate_holder: Some("TEXTRON AVIATION INC".to_string()),
-            }],
-            engine_references: Vec::new(),
-        }
+        )
+        .coverage(vec![TargetCoverage {
+            n_number: n_number.to_string(),
+            matched: true,
+        }])
+        .aircraft(vec![AircraftRecord {
+            n_number: n_number.to_string(),
+            manufacturer_serial_raw: Some(serial.to_string()),
+            manufacturer_serial_key: Some(
+                serial
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .map(|character| character.to_ascii_uppercase())
+                    .collect(),
+            ),
+            aircraft_code: "2072723".to_string(),
+            engine_code: None,
+            year_manufactured: Some(2022),
+            source_record_sha256: "1".repeat(64),
+        }])
+        .aircraft_references(vec![AircraftReference {
+            aircraft_code: "2072723".to_string(),
+            manufacturer_name: Some(faa_make.to_string()),
+            model_name: Some(faa_model.to_string()),
+            aircraft_type_code: None,
+            engine_type_code: None,
+            category_code: None,
+            certification_indicator_code: None,
+            engine_count: Some(1),
+            seat_count: Some(4),
+            weight_class_code: None,
+            cruise_speed_mph: None,
+            type_certificate_data_sheet: Some("3A13".to_string()),
+            type_certificate_holder: Some("TEXTRON AVIATION INC".to_string()),
+        }])
+        .build()
     }
 
     async fn fixture(faa_make: &str, observed_make: &str) -> Fixture {

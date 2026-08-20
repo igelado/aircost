@@ -8397,11 +8397,12 @@ mod tests {
               source_manifest_sha256, target_set_sha256,
               master_member_name, master_member_sha256,
               aircraft_member_name, aircraft_member_sha256,
-              engine_member_name, engine_member_sha256
+              engine_member_name, engine_member_sha256, record_hash_domain
             ) VALUES (
               ?, '2026-07-31',
               ?,
-              ?, ?, ?, 'MASTER.txt', ?, 'ACFTREF.txt', ?, 'ENGINE.txt', ?
+              ?, ?, ?, 'MASTER.txt', ?, 'ACFTREF.txt', ?, 'ENGINE.txt', ?,
+              'aircost-faa-master-retained-aircraft-projection-v1'
             )
             RETURNING id
             "#,

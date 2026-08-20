@@ -4511,8 +4511,8 @@ mod tests {
     };
     use crate::aircraft::faa::{
         store_release, AircraftRecord, AircraftReference, BlockReason, MemberProvenance,
-        NotApplicableReason, Release, ReleaseMetadata, SerialMatch, TargetCoverage,
-        AIRCRAFT_MEMBER_NAME, ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
+        NotApplicableReason, Release, ReleaseFixtureBuilder, ReleaseMetadata, SerialMatch,
+        TargetCoverage, AIRCRAFT_MEMBER_NAME, ENGINE_MEMBER_NAME, MASTER_MEMBER_NAME,
     };
     use crate::db::DatabaseBackend;
     use crate::gemini::interactions::{GeminiInteractionsError, Interaction};
@@ -4526,6 +4526,7 @@ mod tests {
             archive_sha256: "a".repeat(64),
             source_manifest_sha256: "b".repeat(64),
             target_set_sha256: "c".repeat(64),
+            record_hash_domain: crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN.to_string(),
         }
     }
 
@@ -5104,52 +5105,52 @@ mod tests {
     }
 
     fn mixed_cluster_release() -> Release {
-        Release {
-            metadata: ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
-            source_manifest_sha256: "b".repeat(64),
-            target_set_sha256: "c".repeat(64),
-            master: MemberProvenance {
+        ReleaseFixtureBuilder::new(
+            ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
+            "b".repeat(64),
+            "c".repeat(64),
+            MemberProvenance {
                 member_name: MASTER_MEMBER_NAME.to_string(),
                 sha256: "d".repeat(64),
             },
-            aircraft_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: AIRCRAFT_MEMBER_NAME.to_string(),
                 sha256: "e".repeat(64),
             },
-            engine_reference: MemberProvenance {
+            MemberProvenance {
                 member_name: ENGINE_MEMBER_NAME.to_string(),
                 sha256: "f".repeat(64),
             },
-            coverage: vec![TargetCoverage {
-                n_number: "N123AB".to_string(),
-                matched: true,
-            }],
-            aircraft: vec![AircraftRecord {
-                n_number: "N123AB".to_string(),
-                manufacturer_serial_raw: Some("182-123".to_string()),
-                manufacturer_serial_key: Some("182123".to_string()),
-                aircraft_code: "2072738".to_string(),
-                engine_code: None,
-                year_manufactured: Some(2006),
-                source_record_sha256: "1".repeat(64),
-            }],
-            aircraft_references: vec![AircraftReference {
-                aircraft_code: "2072738".to_string(),
-                manufacturer_name: Some("TEXTRON AVIATION INC".to_string()),
-                model_name: Some("182T".to_string()),
-                aircraft_type_code: None,
-                engine_type_code: None,
-                category_code: None,
-                certification_indicator_code: None,
-                engine_count: Some(1),
-                seat_count: Some(4),
-                weight_class_code: None,
-                cruise_speed_mph: None,
-                type_certificate_data_sheet: Some("3A13".to_string()),
-                type_certificate_holder: Some("TEXTRON AVIATION INC".to_string()),
-            }],
-            engine_references: Vec::new(),
-        }
+        )
+        .coverage(vec![TargetCoverage {
+            n_number: "N123AB".to_string(),
+            matched: true,
+        }])
+        .aircraft(vec![AircraftRecord {
+            n_number: "N123AB".to_string(),
+            manufacturer_serial_raw: Some("182-123".to_string()),
+            manufacturer_serial_key: Some("182123".to_string()),
+            aircraft_code: "2072738".to_string(),
+            engine_code: None,
+            year_manufactured: Some(2006),
+            source_record_sha256: "1".repeat(64),
+        }])
+        .aircraft_references(vec![AircraftReference {
+            aircraft_code: "2072738".to_string(),
+            manufacturer_name: Some("TEXTRON AVIATION INC".to_string()),
+            model_name: Some("182T".to_string()),
+            aircraft_type_code: None,
+            engine_type_code: None,
+            category_code: None,
+            certification_indicator_code: None,
+            engine_count: Some(1),
+            seat_count: Some(4),
+            weight_class_code: None,
+            cruise_speed_mph: None,
+            type_certificate_data_sheet: Some("3A13".to_string()),
+            type_certificate_holder: Some("TEXTRON AVIATION INC".to_string()),
+        }])
+        .build()
     }
 
     fn mixed_cluster_observation(

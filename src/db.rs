@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, PgPool, SqlitePool};
@@ -98,6 +99,88 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
     "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
+const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
+const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
+const FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT: &str =
+    "fc6451ffe8e1ee2034e76480767d16d6c37463461d9e684687448b4d43f96bef";
+const FAA_RECORD_HASH_DOMAIN_MIGRATION: &str = "20260820_faa_record_hash_domain";
+const FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION: i64 = 1;
+const FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT: &str =
+    "f124f573bf705da6c1e4b0a5c7a8df45ea5a4a5dc009a28eee012be42c691502";
+// SHA-256 fingerprints of newline-terminated, ordered PostgreSQL catalog
+// signatures. Keeping each object class separate lets startup identify the
+// broken class without exposing row data. Trigger and function definitions are
+// attested separately because their bodies need reviewable source constants.
+const POSTGRES_FAA_RELATION_SHAPE_FINGERPRINT: &str =
+    "89fec02f98c47c310eff50a08c2ad3e36e1c384f815ca0cf68a60f26cc3d15a5";
+const POSTGRES_FAA_COLUMN_SHAPE_FINGERPRINT: &str =
+    "b6b60fe7998931e1b22d4d7d074fb45f8df3781c18335f5a06ccfc3e7102f798";
+const POSTGRES_FAA_CONSTRAINT_SHAPE_FINGERPRINT: &str =
+    "980de61c2318834ecfeb1b6cb0dfc97d85edb3b08b1ed2048a1ff867d88c259c";
+const POSTGRES_FAA_FOREIGN_KEY_SHAPE_FINGERPRINT: &str =
+    "2a9c555c9393f8ea9e55adceb51ae53fd9d074d5eb4071b883e28797aa346a6f";
+const POSTGRES_FAA_INDEX_SHAPE_FINGERPRINT: &str =
+    "1cf04e4f89a155745c8dcf13aaca19b8ff92e80437a95f176282d1acb1977158";
+const POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.curation_evidence_sources source
+    WHERE source.id = NEW.evidence_source_id
+      AND source.source_domain = 'faa.gov'
+      AND source.source_tier = 'regulator_primary'
+      AND source.source_url = NEW.source_url
+      AND source.content_sha256 = NEW.archive_sha256
+  ) THEN
+    RAISE EXCEPTION 'FAA snapshot requires exact regulator evidence provenance';
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.aircraft_code = NEW.aircraft_code
+  ) THEN
+    RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.engine_code = NEW.engine_code
+  ) THEN
+    RAISE EXCEPTION 'FAA engine reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF (NEW.lookup_status = 'matched' AND NOT EXISTS (
+        SELECT 1 FROM public.faa_registry_aircraft aircraft
+        WHERE aircraft.snapshot_id = NEW.snapshot_id
+          AND aircraft.n_number = NEW.n_number
+      )) OR (NEW.lookup_status = 'absent' AND EXISTS (
+        SELECT 1 FROM public.faa_registry_aircraft aircraft
+        WHERE aircraft.snapshot_id = NEW.snapshot_id
+          AND aircraft.n_number = NEW.n_number
+      )) THEN
+    RAISE EXCEPTION 'FAA coverage must agree with its target match';
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  RAISE EXCEPTION 'FAA registry snapshots and projections are immutable';
+END;
+"#;
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION: &str =
     "20260819_aircraft_listing_identity_corrections";
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
@@ -244,6 +327,81 @@ struct PostgresCorrectionTriggerDefinition {
     volatility: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct PostgresFaaReferenceTriggerDefinition {
+    trigger_name: String,
+    trigger_type: i16,
+    has_no_when_clause: bool,
+    has_no_update_columns: bool,
+    trigger_enabled: String,
+    trigger_argument_count: i16,
+    relation_schema: String,
+    relation_name: String,
+    relation_oid_matches: bool,
+    function_name: String,
+    function_schema: String,
+    function_oid_matches: bool,
+    function_source: String,
+    function_configuration: String,
+    function_language: String,
+    returns_trigger: bool,
+    function_argument_count: i16,
+    ordinary_function: bool,
+    security_definer: bool,
+    strict: bool,
+    volatility: String,
+    parallel_safety: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresFaaRegistryShape {
+    relation_signature: Option<String>,
+    column_signature: Option<String>,
+    constraint_signature: Option<String>,
+    foreign_key_signature: Option<String>,
+    index_signature: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SqliteSchemaDefinition {
+    object_type: String,
+    name: String,
+    sql: Option<String>,
+}
+
+const SQLITE_FAA_REGISTRY_OBJECTS: [(&str, &str); 24] = [
+    ("table", "faa_registry_aircraft"),
+    ("table", "faa_registry_aircraft_references"),
+    ("table", "faa_registry_coverage"),
+    ("table", "faa_registry_engine_references"),
+    ("table", "faa_registry_snapshots"),
+    ("index", "idx_faa_registry_aircraft_code"),
+    ("index", "idx_faa_registry_aircraft_lineage_record"),
+    ("index", "idx_faa_registry_coverage_lookup"),
+    ("index", "idx_faa_registry_engine_code"),
+    ("index", "idx_faa_registry_snapshots_current"),
+    ("trigger", "faa_registry_aircraft_immutable_delete"),
+    ("trigger", "faa_registry_aircraft_immutable_update"),
+    (
+        "trigger",
+        "faa_registry_aircraft_references_immutable_delete",
+    ),
+    (
+        "trigger",
+        "faa_registry_aircraft_references_immutable_update",
+    ),
+    ("trigger", "faa_registry_aircraft_references_reachable"),
+    ("trigger", "faa_registry_coverage_consistent"),
+    ("trigger", "faa_registry_coverage_immutable_delete"),
+    ("trigger", "faa_registry_coverage_immutable_update"),
+    ("trigger", "faa_registry_engine_references_immutable_delete"),
+    ("trigger", "faa_registry_engine_references_immutable_update"),
+    ("trigger", "faa_registry_engine_references_reachable"),
+    ("trigger", "faa_registry_snapshots_immutable_delete"),
+    ("trigger", "faa_registry_snapshots_immutable_update"),
+    ("trigger", "faa_registry_snapshots_require_exact_evidence"),
+];
+
 fn canonical_sql_definition(value: &str) -> String {
     let mut canonical = String::with_capacity(value.len());
     let mut characters = value.chars().peekable();
@@ -268,6 +426,54 @@ fn canonical_sql_definition(value: &str) -> String {
         }
     }
     canonical
+}
+
+fn canonical_sqlite_schema_definition(value: &str) -> String {
+    let canonical = canonical_sql_definition(value);
+    for prefix in [
+        "createtableifnotexists",
+        "createindexifnotexists",
+        "createuniqueindexifnotexists",
+        "createtriggerifnotexists",
+    ] {
+        if let Some(remainder) = canonical.strip_prefix(prefix) {
+            let replacement = prefix.replace("ifnotexists", "");
+            return format!("{replacement}{remainder}");
+        }
+    }
+    canonical
+}
+
+fn expected_sqlite_faa_registry_definitions() -> Vec<SqliteSchemaDefinition> {
+    SQLITE_FAA_REGISTRY_OBJECTS
+        .iter()
+        .map(|(object_type, name)| {
+            let expected_prefixes = match *object_type {
+                "table" => vec![format!("createtable{name}(")],
+                "index" => vec![
+                    format!("createindex{name}on"),
+                    format!("createuniqueindex{name}on"),
+                ],
+                "trigger" => vec![format!("createtrigger{name}")],
+                _ => unreachable!("FAA SQLite object type is fixed"),
+            };
+            let definition = split_sql_statements(SQLITE_SCHEMA_SQL)
+                .into_iter()
+                .map(strip_leading_sql_comments)
+                .map(canonical_sqlite_schema_definition)
+                .find(|statement| {
+                    expected_prefixes
+                        .iter()
+                        .any(|prefix| statement.starts_with(prefix))
+                })
+                .unwrap_or_else(|| panic!("canonical SQLite schema is missing {name}"));
+            SqliteSchemaDefinition {
+                object_type: (*object_type).to_owned(),
+                name: (*name).to_owned(),
+                sql: Some(definition),
+            }
+        })
+        .collect()
 }
 
 impl AppDb {
@@ -333,8 +539,61 @@ impl AppDb {
         })
     }
 
+    /// Opens an existing database for diagnostic commands without schema
+    /// initialization, migrations, seed writes, or writable transactions.
+    /// Unlike an export source, this boundary supports both backends: SQLite
+    /// opens the file read-only and PostgreSQL makes read-only the default for
+    /// every connection in the pool.
+    pub async fn connect_diagnostic(database_url: &str) -> Result<Self> {
+        let database_url = normalize_database_url(database_url);
+        if is_postgres_url(&database_url) {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .after_connect(|connection, _metadata| {
+                    Box::pin(async move {
+                        sqlx::query("SET default_transaction_read_only = on")
+                            .execute(connection)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&database_url)
+                .await
+                .with_context(|| {
+                    format!("could not open diagnostic Postgres database {database_url}")
+                })?;
+            let db = Self {
+                backend: DatabaseBackend::Postgres(pool),
+            };
+            db.ensure_required_migrations().await?;
+            return Ok(db);
+        }
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .with_context(|| format!("invalid SQLite database URL {database_url}"))?
+            .create_if_missing(false)
+            .read_only(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .with_context(|| format!("could not open diagnostic SQLite database {database_url}"))?;
+        let db = Self {
+            backend: DatabaseBackend::Sqlite(pool),
+        };
+        db.ensure_required_migrations().await?;
+        Ok(db)
+    }
+
     pub(crate) fn backend(&self) -> &DatabaseBackend {
         &self.backend
+    }
+
+    pub async fn close(self) {
+        match self.backend {
+            DatabaseBackend::Sqlite(pool) => pool.close().await,
+            DatabaseBackend::Postgres(pool) => pool.close().await,
+        }
     }
 
     pub(crate) fn kind(&self) -> DatabaseKind {
@@ -2803,6 +3062,48 @@ impl AppDb {
                 LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
             ));
         }
+        let faa_registry_schema_started = self.faa_registry_schema_started().await?;
+        let missing_faa_reference_contract = match self.backend() {
+            DatabaseBackend::Sqlite(_) => false,
+            DatabaseBackend::Postgres(_) => {
+                self.migration_contract_missing(
+                    "public.faa_registry_aircraft_references",
+                    FAA_REFERENCE_REACHABILITY_MIGRATION,
+                    FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
+                    FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+                )
+                .await?
+            }
+        };
+        let missing_faa_record_hash_domain_contract = self
+            .migration_contract_missing(
+                match self.kind() {
+                    DatabaseKind::Sqlite => "faa_registry_snapshots",
+                    DatabaseKind::Postgres => "public.faa_registry_snapshots",
+                },
+                FAA_RECORD_HASH_DOMAIN_MIGRATION,
+                FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION,
+                FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT,
+            )
+            .await?;
+        if faa_registry_schema_started {
+            if missing_faa_record_hash_domain_contract {
+                bail!(faa_record_hash_domain_migration_required_message(
+                    self.kind()
+                ));
+            }
+            let contract_problem = if missing_faa_reference_contract {
+                Some(String::from("migration contract marker"))
+            } else {
+                self.faa_registry_contract_problem().await?
+            };
+            if let Some(problem) = contract_problem {
+                bail!(faa_registry_contract_required_message(
+                    self.kind(),
+                    &problem
+                ));
+            }
+        }
         let missing_aircraft_listing_identity_correction_objects = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
@@ -3203,6 +3504,680 @@ impl AppDb {
                     ))
             }
         }
+    }
+
+    async fn postgres_faa_registry_trigger_definitions_valid(&self) -> Result<bool> {
+        let DatabaseBackend::Postgres(pool) = self.backend() else {
+            return Ok(true);
+        };
+        let definitions = sqlx::query_as::<_, PostgresFaaReferenceTriggerDefinition>(
+            r#"
+            SELECT
+              actual_trigger.tgname AS trigger_name,
+              actual_trigger.tgtype::smallint AS trigger_type,
+              actual_trigger.tgqual IS NULL AS has_no_when_clause,
+              pg_catalog.cardinality(actual_trigger.tgattr) = 0
+                AS has_no_update_columns,
+              actual_trigger.tgenabled::text AS trigger_enabled,
+              actual_trigger.tgnargs::smallint AS trigger_argument_count,
+              relation_namespace.nspname AS relation_schema,
+              relation.relname AS relation_name,
+              TRUE AS relation_oid_matches,
+              routine.proname AS function_name,
+              routine_namespace.nspname AS function_schema,
+              TRUE AS function_oid_matches,
+              routine.prosrc AS function_source,
+              COALESCE(
+                pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+              ) AS function_configuration,
+              language.lanname AS function_language,
+              routine.prorettype = 'trigger'::pg_catalog.regtype AS returns_trigger,
+              routine.pronargs::smallint AS function_argument_count,
+              routine.prokind = 'f' AS ordinary_function,
+              routine.prosecdef AS security_definer,
+              routine.proisstrict AS strict,
+              routine.provolatile::text AS volatility,
+              routine.proparallel::text AS parallel_safety
+            FROM pg_catalog.pg_trigger actual_trigger
+            JOIN pg_catalog.pg_class relation
+              ON relation.oid = actual_trigger.tgrelid
+            JOIN pg_catalog.pg_namespace relation_namespace
+              ON relation_namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_proc routine ON routine.oid = actual_trigger.tgfoid
+            JOIN pg_catalog.pg_namespace routine_namespace
+              ON routine_namespace.oid = routine.pronamespace
+            JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+            WHERE NOT actual_trigger.tgisinternal
+              AND relation_namespace.nspname = 'public'
+              AND relation.relname IN (
+                'faa_registry_aircraft',
+                'faa_registry_aircraft_references',
+                'faa_registry_coverage',
+                'faa_registry_engine_references',
+                'faa_registry_snapshots'
+              )
+            ORDER BY actual_trigger.tgname
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        let expected = [
+            (
+                "faa_registry_aircraft_immutable",
+                27_i16,
+                "faa_registry_aircraft",
+                "preserve_faa_registry_data",
+                POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_aircraft_references_immutable",
+                27_i16,
+                "faa_registry_aircraft_references",
+                "preserve_faa_registry_data",
+                POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_aircraft_references_reachable",
+                7_i16,
+                "faa_registry_aircraft_references",
+                "validate_faa_aircraft_reference_reachability",
+                POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_coverage_consistent",
+                7_i16,
+                "faa_registry_coverage",
+                "validate_faa_coverage",
+                POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_coverage_immutable",
+                27_i16,
+                "faa_registry_coverage",
+                "preserve_faa_registry_data",
+                POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_engine_references_immutable",
+                27_i16,
+                "faa_registry_engine_references",
+                "preserve_faa_registry_data",
+                POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_engine_references_reachable",
+                7_i16,
+                "faa_registry_engine_references",
+                "validate_faa_engine_reference_reachability",
+                POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_snapshots_immutable",
+                27_i16,
+                "faa_registry_snapshots",
+                "preserve_faa_registry_data",
+                POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_snapshots_require_exact_evidence",
+                7_i16,
+                "faa_registry_snapshots",
+                "validate_faa_snapshot_evidence",
+                POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
+            ),
+        ];
+        Ok(definitions.len() == expected.len()
+            && definitions.iter().zip(expected).all(
+                |(
+                    actual,
+                    (trigger_name, trigger_type, relation_name, function_name, function_source),
+                )| {
+                    actual.trigger_name == trigger_name
+                        && actual.trigger_type == trigger_type
+                        && actual.has_no_when_clause
+                        && actual.has_no_update_columns
+                        && actual.trigger_enabled == "O"
+                        && actual.trigger_argument_count == 0
+                        && actual.relation_schema == "public"
+                        && actual.relation_name == relation_name
+                        && actual.relation_oid_matches
+                        && actual.function_name == function_name
+                        && actual.function_schema == "public"
+                        && actual.function_oid_matches
+                        && canonical_sql_definition(&actual.function_source)
+                            == canonical_sql_definition(function_source)
+                        && actual.function_configuration == "search_path=pg_catalog"
+                        && actual.function_language == "plpgsql"
+                        && actual.returns_trigger
+                        && actual.function_argument_count == 0
+                        && actual.ordinary_function
+                        && !actual.security_definer
+                        && !actual.strict
+                        && actual.volatility == "v"
+                        && actual.parallel_safety == "u"
+                },
+            ))
+    }
+
+    async fn postgres_faa_registry_shape_problem(&self) -> Result<Option<String>> {
+        let DatabaseBackend::Postgres(pool) = self.backend() else {
+            return Ok(None);
+        };
+        let shape = sqlx::query_as::<_, PostgresFaaRegistryShape>(
+            r#"
+            SELECT
+              (
+                SELECT pg_catalog.string_agg(
+                  pg_catalog.format(
+                    '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+                    relation.relkind, relation.relpersistence,
+                    relation.relrowsecurity, relation.relforcerowsecurity,
+                    relation.relispartition, relation.relhasrules
+                  ), E'\n' ORDER BY relation.relname
+                )
+                FROM pg_catalog.pg_class relation
+                JOIN pg_catalog.pg_namespace relation_namespace
+                  ON relation_namespace.oid = relation.relnamespace
+                WHERE relation_namespace.nspname = 'public'
+                  AND relation.relname IN (
+                    'faa_registry_aircraft',
+                    'faa_registry_aircraft_references',
+                    'faa_registry_coverage',
+                    'faa_registry_engine_references',
+                    'faa_registry_snapshots'
+                  )
+              ) AS relation_signature,
+              (
+                SELECT pg_catalog.string_agg(
+                  pg_catalog.format(
+                    '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+                    attribute.attnum, attribute.attname,
+                    pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+                    attribute.attnotnull, attribute.attidentity,
+                    COALESCE(
+                      pg_catalog.pg_get_expr(
+                        attribute_default.adbin, attribute_default.adrelid
+                      ), ''
+                    )
+                  ), E'\n' ORDER BY relation.relname, attribute.attnum
+                )
+                FROM pg_catalog.pg_class relation
+                JOIN pg_catalog.pg_namespace relation_namespace
+                  ON relation_namespace.oid = relation.relnamespace
+                JOIN pg_catalog.pg_attribute attribute
+                  ON attribute.attrelid = relation.oid
+                 AND attribute.attnum > 0
+                 AND NOT attribute.attisdropped
+                LEFT JOIN pg_catalog.pg_attrdef attribute_default
+                  ON attribute_default.adrelid = relation.oid
+                 AND attribute_default.adnum = attribute.attnum
+                WHERE relation_namespace.nspname = 'public'
+                  AND relation.relname IN (
+                    'faa_registry_aircraft',
+                    'faa_registry_aircraft_references',
+                    'faa_registry_coverage',
+                    'faa_registry_engine_references',
+                    'faa_registry_snapshots'
+                  )
+              ) AS column_signature,
+              (
+                SELECT pg_catalog.string_agg(
+                  pg_catalog.format(
+                    '%s|%s|%s|%s|%s', relation.relname,
+                    constraint_row.contype, constraint_row.conname,
+                    constraint_row.convalidated,
+                    pg_catalog.pg_get_constraintdef(constraint_row.oid, FALSE)
+                  ), E'\n' ORDER BY relation.relname,
+                    constraint_row.contype, constraint_row.conname
+                )
+                FROM pg_catalog.pg_constraint constraint_row
+                JOIN pg_catalog.pg_class relation
+                  ON relation.oid = constraint_row.conrelid
+                JOIN pg_catalog.pg_namespace relation_namespace
+                  ON relation_namespace.oid = relation.relnamespace
+                WHERE relation_namespace.nspname = 'public'
+                  AND relation.relname IN (
+                    'faa_registry_aircraft',
+                    'faa_registry_aircraft_references',
+                    'faa_registry_coverage',
+                    'faa_registry_engine_references',
+                    'faa_registry_snapshots'
+                  )
+                  AND constraint_row.contype <> 'f'
+              ) AS constraint_signature,
+              (
+                SELECT pg_catalog.string_agg(
+                  pg_catalog.format(
+                    '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+                    relation.relname,
+                    constraint_namespace.nspname,
+                    constraint_row.contype,
+                    constraint_row.conname,
+                    constraint_row.convalidated,
+                    constraint_row.condeferrable,
+                    constraint_row.condeferred,
+                    constraint_row.connoinherit,
+                    constraint_row.conislocal,
+                    constraint_row.coninhcount,
+                    referenced_namespace.nspname,
+                    referenced_relation.relname,
+                    referenced_index_namespace.nspname,
+                    referenced_index.relname,
+                    constraint_row.contypid = 0,
+                    constraint_row.conparentid = 0,
+                    constraint_row.confupdtype::text,
+                    constraint_row.confdeltype::text,
+                    constraint_row.confmatchtype::text,
+                    COALESCE(constraint_row.conkey::text, ''),
+                    COALESCE(constraint_row.confkey::text, ''),
+                    COALESCE((
+                      SELECT pg_catalog.string_agg(
+                        operator_namespace.nspname || '.' || operator_row.oprname || '(' ||
+                        left_namespace.nspname || '.' || left_type.typname || ',' ||
+                        right_namespace.nspname || '.' || right_type.typname || ')',
+                        ',' ORDER BY operator_key.ordinality
+                      )
+                      FROM pg_catalog.unnest(constraint_row.conpfeqop) WITH ORDINALITY
+                        AS operator_key(operator_oid, ordinality)
+                      JOIN pg_catalog.pg_operator operator_row
+                        ON operator_row.oid = operator_key.operator_oid
+                      JOIN pg_catalog.pg_namespace operator_namespace
+                        ON operator_namespace.oid = operator_row.oprnamespace
+                      JOIN pg_catalog.pg_type left_type
+                        ON left_type.oid = operator_row.oprleft
+                      JOIN pg_catalog.pg_namespace left_namespace
+                        ON left_namespace.oid = left_type.typnamespace
+                      JOIN pg_catalog.pg_type right_type
+                        ON right_type.oid = operator_row.oprright
+                      JOIN pg_catalog.pg_namespace right_namespace
+                        ON right_namespace.oid = right_type.typnamespace
+                    ), ''),
+                    COALESCE((
+                      SELECT pg_catalog.string_agg(
+                        operator_namespace.nspname || '.' || operator_row.oprname || '(' ||
+                        left_namespace.nspname || '.' || left_type.typname || ',' ||
+                        right_namespace.nspname || '.' || right_type.typname || ')',
+                        ',' ORDER BY operator_key.ordinality
+                      )
+                      FROM pg_catalog.unnest(constraint_row.conppeqop) WITH ORDINALITY
+                        AS operator_key(operator_oid, ordinality)
+                      JOIN pg_catalog.pg_operator operator_row
+                        ON operator_row.oid = operator_key.operator_oid
+                      JOIN pg_catalog.pg_namespace operator_namespace
+                        ON operator_namespace.oid = operator_row.oprnamespace
+                      JOIN pg_catalog.pg_type left_type
+                        ON left_type.oid = operator_row.oprleft
+                      JOIN pg_catalog.pg_namespace left_namespace
+                        ON left_namespace.oid = left_type.typnamespace
+                      JOIN pg_catalog.pg_type right_type
+                        ON right_type.oid = operator_row.oprright
+                      JOIN pg_catalog.pg_namespace right_namespace
+                        ON right_namespace.oid = right_type.typnamespace
+                    ), ''),
+                    COALESCE((
+                      SELECT pg_catalog.string_agg(
+                        operator_namespace.nspname || '.' || operator_row.oprname || '(' ||
+                        left_namespace.nspname || '.' || left_type.typname || ',' ||
+                        right_namespace.nspname || '.' || right_type.typname || ')',
+                        ',' ORDER BY operator_key.ordinality
+                      )
+                      FROM pg_catalog.unnest(constraint_row.conffeqop) WITH ORDINALITY
+                        AS operator_key(operator_oid, ordinality)
+                      JOIN pg_catalog.pg_operator operator_row
+                        ON operator_row.oid = operator_key.operator_oid
+                      JOIN pg_catalog.pg_namespace operator_namespace
+                        ON operator_namespace.oid = operator_row.oprnamespace
+                      JOIN pg_catalog.pg_type left_type
+                        ON left_type.oid = operator_row.oprleft
+                      JOIN pg_catalog.pg_namespace left_namespace
+                        ON left_namespace.oid = left_type.typnamespace
+                      JOIN pg_catalog.pg_type right_type
+                        ON right_type.oid = operator_row.oprright
+                      JOIN pg_catalog.pg_namespace right_namespace
+                        ON right_namespace.oid = right_type.typnamespace
+                    ), ''),
+                    COALESCE(constraint_row.confdelsetcols::text, ''),
+                    constraint_row.conexclop IS NULL,
+                    constraint_row.conbin IS NULL,
+                    ''
+                  ), E'\n' ORDER BY relation.relname, constraint_row.conname
+                )
+                FROM pg_catalog.pg_constraint constraint_row
+                JOIN pg_catalog.pg_namespace constraint_namespace
+                  ON constraint_namespace.oid = constraint_row.connamespace
+                JOIN pg_catalog.pg_class relation
+                  ON relation.oid = constraint_row.conrelid
+                JOIN pg_catalog.pg_namespace relation_namespace
+                  ON relation_namespace.oid = relation.relnamespace
+                JOIN pg_catalog.pg_class referenced_relation
+                  ON referenced_relation.oid = constraint_row.confrelid
+                JOIN pg_catalog.pg_namespace referenced_namespace
+                  ON referenced_namespace.oid = referenced_relation.relnamespace
+                JOIN pg_catalog.pg_class referenced_index
+                  ON referenced_index.oid = constraint_row.conindid
+                JOIN pg_catalog.pg_namespace referenced_index_namespace
+                  ON referenced_index_namespace.oid = referenced_index.relnamespace
+                WHERE relation_namespace.nspname = 'public'
+                  AND relation.relname IN (
+                    'faa_registry_aircraft',
+                    'faa_registry_aircraft_references',
+                    'faa_registry_coverage',
+                    'faa_registry_engine_references',
+                    'faa_registry_snapshots'
+                  )
+                  AND constraint_row.contype = 'f'
+              ) AS foreign_key_signature,
+              (
+                SELECT pg_catalog.string_agg(
+                  pg_catalog.format(
+                    '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+                    index_relation.relname, index_row.indisunique,
+                    index_row.indisprimary, index_row.indisvalid,
+                    index_row.indisready,
+                    pg_catalog.pg_get_indexdef(index_relation.oid)
+                  ), E'\n' ORDER BY relation.relname, index_relation.relname
+                )
+                FROM pg_catalog.pg_index index_row
+                JOIN pg_catalog.pg_class relation
+                  ON relation.oid = index_row.indrelid
+                JOIN pg_catalog.pg_namespace relation_namespace
+                  ON relation_namespace.oid = relation.relnamespace
+                JOIN pg_catalog.pg_class index_relation
+                  ON index_relation.oid = index_row.indexrelid
+                WHERE relation_namespace.nspname = 'public'
+                  AND relation.relname IN (
+                    'faa_registry_aircraft',
+                    'faa_registry_aircraft_references',
+                    'faa_registry_coverage',
+                    'faa_registry_engine_references',
+                    'faa_registry_snapshots'
+                  )
+              ) AS index_signature
+            "#,
+        )
+        .fetch_one(pool)
+        .await?;
+        let Some(relation_signature) = shape.relation_signature else {
+            return Ok(Some(String::from("PostgreSQL FAA registry relations")));
+        };
+        let Some(column_signature) = shape.column_signature else {
+            return Ok(Some(String::from("PostgreSQL FAA registry columns")));
+        };
+        let Some(constraint_signature) = shape.constraint_signature else {
+            return Ok(Some(String::from("PostgreSQL FAA registry constraints")));
+        };
+        let Some(foreign_key_signature) = shape.foreign_key_signature else {
+            return Ok(Some(String::from("PostgreSQL FAA registry foreign keys")));
+        };
+        let Some(index_signature) = shape.index_signature else {
+            return Ok(Some(String::from("PostgreSQL FAA registry indexes")));
+        };
+        for (object_class, signature, expected_fingerprint) in [
+            (
+                "PostgreSQL FAA registry relations",
+                relation_signature,
+                POSTGRES_FAA_RELATION_SHAPE_FINGERPRINT,
+            ),
+            (
+                "PostgreSQL FAA registry columns",
+                column_signature,
+                POSTGRES_FAA_COLUMN_SHAPE_FINGERPRINT,
+            ),
+            (
+                "PostgreSQL FAA registry constraints",
+                constraint_signature,
+                POSTGRES_FAA_CONSTRAINT_SHAPE_FINGERPRINT,
+            ),
+            (
+                "PostgreSQL FAA registry foreign keys",
+                foreign_key_signature,
+                POSTGRES_FAA_FOREIGN_KEY_SHAPE_FINGERPRINT,
+            ),
+            (
+                "PostgreSQL FAA registry indexes",
+                index_signature,
+                POSTGRES_FAA_INDEX_SHAPE_FINGERPRINT,
+            ),
+        ] {
+            let fingerprint = format!("{:x}", Sha256::digest(format!("{signature}\n")));
+            if fingerprint != expected_fingerprint {
+                return Ok(Some(object_class.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn sqlite_faa_registry_definition_problem(&self) -> Result<Option<String>> {
+        let DatabaseBackend::Sqlite(pool) = self.backend() else {
+            return Ok(None);
+        };
+        let foreign_keys = sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(pool)
+            .await?;
+        if foreign_keys != 1 {
+            return Ok(Some(String::from("SQLite PRAGMA foreign_keys")));
+        }
+        let actual = sqlx::query_as::<_, SqliteSchemaDefinition>(
+            r#"
+            SELECT type AS object_type, name, sql
+            FROM sqlite_schema
+            WHERE name IN (
+              'faa_registry_aircraft',
+              'faa_registry_aircraft_references',
+              'faa_registry_coverage',
+              'faa_registry_engine_references',
+              'faa_registry_snapshots',
+              'idx_faa_registry_aircraft_code',
+              'idx_faa_registry_aircraft_lineage_record',
+              'idx_faa_registry_coverage_lookup',
+              'idx_faa_registry_engine_code',
+              'idx_faa_registry_snapshots_current',
+              'faa_registry_aircraft_immutable_delete',
+              'faa_registry_aircraft_immutable_update',
+              'faa_registry_aircraft_references_immutable_delete',
+              'faa_registry_aircraft_references_immutable_update',
+              'faa_registry_aircraft_references_reachable',
+              'faa_registry_coverage_consistent',
+              'faa_registry_coverage_immutable_delete',
+              'faa_registry_coverage_immutable_update',
+              'faa_registry_engine_references_immutable_delete',
+              'faa_registry_engine_references_immutable_update',
+              'faa_registry_engine_references_reachable',
+              'faa_registry_snapshots_immutable_delete',
+              'faa_registry_snapshots_immutable_update',
+              'faa_registry_snapshots_require_exact_evidence'
+            )
+            OR (
+              type IN ('index', 'trigger')
+              AND tbl_name IN (
+                'faa_registry_aircraft',
+                'faa_registry_aircraft_references',
+                'faa_registry_coverage',
+                'faa_registry_engine_references',
+                'faa_registry_snapshots'
+              )
+              AND sql IS NOT NULL
+            )
+            ORDER BY type, name
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut expected = expected_sqlite_faa_registry_definitions();
+        expected.sort_by(|left, right| {
+            (&left.object_type, &left.name).cmp(&(&right.object_type, &right.name))
+        });
+        if actual.len() != expected.len() {
+            return Ok(Some(String::from("SQLite FAA registry object set")));
+        }
+        for (actual, expected) in actual.iter().zip(expected) {
+            if actual.object_type != expected.object_type
+                || actual.name != expected.name
+                || actual
+                    .sql
+                    .as_deref()
+                    .map(canonical_sqlite_schema_definition)
+                    != expected.sql
+            {
+                return Ok(Some(format!(
+                    "SQLite FAA registry {} `{}`",
+                    expected.object_type, expected.name
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn faa_registry_contract_problem(&self) -> Result<Option<String>> {
+        let structure_problem = match self.backend() {
+            DatabaseBackend::Sqlite(_) => self.sqlite_faa_registry_definition_problem().await?,
+            DatabaseBackend::Postgres(_) => {
+                if let Some(problem) = self.postgres_faa_registry_shape_problem().await? {
+                    return Ok(Some(problem));
+                }
+                if !self
+                    .postgres_faa_registry_trigger_definitions_valid()
+                    .await?
+                {
+                    return Ok(Some(String::from(
+                        "PostgreSQL FAA registry triggers or functions",
+                    )));
+                }
+                None
+            }
+        };
+        if structure_problem.is_some() {
+            return Ok(structure_problem);
+        }
+        let mismatched_domain = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS (SELECT 1 FROM faa_registry_snapshots \
+                     WHERE record_hash_domain IS NOT ?)",
+                )
+                .bind(crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN)
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM public.faa_registry_snapshots \
+                     WHERE record_hash_domain IS DISTINCT FROM $1)",
+                )
+                .bind(crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN)
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if mismatched_domain {
+            return Ok(Some(String::from("FAA record hash domain values")));
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    async fn faa_registry_contract_valid(&self) -> Result<bool> {
+        Ok(self.faa_registry_contract_problem().await?.is_none())
+    }
+
+    async fn faa_registry_schema_started(&self) -> Result<bool> {
+        let objects_started = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE name IN (
+                        'faa_registry_aircraft',
+                        'faa_registry_aircraft_references',
+                        'faa_registry_coverage',
+                        'faa_registry_engine_references',
+                        'faa_registry_snapshots',
+                        'faa_registry_aircraft_references_reachable',
+                        'faa_registry_engine_references_reachable'
+                      )
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0
+            }
+            DatabaseBackend::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+            SELECT
+              pg_catalog.to_regclass('public.faa_registry_snapshots') IS NOT NULL
+              OR pg_catalog.to_regclass('public.faa_registry_coverage') IS NOT NULL
+              OR pg_catalog.to_regclass('public.faa_registry_aircraft') IS NOT NULL
+              OR pg_catalog.to_regclass(
+                'public.faa_registry_aircraft_references'
+              ) IS NOT NULL
+              OR pg_catalog.to_regclass(
+                'public.faa_registry_engine_references'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.validate_faa_aircraft_reference_reachability()'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.validate_faa_engine_reference_reachability()'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.validate_faa_snapshot_evidence()'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.validate_faa_coverage()'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.preserve_faa_registry_data()'
+              ) IS NOT NULL
+              OR EXISTS (
+                SELECT 1 FROM pg_catalog.pg_trigger
+                WHERE NOT tgisinternal
+                  AND tgname IN (
+                    'faa_registry_snapshots_require_exact_evidence',
+                    'faa_registry_aircraft_references_reachable',
+                    'faa_registry_engine_references_reachable',
+                    'faa_registry_coverage_consistent',
+                    'faa_registry_snapshots_immutable',
+                    'faa_registry_aircraft_immutable',
+                    'faa_registry_aircraft_references_immutable',
+                    'faa_registry_engine_references_immutable',
+                    'faa_registry_coverage_immutable'
+                  )
+              )
+            "#,
+                )
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        if objects_started {
+            return Ok(true);
+        }
+        let DatabaseBackend::Postgres(pool) = self.backend() else {
+            return Ok(false);
+        };
+        let ledger_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.to_regclass('public.schema_migration_contracts') IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await?;
+        if !ledger_exists {
+            return Ok(false);
+        }
+        Ok(sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+              SELECT 1 FROM public.schema_migration_contracts
+              WHERE migration_name = $1
+            )
+            "#,
+        )
+        .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
+        .fetch_one(pool)
+        .await?)
     }
 
     async fn migration_contract_missing(
@@ -4075,6 +5050,35 @@ fn aircraft_listing_identity_corrections_migration_required_message(kind: Databa
     )
 }
 
+fn faa_registry_contract_required_message(kind: DatabaseKind, problem: &str) -> String {
+    match kind {
+        DatabaseKind::Sqlite => format!(
+            "database migration required before startup: {problem} does not match the canonical \
+             FAA projection contract; restore the database from a verified backup before \
+             restarting aircost"
+        ),
+        DatabaseKind::Postgres => format!(
+            "database migration required before startup: {problem} does not match the exact \
+             namespace-locked FAA projection contract; back up the database, apply \
+             `migrations/{FAA_REFERENCE_REACHABILITY_MIGRATION}.postgres.sql`, then restart \
+             aircost"
+        ),
+    }
+}
+
+fn faa_record_hash_domain_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: FAA source-record hashes need an explicit \
+         immutable domain; a nonempty legacy FAA projection must be discarded and regenerated \
+         from its exact release archive, then apply \
+         `migrations/{FAA_RECORD_HASH_DOMAIN_MIGRATION}.{backend}.sql` and restart aircost"
+    )
+}
+
 pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
     if is_database_url(database_url) || !database_url.trim().is_empty() {
         Ok(())
@@ -4101,6 +5105,7 @@ mod tests {
         avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
         avionics_product_reuse_attestations_migration_required_message, canonical_sql_definition,
+        faa_record_hash_domain_migration_required_message, faa_registry_contract_required_message,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
@@ -4134,14 +5139,21 @@ mod tests {
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION,
         DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
+        FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT, FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION,
+        FAA_RECORD_HASH_DOMAIN_MIGRATION, FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+        FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION, FAA_REFERENCE_REACHABILITY_MIGRATION,
         IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE, POSTGRES_SCHEMA_SQL, SQLITE_SCHEMA_SQL,
-        VALUATION_DATA_HARDENING_MIGRATION,
+        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
+        POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+        POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
+        POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+        POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE, POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
+        POSTGRES_SCHEMA_SQL, SQLITE_SCHEMA_SQL, VALUATION_DATA_HARDENING_MIGRATION,
     };
 
     const LISTING_PENDING_REVIEWS_SQLITE_MIGRATION_SQL: &str =
@@ -4160,6 +5172,12 @@ mod tests {
         include_str!("../migrations/20260730_aircraft_tcds_make_lineage.sqlite.sql");
     const AIRCRAFT_TCDS_MAKE_LINEAGE_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260730_aircraft_tcds_make_lineage.postgres.sql");
+    const FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260819_faa_reference_reachability.postgres.sql");
+    const FAA_RECORD_HASH_DOMAIN_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260820_faa_record_hash_domain.sqlite.sql");
+    const FAA_RECORD_HASH_DOMAIN_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260820_faa_record_hash_domain.postgres.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260731_avionics_human_reviewed_consolidation.sqlite.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
@@ -4233,6 +5251,71 @@ mod tests {
         ));
         let url = format!("sqlite://{}", path.display());
         (path, url)
+    }
+
+    #[tokio::test]
+    async fn diagnostic_sqlite_connection_never_creates_a_missing_database() {
+        let (database_path, database_url) = unique_sqlite_test_database("diagnostic-missing");
+        assert!(!database_path.exists());
+        let error = match AppDb::connect_diagnostic(&database_url).await {
+            Ok(_) => panic!("diagnostic connection must not create a missing SQLite database"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("could not open diagnostic SQLite database"));
+        assert!(!database_path.exists());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_sqlite_connection_leaves_database_bytes_unchanged() {
+        let (database_path, database_url) = unique_sqlite_test_database("diagnostic-unchanged");
+        let writable = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(writable_pool) = writable.backend() else {
+            unreachable!()
+        };
+        writable_pool.close().await;
+        drop(writable);
+        let before = std::fs::read(&database_path).unwrap();
+
+        let diagnostic = AppDb::connect_diagnostic(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(diagnostic_pool) = diagnostic.backend() else {
+            unreachable!()
+        };
+        let table_count =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE type = 'table'")
+                .fetch_one(diagnostic_pool)
+                .await
+                .unwrap();
+        assert!(table_count > 0);
+        diagnostic_pool.close().await;
+        drop(diagnostic);
+
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+        assert!(!PathBuf::from(format!("{}-wal", database_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", database_path.display())).exists());
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL in AIRCOST_TEST_POSTGRES_URL"]
+    async fn diagnostic_postgres_connections_default_to_read_only() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let diagnostic = AppDb::connect_diagnostic(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = diagnostic.backend() else {
+            unreachable!()
+        };
+        let setting = sqlx::query_scalar::<_, String>("SHOW default_transaction_read_only")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(setting, "on");
+        let error = pool
+            .execute("CREATE TABLE public.aircost_diagnostic_write_must_fail (id BIGINT)")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("read-only"), "{error}");
+        pool.close().await;
     }
 
     async fn assert_corrupt_identity_correction_schema_rejected(label: &str, statements: &[&str]) {
@@ -4378,6 +5461,659 @@ mod tests {
             .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
         let db = AppDb::connect(&database_url).await.unwrap();
         db.ensure_required_migrations().await.unwrap();
+    }
+
+    async fn install_faa_registry_functions(pool: &sqlx::PgPool) {
+        for (function_name, body) in [
+            (
+                "validate_faa_snapshot_evidence",
+                POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
+            ),
+            (
+                "validate_faa_aircraft_reference_reachability",
+                POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "validate_faa_engine_reference_reachability",
+                POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "validate_faa_coverage",
+                POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
+            ),
+            (
+                "preserve_faa_registry_data",
+                POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE,
+            ),
+        ] {
+            let statement = format!(
+                "CREATE OR REPLACE FUNCTION public.{function_name}() RETURNS TRIGGER \
+                 LANGUAGE plpgsql AS $function${body}$function$ \
+                 SET search_path = pg_catalog"
+            );
+            pool.execute(statement.as_str()).await.unwrap();
+        }
+    }
+
+    async fn install_faa_registry_triggers(pool: &sqlx::PgPool) {
+        for (trigger_name, relation_name, event, function_name) in [
+            (
+                "faa_registry_snapshots_require_exact_evidence",
+                "faa_registry_snapshots",
+                "INSERT",
+                "validate_faa_snapshot_evidence",
+            ),
+            (
+                "faa_registry_aircraft_references_reachable",
+                "faa_registry_aircraft_references",
+                "INSERT",
+                "validate_faa_aircraft_reference_reachability",
+            ),
+            (
+                "faa_registry_engine_references_reachable",
+                "faa_registry_engine_references",
+                "INSERT",
+                "validate_faa_engine_reference_reachability",
+            ),
+            (
+                "faa_registry_coverage_consistent",
+                "faa_registry_coverage",
+                "INSERT",
+                "validate_faa_coverage",
+            ),
+            (
+                "faa_registry_snapshots_immutable",
+                "faa_registry_snapshots",
+                "UPDATE OR DELETE",
+                "preserve_faa_registry_data",
+            ),
+            (
+                "faa_registry_aircraft_immutable",
+                "faa_registry_aircraft",
+                "UPDATE OR DELETE",
+                "preserve_faa_registry_data",
+            ),
+            (
+                "faa_registry_aircraft_references_immutable",
+                "faa_registry_aircraft_references",
+                "UPDATE OR DELETE",
+                "preserve_faa_registry_data",
+            ),
+            (
+                "faa_registry_engine_references_immutable",
+                "faa_registry_engine_references",
+                "UPDATE OR DELETE",
+                "preserve_faa_registry_data",
+            ),
+            (
+                "faa_registry_coverage_immutable",
+                "faa_registry_coverage",
+                "UPDATE OR DELETE",
+                "preserve_faa_registry_data",
+            ),
+        ] {
+            let drop_statement =
+                format!("DROP TRIGGER IF EXISTS {trigger_name} ON public.{relation_name}");
+            pool.execute(drop_statement.as_str()).await.unwrap();
+            let create_statement = format!(
+                "CREATE TRIGGER {trigger_name} BEFORE {event} ON public.{relation_name} \
+                 FOR EACH ROW EXECUTE FUNCTION public.{function_name}()"
+            );
+            pool.execute(create_statement.as_str()).await.unwrap();
+        }
+    }
+
+    async fn assert_faa_reference_startup_rejected(db: &AppDb) -> String {
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("database migration required before startup"),
+            "{error}"
+        );
+        assert!(
+            error.contains("20260819_faa_reference_reachability.postgres.sql")
+                || error.contains("20260722_aircraft_reference_catalog.postgres.sql"),
+            "{error}"
+        );
+        assert!(
+            error.contains("PostgreSQL FAA")
+                || error.contains("migration contract marker")
+                || error.contains("clean aircraft identity/reference catalogs"),
+            "{error}"
+        );
+        error
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_faa_reference_startup_attests_exact_objects() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        pool.execute("DROP SCHEMA public CASCADE").await.unwrap();
+        pool.execute("CREATE SCHEMA public").await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        for statement in split_sql_statements(POSTGRES_SCHEMA_SQL) {
+            connection.execute(statement).await.unwrap();
+        }
+        drop(connection);
+        let db = AppDb {
+            backend: DatabaseBackend::Postgres(pool.clone()),
+        };
+        assert!(db.faa_registry_contract_valid().await.unwrap());
+        db.ensure_required_migrations().await.unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references DISABLE TRIGGER \
+             faa_registry_aircraft_references_reachable",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references ENABLE TRIGGER \
+             faa_registry_aircraft_references_reachable",
+        )
+        .await
+        .unwrap();
+
+        pool.execute(
+            "DROP TRIGGER faa_registry_aircraft_references_reachable \
+             ON public.faa_registry_aircraft_references",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER faa_registry_aircraft_references_reachable BEFORE INSERT \
+             ON public.faa_registry_aircraft_references FOR EACH ROW EXECUTE FUNCTION \
+             public.validate_faa_engine_reference_reachability()",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_registry_triggers(&pool).await;
+
+        pool.execute(
+            "CREATE OR REPLACE FUNCTION \
+             public.validate_faa_aircraft_reference_reachability() RETURNS TRIGGER \
+             LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$ \
+             SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_registry_functions(&pool).await;
+
+        pool.execute(
+            "ALTER FUNCTION public.validate_faa_aircraft_reference_reachability() PARALLEL SAFE",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        pool.execute(
+            "ALTER FUNCTION public.validate_faa_aircraft_reference_reachability() PARALLEL UNSAFE",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("CREATE SCHEMA attacker_schema").await.unwrap();
+        pool.execute(
+            "CREATE FUNCTION attacker_schema.validate_faa_aircraft_reference_reachability() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "DROP TRIGGER faa_registry_aircraft_references_reachable \
+             ON public.faa_registry_aircraft_references",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER faa_registry_aircraft_references_reachable BEFORE INSERT \
+             ON public.faa_registry_aircraft_references FOR EACH ROW EXECUTE FUNCTION \
+             attacker_schema.validate_faa_aircraft_reference_reachability()",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_registry_triggers(&pool).await;
+        pool.execute(
+            "ALTER FUNCTION public.validate_faa_snapshot_evidence() \
+             SET search_path = attacker_schema, public",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("triggers or functions"), "{error}");
+        install_faa_registry_functions(&pool).await;
+        pool.execute("DROP SCHEMA attacker_schema CASCADE")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references \
+             RENAME TO faa_registry_aircraft_references_missing",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references_missing \
+             RENAME TO faa_registry_aircraft_references",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("DROP FUNCTION public.validate_faa_engine_reference_reachability() CASCADE")
+            .await
+            .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_registry_functions(&pool).await;
+        install_faa_registry_triggers(&pool).await;
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_snapshots DISABLE TRIGGER \
+             faa_registry_snapshots_require_exact_evidence",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("triggers or functions"), "{error}");
+        pool.execute(
+            "ALTER TABLE public.faa_registry_snapshots ENABLE TRIGGER \
+             faa_registry_snapshots_require_exact_evidence",
+        )
+        .await
+        .unwrap();
+
+        pool.execute(
+            "CREATE OR REPLACE FUNCTION public.validate_faa_coverage() RETURNS TRIGGER \
+             LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$ \
+             SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("triggers or functions"), "{error}");
+        install_faa_registry_functions(&pool).await;
+
+        pool.execute(
+            "CREATE FUNCTION public.unexpected_faa_trigger_function() RETURNS TRIGGER \
+             LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$ \
+             SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER unexpected_faa_trigger BEFORE INSERT \
+             ON public.faa_registry_aircraft FOR EACH ROW EXECUTE FUNCTION \
+             public.unexpected_faa_trigger_function()",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("triggers or functions"), "{error}");
+        pool.execute("DROP TRIGGER unexpected_faa_trigger ON public.faa_registry_aircraft")
+            .await
+            .unwrap();
+        pool.execute("DROP FUNCTION public.unexpected_faa_trigger_function()")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "CREATE INDEX unexpected_faa_index \
+             ON public.faa_registry_engine_references (model_name)",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry indexes"), "{error}");
+        pool.execute("DROP INDEX public.unexpected_faa_index")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT \
+             unexpected_faa_constraint CHECK (length(lookup_status) > 0)",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry constraints"), "{error}");
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage \
+             DROP CONSTRAINT unexpected_faa_constraint",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("DROP INDEX public.idx_faa_registry_coverage_lookup")
+            .await
+            .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry indexes"), "{error}");
+        pool.execute(
+            "CREATE INDEX idx_faa_registry_coverage_lookup \
+             ON public.faa_registry_coverage (n_number, snapshot_id)",
+        )
+        .await
+        .unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage \
+             DROP CONSTRAINT faa_registry_coverage_lookup_status_check",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry constraints"), "{error}");
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT \
+             faa_registry_coverage_lookup_status_check \
+             CHECK (lookup_status IN ('matched', 'absent'))",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("CREATE SCHEMA attacker_schema").await.unwrap();
+        pool.execute(
+            "CREATE TABLE attacker_schema.faa_registry_snapshots \
+             (id BIGINT PRIMARY KEY)",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage DROP CONSTRAINT \
+             faa_registry_coverage_snapshot_id_fkey",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "SET search_path = attacker_schema, public; \
+             ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT \
+             faa_registry_coverage_snapshot_id_fkey FOREIGN KEY (snapshot_id) \
+             REFERENCES faa_registry_snapshots(id) ON DELETE RESTRICT; \
+             RESET search_path",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry foreign keys"), "{error}");
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage DROP CONSTRAINT \
+             faa_registry_coverage_snapshot_id_fkey; \
+             ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT \
+             faa_registry_coverage_snapshot_id_fkey FOREIGN KEY (snapshot_id) \
+             REFERENCES public.faa_registry_snapshots(id) ON DELETE RESTRICT",
+        )
+        .await
+        .unwrap();
+        pool.execute("DROP SCHEMA attacker_schema CASCADE")
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM public.schema_migration_contracts WHERE migration_name = $1")
+            .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        sqlx::query(
+            "INSERT INTO public.schema_migration_contracts \
+             (migration_name, contract_version, contract_fingerprint) VALUES ($1, $2, $3)",
+        )
+        .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
+        .bind(FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION)
+        .bind(FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(db.faa_registry_contract_valid().await.unwrap());
+        db.ensure_required_migrations().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_faa_registry_startup_attests_exact_objects() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        assert!(db.faa_registry_contract_valid().await.unwrap());
+
+        sqlx::query("DELETE FROM schema_migration_contracts WHERE migration_name = ?")
+            .bind(FAA_RECORD_HASH_DOMAIN_MIGRATION)
+            .execute(pool)
+            .await
+            .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit immutable domain"), "{error}");
+        sqlx::query(
+            "INSERT INTO schema_migration_contracts \
+             (migration_name, contract_version, contract_fingerprint) VALUES (?, ?, ?)",
+        )
+        .bind(FAA_RECORD_HASH_DOMAIN_MIGRATION)
+        .bind(FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION)
+        .bind(FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        pool.execute(
+            "CREATE TRIGGER unexpected_faa_trigger BEFORE INSERT \
+             ON faa_registry_aircraft BEGIN SELECT 1; END",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SQLite FAA registry object set"), "{error}");
+        pool.execute("DROP TRIGGER unexpected_faa_trigger")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "CREATE INDEX unexpected_faa_index \
+             ON faa_registry_engine_references(model_name)",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SQLite FAA registry object set"), "{error}");
+        pool.execute("DROP INDEX unexpected_faa_index")
+            .await
+            .unwrap();
+
+        let evidence_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+             AND name = 'faa_registry_snapshots_require_exact_evidence'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        pool.execute("DROP TRIGGER faa_registry_snapshots_require_exact_evidence")
+            .await
+            .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SQLite FAA registry object set"), "{error}");
+        pool.execute(evidence_trigger.as_str()).await.unwrap();
+
+        let coverage_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+             AND name = 'faa_registry_coverage_consistent'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        pool.execute("DROP TRIGGER faa_registry_coverage_consistent")
+            .await
+            .unwrap();
+        pool.execute(
+            "CREATE TRIGGER faa_registry_coverage_consistent BEFORE INSERT \
+             ON faa_registry_coverage BEGIN SELECT 1; END",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SQLite FAA registry trigger `faa_registry_coverage_consistent`"),
+            "{error}"
+        );
+        pool.execute("DROP TRIGGER faa_registry_coverage_consistent")
+            .await
+            .unwrap();
+        pool.execute(coverage_trigger.as_str()).await.unwrap();
+
+        let coverage_index: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' \
+             AND name = 'idx_faa_registry_coverage_lookup'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        pool.execute("DROP INDEX idx_faa_registry_coverage_lookup")
+            .await
+            .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SQLite FAA registry object set"), "{error}");
+        pool.execute(coverage_index.as_str()).await.unwrap();
+
+        let coverage_object_names = [
+            "faa_registry_coverage_consistent",
+            "faa_registry_coverage_immutable_delete",
+            "faa_registry_coverage_immutable_update",
+            "idx_faa_registry_coverage_lookup",
+        ];
+        let mut coverage_objects = Vec::new();
+        for name in coverage_object_names {
+            let sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?")
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            coverage_objects.push(sql);
+        }
+        for name in &coverage_object_names[..3] {
+            pool.execute(format!("DROP TRIGGER {name}").as_str())
+                .await
+                .unwrap();
+        }
+        pool.execute("DROP INDEX idx_faa_registry_coverage_lookup")
+            .await
+            .unwrap();
+        pool.execute("DROP TABLE faa_registry_coverage")
+            .await
+            .unwrap();
+        pool.execute(
+            "CREATE TABLE faa_registry_coverage ( \
+               snapshot_id INTEGER NOT NULL REFERENCES faa_registry_snapshots(id) \
+                 ON DELETE RESTRICT, \
+               n_number TEXT NOT NULL, \
+               lookup_status TEXT NOT NULL, \
+               PRIMARY KEY (snapshot_id, n_number), \
+               CHECK (substr(n_number, 1, 1) = 'N' AND length(n_number) BETWEEN 2 AND 6), \
+               CHECK (lookup_status IN ('matched', 'absent')), \
+               CONSTRAINT unexpected_faa_constraint CHECK (length(lookup_status) > 0) \
+             )",
+        )
+        .await
+        .unwrap();
+        for sql in coverage_objects {
+            pool.execute(sql.as_str()).await.unwrap();
+        }
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("SQLite FAA registry table `faa_registry_coverage`"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_faa_registry_startup_rejects_mismatched_record_hash_domain_rows() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        pool.execute(
+            "INSERT INTO curation_evidence_sources (\
+               source_url, source_title, source_domain, source_tier, \
+               content_sha256, retrieved_at\
+             ) VALUES (\
+               'https://www.faa.gov/registry/corrupt.zip', 'corrupt fixture', \
+               'faa.gov', 'regulator_primary', printf('%064d', 1), '2026-08-20'\
+             )",
+        )
+        .await
+        .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        connection
+            .execute("PRAGMA ignore_check_constraints = ON")
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO faa_registry_snapshots (\
+                   evidence_source_id, snapshot_date, source_url, archive_sha256, \
+                   source_manifest_sha256, target_set_sha256, \
+                   master_member_name, master_member_sha256, \
+                   aircraft_member_name, aircraft_member_sha256, \
+                   engine_member_name, engine_member_sha256, record_hash_domain\
+                 ) SELECT id, '2026-08-20', source_url, content_sha256, \
+                   printf('%064d', 2), printf('%064d', 3), \
+                   'MASTER.txt', printf('%064d', 4), \
+                   'ACFTREF.txt', printf('%064d', 5), \
+                   'ENGINE.txt', printf('%064d', 6), 'wrong-domain' \
+                 FROM curation_evidence_sources WHERE source_title = 'corrupt fixture'",
+            )
+            .await
+            .unwrap();
+        connection
+            .execute("PRAGMA ignore_check_constraints = OFF")
+            .await
+            .unwrap();
+        drop(connection);
+
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FAA record hash domain values"), "{error}");
     }
 
     #[tokio::test]
@@ -4559,11 +6295,18 @@ mod tests {
     }
 
     fn table_columns(schema: &str, table: &str) -> Vec<String> {
-        let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
-        let start = schema
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing {table} in schema"))
-            + marker.len();
+        let unqualified_marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
+        let qualified_marker = format!("CREATE TABLE IF NOT EXISTS public.{table} (");
+        let (marker_start, marker_length) = schema
+            .find(&unqualified_marker)
+            .map(|start| (start, unqualified_marker.len()))
+            .or_else(|| {
+                schema
+                    .find(&qualified_marker)
+                    .map(|start| (start, qualified_marker.len()))
+            })
+            .unwrap_or_else(|| panic!("missing {table} in schema"));
+        let start = marker_start + marker_length;
         let mut depth = 1_i64;
         let mut end = start;
         for (offset, character) in schema[start..].char_indices() {
@@ -6634,6 +8377,77 @@ mod tests {
     }
 
     #[test]
+    fn postgres_faa_provenance_uses_namespace_locked_exact_contracts() {
+        assert_eq!(FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION, 1);
+        for contract_value in [
+            FAA_REFERENCE_REACHABILITY_MIGRATION,
+            FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+        ] {
+            assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
+            assert!(FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL.contains(contract_value));
+        }
+        for function in [
+            "public.validate_faa_snapshot_evidence()",
+            "public.validate_faa_aircraft_reference_reachability()",
+            "public.validate_faa_engine_reference_reachability()",
+            "public.validate_faa_coverage()",
+            "public.preserve_faa_registry_data()",
+        ] {
+            assert!(POSTGRES_SCHEMA_SQL.contains(function));
+            assert!(FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL.contains(function));
+        }
+        for sql in [
+            POSTGRES_SCHEMA_SQL,
+            FAA_REFERENCE_REACHABILITY_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(sql.contains("FROM public.faa_registry_aircraft aircraft"));
+            assert!(sql.contains("SET search_path = pg_catalog"));
+            assert!(!sql.contains("EXECUTE FUNCTION public.validate_faa_reference_reachability()"));
+            assert!(sql.contains("EXECUTE FUNCTION public.validate_faa_snapshot_evidence()"));
+            assert!(sql.contains("EXECUTE FUNCTION public.validate_faa_coverage()"));
+            assert!(sql.contains("EXECUTE FUNCTION public.preserve_faa_registry_data()"));
+        }
+    }
+
+    #[test]
+    fn faa_record_hash_domain_contract_has_backend_parity() {
+        assert_eq!(FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION, 1);
+        for contract_value in [
+            FAA_RECORD_HASH_DOMAIN_MIGRATION,
+            FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT,
+        ] {
+            assert!(SQLITE_SCHEMA_SQL.contains(contract_value));
+            assert!(POSTGRES_SCHEMA_SQL.contains(contract_value));
+            assert!(FAA_RECORD_HASH_DOMAIN_SQLITE_MIGRATION_SQL.contains(contract_value));
+            assert!(FAA_RECORD_HASH_DOMAIN_POSTGRES_MIGRATION_SQL.contains(contract_value));
+        }
+        for sql in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            FAA_RECORD_HASH_DOMAIN_SQLITE_MIGRATION_SQL,
+            FAA_RECORD_HASH_DOMAIN_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(sql.contains("record_hash_domain"));
+            assert!(sql.contains("aircost-faa-master-retained-aircraft-projection-v1"));
+            assert!(sql.contains("ON CONFLICT (migration_name) DO NOTHING"));
+        }
+        for migration in [
+            FAA_RECORD_HASH_DOMAIN_SQLITE_MIGRATION_SQL,
+            FAA_RECORD_HASH_DOMAIN_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(migration.contains("exact"));
+            assert!(migration.contains("archive"));
+            assert!(!migration
+                .to_ascii_lowercase()
+                .contains("update set installed_at"));
+        }
+        assert_eq!(
+            table_columns(SQLITE_SCHEMA_SQL, "faa_registry_snapshots"),
+            table_columns(POSTGRES_SCHEMA_SQL, "faa_registry_snapshots")
+        );
+    }
+
+    #[test]
     fn migration_messages_select_the_backend_specific_script() {
         let sqlite = migration_required_message(
             DatabaseKind::Sqlite,
@@ -6657,6 +8471,11 @@ mod tests {
         let aircraft_reference =
             aircraft_reference_catalog_migration_required_message(DatabaseKind::Sqlite);
         assert!(aircraft_reference.contains("20260722_aircraft_reference_catalog.sqlite.sql"));
+
+        let faa_hash_domain =
+            faa_record_hash_domain_migration_required_message(DatabaseKind::Postgres);
+        assert!(faa_hash_domain.contains("20260820_faa_record_hash_domain.postgres.sql"));
+        assert!(faa_hash_domain.contains("exact release archive"));
 
         let pending_reviews =
             listing_pending_reviews_migration_required_message(DatabaseKind::Postgres);
@@ -6710,5 +8529,11 @@ mod tests {
             avionics_descriptive_consolidation_migration_required_message(DatabaseKind::Postgres);
         assert!(descriptive_consolidation
             .contains("20260808_avionics_descriptive_consolidation.postgres.sql"));
+
+        let faa_reference_reachability =
+            faa_registry_contract_required_message(DatabaseKind::Postgres, "test object");
+        assert!(
+            faa_reference_reachability.contains("20260819_faa_reference_reachability.postgres.sql")
+        );
     }
 }

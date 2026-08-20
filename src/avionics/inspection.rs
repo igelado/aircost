@@ -1608,7 +1608,8 @@ mod tests {
                      archive_sha256, source_manifest_sha256, target_set_sha256,
                      master_member_name, master_member_sha256,
                      aircraft_member_name, aircraft_member_sha256,
-                     engine_member_name, engine_member_sha256
+                     engine_member_name, engine_member_sha256,
+                     record_hash_domain
                    ) SELECT id, '2026-07-22', source_url,
                             '{FAA_ARCHIVE_SHA256}',
                             'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
@@ -1618,7 +1619,8 @@ mod tests {
                             'ACFTREF.txt',
                             'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
                             'ENGINE.txt',
-                            'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+                            'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                            'aircost-faa-master-retained-aircraft-projection-v1'
                      FROM curation_evidence_sources
                      WHERE source_url = 'https://faa.gov/aircraft-registry/test-release.zip'"#,
             ),
