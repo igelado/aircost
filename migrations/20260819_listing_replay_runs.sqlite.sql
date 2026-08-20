@@ -20,7 +20,7 @@ SELECT CASE
     WHERE migration_name = '20260819_listing_replay_runs'
       AND contract_version = 1
       AND contract_fingerprint =
-        '8efc70b938e9937d22ae5532ea19f93ce51cc322b2c99f5a2b52e79212c92c3c'
+        '3a42bf7af89b641ec62cedf520dadc665be97acbc440bb73f438406c2d3e911d'
   ) AND EXISTS (
     SELECT 1 FROM sqlite_schema
     WHERE type = 'table' AND name = 'listing_replay_runs'
@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
     REFERENCES plugin_submissions(id) ON DELETE RESTRICT,
   position INTEGER NOT NULL CHECK (position >= 0),
   expected_rendered_html_sha256 TEXT NOT NULL,
+  extracted_listing_sha256 TEXT,
   extraction_state TEXT NOT NULL DEFAULT 'queued'
     CHECK (extraction_state IN ('queued', 'running', 'succeeded', 'rejected', 'failed')),
   materialization_state TEXT NOT NULL DEFAULT 'blocked'
@@ -96,22 +97,23 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
   terminal_rejection_phase TEXT
     CHECK (terminal_rejection_phase IN ('extraction', 'materialization')),
   terminal_rejection_stage TEXT CHECK (terminal_rejection_stage IN (
-    'capture_admission', 'listing_extraction',
-    'faa_aircraft_admission', 'listing_admission'
+    'capture_admission', 'faa_aircraft_admission'
   )),
   terminal_rejection_reason_code TEXT CHECK (terminal_rejection_reason_code IN (
     'capture_authentication_failed', 'capture_not_found', 'capture_validation_failed',
-    'extraction_rejected', 'checkpoint_missing', 'listing_admission_rejected',
-    'faa_aircraft_admission_rejected', 'missing_registration', 'non_n_registration',
-    'invalid_n_number', 'registry_snapshot_unavailable', 'registration_not_found',
-    'registration_not_covered', 'ambiguous_registration', 'serial_conflict',
-    'registry_aircraft_identity_unavailable', 'aircraft_manufacturer_mismatch',
-    'aircraft_model_mismatch', 'canonical_identity_assignment_missing',
-    'canonical_identity_assignment_mismatch'
+    'missing_registration', 'non_n_registration',
+    'invalid_n_number', 'serial_conflict'
   )),
   last_failure_phase TEXT CHECK (last_failure_phase IN ('extraction', 'materialization')),
   last_failure_reason_code TEXT
-    CHECK (last_failure_reason_code IN ('database_error', 'operation_failed')),
+    CHECK (last_failure_reason_code IN (
+      'database_error', 'operation_failed', 'faa_lookup_failed', 'faa_listing_not_found',
+      'faa_registry_snapshot_unavailable', 'faa_registration_not_found',
+      'faa_registration_not_covered', 'faa_ambiguous_registration',
+      'faa_registry_aircraft_identity_unavailable', 'faa_aircraft_manufacturer_mismatch',
+      'faa_aircraft_model_mismatch', 'faa_canonical_identity_assignment_missing',
+      'faa_canonical_identity_assignment_mismatch'
+    )),
   extraction_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (extraction_attempt_count >= 0),
   materialization_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (materialization_attempt_count >= 0),
   extraction_started_at TEXT,
@@ -125,6 +127,11 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
   CHECK (length(expected_rendered_html_sha256) = 64),
   CHECK (expected_rendered_html_sha256 = lower(expected_rendered_html_sha256)),
   CHECK (expected_rendered_html_sha256 NOT GLOB '*[^0-9a-f]*'),
+  CHECK (extracted_listing_sha256 IS NULL OR (
+    length(extracted_listing_sha256) = 64
+    AND extracted_listing_sha256 = lower(extracted_listing_sha256)
+    AND extracted_listing_sha256 NOT GLOB '*[^0-9a-f]*'
+  )),
   CHECK (
     (terminal_rejection_phase IS NULL AND terminal_rejection_stage IS NULL
       AND terminal_rejection_reason_code IS NULL)
@@ -137,6 +144,7 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
     OR (last_failure_phase IS NOT NULL AND last_failure_reason_code IS NOT NULL)
   ),
   CHECK (resulting_listing_id IS NULL OR materialization_state = 'succeeded'),
+  CHECK ((extraction_state = 'succeeded') = (extracted_listing_sha256 IS NOT NULL)),
   CHECK (extraction_state = 'succeeded' OR materialization_state = 'blocked'),
   CHECK (extraction_state <> 'running' OR extraction_started_at IS NOT NULL),
   CHECK (materialization_state <> 'running' OR materialization_started_at IS NOT NULL)
@@ -149,7 +157,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '8efc70b938e9937d22ae5532ea19f93ce51cc322b2c99f5a2b52e79212c92c3c',
+  '3a42bf7af89b641ec62cedf520dadc665be97acbc440bb73f438406c2d3e911d',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,

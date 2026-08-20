@@ -12,7 +12,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
-use tokio::sync::oneshot;
 
 use super::{validate_trusted_capture_manifest, TrustedCaptureManifest};
 use crate::db::{AppDb, DatabaseBackend};
@@ -177,10 +176,11 @@ struct ItemRow {
     materialization_state: String,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, FromRow)]
 struct ClaimedItem {
     id: i64,
     submission_id: i64,
+    extracted_listing_sha256: Option<String>,
 }
 
 pub async fn replay_captures(
@@ -229,10 +229,10 @@ pub async fn replay_captures(
                                 if reconcile_materialization_domain_state(
                                     db,
                                     run.id,
-                                    submission_id,
-                                    &owner_token,
-                                    state.checkpoint.is_some(),
-                                    state.canonical_listing_id,
+                                submission_id,
+                                &owner_token,
+                                state.checkpoint.as_ref(),
+                                state.canonical_listing_id,
                                 )
                                 .await? =>
                             {
@@ -259,6 +259,15 @@ pub async fn replay_captures(
                                 PluginStoreError::NotFound(_) => "capture_not_found",
                                 PluginStoreError::Validation(_) => "capture_validation_failed",
                                 PluginStoreError::Database(_) => unreachable!(),
+                                PluginStoreError::AircraftAdmission(error) => {
+                                    return Err(ReplayRunError::Validation(error.to_string()));
+                                }
+                                PluginStoreError::AdmissionBlocked(reason) => {
+                                    return Err(ReplayRunError::Validation(format!(
+                                        "replay admission is blocked: {}",
+                                        reason.code()
+                                    )));
+                                }
                             },
                         )
                         .await?
@@ -307,12 +316,23 @@ pub async fn replay_captures(
             let operation = match request.phase {
                 ReplayPhase::Extraction => {
                     if state.checkpoint.is_some() || state.canonical_listing_id.is_some() {
+                        let checkpoint_sha256 = state
+                            .checkpoint
+                            .as_ref()
+                            .map(|checkpoint| checkpoint.extracted_listing_sha256.as_str())
+                            .ok_or_else(|| {
+                                ReplayRunError::Validation(
+                                    "a bound replay capture is missing its extraction checkpoint"
+                                        .to_string(),
+                                )
+                            })?;
                         finish_succeeded(
                             db,
                             run.id,
                             claimed,
                             request.phase,
                             &owner_token,
+                            Some(checkpoint_sha256),
                             state.canonical_listing_id,
                         )
                         .await
@@ -339,13 +359,14 @@ pub async fn replay_captures(
                         })
                         .await?;
                         match result {
-                            Ok(_) => {
+                            Ok(checkpoint) => {
                                 finish_succeeded(
                                     db,
                                     run.id,
                                     claimed,
                                     request.phase,
                                     &owner_token,
+                                    Some(&checkpoint.extracted_listing_sha256),
                                     None,
                                 )
                                 .await
@@ -372,18 +393,18 @@ pub async fn replay_captures(
                             claimed,
                             request.phase,
                             &owner_token,
+                            None,
                             Some(listing_id),
                         )
                         .await
                     } else if state.checkpoint.is_none() {
-                        finish_rejected(
+                        finish_failed(
                             db,
                             run.id,
                             claimed,
                             request.phase,
                             &owner_token,
-                            "listing_extraction",
-                            "checkpoint_missing",
+                            "operation_failed",
                         )
                         .await
                     } else {
@@ -403,6 +424,12 @@ pub async fn replay_captures(
                                 db,
                                 &owner,
                                 submission_id,
+                                claimed.extracted_listing_sha256.as_deref().ok_or_else(|| {
+                                    PluginStoreError::Validation(
+                                        "materialization claim is missing its pinned checkpoint hash"
+                                            .to_string(),
+                                    )
+                                })?,
                                 &extractor,
                             )
                             .await
@@ -416,21 +443,20 @@ pub async fn replay_captures(
                                     claimed,
                                     request.phase,
                                     &owner_token,
+                                    None,
                                     Some(listing.id),
                                 )
                                 .await
                             }
-                            Ok(PluginListingReplayOutcome::Rejected {
-                                stage, reason_code, ..
-                            }) => {
+                            Ok(PluginListingReplayOutcome::Rejected { rejection, .. }) => {
                                 finish_rejected(
                                     db,
                                     run.id,
                                     claimed,
                                     request.phase,
                                     &owner_token,
-                                    stage,
-                                    &reason_code,
+                                    rejection.stage(),
+                                    rejection.code(),
                                 )
                                 .await
                             }
@@ -517,20 +543,26 @@ async fn reconcile_materialization_domain_state(
     run_id: i64,
     submission_id: i64,
     owner_token: &str,
-    has_checkpoint: bool,
+    checkpoint: Option<&crate::plugin::PluginExtractionCheckpoint>,
     listing_id: Option<i64>,
 ) -> ReplayRunResult<bool> {
     if let Some(listing_id) = listing_id {
+        let checkpoint = checkpoint.ok_or_else(|| {
+            ReplayRunError::Validation(
+                "a bound replay capture is missing its extraction checkpoint".to_string(),
+            )
+        })?;
         let sql = db.sql(
             r#"UPDATE listing_replay_run_items
                SET extraction_state = 'succeeded', materialization_state = 'succeeded',
-                   resulting_listing_id = ?,
+                   resulting_listing_id = ?, extracted_listing_sha256 = ?,
                    extraction_completed_at = COALESCE(extraction_completed_at, CURRENT_TIMESTAMP),
                    materialization_completed_at = CURRENT_TIMESTAMP,
                    last_failure_phase = NULL, last_failure_reason_code = NULL,
                    updated_at = CURRENT_TIMESTAMP
                WHERE run_id = ? AND plugin_submission_id = ?
                  AND extraction_state <> 'rejected' AND materialization_state <> 'rejected'
+                 AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
                  AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
                    AND run.status = 'running' AND run.active_phase = 'materialization'
                    AND run.owner_token = ?)"#,
@@ -540,8 +572,10 @@ async fn reconcile_materialization_domain_state(
             &sql,
             &[
                 Bind::I64(listing_id),
+                Bind::Text(&checkpoint.extracted_listing_sha256),
                 Bind::I64(run_id),
                 Bind::I64(submission_id),
+                Bind::Text(&checkpoint.extracted_listing_sha256),
                 Bind::I64(run_id),
                 Bind::Text(owner_token),
             ],
@@ -555,10 +589,11 @@ async fn reconcile_materialization_domain_state(
         }
         return Ok(true);
     }
-    if has_checkpoint {
+    if let Some(checkpoint) = checkpoint {
         let sql = db.sql(
             r#"UPDATE listing_replay_run_items
                SET extraction_state = 'succeeded',
+                   extracted_listing_sha256 = ?,
                    materialization_state = CASE
                      WHEN materialization_state = 'blocked' THEN 'queued'
                      ELSE materialization_state END,
@@ -570,6 +605,7 @@ async fn reconcile_materialization_domain_state(
                    updated_at = CURRENT_TIMESTAMP
                WHERE run_id = ? AND plugin_submission_id = ?
                  AND extraction_state <> 'rejected'
+                 AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
                  AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
                    AND run.status = 'running' AND run.active_phase = 'materialization'
                    AND run.owner_token = ?)"#,
@@ -578,8 +614,10 @@ async fn reconcile_materialization_domain_state(
             db,
             &sql,
             &[
+                Bind::Text(&checkpoint.extracted_listing_sha256),
                 Bind::I64(run_id),
                 Bind::I64(submission_id),
+                Bind::Text(&checkpoint.extracted_listing_sha256),
                 Bind::I64(run_id),
                 Bind::Text(owner_token),
             ],
@@ -604,29 +642,33 @@ async fn with_heartbeat<F, T>(
 where
     F: std::future::Future<Output = T>,
 {
-    let heartbeat_db = db.clone();
-    let heartbeat_token = owner_token.to_string();
-    let (stop_tx, mut stop_rx) = oneshot::channel();
-    let heartbeat = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(HEARTBEAT_INTERVAL) => {
-                    if heartbeat_run(&heartbeat_db, run_id, &heartbeat_token).await? == 0 {
-                        return Err(ReplayRunError::Conflict(
-                            "replay ownership changed while an operation was running".to_string()
-                        ));
-                    }
+    with_heartbeat_interval(db, run_id, owner_token, HEARTBEAT_INTERVAL, operation).await
+}
+
+async fn with_heartbeat_interval<F, T>(
+    db: &AppDb,
+    run_id: i64,
+    owner_token: &str,
+    interval: Duration,
+    operation: F,
+) -> ReplayRunResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(interval) => {
+                if heartbeat_run(db, run_id, owner_token).await? == 0 {
+                    return Err(ReplayRunError::Conflict(
+                        "replay ownership changed while an operation was running".to_string()
+                    ));
                 }
-                _ = &mut stop_rx => return Ok(()),
             }
+            result = &mut operation => return Ok(result),
         }
-    });
-    let result = operation.await;
-    let _ = stop_tx.send(());
-    heartbeat
-        .await
-        .map_err(|error| ReplayRunError::Database(error.to_string()))??;
-    Ok(result)
+    }
 }
 
 fn selected_submission_ids(request: &ReplayCapturesRequest<'_>) -> ReplayRunResult<BTreeSet<i64>> {
@@ -956,7 +998,8 @@ async fn claim_item(
                  AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
                    AND run.status = 'running' AND run.active_phase = 'extraction'
                    AND run.owner_token = ?)
-               RETURNING id"#,
+               RETURNING id, plugin_submission_id AS submission_id,
+                         extracted_listing_sha256"#,
         ),
         ReplayPhase::Materialization => db.sql(
             r#"UPDATE listing_replay_run_items SET materialization_state = 'running',
@@ -971,12 +1014,13 @@ async fn claim_item(
                  AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
                    AND run.status = 'running' AND run.active_phase = 'materialization'
                    AND run.owner_token = ?)
-               RETURNING id"#,
+               RETURNING id, plugin_submission_id AS submission_id,
+                         extracted_listing_sha256"#,
         ),
     };
-    let item_id = match db.backend() {
+    let item = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_scalar(&sql)
+            sqlx::query_as(&sql)
                 .bind(run_id)
                 .bind(submission_id)
                 .bind(run_id)
@@ -985,7 +1029,7 @@ async fn claim_item(
                 .await?
         }
         DatabaseBackend::Postgres(pool) => {
-            sqlx::query_scalar(&sql)
+            sqlx::query_as(&sql)
                 .bind(run_id)
                 .bind(submission_id)
                 .bind(run_id)
@@ -994,7 +1038,7 @@ async fn claim_item(
                 .await?
         }
     };
-    Ok(item_id.map(|id| ClaimedItem { id, submission_id }))
+    Ok(item)
 }
 
 async fn finish_succeeded(
@@ -1003,16 +1047,21 @@ async fn finish_succeeded(
     item: ClaimedItem,
     phase: ReplayPhase,
     owner_token: &str,
+    checkpoint_sha256: Option<&str>,
     listing_id: Option<i64>,
 ) -> ReplayRunResult<()> {
     let sql = match phase {
         ReplayPhase::Extraction => db.sql(
             r#"UPDATE listing_replay_run_items SET extraction_state = 'succeeded',
                  materialization_state = 'queued', extraction_completed_at = CURRENT_TIMESTAMP,
+                 extracted_listing_sha256 = ?,
                  last_failure_phase = NULL, last_failure_reason_code = NULL,
                  updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND run_id = ? AND plugin_submission_id = ?
-                 AND extraction_state = 'running' AND EXISTS (
+                 AND extraction_state = 'running'
+                 AND ? IS NOT NULL
+                 AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
+                 AND EXISTS (
                    SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
                      AND run.status = 'running' AND run.owner_token = ?)"#,
         ),
@@ -1029,18 +1078,24 @@ async fn finish_succeeded(
     };
     let changed = match (db.backend(), phase) {
         (DatabaseBackend::Sqlite(pool), ReplayPhase::Extraction) => sqlx::query(&sql)
+            .bind(checkpoint_sha256)
             .bind(item.id)
             .bind(run_id)
             .bind(item.submission_id)
+            .bind(checkpoint_sha256)
+            .bind(checkpoint_sha256)
             .bind(run_id)
             .bind(owner_token)
             .execute(pool)
             .await?
             .rows_affected(),
         (DatabaseBackend::Postgres(pool), ReplayPhase::Extraction) => sqlx::query(&sql)
+            .bind(checkpoint_sha256)
             .bind(item.id)
             .bind(run_id)
             .bind(item.submission_id)
+            .bind(checkpoint_sha256)
+            .bind(checkpoint_sha256)
             .bind(run_id)
             .bind(owner_token)
             .execute(pool)
@@ -1164,6 +1219,12 @@ async fn finish_capture_admission_error(
             )
             .await
         }
+        PluginStoreError::AdmissionBlocked(reason) => {
+            finish_failed(db, run_id, item, phase, owner_token, reason.code()).await
+        }
+        PluginStoreError::AircraftAdmission(_) => {
+            finish_failed(db, run_id, item, phase, owner_token, "operation_failed").await
+        }
     }
 }
 
@@ -1175,19 +1236,15 @@ async fn finish_operation_error(
     owner_token: &str,
     error: &PluginStoreError,
 ) -> ReplayRunResult<()> {
-    finish_failed(
-        db,
-        run_id,
-        item,
-        phase,
-        owner_token,
-        if matches!(error, PluginStoreError::Database(_)) {
-            "database_error"
-        } else {
-            "operation_failed"
-        },
-    )
-    .await
+    let reason_code = match error {
+        PluginStoreError::Database(_) => "database_error",
+        PluginStoreError::AdmissionBlocked(reason) => reason.code(),
+        PluginStoreError::Validation(_)
+        | PluginStoreError::Permission(_)
+        | PluginStoreError::NotFound(_)
+        | PluginStoreError::AircraftAdmission(_) => "operation_failed",
+    };
+    finish_failed(db, run_id, item, phase, owner_token, reason_code).await
 }
 
 async fn finish_failed(
@@ -1198,6 +1255,7 @@ async fn finish_failed(
     owner_token: &str,
     reason_code: &str,
 ) -> ReplayRunResult<()> {
+    validate_closed_failure(reason_code)?;
     let sql = match phase {
         ReplayPhase::Extraction => db.sql(
             r#"UPDATE listing_replay_run_items SET extraction_state = 'failed',
@@ -1432,37 +1490,43 @@ fn sum_optional_usage(
 }
 
 fn validate_closed_rejection(stage: &str, reason_code: &str) -> ReplayRunResult<()> {
-    const STAGES: &[&str] = &[
-        "capture_admission",
-        "listing_extraction",
-        "faa_aircraft_admission",
-        "listing_admission",
-    ];
+    const STAGES: &[&str] = &["capture_admission", "faa_aircraft_admission"];
     const CODES: &[&str] = &[
         "capture_authentication_failed",
         "capture_not_found",
         "capture_validation_failed",
-        "extraction_rejected",
-        "checkpoint_missing",
-        "listing_admission_rejected",
-        "faa_aircraft_admission_rejected",
         "missing_registration",
         "non_n_registration",
         "invalid_n_number",
-        "registry_snapshot_unavailable",
-        "registration_not_found",
-        "registration_not_covered",
-        "ambiguous_registration",
         "serial_conflict",
-        "registry_aircraft_identity_unavailable",
-        "aircraft_manufacturer_mismatch",
-        "aircraft_model_mismatch",
-        "canonical_identity_assignment_missing",
-        "canonical_identity_assignment_mismatch",
     ];
     if !STAGES.contains(&stage) || !CODES.contains(&reason_code) {
         return Err(ReplayRunError::Validation(
             "replay rejection is outside the closed operational vocabulary".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_closed_failure(reason_code: &str) -> ReplayRunResult<()> {
+    const CODES: &[&str] = &[
+        "database_error",
+        "operation_failed",
+        "faa_lookup_failed",
+        "faa_listing_not_found",
+        "faa_registry_snapshot_unavailable",
+        "faa_registration_not_found",
+        "faa_registration_not_covered",
+        "faa_ambiguous_registration",
+        "faa_registry_aircraft_identity_unavailable",
+        "faa_aircraft_manufacturer_mismatch",
+        "faa_aircraft_model_mismatch",
+        "faa_canonical_identity_assignment_missing",
+        "faa_canonical_identity_assignment_mismatch",
+    ];
+    if !CODES.contains(&reason_code) {
+        return Err(ReplayRunError::Validation(
+            "replay failure is outside the closed operational vocabulary".to_string(),
         ));
     }
     Ok(())
@@ -1596,11 +1660,15 @@ mod tests {
 
     #[test]
     fn rejection_vocabulary_is_closed() {
+        assert!(
+            validate_closed_rejection("faa_aircraft_admission", "missing_registration").is_ok()
+        );
         assert!(validate_closed_rejection(
             "faa_aircraft_admission",
             "canonical_identity_assignment_missing"
         )
-        .is_ok());
+        .is_err());
+        assert!(validate_closed_failure("faa_canonical_identity_assignment_missing").is_ok());
         assert!(validate_closed_rejection("gemini", "raw provider error").is_err());
     }
 
@@ -1820,7 +1888,8 @@ mod tests {
         .unwrap();
         assert_eq!(report.counts.selected, 2);
         assert_eq!(report.counts.blocked, 1);
-        assert_eq!(report.counts.rejected, 1);
+        assert_eq!(report.counts.rejected, 0);
+        assert_eq!(report.counts.failed, 1);
         let first: (String, String, String) = sqlx::query_as(
             "SELECT extraction_state, terminal_rejection_stage, terminal_rejection_reason_code FROM listing_replay_run_items WHERE plugin_submission_id = ?",
         )
@@ -1974,6 +2043,7 @@ mod tests {
                 first,
                 ReplayPhase::Extraction,
                 "owner-one",
+                None,
                 None
             )
             .await,
@@ -2001,6 +2071,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_ownership_loss_promptly_drops_the_inflight_operation() {
+        struct PendingOperation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+        impl std::future::Future for PendingOperation {
+            type Output = ();
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingOperation {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, _, _) = signed_checkpoint(&db).await;
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(&db, run.id, ReplayPhase::Extraction, "owner-one", false)
+            .await
+            .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE listing_replay_runs SET owner_token = 'owner-two' WHERE id = ?")
+            .bind(run.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            with_heartbeat_interval(
+                &db,
+                run.id,
+                "owner-one",
+                Duration::from_millis(5),
+                PendingOperation(dropped.clone()),
+            ),
+        )
+        .await
+        .expect("ownership loss must cancel before the timeout");
+        assert!(matches!(result, Err(ReplayRunError::Conflict(_))));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn a_live_run_excludes_a_competing_manifest() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -2025,7 +2147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn faa_rejection_is_durable_without_raw_reason_text() {
+    async fn faa_setup_gap_is_retryable_without_raw_reason_text() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let (manifest, submission_id, _) = signed_checkpoint(&db).await;
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
@@ -2042,12 +2164,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report.counts.rejected, 1);
+        assert_eq!(report.counts.failed, 1);
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
         };
-        let stored: (String, String, String) = sqlx::query_as(
-            "SELECT materialization_state, terminal_rejection_stage, terminal_rejection_reason_code FROM listing_replay_run_items WHERE plugin_submission_id = ?",
+        let stored: (String, Option<String>, String) = sqlx::query_as(
+            "SELECT materialization_state, terminal_rejection_reason_code, last_failure_reason_code FROM listing_replay_run_items WHERE plugin_submission_id = ?",
         )
         .bind(submission_id)
         .fetch_one(pool)
@@ -2056,9 +2178,9 @@ mod tests {
         assert_eq!(
             stored,
             (
-                "rejected".to_string(),
-                "faa_aircraft_admission".to_string(),
-                "registry_snapshot_unavailable".to_string()
+                "failed".to_string(),
+                None,
+                "faa_registry_snapshot_unavailable".to_string()
             )
         );
     }

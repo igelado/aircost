@@ -2459,6 +2459,9 @@ impl From<ListingStoreError> for ApiError {
             ListingStoreError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
             ListingStoreError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
             ListingStoreError::State(message) => ApiError::new(StatusCode::CONFLICT, message),
+            ListingStoreError::AircraftAdmission(error) => {
+                ApiError::new(StatusCode::CONFLICT, error.to_string())
+            }
             ListingStoreError::Ingestion {
                 listing_id,
                 message,
@@ -2481,6 +2484,13 @@ impl From<PluginStoreError> for ApiError {
             }
             PluginStoreError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
             PluginStoreError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
+            PluginStoreError::AircraftAdmission(error) => {
+                ApiError::new(StatusCode::CONFLICT, error.to_string())
+            }
+            PluginStoreError::AdmissionBlocked(reason) => ApiError::new(
+                StatusCode::CONFLICT,
+                format!("replay admission is blocked: {}", reason.code()),
+            ),
             PluginStoreError::Database(message) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
             }

@@ -67,8 +67,12 @@ All operational commands are dry-run unless `--apply` is supplied.
    aircraft, avionics, review, and finalization workflow in create-only mode, so
    it cannot refresh or repair a preexisting listing. The listing observation
    timestamp is restored from the capture's `submitted_at`. FAA rejection is a
-   typed result and leaves the checkpoint unbound. For a narrow FAA serial
-   correction, listing insertion and checkpoint binding are one transaction.
+   typed result and leaves the checkpoint unbound. Only immutable source-policy
+   outcomes (missing, invalid, or non-N registration and serial conflict) are
+   terminal. Registry lookup failures, unavailable or insufficient snapshots,
+   and missing or mismatched canonical assignments remain retryable. For a
+   narrow FAA serial correction, listing insertion and checkpoint binding are
+   one transaction.
    A later failure retains that private receipt-gated pair, and an exact retry
    deterministically resumes child projections, writes one correction receipt,
    and finalizes the same listing. Uncorrected replay failures still compensate
@@ -91,14 +95,18 @@ invocation without changing the manifest-backed run membership. Apply records
 independent extraction and materialization states, attempts, and timestamps.
 Before any provider-backed retry, it derives an already-committed checkpoint or
 capture binding from the authoritative submission and completes the ledger
-without repeating that work.
+without repeating that work. Each successful extraction also pins the exact
+checkpoint SHA-256 in the run member; materialization refuses a different
+payload even when the signed capture itself is unchanged.
 
 Only one replay run may own mutations at a time. Its opaque owner token is
 heartbeated during long operations and fences every item completion. There is
 no automatic time-only takeover. If a worker was killed, first confirm it is no
 longer running; after one hour without a heartbeat, repeat the apply command
 with `--recover-stale`. The displaced token cannot commit a later ledger
-transition.
+transition or replace the first committed extraction checkpoint. Loss of the
+heartbeat/owner lease cancels the in-flight provider operation promptly; resume
+then reconciles any authoritative checkpoint or listing commit before retrying.
 
 Each report includes `gemini_usage` with the explicit
 `manifest_phase_cumulative` scope. A stable correlation ID is derived from the
@@ -112,8 +120,10 @@ instead of losing durable attribution.
 
 The ledger stores no HTML, extraction JSON, Gemini response, or raw rejection
 message. Terminal rejection stage and reason use a closed vocabulary; FAA
-admission failures retain the stable FAA policy reason code. Retryable database
-or operation failures remain distinct from terminal rejection.
+source-policy rejections retain a stable policy reason code. Transient FAA
+lookup and mutable catalog/snapshot readiness failures use a separate closed
+retry-failure vocabulary; database and other operation failures likewise remain
+distinct from terminal rejection.
 
 ## Avionics terminal state
 

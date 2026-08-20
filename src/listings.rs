@@ -121,6 +121,7 @@ pub enum ListingStoreError {
     NotFound(String),
     Permission(String),
     State(String),
+    AircraftAdmission(AircraftAdmissionError),
     Ingestion { listing_id: i64, message: String },
     Database(String),
 }
@@ -133,6 +134,7 @@ impl fmt::Display for ListingStoreError {
             | ListingStoreError::Permission(message)
             | ListingStoreError::State(message)
             | ListingStoreError::Database(message) => write!(formatter, "{message}"),
+            ListingStoreError::AircraftAdmission(error) => write!(formatter, "{error}"),
             ListingStoreError::Ingestion {
                 listing_id,
                 message,
@@ -842,12 +844,7 @@ fn emit_listing_progress(progress: Option<&ListingProgressSender>, stage: &str, 
 }
 
 fn listing_admission_error(error: AircraftAdmissionError) -> ListingStoreError {
-    let message = error.to_string();
-    match error {
-        AircraftAdmissionError::Rejected { .. } => ListingStoreError::Validation(message),
-        AircraftAdmissionError::LookupFailed { .. }
-        | AircraftAdmissionError::ListingNotFound { .. } => ListingStoreError::State(message),
-    }
+    ListingStoreError::AircraftAdmission(error)
 }
 
 pub async fn list_listings(db: &AppDb, user_id: i64) -> StoreResult<Vec<SaleListing>> {
@@ -3751,6 +3748,7 @@ async fn quarantine_after_error<T>(
     error: ListingStoreError,
 ) -> StoreResult<T> {
     let message = error.to_string();
+    let preserves_admission = matches!(error, ListingStoreError::AircraftAdmission(_));
     execute_query!(
         db,
         r#"
@@ -3778,10 +3776,14 @@ async fn quarantine_after_error<T>(
         message.as_str(),
         listing_id
     )?;
-    Err(ListingStoreError::Ingestion {
-        listing_id,
-        message,
-    })
+    if preserves_admission {
+        Err(error)
+    } else {
+        Err(ListingStoreError::Ingestion {
+            listing_id,
+            message,
+        })
+    }
 }
 
 async fn retain_receipt_gate_or_quarantine<T>(
@@ -3791,10 +3793,14 @@ async fn retain_receipt_gate_or_quarantine<T>(
     preserve_source_identity_receipt_gate: bool,
 ) -> StoreResult<T> {
     if preserve_source_identity_receipt_gate {
-        return Err(ListingStoreError::Ingestion {
-            listing_id,
-            message: error.to_string(),
-        });
+        return if matches!(error, ListingStoreError::AircraftAdmission(_)) {
+            Err(error)
+        } else {
+            Err(ListingStoreError::Ingestion {
+                listing_id,
+                message: error.to_string(),
+            })
+        };
     }
     quarantine_after_error(db, listing_id, error).await
 }
@@ -4765,7 +4771,8 @@ mod tests {
     use serde_json::json;
 
     use crate::aircraft::faa::{
-        require_listing_faa_admission, store_release, ReleaseFixtureBuilder, ReleaseMetadata,
+        require_listing_faa_admission, store_release, AircraftAdmissionError, BlockReason,
+        ReleaseFixtureBuilder, ReleaseMetadata,
     };
     use crate::avionics::catalog::{
         ApprovedAvionicsIdentity, AvionicsIdentityOutcome, CatalogError,
@@ -6165,7 +6172,14 @@ mod tests {
         let error = super::create_listing(&db, user.id, &preview, None, None)
             .await
             .expect_err("non-N registration must fail before model-assisted work");
-        assert!(matches!(error, super::ListingStoreError::Validation(_)));
+        assert!(matches!(
+            error,
+            super::ListingStoreError::AircraftAdmission(AircraftAdmissionError::Rejected {
+                listing_id: None,
+                reason: BlockReason::NonNRegistration,
+                ..
+            })
+        ));
         assert!(error.to_string().contains("non_n_registration"));
         assert_eq!(
             query_scalar_one!(
@@ -7623,12 +7637,11 @@ mod tests {
             .expect_err("raw FAA rejection must remain an ingestion failure");
         assert!(matches!(
             error,
-            super::ListingStoreError::Ingestion {
-                listing_id: failed_listing_id,
-                ref message,
-            } if failed_listing_id == listing_id
-                && message.contains("FAA aircraft admission rejected")
-                && message.contains("missing_registration")
+            super::ListingStoreError::AircraftAdmission(AircraftAdmissionError::Rejected {
+                listing_id: Some(failed_listing_id),
+                reason: BlockReason::MissingRegistration,
+                ..
+            }) if failed_listing_id == listing_id
         ));
     }
 
@@ -7984,15 +7997,14 @@ mod tests {
         let error = super::finalize_reviewed_listing_ingestion(&db, listing_id, None, None)
             .await
             .expect_err("a reviewed listing without FAA admission must not be published");
-        let super::ListingStoreError::Ingestion {
-            listing_id: failed_listing_id,
-            message,
-        } = error
-        else {
-            panic!("expected an ingestion error")
-        };
-        assert_eq!(failed_listing_id, listing_id);
-        assert!(message.contains("FAA aircraft admission rejected"));
+        assert!(matches!(
+            error,
+            super::ListingStoreError::AircraftAdmission(AircraftAdmissionError::Rejected {
+                listing_id: Some(failed_listing_id),
+                reason: BlockReason::MissingRegistration,
+                ..
+            }) if failed_listing_id == listing_id
+        ));
 
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects sqlite")

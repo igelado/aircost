@@ -128,16 +128,21 @@ Coordinate manifest-backed clean replay without copying capture or provider
 payloads. A run pins the trusted-manifest version, SHA-256, and member count and
 holds an owner-token heartbeat while active. Each unique run/submission member
 stores the expected capture SHA-256, independent typed extraction and
-materialization state, attempts/timestamps, an optional resulting listing ID,
-and closed terminal rejection or retry-failure codes. A partial unique index
+materialization state, the exact successful extraction-checkpoint SHA-256,
+attempts/timestamps, an optional resulting listing ID, and closed terminal
+rejection or retry-failure codes. A partial unique index
 permits one active replay owner across processes. Explicit stale recovery
-fences the prior token; checkpoint and binding state are re-derived from
-`plugin_submissions` before a provider-backed retry. The optional resulting
+fences the prior token; loss of ownership cancels the in-flight operation, and
+checkpoint and binding state are re-derived from `plugin_submissions` before a
+provider-backed retry. Checkpoint storage is first-writer immutable, and
+materialization compare-and-sets against the member's pinned checkpoint hash.
+The optional resulting
 listing foreign key uses `ON DELETE SET NULL`, so this operational history does
-not prevent ordinary listing deletion. Startup structurally attests the
-running-only unique fence, the ordered phase index, and both run/member
-uniqueness constraints on SQLite and PostgreSQL; same-name weakened indexes do
-not satisfy the migration contract.
+not prevent ordinary listing deletion. Startup attests both complete replay
+table definitions on SQLite and the exact PostgreSQL column/type/nullability/
+default/identity, primary-key, unique, foreign-key/delete-action, check-
+vocabulary/hash, and index contracts. Same-name objects with weakened columns,
+constraints, or indexes do not satisfy the migration contract.
 
 `gemini_api_usage`
 

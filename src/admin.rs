@@ -178,10 +178,13 @@ async fn main() -> Result<()> {
             let owner = plugin_submission_owner(&db, submission_id).await?;
             if apply {
                 let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
+                let checkpoint =
+                    inspect_plugin_submission_extraction(&db, owner.id, submission_id).await?;
                 let outcome = materialize_plugin_submission_checkpoint(
                     &db,
                     &owner,
                     submission_id,
+                    &checkpoint.extracted_listing_sha256,
                     &extractor,
                 )
                 .await?;
