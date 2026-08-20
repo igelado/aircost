@@ -37,7 +37,7 @@ SELECT CASE WHEN EXISTS (
     AND (
       contract_version <> 1
       OR contract_fingerprint <>
-        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
+        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
     )
 ) THEN 0 ELSE 1 END;
 DROP TABLE reference_catalog_cutover_contract_preflight;
@@ -2618,9 +2618,9 @@ CREATE TABLE IF NOT EXISTS listing_verification_run_items (
     REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
   position INTEGER NOT NULL CHECK (position >= 0),
   status TEXT NOT NULL DEFAULT 'queued'
-    CHECK (status IN (
+    CONSTRAINT listing_verification_run_items_status_check CHECK (status IN (
       'queued', 'running', 'verified', 'pending_review',
-      'pending_reference', 'blocked', 'failed', 'cancelled'
+      'blocked', 'failed', 'cancelled'
     )),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   lease_token TEXT,
@@ -2646,11 +2646,11 @@ CREATE TABLE IF NOT EXISTS listing_verification_run_items (
       AND lease_token IS NULL
       AND lease_expires_at_epoch_seconds IS NULL)
   ),
-  CHECK (
+  CONSTRAINT listing_verification_run_items_completion_check CHECK (
     (status IN ('queued', 'running') AND completed_at IS NULL)
     OR
     (status IN (
-      'verified', 'pending_review', 'pending_reference',
+      'verified', 'pending_review',
       'blocked', 'failed', 'cancelled'
     ) AND completed_at IS NOT NULL)
   ),
@@ -2662,9 +2662,9 @@ CREATE TABLE IF NOT EXISTS listing_verification_run_items (
       AND json_type(outcome_json) = 'object'
     )
   ),
-  CHECK (
+  CONSTRAINT listing_verification_run_items_outcome_required_check CHECK (
     status NOT IN (
-      'verified', 'pending_review', 'pending_reference', 'blocked'
+      'verified', 'pending_review', 'blocked'
     )
     OR outcome_json IS NOT NULL
   ),
@@ -4592,7 +4592,7 @@ CREATE TABLE IF NOT EXISTS aircraft_reference_applicability_scopes (
       AND aircraft_serial_number_scheme_id IS NOT NULL
       AND serial_from_display IS NOT NULL AND serial_to_display IS NOT NULL
       AND serial_from_sort_key IS NOT NULL AND serial_to_sort_key IS NOT NULL
-      AND serial_from_sort_key COLLATE BINARY <= serial_to_sort_key COLLATE BINARY)
+      AND serial_from_sort_key <= serial_to_sort_key)
   ),
   UNIQUE (
     aircraft_reference_configuration_version_id, aircraft_market_id,
@@ -9458,7 +9458,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647',
+  '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

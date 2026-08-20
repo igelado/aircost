@@ -554,8 +554,9 @@ itself.
 One run processes its listings serially while exposing queued, running, and
 terminal item counts. The UI polls with request-sequence guards, shows the
 current listing and terminal result of every item, and can request a stop after
-the current listing. Verified items, residual manual reviews, factory-reference
-work, blocked items, failures, and cancelled items remain distinct. A manual
+the current listing. Verified items, residual manual reviews, blocked items,
+failures, and cancelled items remain distinct. Factory-reference readiness is
+displayed independently from the verification-run outcome. A manual
 review link is shown only after a provider-free refresh confirms that the
 listing still has a current pending review.
 
@@ -567,19 +568,17 @@ curation; verified-local identities and successful closed-context candidate
 adjudications do not incur that request. They also include one request for each
 otherwise-valid current-schema generic label evaluated before terminal invalid
 retention; those observations never proceed to grounding from that path.
-Deterministically FAA-rejected
-aircraft and reference-only listings remain visible but are not selectable for
-another automatic identity run. `GEMINI_API_KEY` enables extraction and
+Deterministically FAA-rejected aircraft remain visible but are not selectable
+for another automatic identity run. A pending factory reference never blocks
+automatic listing verification. `GEMINI_API_KEY` enables extraction and
 curation; `FAA_DRS_API_KEY` additionally enables unresolved aircraft grounding.
 Deterministic FAA/catalog reuse still works without paid calls; unresolved or
 uncertain observations remain in review rather than being auto-approved.
 When aircraft and avionics review is complete but valuation-grade factory
-reference data is not yet published, the response status is
-`pending_reference`. Its finalization stage uses
-`reason_code: factory_reference_pending`; the listing remains `incomplete` and
-unverified, but the result is terminal for the manual review queue and has no
-aircraft or avionics focus tab. Preflight and preview derive this state from
-local reference rows without Gemini.
+reference data is not yet published, the listing can still be `verified` and
+`ready`; its independent `reference.status` is `pending_reference`. Preflight
+and preview derive this display-only valuation gap from local reference rows
+without Gemini.
 
 The Review page opens on a provider-free **Pipeline** view. It follows the
 numeric `resume_after_listing_id` checkpoint from the verification preflight
@@ -588,8 +587,8 @@ identity review is complete but factory reference data remains pending. The
 table keeps aircraft, avionics, and reference status separate, shows whether
 Gemini is expected or may be needed after local checks, and exposes manual
 review only when the response's listing context explicitly reports a current
-pending review. Reference-only rows therefore remain visible without a
-misleading review action.
+pending review. Reference-pending rows remain visible and can still be selected
+when automatic identity or listing-readiness work remains.
 
 The Pipeline overview translates the current preflight stages into four
 operator-facing backlog categories without making provider calls:

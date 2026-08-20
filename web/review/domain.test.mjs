@@ -240,25 +240,14 @@ test("describes manual resolution from the returned listing state", () => {
     {
       kind: "verified",
       label: "Listing 23 verified",
-      detail: "The review and valuation-readiness checks are complete.",
+      detail: "The aircraft identity and listing review checks are complete.",
       listingId: 23,
-      terminal: true,
-    },
-  );
-  assert.deepEqual(
-    describeResolvedListingOutcome({
-      listing: { id: 24, ingestion_state: "incomplete", is_verified: false },
-    }, 24),
-    {
-      kind: "pending_reference",
-      label: "Listing 24 review complete; factory reference pending before valuation",
-      detail: "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.",
-      listingId: 24,
       terminal: true,
     },
   );
   for (const payload of [
     {},
+    { listing: { id: 24, ingestion_state: "incomplete", is_verified: false } },
     { listing: { id: 24, ingestion_state: "quarantined", is_verified: false } },
     { listing: { id: 25, ingestion_state: "ready", is_verified: true } },
   ]) {

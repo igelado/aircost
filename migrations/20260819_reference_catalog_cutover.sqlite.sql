@@ -14,7 +14,7 @@ SELECT CASE WHEN EXISTS (
     AND (
       contract_version <> 1
       OR contract_fingerprint <>
-        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
+        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
     )
 ) OR (
   EXISTS (
@@ -22,7 +22,7 @@ SELECT CASE WHEN EXISTS (
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
+        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
   )
   AND (
     (SELECT count(*) FROM sqlite_schema
@@ -126,6 +126,27 @@ SELECT CASE WHEN EXISTS (
           ) exact_object
           ORDER BY type, name
         )) <> '9ef50133da8e63ad020fb3fc74ec3c66230f200616783315e96cf6dd9912acb1'
+    OR (SELECT count(*) FROM sqlite_schema
+        WHERE (type = 'table' AND name = 'listing_verification_run_items')
+           OR (type IN ('index', 'trigger')
+               AND tbl_name = 'listing_verification_run_items')) <> 6
+    OR (SELECT lower(hex(sha3(group_concat(
+          type || ':' || name || ':' || normalized_sql, '|'
+        ), 256)))
+        FROM (
+          SELECT type, name, lower(replace(replace(replace(replace(
+            sql, char(9), ''
+          ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
+          FROM sqlite_schema
+          WHERE (
+            type = 'table' AND name = 'listing_verification_run_items'
+          ) OR (
+            type IN ('index', 'trigger')
+            AND tbl_name = 'listing_verification_run_items'
+            AND sql IS NOT NULL
+          )
+          ORDER BY type, name
+        )) <> 'dab93c6d4c1d7f80e7297e528419ee99a0d6b5e1f9ad971bc4155ddd3f418e81'
     OR EXISTS (
       SELECT 1 FROM sqlite_schema
       WHERE type = 'table' AND name IN (
@@ -141,6 +162,167 @@ SELECT CASE WHEN EXISTS (
   )
 ) THEN 0 ELSE 1 END;
 DROP TABLE reference_catalog_cutover_rerun_preflight;
+
+-- A marker-absent upgrade may rebuild the historical run-item table only from
+-- its exact owned schema. Unexpected constraints, indexes, or triggers are a
+-- conflict to investigate, never objects for this migration to erase.
+CREATE TEMP TABLE reference_catalog_cutover_run_item_preflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO reference_catalog_cutover_run_item_preflight (valid)
+SELECT CASE WHEN NOT EXISTS (
+  SELECT 1 FROM schema_migration_contracts
+  WHERE migration_name = '20260819_reference_catalog_cutover'
+) AND (
+  (SELECT count(*) FROM sqlite_schema
+   WHERE (type = 'table' AND name = 'listing_verification_run_items')
+      OR (type IN ('index', 'trigger')
+          AND tbl_name = 'listing_verification_run_items')) <> 6
+  OR (SELECT lower(hex(sha3(group_concat(
+        type || ':' || name || ':' || normalized_sql, '|'
+      ), 256)))
+      FROM (
+        SELECT type, name, lower(replace(replace(replace(replace(
+          sql, char(9), ''
+        ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
+        FROM sqlite_schema
+        WHERE (
+          type = 'table' AND name = 'listing_verification_run_items'
+        ) OR (
+          type IN ('index', 'trigger')
+          AND tbl_name = 'listing_verification_run_items'
+          AND sql IS NOT NULL
+        )
+        ORDER BY type, name
+      )) <> '9995284c615eea7e025a34ee4f7e6fb24fc5f7e9c40414cb158879d6f227b00f'
+) THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_cutover_run_item_preflight;
+
+-- Reference readiness is independent from listing verification. Rewrite the
+-- obsolete terminal run-item outcome before tightening the durable queue
+-- contract. It is not evidence that the listing passed verification: preserve
+-- the incomplete listing state and nested reference stage, and require a new
+-- run to determine the current outcome.
+CREATE TEMP TABLE reference_catalog_cutover_run_item_sequence (
+  sequence_value INTEGER NOT NULL
+);
+INSERT INTO reference_catalog_cutover_run_item_sequence (sequence_value)
+SELECT COALESCE((
+  SELECT seq FROM sqlite_sequence
+  WHERE name = 'listing_verification_run_items'
+), 0);
+
+ALTER TABLE listing_verification_run_items
+  RENAME TO reference_catalog_cutover_legacy_run_items;
+
+CREATE TABLE listing_verification_run_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL
+    REFERENCES listing_verification_runs(id) ON DELETE CASCADE,
+  listing_id INTEGER NOT NULL
+    REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  status TEXT NOT NULL DEFAULT 'queued'
+    CONSTRAINT listing_verification_run_items_status_check CHECK (status IN (
+      'queued', 'running', 'verified', 'pending_review',
+      'blocked', 'failed', 'cancelled'
+    )),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  lease_token TEXT,
+  lease_expires_at_epoch_seconds INTEGER,
+  outcome_json TEXT,
+  reason_code TEXT,
+  reason TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  completed_at TEXT,
+  UNIQUE (run_id, position),
+  UNIQUE (run_id, listing_id),
+  CHECK (lease_token IS NULL OR length(trim(lease_token)) BETWEEN 1 AND 200),
+  CHECK (
+    (status = 'running'
+      AND lease_token IS NOT NULL
+      AND lease_expires_at_epoch_seconds IS NOT NULL
+      AND started_at IS NOT NULL
+      AND completed_at IS NULL)
+    OR
+    (status <> 'running'
+      AND lease_token IS NULL
+      AND lease_expires_at_epoch_seconds IS NULL)
+  ),
+  CONSTRAINT listing_verification_run_items_completion_check CHECK (
+    (status IN ('queued', 'running') AND completed_at IS NULL)
+    OR
+    (status IN (
+      'verified', 'pending_review',
+      'blocked', 'failed', 'cancelled'
+    ) AND completed_at IS NOT NULL)
+  ),
+  CHECK (
+    outcome_json IS NULL
+    OR (
+      length(outcome_json) BETWEEN 2 AND 65536
+      AND json_valid(outcome_json)
+      AND json_type(outcome_json) = 'object'
+    )
+  ),
+  CONSTRAINT listing_verification_run_items_outcome_required_check CHECK (
+    status NOT IN (
+      'verified', 'pending_review', 'blocked'
+    )
+    OR outcome_json IS NOT NULL
+  ),
+  CHECK (reason_code IS NULL OR length(trim(reason_code)) BETWEEN 1 AND 100),
+  CHECK (reason IS NULL OR length(trim(reason)) BETWEEN 1 AND 2000)
+);
+
+INSERT INTO listing_verification_run_items (
+  id, run_id, listing_id, position, status, attempt_count, lease_token,
+  lease_expires_at_epoch_seconds, outcome_json, reason_code, reason,
+  created_at, updated_at, started_at, completed_at
+)
+SELECT
+  id, run_id, listing_id, position,
+  CASE status WHEN 'pending_reference' THEN 'blocked' ELSE status END,
+  attempt_count, lease_token, lease_expires_at_epoch_seconds,
+  CASE status WHEN 'pending_reference' THEN json_set(
+    outcome_json,
+    '$.status', 'blocked',
+    '$.finalization.status', 'not_attempted'
+  ) ELSE outcome_json END,
+  CASE status WHEN 'pending_reference' THEN
+    'legacy_reference_gate_removed' ELSE reason_code END,
+  CASE status WHEN 'pending_reference' THEN
+    'Historical reference gating was removed; run verification again.'
+    ELSE reason END,
+  created_at, updated_at, started_at, completed_at
+FROM reference_catalog_cutover_legacy_run_items;
+
+DROP TABLE reference_catalog_cutover_legacy_run_items;
+UPDATE sqlite_sequence
+SET seq = MAX(seq, (
+  SELECT sequence_value FROM reference_catalog_cutover_run_item_sequence
+))
+WHERE name = 'listing_verification_run_items';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'listing_verification_run_items', sequence_value
+FROM reference_catalog_cutover_run_item_sequence
+WHERE sequence_value > 0
+  AND NOT EXISTS (
+    SELECT 1 FROM sqlite_sequence
+    WHERE name = 'listing_verification_run_items'
+  );
+DROP TABLE reference_catalog_cutover_run_item_sequence;
+
+CREATE UNIQUE INDEX idx_listing_verification_run_items_one_active_listing
+  ON listing_verification_run_items (listing_id)
+  WHERE status IN ('queued', 'running');
+CREATE UNIQUE INDEX idx_listing_verification_run_items_one_running_per_run
+  ON listing_verification_run_items (run_id)
+  WHERE status = 'running';
+CREATE INDEX idx_listing_verification_run_items_claim
+  ON listing_verification_run_items (run_id, status, position, id);
 
 DROP VIEW IF EXISTS aircraft_reference_serial_key_errors;
 CREATE VIEW aircraft_reference_serial_key_errors AS
@@ -796,7 +978,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647', CURRENT_TIMESTAMP
+  '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

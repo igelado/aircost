@@ -377,8 +377,8 @@ pub async fn listing_reference_status(
             JOIN aircraft_reference_configurations configuration
               ON configuration.id = version.aircraft_reference_configuration_id
             WHERE configuration.aircraft_designation_id = ?
-              AND configuration.aircraft_generation_id IS ?
-              AND configuration.tier_package_id IS ?
+              AND configuration.aircraft_generation_id IS NOT DISTINCT FROM ?
+              AND configuration.tier_package_id IS NOT DISTINCT FROM ?
               AND version.model_year = ?
               AND version.publication_state = 'building'
             "#,
@@ -470,8 +470,8 @@ pub async fn listing_reference_status(
           ON scope.aircraft_reference_configuration_version_id = version.id
         JOIN aircraft_markets market ON market.id = scope.aircraft_market_id
         WHERE configuration.aircraft_designation_id = ?
-          AND configuration.aircraft_generation_id IS ?
-          AND configuration.tier_package_id IS ?
+          AND configuration.aircraft_generation_id IS NOT DISTINCT FROM ?
+          AND configuration.tier_package_id IS NOT DISTINCT FROM ?
           AND version.model_year = ?
           AND version.publication_state = 'published'
           AND market.code IN ('GLOBAL', 'US')
@@ -542,9 +542,11 @@ pub async fn listing_reference_status(
            ORDER BY price.id LIMIT 1) AS price_reference_year,
           (SELECT COUNT(*) FROM aircraft_reference_avionics fact
            WHERE fact.aircraft_reference_configuration_version_id = version.id) AS avionics_count,
-          (SELECT COALESCE(SUM(fact.quantity), 0) FROM aircraft_reference_engines fact
+          (SELECT CAST(COALESCE(SUM(fact.quantity), 0) AS BIGINT)
+           FROM aircraft_reference_engines fact
            WHERE fact.aircraft_reference_configuration_version_id = version.id) AS engine_count,
-          (SELECT COALESCE(SUM(fact.quantity), 0) FROM aircraft_reference_propellers fact
+          (SELECT CAST(COALESCE(SUM(fact.quantity), 0) AS BIGINT)
+           FROM aircraft_reference_propellers fact
            WHERE fact.aircraft_reference_configuration_version_id = version.id) AS propeller_count,
           (SELECT COUNT(*) FROM aircraft_reference_features fact
            WHERE fact.aircraft_reference_configuration_version_id = version.id) AS feature_count,
@@ -827,8 +829,8 @@ async fn assemble_reference_version(
         SELECT id FROM aircraft_reference_configurations
         WHERE aircraft_model_family_id = ?
           AND aircraft_designation_id = ?
-          AND aircraft_generation_id IS ?
-          AND tier_package_id IS ?
+          AND aircraft_generation_id IS NOT DISTINCT FROM ?
+          AND tier_package_id IS NOT DISTINCT FROM ?
         "#,
     );
     let insert_configuration = db.sql(
@@ -2043,6 +2045,256 @@ mod tests {
         assert_eq!(
             rejected_count, 0,
             "failed correction must roll back as a unit"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_publishes_and_selects_null_and_non_null_configuration_dimensions() {
+        use sqlx::postgres::PgPoolOptions;
+
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../../../schema/postgres.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../tests/schema/aircraft_reference_catalog.postgres.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let db = AppDb::connect(&database_url).await.unwrap();
+
+        let null_configuration_decision: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_decisions (
+              resolution_case_id, entity_kind, decision_action, decision_status,
+              decision_payload_json, deterministic_validation_json,
+              deterministic_validation_passed, rationale, decided_at
+            ) VALUES (1, 'reference_configuration', 'approve_new', 'approved',
+              '{}', '{}', TRUE, 'null-dimension configuration', '2026-08-20')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let null_profile_decision: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_decisions (
+              resolution_case_id, entity_kind, decision_action, decision_status,
+              decision_payload_json, deterministic_validation_json,
+              deterministic_validation_passed, rationale, decided_at
+            ) VALUES (1, 'reference_profile', 'approve_new', 'approved',
+              '{}', '{}', TRUE, 'null-dimension profile', '2026-08-20')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let non_null_profile_decision: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_decisions (
+              resolution_case_id, entity_kind, decision_action, decision_status,
+              decision_payload_json, deterministic_validation_json,
+              deterministic_validation_passed, rationale, decided_at
+            ) VALUES (1, 'reference_profile', 'approve_new', 'approved',
+              '{}', '{}', TRUE, 'non-null-dimension profile', '2026-08-20')
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        for decision_id in [
+            null_configuration_decision,
+            null_profile_decision,
+            non_null_profile_decision,
+        ] {
+            sqlx::query(
+                "INSERT INTO aircraft_identity_decision_claims \
+                 (decision_id, evidence_claim_id, evidence_role) \
+                 VALUES ($1, 1, 'identity')",
+            )
+            .bind(decision_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let draft = |model_year,
+                     generation_id,
+                     tier_package_id,
+                     configuration_decision,
+                     profile_decision,
+                     display_name: &str| ApprovedReferenceVersionDraft {
+            identity: ReferenceConfigurationIdentityDraft {
+                aircraft_model_family_id: 1,
+                aircraft_designation_id: 1,
+                aircraft_generation_id: generation_id,
+                tier_package_id,
+                display_name: display_name.to_string(),
+                approval_decision_id: configuration_decision,
+            },
+            model_year,
+            revision: 1,
+            supersedes_version_id: None,
+            profile_approval_decision_id: profile_decision,
+            applicability: vec![ReferenceApplicabilityDraft {
+                aircraft_market_id: 1,
+                applies_to_all_serials: true,
+                aircraft_serial_number_scheme_id: None,
+                serial_prefix: None,
+                serial_from_display: None,
+                serial_to_display: None,
+                evidence_claim_id: 2,
+            }],
+            price: ReferencePriceDraft {
+                direct_cited_amount_usd: 800_000.0,
+                direct_cited_nominal_dollar_year: model_year,
+                evidence_claim_id: 3,
+            },
+            dollar_normalization: None,
+            avionics: vec![],
+            engines: vec![ReferenceComponentDraft {
+                catalog_id: 1,
+                quantity: 1,
+                included_in_tier: tier_package_id.is_some(),
+                evidence_claim_id: 4,
+            }],
+            propellers: vec![ReferenceComponentDraft {
+                catalog_id: 1,
+                quantity: 1,
+                included_in_tier: tier_package_id.is_some(),
+                evidence_claim_id: 4,
+            }],
+            features: vec![],
+            avionics_set_evidence_claim_id: 4,
+            engines_set_evidence_claim_id: 4,
+            propellers_set_evidence_claim_id: 4,
+            features_set_evidence_claim_id: 4,
+        };
+
+        let non_null_ids = assemble_and_publish_reference_version(
+            &db,
+            &draft(
+                2024,
+                Some(1),
+                Some(1),
+                8,
+                non_null_profile_decision,
+                "SR22 G6 GTS",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(non_null_ids.configuration_id, 1);
+        let null_ids = assemble_and_publish_reference_version(
+            &db,
+            &draft(
+                2023,
+                None,
+                None,
+                null_configuration_decision,
+                null_profile_decision,
+                "SR22 base",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_ne!(null_ids.configuration_id, non_null_ids.configuration_id);
+
+        sqlx::raw_sql(
+            r#"
+            SET session_replication_role = replica;
+            INSERT INTO curation_evidence_sources (
+              source_url, source_title, source_domain, source_tier, retrieved_at
+            ) VALUES (
+              'https://www.faa.gov/test/reference-nullness', 'FAA test source',
+              'faa.gov', 'regulator_primary', '2026-08-20'
+            );
+            INSERT INTO faa_registry_snapshots (
+              evidence_source_id, snapshot_date, source_url, archive_sha256,
+              source_manifest_sha256, target_set_sha256,
+              master_member_name, master_member_sha256,
+              aircraft_member_name, aircraft_member_sha256,
+              engine_member_name, engine_member_sha256, record_hash_domain
+            ) VALUES (
+              3, '2026-08-20', 'https://www.faa.gov/test/reference-nullness',
+              repeat('1',64), repeat('2',64), repeat('3',64),
+              'MASTER.txt', repeat('4',64), 'ACFTREF.txt', repeat('5',64),
+              'ENGINE.txt', repeat('6',64),
+              'aircost-faa-master-retained-aircraft-projection-v1'
+            );
+            INSERT INTO faa_registry_aircraft (
+              snapshot_id, n_number, manufacturer_serial_raw,
+              manufacturer_serial_key, aircraft_code, year_manufactured,
+              source_record_sha256
+            ) VALUES
+              (1, 'N100AA', 'SR100', 'SR100', 'TEST', 2024, repeat('a',64)),
+              (1, 'N200AA', 'SR200', 'SR200', 'TEST', 2023, repeat('b',64));
+            INSERT INTO faa_registry_coverage (snapshot_id, n_number, lookup_status)
+            VALUES (1, 'N100AA', 'matched'), (1, 'N200AA', 'matched');
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, registration_number, serial_number,
+              airframe_hours
+            ) SELECT aircraft_model_variant_id, 1,
+                'https://listing.test/non-null-reference', 2024, 500000,
+                'N100AA', 'SR100', 100
+              FROM aircraft_sale_listing_pending_compatibility_placeholder
+              WHERE singleton_id=1;
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, registration_number, serial_number,
+              airframe_hours
+            ) SELECT aircraft_model_variant_id, 1,
+                'https://listing.test/null-reference', 2023, 400000,
+                'N200AA', 'SR200', 200
+              FROM aircraft_sale_listing_pending_compatibility_placeholder
+              WHERE singleton_id=1;
+            INSERT INTO aircraft_sale_listing_identity_assignments (
+              aircraft_sale_listing_id, aircraft_make_id,
+              aircraft_model_family_id, aircraft_designation_id,
+              aircraft_generation_id, aircraft_factory_package_id,
+              identity_decision_id, identity_evidence_claim_id,
+              faa_registry_snapshot_id, faa_n_number, faa_source_record_sha256
+            ) VALUES
+              (1, 1, 1, 1, 1, 1, 3, 1, 1, 'N100AA', repeat('a',64)),
+              (2, 1, 1, 1, NULL, NULL, 3, 1, 1, 'N200AA', repeat('b',64));
+            INSERT INTO aircraft_sale_listing_current_identity_assignments (
+              aircraft_sale_listing_id, identity_assignment_id
+            ) VALUES (1, 1), (2, 2);
+            SET session_replication_role = origin;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let non_null_status = listing_reference_status(&db, 1).await.unwrap();
+        assert!(non_null_status.ready, "{:?}", non_null_status.gaps);
+        assert_eq!(
+            non_null_status.published.unwrap().version_id,
+            non_null_ids.version_id
+        );
+        let null_status = listing_reference_status(&db, 2).await.unwrap();
+        assert!(null_status.ready, "{:?}", null_status.gaps);
+        assert_eq!(
+            null_status.published.unwrap().version_id,
+            null_ids.version_id
         );
     }
 }

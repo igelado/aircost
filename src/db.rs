@@ -290,7 +290,7 @@ END;
 const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
-    "039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647";
+    "8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL: &str =
     include_str!("../migrations/20260819_reference_catalog_cutover.sqlite.sql");
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL: &str =
@@ -334,16 +334,22 @@ const REFERENCE_CATALOG_CUTOVER_PROTECTED_RELATIONS: &[&str] = &[
     "aircraft_reference_prices",
     "aircraft_reference_fact_set_attestations",
     "official_dollar_normalization_facts",
+    "listing_verification_run_items",
 ];
 const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0",
     "aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0",
+    "listing_verification_run_items:idx_listing_verification_run_items_claim:0:c:0:0:1:run_id:0:BINARY:1,1:4:status:0:BINARY:1,2:3:position:0:BINARY:1,3:0:id:0:BINARY:1,4:-1::0:BINARY:0",
+    "listing_verification_run_items:idx_listing_verification_run_items_one_active_listing:1:c:1:0:2:listing_id:0:BINARY:1,1:-1::0:BINARY:0",
+    "listing_verification_run_items:idx_listing_verification_run_items_one_running_per_run:1:c:1:0:1:run_id:0:BINARY:1,1:-1::0:BINARY:0",
+    "listing_verification_run_items:sqlite_autoindex_listing_verification_run_items_1:1:u:0:0:1:run_id:0:BINARY:1,1:3:position:0:BINARY:1,2:-1::0:BINARY:0",
+    "listing_verification_run_items:sqlite_autoindex_listing_verification_run_items_2:1:u:0:0:1:run_id:0:BINARY:1,1:2:listing_id:0:BINARY:1,2:-1::0:BINARY:0",
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_1:1:u:0:0:7:evidence_claim_id:0:BINARY:1,1:-1::0:BINARY:0",
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_2:1:u:0:0:1:source_year:0:BINARY:1,1:2:target_year:0:BINARY:1,2:-1::0:BINARY:0",
 ];
-const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 116;
+const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 152;
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_DEFINITION_DIGEST: &str =
-    "db6081595739bd253ec04772246e23b9";
+    "d609ec15a4522b9ab15ae7d145e76c67";
 const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
@@ -4906,6 +4912,7 @@ impl AppDb {
                 for table_name in [
                     "aircraft_reference_fact_set_attestations",
                     "official_dollar_normalization_facts",
+                    "listing_verification_run_items",
                 ] {
                     let Some(definition) = sqlite_migration_definition("TABLE", table_name) else {
                         #[cfg(test)]
@@ -4939,7 +4946,8 @@ impl AppDb {
                     FROM sqlite_schema
                     WHERE (type = 'table' AND name IN (
                       'aircraft_reference_fact_set_attestations',
-                      'official_dollar_normalization_facts'
+                      'official_dollar_normalization_facts',
+                      'listing_verification_run_items'
                     )) OR (type = 'trigger' AND (
                       name IN (
                         'avionics_models_referenced_status_update',
@@ -4963,7 +4971,8 @@ impl AppDb {
                       OR tbl_name IN (
                         'aircraft_reference_prices',
                         'aircraft_reference_fact_set_attestations',
-                        'official_dollar_normalization_facts'
+                        'official_dollar_normalization_facts',
+                        'listing_verification_run_items'
                       )
                     ))
                     ORDER BY type, name
@@ -5046,7 +5055,8 @@ impl AppDb {
                       VALUES
                         ('aircraft_reference_prices'),
                         ('aircraft_reference_fact_set_attestations'),
-                        ('official_dollar_normalization_facts')
+                        ('official_dollar_normalization_facts'),
+                        ('listing_verification_run_items')
                     )
                     SELECT
                       protected_relation.relation_name || ':' ||
@@ -5287,7 +5297,8 @@ impl AppDb {
               VALUES
                 ('aircraft_reference_prices'),
                 ('aircraft_reference_fact_set_attestations'),
-                ('official_dollar_normalization_facts')
+                ('official_dollar_normalization_facts'),
+                ('listing_verification_run_items')
             ),
             objects(object_key, definition) AS (
               SELECT
@@ -7484,8 +7495,8 @@ mod tests {
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
         listing_pending_reviews_migration_required_message, migration_required_message,
-        split_sql_statements, sqlite_table_definition, AppDb, DatabaseBackend, DatabaseKind,
-        AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
+        split_sql_statements, sqlite_migration_definition, sqlite_table_definition, AppDb,
+        DatabaseBackend, DatabaseKind, AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
         AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
@@ -8776,6 +8787,12 @@ mod tests {
                 "unexpected_reference_normalization_trigger",
             ),
             (
+                "verification-run-unexpected-trigger",
+                "CREATE TRIGGER unexpected_verification_run_trigger BEFORE INSERT ON listing_verification_run_items BEGIN SELECT 1; END",
+                "trigger",
+                "unexpected_verification_run_trigger",
+            ),
+            (
                 "reference-price-unexpected-index",
                 "CREATE INDEX unexpected_reference_price_index ON aircraft_reference_prices(amount)",
                 "index",
@@ -8793,6 +8810,12 @@ mod tests {
                 "index",
                 "unexpected_reference_normalization_index",
             ),
+            (
+                "verification-run-unexpected-index",
+                "CREATE INDEX unexpected_verification_run_index ON listing_verification_run_items(reason_code)",
+                "index",
+                "unexpected_verification_run_index",
+            ),
         ] {
             assert_unexpected_reference_cutover_object_rejected_without_healing(
                 label,
@@ -8802,6 +8825,71 @@ mod tests {
             )
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_weakened_verification_run_status_check_without_healing() {
+        let (database_path, database_url) =
+            unique_sqlite_test_database("verification-run-weakened-check");
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let canonical =
+            sqlite_migration_definition("TABLE", "listing_verification_run_items").unwrap();
+        let weakened = canonical.replace(
+            "'verified', 'pending_review',\n      'blocked', 'failed'",
+            "'verified', 'pending_review', 'pending_reference',\n      'blocked', 'failed'",
+        );
+        assert_ne!(weakened, canonical);
+        sqlx::raw_sql(
+            "DROP INDEX idx_listing_verification_run_items_one_active_listing; \
+             DROP INDEX idx_listing_verification_run_items_one_running_per_run; \
+             DROP INDEX idx_listing_verification_run_items_claim; \
+             ALTER TABLE listing_verification_run_items \
+               RENAME TO weakened_listing_verification_run_items;",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(&weakened).execute(pool).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO listing_verification_run_items \
+             SELECT * FROM weakened_listing_verification_run_items; \
+             DROP TABLE weakened_listing_verification_run_items; \
+             CREATE UNIQUE INDEX idx_listing_verification_run_items_one_active_listing \
+               ON listing_verification_run_items(listing_id) \
+               WHERE status IN ('queued','running'); \
+             CREATE UNIQUE INDEX idx_listing_verification_run_items_one_running_per_run \
+               ON listing_verification_run_items(run_id) WHERE status='running'; \
+             CREATE INDEX idx_listing_verification_run_items_claim \
+               ON listing_verification_run_items(run_id,status,position,id);",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        drop(db);
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("startup must reject the weakened run-item CHECK"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+        let inspection_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let preserved: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema \
+             WHERE type='table' AND name='listing_verification_run_items'",
+        )
+        .fetch_one(&inspection_pool)
+        .await
+        .unwrap();
+        assert!(preserved.contains("pending_reference"));
+        inspection_pool.close().await;
+        std::fs::remove_file(database_path).unwrap();
     }
 
     #[tokio::test]
@@ -9050,6 +9138,12 @@ mod tests {
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.official_dollar_normalization_facts'::regclass AND tgname = 'unexpected_reference_normalization_trigger' AND NOT tgisinternal)",
             ),
             (
+                "unexpected_verification_run_trigger",
+                "CREATE TRIGGER unexpected_verification_run_trigger BEFORE INSERT ON public.listing_verification_run_items FOR EACH ROW EXECUTE FUNCTION public.unexpected_reference_cutover_trigger()",
+                "DROP TRIGGER unexpected_verification_run_trigger ON public.listing_verification_run_items",
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = 'public.listing_verification_run_items'::regclass AND tgname = 'unexpected_verification_run_trigger' AND NOT tgisinternal)",
+            ),
+            (
                 "unexpected_reference_price_index",
                 "CREATE INDEX unexpected_reference_price_index ON public.aircraft_reference_prices(amount)",
                 "DROP INDEX public.unexpected_reference_price_index",
@@ -9066,6 +9160,12 @@ mod tests {
                 "CREATE INDEX unexpected_reference_normalization_index ON public.official_dollar_normalization_facts(index_series)",
                 "DROP INDEX public.unexpected_reference_normalization_index",
                 "SELECT pg_catalog.to_regclass('public.unexpected_reference_normalization_index') IS NOT NULL",
+            ),
+            (
+                "unexpected_verification_run_index",
+                "CREATE INDEX unexpected_verification_run_index ON public.listing_verification_run_items(reason_code)",
+                "DROP INDEX public.unexpected_verification_run_index",
+                "SELECT pg_catalog.to_regclass('public.unexpected_verification_run_index') IS NOT NULL",
             ),
         ] {
             pool.execute(create_statement).await.unwrap();
@@ -9097,6 +9197,44 @@ mod tests {
                 .await
                 .unwrap());
         }
+
+        pool.execute(
+            "ALTER TABLE public.listing_verification_run_items \
+             DROP CONSTRAINT listing_verification_run_items_status_check, \
+             ADD CONSTRAINT listing_verification_run_items_status_check CHECK (status IN (\
+               'queued', 'running', 'verified', 'pending_review', \
+               'pending_reference', 'blocked', 'failed', 'cancelled'))",
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+        assert_postgres_reference_migration_rerun_rejected(&pool).await;
+        let weakened_constraint_preserved: bool = sqlx::query_scalar(
+            "SELECT pg_catalog.pg_get_constraintdef(oid) LIKE '%pending_reference%' \
+             FROM pg_catalog.pg_constraint \
+             WHERE conrelid='public.listing_verification_run_items'::regclass \
+               AND conname='listing_verification_run_items_status_check'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(weakened_constraint_preserved);
+        pool.execute(
+            "ALTER TABLE public.listing_verification_run_items \
+             DROP CONSTRAINT listing_verification_run_items_status_check, \
+             ADD CONSTRAINT listing_verification_run_items_status_check CHECK (status IN (\
+               'queued', 'running', 'verified', 'pending_review', \
+               'blocked', 'failed', 'cancelled'))",
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
         pool.execute("DROP FUNCTION public.unexpected_reference_cutover_trigger()")
             .await
             .unwrap();

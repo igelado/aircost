@@ -72,9 +72,6 @@ const AIRCRAFT_IDENTITY_REASONS = Object.freeze({
     "The current canonical aircraft assignment no longer matches the FAA record or its valuation identity.",
 });
 
-const FACTORY_REFERENCE_PENDING_DETAIL =
-  "The aircraft and avionics review is complete, but factory reference data still needs automated curation before valuation is available.";
-
 const FALLBACK_REASON = Object.freeze({
   label: "Manual review required",
   detail: "The automated review could not verify this item with enough confidence.",
@@ -845,16 +842,7 @@ export function describeResolvedListingOutcome(payload, expectedListingId = null
     return {
       kind: "verified",
       label: `Listing ${listingId} verified`,
-      detail: "The review and valuation-readiness checks are complete.",
-      listingId,
-      terminal: true,
-    };
-  }
-  if (listing.ingestion_state === "incomplete" && listing.is_verified === false) {
-    return {
-      kind: "pending_reference",
-      label: `Listing ${listingId} review complete; factory reference pending before valuation`,
-      detail: FACTORY_REFERENCE_PENDING_DETAIL,
+      detail: "The aircraft identity and listing review checks are complete.",
       listingId,
       terminal: true,
     };

@@ -1775,7 +1775,7 @@ WHERE type = 'table'
 ```
 
 The contract must be version `1` with fingerprint
-`039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647`.
+`8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455`.
 Its `installed_at` value records the first successful installation and remains
 unchanged across schema reruns and application startups. A marker mismatch or
 marker-present damaged cutover contract fails before canonical DDL can heal it.

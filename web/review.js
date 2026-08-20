@@ -1156,7 +1156,6 @@ function renderVerificationRun() {
     ["Running", run.counts.running],
     ["Verified", run.counts.verified],
     ["Manual review", run.counts.pendingReview],
-    ["Reference pending", run.counts.pendingReference],
     ["Blocked", run.counts.blocked],
     ["Failed", run.counts.failed],
     ["Cancelled", run.counts.cancelled],
@@ -1265,7 +1264,7 @@ async function reconcileCompletedVerificationRun(run, sequence) {
     return;
   }
   const status = verificationRunStatusView(item.status);
-  if (item.status === "verified" || item.status === "pending_reference") {
+  if (item.status === "verified") {
     await leaveAutomaticallyVerifiedReview(listingId, state.reviews.slice(), status.label);
     return;
   }

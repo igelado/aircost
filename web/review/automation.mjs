@@ -32,7 +32,6 @@ const RUN_ITEM_STATUSES = new Set([
   "running",
   "verified",
   "pending_review",
-  "pending_reference",
   "blocked",
   "failed",
   "cancelled",
@@ -357,15 +356,6 @@ export function pipelineAutomaticEligibility(row) {
     return { eligible: false, reason: "The listing is already verified." };
   }
   if (
-    row.reference?.status === "pending_reference"
-    || row.status === "pending_reference"
-  ) {
-    return {
-      eligible: false,
-      reason: "Identity review is complete; factory reference publication is the remaining work.",
-    };
-  }
-  if (
     row.aircraft?.status === "rejected"
     || row.avionics?.status === "faa_rejected"
   ) {
@@ -449,18 +439,12 @@ export function verificationRunState(run, items = []) {
       "pending_review_items",
       derived.pending_review,
     ),
-    pendingReference: runCount(
-      run,
-      "pending_reference_items",
-      derived.pending_reference,
-    ),
     blocked: runCount(run, "blocked_items", derived.blocked),
     failed: runCount(run, "failed_items", derived.failed),
     cancelled: runCount(run, "cancelled_items", derived.cancelled),
   };
   const completed = counts.verified
     + counts.pendingReview
-    + counts.pendingReference
     + counts.blocked
     + counts.failed
     + counts.cancelled;
@@ -497,11 +481,6 @@ export function verificationRunStatusView(status) {
     cancelled: ["Cancelled", "The work was not started because the run was stopped.", "cancelled"],
     verified: ["Verified", "The listing passed identity and readiness checks.", "complete"],
     pending_review: ["Manual review", "Automatic checks left a current manual review.", "pending"],
-    pending_reference: [
-      "Reference pending",
-      "Identity review is complete; factory reference publication remains.",
-      "reference",
-    ],
     blocked: ["Blocked", "Automatic verification could not safely advance this listing.", "blocked"],
     failed: ["Failed", "Automatic verification failed for this listing.", "blocked"],
   };
@@ -605,14 +584,14 @@ function geminiRequirement(listing) {
 }
 
 function listingReason(listing, aircraft, avionics, reference) {
-  if (reference.status === "pending_reference") {
-    return reference.reason || REASON_COPY.factory_reference_pending;
-  }
   if (!aircraft.complete) {
     return aircraft.reason || "The aircraft identity still needs verification.";
   }
   if (!avionics.complete) {
     return avionics.reason || "One or more avionics observations still need verification.";
+  }
+  if (reference.status === "pending_reference") {
+    return reference.reason || REASON_COPY.factory_reference_pending;
   }
   const status = nonBlank(listing?.status);
   if (status === "failed") {

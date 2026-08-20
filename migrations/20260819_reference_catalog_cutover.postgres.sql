@@ -16,7 +16,7 @@ BEGIN
       AND (
         contract_version <> 1
         OR contract_fingerprint <>
-          '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
+          '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -28,7 +28,7 @@ BEGIN
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
+        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
   ) INTO exact_marker;
 
   IF exact_marker THEN
@@ -53,7 +53,8 @@ BEGIN
       VALUES
         ('aircraft_reference_prices'),
         ('aircraft_reference_fact_set_attestations'),
-        ('official_dollar_normalization_facts')
+        ('official_dollar_normalization_facts'),
+        ('listing_verification_run_items')
     ),
     objects(object_key, definition) AS (
       SELECT
@@ -185,9 +186,9 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM objects;
 
-    IF actual_object_count <> 116
+    IF actual_object_count <> 152
        OR actual_definition_digest <>
-            'db6081595739bd253ec04772246e23b9' THEN
+            'd609ec15a4522b9ab15ae7d145e76c67' THEN
       RAISE EXCEPTION
         'reference catalog cutover marker-present definition mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -195,6 +196,177 @@ BEGIN
   END IF;
 END
 $reference_catalog_cutover_rerun_preflight$;
+
+-- A marker-absent upgrade may rewrite the historical run-item contract only
+-- from its exact owned schema. Unexpected constraints, indexes, or triggers
+-- are a conflict to investigate, never objects for this migration to erase.
+DO $reference_catalog_cutover_run_item_preflight$
+DECLARE
+  actual_object_count BIGINT;
+  actual_definition_digest TEXT;
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+  ) THEN
+    WITH objects(object_key, definition) AS (
+      SELECT
+        'column:' || attribute.attnum::TEXT,
+        attribute.attname || ':' ||
+          pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || ':' ||
+          attribute.attnotnull::TEXT || ':' || attribute.attidentity::TEXT || ':' ||
+          COALESCE(
+            pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid), ''
+          )
+      FROM pg_catalog.pg_attribute attribute
+      LEFT JOIN pg_catalog.pg_attrdef default_row
+        ON default_row.adrelid = attribute.attrelid
+       AND default_row.adnum = attribute.attnum
+      WHERE attribute.attrelid =
+              'public.listing_verification_run_items'::regclass
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+      UNION ALL
+      SELECT
+        'constraint:' || constraint_row.conname,
+        constraint_row.contype::TEXT || ':' || replace(
+          pg_catalog.pg_get_constraintdef(constraint_row.oid, TRUE),
+          'public.', ''
+        )
+      FROM pg_catalog.pg_constraint constraint_row
+      WHERE constraint_row.conrelid =
+              'public.listing_verification_run_items'::regclass
+      UNION ALL
+      SELECT
+        'index:' || index_relation.relname,
+        replace(
+          pg_catalog.pg_get_indexdef(index_row.indexrelid), 'public.', ''
+        ) || ':' || index_row.indisunique::TEXT || ':' ||
+          index_row.indisprimary::TEXT || ':' || index_row.indisvalid::TEXT || ':' ||
+          index_row.indisready::TEXT || ':' || index_row.indislive::TEXT || ':' ||
+          index_row.indisreplident::TEXT || ':' || index_row.indimmediate::TEXT || ':' ||
+          index_row.indnullsnotdistinct::TEXT || ':' || index_row.indnatts::TEXT || ':' ||
+          index_row.indnkeyatts::TEXT
+      FROM pg_catalog.pg_index index_row
+      JOIN pg_catalog.pg_class index_relation
+        ON index_relation.oid = index_row.indexrelid
+      WHERE index_row.indrelid =
+              'public.listing_verification_run_items'::regclass
+      UNION ALL
+      SELECT
+        'trigger:' || trigger_row.tgname,
+        trigger_row.tgenabled::TEXT || ':' || replace(
+          pg_catalog.pg_get_triggerdef(trigger_row.oid, TRUE), 'public.', ''
+        )
+      FROM pg_catalog.pg_trigger trigger_row
+      WHERE trigger_row.tgrelid =
+              'public.listing_verification_run_items'::regclass
+        AND NOT trigger_row.tgisinternal
+    )
+    SELECT
+      count(*),
+      pg_catalog.md5(pg_catalog.string_agg(
+        object_key || '=' || definition,
+        E'\n' ORDER BY object_key
+      ))
+    INTO actual_object_count, actual_definition_digest
+    FROM objects;
+
+    IF actual_object_count <> 36
+       OR actual_definition_digest <> 'c1adfeee9a59a7fe8c3d5240c9c2732c' THEN
+      RAISE EXCEPTION
+        'reference catalog cutover run-item pre-state mismatch (% objects, digest %)',
+        actual_object_count, actual_definition_digest;
+    END IF;
+  END IF;
+END
+$reference_catalog_cutover_run_item_preflight$;
+
+-- Reference readiness is independent from listing verification. Rewrite the
+-- obsolete terminal run-item outcome before tightening the durable queue
+-- contract. It is not evidence that the listing passed verification: preserve
+-- the incomplete listing state and nested reference stage, and require a new
+-- run to determine the current outcome.
+UPDATE public.listing_verification_run_items
+SET status = 'blocked',
+    outcome_json = (
+      jsonb_set(
+        outcome_json::jsonb,
+        '{status}', to_jsonb('blocked'::TEXT), TRUE
+      ) || jsonb_build_object(
+        'finalization',
+        COALESCE(outcome_json::jsonb -> 'finalization', '{}'::jsonb)
+          || jsonb_build_object('status', 'not_attempted')
+      )
+    )::TEXT,
+    reason_code = 'legacy_reference_gate_removed',
+    reason = 'Historical reference gating was removed; run verification again.',
+    updated_at = CURRENT_TIMESTAMP
+WHERE status = 'pending_reference';
+
+DO $reference_catalog_cutover_run_item_contract$
+DECLARE
+  constraint_name TEXT;
+BEGIN
+  FOR constraint_name IN
+    SELECT constraint_row.conname
+    FROM pg_catalog.pg_constraint constraint_row
+    JOIN pg_catalog.pg_class relation
+      ON relation.oid = constraint_row.conrelid
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+      AND relation.relname = 'listing_verification_run_items'
+      AND constraint_row.contype = 'c'
+      AND pg_catalog.pg_get_constraintdef(constraint_row.oid)
+        LIKE '%pending_reference%'
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE public.listing_verification_run_items DROP CONSTRAINT %I',
+      constraint_name
+    );
+  END LOOP;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid = 'public.listing_verification_run_items'::regclass
+      AND conname = 'listing_verification_run_items_status_check'
+  ) THEN
+    ALTER TABLE public.listing_verification_run_items
+      ADD CONSTRAINT listing_verification_run_items_status_check CHECK (
+        status IN (
+          'queued', 'running', 'verified', 'pending_review',
+          'blocked', 'failed', 'cancelled'
+        )
+      );
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid = 'public.listing_verification_run_items'::regclass
+      AND conname = 'listing_verification_run_items_completion_check'
+  ) THEN
+    ALTER TABLE public.listing_verification_run_items
+      ADD CONSTRAINT listing_verification_run_items_completion_check CHECK (
+        (status IN ('queued', 'running') AND completed_at IS NULL)
+        OR
+        (status IN (
+          'verified', 'pending_review', 'blocked', 'failed', 'cancelled'
+        ) AND completed_at IS NOT NULL)
+      );
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid = 'public.listing_verification_run_items'::regclass
+      AND conname = 'listing_verification_run_items_outcome_required_check'
+  ) THEN
+    ALTER TABLE public.listing_verification_run_items
+      ADD CONSTRAINT listing_verification_run_items_outcome_required_check CHECK (
+        status NOT IN ('verified', 'pending_review', 'blocked')
+        OR outcome_json IS NOT NULL
+      );
+  END IF;
+END
+$reference_catalog_cutover_run_item_contract$;
 
 CREATE OR REPLACE FUNCTION public.aircraft_serial_natural_sort_key(serial_value TEXT)
 RETURNS TEXT
@@ -982,7 +1154,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647', CURRENT_TIMESTAMP
+  '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

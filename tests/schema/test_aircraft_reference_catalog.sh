@@ -14,7 +14,12 @@ marker_rerun_database="$(mktemp /tmp/aircost-reference-marker-rerun.XXXXXX.sqlit
 marker_mismatch_database="$(mktemp /tmp/aircost-reference-marker-mismatch.XXXXXX.sqlite3)"
 marker_damage_database="$(mktemp /tmp/aircost-reference-marker-damage.XXXXXX.sqlite3)"
 marker_unexpected_database="$(mktemp /tmp/aircost-reference-marker-unexpected.XXXXXX.sqlite3)"
-trap 'rm -f "$test_database" "$approval_database" "$component_database" "$duplicate_price_database" "$overlap_database" "$serial_overlap_database" "$incomplete_database" "$cleanup_database" "$marker_rerun_database" "$marker_mismatch_database" "$marker_damage_database" "$marker_unexpected_database"' EXIT
+marker_run_check_database="$(mktemp /tmp/aircost-reference-marker-run-check.XXXXXX.sqlite3)"
+upgrade_database="$(mktemp /tmp/aircost-reference-upgrade.XXXXXX.sqlite3)"
+upgrade_unexpected_index_database="$(mktemp /tmp/aircost-reference-upgrade-index.XXXXXX.sqlite3)"
+upgrade_unexpected_trigger_database="$(mktemp /tmp/aircost-reference-upgrade-trigger.XXXXXX.sqlite3)"
+upgrade_altered_check_database="$(mktemp /tmp/aircost-reference-upgrade-check.XXXXXX.sqlite3)"
+trap 'rm -f "$test_database" "$approval_database" "$component_database" "$duplicate_price_database" "$overlap_database" "$serial_overlap_database" "$incomplete_database" "$cleanup_database" "$marker_rerun_database" "$marker_mismatch_database" "$marker_damage_database" "$marker_unexpected_database" "$marker_run_check_database" "$upgrade_database" "$upgrade_unexpected_index_database" "$upgrade_unexpected_trigger_database" "$upgrade_altered_check_database"' EXIT
 
 sqlite3 -bail "$test_database" \
   ".read $repository_root/schema/sqlite.sql" \
@@ -57,6 +62,117 @@ expect_failure() {
     exit 1
   fi
 }
+
+sqlite3 -bail "$upgrade_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  ".read $repository_root/tests/schema/reference_catalog_run_item_pre_cutover.sqlite.sql" \
+  "INSERT INTO users (email, display_name, auth_subject)
+   VALUES ('run-history@example.test', 'Run history', 'run-history');
+   INSERT INTO aircraft_sale_listings (
+     aircraft_model_variant_id, created_by_user_id, source_url, model_year,
+     asking_price_usd, registration_number, airframe_hours, ingestion_state
+   ) SELECT placeholder.aircraft_model_variant_id, user.id,
+       'https://listing.example/run-history', 2020, 100000, 'N12345', 100,
+       'incomplete'
+     FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder,
+          users user
+     WHERE placeholder.singleton_id = 1
+       AND user.auth_subject = 'run-history';
+   INSERT INTO listing_verification_runs (
+     owner_user_id, idempotency_key, request_fingerprint,
+     status, completed_at
+   ) SELECT id, 'historical-reference', printf('%064d', 0),
+       'completed', CURRENT_TIMESTAMP
+     FROM users WHERE auth_subject = 'run-history';
+   INSERT INTO listing_verification_run_items (
+     run_id, listing_id, position, status, outcome_json,
+     reason_code, reason, completed_at
+   ) SELECT run.id, listing.id, 0, 'pending_reference', json_object(
+       'status', 'pending_reference',
+       'final_ingestion_state', 'incomplete',
+       'reference', json_object('status', 'pending_reference'),
+       'finalization', json_object('status', 'pending_reference')
+     ), 'factory_reference_pending', 'Factory reference pending', CURRENT_TIMESTAMP
+     FROM listing_verification_runs run, aircraft_sale_listings listing
+     WHERE run.idempotency_key = 'historical-reference';"
+
+cp "$upgrade_database" "$upgrade_unexpected_index_database"
+cp "$upgrade_database" "$upgrade_unexpected_trigger_database"
+
+sqlite3 -bail "$upgrade_unexpected_index_database" \
+  "CREATE INDEX unexpected_run_item_index
+   ON listing_verification_run_items(reason_code);"
+expect_failure "$upgrade_unexpected_index_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "CHECK constraint failed"
+test "$(sqlite3 "$upgrade_unexpected_index_database" \
+  "SELECT count(*) FROM sqlite_schema WHERE name='unexpected_run_item_index';
+   SELECT count(*) FROM schema_migration_contracts
+   WHERE migration_name='20260819_reference_catalog_cutover';")" = $'1\n0'
+
+sqlite3 -bail "$upgrade_unexpected_trigger_database" \
+  "CREATE TRIGGER unexpected_run_item_trigger
+   BEFORE UPDATE ON listing_verification_run_items BEGIN SELECT 1; END;"
+expect_failure "$upgrade_unexpected_trigger_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "CHECK constraint failed"
+test "$(sqlite3 "$upgrade_unexpected_trigger_database" \
+  "SELECT count(*) FROM sqlite_schema WHERE name='unexpected_run_item_trigger';
+   SELECT count(*) FROM schema_migration_contracts
+   WHERE migration_name='20260819_reference_catalog_cutover';")" = $'1\n0'
+
+sqlite3 -bail "$upgrade_altered_check_database" \
+  ".read $repository_root/schema/sqlite.sql"
+sed "0,/'cancelled'/s/'cancelled'/'cancelled', 'hostile'/" \
+  "$repository_root/tests/schema/reference_catalog_run_item_pre_cutover.sqlite.sql" \
+  | sqlite3 -bail "$upgrade_altered_check_database"
+expect_failure "$upgrade_altered_check_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "CHECK constraint failed"
+test "$(sqlite3 "$upgrade_altered_check_database" \
+  "SELECT instr(sql, '''hostile''') > 0 FROM sqlite_schema
+   WHERE type='table' AND name='listing_verification_run_items';
+   SELECT count(*) FROM schema_migration_contracts
+   WHERE migration_name='20260819_reference_catalog_cutover';")" = $'1\n0'
+
+sqlite3 -bail "$upgrade_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "PRAGMA foreign_key_check; PRAGMA integrity_check;"
+test "$(sqlite3 "$upgrade_database" \
+  "SELECT status || ':' || reason_code || ':' ||
+     json_extract(outcome_json, '$.status') || ':' ||
+     json_extract(outcome_json, '$.final_ingestion_state') || ':' ||
+     json_extract(outcome_json, '$.reference.status') || ':' ||
+     json_extract(outcome_json, '$.finalization.status')
+   FROM listing_verification_run_items;")" = \
+  "blocked:legacy_reference_gate_removed:blocked:incomplete:pending_reference:not_attempted"
+expect_failure "$upgrade_database" \
+  "UPDATE listing_verification_run_items SET status='pending_reference' WHERE id=1" \
+  "CHECK constraint failed"
+
+fresh_applicability_sql="$(sqlite3 "$test_database" \
+  "SELECT lower(replace(replace(replace(replace(replace(
+     sql, char(9), ''), char(10), ''), char(13), ''), ' ', ''),
+     'ifnotexists', '')) FROM sqlite_schema
+   WHERE type='table' AND name='aircraft_reference_applicability_scopes'")"
+upgrade_applicability_sql="$(sqlite3 "$upgrade_database" \
+  "SELECT lower(replace(replace(replace(replace(replace(
+     sql, char(9), ''), char(10), ''), char(13), ''), ' ', ''),
+     'ifnotexists', '')) FROM sqlite_schema
+   WHERE type='table' AND name='aircraft_reference_applicability_scopes'")"
+test "$upgrade_applicability_sql" = "$fresh_applicability_sql"
+
+fresh_run_item_sql="$(sqlite3 "$test_database" \
+  "SELECT lower(replace(replace(replace(replace(replace(
+     sql, char(9), ''), char(10), ''), char(13), ''), ' ', ''),
+     'ifnotexists', '')) FROM sqlite_schema
+   WHERE type='table' AND name='listing_verification_run_items'")"
+upgrade_run_item_sql="$(sqlite3 "$upgrade_database" \
+  "SELECT lower(replace(replace(replace(replace(replace(
+     sql, char(9), ''), char(10), ''), char(13), ''), ' ', ''),
+     'ifnotexists', '')) FROM sqlite_schema
+   WHERE type='table' AND name='listing_verification_run_items'")"
+test "$upgrade_run_item_sql" = "$fresh_run_item_sql"
 
 sqlite3 -bail "$marker_rerun_database" \
   ".read $repository_root/schema/sqlite.sql" \
@@ -113,7 +229,11 @@ sqlite3 -bail "$marker_unexpected_database" \
    CREATE INDEX unexpected_reference_fact_set_index
      ON aircraft_reference_fact_set_attestations(evidence_claim_id);
    CREATE INDEX unexpected_reference_normalization_index
-     ON official_dollar_normalization_facts(index_series);"
+     ON official_dollar_normalization_facts(index_series);
+   CREATE TRIGGER unexpected_verification_run_trigger
+     BEFORE INSERT ON listing_verification_run_items BEGIN SELECT 1; END;
+   CREATE INDEX unexpected_verification_run_index
+     ON listing_verification_run_items(reason_code);"
 expect_failure "$marker_unexpected_database" \
   ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
   "CHECK constraint failed"
@@ -125,8 +245,28 @@ test "$(sqlite3 "$marker_unexpected_database" \
      'unexpected_reference_normalization_trigger',
      'unexpected_reference_price_index',
      'unexpected_reference_fact_set_index',
-     'unexpected_reference_normalization_index'
-   )")" = "6"
+     'unexpected_reference_normalization_index',
+     'unexpected_verification_run_trigger',
+     'unexpected_verification_run_index'
+   )")" = "8"
+
+sqlite3 -bail "$marker_run_check_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  "CREATE TEMP TABLE cutover_marker_copy AS
+   SELECT * FROM schema_migration_contracts
+   WHERE migration_name='20260819_reference_catalog_cutover';" \
+  ".read $repository_root/tests/schema/reference_catalog_run_item_pre_cutover.sqlite.sql" \
+  "INSERT INTO schema_migration_contracts
+   SELECT * FROM cutover_marker_copy;"
+expect_failure "$marker_run_check_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "CHECK constraint failed"
+test "$(sqlite3 "$marker_run_check_database" \
+  "SELECT instr(sql, '''pending_reference''') > 0
+   FROM sqlite_schema
+   WHERE type='table' AND name='listing_verification_run_items';
+   SELECT count(*) FROM schema_migration_contracts
+   WHERE migration_name='20260819_reference_catalog_cutover';")" = $'1\n1'
 
 expect_failure "$test_database" \
   "UPDATE aircraft_reference_prices SET amount = 1 WHERE id = 1" \
