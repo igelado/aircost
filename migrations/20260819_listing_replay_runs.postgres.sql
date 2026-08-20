@@ -7,6 +7,7 @@ DECLARE
   marker_is_present BOOLEAN;
   contract_is_exact BOOLEAN;
   check_signature TEXT;
+  function_signature TEXT;
 BEGIN
   SELECT EXISTS (
     SELECT 1 FROM public.schema_migration_contracts
@@ -18,7 +19,7 @@ BEGIN
     WHERE migration_name = '20260819_listing_replay_runs'
       AND contract_version = 1
       AND contract_fingerprint =
-        '88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c'
+        'ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1'
   ) THEN
     RAISE EXCEPTION 'installed listing replay runs migration has a different contract';
   END IF;
@@ -47,22 +48,23 @@ BEGIN
                         ('listing_replay_run_items', 4, 'position', 'bigint', TRUE, '', ''),
                         ('listing_replay_run_items', 5, 'expected_rendered_html_sha256', 'text', TRUE, '', ''),
                         ('listing_replay_run_items', 6, 'extracted_listing_sha256', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 7, 'extraction_state', 'text', TRUE, '', '''queued''::text'),
-                        ('listing_replay_run_items', 8, 'materialization_state', 'text', TRUE, '', '''blocked''::text'),
-                        ('listing_replay_run_items', 9, 'resulting_listing_id', 'bigint', FALSE, '', ''),
-                        ('listing_replay_run_items', 10, 'terminal_rejection_phase', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 11, 'terminal_rejection_stage', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 12, 'terminal_rejection_reason_code', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 13, 'last_failure_phase', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 14, 'last_failure_reason_code', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 15, 'extraction_attempt_count', 'bigint', TRUE, '', '0'),
-                        ('listing_replay_run_items', 16, 'materialization_attempt_count', 'bigint', TRUE, '', '0'),
-                        ('listing_replay_run_items', 17, 'extraction_started_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 18, 'extraction_completed_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 19, 'materialization_started_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 20, 'materialization_completed_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 21, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
-                        ('listing_replay_run_items', 22, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_run_items', 7, 'extracted_listing_json', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 8, 'extraction_state', 'text', TRUE, '', '''queued''::text'),
+                        ('listing_replay_run_items', 9, 'materialization_state', 'text', TRUE, '', '''blocked''::text'),
+                        ('listing_replay_run_items', 10, 'resulting_listing_id', 'bigint', FALSE, '', ''),
+                        ('listing_replay_run_items', 11, 'terminal_rejection_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 12, 'terminal_rejection_stage', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 13, 'terminal_rejection_reason_code', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 14, 'last_failure_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 15, 'last_failure_reason_code', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 16, 'extraction_attempt_count', 'bigint', TRUE, '', '0'),
+                        ('listing_replay_run_items', 17, 'materialization_attempt_count', 'bigint', TRUE, '', '0'),
+                        ('listing_replay_run_items', 18, 'extraction_started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 19, 'extraction_completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 20, 'materialization_started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 21, 'materialization_completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 22, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_run_items', 23, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
                         ('plugin_submission_materialization_receipts', 1, 'plugin_submission_id', 'bigint', TRUE, '', ''),
                         ('plugin_submission_materialization_receipts', 2, 'aircraft_sale_listing_id', 'bigint', TRUE, '', ''),
                         ('plugin_submission_materialization_receipts', 3, 'rendered_html_sha256', 'text', TRUE, '', ''),
@@ -186,7 +188,8 @@ BEGIN
                       WHERE index_namespace.nspname = 'public'
                         AND index_relation.relname IN (
                           'idx_listing_replay_runs_one_running',
-                          'idx_listing_replay_run_items_phase'
+                          'idx_listing_replay_run_items_phase',
+                          'uq_aircraft_sale_listings_owner_source'
                         )
                     ), replay_attached_indexes AS (
                       SELECT index_definition.indexrelid
@@ -420,6 +423,7 @@ BEGIN
                         ('listing_replay_run_items', '"position" >= 0'),
                         ('listing_replay_run_items', 'expected_rendered_html_sha256'),
                         ('listing_replay_run_items', 'extracted_listing_sha256'),
+                        ('listing_replay_run_items', 'extracted_listing_json IS NOT NULL'),
                         ('listing_replay_run_items', 'extraction_state = ANY'),
                         ('listing_replay_run_items', 'materialization_state = ANY'),
                         ('listing_replay_run_items', 'terminal_rejection_phase = ANY'),
@@ -455,7 +459,7 @@ BEGIN
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 39 FROM actual_columns)
+                      (SELECT COUNT(*) = 40 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
@@ -489,6 +493,38 @@ BEGIN
                             'public.plugin_submission_materialization_receipts'
                           )
                         ) AND NOT trigger_definition.tgisinternal
+                          AND trigger_definition.tgname NOT IN (
+                            'listing_replay_run_items_checkpoint_exact',
+                            'listing_replay_run_items_completed_immutable',
+                            'plugin_submission_materialization_receipts_immutable'
+                          )
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE NOT trigger_definition.tgisinternal
+                          AND trigger_definition.tgrelid IN (
+                            pg_catalog.to_regclass('public.plugin_submissions'),
+                            pg_catalog.to_regclass('public.plugin_installs')
+                          )
+                          AND NOT (
+                            (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.plugin_submissions'
+                              )
+                              AND trigger_definition.tgname IN (
+                                'plugin_submissions_replay_checkpoint_immutable',
+                                'listing_avionics_authorizations_invalidate_capture_delete',
+                                'listing_avionics_authorizations_invalidate_capture_update'
+                              )
+                            )
+                            OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.plugin_installs'
+                              )
+                              AND trigger_definition.tgname =
+                                'plugin_installs_replay_identity_immutable'
+                            )
+                          )
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_policy policy_definition
@@ -527,6 +563,13 @@ BEGIN
                         )
                       )
                       AND (SELECT COUNT(*) = 9 FROM replay_attached_indexes)
+                      AND (SELECT COUNT(*) = 3 FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE trigger_definition.tgrelid IN (
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        ) AND NOT trigger_definition.tgisinternal)
                       AND (SELECT COUNT(*) = 1 FROM replay_indexes
                        WHERE index_name = 'idx_listing_replay_runs_one_running'
                          AND relation_oid = pg_catalog.to_regclass(
@@ -573,6 +616,93 @@ BEGIN
                            'pg_catalog.int8_ops', 'pg_catalog.text_ops',
                            'pg_catalog.text_ops', 'pg_catalog.int8_ops'
                          ]::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_indexes
+                       WHERE index_name = 'uq_aircraft_sale_listings_owner_source'
+                         AND relation_oid = pg_catalog.to_regclass(
+                           'public.aircraft_sale_listings'
+                         )
+                         AND is_unique AND NOT is_primary AND NOT is_exclusion
+                         AND is_immediate AND NOT is_clustered
+                         AND is_valid AND is_ready AND is_live
+                         AND NOT is_replica_identity AND NOT nulls_not_distinct
+                         AND is_partial AND NOT has_expressions
+                         AND key_attribute_count = 2 AND total_attribute_count = 2
+                         AND access_method = 'btree' AND index_options = '0 0'
+                         AND columns = ARRAY['created_by_user_id', 'source_url']::text[]
+                         AND collations = ARRAY['0', 'pg_catalog.default']::text[]
+                         AND operator_classes = ARRAY[
+                           'pg_catalog.int8_ops', 'pg_catalog.text_ops'
+                         ]::text[]
+                         AND pg_catalog.translate(predicate, E' \n\r\t()', '') IN (
+                           'source_urlisnotnullandlengthbtrimsource_url>0',
+                           'source_urlisnotnullandlengthbtrimsource_url>0::integer'
+                         ))
+                      AND (SELECT COUNT(*) = 5
+                        FROM pg_catalog.pg_trigger replay_trigger
+                        JOIN pg_catalog.pg_proc routine
+                          ON routine.oid = replay_trigger.tgfoid
+                        JOIN pg_catalog.pg_namespace routine_namespace
+                          ON routine_namespace.oid = routine.pronamespace
+                        WHERE NOT replay_trigger.tgisinternal
+                          AND replay_trigger.tgenabled = 'O'
+                          AND replay_trigger.tgqual IS NULL
+                          AND replay_trigger.tgnargs = 0
+                          AND routine_namespace.nspname = 'public'
+                          AND routine.proconfig = ARRAY['search_path=pg_catalog']::text[]
+                          AND NOT routine.prosecdef AND NOT routine.proisstrict
+                          AND NOT routine.proleakproof
+                          AND routine.provolatile = 'v'
+                          AND routine.proparallel = 'u'
+                          AND routine.prokind = 'f'
+                          AND routine.pronargs = 0
+                          AND routine.prorettype = pg_catalog.to_regtype(
+                            'pg_catalog.trigger'
+                          )
+                          AND routine.prolang = (
+                            SELECT language.oid FROM pg_catalog.pg_language language
+                            WHERE language.lanname = 'plpgsql'
+                          )
+                          AND (
+                            (replay_trigger.tgname =
+                               'listing_replay_run_items_checkpoint_exact'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_run_items'
+                             ) AND replay_trigger.tgtype = 23
+                             AND routine.proname =
+                               'enforce_replay_extraction_checkpoint_exactness')
+                            OR
+                            (replay_trigger.tgname =
+                               'listing_replay_run_items_completed_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_run_items'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname = 'preserve_completed_replay_item')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_submission_materialization_receipts_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submission_materialization_receipts'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname =
+                               'preserve_replay_materialization_receipt')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_submissions_replay_checkpoint_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submissions'
+                             ) AND replay_trigger.tgtype = 19
+                             AND routine.proname =
+                               'enforce_replay_checkpoint_capture_immutability')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_installs_replay_identity_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_installs'
+                             ) AND replay_trigger.tgtype = 19
+                             AND routine.proname =
+                               'enforce_replay_plugin_identity_immutability')
+                          ))
                       AND
                       (SELECT COUNT(*) = 4 FROM replay_unique_constraints)
                       AND NOT EXISTS (
@@ -716,7 +846,7 @@ BEGIN
                           AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
                       AND (SELECT COUNT(*) = 7 FROM replay_checks
                            WHERE relation_name = 'listing_replay_runs')
-                      AND (SELECT COUNT(*) = 19 FROM replay_checks
+                      AND (SELECT COUNT(*) = 20 FROM replay_checks
                            WHERE relation_name = 'listing_replay_run_items')
                       AND (SELECT COUNT(*) = 2 FROM replay_checks
                            WHERE relation_name = 'plugin_submission_materialization_receipts')
@@ -747,8 +877,27 @@ BEGIN
       )
       AND constraint_definition.contype = 'c';
 
+    SELECT pg_catalog.md5(pg_catalog.string_agg(
+      routine.proname::text || '|' || routine.prosrc || E'\n',
+      '' ORDER BY routine.proname
+    ))
+    INTO function_signature
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND routine.pronargs = 0
+      AND routine.proname IN (
+        'enforce_replay_extraction_checkpoint_exactness',
+        'preserve_completed_replay_item',
+        'preserve_replay_materialization_receipt',
+        'enforce_replay_checkpoint_capture_immutability',
+        'enforce_replay_plugin_identity_immutability'
+      );
+
     IF NOT COALESCE(contract_is_exact, FALSE)
-       OR check_signature IS DISTINCT FROM 'd9de973176f4fba876725550b6296db9' THEN
+       OR check_signature IS DISTINCT FROM 'b33af6b1c9969a333dbdb7d8a5910e92'
+       OR function_signature IS DISTINCT FROM '7e885abd1d361c7c831c84e5e3a58e1d' THEN
       RAISE EXCEPTION
         'installed listing replay migration contract has noncanonical objects';
     END IF;
@@ -758,6 +907,30 @@ BEGIN
     OR pg_catalog.to_regclass('public.plugin_submission_materialization_receipts') IS NOT NULL
     OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NOT NULL
     OR pg_catalog.to_regclass('public.idx_listing_replay_run_items_phase') IS NOT NULL
+    OR pg_catalog.to_regclass('public.uq_aircraft_sale_listings_owner_source') IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.enforce_replay_extraction_checkpoint_exactness()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure('public.preserve_completed_replay_item()') IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.preserve_replay_materialization_receipt()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.enforce_replay_checkpoint_capture_immutability()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.enforce_replay_plugin_identity_immutability()'
+    ) IS NOT NULL
+    OR EXISTS (
+      SELECT 1 FROM pg_catalog.pg_trigger
+      WHERE NOT tgisinternal AND tgname IN (
+        'listing_replay_run_items_checkpoint_exact',
+        'listing_replay_run_items_completed_immutable',
+        'plugin_submission_materialization_receipts_immutable',
+        'plugin_submissions_replay_checkpoint_immutable',
+        'plugin_installs_replay_identity_immutable'
+      )
+    )
   ) THEN
     RAISE EXCEPTION
       'listing replay objects exist without the exact migration contract';
@@ -806,6 +979,7 @@ CREATE TABLE IF NOT EXISTS public.listing_replay_run_items (
     CHECK (expected_rendered_html_sha256 ~ '^[0-9a-f]{64}$'),
   extracted_listing_sha256 TEXT
     CHECK (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 ~ '^[0-9a-f]{64}$'),
+  extracted_listing_json TEXT,
   extraction_state TEXT NOT NULL DEFAULT 'queued'
     CHECK (extraction_state IN ('queued', 'running', 'succeeded', 'rejected', 'failed')),
   materialization_state TEXT NOT NULL DEFAULT 'blocked'
@@ -881,6 +1055,7 @@ CREATE TABLE IF NOT EXISTS public.listing_replay_run_items (
   ),
   CHECK ((materialization_state = 'succeeded') = (resulting_listing_id IS NOT NULL)),
   CHECK ((extraction_state = 'succeeded') = (extracted_listing_sha256 IS NOT NULL)),
+  CHECK ((extraction_state = 'succeeded') = (extracted_listing_json IS NOT NULL)),
   CHECK (extraction_state = 'succeeded' OR materialization_state = 'blocked'),
   CHECK (extraction_state <> 'running' OR extraction_started_at IS NOT NULL),
   CHECK (materialization_state <> 'running' OR materialization_started_at IS NOT NULL)
@@ -889,6 +1064,76 @@ CREATE TABLE IF NOT EXISTS public.listing_replay_run_items (
 CREATE INDEX IF NOT EXISTS idx_listing_replay_run_items_phase
   ON public.listing_replay_run_items
     (run_id, extraction_state, materialization_state, position);
+
+CREATE OR REPLACE FUNCTION public.enforce_replay_extraction_checkpoint_exactness()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF NEW.extraction_state = 'succeeded' AND NOT EXISTS (
+    SELECT 1
+    FROM public.plugin_submissions submission
+    JOIN public.plugin_installs install ON install.id = submission.plugin_install_id
+    WHERE submission.id = NEW.plugin_submission_id
+      AND submission.rendered_html_sha256 = NEW.expected_rendered_html_sha256
+      AND submission.extracted_listing_json IS NOT DISTINCT FROM NEW.extracted_listing_json
+      AND submission.extraction_error IS NULL
+      AND CAST(submission.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+      AND (
+        install.revoked_at IS NULL
+        OR CAST(submission.submitted_at AS TIMESTAMPTZ)
+          <= CAST(install.revoked_at AS TIMESTAMPTZ)
+      )
+  ) THEN
+    RAISE EXCEPTION 'replay extraction transition does not match its exact checkpoint';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'listing_replay_run_items_checkpoint_exact'
+      AND tgrelid = pg_catalog.to_regclass('public.listing_replay_run_items')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER listing_replay_run_items_checkpoint_exact
+    BEFORE INSERT OR UPDATE ON public.listing_replay_run_items
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_replay_extraction_checkpoint_exactness();
+  END IF;
+END
+$trigger_install$;
+
+CREATE OR REPLACE FUNCTION public.preserve_completed_replay_item()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF OLD.materialization_state = 'succeeded' THEN
+    RAISE EXCEPTION 'completed replay item is immutable';
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'listing_replay_run_items_completed_immutable'
+      AND tgrelid = pg_catalog.to_regclass('public.listing_replay_run_items')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER listing_replay_run_items_completed_immutable
+    BEFORE UPDATE OR DELETE ON public.listing_replay_run_items
+    FOR EACH ROW EXECUTE FUNCTION public.preserve_completed_replay_item();
+  END IF;
+END
+$trigger_install$;
 
 CREATE TABLE IF NOT EXISTS public.plugin_submission_materialization_receipts (
   plugin_submission_id BIGINT PRIMARY KEY
@@ -902,11 +1147,181 @@ CREATE TABLE IF NOT EXISTS public.plugin_submission_materialization_receipts (
   completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE OR REPLACE FUNCTION public.preserve_replay_materialization_receipt()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'replay materialization receipt is immutable';
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'plugin_submission_materialization_receipts_immutable'
+      AND tgrelid = pg_catalog.to_regclass(
+        'public.plugin_submission_materialization_receipts'
+      )
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER plugin_submission_materialization_receipts_immutable
+    BEFORE UPDATE OR DELETE ON public.plugin_submission_materialization_receipts
+    FOR EACH ROW EXECUTE FUNCTION public.preserve_replay_materialization_receipt();
+  END IF;
+END
+$trigger_install$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_aircraft_sale_listings_owner_source
+  ON public.aircraft_sale_listings (created_by_user_id, source_url)
+  WHERE source_url IS NOT NULL AND length(BTRIM(source_url)) > 0;
+
+CREATE OR REPLACE FUNCTION public.enforce_replay_checkpoint_capture_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF (
+    EXISTS (
+      SELECT 1 FROM public.listing_replay_run_items item
+      WHERE item.plugin_submission_id = OLD.id
+        AND item.extraction_state = 'succeeded'
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.plugin_submission_materialization_receipts receipt
+      WHERE receipt.plugin_submission_id = OLD.id
+    )
+  ) AND (
+    NEW.id IS DISTINCT FROM OLD.id
+    OR NEW.user_id IS DISTINCT FROM OLD.user_id
+    OR NEW.plugin_install_id IS DISTINCT FROM OLD.plugin_install_id
+    OR NEW.source_url IS DISTINCT FROM OLD.source_url
+    OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at
+    OR NEW.rendered_html IS DISTINCT FROM OLD.rendered_html
+    OR NEW.rendered_html_sha256 IS DISTINCT FROM OLD.rendered_html_sha256
+    OR NEW.signature_base64 IS DISTINCT FROM OLD.signature_base64
+    OR NEW.extracted_listing_json IS DISTINCT FROM OLD.extracted_listing_json
+    OR NEW.extraction_error IS DISTINCT FROM OLD.extraction_error
+    OR NOT (
+      NEW.canonical_listing_id IS NOT DISTINCT FROM OLD.canonical_listing_id
+      OR (
+        OLD.canonical_listing_id IS NULL
+        AND NEW.canonical_listing_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM public.plugin_submission_materialization_receipts receipt
+          WHERE receipt.plugin_submission_id = OLD.id
+        )
+        AND EXISTS (
+          SELECT 1 FROM public.aircraft_sale_listings listing
+          WHERE listing.id = NEW.canonical_listing_id
+            AND listing.created_by_user_id = OLD.user_id
+            AND listing.source_url = OLD.source_url
+        )
+      )
+    )
+  ) THEN
+    RAISE EXCEPTION 'replay checkpoint capture is immutable';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'plugin_submissions_replay_checkpoint_immutable'
+      AND tgrelid = pg_catalog.to_regclass('public.plugin_submissions')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER plugin_submissions_replay_checkpoint_immutable
+    BEFORE UPDATE ON public.plugin_submissions
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_replay_checkpoint_capture_immutability();
+  END IF;
+END
+$trigger_install$;
+
+CREATE OR REPLACE FUNCTION public.enforce_replay_plugin_identity_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.plugin_submissions submission
+    WHERE submission.plugin_install_id = OLD.id
+      AND (
+        EXISTS (
+          SELECT 1 FROM public.listing_replay_run_items item
+          WHERE item.plugin_submission_id = submission.id
+            AND item.extraction_state = 'succeeded'
+        )
+        OR EXISTS (
+          SELECT 1 FROM public.plugin_submission_materialization_receipts receipt
+          WHERE receipt.plugin_submission_id = submission.id
+        )
+      )
+  ) AND (
+    NEW.id IS DISTINCT FROM OLD.id
+    OR NEW.user_id IS DISTINCT FROM OLD.user_id
+    OR NEW.public_key_base64 IS DISTINCT FROM OLD.public_key_base64
+    OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    OR NOT (
+      NEW.revoked_at IS NOT DISTINCT FROM OLD.revoked_at
+      OR (
+        OLD.revoked_at IS NULL
+        AND NEW.revoked_at IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.plugin_submissions submission
+          WHERE submission.plugin_install_id = OLD.id
+            AND (
+              EXISTS (
+                SELECT 1 FROM public.listing_replay_run_items item
+                WHERE item.plugin_submission_id = submission.id
+                  AND item.extraction_state = 'succeeded'
+              )
+              OR EXISTS (
+                SELECT 1 FROM public.plugin_submission_materialization_receipts receipt
+                WHERE receipt.plugin_submission_id = submission.id
+              )
+            )
+            AND CAST(submission.submitted_at AS TIMESTAMPTZ)
+              > CAST(NEW.revoked_at AS TIMESTAMPTZ)
+        )
+      )
+    )
+  ) THEN
+    RAISE EXCEPTION 'replay checkpoint plugin identity is immutable';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'plugin_installs_replay_identity_immutable'
+      AND tgrelid = pg_catalog.to_regclass('public.plugin_installs')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER plugin_installs_replay_identity_immutable
+    BEFORE UPDATE ON public.plugin_installs
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_replay_plugin_identity_immutability();
+  END IF;
+END
+$trigger_install$;
+
 INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c',
+  'ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 

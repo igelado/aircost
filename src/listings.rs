@@ -1211,6 +1211,15 @@ async fn insert_listing(
                   AND exact_install.user_id = plugin_submissions.user_id
                   AND exact_install.public_key_base64 = ?
                   AND exact_install.revoked_at IS ?
+                  AND julianday(plugin_submissions.submitted_at) IS NOT NULL
+                  AND (
+                    exact_install.revoked_at IS NULL
+                    OR (
+                      julianday(exact_install.revoked_at) IS NOT NULL
+                      AND julianday(plugin_submissions.submitted_at)
+                        <= julianday(exact_install.revoked_at)
+                    )
+                  )
               )
             "#
         }
@@ -1231,7 +1240,40 @@ async fn insert_listing(
                   AND exact_install.user_id = plugin_submissions.user_id
                   AND exact_install.public_key_base64 = ?
                   AND exact_install.revoked_at IS NOT DISTINCT FROM ?
+                  AND CAST(plugin_submissions.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+                  AND (
+                    exact_install.revoked_at IS NULL
+                    OR CAST(plugin_submissions.submitted_at AS TIMESTAMPTZ)
+                      <= CAST(exact_install.revoked_at AS TIMESTAMPTZ)
+                  )
               )
+            "#
+        }
+    });
+    let lock_exact_install_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS ?
+              AND julianday(?) IS NOT NULL
+              AND (
+                revoked_at IS NULL
+                OR (julianday(revoked_at) IS NOT NULL AND julianday(?) <= julianday(revoked_at))
+              )
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS NOT DISTINCT FROM ?
+              AND CAST(? AS TIMESTAMPTZ) IS NOT NULL
+              AND (
+                revoked_at IS NULL
+                OR CAST(? AS TIMESTAMPTZ) <= CAST(revoked_at AS TIMESTAMPTZ)
+              )
+            FOR SHARE
             "#
         }
     });
@@ -1258,6 +1300,23 @@ async fn insert_listing(
     macro_rules! insert_and_bind {
         ($pool:expr) => {{
             let mut transaction = $pool.begin().await?;
+            if let Some(binding) = signed_source_binding {
+                let install_id = sqlx::query_scalar::<_, i64>(&lock_exact_install_sql)
+                    .bind(binding.plugin_install_id)
+                    .bind(binding.user_id)
+                    .bind(binding.install_public_key_base64.as_str())
+                    .bind(binding.install_revoked_at.as_deref())
+                    .bind(binding.submitted_at.as_str())
+                    .bind(binding.submitted_at.as_str())
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                if install_id != Some(binding.plugin_install_id) {
+                    return Err(ListingStoreError::State(
+                        "signed source install changed before its listing could be atomically bound"
+                            .to_string(),
+                    ));
+                }
+            }
             let listing_id = sqlx::query_scalar::<_, i64>(&insert_sql)
                 .bind(aircraft_model_variant_id)
                 .bind(user_id)
@@ -1293,7 +1352,8 @@ async fn insert_listing(
                 .bind(values.installed_propeller_evidence_text.as_deref())
                 .bind(values.installed_propeller_confidence.as_deref())
                 .fetch_one(&mut *transaction)
-                .await?;
+                .await
+                .map_err(listing_insert_error)?;
             if let Some(binding) = signed_source_binding {
                 let bound = sqlx::query(&bind_exact_signed_checkpoint_sql)
                     .bind(listing_id)
@@ -1359,6 +1419,23 @@ async fn insert_listing(
         .await;
     }
     Ok(listing_id)
+}
+
+fn listing_insert_error(error: sqlx::Error) -> ListingStoreError {
+    let source_claim_conflict = match &error {
+        sqlx::Error::Database(database) => {
+            database.constraint() == Some("uq_aircraft_sale_listings_owner_source")
+                || database.message().contains(
+                    "aircraft_sale_listings.created_by_user_id, aircraft_sale_listings.source_url",
+                )
+        }
+        _ => false,
+    };
+    if source_claim_conflict {
+        ListingStoreError::State("listing source is already claimed by this owner".to_string())
+    } else {
+        error.into()
+    }
 }
 
 async fn update_listing_values(
@@ -7031,7 +7108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_source_serial_correction_isolated_from_same_source_and_tail() {
+    async fn signed_source_serial_correction_rejects_an_existing_owner_source_claim() {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -7092,7 +7169,7 @@ mod tests {
             before
         );
 
-        let created = super::create_listing_with_progress_and_occurrence_dispositions(
+        let signed_error = super::create_listing_with_progress_and_occurrence_dispositions(
             &db,
             user.id,
             &preview,
@@ -7103,56 +7180,24 @@ mod tests {
             None,
         )
         .await
-        .expect("signed source admission should isolate the corrected observation");
-        assert_ne!(created.listing.id, existing_id);
-        assert_eq!(created.listing.serial_number.as_deref(), Some("TESTSERIAL"));
-        assert_eq!(created.listing.ingestion_state, "quarantined");
-        assert_eq!(
-            created.listing.ingestion_error.as_deref(),
-            Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
-        );
-        assert!(!created.listing.is_verified);
-        assert!(created.listing.ingestion_completed_at.is_none());
-        let gated_before_finalize = created.listing.clone();
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
-        assert!(sqlx::query(
-            "UPDATE aircraft_sale_listings SET ingestion_state = 'incomplete', ingestion_error = NULL WHERE id = ?",
-        )
-        .bind(created.listing.id)
-        .execute(pool)
-        .await
-        .is_err(), "the database must reject bypassing the receipt gate directly");
-        let finalize_error = super::finalize_reviewed_listing_ingestion(
-            &db,
-            created.listing.id,
-            None,
-            preview.context_text.as_deref(),
-        )
-        .await
-        .expect_err("a corrected listing must not finalize before its bound receipt exists");
-        assert!(finalize_error
-            .to_string()
-            .contains("immutable source identity correction receipt"));
-        assert_eq!(
-            super::get_listing(&db, user.id, created.listing.id)
-                .await
-                .expect("receipt-gated listing should remain private"),
-            gated_before_finalize
-        );
-        assert_eq!(
-            created.source_serial_correction.as_ref().map(|correction| (
-                correction.observed_serial_number.as_str(),
-                correction.corrected_serial_number.as_str()
-            )),
-            Some(("TESTSERAL", "TESTSERIAL"))
-        );
+        .expect_err("signed source admission must not create a second owner/source row");
+        assert!(signed_error.to_string().contains("already claimed"));
         assert_eq!(
             super::get_listing(&db, user.id, existing_id)
                 .await
                 .expect("legacy listing should remain byte-for-byte unchanged"),
             before
+        );
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                "SELECT COUNT(*) FROM aircraft_sale_listings WHERE created_by_user_id = ? AND source_url = ?",
+                user.id,
+                source_url
+            )
+            .expect("source claim count should load"),
+            1
         );
     }
 

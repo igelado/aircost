@@ -316,23 +316,19 @@ pub async fn replay_captures(
             let operation = match request.phase {
                 ReplayPhase::Extraction => {
                     if state.checkpoint.is_some() || state.canonical_listing_id.is_some() {
-                        let checkpoint_sha256 = state
-                            .checkpoint
-                            .as_ref()
-                            .map(|checkpoint| checkpoint.extracted_listing_sha256.as_str())
-                            .ok_or_else(|| {
-                                ReplayRunError::Validation(
-                                    "a bound replay capture is missing its extraction checkpoint"
-                                        .to_string(),
-                                )
-                            })?;
+                        let checkpoint = state.checkpoint.as_ref().ok_or_else(|| {
+                            ReplayRunError::Validation(
+                                "a bound replay capture is missing its extraction checkpoint"
+                                    .to_string(),
+                            )
+                        })?;
                         finish_succeeded(
                             db,
                             run.id,
                             claimed,
                             request.phase,
                             &owner_token,
-                            Some(checkpoint_sha256),
+                            Some(checkpoint),
                             state.canonical_listing_id,
                         )
                         .await
@@ -366,7 +362,7 @@ pub async fn replay_captures(
                                     claimed,
                                     request.phase,
                                     &owner_token,
-                                    Some(&checkpoint.extracted_listing_sha256),
+                                    Some(&checkpoint),
                                     None,
                                 )
                                 .await
@@ -543,91 +539,172 @@ async fn reconcile_materialization_domain_state(
     checkpoint: Option<&crate::plugin::PluginExtractionCheckpoint>,
     listing_id: Option<i64>,
 ) -> ReplayRunResult<bool> {
-    if let Some(listing_id) = listing_id {
-        let checkpoint = checkpoint.ok_or_else(|| {
-            ReplayRunError::Validation(
+    let Some(checkpoint) = checkpoint else {
+        if listing_id.is_some() {
+            return Err(ReplayRunError::Validation(
                 "a bound replay capture is missing its extraction checkpoint".to_string(),
-            )
-        })?;
-        let sql = db.sql(
-            r#"UPDATE listing_replay_run_items
-               SET extraction_state = 'succeeded', materialization_state = 'succeeded',
-                   resulting_listing_id = ?, extracted_listing_sha256 = ?,
-                   extraction_completed_at = COALESCE(extraction_completed_at, CURRENT_TIMESTAMP),
-                   materialization_completed_at = CURRENT_TIMESTAMP,
-                   last_failure_phase = NULL, last_failure_reason_code = NULL,
-                   updated_at = CURRENT_TIMESTAMP
-               WHERE run_id = ? AND plugin_submission_id = ?
-                 AND extraction_state <> 'rejected' AND materialization_state <> 'rejected'
-                 AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
-                 AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
-                   AND run.status = 'running' AND run.active_phase = 'materialization'
-                   AND run.owner_token = ?)"#,
-        );
-        let changed = execute(
-            db,
-            &sql,
-            &[
-                Bind::I64(listing_id),
-                Bind::Text(&checkpoint.extracted_listing_sha256),
-                Bind::I64(run_id),
-                Bind::I64(submission_id),
-                Bind::Text(&checkpoint.extracted_listing_sha256),
-                Bind::I64(run_id),
-                Bind::Text(owner_token),
-            ],
-        )
-        .await?;
-        if changed != 1 {
-            return Err(ReplayRunError::Conflict(
-                "replay ownership or terminal state changed during binding reconciliation"
-                    .to_string(),
             ));
         }
-        return Ok(true);
+        return Ok(false);
+    };
+    if listing_id.is_some() && checkpoint.exact_capture.canonical_listing_id != listing_id {
+        return Err(ReplayRunError::Conflict(
+            "materialization receipt does not match the exact capture binding".to_string(),
+        ));
     }
-    if let Some(checkpoint) = checkpoint {
-        let sql = db.sql(
-            r#"UPDATE listing_replay_run_items
-               SET extraction_state = 'succeeded',
-                   extracted_listing_sha256 = ?,
-                   materialization_state = CASE
-                     WHEN materialization_state = 'blocked' THEN 'queued'
-                     ELSE materialization_state END,
-                   extraction_completed_at = COALESCE(extraction_completed_at, CURRENT_TIMESTAMP),
-                   last_failure_phase = CASE WHEN last_failure_phase = 'extraction'
-                     THEN NULL ELSE last_failure_phase END,
-                   last_failure_reason_code = CASE WHEN last_failure_phase = 'extraction'
-                     THEN NULL ELSE last_failure_reason_code END,
-                   updated_at = CURRENT_TIMESTAMP
-               WHERE run_id = ? AND plugin_submission_id = ?
-                 AND extraction_state <> 'rejected'
-                 AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
-                 AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
-                   AND run.status = 'running' AND run.active_phase = 'materialization'
-                   AND run.owner_token = ?)"#,
-        );
-        let changed = execute(
-            db,
-            &sql,
-            &[
-                Bind::Text(&checkpoint.extracted_listing_sha256),
-                Bind::I64(run_id),
-                Bind::I64(submission_id),
-                Bind::Text(&checkpoint.extracted_listing_sha256),
-                Bind::I64(run_id),
-                Bind::Text(owner_token),
-            ],
-        )
-        .await?;
-        if changed != 1 {
-            return Err(ReplayRunError::Conflict(
-                "replay ownership or terminal state changed during checkpoint reconciliation"
-                    .to_string(),
-            ));
+    reconcile_exact_checkpoint(
+        db,
+        run_id,
+        submission_id,
+        owner_token,
+        checkpoint,
+        listing_id,
+    )
+    .await?;
+    Ok(listing_id.is_some())
+}
+
+async fn reconcile_exact_checkpoint(
+    db: &AppDb,
+    run_id: i64,
+    submission_id: i64,
+    owner_token: &str,
+    checkpoint: &crate::plugin::PluginExtractionCheckpoint,
+    listing_id: Option<i64>,
+) -> ReplayRunResult<()> {
+    let update_sql = db.sql(
+        r#"UPDATE listing_replay_run_items
+           SET extraction_state = 'succeeded',
+               extracted_listing_sha256 = ?, extracted_listing_json = ?,
+               materialization_state = CASE
+                 WHEN ? IS NOT NULL THEN 'succeeded'
+                 WHEN materialization_state = 'blocked' THEN 'queued'
+                 ELSE materialization_state END,
+               resulting_listing_id = CASE
+                 WHEN ? IS NOT NULL THEN ? ELSE resulting_listing_id END,
+               extraction_completed_at = COALESCE(extraction_completed_at, CURRENT_TIMESTAMP),
+               materialization_completed_at = CASE WHEN ? IS NOT NULL
+                 THEN CURRENT_TIMESTAMP ELSE materialization_completed_at END,
+               last_failure_phase = CASE
+                 WHEN ? IS NOT NULL OR last_failure_phase = 'extraction'
+                 THEN NULL ELSE last_failure_phase END,
+               last_failure_reason_code = CASE
+                 WHEN ? IS NOT NULL OR last_failure_phase = 'extraction'
+                 THEN NULL ELSE last_failure_reason_code END,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE run_id = ? AND plugin_submission_id = ?
+             AND extraction_state <> 'rejected' AND materialization_state <> 'rejected'
+             AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
+             AND (extracted_listing_json IS NULL OR extracted_listing_json = ?)
+             AND EXISTS (SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
+               AND run.status = 'running' AND run.active_phase = 'materialization'
+               AND run.owner_token = ?)"#,
+    );
+    let lock_sql = exact_replay_capture_lock_sql(db);
+    macro_rules! reconcile_transaction {
+        ($pool:expr) => {{
+            let capture = &checkpoint.exact_capture;
+            let mut transaction = $pool.begin().await?;
+            let locked = sqlx::query_scalar::<_, i64>(&lock_sql)
+                .bind(capture.submission_id)
+                .bind(capture.user_id)
+                .bind(capture.plugin_install_id)
+                .bind(&capture.public_key_base64)
+                .bind(capture.install_revoked_at.as_deref())
+                .bind(&capture.source_url)
+                .bind(&capture.submitted_at)
+                .bind(&capture.rendered_html)
+                .bind(&capture.rendered_html_sha256)
+                .bind(&capture.signature_base64)
+                .bind(&capture.extracted_listing_json)
+                .bind(capture.canonical_listing_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if locked != Some(submission_id) {
+                return Err(ReplayRunError::Conflict(
+                    "the exact verified capture changed before reconciliation".to_string(),
+                ));
+            }
+            let changed = sqlx::query(&update_sql)
+                .bind(&checkpoint.extracted_listing_sha256)
+                .bind(&checkpoint.exact_extracted_listing_json)
+                .bind(listing_id)
+                .bind(listing_id)
+                .bind(listing_id)
+                .bind(listing_id)
+                .bind(listing_id)
+                .bind(listing_id)
+                .bind(run_id)
+                .bind(submission_id)
+                .bind(&checkpoint.extracted_listing_sha256)
+                .bind(&checkpoint.exact_extracted_listing_json)
+                .bind(run_id)
+                .bind(owner_token)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            if changed != 1 {
+                return Err(ReplayRunError::Conflict(
+                    "replay ownership or terminal state changed during reconciliation".to_string(),
+                ));
+            }
+            transaction.commit().await?;
+            Ok::<(), ReplayRunError>(())
+        }};
+    }
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => reconcile_transaction!(pool),
+        DatabaseBackend::Postgres(pool) => reconcile_transaction!(pool),
+    }
+}
+
+fn exact_replay_capture_lock_sql(db: &AppDb) -> String {
+    db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"SELECT submission.id
+               FROM plugin_submissions submission
+               JOIN plugin_installs install ON install.id = submission.plugin_install_id
+               WHERE submission.id = ? AND submission.user_id = ?
+                 AND submission.plugin_install_id = ?
+                 AND install.user_id = submission.user_id
+                 AND install.public_key_base64 = ? AND install.revoked_at IS ?
+                 AND submission.source_url = ? AND submission.submitted_at = ?
+                 AND submission.rendered_html = ?
+                 AND submission.rendered_html_sha256 = ?
+                 AND submission.signature_base64 = ?
+                 AND submission.extracted_listing_json = ?
+                 AND submission.extraction_error IS NULL
+                 AND submission.canonical_listing_id IS ?
+                 AND julianday(submission.submitted_at) IS NOT NULL
+                 AND (install.revoked_at IS NULL OR (
+                   julianday(install.revoked_at) IS NOT NULL
+                   AND julianday(submission.submitted_at) <= julianday(install.revoked_at)
+                 ))"#
         }
-    }
-    Ok(false)
+        DatabaseBackend::Postgres(_) => {
+            r#"SELECT submission.id
+               FROM plugin_submissions submission
+               JOIN plugin_installs install ON install.id = submission.plugin_install_id
+               WHERE submission.id = ? AND submission.user_id = ?
+                 AND submission.plugin_install_id = ?
+                 AND install.user_id = submission.user_id
+                 AND install.public_key_base64 = ?
+                 AND install.revoked_at IS NOT DISTINCT FROM ?
+                 AND submission.source_url = ? AND submission.submitted_at = ?
+                 AND submission.rendered_html = ?
+                 AND submission.rendered_html_sha256 = ?
+                 AND submission.signature_base64 = ?
+                 AND submission.extracted_listing_json = ?
+                 AND submission.extraction_error IS NULL
+                 AND submission.canonical_listing_id IS NOT DISTINCT FROM ?
+                 AND CAST(submission.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+                 AND (install.revoked_at IS NULL
+                   OR CAST(submission.submitted_at AS TIMESTAMPTZ)
+                     <= CAST(install.revoked_at AS TIMESTAMPTZ))
+               FOR UPDATE OF submission, install"#
+        }
+    })
+    .into_owned()
 }
 
 async fn with_heartbeat<F, T>(
@@ -1044,20 +1121,29 @@ async fn finish_succeeded(
     item: ClaimedItem,
     phase: ReplayPhase,
     owner_token: &str,
-    checkpoint_sha256: Option<&str>,
+    checkpoint: Option<&crate::plugin::PluginExtractionCheckpoint>,
     listing_id: Option<i64>,
 ) -> ReplayRunResult<()> {
+    if phase == ReplayPhase::Extraction && checkpoint.is_none() {
+        return Err(ReplayRunError::Conflict(
+            "replay ownership or state changed during its owned transition".to_string(),
+        ));
+    }
+    let checkpoint_sha256 = checkpoint.map(|value| value.extracted_listing_sha256.as_str());
+    let checkpoint_json = checkpoint.map(|value| value.exact_extracted_listing_json.as_str());
     let sql = match phase {
         ReplayPhase::Extraction => db.sql(
             r#"UPDATE listing_replay_run_items SET extraction_state = 'succeeded',
                  materialization_state = 'queued', extraction_completed_at = CURRENT_TIMESTAMP,
-                 extracted_listing_sha256 = ?,
+                 extracted_listing_sha256 = ?, extracted_listing_json = ?,
                  last_failure_phase = NULL, last_failure_reason_code = NULL,
                  updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND run_id = ? AND plugin_submission_id = ?
                  AND extraction_state = 'running'
                  AND ? IS NOT NULL
+                 AND ? IS NOT NULL
                  AND (extracted_listing_sha256 IS NULL OR extracted_listing_sha256 = ?)
+                 AND (extracted_listing_json IS NULL OR extracted_listing_json = ?)
                  AND EXISTS (
                    SELECT 1 FROM listing_replay_runs run WHERE run.id = ?
                      AND run.status = 'running' AND run.owner_token = ?)"#,
@@ -1073,31 +1159,110 @@ async fn finish_succeeded(
                      AND run.status = 'running' AND run.owner_token = ?)"#,
         ),
     };
+    let lock_capture_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"SELECT submission.id
+               FROM plugin_submissions submission
+               JOIN plugin_installs install ON install.id = submission.plugin_install_id
+               WHERE submission.id = ? AND submission.user_id = ?
+                 AND submission.plugin_install_id = ?
+                 AND install.user_id = submission.user_id
+                 AND install.public_key_base64 = ? AND install.revoked_at IS ?
+                 AND submission.source_url = ? AND submission.submitted_at = ?
+                 AND submission.rendered_html = ?
+                 AND submission.rendered_html_sha256 = ?
+                 AND submission.signature_base64 = ?
+                 AND submission.extracted_listing_json = ?
+                 AND submission.extraction_error IS NULL
+                 AND submission.canonical_listing_id IS ?
+                 AND julianday(submission.submitted_at) IS NOT NULL
+                 AND (install.revoked_at IS NULL OR (
+                   julianday(install.revoked_at) IS NOT NULL
+                   AND julianday(submission.submitted_at) <= julianday(install.revoked_at)
+                 ))"#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"SELECT submission.id
+               FROM plugin_submissions submission
+               JOIN plugin_installs install ON install.id = submission.plugin_install_id
+               WHERE submission.id = ? AND submission.user_id = ?
+                 AND submission.plugin_install_id = ?
+                 AND install.user_id = submission.user_id
+                 AND install.public_key_base64 = ?
+                 AND install.revoked_at IS NOT DISTINCT FROM ?
+                 AND submission.source_url = ? AND submission.submitted_at = ?
+                 AND submission.rendered_html = ?
+                 AND submission.rendered_html_sha256 = ?
+                 AND submission.signature_base64 = ?
+                 AND submission.extracted_listing_json = ?
+                 AND submission.extraction_error IS NULL
+                 AND submission.canonical_listing_id IS NOT DISTINCT FROM ?
+                 AND CAST(submission.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+                 AND (install.revoked_at IS NULL
+                   OR CAST(submission.submitted_at AS TIMESTAMPTZ)
+                     <= CAST(install.revoked_at AS TIMESTAMPTZ))
+               FOR UPDATE OF submission, install"#
+        }
+    });
+    macro_rules! finish_exact_extraction {
+        ($pool:expr) => {{
+            let checkpoint = checkpoint.ok_or_else(|| {
+                ReplayRunError::Validation(
+                    "successful extraction requires an exact capture checkpoint".to_string(),
+                )
+            })?;
+            let capture = &checkpoint.exact_capture;
+            let mut transaction = $pool.begin().await?;
+            let locked = sqlx::query_scalar::<_, i64>(&lock_capture_sql)
+                .bind(capture.submission_id)
+                .bind(capture.user_id)
+                .bind(capture.plugin_install_id)
+                .bind(&capture.public_key_base64)
+                .bind(capture.install_revoked_at.as_deref())
+                .bind(&capture.source_url)
+                .bind(&capture.submitted_at)
+                .bind(&capture.rendered_html)
+                .bind(&capture.rendered_html_sha256)
+                .bind(&capture.signature_base64)
+                .bind(&capture.extracted_listing_json)
+                .bind(capture.canonical_listing_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if locked != Some(item.submission_id) {
+                return Err(ReplayRunError::Conflict(
+                    "the exact verified capture changed before its extraction could be pinned"
+                        .to_string(),
+                ));
+            }
+            let changed = sqlx::query(&sql)
+                .bind(checkpoint_sha256)
+                .bind(checkpoint_json)
+                .bind(item.id)
+                .bind(run_id)
+                .bind(item.submission_id)
+                .bind(checkpoint_sha256)
+                .bind(checkpoint_json)
+                .bind(checkpoint_sha256)
+                .bind(checkpoint_json)
+                .bind(run_id)
+                .bind(owner_token)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            if changed != 1 {
+                return Err(ReplayRunError::Conflict(
+                    "replay ownership or state changed during its owned transition".to_string(),
+                ));
+            }
+            transaction.commit().await?;
+            Ok::<u64, ReplayRunError>(changed)
+        }};
+    }
     let changed = match (db.backend(), phase) {
-        (DatabaseBackend::Sqlite(pool), ReplayPhase::Extraction) => sqlx::query(&sql)
-            .bind(checkpoint_sha256)
-            .bind(item.id)
-            .bind(run_id)
-            .bind(item.submission_id)
-            .bind(checkpoint_sha256)
-            .bind(checkpoint_sha256)
-            .bind(run_id)
-            .bind(owner_token)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-        (DatabaseBackend::Postgres(pool), ReplayPhase::Extraction) => sqlx::query(&sql)
-            .bind(checkpoint_sha256)
-            .bind(item.id)
-            .bind(run_id)
-            .bind(item.submission_id)
-            .bind(checkpoint_sha256)
-            .bind(checkpoint_sha256)
-            .bind(run_id)
-            .bind(owner_token)
-            .execute(pool)
-            .await?
-            .rows_affected(),
+        (DatabaseBackend::Sqlite(pool), ReplayPhase::Extraction) => finish_exact_extraction!(pool)?,
+        (DatabaseBackend::Postgres(pool), ReplayPhase::Extraction) => {
+            finish_exact_extraction!(pool)?
+        }
         (DatabaseBackend::Sqlite(pool), ReplayPhase::Materialization) => sqlx::query(&sql)
             .bind(listing_id)
             .bind(item.id)
@@ -2132,6 +2297,97 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn extraction_transition_rejects_every_full_capture_interleaving() {
+        for drift in [
+            "rendered_html",
+            "source_url",
+            "submitted_at",
+            "signature_base64",
+            "extracted_listing_json",
+            "public_key_base64",
+            "revoked_at",
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let (manifest, submission_id, user) = signed_checkpoint(&db).await;
+            let run = ensure_run(&db, &manifest).await.unwrap();
+            acquire_run(&db, run.id, ReplayPhase::Extraction, "exact-owner", false)
+                .await
+                .unwrap();
+            let claimed = claim_item(
+                &db,
+                run.id,
+                submission_id,
+                ReplayPhase::Extraction,
+                "exact-owner",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let state = inspect_plugin_replay_capture_state(&db, user.id, submission_id)
+                .await
+                .unwrap();
+            let checkpoint = state.checkpoint.as_ref().unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let mutation = match drift {
+                "rendered_html" => {
+                    "UPDATE plugin_submissions SET rendered_html = rendered_html || ' changed' WHERE id = ?"
+                }
+                "source_url" => {
+                    "UPDATE plugin_submissions SET source_url = source_url || '/changed' WHERE id = ?"
+                }
+                "submitted_at" => {
+                    "UPDATE plugin_submissions SET submitted_at = '2026-08-19 12:00:01' WHERE id = ?"
+                }
+                "signature_base64" => {
+                    "UPDATE plugin_submissions SET signature_base64 = signature_base64 || 'changed' WHERE id = ?"
+                }
+                "extracted_listing_json" => {
+                    "UPDATE plugin_submissions SET extracted_listing_json = extracted_listing_json || ' ' WHERE id = ?"
+                }
+                "public_key_base64" => {
+                    "UPDATE plugin_installs SET public_key_base64 = public_key_base64 || 'changed' WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"
+                }
+                "revoked_at" => {
+                    "UPDATE plugin_installs SET revoked_at = '2026-08-19 12:00:01Z' WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"
+                }
+                _ => unreachable!(),
+            };
+            sqlx::query(mutation)
+                .bind(submission_id)
+                .execute(pool)
+                .await
+                .unwrap();
+
+            let error = finish_succeeded(
+                &db,
+                run.id,
+                claimed,
+                ReplayPhase::Extraction,
+                "exact-owner",
+                Some(checkpoint),
+                None,
+            )
+            .await
+            .expect_err("capture drift must fail before the ledger pins extraction");
+            assert!(
+                matches!(error, ReplayRunError::Conflict(_)),
+                "{drift}: {error}"
+            );
+            let extraction_state: String = sqlx::query_scalar(
+                "SELECT extraction_state FROM listing_replay_run_items WHERE run_id = ? AND plugin_submission_id = ?",
+            )
+            .bind(run.id)
+            .bind(submission_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(extraction_state, "running", "{drift}");
+        }
     }
 
     async fn age_running_replay_for_recovery(db: &AppDb) {

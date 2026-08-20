@@ -173,6 +173,26 @@ pub struct PluginExtractionCheckpoint {
     pub rendered_html_sha256: String,
     pub extracted_listing_sha256: String,
     pub avionics_occurrence_count: usize,
+    #[serde(skip)]
+    pub(crate) exact_extracted_listing_json: String,
+    #[serde(skip)]
+    pub(crate) exact_capture: PluginReplayCaptureAttestation,
+}
+
+#[derive(Debug)]
+pub(crate) struct PluginReplayCaptureAttestation {
+    pub(crate) submission_id: i64,
+    pub(crate) user_id: i64,
+    pub(crate) plugin_install_id: i64,
+    pub(crate) public_key_base64: String,
+    pub(crate) install_revoked_at: Option<String>,
+    pub(crate) source_url: String,
+    pub(crate) submitted_at: String,
+    pub(crate) rendered_html: String,
+    pub(crate) rendered_html_sha256: String,
+    pub(crate) signature_base64: String,
+    pub(crate) extracted_listing_json: String,
+    pub(crate) canonical_listing_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,6 +327,26 @@ struct MaterializationReceiptRow {
     aircraft_sale_listing_id: i64,
     rendered_html_sha256: String,
     extracted_listing_sha256: String,
+}
+
+fn replay_capture_attestation(
+    stored: &PluginCheckpointRow,
+    extracted_listing_json: &str,
+) -> PluginReplayCaptureAttestation {
+    PluginReplayCaptureAttestation {
+        submission_id: stored.id,
+        user_id: stored.user_id,
+        plugin_install_id: stored.plugin_install_id,
+        public_key_base64: stored.public_key_base64.clone(),
+        install_revoked_at: stored.install_revoked_at.clone(),
+        source_url: stored.source_url.clone(),
+        submitted_at: stored.submitted_at.clone(),
+        rendered_html: stored.rendered_html.clone(),
+        rendered_html_sha256: stored.rendered_html_sha256.clone(),
+        signature_base64: stored.signature_base64.clone(),
+        extracted_listing_json: extracted_listing_json.to_string(),
+        canonical_listing_id: stored.canonical_listing_id,
+    }
 }
 
 pub async fn plugin_submission_owner(db: &AppDb, submission_id: i64) -> StoreResult<User> {
@@ -1430,9 +1470,11 @@ pub async fn checkpoint_plugin_submission_extraction(
     store_plugin_extraction_checkpoint(db, &stored, &payload_json).await?;
     Ok(PluginExtractionCheckpoint {
         submission_id,
-        rendered_html_sha256: stored.rendered_html_sha256,
+        rendered_html_sha256: stored.rendered_html_sha256.clone(),
         extracted_listing_sha256: payload_sha256,
         avionics_occurrence_count: occurrences.len(),
+        exact_extracted_listing_json: payload_json,
+        exact_capture: replay_capture_attestation(&stored, &payload.to_string()),
     })
 }
 
@@ -1441,8 +1483,36 @@ async fn store_plugin_extraction_checkpoint(
     stored: &PluginCheckpointRow,
     payload_json: &str,
 ) -> StoreResult<()> {
-    let sql = db.sql(
-        r#"
+    let lock_install_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS ?
+              AND julianday(?) IS NOT NULL
+              AND (
+                revoked_at IS NULL
+                OR (julianday(revoked_at) IS NOT NULL AND julianday(?) <= julianday(revoked_at))
+              )
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS NOT DISTINCT FROM ?
+              AND CAST(? AS TIMESTAMPTZ) IS NOT NULL
+              AND (
+                revoked_at IS NULL
+                OR CAST(? AS TIMESTAMPTZ) <= CAST(revoked_at AS TIMESTAMPTZ)
+              )
+            FOR SHARE
+            "#
+        }
+    });
+    let sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
         UPDATE plugin_submissions
         SET extracted_listing_json = ?,
             extraction_error = NULL,
@@ -1451,42 +1521,111 @@ async fn store_plugin_extraction_checkpoint(
           AND user_id = ?
           AND plugin_install_id = ?
           AND source_url = ?
+          AND submitted_at = ?
+          AND rendered_html = ?
           AND rendered_html_sha256 = ?
           AND signature_base64 = ?
           AND extracted_listing_json IS NULL
           AND extraction_error IS NULL
           AND canonical_listing_id IS NULL
-        "#,
-    );
-    let changed = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => sqlx::query(&sql)
-            .bind(payload_json)
-            .bind(stored.id)
-            .bind(stored.user_id)
-            .bind(stored.plugin_install_id)
-            .bind(&stored.source_url)
-            .bind(&stored.rendered_html_sha256)
-            .bind(&stored.signature_base64)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-        DatabaseBackend::Postgres(pool) => sqlx::query(&sql)
-            .bind(payload_json)
-            .bind(stored.id)
-            .bind(stored.user_id)
-            .bind(stored.plugin_install_id)
-            .bind(&stored.source_url)
-            .bind(&stored.rendered_html_sha256)
-            .bind(&stored.signature_base64)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-    };
-    if changed != 1 {
-        return Err(PluginStoreError::Database(
-            "signed capture changed while its extraction checkpoint was being stored".to_string(),
-        ));
+          AND EXISTS (
+            SELECT 1 FROM plugin_installs exact_install
+            WHERE exact_install.id = plugin_submissions.plugin_install_id
+              AND exact_install.user_id = plugin_submissions.user_id
+              AND exact_install.public_key_base64 = ?
+              AND exact_install.revoked_at IS ?
+              AND julianday(plugin_submissions.submitted_at) IS NOT NULL
+              AND (
+                exact_install.revoked_at IS NULL
+                OR (
+                  julianday(exact_install.revoked_at) IS NOT NULL
+                  AND julianday(plugin_submissions.submitted_at)
+                    <= julianday(exact_install.revoked_at)
+                )
+              )
+          )
+        "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+        UPDATE plugin_submissions
+        SET extracted_listing_json = ?,
+            extraction_error = NULL,
+            canonical_listing_id = NULL
+        WHERE id = ?
+          AND user_id = ?
+          AND plugin_install_id = ?
+          AND source_url = ?
+          AND submitted_at = ?
+          AND rendered_html = ?
+          AND rendered_html_sha256 = ?
+          AND signature_base64 = ?
+          AND extracted_listing_json IS NULL
+          AND extraction_error IS NULL
+          AND canonical_listing_id IS NULL
+          AND EXISTS (
+            SELECT 1 FROM plugin_installs exact_install
+            WHERE exact_install.id = plugin_submissions.plugin_install_id
+              AND exact_install.user_id = plugin_submissions.user_id
+              AND exact_install.public_key_base64 = ?
+              AND exact_install.revoked_at IS NOT DISTINCT FROM ?
+              AND CAST(plugin_submissions.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+              AND (
+                exact_install.revoked_at IS NULL
+                OR CAST(plugin_submissions.submitted_at AS TIMESTAMPTZ)
+                  <= CAST(exact_install.revoked_at AS TIMESTAMPTZ)
+              )
+          )
+        "#
+        }
+    });
+    macro_rules! exact_checkpoint_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            let install_id = sqlx::query_scalar::<_, i64>(&lock_install_sql)
+                .bind(stored.plugin_install_id)
+                .bind(stored.user_id)
+                .bind(&stored.public_key_base64)
+                .bind(stored.install_revoked_at.as_deref())
+                .bind(&stored.submitted_at)
+                .bind(&stored.submitted_at)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if install_id != Some(stored.plugin_install_id) {
+                return Err(PluginStoreError::Database(
+                    "signed capture install changed while its extraction checkpoint was being stored"
+                        .to_string(),
+                ));
+            }
+            let changed = sqlx::query(&sql)
+                .bind(payload_json)
+                .bind(stored.id)
+                .bind(stored.user_id)
+                .bind(stored.plugin_install_id)
+                .bind(&stored.source_url)
+                .bind(&stored.submitted_at)
+                .bind(&stored.rendered_html)
+                .bind(&stored.rendered_html_sha256)
+                .bind(&stored.signature_base64)
+                .bind(&stored.public_key_base64)
+                .bind(stored.install_revoked_at.as_deref())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            if changed != 1 {
+                return Err(PluginStoreError::Database(
+                    "signed capture changed while its extraction checkpoint was being stored"
+                        .to_string(),
+                ));
+            }
+            transaction.commit().await?;
+            Ok::<(), PluginStoreError>(())
+        }};
     }
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => exact_checkpoint_transaction!(pool)?,
+        DatabaseBackend::Postgres(pool) => exact_checkpoint_transaction!(pool)?,
+    };
     Ok(())
 }
 
@@ -1516,9 +1655,11 @@ pub async fn inspect_plugin_submission_extraction(
             .map_err(PluginStoreError::Validation)?;
     Ok(PluginExtractionCheckpoint {
         submission_id,
-        rendered_html_sha256: stored.rendered_html_sha256,
+        rendered_html_sha256: stored.rendered_html_sha256.clone(),
         extracted_listing_sha256: sha256_hex(extracted.as_bytes()),
         avionics_occurrence_count: occurrences.len(),
+        exact_extracted_listing_json: extracted.to_string(),
+        exact_capture: replay_capture_attestation(&stored, extracted),
     })
 }
 
@@ -1550,9 +1691,11 @@ pub async fn preflight_plugin_submission_extraction(
             parse_current_checkpoint_payload(extracted)?;
             Some(PluginExtractionCheckpoint {
                 submission_id,
-                rendered_html_sha256: stored.rendered_html_sha256,
+                rendered_html_sha256: stored.rendered_html_sha256.clone(),
                 extracted_listing_sha256: sha256_hex(extracted.as_bytes()),
                 avionics_occurrence_count: occurrences.len(),
+                exact_extracted_listing_json: extracted.to_string(),
+                exact_capture: replay_capture_attestation(&stored, extracted),
             })
         }
         None => None,
@@ -1599,8 +1742,36 @@ async fn record_materialization_receipt(
     listing_id: i64,
     extracted_listing_sha256: &str,
 ) -> StoreResult<()> {
-    let sql = db.sql(
-        r#"
+    let lock_install_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS ?
+              AND julianday(?) IS NOT NULL
+              AND (
+                revoked_at IS NULL
+                OR (julianday(revoked_at) IS NOT NULL AND julianday(?) <= julianday(revoked_at))
+              )
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS NOT DISTINCT FROM ?
+              AND CAST(? AS TIMESTAMPTZ) IS NOT NULL
+              AND (
+                revoked_at IS NULL
+                OR CAST(? AS TIMESTAMPTZ) <= CAST(revoked_at AS TIMESTAMPTZ)
+              )
+            FOR SHARE
+            "#
+        }
+    });
+    let sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
         INSERT INTO plugin_submission_materialization_receipts (
           plugin_submission_id, aircraft_sale_listing_id,
           rendered_html_sha256, extracted_listing_sha256
@@ -1611,41 +1782,107 @@ async fn record_materialization_receipt(
           ON listing.id = submission.canonical_listing_id
         WHERE submission.id = ? AND submission.user_id = ?
           AND submission.plugin_install_id = ? AND submission.source_url = ?
+          AND submission.submitted_at = ? AND submission.rendered_html = ?
           AND submission.rendered_html_sha256 = ? AND submission.signature_base64 = ?
           AND submission.extracted_listing_json = ? AND submission.extraction_error IS NULL
           AND submission.canonical_listing_id = ?
           AND listing.created_by_user_id = submission.user_id
           AND listing.source_url = submission.source_url
+          AND EXISTS (
+            SELECT 1 FROM plugin_installs exact_install
+            WHERE exact_install.id = submission.plugin_install_id
+              AND exact_install.user_id = submission.user_id
+              AND exact_install.public_key_base64 = ?
+              AND exact_install.revoked_at IS ?
+              AND julianday(submission.submitted_at) IS NOT NULL
+              AND (
+                exact_install.revoked_at IS NULL
+                OR (
+                  julianday(exact_install.revoked_at) IS NOT NULL
+                  AND julianday(submission.submitted_at)
+                    <= julianday(exact_install.revoked_at)
+                )
+              )
+          )
         ON CONFLICT (plugin_submission_id) DO NOTHING
-        "#,
-    );
+        "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+        INSERT INTO plugin_submission_materialization_receipts (
+          plugin_submission_id, aircraft_sale_listing_id,
+          rendered_html_sha256, extracted_listing_sha256
+        )
+        SELECT submission.id, listing.id, submission.rendered_html_sha256, ?
+        FROM plugin_submissions submission
+        JOIN aircraft_sale_listings listing
+          ON listing.id = submission.canonical_listing_id
+        WHERE submission.id = ? AND submission.user_id = ?
+          AND submission.plugin_install_id = ? AND submission.source_url = ?
+          AND submission.submitted_at = ? AND submission.rendered_html = ?
+          AND submission.rendered_html_sha256 = ? AND submission.signature_base64 = ?
+          AND submission.extracted_listing_json = ? AND submission.extraction_error IS NULL
+          AND submission.canonical_listing_id = ?
+          AND listing.created_by_user_id = submission.user_id
+          AND listing.source_url = submission.source_url
+          AND EXISTS (
+            SELECT 1 FROM plugin_installs exact_install
+            WHERE exact_install.id = submission.plugin_install_id
+              AND exact_install.user_id = submission.user_id
+              AND exact_install.public_key_base64 = ?
+              AND exact_install.revoked_at IS NOT DISTINCT FROM ?
+              AND CAST(submission.submitted_at AS TIMESTAMPTZ) IS NOT NULL
+              AND (
+                exact_install.revoked_at IS NULL
+                OR CAST(submission.submitted_at AS TIMESTAMPTZ)
+                  <= CAST(exact_install.revoked_at AS TIMESTAMPTZ)
+              )
+          )
+        ON CONFLICT (plugin_submission_id) DO NOTHING
+        "#
+        }
+    });
+    macro_rules! exact_receipt_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            let install_id = sqlx::query_scalar::<_, i64>(&lock_install_sql)
+                .bind(stored.plugin_install_id)
+                .bind(stored.user_id)
+                .bind(&stored.public_key_base64)
+                .bind(stored.install_revoked_at.as_deref())
+                .bind(&stored.submitted_at)
+                .bind(&stored.submitted_at)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if install_id != Some(stored.plugin_install_id) {
+                return Err(PluginStoreError::Database(
+                    "signed capture install changed before materialization completion".to_string(),
+                ));
+            }
+            let changed = sqlx::query(&sql)
+                .bind(extracted_listing_sha256)
+                .bind(stored.id)
+                .bind(stored.user_id)
+                .bind(stored.plugin_install_id)
+                .bind(&stored.source_url)
+                .bind(&stored.submitted_at)
+                .bind(&stored.rendered_html)
+                .bind(&stored.rendered_html_sha256)
+                .bind(&stored.signature_base64)
+                .bind(stored.extracted_listing_json.as_deref())
+                .bind(listing_id)
+                .bind(&stored.public_key_base64)
+                .bind(stored.install_revoked_at.as_deref())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            transaction.commit().await?;
+            Ok::<u64, PluginStoreError>(changed)
+        }};
+    }
     let changed = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => sqlx::query(&sql)
-            .bind(extracted_listing_sha256)
-            .bind(stored.id)
-            .bind(stored.user_id)
-            .bind(stored.plugin_install_id)
-            .bind(&stored.source_url)
-            .bind(&stored.rendered_html_sha256)
-            .bind(&stored.signature_base64)
-            .bind(stored.extracted_listing_json.as_deref())
-            .bind(listing_id)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-        DatabaseBackend::Postgres(pool) => sqlx::query(&sql)
-            .bind(extracted_listing_sha256)
-            .bind(stored.id)
-            .bind(stored.user_id)
-            .bind(stored.plugin_install_id)
-            .bind(&stored.source_url)
-            .bind(&stored.rendered_html_sha256)
-            .bind(&stored.signature_base64)
-            .bind(stored.extracted_listing_json.as_deref())
-            .bind(listing_id)
-            .execute(pool)
-            .await?
-            .rows_affected(),
+        DatabaseBackend::Sqlite(pool) => exact_receipt_transaction!(pool)?,
+        DatabaseBackend::Postgres(pool) => exact_receipt_transaction!(pool)?,
     };
     if changed == 0
         && exact_materialization_receipt_listing_id(db, stored, extracted_listing_sha256).await?
@@ -1687,6 +1924,8 @@ pub async fn inspect_plugin_replay_capture_state(
                 rendered_html_sha256: stored.rendered_html_sha256.clone(),
                 extracted_listing_sha256: sha256_hex(extracted.as_bytes()),
                 avionics_occurrence_count: occurrences.len(),
+                exact_extracted_listing_json: extracted.to_string(),
+                exact_capture: replay_capture_attestation(&stored, extracted),
             })
         })
         .transpose()?;
@@ -1717,6 +1956,7 @@ async fn complete_bound_replay_materialization(
     extracted_listing_sha256: &str,
     extractor: &GeminiListingExtractor,
 ) -> StoreResult<SaleListing> {
+    validate_stored_checkpoint_capture(db, stored).await?;
     let listing_id = stored.canonical_listing_id.ok_or_else(|| {
         PluginStoreError::Database("bound replay recovery lost its listing identifier".to_string())
     })?;
@@ -1808,6 +2048,7 @@ pub async fn materialize_plugin_submission_checkpoint(
             "replay extraction checkpoint does not match the pinned checkpoint hash".to_string(),
         ));
     }
+    validate_stored_checkpoint_capture(db, &stored).await?;
     if stored.canonical_listing_id.is_some() {
         let listing = complete_bound_replay_materialization(
             db,
@@ -1822,12 +2063,12 @@ pub async fn materialize_plugin_submission_checkpoint(
             listing,
         });
     }
-    validate_stored_checkpoint_capture(db, &stored).await?;
     if stored.extraction_error.is_some() {
         return Err(PluginStoreError::Validation(
             "replay capture has an extraction error".to_string(),
         ));
     }
+    preflight_replay_source_claim(db, stored.user_id, &stored.source_url).await?;
     validate_unbound_current_avionics_extraction(extracted_listing_json, &stored.rendered_html)
         .map_err(PluginStoreError::Validation)?;
     let (parsed_listing, identity_recovery) =
@@ -1854,7 +2095,6 @@ pub async fn materialize_plugin_submission_checkpoint(
         stored.extraction_error.clone(),
         extracted_listing_json.to_string(),
     );
-    ensure_replay_source_is_unclaimed(db, &stored.source_url).await?;
     let creation = create_listing_with_progress_and_occurrence_dispositions(
         db,
         user.id,
@@ -1970,6 +2210,33 @@ pub async fn materialize_plugin_submission_checkpoint(
     })
 }
 
+// This read avoids unnecessary FAA/catalog work for an obvious conflict. It is
+// only an optimization: the owner/source unique index remains the atomic claim
+// that decides concurrent inserts.
+async fn preflight_replay_source_claim(
+    db: &AppDb,
+    owner_user_id: i64,
+    source_url: &str,
+) -> StoreResult<()> {
+    let existing = query_as_optional!(
+        db,
+        ListingIdRow,
+        r#"
+        SELECT id FROM aircraft_sale_listings
+        WHERE created_by_user_id = ? AND source_url = ?
+        ORDER BY id LIMIT 1
+        "#,
+        owner_user_id,
+        source_url
+    )?;
+    if existing.is_some() {
+        return Err(PluginStoreError::Validation(
+            "listing source is already claimed by this owner".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn classify_replay_aircraft_admission(
     error: AircraftAdmissionError,
 ) -> Result<PluginReplayTerminalRejection, PluginReplayAdmissionBlock> {
@@ -2016,28 +2283,6 @@ fn classify_replay_aircraft_admission(
             }
         },
     }
-}
-
-async fn ensure_replay_source_is_unclaimed(db: &AppDb, source_url: &str) -> StoreResult<()> {
-    let source_owner = query_as_optional!(
-        db,
-        ListingIdRow,
-        r#"
-        SELECT id
-        FROM aircraft_sale_listings
-        WHERE source_url = ?
-        ORDER BY id
-        LIMIT 1
-        "#,
-        source_url
-    )?;
-    if let Some(row) = source_owner {
-        return Err(PluginStoreError::Validation(format!(
-            "replay target already contains listing {} for this exact capture source",
-            row.id
-        )));
-    }
-    Ok(())
 }
 
 async fn load_checkpoint_capture(
@@ -3967,7 +4212,10 @@ mod tests {
         let error = materialize_plugin_submission_checkpoint(&db, &user, submission.id, &extractor)
             .await
             .expect_err("same-source replay must fail before ordinary dedup mutation");
-        assert!(error.to_string().contains("already contains listing"));
+        assert!(
+            error.to_string().contains("already claimed"),
+            "unexpected rejection: {error}"
+        );
         let retained: (f64, f64, String, Option<i64>) = match db.backend() {
             DatabaseBackend::Sqlite(pool) => sqlx::query_as(
                 r#"SELECT listing.asking_price_usd, listing.airframe_hours,

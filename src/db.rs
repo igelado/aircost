@@ -189,9 +189,10 @@ const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
 const LISTING_REPLAY_RUNS_MIGRATION: &str = "20260819_listing_replay_runs";
 const LISTING_REPLAY_RUNS_CONTRACT_VERSION: i64 = 1;
 const LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT: &str =
-    "88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c";
+    "ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1";
 const POSTGRES_LISTING_REPLAY_CHECKS_FINGERPRINT: &str =
-    "25c20fb7d9762ae5379376fe99947751fd6544bf8d2dc5a360a245484e2cccee";
+    "36cb3b5e9642cedfe6e0b2d92c03864fc9ff9cc2d54ee64348f8fca67d567f40";
+const POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT: &str = "7e885abd1d361c7c831c84e5e3a58e1d";
 const SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update
 BEFORE UPDATE ON aircraft_listing_identity_correction_decisions
@@ -497,6 +498,19 @@ fn canonical_sqlite_table_definition(schema: &str, table: &str) -> Option<String
             1,
         ),
     )
+}
+
+fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String> {
+    let canonical_name = name.to_ascii_lowercase();
+    split_sql_statements(schema)
+        .into_iter()
+        .map(strip_leading_sql_comments)
+        .map(canonical_sqlite_schema_definition)
+        .find(|statement| {
+            statement.starts_with(&format!("createindex{canonical_name}on"))
+                || statement.starts_with(&format!("createuniqueindex{canonical_name}on"))
+                || statement.starts_with(&format!("createtrigger{canonical_name}"))
+        })
 }
 
 impl AppDb {
@@ -3316,6 +3330,42 @@ impl AppDb {
                   ) OR NOT EXISTS (
                     SELECT 1 FROM sqlite_schema
                     WHERE type = 'index' AND name = 'idx_listing_replay_run_items_phase'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'index'
+                      AND name = 'uq_aircraft_sale_listings_owner_source'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'listing_replay_run_items_checkpoint_exact_insert'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'listing_replay_run_items_checkpoint_exact_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'listing_replay_run_items_completed_immutable_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'listing_replay_run_items_completed_immutable_delete'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'plugin_submission_materialization_receipts_immutable_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'plugin_submission_materialization_receipts_immutable_delete'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'plugin_submissions_replay_checkpoint_immutable'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'plugin_installs_replay_identity_immutable'
                   ) OR (
                     SELECT COUNT(*) FROM pragma_table_info('listing_replay_runs')
                     WHERE name IN ('manifest_sha256', 'status', 'active_phase',
@@ -3349,6 +3399,21 @@ impl AppDb {
                     ) IS NULL
                     OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NULL
                     OR pg_catalog.to_regclass('public.idx_listing_replay_run_items_phase') IS NULL
+                    OR pg_catalog.to_regclass(
+                      'public.uq_aircraft_sale_listings_owner_source'
+                    ) IS NULL
+                    OR NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_trigger
+                      WHERE NOT tgisinternal
+                        AND tgname IN (
+                          'listing_replay_run_items_checkpoint_exact',
+                          'listing_replay_run_items_completed_immutable',
+                          'plugin_submission_materialization_receipts_immutable',
+                          'plugin_submissions_replay_checkpoint_immutable',
+                          'plugin_installs_replay_identity_immutable'
+                        )
+                      HAVING COUNT(*) = 5
+                    )
                     OR (
                       SELECT COUNT(*) FROM pg_catalog.pg_attribute
                       WHERE attrelid = pg_catalog.to_regclass('public.listing_replay_runs')
@@ -3388,7 +3453,16 @@ impl AppDb {
                     'listing_replay_runs', 'listing_replay_run_items',
                     'plugin_submission_materialization_receipts',
                     'idx_listing_replay_runs_one_running',
-                    'idx_listing_replay_run_items_phase'
+                    'idx_listing_replay_run_items_phase',
+                    'uq_aircraft_sale_listings_owner_source',
+                    'listing_replay_run_items_checkpoint_exact_insert',
+                    'listing_replay_run_items_checkpoint_exact_update',
+                    'listing_replay_run_items_completed_immutable_update',
+                    'listing_replay_run_items_completed_immutable_delete',
+                    'plugin_submission_materialization_receipts_immutable_update',
+                    'plugin_submission_materialization_receipts_immutable_delete',
+                    'plugin_submissions_replay_checkpoint_immutable',
+                    'plugin_installs_replay_identity_immutable'
                   )
                 )
                 "#,
@@ -3411,6 +3485,19 @@ impl AppDb {
                   OR pg_catalog.to_regclass(
                     'public.idx_listing_replay_run_items_phase'
                   ) IS NOT NULL
+                  OR pg_catalog.to_regclass(
+                    'public.uq_aircraft_sale_listings_owner_source'
+                  ) IS NOT NULL
+                  OR EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_trigger
+                    WHERE NOT tgisinternal AND tgname IN (
+                      'listing_replay_run_items_checkpoint_exact',
+                      'listing_replay_run_items_completed_immutable',
+                      'plugin_submission_materialization_receipts_immutable',
+                      'plugin_submissions_replay_checkpoint_immutable',
+                      'plugin_installs_replay_identity_immutable'
+                    )
+                  )
                 "#,
                 )
                 .fetch_one(pool)
@@ -3554,7 +3641,17 @@ impl AppDb {
                         'plugin_submission_materialization_receipts'
                       )
                         AND (
-                          type = 'trigger'
+                          (
+                            type = 'trigger'
+                            AND name NOT IN (
+                              'listing_replay_run_items_checkpoint_exact_insert',
+                              'listing_replay_run_items_checkpoint_exact_update',
+                              'listing_replay_run_items_completed_immutable_update',
+                              'listing_replay_run_items_completed_immutable_delete',
+                              'plugin_submission_materialization_receipts_immutable_update',
+                              'plugin_submission_materialization_receipts_immutable_delete'
+                            )
+                          )
                           OR (
                             type = 'index'
                             AND name NOT IN (
@@ -3574,6 +3671,32 @@ impl AppDb {
                         'plugin_submission_materialization_receipts'
                       )
                     ) = 6
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0;
+                let plugin_attached_triggers_are_closed = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT NOT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE type = 'trigger'
+                        AND tbl_name IN ('plugin_submissions', 'plugin_installs')
+                        AND NOT (
+                          (
+                            tbl_name = 'plugin_submissions'
+                            AND name IN (
+                              'plugin_submissions_replay_checkpoint_immutable',
+                              'listing_avionics_authorizations_invalidate_capture_delete',
+                              'listing_avionics_authorizations_invalidate_capture_update'
+                            )
+                          )
+                          OR (
+                            tbl_name = 'plugin_installs'
+                            AND name = 'plugin_installs_replay_identity_immutable'
+                          )
+                        )
+                    )
                     "#,
                 )
                 .fetch_one(pool)
@@ -3607,6 +3730,52 @@ impl AppDb {
                 }
                 unique_column_sets.sort();
 
+                let exact_guard_names = [
+                    "listing_replay_run_items_checkpoint_exact_insert",
+                    "listing_replay_run_items_checkpoint_exact_update",
+                    "listing_replay_run_items_completed_immutable_delete",
+                    "listing_replay_run_items_completed_immutable_update",
+                    "plugin_installs_replay_identity_immutable",
+                    "plugin_submission_materialization_receipts_immutable_delete",
+                    "plugin_submission_materialization_receipts_immutable_update",
+                    "plugin_submissions_replay_checkpoint_immutable",
+                    "uq_aircraft_sale_listings_owner_source",
+                ];
+                let exact_guard_definitions = sqlx::query_as::<_, (String, Option<String>)>(
+                    r#"
+                    SELECT name, sql FROM sqlite_schema
+                    WHERE name IN (
+                      'listing_replay_run_items_checkpoint_exact_insert',
+                      'listing_replay_run_items_checkpoint_exact_update',
+                      'listing_replay_run_items_completed_immutable_delete',
+                      'listing_replay_run_items_completed_immutable_update',
+                      'plugin_installs_replay_identity_immutable',
+                      'plugin_submission_materialization_receipts_immutable_delete',
+                      'plugin_submission_materialization_receipts_immutable_update',
+                      'plugin_submissions_replay_checkpoint_immutable',
+                      'uq_aircraft_sale_listings_owner_source'
+                    )
+                    ORDER BY name
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?;
+                let exact_guards_are_canonical = exact_guard_definitions.len()
+                    == exact_guard_names.len()
+                    && exact_guard_definitions.iter().zip(exact_guard_names).all(
+                        |((actual_name, actual_definition), expected_name)| {
+                            actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    canonical_sqlite_schema_definition(actual)
+                                        == canonical_sqlite_named_definition(
+                                            SQLITE_SCHEMA_SQL,
+                                            expected_name,
+                                        )
+                                        .expect("canonical replay guard must exist")
+                                })
+                        },
+                    );
+
                 let running_predicate_is_exact = running_index
                     .as_ref()
                     .and_then(|(_, _, definition)| definition.as_deref())
@@ -3627,6 +3796,8 @@ impl AppDb {
                     && phase_columns.as_deref()
                         == Some("run_id,extraction_state,materialization_state,position")
                     && attached_objects_are_closed
+                    && plugin_attached_triggers_are_closed
+                    && exact_guards_are_canonical
                     && unique_column_sets == ["run_id,plugin_submission_id", "run_id,position"])
             }
             DatabaseBackend::Postgres(pool) => {
@@ -3655,22 +3826,23 @@ impl AppDb {
                         ('listing_replay_run_items', 4, 'position', 'bigint', TRUE, '', ''),
                         ('listing_replay_run_items', 5, 'expected_rendered_html_sha256', 'text', TRUE, '', ''),
                         ('listing_replay_run_items', 6, 'extracted_listing_sha256', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 7, 'extraction_state', 'text', TRUE, '', '''queued''::text'),
-                        ('listing_replay_run_items', 8, 'materialization_state', 'text', TRUE, '', '''blocked''::text'),
-                        ('listing_replay_run_items', 9, 'resulting_listing_id', 'bigint', FALSE, '', ''),
-                        ('listing_replay_run_items', 10, 'terminal_rejection_phase', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 11, 'terminal_rejection_stage', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 12, 'terminal_rejection_reason_code', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 13, 'last_failure_phase', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 14, 'last_failure_reason_code', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 15, 'extraction_attempt_count', 'bigint', TRUE, '', '0'),
-                        ('listing_replay_run_items', 16, 'materialization_attempt_count', 'bigint', TRUE, '', '0'),
-                        ('listing_replay_run_items', 17, 'extraction_started_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 18, 'extraction_completed_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 19, 'materialization_started_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 20, 'materialization_completed_at', 'text', FALSE, '', ''),
-                        ('listing_replay_run_items', 21, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
-                        ('listing_replay_run_items', 22, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_run_items', 7, 'extracted_listing_json', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 8, 'extraction_state', 'text', TRUE, '', '''queued''::text'),
+                        ('listing_replay_run_items', 9, 'materialization_state', 'text', TRUE, '', '''blocked''::text'),
+                        ('listing_replay_run_items', 10, 'resulting_listing_id', 'bigint', FALSE, '', ''),
+                        ('listing_replay_run_items', 11, 'terminal_rejection_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 12, 'terminal_rejection_stage', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 13, 'terminal_rejection_reason_code', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 14, 'last_failure_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 15, 'last_failure_reason_code', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 16, 'extraction_attempt_count', 'bigint', TRUE, '', '0'),
+                        ('listing_replay_run_items', 17, 'materialization_attempt_count', 'bigint', TRUE, '', '0'),
+                        ('listing_replay_run_items', 18, 'extraction_started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 19, 'extraction_completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 20, 'materialization_started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 21, 'materialization_completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 22, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_run_items', 23, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
                         ('plugin_submission_materialization_receipts', 1, 'plugin_submission_id', 'bigint', TRUE, '', ''),
                         ('plugin_submission_materialization_receipts', 2, 'aircraft_sale_listing_id', 'bigint', TRUE, '', ''),
                         ('plugin_submission_materialization_receipts', 3, 'rendered_html_sha256', 'text', TRUE, '', ''),
@@ -3794,7 +3966,8 @@ impl AppDb {
                       WHERE index_namespace.nspname = 'public'
                         AND index_relation.relname IN (
                           'idx_listing_replay_runs_one_running',
-                          'idx_listing_replay_run_items_phase'
+                          'idx_listing_replay_run_items_phase',
+                          'uq_aircraft_sale_listings_owner_source'
                         )
                     ), replay_attached_indexes AS (
                       SELECT index_definition.indexrelid
@@ -4028,6 +4201,7 @@ impl AppDb {
                         ('listing_replay_run_items', '"position" >= 0'),
                         ('listing_replay_run_items', 'expected_rendered_html_sha256'),
                         ('listing_replay_run_items', 'extracted_listing_sha256'),
+                        ('listing_replay_run_items', 'extracted_listing_json IS NOT NULL'),
                         ('listing_replay_run_items', 'extraction_state = ANY'),
                         ('listing_replay_run_items', 'materialization_state = ANY'),
                         ('listing_replay_run_items', 'terminal_rejection_phase = ANY'),
@@ -4063,7 +4237,7 @@ impl AppDb {
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 39 FROM actual_columns)
+                      (SELECT COUNT(*) = 40 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
@@ -4097,6 +4271,38 @@ impl AppDb {
                             'public.plugin_submission_materialization_receipts'
                           )
                         ) AND NOT trigger_definition.tgisinternal
+                          AND trigger_definition.tgname NOT IN (
+                            'listing_replay_run_items_checkpoint_exact',
+                            'listing_replay_run_items_completed_immutable',
+                            'plugin_submission_materialization_receipts_immutable'
+                          )
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE NOT trigger_definition.tgisinternal
+                          AND trigger_definition.tgrelid IN (
+                            pg_catalog.to_regclass('public.plugin_submissions'),
+                            pg_catalog.to_regclass('public.plugin_installs')
+                          )
+                          AND NOT (
+                            (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.plugin_submissions'
+                              )
+                              AND trigger_definition.tgname IN (
+                                'plugin_submissions_replay_checkpoint_immutable',
+                                'listing_avionics_authorizations_invalidate_capture_delete',
+                                'listing_avionics_authorizations_invalidate_capture_update'
+                              )
+                            )
+                            OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.plugin_installs'
+                              )
+                              AND trigger_definition.tgname =
+                                'plugin_installs_replay_identity_immutable'
+                            )
+                          )
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_policy policy_definition
@@ -4135,6 +4341,13 @@ impl AppDb {
                         )
                       )
                       AND (SELECT COUNT(*) = 9 FROM replay_attached_indexes)
+                      AND (SELECT COUNT(*) = 3 FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE trigger_definition.tgrelid IN (
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        ) AND NOT trigger_definition.tgisinternal)
                       AND (SELECT COUNT(*) = 1 FROM replay_indexes
                        WHERE index_name = 'idx_listing_replay_runs_one_running'
                          AND relation_oid = pg_catalog.to_regclass(
@@ -4181,6 +4394,93 @@ impl AppDb {
                            'pg_catalog.int8_ops', 'pg_catalog.text_ops',
                            'pg_catalog.text_ops', 'pg_catalog.int8_ops'
                          ]::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_indexes
+                       WHERE index_name = 'uq_aircraft_sale_listings_owner_source'
+                         AND relation_oid = pg_catalog.to_regclass(
+                           'public.aircraft_sale_listings'
+                         )
+                         AND is_unique AND NOT is_primary AND NOT is_exclusion
+                         AND is_immediate AND NOT is_clustered
+                         AND is_valid AND is_ready AND is_live
+                         AND NOT is_replica_identity AND NOT nulls_not_distinct
+                         AND is_partial AND NOT has_expressions
+                         AND key_attribute_count = 2 AND total_attribute_count = 2
+                         AND access_method = 'btree' AND index_options = '0 0'
+                         AND columns = ARRAY['created_by_user_id', 'source_url']::text[]
+                         AND collations = ARRAY['0', 'pg_catalog.default']::text[]
+                         AND operator_classes = ARRAY[
+                           'pg_catalog.int8_ops', 'pg_catalog.text_ops'
+                         ]::text[]
+                         AND pg_catalog.translate(predicate, E' \n\r\t()', '') IN (
+                           'source_urlisnotnullandlengthbtrimsource_url>0',
+                           'source_urlisnotnullandlengthbtrimsource_url>0::integer'
+                         ))
+                      AND (SELECT COUNT(*) = 5
+                        FROM pg_catalog.pg_trigger replay_trigger
+                        JOIN pg_catalog.pg_proc routine
+                          ON routine.oid = replay_trigger.tgfoid
+                        JOIN pg_catalog.pg_namespace routine_namespace
+                          ON routine_namespace.oid = routine.pronamespace
+                        WHERE NOT replay_trigger.tgisinternal
+                          AND replay_trigger.tgenabled = 'O'
+                          AND replay_trigger.tgqual IS NULL
+                          AND replay_trigger.tgnargs = 0
+                          AND routine_namespace.nspname = 'public'
+                          AND routine.proconfig = ARRAY['search_path=pg_catalog']::text[]
+                          AND NOT routine.prosecdef AND NOT routine.proisstrict
+                          AND NOT routine.proleakproof
+                          AND routine.provolatile = 'v'
+                          AND routine.proparallel = 'u'
+                          AND routine.prokind = 'f'
+                          AND routine.pronargs = 0
+                          AND routine.prorettype = pg_catalog.to_regtype(
+                            'pg_catalog.trigger'
+                          )
+                          AND routine.prolang = (
+                            SELECT language.oid FROM pg_catalog.pg_language language
+                            WHERE language.lanname = 'plpgsql'
+                          )
+                          AND (
+                            (replay_trigger.tgname =
+                               'listing_replay_run_items_checkpoint_exact'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_run_items'
+                             ) AND replay_trigger.tgtype = 23
+                             AND routine.proname =
+                               'enforce_replay_extraction_checkpoint_exactness')
+                            OR
+                            (replay_trigger.tgname =
+                               'listing_replay_run_items_completed_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_run_items'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname = 'preserve_completed_replay_item')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_submission_materialization_receipts_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submission_materialization_receipts'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname =
+                               'preserve_replay_materialization_receipt')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_submissions_replay_checkpoint_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submissions'
+                             ) AND replay_trigger.tgtype = 19
+                             AND routine.proname =
+                               'enforce_replay_checkpoint_capture_immutability')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_installs_replay_identity_immutable'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_installs'
+                             ) AND replay_trigger.tgtype = 19
+                             AND routine.proname =
+                               'enforce_replay_plugin_identity_immutability')
+                          ))
                       AND
                       (SELECT COUNT(*) = 4 FROM replay_unique_constraints)
                       AND NOT EXISTS (
@@ -4324,7 +4624,7 @@ impl AppDb {
                           AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
                       AND (SELECT COUNT(*) = 7 FROM replay_checks
                            WHERE relation_name = 'listing_replay_runs')
-                      AND (SELECT COUNT(*) = 19 FROM replay_checks
+                      AND (SELECT COUNT(*) = 20 FROM replay_checks
                            WHERE relation_name = 'listing_replay_run_items')
                       AND (SELECT COUNT(*) = 2 FROM replay_checks
                            WHERE relation_name = 'plugin_submission_materialization_receipts')
@@ -4341,6 +4641,33 @@ impl AppDb {
                 .fetch_one(pool)
                 .await?;
                 if !structural_contract {
+                    return Ok(false);
+                }
+                let function_fingerprint = sqlx::query_scalar::<_, Option<String>>(
+                    r#"
+                    SELECT pg_catalog.md5(pg_catalog.string_agg(
+                      routine.proname::text || '|' || routine.prosrc || E'\n',
+                      '' ORDER BY routine.proname
+                    ))
+                    FROM pg_catalog.pg_proc routine
+                    JOIN pg_catalog.pg_namespace namespace
+                      ON namespace.oid = routine.pronamespace
+                    WHERE namespace.nspname = 'public'
+                      AND routine.pronargs = 0
+                      AND routine.proname IN (
+                        'enforce_replay_extraction_checkpoint_exactness',
+                        'preserve_completed_replay_item',
+                        'preserve_replay_materialization_receipt',
+                        'enforce_replay_checkpoint_capture_immutability',
+                        'enforce_replay_plugin_identity_immutability'
+                      )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?;
+                if function_fingerprint.as_deref()
+                    != Some(POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT)
+                {
                     return Ok(false);
                 }
                 let checks = sqlx::query_as::<_, (String, String, String)>(
@@ -6495,8 +6822,20 @@ mod tests {
               installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE users (id INTEGER PRIMARY KEY);
-            CREATE TABLE plugin_submissions (id INTEGER PRIMARY KEY);
-            CREATE TABLE aircraft_sale_listings (id INTEGER PRIMARY KEY);
+            CREATE TABLE plugin_installs (
+              id INTEGER PRIMARY KEY, user_id INTEGER, public_key_base64 TEXT,
+              created_at TEXT, revoked_at TEXT
+            );
+            CREATE TABLE plugin_submissions (
+              id INTEGER PRIMARY KEY, user_id INTEGER, plugin_install_id INTEGER,
+              source_url TEXT, submitted_at TEXT, rendered_html TEXT,
+              rendered_html_sha256 TEXT, signature_base64 TEXT,
+              extracted_listing_json TEXT, extraction_error TEXT,
+              canonical_listing_id INTEGER
+            );
+            CREATE TABLE aircraft_sale_listings (
+              id INTEGER PRIMARY KEY, created_by_user_id INTEGER, source_url TEXT
+            );
             "#,
         )
         .execute(&mut connection)
@@ -6532,7 +6871,8 @@ mod tests {
               )
               OR tbl_name IN (
                 'listing_replay_runs', 'listing_replay_run_items',
-                'plugin_submission_materialization_receipts'
+                'plugin_submission_materialization_receipts',
+                'plugin_submissions', 'plugin_installs'
               )
             ORDER BY type, name
         "#;
@@ -6795,14 +7135,36 @@ mod tests {
             .execute(&mut connection)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO plugin_submissions (id) VALUES (1)")
+        sqlx::query("INSERT INTO users (id) VALUES (1)")
             .execute(&mut connection)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO aircraft_sale_listings (id) VALUES (7)")
-            .execute(&mut connection)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO plugin_installs \
+             (id, user_id, public_key_base64, created_at) \
+             VALUES (1, 1, 'key', '2026-08-19T00:00:00Z')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listings (id, created_by_user_id, source_url) \
+             VALUES (7, 1, 'https://example.test/replay')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO plugin_submissions (id, user_id, plugin_install_id, source_url, \
+             submitted_at, rendered_html, rendered_html_sha256, signature_base64, \
+             extracted_listing_json, canonical_listing_id) VALUES \
+             (1, 1, 1, 'https://example.test/replay', '2026-08-19T01:00:00Z', \
+              '<html/>', ?, 'signature', '{}', 7)",
+        )
+        .bind("b".repeat(64))
+        .execute(&mut connection)
+        .await
+        .unwrap();
         let run_id: i64 = sqlx::query_scalar(
             "INSERT INTO listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, ?, 3) RETURNING id",
         )
@@ -6966,6 +7328,14 @@ mod tests {
                 "unexpected-attached-trigger",
                 "CREATE TRIGGER unexpected_replay_update BEFORE UPDATE ON listing_replay_runs BEGIN SELECT 1; END",
             ),
+            (
+                "unexpected-submission-trigger",
+                "CREATE TRIGGER unexpected_submission_delete BEFORE DELETE ON plugin_submissions BEGIN SELECT 1; END",
+            ),
+            (
+                "unexpected-install-trigger",
+                "CREATE TRIGGER unexpected_install_delete BEFORE DELETE ON plugin_installs BEGIN SELECT 1; END",
+            ),
         ] {
             let db = AppDb::connect("sqlite::memory:").await.unwrap();
             let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -7078,14 +7448,36 @@ mod tests {
             .execute(&mut connection)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO plugin_submissions (id) VALUES (1)")
+        sqlx::query("INSERT INTO users (id) VALUES (1)")
             .execute(&mut connection)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO aircraft_sale_listings (id) VALUES (7)")
-            .execute(&mut connection)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO plugin_installs \
+             (id, user_id, public_key_base64, created_at) \
+             VALUES (1, 1, 'key', '2026-08-19T00:00:00Z')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listings (id, created_by_user_id, source_url) \
+             VALUES (7, 1, 'https://example.test/replay-result')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO plugin_submissions (id, user_id, plugin_install_id, source_url, \
+             submitted_at, rendered_html, rendered_html_sha256, signature_base64, \
+             extracted_listing_json, canonical_listing_id) VALUES \
+             (1, 1, 1, 'https://example.test/replay-result', '2026-08-19T01:00:00Z', \
+              '<html/>', ?, 'signature', '{}', 7)",
+        )
+        .bind("b".repeat(64))
+        .execute(&mut connection)
+        .await
+        .unwrap();
         let run_id: i64 = sqlx::query_scalar(
             "INSERT INTO listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, ?, 1) RETURNING id",
         )
@@ -7094,7 +7486,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO listing_replay_run_items (run_id, plugin_submission_id, position, expected_rendered_html_sha256, extracted_listing_sha256, extraction_state, materialization_state, resulting_listing_id) VALUES (?, 1, 0, ?, ?, 'succeeded', 'succeeded', 7)",
+            "INSERT INTO listing_replay_run_items (run_id, plugin_submission_id, position, expected_rendered_html_sha256, extracted_listing_sha256, extracted_listing_json, extraction_state, materialization_state, resulting_listing_id) VALUES (?, 1, 0, ?, ?, '{}', 'succeeded', 'succeeded', 7)",
         )
         .bind(run_id)
         .bind("b".repeat(64))
@@ -7110,6 +7502,37 @@ mod tests {
         .execute(&mut connection)
         .await
         .unwrap();
+        for (label, statement) in [
+            (
+                "signed capture bytes",
+                "UPDATE plugin_submissions SET rendered_html = '<changed/>' WHERE id = 1",
+            ),
+            (
+                "plugin signing identity",
+                "UPDATE plugin_installs SET public_key_base64 = 'changed' WHERE id = 1",
+            ),
+            (
+                "completion receipt update",
+                "UPDATE plugin_submission_materialization_receipts SET completed_at = 'changed' WHERE plugin_submission_id = 1",
+            ),
+            (
+                "completion receipt deletion",
+                "DELETE FROM plugin_submission_materialization_receipts WHERE plugin_submission_id = 1",
+            ),
+            (
+                "completed replay item update",
+                "UPDATE listing_replay_run_items SET updated_at = 'changed' WHERE run_id = 1",
+            ),
+            (
+                "completed replay item deletion",
+                "DELETE FROM listing_replay_run_items WHERE run_id = 1",
+            ),
+        ] {
+            assert!(
+                connection.execute(statement).await.is_err(),
+                "{label} must be immutable after completion"
+            );
+        }
         let deletion = sqlx::query("DELETE FROM aircraft_sale_listings WHERE id = 7")
             .execute(&mut connection)
             .await;
@@ -7135,6 +7558,40 @@ mod tests {
         assert_eq!(resulting_listing_id, Some(7));
         assert_eq!(listing_count, 1);
         assert_eq!(receipt_listing_id, 7);
+    }
+
+    #[tokio::test]
+    async fn listing_source_claim_is_atomic_per_owner_and_reusable_across_owners() {
+        let mut connection = legacy_replay_migration_connection().await;
+        sqlx::raw_sql(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id) VALUES (1), (2)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listings (id, created_by_user_id, source_url) \
+             VALUES (1, 1, 'https://example.test/shared-source')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let duplicate = sqlx::query(
+            "INSERT INTO aircraft_sale_listings (id, created_by_user_id, source_url) \
+             VALUES (2, 1, 'https://example.test/shared-source')",
+        )
+        .execute(&mut connection)
+        .await;
+        assert!(duplicate.is_err(), "one owner cannot claim a source twice");
+        sqlx::query(
+            "INSERT INTO aircraft_sale_listings (id, created_by_user_id, source_url) \
+             VALUES (3, 2, 'https://example.test/shared-source')",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("the same publisher URL remains independent across owners");
     }
 
     #[test]
@@ -8121,7 +8578,8 @@ mod tests {
                   pg_catalog.to_regclass('public.listing_replay_run_items'),
                   pg_catalog.to_regclass(
                     'public.plugin_submission_materialization_receipts'
-                  )
+                  ),
+                  pg_catalog.to_regclass('public.aircraft_sale_listings')
                 )
               ), '') || E'\n--triggers--\n' || COALESCE((
                 SELECT pg_catalog.string_agg(
@@ -8139,8 +8597,29 @@ mod tests {
                   pg_catalog.to_regclass('public.listing_replay_run_items'),
                   pg_catalog.to_regclass(
                     'public.plugin_submission_materialization_receipts'
-                  )
+                  ),
+                  pg_catalog.to_regclass('public.plugin_submissions'),
+                  pg_catalog.to_regclass('public.plugin_installs')
                 )
+              ), '') || E'\n--functions--\n' || COALESCE((
+                SELECT pg_catalog.string_agg(
+                  routine.oid::text || '|' || routine.proname || '|' ||
+                  routine.prosrc || '|' || COALESCE(
+                    pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+                  ), E'\n' ORDER BY routine.proname
+                )
+                FROM pg_catalog.pg_proc routine
+                JOIN pg_catalog.pg_namespace namespace
+                  ON namespace.oid = routine.pronamespace
+                WHERE namespace.nspname = 'public'
+                  AND routine.pronargs = 0
+                  AND routine.proname IN (
+                    'enforce_replay_extraction_checkpoint_exactness',
+                    'preserve_completed_replay_item',
+                    'preserve_replay_materialization_receipt',
+                    'enforce_replay_checkpoint_capture_immutability',
+                    'enforce_replay_plugin_identity_immutability'
+                  )
               ), '') || E'\n--policies--\n' || COALESCE((
                 SELECT pg_catalog.string_agg(
                   policy_definition.polrelid::text || '|' ||
@@ -8263,6 +8742,21 @@ mod tests {
         let DatabaseBackend::Postgres(pool) = initialized.backend() else {
             unreachable!()
         };
+        pool.execute(
+            "DROP TRIGGER plugin_submissions_replay_checkpoint_immutable \
+             ON public.plugin_submissions",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "DROP TRIGGER plugin_installs_replay_identity_immutable \
+             ON public.plugin_installs",
+        )
+        .await
+        .unwrap();
+        pool.execute("DROP INDEX public.uq_aircraft_sale_listings_owner_source")
+            .await
+            .unwrap();
         pool.execute("DROP TABLE public.plugin_submission_materialization_receipts")
             .await
             .unwrap();
@@ -8272,6 +8766,18 @@ mod tests {
         pool.execute("DROP TABLE public.listing_replay_runs")
             .await
             .unwrap();
+        sqlx::raw_sql(
+            r#"
+            DROP FUNCTION public.enforce_replay_extraction_checkpoint_exactness();
+            DROP FUNCTION public.preserve_completed_replay_item();
+            DROP FUNCTION public.preserve_replay_materialization_receipt();
+            DROP FUNCTION public.enforce_replay_checkpoint_capture_immutability();
+            DROP FUNCTION public.enforce_replay_plugin_identity_immutability();
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
         sqlx::query("DELETE FROM public.schema_migration_contracts WHERE migration_name = $1")
             .bind(LISTING_REPLAY_RUNS_MIGRATION)
             .execute(pool)
@@ -8538,6 +9044,58 @@ mod tests {
         assert_postgres_replay_migration_rerun_rejected_without_changes(
             pool,
             "unexpected-attached-trigger",
+        )
+        .await;
+        drop(db);
+        assert_postgres_replay_startup_rejected(&database_url).await;
+
+        for (label, relation) in [
+            ("unexpected-submission-trigger", "plugin_submissions"),
+            ("unexpected-install-trigger", "plugin_installs"),
+        ] {
+            let reset = reset_isolated_postgres(&database_url).await;
+            reset.close().await;
+            let db = AppDb::connect(&database_url).await.unwrap();
+            let DatabaseBackend::Postgres(pool) = db.backend() else {
+                unreachable!()
+            };
+            let trigger_sql = format!(
+                "CREATE FUNCTION public.unexpected_plugin_trigger() RETURNS TRIGGER \
+                 LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END'; \
+                 CREATE TRIGGER unexpected_plugin_delete BEFORE DELETE ON public.{relation} \
+                 FOR EACH ROW EXECUTE FUNCTION public.unexpected_plugin_trigger();"
+            );
+            sqlx::raw_sql(&trigger_sql).execute(pool).await.unwrap();
+            assert_postgres_replay_migration_rerun_rejected_without_changes(pool, label).await;
+            drop(db);
+            assert_postgres_replay_startup_rejected(&database_url).await;
+        }
+
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(
+            r#"
+            CREATE OR REPLACE FUNCTION public.enforce_replay_checkpoint_capture_immutability()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            SET search_path = pg_catalog
+            AS $function$
+            BEGIN
+              RETURN NEW;
+            END
+            $function$;
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_postgres_replay_migration_rerun_rejected_without_changes(
+            pool,
+            "weakened-replay-trigger-function",
         )
         .await;
         drop(db);

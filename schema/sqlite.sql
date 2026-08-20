@@ -2745,6 +2745,10 @@ CREATE INDEX IF NOT EXISTS idx_aircraft_sale_listings_user
 CREATE INDEX IF NOT EXISTS idx_aircraft_sale_listings_ingestion
   ON aircraft_sale_listings (ingestion_state, status, added_at);
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_aircraft_sale_listings_owner_source
+  ON aircraft_sale_listings (created_by_user_id, source_url)
+  WHERE source_url IS NOT NULL AND length(trim(source_url)) > 0;
+
 CREATE TABLE IF NOT EXISTS plugin_installs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL REFERENCES users(id),
@@ -2956,8 +2960,9 @@ CREATE INDEX IF NOT EXISTS idx_listing_verification_run_items_claim
   ON listing_verification_run_items (run_id, status, position, id);
 
 -- Durable coordination for rebuilding listing state from trusted captures.
--- This is an operational ledger only: raw capture bytes, extraction payloads,
--- provider responses, and evidence remain in their authoritative stores.
+-- This operational ledger pins the exact extracted JSON needed for a durable
+-- checkpoint; raw capture bytes, provider responses, and evidence remain in
+-- their authoritative stores.
 CREATE TABLE IF NOT EXISTS listing_replay_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   manifest_version INTEGER NOT NULL CHECK (manifest_version > 0),
@@ -3002,6 +3007,7 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
   position INTEGER NOT NULL CHECK (position >= 0),
   expected_rendered_html_sha256 TEXT NOT NULL,
   extracted_listing_sha256 TEXT,
+  extracted_listing_json TEXT,
   extraction_state TEXT NOT NULL DEFAULT 'queued'
     CHECK (extraction_state IN ('queued', 'running', 'succeeded', 'rejected', 'failed')),
   materialization_state TEXT NOT NULL DEFAULT 'blocked'
@@ -3085,6 +3091,7 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
   ),
   CHECK ((materialization_state = 'succeeded') = (resulting_listing_id IS NOT NULL)),
   CHECK ((extraction_state = 'succeeded') = (extracted_listing_sha256 IS NOT NULL)),
+  CHECK ((extraction_state = 'succeeded') = (extracted_listing_json IS NOT NULL)),
   CHECK (extraction_state = 'succeeded' OR materialization_state = 'blocked'),
   CHECK (extraction_state <> 'running' OR extraction_started_at IS NOT NULL),
   CHECK (materialization_state <> 'running' OR materialization_started_at IS NOT NULL)
@@ -3092,6 +3099,66 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
 
 CREATE INDEX IF NOT EXISTS idx_listing_replay_run_items_phase
   ON listing_replay_run_items (run_id, extraction_state, materialization_state, position);
+
+CREATE TRIGGER IF NOT EXISTS listing_replay_run_items_checkpoint_exact_insert
+BEFORE INSERT ON listing_replay_run_items
+WHEN NEW.extraction_state = 'succeeded' AND NOT EXISTS (
+  SELECT 1
+  FROM plugin_submissions submission
+  JOIN plugin_installs install ON install.id = submission.plugin_install_id
+  WHERE submission.id = NEW.plugin_submission_id
+    AND submission.rendered_html_sha256 = NEW.expected_rendered_html_sha256
+    AND submission.extracted_listing_json IS NEW.extracted_listing_json
+    AND submission.extraction_error IS NULL
+    AND julianday(submission.submitted_at) IS NOT NULL
+    AND (
+      install.revoked_at IS NULL
+      OR (
+        julianday(install.revoked_at) IS NOT NULL
+        AND julianday(submission.submitted_at) <= julianday(install.revoked_at)
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay extraction transition does not match its exact checkpoint');
+END;
+
+CREATE TRIGGER IF NOT EXISTS listing_replay_run_items_checkpoint_exact_update
+BEFORE UPDATE ON listing_replay_run_items
+WHEN NEW.extraction_state = 'succeeded' AND NOT EXISTS (
+  SELECT 1
+  FROM plugin_submissions submission
+  JOIN plugin_installs install ON install.id = submission.plugin_install_id
+  WHERE submission.id = NEW.plugin_submission_id
+    AND submission.rendered_html_sha256 = NEW.expected_rendered_html_sha256
+    AND submission.extracted_listing_json IS NEW.extracted_listing_json
+    AND submission.extraction_error IS NULL
+    AND julianday(submission.submitted_at) IS NOT NULL
+    AND (
+      install.revoked_at IS NULL
+      OR (
+        julianday(install.revoked_at) IS NOT NULL
+        AND julianday(submission.submitted_at) <= julianday(install.revoked_at)
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay extraction transition does not match its exact checkpoint');
+END;
+
+CREATE TRIGGER IF NOT EXISTS listing_replay_run_items_completed_immutable_update
+BEFORE UPDATE ON listing_replay_run_items
+WHEN OLD.materialization_state = 'succeeded'
+BEGIN
+  SELECT RAISE(ABORT, 'completed replay item is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS listing_replay_run_items_completed_immutable_delete
+BEFORE DELETE ON listing_replay_run_items
+WHEN OLD.materialization_state = 'succeeded'
+BEGIN
+  SELECT RAISE(ABORT, 'completed replay item is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS plugin_submission_materialization_receipts (
   plugin_submission_id INTEGER PRIMARY KEY
@@ -3109,11 +3176,129 @@ CREATE TABLE IF NOT EXISTS plugin_submission_materialization_receipts (
   CHECK (extracted_listing_sha256 NOT GLOB '*[^0-9a-f]*')
 );
 
+CREATE TRIGGER IF NOT EXISTS plugin_submission_materialization_receipts_immutable_update
+BEFORE UPDATE ON plugin_submission_materialization_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'replay materialization receipt is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS plugin_submission_materialization_receipts_immutable_delete
+BEFORE DELETE ON plugin_submission_materialization_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'replay materialization receipt is immutable');
+END;
+
+-- A replay checkpoint is a permanent binding to the exact authenticated
+-- capture. The only permitted change after extraction is its one-time binding
+-- to the unique same-owner source listing; a receipt closes that transition.
+CREATE TRIGGER IF NOT EXISTS plugin_submissions_replay_checkpoint_immutable
+BEFORE UPDATE ON plugin_submissions
+WHEN (
+  EXISTS (
+    SELECT 1 FROM listing_replay_run_items item
+    WHERE item.plugin_submission_id = OLD.id
+      AND item.extraction_state = 'succeeded'
+  )
+  OR EXISTS (
+    SELECT 1 FROM plugin_submission_materialization_receipts receipt
+    WHERE receipt.plugin_submission_id = OLD.id
+  )
+) AND (
+  NOT (NEW.id IS OLD.id)
+  OR NOT (NEW.user_id IS OLD.user_id)
+  OR NOT (NEW.plugin_install_id IS OLD.plugin_install_id)
+  OR NOT (NEW.source_url IS OLD.source_url)
+  OR NOT (NEW.submitted_at IS OLD.submitted_at)
+  OR NOT (NEW.rendered_html IS OLD.rendered_html)
+  OR NOT (NEW.rendered_html_sha256 IS OLD.rendered_html_sha256)
+  OR NOT (NEW.signature_base64 IS OLD.signature_base64)
+  OR NOT (NEW.extracted_listing_json IS OLD.extracted_listing_json)
+  OR NOT (NEW.extraction_error IS OLD.extraction_error)
+  OR NOT (
+    NEW.canonical_listing_id IS OLD.canonical_listing_id
+    OR (
+      OLD.canonical_listing_id IS NULL
+      AND NEW.canonical_listing_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM plugin_submission_materialization_receipts receipt
+        WHERE receipt.plugin_submission_id = OLD.id
+      )
+      AND EXISTS (
+        SELECT 1 FROM aircraft_sale_listings listing
+        WHERE listing.id = NEW.canonical_listing_id
+          AND listing.created_by_user_id = OLD.user_id
+          AND listing.source_url = OLD.source_url
+      )
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay checkpoint capture is immutable');
+END;
+
+-- Public-key identity is immutable once used by a replay checkpoint.
+-- Revocation remains a legitimate monotonic lifecycle transition, provided
+-- every pinned capture predates the parsed revocation instant.
+CREATE TRIGGER IF NOT EXISTS plugin_installs_replay_identity_immutable
+BEFORE UPDATE ON plugin_installs
+WHEN EXISTS (
+  SELECT 1
+  FROM plugin_submissions submission
+  WHERE submission.plugin_install_id = OLD.id
+    AND (
+      EXISTS (
+        SELECT 1 FROM listing_replay_run_items item
+        WHERE item.plugin_submission_id = submission.id
+          AND item.extraction_state = 'succeeded'
+      )
+      OR EXISTS (
+        SELECT 1 FROM plugin_submission_materialization_receipts receipt
+        WHERE receipt.plugin_submission_id = submission.id
+      )
+    )
+) AND (
+  NOT (NEW.id IS OLD.id)
+  OR NOT (NEW.user_id IS OLD.user_id)
+  OR NOT (NEW.public_key_base64 IS OLD.public_key_base64)
+  OR NOT (NEW.created_at IS OLD.created_at)
+  OR NOT (
+    NEW.revoked_at IS OLD.revoked_at
+    OR (
+      OLD.revoked_at IS NULL
+      AND NEW.revoked_at IS NOT NULL
+      AND julianday(NEW.revoked_at) IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM plugin_submissions submission
+        WHERE submission.plugin_install_id = OLD.id
+          AND (
+            EXISTS (
+              SELECT 1 FROM listing_replay_run_items item
+              WHERE item.plugin_submission_id = submission.id
+                AND item.extraction_state = 'succeeded'
+            )
+            OR EXISTS (
+              SELECT 1 FROM plugin_submission_materialization_receipts receipt
+              WHERE receipt.plugin_submission_id = submission.id
+            )
+          )
+          AND (
+            julianday(submission.submitted_at) IS NULL
+            OR julianday(submission.submitted_at) > julianday(NEW.revoked_at)
+          )
+      )
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay checkpoint plugin identity is immutable');
+END;
+
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c',
+  'ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 

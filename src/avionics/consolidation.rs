@@ -4583,7 +4583,8 @@ mod tests {
             r#"INSERT INTO aircraft_sale_listings (
                  aircraft_model_variant_id, created_by_user_id, source_url,
                  model_year, asking_price_usd, airframe_hours
-               ) VALUES (?, ?, 'https://listing.example/legacy', 2004, 300000, 1000)
+               ) VALUES (?, ?, 'https://listing.example/legacy/' ||
+                 (SELECT COUNT(*) + 1 FROM aircraft_sale_listings), 2004, 300000, 1000)
                RETURNING id"#,
         )
         .bind(pending_variant_id)
