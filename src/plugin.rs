@@ -2799,6 +2799,49 @@ mod tests {
             .await
             .expect("a capture signed and submitted before revocation remains replayable");
 
+        sqlx::query(
+            "UPDATE plugin_submissions SET submitted_at = '2026-08-19T01:00:00+02:00' WHERE id = ?",
+        )
+        .bind(outcome.submission.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE plugin_installs SET revoked_at = '2026-08-18T23:30:00Z' WHERE id = ?")
+            .bind(request.plugin_install_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let lexically_later_but_earlier_instant =
+            load_checkpoint_capture(&db, user.id, outcome.submission.id)
+                .await
+                .unwrap();
+        validate_stored_checkpoint_capture(&db, &lexically_later_but_earlier_instant)
+            .await
+            .expect("revocation comparison must use parsed instants rather than TEXT ordering");
+
+        sqlx::query(
+            "UPDATE plugin_submissions SET submitted_at = '2026-08-18T22:00:00-02:00' WHERE id = ?",
+        )
+        .bind(outcome.submission.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let lexically_earlier_but_later_instant =
+            load_checkpoint_capture(&db, user.id, outcome.submission.id)
+                .await
+                .unwrap();
+        let error = validate_stored_checkpoint_capture(&db, &lexically_earlier_but_later_instant)
+            .await
+            .expect_err("a post-revocation instant must fail despite its earlier TEXT spelling");
+        assert!(matches!(error, PluginStoreError::Permission(_)));
+
+        sqlx::query(
+            "UPDATE plugin_submissions SET submitted_at = '2026-08-18 12:00:00' WHERE id = ?",
+        )
+        .bind(outcome.submission.id)
+        .execute(pool)
+        .await
+        .unwrap();
         sqlx::query("UPDATE plugin_installs SET revoked_at = '2026-08-17 12:00:00' WHERE id = ?")
             .bind(request.plugin_install_id)
             .execute(pool)
