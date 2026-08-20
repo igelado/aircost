@@ -75,8 +75,14 @@ All operational commands are dry-run unless `--apply` is supplied.
    one transaction.
    A later failure retains that private receipt-gated pair, and an exact retry
    deterministically resumes child projections, writes one correction receipt,
-   and finalizes the same listing. Uncorrected replay failures still compensate
-   the newly created listing and binding.
+   and finalizes the same listing. Before binding, any listing-creation failure
+   rolls back the insert and exact capture CAS in their shared transaction; no
+   replay path scans for or deletes listings as compensation.
+   Install revocation does not invalidate an older signed capture: replay and
+   reprocess accept it only when its retained `submitted_at` is at or before
+   the retained install `revoked_at`. A capture timestamp after revocation is
+   rejected as an impossible signed-source history. The exact key and
+   revocation timestamp are pinned again by the atomic bind CAS.
 
 For a manifest-sized replay, use the durable batch coordinator instead of a
 shell loop:
@@ -89,6 +95,11 @@ aircost-admin replay-captures --database SHADOW --manifest captures.json \
 aircost-admin replay-captures --database SHADOW --manifest captures.json \
   --phase materialization --apply
 ```
+
+Fatal database, heartbeat, or final-ledger errors intentionally leave the
+owner-fenced run in `running` state. After confirming that worker has stopped
+and the conservative heartbeat threshold has elapsed, resume it explicitly
+with `--recover-stale`; this requeues only the fenced in-flight item state.
 
 The default is provider-free and read-only. `--submission-id ID` restricts one
 invocation without changing the manifest-backed run membership. Apply records

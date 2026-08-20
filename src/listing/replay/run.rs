@@ -480,14 +480,7 @@ pub async fn replay_captures(
         Ok(())
     }
     .await;
-    match processing {
-        Ok(()) => {}
-        Err(error @ ReplayRunError::Conflict(_)) => return Err(error),
-        Err(error) => {
-            let _ = release_run(db, run.id, &owner_token).await;
-            return Err(error);
-        }
-    }
+    processing?;
     release_run(db, run.id, &owner_token).await?;
     let gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
     report_from_ledger(db, run.id, request, &selected, gemini_usage).await
@@ -2141,6 +2134,149 @@ mod tests {
         assert_eq!(attempts, 2);
     }
 
+    async fn age_running_replay_for_recovery(db: &AppDb) {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "UPDATE listing_replay_runs SET heartbeat_at_epoch_seconds = ? WHERE status = 'running'",
+        )
+        .bind(epoch_seconds().unwrap() - STALE_RECOVERY_THRESHOLD.as_secs() as i64 - 1)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_item_ledger_failure_stays_owned_until_explicit_stale_recovery() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER fail_replay_item_success
+               BEFORE UPDATE OF extraction_state ON listing_replay_run_items
+               WHEN NEW.extraction_state = 'succeeded'
+               BEGIN SELECT RAISE(ABORT, 'injected item ledger failure'); END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let failure = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: true,
+                recover_stale: false,
+            },
+        )
+        .await
+        .expect_err("fatal ledger storage must escape the operation result path");
+        assert!(matches!(failure, ReplayRunError::Database(_)));
+        let retained: (String, String) = sqlx::query_as(
+            r#"SELECT run.status, item.extraction_state
+               FROM listing_replay_runs run
+               JOIN listing_replay_run_items item ON item.run_id = run.id
+               WHERE item.plugin_submission_id = ?"#,
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, ("running".to_string(), "running".to_string()));
+
+        sqlx::query("DROP TRIGGER fail_replay_item_success")
+            .execute(pool)
+            .await
+            .unwrap();
+        age_running_replay_for_recovery(&db).await;
+        let recovered = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: true,
+                recover_stale: true,
+            },
+        )
+        .await
+        .expect("explicit stale recovery should resume the fenced item");
+        assert_eq!(recovered.counts.succeeded, 1);
+        assert_eq!(recovered.gemini_usage.logical_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn fatal_run_release_failure_stays_owned_until_explicit_stale_recovery() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER fail_replay_release
+               BEFORE UPDATE OF owner_token ON listing_replay_runs
+               WHEN OLD.status = 'running' AND NEW.owner_token IS NULL
+               BEGIN SELECT RAISE(ABORT, 'injected run release failure'); END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let failure = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: true,
+                recover_stale: false,
+            },
+        )
+        .await
+        .expect_err("final ledger release must fail visibly");
+        assert!(matches!(failure, ReplayRunError::Database(_)));
+        let retained: (String, String) = sqlx::query_as(
+            r#"SELECT run.status, item.extraction_state
+               FROM listing_replay_runs run
+               JOIN listing_replay_run_items item ON item.run_id = run.id
+               WHERE item.plugin_submission_id = ?"#,
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, ("running".to_string(), "succeeded".to_string()));
+
+        sqlx::query("DROP TRIGGER fail_replay_release")
+            .execute(pool)
+            .await
+            .unwrap();
+        age_running_replay_for_recovery(&db).await;
+        let recovered = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: true,
+                recover_stale: true,
+            },
+        )
+        .await
+        .expect("stale recovery should close the already-succeeded ledger");
+        assert_eq!(recovered.counts.succeeded, 1);
+        assert_eq!(recovered.gemini_usage.logical_requests, 0);
+    }
+
     #[tokio::test]
     async fn heartbeat_ownership_loss_promptly_drops_the_inflight_operation() {
         struct PendingOperation(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -2191,6 +2327,13 @@ mod tests {
         .expect("ownership loss must cancel before the timeout");
         assert!(matches!(result, Err(ReplayRunError::Conflict(_))));
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM listing_replay_runs WHERE id = ?")
+                .bind(run.id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "running");
     }
 
     #[tokio::test]

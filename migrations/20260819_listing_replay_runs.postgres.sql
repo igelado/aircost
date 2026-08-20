@@ -18,7 +18,7 @@ BEGIN
     WHERE migration_name = '20260819_listing_replay_runs'
       AND contract_version = 1
       AND contract_fingerprint =
-        'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d'
+        '88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c'
   ) THEN
     RAISE EXCEPTION 'installed listing replay runs migration has a different contract';
   END IF;
@@ -117,13 +117,24 @@ BEGIN
                         index_relation.relname AS index_name,
                         indexed_relation.oid AS relation_oid,
                         index_definition.indisunique AS is_unique,
+                        index_definition.indisprimary AS is_primary,
+                        index_definition.indisexclusion AS is_exclusion,
+                        index_definition.indimmediate AS is_immediate,
+                        index_definition.indisclustered AS is_clustered,
                         index_definition.indisvalid AS is_valid,
                         index_definition.indisready AS is_ready,
+                        index_definition.indislive AS is_live,
+                        index_definition.indisreplident AS is_replica_identity,
+                        index_definition.indnullsnotdistinct AS nulls_not_distinct,
                         index_definition.indpred IS NOT NULL AS is_partial,
                         index_definition.indexprs IS NOT NULL AS has_expressions,
                         index_definition.indnkeyatts AS key_attribute_count,
                         index_definition.indnatts AS total_attribute_count,
+                        index_definition.indkey::text AS index_keys,
+                        index_definition.indcollation::text AS index_collations,
+                        index_definition.indclass::text AS index_operator_classes,
                         index_definition.indoption::text AS index_options,
+                        access_method.amname::text AS access_method,
                         lower(pg_catalog.pg_get_expr(
                           index_definition.indpred,
                           index_definition.indrelid
@@ -136,9 +147,38 @@ BEGIN
                             ON attribute.attrelid = index_definition.indrelid
                            AND attribute.attnum = key.attnum
                         ) AS columns
+                        ,(
+                          SELECT array_agg(
+                            CASE WHEN collation_key.collation_oid = 0 THEN '0'
+                              ELSE collation_namespace.nspname::text || '.' ||
+                                collation_definition.collname::text END
+                            ORDER BY collation_key.ordinality
+                          )
+                          FROM unnest(index_definition.indcollation) WITH ORDINALITY
+                            AS collation_key(collation_oid, ordinality)
+                          LEFT JOIN pg_catalog.pg_collation collation_definition
+                            ON collation_definition.oid = collation_key.collation_oid
+                          LEFT JOIN pg_catalog.pg_namespace collation_namespace
+                            ON collation_namespace.oid = collation_definition.collnamespace
+                        ) AS collations,
+                        (
+                          SELECT array_agg(
+                            operator_namespace.nspname::text || '.' ||
+                              operator_class.opcname::text
+                            ORDER BY operator_key.ordinality
+                          )
+                          FROM unnest(index_definition.indclass) WITH ORDINALITY
+                            AS operator_key(operator_class_oid, ordinality)
+                          JOIN pg_catalog.pg_opclass operator_class
+                            ON operator_class.oid = operator_key.operator_class_oid
+                          JOIN pg_catalog.pg_namespace operator_namespace
+                            ON operator_namespace.oid = operator_class.opcnamespace
+                        ) AS operator_classes
                       FROM pg_catalog.pg_index index_definition
                       JOIN pg_catalog.pg_class index_relation
                         ON index_relation.oid = index_definition.indexrelid
+                      JOIN pg_catalog.pg_am access_method
+                        ON access_method.oid = index_relation.relam
                       JOIN pg_catalog.pg_namespace index_namespace
                         ON index_namespace.oid = index_relation.relnamespace
                       JOIN pg_catalog.pg_class indexed_relation
@@ -172,10 +212,58 @@ BEGIN
                         constraint_definition.condeferred AS is_initially_deferred,
                         backing_index.indisunique AS backing_is_unique,
                         backing_index.indisprimary AS backing_is_primary,
+                        backing_index.indisexclusion AS backing_is_exclusion,
+                        backing_index.indimmediate AS backing_is_immediate,
+                        backing_index.indisclustered AS backing_is_clustered,
                         backing_index.indisvalid AS backing_is_valid,
                         backing_index.indisready AS backing_is_ready,
+                        backing_index.indislive AS backing_is_live,
+                        backing_index.indisreplident AS backing_is_replica_identity,
+                        backing_index.indnullsnotdistinct AS backing_nulls_not_distinct,
                         backing_index.indpred IS NOT NULL AS backing_is_partial,
-                        backing_index.indexprs IS NOT NULL AS backing_has_expressions
+                        backing_index.indexprs IS NOT NULL AS backing_has_expressions,
+                        backing_index.indnkeyatts AS backing_key_attribute_count,
+                        backing_index.indnatts AS backing_total_attribute_count,
+                        backing_index.indkey::text AS backing_index_keys,
+                        backing_index.indcollation::text AS backing_index_collations,
+                        backing_index.indclass::text AS backing_index_operator_classes,
+                        backing_index.indoption::text AS backing_index_options,
+                        backing_access_method.amname::text AS backing_access_method,
+                        (
+                          SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                          FROM unnest(backing_index.indkey) WITH ORDINALITY
+                            AS key(attnum, ordinality)
+                          JOIN pg_catalog.pg_attribute attribute
+                            ON attribute.attrelid = constraint_definition.conrelid
+                           AND attribute.attnum = key.attnum
+                        ) AS backing_columns,
+                        (
+                          SELECT array_agg(
+                            CASE WHEN collation_key.collation_oid = 0 THEN '0'
+                              ELSE collation_namespace.nspname::text || '.' ||
+                                collation_definition.collname::text END
+                            ORDER BY collation_key.ordinality
+                          )
+                          FROM unnest(backing_index.indcollation) WITH ORDINALITY
+                            AS collation_key(collation_oid, ordinality)
+                          LEFT JOIN pg_catalog.pg_collation collation_definition
+                            ON collation_definition.oid = collation_key.collation_oid
+                          LEFT JOIN pg_catalog.pg_namespace collation_namespace
+                            ON collation_namespace.oid = collation_definition.collnamespace
+                        ) AS backing_collations,
+                        (
+                          SELECT array_agg(
+                            operator_namespace.nspname::text || '.' ||
+                              operator_class.opcname::text
+                            ORDER BY operator_key.ordinality
+                          )
+                          FROM unnest(backing_index.indclass) WITH ORDINALITY
+                            AS operator_key(operator_class_oid, ordinality)
+                          JOIN pg_catalog.pg_opclass operator_class
+                            ON operator_class.oid = operator_key.operator_class_oid
+                          JOIN pg_catalog.pg_namespace operator_namespace
+                            ON operator_namespace.oid = operator_class.opcnamespace
+                        ) AS backing_operator_classes
                       FROM pg_catalog.pg_constraint constraint_definition
                       JOIN pg_catalog.pg_class relation
                         ON relation.oid = constraint_definition.conrelid
@@ -183,6 +271,10 @@ BEGIN
                         ON namespace.oid = relation.relnamespace
                       JOIN pg_catalog.pg_index backing_index
                         ON backing_index.indexrelid = constraint_definition.conindid
+                      JOIN pg_catalog.pg_class backing_index_relation
+                        ON backing_index_relation.oid = backing_index.indexrelid
+                      JOIN pg_catalog.pg_am backing_access_method
+                        ON backing_access_method.oid = backing_index_relation.relam
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
@@ -203,10 +295,58 @@ BEGIN
                         constraint_definition.condeferred AS is_initially_deferred,
                         backing_index.indisunique AS backing_is_unique,
                         backing_index.indisprimary AS backing_is_primary,
+                        backing_index.indisexclusion AS backing_is_exclusion,
+                        backing_index.indimmediate AS backing_is_immediate,
+                        backing_index.indisclustered AS backing_is_clustered,
                         backing_index.indisvalid AS backing_is_valid,
                         backing_index.indisready AS backing_is_ready,
+                        backing_index.indislive AS backing_is_live,
+                        backing_index.indisreplident AS backing_is_replica_identity,
+                        backing_index.indnullsnotdistinct AS backing_nulls_not_distinct,
                         backing_index.indpred IS NOT NULL AS backing_is_partial,
-                        backing_index.indexprs IS NOT NULL AS backing_has_expressions
+                        backing_index.indexprs IS NOT NULL AS backing_has_expressions,
+                        backing_index.indnkeyatts AS backing_key_attribute_count,
+                        backing_index.indnatts AS backing_total_attribute_count,
+                        backing_index.indkey::text AS backing_index_keys,
+                        backing_index.indcollation::text AS backing_index_collations,
+                        backing_index.indclass::text AS backing_index_operator_classes,
+                        backing_index.indoption::text AS backing_index_options,
+                        backing_access_method.amname::text AS backing_access_method,
+                        (
+                          SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                          FROM unnest(backing_index.indkey) WITH ORDINALITY
+                            AS key(attnum, ordinality)
+                          JOIN pg_catalog.pg_attribute attribute
+                            ON attribute.attrelid = constraint_definition.conrelid
+                           AND attribute.attnum = key.attnum
+                        ) AS backing_columns,
+                        (
+                          SELECT array_agg(
+                            CASE WHEN collation_key.collation_oid = 0 THEN '0'
+                              ELSE collation_namespace.nspname::text || '.' ||
+                                collation_definition.collname::text END
+                            ORDER BY collation_key.ordinality
+                          )
+                          FROM unnest(backing_index.indcollation) WITH ORDINALITY
+                            AS collation_key(collation_oid, ordinality)
+                          LEFT JOIN pg_catalog.pg_collation collation_definition
+                            ON collation_definition.oid = collation_key.collation_oid
+                          LEFT JOIN pg_catalog.pg_namespace collation_namespace
+                            ON collation_namespace.oid = collation_definition.collnamespace
+                        ) AS backing_collations,
+                        (
+                          SELECT array_agg(
+                            operator_namespace.nspname::text || '.' ||
+                              operator_class.opcname::text
+                            ORDER BY operator_key.ordinality
+                          )
+                          FROM unnest(backing_index.indclass) WITH ORDINALITY
+                            AS operator_key(operator_class_oid, ordinality)
+                          JOIN pg_catalog.pg_opclass operator_class
+                            ON operator_class.oid = operator_key.operator_class_oid
+                          JOIN pg_catalog.pg_namespace operator_namespace
+                            ON operator_namespace.oid = operator_class.opcnamespace
+                        ) AS backing_operator_classes
                       FROM pg_catalog.pg_constraint constraint_definition
                       JOIN pg_catalog.pg_class relation
                         ON relation.oid = constraint_definition.conrelid
@@ -214,6 +354,10 @@ BEGIN
                         ON namespace.oid = relation.relnamespace
                       JOIN pg_catalog.pg_index backing_index
                         ON backing_index.indexrelid = constraint_definition.conindid
+                      JOIN pg_catalog.pg_class backing_index_relation
+                        ON backing_index_relation.oid = backing_index.indexrelid
+                      JOIN pg_catalog.pg_am backing_access_method
+                        ON backing_access_method.oid = backing_index_relation.relam
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
@@ -287,7 +431,7 @@ BEGIN
                         ('listing_replay_run_items', 'materialization_attempt_count >= 0'),
                         ('listing_replay_run_items', 'terminal_rejection_phase IS NULL'),
                         ('listing_replay_run_items', 'last_failure_phase IS NULL'),
-                        ('listing_replay_run_items', 'resulting_listing_id IS NULL'),
+                        ('listing_replay_run_items', 'resulting_listing_id IS NOT NULL'),
                         ('listing_replay_run_items', 'extracted_listing_sha256 IS NOT NULL'),
                         ('listing_replay_run_items', 'extraction_state = ''succeeded'''),
                         ('listing_replay_run_items', 'extraction_started_at IS NOT NULL'),
@@ -388,11 +532,18 @@ BEGIN
                          AND relation_oid = pg_catalog.to_regclass(
                            'public.listing_replay_runs'
                          )
-                         AND is_unique AND is_valid AND is_ready AND is_partial
+                         AND is_unique AND NOT is_primary AND NOT is_exclusion
+                         AND is_immediate AND NOT is_clustered
+                         AND is_valid AND is_ready AND is_live
+                         AND NOT is_replica_identity AND NOT nulls_not_distinct
+                         AND is_partial
                          AND NOT has_expressions
                          AND key_attribute_count = 1 AND total_attribute_count = 1
+                         AND access_method = 'btree'
                          AND index_options = '0'
                          AND columns = ARRAY['status']::text[]
+                         AND collations = ARRAY['pg_catalog.default']::text[]
+                         AND operator_classes = ARRAY['pg_catalog.text_ops']::text[]
                          AND pg_catalog.translate(
                            predicate, E' \n\r\t()', ''
                          ) IN ('status=''running''', 'status=''running''::text'))
@@ -402,13 +553,25 @@ BEGIN
                          AND relation_oid = pg_catalog.to_regclass(
                            'public.listing_replay_run_items'
                          )
-                         AND NOT is_unique AND is_valid AND is_ready AND NOT is_partial
+                         AND NOT is_unique AND NOT is_primary AND NOT is_exclusion
+                         AND is_immediate AND NOT is_clustered
+                         AND is_valid AND is_ready AND is_live
+                         AND NOT is_replica_identity AND NOT nulls_not_distinct
+                         AND NOT is_partial
                          AND NOT has_expressions
                          AND key_attribute_count = 4 AND total_attribute_count = 4
+                         AND access_method = 'btree'
                          AND index_options = '0 0 0 0'
                          AND columns = ARRAY[
                            'run_id', 'extraction_state',
                            'materialization_state', 'position'
+                         ]::text[]
+                         AND collations = ARRAY[
+                           '0', 'pg_catalog.default', 'pg_catalog.default', '0'
+                         ]::text[]
+                         AND operator_classes = ARRAY[
+                           'pg_catalog.int8_ops', 'pg_catalog.text_ops',
+                           'pg_catalog.text_ops', 'pg_catalog.int8_ops'
                          ]::text[])
                       AND
                       (SELECT COUNT(*) = 4 FROM replay_unique_constraints)
@@ -416,8 +579,33 @@ BEGIN
                         SELECT 1 FROM replay_unique_constraints
                         WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
                           OR NOT backing_is_unique OR backing_is_primary
+                          OR backing_is_exclusion OR NOT backing_is_immediate
+                          OR backing_is_clustered
                           OR NOT backing_is_valid OR NOT backing_is_ready
+                          OR NOT backing_is_live OR backing_is_replica_identity
+                          OR backing_nulls_not_distinct
                           OR backing_is_partial OR backing_has_expressions
+                          OR backing_access_method <> 'btree'
+                          OR backing_key_attribute_count <> cardinality(columns)
+                          OR backing_total_attribute_count <> cardinality(columns)
+                          OR backing_columns <> columns
+                          OR backing_index_options <>
+                            array_to_string(array_fill(
+                              '0'::text, ARRAY[cardinality(columns)]
+                            ), ' ')
+                          OR backing_collations <> CASE
+                            WHEN columns = ARRAY['manifest_sha256']::text[]
+                              THEN ARRAY['pg_catalog.default']::text[]
+                            ELSE array_fill(
+                              '0'::text, ARRAY[cardinality(columns)]
+                            ) END
+                          OR backing_operator_classes <> CASE
+                            WHEN columns = ARRAY['manifest_sha256']::text[]
+                              THEN ARRAY['pg_catalog.text_ops']::text[]
+                            ELSE array_fill(
+                              'pg_catalog.int8_ops'::text,
+                              ARRAY[cardinality(columns)]
+                            ) END
                       )
                       AND
                       (SELECT COUNT(*) = 1 FROM replay_unique_constraints
@@ -442,8 +630,27 @@ BEGIN
                         SELECT 1 FROM replay_primary_keys
                         WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
                           OR NOT backing_is_unique OR NOT backing_is_primary
+                          OR backing_is_exclusion OR NOT backing_is_immediate
+                          OR backing_is_clustered
                           OR NOT backing_is_valid OR NOT backing_is_ready
+                          OR NOT backing_is_live OR backing_is_replica_identity
+                          OR backing_nulls_not_distinct
                           OR backing_is_partial OR backing_has_expressions
+                          OR backing_access_method <> 'btree'
+                          OR backing_key_attribute_count <> cardinality(columns)
+                          OR backing_total_attribute_count <> cardinality(columns)
+                          OR backing_columns <> columns
+                          OR backing_index_options <>
+                            array_to_string(array_fill(
+                              '0'::text, ARRAY[cardinality(columns)]
+                            ), ' ')
+                          OR backing_collations <>
+                            array_fill('0'::text, ARRAY[cardinality(columns)])
+                          OR backing_operator_classes <>
+                            array_fill(
+                              'pg_catalog.int8_ops'::text,
+                              ARRAY[cardinality(columns)]
+                            )
                       )
                       AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
                            WHERE relation_name = 'listing_replay_runs'
@@ -486,7 +693,7 @@ BEGIN
                           AND child_columns = 'resulting_listing_id'
                           AND parent_columns = 'id'
                           AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
-                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'n')
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
                       AND EXISTS (SELECT 1 FROM replay_foreign_keys
                         WHERE child_namespace = 'public'
                           AND child_relation = 'plugin_submission_materialization_receipts'
@@ -506,7 +713,7 @@ BEGIN
                           AND parent_oid = pg_catalog.to_regclass('public.aircraft_sale_listings')
                           AND child_columns = 'aircraft_sale_listing_id' AND parent_columns = 'id'
                           AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
-                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'c')
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
                       AND (SELECT COUNT(*) = 7 FROM replay_checks
                            WHERE relation_name = 'listing_replay_runs')
                       AND (SELECT COUNT(*) = 19 FROM replay_checks
@@ -541,7 +748,7 @@ BEGIN
       AND constraint_definition.contype = 'c';
 
     IF NOT COALESCE(contract_is_exact, FALSE)
-       OR check_signature IS DISTINCT FROM 'cca30d8412de563f1089046f15ee3298' THEN
+       OR check_signature IS DISTINCT FROM 'd9de973176f4fba876725550b6296db9' THEN
       RAISE EXCEPTION
         'installed listing replay migration contract has noncanonical objects';
     END IF;
@@ -604,7 +811,7 @@ CREATE TABLE IF NOT EXISTS public.listing_replay_run_items (
   materialization_state TEXT NOT NULL DEFAULT 'blocked'
     CHECK (materialization_state IN ('blocked', 'queued', 'running', 'succeeded', 'rejected', 'failed')),
   resulting_listing_id BIGINT
-    REFERENCES public.aircraft_sale_listings(id) ON DELETE SET NULL,
+    REFERENCES public.aircraft_sale_listings(id) ON DELETE RESTRICT,
   terminal_rejection_phase TEXT
     CHECK (terminal_rejection_phase IN ('extraction', 'materialization')),
   terminal_rejection_stage TEXT CHECK (terminal_rejection_stage IN (
@@ -672,7 +879,7 @@ CREATE TABLE IF NOT EXISTS public.listing_replay_run_items (
     (extraction_state <> 'failed' AND materialization_state <> 'failed'
       AND last_failure_phase IS NULL AND last_failure_reason_code IS NULL)
   ),
-  CHECK (resulting_listing_id IS NULL OR materialization_state = 'succeeded'),
+  CHECK ((materialization_state = 'succeeded') = (resulting_listing_id IS NOT NULL)),
   CHECK ((extraction_state = 'succeeded') = (extracted_listing_sha256 IS NOT NULL)),
   CHECK (extraction_state = 'succeeded' OR materialization_state = 'blocked'),
   CHECK (extraction_state <> 'running' OR extraction_started_at IS NOT NULL),
@@ -687,7 +894,7 @@ CREATE TABLE IF NOT EXISTS public.plugin_submission_materialization_receipts (
   plugin_submission_id BIGINT PRIMARY KEY
     REFERENCES public.plugin_submissions(id) ON DELETE CASCADE,
   aircraft_sale_listing_id BIGINT NOT NULL UNIQUE
-    REFERENCES public.aircraft_sale_listings(id) ON DELETE CASCADE,
+    REFERENCES public.aircraft_sale_listings(id) ON DELETE RESTRICT,
   rendered_html_sha256 TEXT NOT NULL
     CHECK (rendered_html_sha256 ~ '^[0-9a-f]{64}$'),
   extracted_listing_sha256 TEXT NOT NULL
@@ -699,7 +906,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d',
+  '88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 

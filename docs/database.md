@@ -140,14 +140,16 @@ does not imply completion: the exact receipt stores the bound listing plus
 rendered-capture and extraction-checkpoint hashes only after review and
 occurrence child projections finish. Checkpoint storage is first-writer
 immutable, and materialization compare-and-sets against the member's pinned
-checkpoint hash.
-The optional resulting
-listing foreign key uses `ON DELETE SET NULL`, so this operational history does
-not prevent ordinary listing deletion. Startup attests both complete replay
+checkpoint hash. A succeeded materialization must retain its non-null resulting
+listing ID. Both that result and the exact materialization receipt use
+`ON DELETE RESTRICT`, so replay provenance prevents deletion of the listing it
+proves was produced. Startup attests both complete replay
 table definitions on SQLite and the exact PostgreSQL column/type/nullability/
 default/identity, primary-key, unique, foreign-key/delete-action, check-
-vocabulary/hash, and index contracts. Same-name objects with weakened columns,
-constraints, or indexes do not satisfy the migration contract.
+vocabulary/hash, and full index/backing-index contracts, including key versus
+included attributes, collations, operator classes, options, predicates,
+expressions, null-distinctness, and lifecycle flags. Same-name objects with
+weakened columns, constraints, or indexes do not satisfy the migration contract.
 Marker-present migration reruns perform that complete attestation before any
 replay DDL. They also reject unexpected attached indexes, triggers, policies,
 rules, inheritance, partitioning, row-security behavior, or nonordinary table

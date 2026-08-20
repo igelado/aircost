@@ -3007,7 +3007,7 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
   materialization_state TEXT NOT NULL DEFAULT 'blocked'
     CHECK (materialization_state IN ('blocked', 'queued', 'running', 'succeeded', 'rejected', 'failed')),
   resulting_listing_id INTEGER
-    REFERENCES aircraft_sale_listings(id) ON DELETE SET NULL,
+    REFERENCES aircraft_sale_listings(id) ON DELETE RESTRICT,
   terminal_rejection_phase TEXT
     CHECK (terminal_rejection_phase IN ('extraction', 'materialization')),
   terminal_rejection_stage TEXT CHECK (terminal_rejection_stage IN (
@@ -3083,7 +3083,7 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
     (extraction_state <> 'failed' AND materialization_state <> 'failed'
       AND last_failure_phase IS NULL AND last_failure_reason_code IS NULL)
   ),
-  CHECK (resulting_listing_id IS NULL OR materialization_state = 'succeeded'),
+  CHECK ((materialization_state = 'succeeded') = (resulting_listing_id IS NOT NULL)),
   CHECK ((extraction_state = 'succeeded') = (extracted_listing_sha256 IS NOT NULL)),
   CHECK (extraction_state = 'succeeded' OR materialization_state = 'blocked'),
   CHECK (extraction_state <> 'running' OR extraction_started_at IS NOT NULL),
@@ -3097,7 +3097,7 @@ CREATE TABLE IF NOT EXISTS plugin_submission_materialization_receipts (
   plugin_submission_id INTEGER PRIMARY KEY
     REFERENCES plugin_submissions(id) ON DELETE CASCADE,
   aircraft_sale_listing_id INTEGER NOT NULL UNIQUE
-    REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
+    REFERENCES aircraft_sale_listings(id) ON DELETE RESTRICT,
   rendered_html_sha256 TEXT NOT NULL,
   extracted_listing_sha256 TEXT NOT NULL,
   completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -3113,7 +3113,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d',
+  '88481d813a511738dd160c0e54a857ce1c8333c60ae09bada01505fb5118163c',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 

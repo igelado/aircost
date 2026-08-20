@@ -177,7 +177,6 @@ pub(crate) struct ListingCreationResult {
     pub(crate) listing: SaleListing,
     pub(crate) occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
     pub(crate) source_serial_correction: Option<FaaSerialCorrection>,
-    pub(crate) created_new_listing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,15 +189,20 @@ pub(crate) enum ListingCreationMode {
 #[derive(Clone, Debug)]
 pub(crate) struct SignedSourceListingBinding {
     pub submission_id: i64,
-    pub observed_at: String,
-    pub checkpoint_replacement: Option<SignedSourceCheckpointReplacement>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SignedSourceCheckpointReplacement {
+    pub user_id: i64,
+    pub plugin_install_id: i64,
+    pub install_public_key_base64: String,
+    pub install_revoked_at: Option<String>,
+    pub source_url: String,
+    pub submitted_at: String,
+    pub rendered_html: String,
+    pub rendered_html_sha256: String,
+    pub signature_base64: String,
     pub expected_extracted_listing_json: Option<String>,
+    pub expected_extracted_listing_sha256: Option<String>,
     pub expected_extraction_error: Option<String>,
-    pub extracted_listing_json: String,
+    pub bound_extracted_listing_json: String,
+    pub bound_extracted_listing_sha256: String,
 }
 
 impl ListingCreationMode {
@@ -562,7 +566,6 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                 source_serial_correction,
-                created_new_listing: false,
             });
         }
     }
@@ -606,7 +609,6 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                     source_serial_correction,
-                    created_new_listing: false,
                 });
             }
         }
@@ -651,7 +653,6 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                     source_serial_correction,
-                    created_new_listing: false,
                 });
             }
         }
@@ -673,7 +674,6 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                 source_serial_correction,
-                created_new_listing: false,
             });
         }
     }
@@ -700,7 +700,6 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
             listing: get_listing(db, user_id, listing_id).await?,
             occurrence_dispositions: resolved_avionics.occurrence_dispositions,
             source_serial_correction,
-            created_new_listing: true,
         });
     }
     emit_listing_progress(
@@ -713,7 +712,6 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
         source_serial_correction,
-        created_new_listing: true,
     })
 }
 
@@ -787,7 +785,6 @@ pub(crate) async fn resume_signed_source_correction_listing(
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
         source_serial_correction: Some(source_serial_correction),
-        created_new_listing: false,
     })
 }
 
@@ -861,7 +858,6 @@ pub(crate) async fn resume_bound_replay_listing(
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
         source_serial_correction: None,
-        created_new_listing: false,
     })
 }
 
@@ -1077,6 +1073,25 @@ pub async fn update_listing(
 pub async fn delete_listing(db: &AppDb, user_id: i64, listing_id: i64) -> StoreResult<()> {
     let row = listing_owner_row(db, listing_id).await?;
     assert_user_can_mutate(&row, user_id, "delete")?;
+    let replay_provenance_count = query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT
+          (SELECT COUNT(*) FROM listing_replay_run_items
+           WHERE resulting_listing_id = ?)
+          +
+          (SELECT COUNT(*) FROM plugin_submission_materialization_receipts
+           WHERE aircraft_sale_listing_id = ?)
+        "#,
+        listing_id,
+        listing_id
+    )?;
+    if replay_provenance_count != 0 {
+        return Err(ListingStoreError::State(format!(
+            "listing {listing_id} is retained by clean-replay provenance and cannot be deleted"
+        )));
+    }
     let model_id = listing_aircraft_identity(db, listing_id)
         .await?
         .map(|identity| identity.aircraft_model_id);
@@ -1178,38 +1193,68 @@ async fn insert_listing(
         RETURNING id
         "#,
     );
-    let retain_checkpoint_and_bind_submission_sql = db.sql(
-        r#"
-        UPDATE plugin_submissions
-        SET canonical_listing_id = ?
-        WHERE id = ? AND user_id = ? AND source_url = ?
-          AND canonical_listing_id IS NULL
-          AND extracted_listing_json IS NOT NULL
-          AND extraction_error IS NULL
-        "#,
-    );
-    let replace_checkpoint_and_bind_submission_sql = db.sql(match db.backend() {
+    let bind_exact_signed_checkpoint_sql = db.sql(match db.backend() {
         DatabaseBackend::Sqlite(_) => {
             r#"
             UPDATE plugin_submissions
             SET canonical_listing_id = ?, extracted_listing_json = ?, extraction_error = NULL
-            WHERE id = ? AND user_id = ? AND source_url = ?
+            WHERE id = ? AND user_id = ? AND plugin_install_id = ?
+              AND source_url = ? AND submitted_at = ?
+              AND rendered_html = ? AND rendered_html_sha256 = ?
+              AND signature_base64 = ?
               AND canonical_listing_id IS NULL
               AND extracted_listing_json IS ?
               AND extraction_error IS ?
+              AND EXISTS (
+                SELECT 1 FROM plugin_installs exact_install
+                WHERE exact_install.id = plugin_submissions.plugin_install_id
+                  AND exact_install.user_id = plugin_submissions.user_id
+                  AND exact_install.public_key_base64 = ?
+                  AND exact_install.revoked_at IS ?
+              )
             "#
         }
         DatabaseBackend::Postgres(_) => {
             r#"
             UPDATE plugin_submissions
             SET canonical_listing_id = ?, extracted_listing_json = ?, extraction_error = NULL
-            WHERE id = ? AND user_id = ? AND source_url = ?
+            WHERE id = ? AND user_id = ? AND plugin_install_id = ?
+              AND source_url = ? AND submitted_at = ?
+              AND rendered_html = ? AND rendered_html_sha256 = ?
+              AND signature_base64 = ?
               AND canonical_listing_id IS NULL
               AND extracted_listing_json IS NOT DISTINCT FROM ?
               AND extraction_error IS NOT DISTINCT FROM ?
+              AND EXISTS (
+                SELECT 1 FROM plugin_installs exact_install
+                WHERE exact_install.id = plugin_submissions.plugin_install_id
+                  AND exact_install.user_id = plugin_submissions.user_id
+                  AND exact_install.public_key_base64 = ?
+                  AND exact_install.revoked_at IS NOT DISTINCT FROM ?
+              )
             "#
         }
     });
+    if let Some(binding) = signed_source_binding {
+        let expected_sha256 = binding
+            .expected_extracted_listing_json
+            .as_deref()
+            .map(|checkpoint| format!("{:x}", Sha256::digest(checkpoint.as_bytes())));
+        if binding.user_id != user_id
+            || values.source_url.as_deref() != Some(binding.source_url.as_str())
+            || format!("{:x}", Sha256::digest(binding.rendered_html.as_bytes()))
+                != binding.rendered_html_sha256
+            || expected_sha256 != binding.expected_extracted_listing_sha256
+            || format!(
+                "{:x}",
+                Sha256::digest(binding.bound_extracted_listing_json.as_bytes())
+            ) != binding.bound_extracted_listing_sha256
+        {
+            return Err(ListingStoreError::State(
+                "signed source binding does not match its exact capture checkpoint".to_string(),
+            ));
+        }
+    }
     macro_rules! insert_and_bind {
         ($pool:expr) => {{
             let mut transaction = $pool.begin().await?;
@@ -1220,7 +1265,7 @@ async fn insert_listing(
                 .bind(values.model_year)
                 .bind(values.asking_price_usd)
                 .bind(values.currency.as_str())
-                .bind(signed_source_binding.map(|binding| binding.observed_at.as_str()))
+                .bind(signed_source_binding.map(|binding| binding.submitted_at.as_str()))
                 .bind(values.status.as_str())
                 .bind(if source_identity_receipt_pending {
                     "quarantined"
@@ -1250,28 +1295,24 @@ async fn insert_listing(
                 .fetch_one(&mut *transaction)
                 .await?;
             if let Some(binding) = signed_source_binding {
-                let bound = if let Some(replacement) = &binding.checkpoint_replacement {
-                    sqlx::query(&replace_checkpoint_and_bind_submission_sql)
-                        .bind(listing_id)
-                        .bind(replacement.extracted_listing_json.as_str())
-                        .bind(binding.submission_id)
-                        .bind(user_id)
-                        .bind(values.source_url.as_deref())
-                        .bind(replacement.expected_extracted_listing_json.as_deref())
-                        .bind(replacement.expected_extraction_error.as_deref())
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected()
-                } else {
-                    sqlx::query(&retain_checkpoint_and_bind_submission_sql)
-                        .bind(listing_id)
-                        .bind(binding.submission_id)
-                        .bind(user_id)
-                        .bind(values.source_url.as_deref())
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected()
-                };
+                let bound = sqlx::query(&bind_exact_signed_checkpoint_sql)
+                    .bind(listing_id)
+                    .bind(binding.bound_extracted_listing_json.as_str())
+                    .bind(binding.submission_id)
+                    .bind(binding.user_id)
+                    .bind(binding.plugin_install_id)
+                    .bind(binding.source_url.as_str())
+                    .bind(binding.submitted_at.as_str())
+                    .bind(binding.rendered_html.as_str())
+                    .bind(binding.rendered_html_sha256.as_str())
+                    .bind(binding.signature_base64.as_str())
+                    .bind(binding.expected_extracted_listing_json.as_deref())
+                    .bind(binding.expected_extraction_error.as_deref())
+                    .bind(binding.install_public_key_base64.as_str())
+                    .bind(binding.install_revoked_at.as_deref())
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
                 if bound != 1 {
                     return Err(ListingStoreError::State(
                         "signed source changed before its corrected listing could be atomically bound"
@@ -4837,6 +4878,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     use crate::aircraft::faa::{
         require_listing_faa_admission, store_release, AircraftAdmissionError, BlockReason,
@@ -5791,6 +5833,155 @@ mod tests {
 
         assert_eq!(listing_count, 0);
         assert_eq!(canonical_listing_id, None);
+    }
+
+    async fn assert_signed_capture_drift_rolls_back_without_deleting_same_source_listing(
+        drift_install_key: bool,
+    ) {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        let source_url = if drift_install_key {
+            "https://example.test/replay-race/install-key"
+        } else {
+            "https://example.test/replay-race/rendered-bytes"
+        };
+        let rendered_html = "<html>exact signed capture</html>";
+        let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let checkpoint = r#"{"checkpoint":"exact"}"#;
+        let checkpoint_sha256 = format!("{:x}", Sha256::digest(checkpoint.as_bytes()));
+        let install_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO plugin_installs (user_id, public_key_base64)
+            VALUES (?, 'exact-public-key')
+            RETURNING id
+            "#,
+            user.id
+        )
+        .expect("install should seed");
+        let submission_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json
+            ) VALUES (?, ?, ?, ?, ?, 'exact-signature', ?)
+            RETURNING id
+            "#,
+            user.id,
+            install_id,
+            source_url,
+            rendered_html,
+            rendered_html_sha256.as_str(),
+            checkpoint
+        )
+        .expect("submission should seed");
+        let submitted_at = query_scalar_one!(
+            &db,
+            String,
+            "SELECT submitted_at FROM plugin_submissions WHERE id = ?",
+            submission_id
+        )
+        .expect("submission timestamp should load");
+        let binding = super::SignedSourceListingBinding {
+            submission_id,
+            user_id: user.id,
+            plugin_install_id: install_id,
+            install_public_key_base64: "exact-public-key".to_string(),
+            install_revoked_at: None,
+            source_url: source_url.to_string(),
+            submitted_at,
+            rendered_html: rendered_html.to_string(),
+            rendered_html_sha256,
+            signature_base64: "exact-signature".to_string(),
+            expected_extracted_listing_json: Some(checkpoint.to_string()),
+            expected_extracted_listing_sha256: Some(checkpoint_sha256.clone()),
+            expected_extraction_error: None,
+            bound_extracted_listing_json: checkpoint.to_string(),
+            bound_extracted_listing_sha256: checkpoint_sha256,
+        };
+
+        // This is the harmful race compensation used to mishandle: an ordinary
+        // same-user/source listing appears after replay preflight but before the
+        // exact capture bind. It is never a rollback target.
+        let ordinary_listing_id = seed_blank_identity_listing(&db, user.id, source_url).await;
+        if drift_install_key {
+            execute_query!(
+                &db,
+                "UPDATE plugin_installs SET public_key_base64 = 'rotated-key' WHERE id = ?",
+                install_id
+            )
+            .expect("install key drift should seed");
+        } else {
+            execute_query!(
+                &db,
+                "UPDATE plugin_submissions SET rendered_html = '<html>changed bytes</html>' WHERE id = ?",
+                submission_id
+            )
+            .expect("rendered-byte drift should seed");
+        }
+        let mut values = listing_values_with_variant("182T");
+        values.source_url = Some(source_url.to_string());
+        let literal_values = values.clone();
+        let error = super::insert_listing(
+            &db,
+            user.id,
+            &values,
+            &literal_values,
+            false,
+            Some(&binding),
+        )
+        .await
+        .expect_err("capture drift must reject the atomic bind");
+        assert!(matches!(error, super::ListingStoreError::State(_)));
+
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                "SELECT COUNT(*) FROM aircraft_sale_listings WHERE source_url = ?",
+                source_url
+            )
+            .expect("same-source listing count should load"),
+            1
+        );
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                "SELECT id FROM aircraft_sale_listings WHERE source_url = ?",
+                source_url
+            )
+            .expect("ordinary listing should remain"),
+            ordinary_listing_id
+        );
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                Option<i64>,
+                "SELECT canonical_listing_id FROM plugin_submissions WHERE id = ?",
+                submission_id
+            )
+            .expect("capture binding should remain queryable"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_capture_rendered_byte_drift_rolls_back_without_compensation_deletion() {
+        assert_signed_capture_drift_rolls_back_without_deleting_same_source_listing(false).await;
+    }
+
+    #[tokio::test]
+    async fn signed_capture_install_key_drift_rolls_back_without_compensation_deletion() {
+        assert_signed_capture_drift_rolls_back_without_deleting_same_source_listing(true).await;
     }
 
     #[tokio::test]
@@ -6913,7 +7104,6 @@ mod tests {
         )
         .await
         .expect("signed source admission should isolate the corrected observation");
-        assert!(created.created_new_listing);
         assert_ne!(created.listing.id, existing_id);
         assert_eq!(created.listing.serial_number.as_deref(), Some("TESTSERIAL"));
         assert_eq!(created.listing.ingestion_state, "quarantined");
