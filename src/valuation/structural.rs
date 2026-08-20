@@ -216,6 +216,8 @@ impl ValuationModel for StructuralModel {
 
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
         let (value_now, breakdown) = self.predict_value(query)?;
+        let modeled_factory_configuration_anchor_usd =
+            self.predict_value(&query.factory_configuration_query())?.0;
         let support = self.support(query);
         let base_q80 = self.q80(query, support);
         let utilization = self.utilization(query);
@@ -250,6 +252,7 @@ impl ValuationModel for StructuralModel {
         }
         let error_multiplier = base_q80.exp();
         Ok(ValuationEstimate {
+            modeled_factory_configuration_anchor_usd,
             estimated_value_usd: value_now,
             low_value_usd: value_now / error_multiplier,
             high_value_usd: value_now * error_multiplier,

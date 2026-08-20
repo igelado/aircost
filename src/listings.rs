@@ -13,7 +13,6 @@ use crate::aircraft::faa::{
 use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
 };
-use crate::aircraft::reference::persistence::listing_reference_status;
 use crate::avionics::catalog::{
     resolve_avionics_identity, resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity,
     AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
@@ -21,7 +20,6 @@ use crate::avionics::catalog::{
 use crate::avionics::reuse::{
     reuse_attestation_is_current_postgres, reuse_attestation_is_current_sqlite,
 };
-use crate::avionics::{enrich_listing_avionics_metadata, AvionicsStoreError};
 use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{optional_f64, optional_i64, optional_string, GeminiListingExtractor};
@@ -166,7 +164,6 @@ pub type ListingProgressSender = tokio::sync::mpsc::UnboundedSender<Value>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ListingFinalizationOutcome {
     Ready,
-    PendingReference { reason: String },
 }
 
 #[derive(Debug)]
@@ -557,8 +554,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 "refreshing_estimates",
                 "Refreshing valuation inputs",
             );
-            finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
-                .await?;
+            finalize_listing_ingestion(db, listing_id).await?;
             return Ok(ListingCreationResult {
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -595,13 +591,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                     "refreshing_estimates",
                     "Refreshing valuation inputs",
                 );
-                finalize_listing_ingestion(
-                    db,
-                    listing_id,
-                    extractor,
-                    preview.context_text.as_deref(),
-                )
-                .await?;
+                finalize_listing_ingestion(db, listing_id).await?;
                 return Ok(ListingCreationResult {
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -639,13 +629,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                     "refreshing_estimates",
                     "Refreshing valuation inputs",
                 );
-                finalize_listing_ingestion(
-                    db,
-                    listing_id,
-                    extractor,
-                    preview.context_text.as_deref(),
-                )
-                .await?;
+                finalize_listing_ingestion(db, listing_id).await?;
                 return Ok(ListingCreationResult {
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -665,8 +649,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 "Refreshing valuation inputs",
             );
             mark_listing_incomplete(db, listing_id).await?;
-            finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref())
-                .await?;
+            finalize_listing_ingestion(db, listing_id).await?;
             return Ok(ListingCreationResult {
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -704,7 +687,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         "refreshing_estimates",
         "Refreshing valuation inputs",
     );
-    finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
+    finalize_listing_ingestion(db, listing_id).await?;
     Ok(ListingCreationResult {
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -850,7 +833,7 @@ pub(crate) async fn resume_bound_replay_listing(
         false,
     )
     .await?;
-    finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
+    finalize_listing_ingestion(db, listing_id).await?;
     Ok(ListingCreationResult {
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -863,8 +846,6 @@ pub(crate) async fn finalize_signed_source_listing_after_receipt(
     user_id: i64,
     listing_id: i64,
     submission_id: i64,
-    extractor: Option<&GeminiListingExtractor>,
-    listing_text: Option<&str>,
 ) -> StoreResult<SaleListing> {
     let receipt_count = query_scalar_one!(
         db,
@@ -896,7 +877,7 @@ pub(crate) async fn finalize_signed_source_listing_after_receipt(
             "listing {listing_id} has no exact bound source identity correction receipt"
         )));
     }
-    finalize_listing_ingestion(db, listing_id, extractor, listing_text).await?;
+    finalize_listing_ingestion(db, listing_id).await?;
     get_listing(db, user_id, listing_id).await
 }
 
@@ -1058,7 +1039,7 @@ pub async fn update_listing(
     if let Some(pending_review_aspects) = pending_review_aspects {
         replace_listing_pending_review(db, listing_id, &pending_review_aspects, false).await?;
     }
-    finalize_listing_ingestion(db, listing_id, extractor, None).await?;
+    finalize_listing_ingestion(db, listing_id).await?;
     let updated = get_listing(db, user_id, listing_id).await?;
     if updated.aircraft.aircraft_model_id != old_model_id {
         mark_valuation_snapshot_stale_best_effort(db, old_model_id).await;
@@ -3386,58 +3367,13 @@ fn canonical_valuation_facts(value: &[ListingValuationFact]) -> Vec<CanonicalVal
 async fn complete_listing_ingestion(
     db: &AppDb,
     listing_id: i64,
-    extractor: Option<&GeminiListingExtractor>,
-    _listing_text: Option<&str>,
 ) -> StoreResult<ListingFinalizationOutcome> {
-    if listing_missing_avionics_metadata_count(db, listing_id).await? > 0 {
-        let Some(extractor) = extractor else {
-            return pending_factory_reference(
-                db,
-                listing_id,
-                    "Gemini extractor is not configured; reusable installed-avionics metadata remains pending"
-                        .to_string(),
-            )
-            .await;
-        };
-        match enrich_listing_avionics_metadata(db, extractor, true, listing_id, None, false).await {
-            Ok(_) => {}
-            Err(AvionicsStoreError::Database(message)) => {
-                return Err(ListingStoreError::Database(message));
-            }
-            Err(AvionicsStoreError::Model(message)) => {
-                require_listing_admission(db, listing_id)
-                    .await
-                    .map_err(listing_admission_error)?;
-                return pending_factory_reference(
-                    db,
-                    listing_id,
-                    format!("reusable installed-avionics metadata remains pending: {message}"),
-                )
-                .await;
-            }
-        }
-        let remaining = listing_missing_avionics_metadata_count(db, listing_id).await?;
-        if remaining > 0 {
-            return pending_factory_reference(
-                db,
-                listing_id,
-                format!(
-                    "reusable installed-avionics metadata remains pending for {remaining} catalog rows"
-                ),
-            )
-            .await;
-        }
-    }
-
-    let reference = listing_reference_status(db, listing_id).await?;
-    if !reference.ready {
-        let reason = reference
-            .gaps
-            .iter()
-            .map(|gap| format!("{}: {}", gap.code, gap.message))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return pending_factory_reference(db, listing_id, reason).await;
+    let invalid_avionics_count =
+        listing_invalid_avionics_product_graph_count(db, listing_id).await?;
+    if invalid_avionics_count > 0 {
+        return Err(ListingStoreError::State(format!(
+            "listing {listing_id} has {invalid_avionics_count} avionics associations without an approved canonical product identity or required suite composition"
+        )));
     }
 
     if let Ok(Some(identity)) = listing_aircraft_identity(db, listing_id).await {
@@ -3447,24 +3383,7 @@ async fn complete_listing_ingestion(
     Ok(ListingFinalizationOutcome::Ready)
 }
 
-async fn pending_factory_reference(
-    db: &AppDb,
-    listing_id: i64,
-    reason: String,
-) -> StoreResult<ListingFinalizationOutcome> {
-    if let Ok(Some(identity)) = listing_aircraft_identity(db, listing_id).await {
-        mark_valuation_snapshot_stale_best_effort(db, identity.aircraft_model_id).await;
-    }
-    let _ = cleanup_orphan_records(db).await;
-    Ok(ListingFinalizationOutcome::PendingReference { reason })
-}
-
-async fn finalize_listing_ingestion(
-    db: &AppDb,
-    listing_id: i64,
-    extractor: Option<&GeminiListingExtractor>,
-    listing_text: Option<&str>,
-) -> StoreResult<()> {
+async fn finalize_listing_ingestion(db: &AppDb, listing_id: i64) -> StoreResult<()> {
     if source_identity_receipt_is_pending(db, listing_id).await? {
         return Err(ListingStoreError::State(format!(
             "listing {listing_id} is waiting for its immutable source identity correction receipt"
@@ -3501,13 +3420,9 @@ async fn finalize_listing_ingestion(
         mark_listing_pending_review(db, listing_id).await?;
         return Ok(());
     }
-    match complete_listing_ingestion(db, listing_id, extractor, listing_text).await {
+    match complete_listing_ingestion(db, listing_id).await {
         Ok(ListingFinalizationOutcome::Ready) => {
             mark_listing_ready(db, listing_id).await?;
-            Ok(())
-        }
-        Ok(ListingFinalizationOutcome::PendingReference { .. }) => {
-            mark_listing_pending_factory_reference(db, listing_id).await?;
             Ok(())
         }
         Err(error) => quarantine_after_error(db, listing_id, error).await,
@@ -3561,14 +3476,13 @@ async fn replace_listing_pending_review(
 
 /// Finish a listing after an explicit review transaction has applied every
 /// pending decision. Review resolution deliberately leaves the listing
-/// incomplete and private: enrichment can make network calls and therefore
-/// cannot safely run inside the transaction that replaces avionics links.
-/// Only a fully enriched listing with a durable source is published.
+/// incomplete and private until canonical aircraft and avionics product-graph
+/// checks have passed. Factory-reference availability is a separate valuation
+/// concern and never demotes an otherwise verified listing. Finalization is
+/// local and never performs model enrichment or other network work.
 pub async fn finalize_reviewed_listing_ingestion(
     db: &AppDb,
     listing_id: i64,
-    extractor: Option<&GeminiListingExtractor>,
-    listing_text: Option<&str>,
 ) -> Result<ListingFinalizationOutcome, ListingStoreError> {
     if source_identity_receipt_is_pending(db, listing_id).await? {
         return Err(ListingStoreError::State(format!(
@@ -3588,23 +3502,17 @@ pub async fn finalize_reviewed_listing_ingestion(
         )));
     }
     // A response retry after successful publication must be free and
-    // idempotent. In particular, do not re-enter any network enrichment path.
+    // idempotent.
     if state.0 == "ready" && state.1 {
         return Ok(ListingFinalizationOutcome::Ready);
     }
     if let Err(error) = ensure_listing_canonical_aircraft_identity(db, listing_id).await {
         return quarantine_after_error(db, listing_id, error).await;
     }
-    match complete_listing_ingestion(db, listing_id, extractor, listing_text).await {
+    match complete_listing_ingestion(db, listing_id).await {
         Ok(ListingFinalizationOutcome::Ready) => {
             match mark_reviewed_listing_ready(db, listing_id).await {
                 Ok(()) => Ok(ListingFinalizationOutcome::Ready),
-                Err(error) => quarantine_after_error(db, listing_id, error).await,
-            }
-        }
-        Ok(pending @ ListingFinalizationOutcome::PendingReference { .. }) => {
-            match mark_listing_pending_factory_reference(db, listing_id).await {
-                Ok(()) => Ok(pending),
                 Err(error) => quarantine_after_error(db, listing_id, error).await,
             }
         }
@@ -3693,30 +3601,6 @@ async fn mark_listing_incomplete(db: &AppDb, listing_id: i64) -> StoreResult<()>
         SET ingestion_state = 'incomplete',
             ingestion_error = NULL,
             ingestion_completed_at = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        "#,
-        listing_id
-    )?;
-    Ok(())
-}
-
-async fn mark_listing_pending_factory_reference(db: &AppDb, listing_id: i64) -> StoreResult<()> {
-    execute_query!(
-        db,
-        r#"
-        UPDATE aircraft_sale_listings
-        SET ingestion_state = CASE
-              WHEN EXISTS (
-                SELECT 1
-                FROM aircraft_sale_listing_pending_reviews review
-                WHERE review.listing_id = aircraft_sale_listings.id
-              ) THEN 'pending_review'
-              ELSE 'incomplete'
-            END,
-            ingestion_error = NULL,
-            ingestion_completed_at = NULL,
-            is_verified = FALSE,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         "#,
@@ -3918,7 +3802,10 @@ async fn retain_receipt_gate_or_quarantine<T>(
     quarantine_after_error(db, listing_id, error).await
 }
 
-async fn listing_missing_avionics_metadata_count(db: &AppDb, listing_id: i64) -> StoreResult<i64> {
+async fn listing_invalid_avionics_product_graph_count(
+    db: &AppDb,
+    listing_id: i64,
+) -> StoreResult<i64> {
     Ok(query_scalar_one!(
         db,
         i64,
@@ -3929,52 +3816,43 @@ async fn listing_missing_avionics_metadata_count(db: &AppDb, listing_id: i64) ->
           ON model.id = link.avionics_model_id
         WHERE link.aircraft_sale_listing_id = ?
           AND (
-            model.catalog_status <> 'approved'
-            OR model.introduced_year IS NULL
-            OR model.estimated_unit_value_usd IS NULL
-            OR model.estimated_unit_value_usd < 0
-            OR model.value_basis <> 'installed_contribution'
-            OR model.replacement_cost_usd IS NULL
-            OR model.replacement_cost_usd < model.estimated_unit_value_usd
-            OR model.value_reference_year IS NULL
-            OR model.value_reference_year < 1900
-            OR model.value_reference_year > 2200
-            OR model.value_source IS NULL
-            OR TRIM(model.value_source) = ''
+            NOT EXISTS (
+              SELECT 1
+              FROM avionics_approved_product_graph_identities approved_identity
+              WHERE approved_identity.avionics_model_id = link.avionics_model_id
+            )
             OR (
-              model.valuation_scope = 'integrated_suite'
+              link.replaces_avionics_model_id IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1
-                FROM avionics_suite_components membership
-                JOIN avionics_models component
-                  ON component.id = membership.component_model_id
-                WHERE membership.suite_model_id = model.id
-                  AND component.catalog_status = 'approved'
+                FROM avionics_approved_product_graph_identities approved_identity
+                WHERE approved_identity.avionics_model_id = link.replaces_avionics_model_id
+              )
+            )
+            OR (
+              model.valuation_scope = 'integrated_suite'
+              AND (
+                NOT EXISTS (
+                  SELECT 1
+                  FROM avionics_suite_components membership
+                  WHERE membership.suite_model_id = model.id
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM avionics_suite_components membership
+                  WHERE membership.suite_model_id = model.id
+                    AND NOT EXISTS (
+                      SELECT 1
+                      FROM avionics_approved_product_graph_identities component_identity
+                      WHERE component_identity.avionics_model_id = membership.component_model_id
+                    )
+                )
               )
             )
           )
         "#,
         listing_id
     )?)
-}
-
-pub(crate) async fn listing_factory_reference_is_pending(
-    db: &AppDb,
-    listing_id: i64,
-) -> Result<bool, ListingStoreError> {
-    if query_scalar_one!(
-        db,
-        i64,
-        "SELECT COUNT(*) FROM aircraft_sale_listings WHERE id = ?",
-        listing_id
-    )? != 1
-    {
-        return Err(ListingStoreError::NotFound(format!(
-            "listing {listing_id} not found"
-        )));
-    }
-    Ok(!listing_reference_status(db, listing_id).await?.ready
-        || listing_missing_avionics_metadata_count(db, listing_id).await? > 0)
 }
 
 async fn mark_valuation_snapshot_stale_best_effort(db: &AppDb, aircraft_model_id: i64) {
@@ -4790,6 +4668,7 @@ fn required_f64(value: Option<f64>, field_name: &str) -> StoreResult<f64> {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -4797,6 +4676,11 @@ mod tests {
     use crate::aircraft::faa::{
         require_listing_faa_admission, store_release, AircraftAdmissionError, BlockReason,
         ReleaseFixtureBuilder, ReleaseMetadata,
+    };
+    use crate::aircraft::reference::persistence::{
+        assemble_and_publish_reference_version, ApprovedReferenceVersionDraft,
+        ReferenceApplicabilityDraft, ReferenceComponentDraft, ReferenceConfigurationIdentityDraft,
+        ReferencePriceDraft,
     };
     use crate::avionics::catalog::{
         ApprovedAvionicsIdentity, AvionicsIdentityOutcome, CatalogError,
@@ -4810,7 +4694,7 @@ mod tests {
     use crate::db::{AppDb, DatabaseBackend};
     use crate::extract::preview_manual_listing;
     use crate::listing::review::{
-        stage_pending_review, ListingAssociationRole, PendingReviewAspect,
+        stage_pending_review, ListingAssociationRole, PendingReviewAspect, ReviewProduct,
     };
     use crate::models::ParsedAvionics;
 
@@ -4934,6 +4818,195 @@ mod tests {
         )
         .expect("curated aircraft staging listing should be removed");
         projected_variant_id
+    }
+
+    async fn publish_test_aircraft_reference(
+        db: &AppDb,
+        aircraft_model_variant_id: i64,
+        model_year: i64,
+        avionics_model_ids: &[i64],
+    ) {
+        let (family_id, designation_id, generation_id, package_id) = query_as_optional!(
+            db,
+            (i64, i64, Option<i64>, Option<i64>),
+            r#"
+            SELECT aircraft_model_family_id, aircraft_designation_id,
+                   aircraft_generation_id, aircraft_factory_package_id
+            FROM aircraft_valuation_compatibility_projections
+            WHERE aircraft_model_variant_id = ?
+            "#,
+            aircraft_model_variant_id
+        )
+        .expect("reference hierarchy should load")
+        .expect("curated compatibility projection should exist");
+        let source_id = query_scalar_one!(
+            db,
+            i64,
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, source_title, source_domain, source_tier, retrieved_at
+            ) VALUES (?, 'Listing test factory reference', 'manufacturer.example',
+              'manufacturer_primary', '2026-08-19')
+            RETURNING id
+            "#,
+            format!(
+                "https://manufacturer.example/listing-reference/{aircraft_model_variant_id}/{model_year}"
+            )
+        )
+        .expect("primary reference source should seed");
+        let claim_id = query_scalar_one!(
+            db,
+            i64,
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'specification', 'fixture aircraft', 'defines',
+              'complete factory configuration',
+              'Primary fixture source defines the complete factory configuration.',
+              'validated', '2026-08-19')
+            RETURNING id
+            "#,
+            source_id
+        )
+        .expect("validated reference claim should seed");
+        let applicability_claim_id = query_scalar_one!(
+            db,
+            i64,
+            "INSERT INTO curation_evidence_claims (evidence_source_id, claim_kind, subject_text, predicate_text, object_text, quoted_evidence, validation_status, validated_at) VALUES (?, 'applicability', 'fixture aircraft', 'applies in', 'GLOBAL', 'Primary fixture source defines global applicability.', 'validated', '2026-08-19') RETURNING id",
+            source_id
+        )
+        .expect("validated applicability claim should seed");
+        let price_claim_id = query_scalar_one!(
+            db,
+            i64,
+            "INSERT INTO curation_evidence_claims (evidence_source_id, claim_kind, subject_text, predicate_text, object_text, quoted_evidence, validation_status, validated_at) VALUES (?, 'price', 'fixture aircraft', 'equipped MSRP', '500000 USD', 'Primary fixture source states the equipped MSRP.', 'validated', '2026-08-19') RETURNING id",
+            source_id
+        )
+        .expect("validated price claim should seed");
+        let factory_claim_id = query_scalar_one!(
+            db,
+            i64,
+            "INSERT INTO curation_evidence_claims (evidence_source_id, claim_kind, subject_text, predicate_text, object_text, quoted_evidence, validation_status, validated_at) VALUES (?, 'standard_equipment', 'fixture aircraft', 'includes', 'factory equipment', 'Primary fixture source defines the standard factory equipment.', 'validated', '2026-08-19') RETURNING id",
+            source_id
+        )
+        .expect("validated factory-equipment claim should seed");
+        let observation_id = query_scalar_one!(
+            db,
+            i64,
+            r#"
+            INSERT INTO aircraft_identity_observations (
+              observed_make, observed_family, observed_designation, model_year,
+              exact_source_evidence, observation_sha256
+            ) VALUES ('Listing Test Maker', 'Listing Test Family',
+              'Listing Test Designation', ?, 'listing reference fixture', ?)
+            RETURNING id
+            "#,
+            model_year,
+            format!("{aircraft_model_variant_id:032x}{model_year:032x}")
+        )
+        .expect("reference observation should seed");
+        let case_id = query_scalar_one!(
+            db,
+            i64,
+            r#"
+            INSERT INTO aircraft_identity_resolution_cases (
+              observation_id, resolution_scope, job_fingerprint, catalog_revision
+            ) VALUES (?, 'reference_profile', ?, 'listing-test')
+            RETURNING id
+            "#,
+            observation_id,
+            format!("listing-reference-{aircraft_model_variant_id}-{model_year}")
+        )
+        .expect("reference resolution case should seed");
+        let mut decision_ids = Vec::new();
+        for entity_kind in ["reference_configuration", "reference_profile"] {
+            let decision_id = query_scalar_one!(
+                db,
+                i64,
+                r#"
+                INSERT INTO aircraft_identity_decisions (
+                  resolution_case_id, entity_kind, decision_action, decision_status,
+                  decision_payload_json, deterministic_validation_json,
+                  deterministic_validation_passed, rationale, decided_at
+                ) VALUES (?, ?, 'approve_new', 'approved', '{}', '{}', TRUE,
+                  'listing test reference', '2026-08-19')
+                RETURNING id
+                "#,
+                case_id,
+                entity_kind
+            )
+            .expect("approved reference decision should seed");
+            execute_query!(
+                db,
+                r#"
+                INSERT INTO aircraft_identity_decision_claims (
+                  decision_id, evidence_claim_id, evidence_role
+                ) VALUES (?, ?, 'identity')
+                "#,
+                decision_id,
+                claim_id
+            )
+            .expect("reference decision evidence should seed");
+            decision_ids.push(decision_id);
+        }
+        let market_id = query_scalar_one!(
+            db,
+            i64,
+            "SELECT id FROM aircraft_markets WHERE code = 'GLOBAL'"
+        )
+        .expect("global aircraft market should exist");
+        assemble_and_publish_reference_version(
+            db,
+            &ApprovedReferenceVersionDraft {
+                identity: ReferenceConfigurationIdentityDraft {
+                    aircraft_model_family_id: family_id,
+                    aircraft_designation_id: designation_id,
+                    aircraft_generation_id: generation_id,
+                    tier_package_id: package_id,
+                    display_name: format!("Listing test reference {model_year}"),
+                    approval_decision_id: decision_ids[0],
+                },
+                model_year,
+                revision: 1,
+                supersedes_version_id: None,
+                profile_approval_decision_id: decision_ids[1],
+                applicability: vec![ReferenceApplicabilityDraft {
+                    aircraft_market_id: market_id,
+                    applies_to_all_serials: true,
+                    aircraft_serial_number_scheme_id: None,
+                    serial_prefix: None,
+                    serial_from_display: None,
+                    serial_to_display: None,
+                    evidence_claim_id: applicability_claim_id,
+                }],
+                price: ReferencePriceDraft {
+                    direct_cited_amount_usd: 500_000.0,
+                    direct_cited_nominal_dollar_year: model_year,
+                    evidence_claim_id: price_claim_id,
+                },
+                dollar_normalization: None,
+                avionics: avionics_model_ids
+                    .iter()
+                    .copied()
+                    .map(|catalog_id| ReferenceComponentDraft {
+                        catalog_id,
+                        quantity: 1,
+                        included_in_tier: false,
+                        evidence_claim_id: factory_claim_id,
+                    })
+                    .collect(),
+                engines: vec![],
+                propellers: vec![],
+                features: vec![],
+                avionics_set_evidence_claim_id: factory_claim_id,
+                engines_set_evidence_claim_id: factory_claim_id,
+                propellers_set_evidence_claim_id: factory_claim_id,
+                features_set_evidence_claim_id: factory_claim_id,
+            },
+        )
+        .await
+        .expect("complete immutable aircraft reference should publish");
     }
 
     #[test]
@@ -6122,82 +6195,7 @@ mod tests {
         )
         .await
         .expect("avionics model should seed");
-        execute_query!(
-            &db,
-            r#"
-            UPDATE avionics_models
-            SET introduced_year = 2017,
-                estimated_unit_value_usd = 50000,
-                value_basis = 'installed_contribution',
-                replacement_cost_usd = 65000,
-                value_reference_year = 2026,
-                value_source = 'gemini',
-                valuation_scope = 'unit'
-            WHERE id = ?
-            "#,
-            avionics_model_id
-        )
-        .expect("avionics metadata should seed");
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_variant_price_points (
-              aircraft_model_variant_id,
-              model_year,
-              purchase_price_new_usd,
-              purchase_price_reference_year,
-              source_url,
-              source_title,
-              source_notes,
-              source_confidence,
-              evidence_kind,
-              is_valuation_eligible
-            )
-            VALUES (
-              ?, 2023, 699000, 2023, 'https://example.test', 'test', 'test fixture',
-              'high', 'direct_model_year', TRUE
-            )
-            "#,
-            variant_id
-        )
-        .expect("price point should seed");
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_variant_default_avionics (
-              aircraft_model_variant_id,
-              model_year,
-              avionics_model_id,
-              quantity,
-              source_url,
-              source_title,
-              source_notes,
-              source_confidence
-            )
-            VALUES (?, 2023, ?, 1, 'https://example.test', 'test', 'test fixture', 'high')
-            "#,
-            variant_id,
-            avionics_model_id
-        )
-        .expect("default avionics should seed");
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_spec_versions (
-              aircraft_model_id, aircraft_model_variant_id, effective_from,
-              source_url, configuration_scope, source_confidence,
-              evidence_kind, is_valuation_eligible
-            )
-            SELECT
-              variant.aircraft_model_id, variant.id, '2023-01-01',
-              'https://manufacturer.example/aircraft-spec',
-              'factory_default', 'high', 'authoritative_reference', TRUE
-            FROM aircraft_model_variants variant
-            WHERE variant.id = ?
-            "#,
-            variant_id
-        )
-        .expect("valuation-ready aircraft spec should seed");
+        publish_test_aircraft_reference(&db, variant_id, 2023, &[avionics_model_id]).await;
         let mut preview = preview_manual_listing(&json!({
             "manufacturer": "Cessna",
             "model": "182 Skylane",
@@ -7286,7 +7284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_requires_valuation_grade_avionics_price_and_suite_membership() {
+    async fn readiness_uses_approved_avionics_graph_without_scalar_values() {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -7315,14 +7313,33 @@ mod tests {
             r#"
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, source_url,
-              model_year, asking_price_usd, currency, status, airframe_hours
-            ) VALUES (?, ?, 'https://example.test/readiness', 2024, 500000, 'USD', 'active', 100)
+              model_year, asking_price_usd, currency, status, airframe_hours,
+              registration_number, serial_number
+            ) VALUES (?, ?, 'https://example.test/readiness', 2024, 500000,
+                      'USD', 'active', 100, 'N123T', 'TESTSERIAL')
             RETURNING id
             "#,
             variant_id,
             user.id
         )
         .expect("listing should seed");
+        let mut raw_identity = listing_values_with_variant("182T");
+        raw_identity.model = "Readiness".to_string();
+        raw_identity.model_year = 2024;
+        raw_identity.source_url = Some("https://example.test/readiness".to_string());
+        raw_identity.registration_number = Some("N123T".to_string());
+        raw_identity.serial_number = Some("TESTSERIAL".to_string());
+        super::stage_literal_aircraft_identity_observation(&db, listing_id, &raw_identity)
+            .await
+            .expect("raw readiness identity should stage");
+        let grounding = require_listing_faa_admission(&db, listing_id)
+            .await
+            .expect("readiness listing should be FAA admitted");
+        crate::aircraft::identity::seed_test_curated_identity_assignment(
+            &db, listing_id, &grounding,
+        )
+        .await
+        .expect("readiness listing should receive its canonical identity assignment");
         execute_query!(
             &db,
             r#"
@@ -7335,81 +7352,48 @@ mod tests {
             suite_id
         )
         .expect("listing avionics should seed");
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_variant_price_points (
-              aircraft_model_variant_id, model_year, purchase_price_new_usd,
-              purchase_price_reference_year, source_url, source_title,
-              source_notes, source_confidence
-            ) VALUES (?, 2024, 500000, 2024, 'https://example.test', 'test', 'legacy', 'high')
-            "#,
-            variant_id
-        )
-        .expect("legacy price should seed");
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_variant_default_avionics (
-              aircraft_model_variant_id, model_year, avionics_model_id, quantity,
-              source_url, source_title, source_notes, source_confidence
-            ) VALUES (?, 2024, ?, 1, 'https://example.test', 'test', 'default suite', 'high')
-            "#,
-            variant_id,
-            suite_id
-        )
-        .expect("default avionics should seed");
 
         assert_eq!(
-            super::listing_missing_avionics_metadata_count(&db, listing_id)
+            super::listing_invalid_avionics_product_graph_count(&db, listing_id)
                 .await
-                .expect("missing metadata should count"),
-            1
+                .expect("approved unit product graph should load"),
+            0
         );
         assert!(
-            super::listing_model_year_factory_reference_is_pending(&db, listing_id)
+            !crate::aircraft::reference::persistence::listing_reference_status(&db, listing_id)
                 .await
-                .expect("legacy records should be incomplete")
+                .expect("missing immutable reference should load")
+                .ready
         );
 
         execute_query!(
             &db,
             r#"
             UPDATE avionics_models
-            SET introduced_year = 2020,
-                estimated_unit_value_usd = 40000,
-                value_basis = 'installed_contribution',
-                replacement_cost_usd = 55000,
-                value_reference_year = 2026,
-                value_source = 'gemini',
-                valuation_scope = 'integrated_suite'
+            SET valuation_scope = 'integrated_suite'
             WHERE id = ?
             "#,
             suite_id
         )
-        .expect("rich suite metadata should seed");
-        execute_query!(
-            &db,
-            r#"
-            UPDATE aircraft_model_variant_price_points
-            SET evidence_kind = 'direct_model_year', is_valuation_eligible = TRUE
-            WHERE aircraft_model_variant_id = ? AND model_year = 2024
-            "#,
-            variant_id
-        )
-        .expect("price should become eligible");
+        .expect("suite scope should seed");
 
         assert_eq!(
-            super::listing_missing_avionics_metadata_count(&db, listing_id)
+            super::listing_invalid_avionics_product_graph_count(&db, listing_id)
                 .await
                 .expect("suite membership should still be required"),
             1
         );
         assert!(
-            super::listing_model_year_factory_reference_is_pending(&db, listing_id)
+            !crate::aircraft::reference::persistence::listing_reference_status(&db, listing_id)
                 .await
-                .expect("default suite should still be incomplete")
+                .expect("missing immutable reference should remain unavailable")
+                .ready
         );
+        assert!(super::complete_listing_ingestion(&db, listing_id)
+            .await
+            .expect_err("a suite without approved composition must not finalize")
+            .to_string()
+            .contains("required suite composition"));
 
         execute_query!(
             &db,
@@ -7419,42 +7403,48 @@ mod tests {
         )
         .expect("suite membership should seed");
         assert_eq!(
-            super::listing_missing_avionics_metadata_count(&db, listing_id)
+            super::listing_invalid_avionics_product_graph_count(&db, listing_id)
                 .await
-                .expect("rich suite should be complete"),
+                .expect("approved suite graph should be complete"),
             0
         );
-        assert!(
-            !super::listing_model_year_factory_reference_is_pending(&db, listing_id)
-                .await
-                .expect("valuation-grade records should be complete")
-        );
-        assert!(super::listing_factory_reference_is_pending(&db, listing_id)
-            .await
-            .expect("missing aircraft spec should keep combined readiness pending"));
-
-        execute_query!(
-            &db,
-            r#"
-            INSERT INTO aircraft_model_spec_versions (
-              aircraft_model_id, aircraft_model_variant_id, effective_from,
-              source_url, configuration_scope, source_confidence,
-              evidence_kind, is_valuation_eligible
+        assert_eq!(
+            query_scalar_one!(
+                &db,
+                i64,
+                r#"
+                SELECT COUNT(*)
+                FROM avionics_models
+                WHERE id = ?
+                  AND estimated_unit_value_usd IS NULL
+                  AND replacement_cost_usd IS NULL
+                  AND value_reference_year IS NULL
+                  AND value_source IS NULL
+                "#,
+                suite_id
             )
-            SELECT
-              variant.aircraft_model_id, variant.id, '2024-01-01',
-              'https://manufacturer.example/aircraft-spec',
-              'factory_default', 'high', 'authoritative_reference', TRUE
-            FROM aircraft_model_variants variant
-            WHERE variant.id = ?
-            "#,
-            variant_id
-        )
-        .expect("valuation-ready aircraft spec should seed");
+            .expect("scalar value state should load"),
+            1
+        );
         assert!(
-            !super::listing_factory_reference_is_pending(&db, listing_id)
+            !crate::aircraft::reference::persistence::listing_reference_status(&db, listing_id)
+                .await
+                .expect("missing immutable aircraft reference should remain unavailable")
+                .ready
+        );
+
+        publish_test_aircraft_reference(&db, variant_id, 2024, &[suite_id]).await;
+        assert!(
+            crate::aircraft::reference::persistence::listing_reference_status(&db, listing_id)
                 .await
                 .expect("all shared valuation references should be ready")
+                .ready
+        );
+        assert_eq!(
+            super::complete_listing_ingestion(&db, listing_id)
+                .await
+                .expect("local finalization should not require Gemini or scalar avionics prices"),
+            super::ListingFinalizationOutcome::Ready
         );
     }
 
@@ -7705,7 +7695,7 @@ mod tests {
             .await
             .expect("pending review should stage");
 
-        super::finalize_listing_ingestion(&db, listing_id, None, None)
+        super::finalize_listing_ingestion(&db, listing_id)
             .await
             .expect("missing canonical catalog identity should remain review work");
 
@@ -7772,7 +7762,7 @@ mod tests {
             .await
             .expect("pending review should stage");
 
-        let error = super::finalize_listing_ingestion(&db, listing_id, None, None)
+        let error = super::finalize_listing_ingestion(&db, listing_id)
             .await
             .expect_err("raw FAA rejection must remain an ingestion failure");
         assert!(matches!(
@@ -7786,7 +7776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_finalization_keeps_shared_reference_work_incomplete() {
+    async fn initial_finalization_verifies_listing_without_factory_reference() {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -7818,13 +7808,16 @@ mod tests {
         )
         .expect("FAA identity should seed");
 
-        super::finalize_listing_ingestion(&db, listing_id, None, None)
+        super::finalize_listing_ingestion(&db, listing_id)
             .await
-            .expect("missing shared factory reference must remain retryable");
+            .expect("missing shared factory reference must not block listing verification");
 
-        assert!(super::listing_factory_reference_is_pending(&db, listing_id)
-            .await
-            .expect("derived reference readiness should load"));
+        assert!(
+            !crate::aircraft::reference::persistence::listing_reference_status(&db, listing_id)
+                .await
+                .expect("valuation reference status should load")
+                .ready
+        );
         let state = query_as_optional!(
             &db,
             (String, Option<String>, bool, Option<String>),
@@ -7836,12 +7829,12 @@ mod tests {
             "#,
             listing_id
         )
-        .expect("pending-reference listing state should load")
-        .expect("pending-reference listing should exist");
-        assert_eq!(state.0, "incomplete");
+        .expect("verified listing state should load")
+        .expect("verified listing should exist");
+        assert_eq!(state.0, "ready");
         assert_eq!(state.1, None);
-        assert!(!state.2);
-        assert_eq!(state.3, None);
+        assert!(state.2);
+        assert!(state.3.is_some());
     }
 
     #[tokio::test]
@@ -8023,14 +8016,14 @@ mod tests {
         // The fixture intentionally lacks enrichment data and there is no
         // extractor. Re-entering normal finalization would fail, so success
         // proves the idempotent ready guard returned first.
-        let outcome = super::finalize_reviewed_listing_ingestion(&db, listing_id, None, None)
+        let outcome = super::finalize_reviewed_listing_ingestion(&db, listing_id)
             .await
             .expect("an already ready verified listing should be a no-op");
         assert_eq!(outcome, super::ListingFinalizationOutcome::Ready);
     }
 
     #[tokio::test]
-    async fn reviewed_finalization_keeps_pending_model_year_reference_incomplete() {
+    async fn reviewed_finalization_verifies_without_model_year_reference() {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -8064,17 +8057,16 @@ mod tests {
         super::ensure_listing_canonical_aircraft_identity(&db, listing_id)
             .await
             .expect("exact curated aircraft identity should be assigned");
-        let outcome = super::finalize_reviewed_listing_ingestion(&db, listing_id, None, None)
+        let outcome = super::finalize_reviewed_listing_ingestion(&db, listing_id)
             .await
-            .expect("missing shared factory reference must remain retryable");
-        assert!(matches!(
-            outcome,
-            super::ListingFinalizationOutcome::PendingReference { ref reason }
-                if reason.contains("published_reference_configuration_missing")
-        ));
-        assert!(super::listing_factory_reference_is_pending(&db, listing_id)
-            .await
-            .expect("derived reference readiness should load"));
+            .expect("missing shared factory reference must not block listing verification");
+        assert_eq!(outcome, super::ListingFinalizationOutcome::Ready);
+        assert!(
+            !crate::aircraft::reference::persistence::listing_reference_status(&db, listing_id)
+                .await
+                .expect("valuation reference status should load")
+                .ready
+        );
 
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects sqlite")
@@ -8085,15 +8077,15 @@ mod tests {
         .bind(listing_id)
         .fetch_one(pool)
         .await
-        .expect("pending-reference listing should remain queryable");
-        assert_eq!(state.0, "incomplete");
+        .expect("verified listing should remain queryable");
+        assert_eq!(state.0, "ready");
         assert_eq!(state.1, None);
-        assert!(!state.2);
-        assert_eq!(state.3, None);
+        assert!(state.2);
+        assert!(state.3.is_some());
     }
 
     #[tokio::test]
-    async fn reviewed_finalization_requires_current_faa_admission_before_enrichment() {
+    async fn reviewed_finalization_requires_current_faa_admission() {
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("test database should initialize");
@@ -8115,7 +8107,7 @@ mod tests {
         )
         .expect("listing should enter post-review finalization state");
 
-        let error = super::finalize_reviewed_listing_ingestion(&db, listing_id, None, None)
+        let error = super::finalize_reviewed_listing_ingestion(&db, listing_id)
             .await
             .expect_err("a reviewed listing without FAA admission must not be published");
         assert!(matches!(

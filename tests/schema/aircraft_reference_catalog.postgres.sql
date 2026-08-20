@@ -18,6 +18,20 @@ INSERT INTO curation_evidence_claims (
   'validated', '2026-07-21'
 );
 
+INSERT INTO curation_evidence_claims (
+  evidence_source_id, claim_kind, subject_text, predicate_text, object_text,
+  quoted_evidence, validation_status, validated_at
+) VALUES
+  (1, 'applicability', 'aircraft', 'applies in', 'GLOBAL',
+    'Authoritative factory source defines global applicability.',
+    'validated', '2026-07-21'),
+  (1, 'price', 'aircraft', 'equipped MSRP', '779900 USD',
+    'Authoritative factory source states the equipped MSRP.',
+    'validated', '2026-07-21'),
+  (1, 'standard_equipment', 'aircraft', 'includes', 'factory equipment',
+    'Authoritative factory source defines the complete standard equipment.',
+    'validated', '2026-07-21');
+
 INSERT INTO curation_evidence_sources (
   source_url, source_title, source_domain, source_tier, retrieved_at
 ) VALUES (
@@ -40,7 +54,7 @@ INSERT INTO official_dollar_normalization_facts (
   source_index_value, target_index_value, normalization_factor,
   evidence_claim_id
 ) VALUES (
-  2019, 2026, 'BLS CPI test series', 250, 300, 1.2, 2
+  2019, 2026, 'BLS CPI test series', 250, 300, 1.2, 5
 );
 
 INSERT INTO aircraft_identity_observations (
@@ -145,31 +159,47 @@ INSERT INTO aircraft_reference_configuration_versions (
 INSERT INTO aircraft_reference_applicability_scopes (
   aircraft_reference_configuration_version_id, aircraft_market_id,
   applies_to_all_serials, evidence_claim_id
-) VALUES (1, 1, TRUE, 1);
+) VALUES (1, 1, TRUE, 2);
 
 INSERT INTO aircraft_reference_prices (
   aircraft_reference_configuration_version_id, price_kind, amount, currency,
   price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
 ) VALUES (1, 'equipped_msrp', 779900, 'USD', 2019,
-  'full_standard_configuration', 'direct_model_year', 1);
+  'full_standard_configuration', 'direct_model_year', 3);
+
+DO $duplicate_price$
+BEGIN
+  BEGIN
+    INSERT INTO aircraft_reference_prices (
+      aircraft_reference_configuration_version_id, price_kind, amount,
+      currency, price_reference_year, configuration_basis, evidence_kind,
+      evidence_claim_id
+    ) VALUES (1, 'equipped_msrp', 789900, 'USD', 2019,
+      'full_standard_configuration', 'direct_model_year', 3);
+    RAISE EXCEPTION 'duplicate equipped MSRP unexpectedly accepted';
+  EXCEPTION WHEN unique_violation THEN
+    NULL;
+  END;
+END
+$duplicate_price$;
 
 INSERT INTO aircraft_reference_engines (
   aircraft_reference_configuration_version_id,
   aircraft_engine_catalog_model_id, quantity, equipment_role,
   evidence_claim_id
-) VALUES (1, 1, 1, 'standard', 1);
+) VALUES (1, 1, 1, 'standard', 4);
 
 INSERT INTO aircraft_reference_propellers (
   aircraft_reference_configuration_version_id,
   aircraft_propeller_catalog_model_id, quantity, equipment_role,
   evidence_claim_id
-) VALUES (1, 1, 1, 'standard', 1);
+) VALUES (1, 1, 1, 'standard', 4);
 
 INSERT INTO aircraft_reference_fact_set_attestations (
   aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id
 ) VALUES
-  (1, 'avionics', 1), (1, 'engines', 1),
-  (1, 'propellers', 1), (1, 'features', 1);
+  (1, 'avionics', 4), (1, 'engines', 4),
+  (1, 'propellers', 4), (1, 'features', 4);
 
 UPDATE aircraft_reference_configuration_versions
 SET publication_state = 'published', published_at = '2026-07-21'
@@ -220,6 +250,226 @@ BEGIN
   END IF;
 END
 $test$;
+
+INSERT INTO aircraft_identity_decisions (
+  resolution_case_id, entity_kind, decision_action, decision_status,
+  decision_payload_json, deterministic_validation_json,
+  deterministic_validation_passed, rationale, decided_at
+) VALUES (
+  1, 'reference_profile', 'approve_new', 'approved', '{}', '{}', TRUE,
+  'GLOBAL versus US overlap guard', '2026-08-19'
+);
+INSERT INTO aircraft_identity_decision_claims (
+  decision_id, evidence_claim_id, evidence_role
+)
+SELECT id, 1, 'identity' FROM aircraft_identity_decisions
+WHERE rationale = 'GLOBAL versus US overlap guard';
+INSERT INTO aircraft_reference_configuration_versions (
+  aircraft_reference_configuration_id, model_year, revision,
+  supersedes_version_id, approval_decision_id
+)
+SELECT 1, 2020, 2, 1, id FROM aircraft_identity_decisions
+WHERE rationale = 'GLOBAL versus US overlap guard';
+INSERT INTO aircraft_reference_applicability_scopes (
+  aircraft_reference_configuration_version_id, aircraft_market_id,
+  applies_to_all_serials, evidence_claim_id
+)
+SELECT version.id, market.id, TRUE, 2
+FROM aircraft_reference_configuration_versions version
+JOIN aircraft_identity_decisions decision
+  ON decision.id = version.approval_decision_id
+CROSS JOIN aircraft_markets market
+WHERE decision.rationale = 'GLOBAL versus US overlap guard'
+  AND market.code = 'US';
+INSERT INTO aircraft_reference_prices (
+  aircraft_reference_configuration_version_id, price_kind, amount, currency,
+  price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+) SELECT
+  version.id, 'equipped_msrp', 789900, 'USD', 2020,
+  'full_standard_configuration', 'direct_model_year', 3
+FROM aircraft_reference_configuration_versions version
+JOIN aircraft_identity_decisions decision
+  ON decision.id = version.approval_decision_id
+WHERE decision.rationale = 'GLOBAL versus US overlap guard';
+INSERT INTO aircraft_reference_fact_set_attestations (
+  aircraft_reference_configuration_version_id, fact_set_kind,
+  evidence_claim_id
+) SELECT version.id, fact_set.kind, 4
+FROM aircraft_reference_configuration_versions version
+JOIN aircraft_identity_decisions decision
+  ON decision.id = version.approval_decision_id
+CROSS JOIN (VALUES ('avionics'), ('engines'), ('propellers'), ('features'))
+  AS fact_set(kind)
+WHERE decision.rationale = 'GLOBAL versus US overlap guard';
+DO $global_overlap$
+DECLARE
+  failure_message TEXT;
+BEGIN
+  BEGIN
+    UPDATE aircraft_reference_configuration_versions
+    SET publication_state = 'published', published_at = '2026-08-19'
+    WHERE approval_decision_id = (
+      SELECT id FROM aircraft_identity_decisions
+      WHERE rationale = 'GLOBAL versus US overlap guard'
+    );
+    RAISE EXCEPTION 'US scope unexpectedly published over a GLOBAL scope';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <>
+       'reference profile applicability overlaps an existing published version'
+    THEN
+      RAISE;
+    END IF;
+  END;
+END
+$global_overlap$;
+
+DO $namespace_contract$
+DECLARE
+  routine_names TEXT[] := ARRAY[
+    'aircraft_serial_natural_sort_key',
+    'validate_aircraft_serial_scheme_ordering',
+    'prevent_referenced_avionics_catalog_downgrade',
+    'invalidate_listing_avionics_authorization_for_capture',
+    'validate_aircraft_valuation_compatibility_projection',
+    'require_aircraft_catalog_approval',
+    'validate_aircraft_reference_version_insert',
+    'validate_faa_reference_reachability',
+    'preserve_assigned_aircraft_applicability',
+    'prevent_new_unresolved_aircraft_dimension',
+    'validate_official_dollar_normalization_fact',
+    'prevent_official_dollar_normalization_mutation',
+    'validate_aircraft_reference_child_insert',
+    'prevent_aircraft_reference_fact_mutation',
+    'validate_aircraft_reference_version_update'
+  ];
+BEGIN
+  IF 15 <> (
+    SELECT COUNT(*)
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND routine.proname = ANY (routine_names)
+  ) THEN
+    RAISE EXCEPTION 'cutover routines are not uniquely installed in public';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND routine.proname = ANY (routine_names)
+      AND routine.proconfig IS DISTINCT FROM
+            ARRAY['search_path=pg_catalog']::TEXT[]
+  ) THEN
+    RAISE EXCEPTION 'cutover routine lacks the exact pg_catalog search_path';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND routine.proname = ANY (routine_names)
+      AND routine.proname <> 'aircraft_serial_natural_sort_key'
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_trigger trigger
+        WHERE trigger.tgfoid = routine.oid
+          AND NOT trigger.tgisinternal
+      )
+  ) THEN
+    RAISE EXCEPTION 'cutover trigger routine is not installed on a relation';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_trigger trigger
+    JOIN pg_catalog.pg_proc routine ON routine.oid = trigger.tgfoid
+    JOIN pg_catalog.pg_namespace routine_namespace
+      ON routine_namespace.oid = routine.pronamespace
+    JOIN pg_catalog.pg_class target ON target.oid = trigger.tgrelid
+    JOIN pg_catalog.pg_namespace target_namespace
+      ON target_namespace.oid = target.relnamespace
+    WHERE routine.proname = ANY (routine_names)
+      AND NOT trigger.tgisinternal
+      AND (
+        routine_namespace.nspname <> 'public'
+        OR target_namespace.nspname <> 'public'
+      )
+  ) THEN
+    RAISE EXCEPTION 'cutover trigger function or target is outside public';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND routine.proname = ANY (routine_names)
+      AND pg_catalog.pg_get_functiondef(routine.oid) ~*
+        '(FROM|JOIN|UPDATE|USING|TABLE)[[:space:]]+(aircraft_|avionics_|curation_|faa_|plugin_|rental_|official_)'
+  ) THEN
+    RAISE EXCEPTION 'cutover routine contains an unqualified app relation';
+  END IF;
+  IF pg_catalog.strpos(
+    pg_catalog.pg_get_functiondef(
+      'public.validate_aircraft_reference_child_insert()'::pg_catalog.regprocedure
+    ),
+    'public.aircraft_serial_natural_sort_key'
+  ) = 0 THEN
+    RAISE EXCEPTION 'reference child trigger does not call the public serial helper';
+  END IF;
+END
+$namespace_contract$;
+
+CREATE SCHEMA reference_catalog_shadow;
+CREATE FUNCTION reference_catalog_shadow.aircraft_serial_natural_sort_key(TEXT)
+RETURNS TEXT LANGUAGE SQL IMMUTABLE AS $$ SELECT 'shadow'::TEXT $$;
+CREATE TABLE reference_catalog_shadow.aircraft_reference_configuration_versions (
+  id BIGINT PRIMARY KEY,
+  publication_state TEXT NOT NULL
+);
+INSERT INTO reference_catalog_shadow.aircraft_reference_configuration_versions
+  (id, publication_state)
+VALUES (1, 'building');
+SET search_path = reference_catalog_shadow, public, pg_catalog;
+DO $shadow_test$
+DECLARE
+  failure_message TEXT;
+BEGIN
+  IF public.aircraft_serial_natural_sort_key('S9') = 'shadow' THEN
+    RAISE EXCEPTION 'public serial helper resolved to the shadow routine';
+  END IF;
+  BEGIN
+    INSERT INTO public.aircraft_reference_fact_set_attestations (
+      aircraft_reference_configuration_version_id, fact_set_kind,
+      evidence_claim_id
+    ) VALUES (1, 'avionics', 1);
+    RAISE SQLSTATE 'P0002' USING MESSAGE =
+      'reference child trigger read the shadow parent relation';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <> 'reference profile children require a building version' THEN
+      RAISE;
+    END IF;
+  END;
+  BEGIN
+    DELETE FROM public.aircraft_reference_fact_set_attestations
+    WHERE aircraft_reference_configuration_version_id = 1
+      AND fact_set_kind = 'features';
+    RAISE SQLSTATE 'P0002' USING MESSAGE =
+      'reference immutability trigger read the shadow parent relation';
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS failure_message = MESSAGE_TEXT;
+    IF failure_message <> 'published reference profile facts are immutable' THEN
+      RAISE;
+    END IF;
+  END;
+END
+$shadow_test$;
+RESET search_path;
+DROP SCHEMA reference_catalog_shadow CASCADE;
 
 INSERT INTO aircraft_identity_decisions (
   resolution_case_id, entity_kind, decision_action, decision_status,
@@ -364,22 +614,22 @@ BEGIN
       serial_from_sort_key, serial_to_sort_key, evidence_claim_id
     ) VALUES
       (version_id, 1, left_all, left_scheme, left_prefix,
-        left_from_display, left_to_display, left_from_key, left_to_key, 1),
+        left_from_display, left_to_display, left_from_key, left_to_key, 2),
       (version_id, 1, right_all, right_scheme, right_prefix,
-        right_from_display, right_to_display, right_from_key, right_to_key, 1);
+        right_from_display, right_to_display, right_from_key, right_to_key, 2);
     INSERT INTO aircraft_reference_prices (
       aircraft_reference_configuration_version_id, price_kind, amount, currency,
       price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
     ) VALUES (
       version_id, 'equipped_msrp', 799900, 'USD', 2021,
-      'full_standard_configuration', 'direct_model_year', 1
+      'full_standard_configuration', 'direct_model_year', 3
     );
     INSERT INTO aircraft_reference_fact_set_attestations (
       aircraft_reference_configuration_version_id, fact_set_kind,
       evidence_claim_id
     ) VALUES
-      (version_id, 'avionics', 1), (version_id, 'engines', 1),
-      (version_id, 'propellers', 1), (version_id, 'features', 1);
+      (version_id, 'avionics', 4), (version_id, 'engines', 4),
+      (version_id, 'propellers', 4), (version_id, 'features', 4);
     UPDATE aircraft_reference_configuration_versions
     SET publication_state = 'published', published_at = '2026-08-19'
     WHERE id = version_id;

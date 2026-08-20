@@ -172,6 +172,8 @@ impl ValuationModel for ComparableModel {
 
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
         let value_now = self.predicted_value(query)?;
+        let modeled_factory_configuration_anchor_usd =
+            self.predicted_value(&query.factory_configuration_query())?;
         let expected_log_hours = (self.expected_hours_per_year * query.age().max(1.0)).ln_1p();
         let support = support_for_counts_with_hours(&self.counts, query, Some(expected_log_hours));
         let base_q80 = self.config.q80_abs_log_error;
@@ -208,6 +210,7 @@ impl ValuationModel for ComparableModel {
         let target_hours_adjustment = self.hours_adjustment(query.age(), query.airframe_hours);
         let multiplier = base_q80.exp();
         Ok(ValuationEstimate {
+            modeled_factory_configuration_anchor_usd,
             estimated_value_usd: value_now,
             low_value_usd: value_now / multiplier,
             high_value_usd: value_now * multiplier,

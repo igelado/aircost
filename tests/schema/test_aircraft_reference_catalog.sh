@@ -5,11 +5,16 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 test_database="$(mktemp /tmp/aircost-reference-schema.XXXXXX.sqlite3)"
 approval_database="$(mktemp /tmp/aircost-reference-approval.XXXXXX.sqlite3)"
 component_database="$(mktemp /tmp/aircost-reference-component.XXXXXX.sqlite3)"
+duplicate_price_database="$(mktemp /tmp/aircost-reference-duplicate-price.XXXXXX.sqlite3)"
 overlap_database="$(mktemp /tmp/aircost-reference-overlap.XXXXXX.sqlite3)"
 serial_overlap_database="$(mktemp /tmp/aircost-reference-serial-overlap.XXXXXX.sqlite3)"
 incomplete_database="$(mktemp /tmp/aircost-reference-incomplete.XXXXXX.sqlite3)"
 cleanup_database="$(mktemp /tmp/aircost-reference-cleanup.XXXXXX.sqlite3)"
-trap 'rm -f "$test_database" "$approval_database" "$component_database" "$overlap_database" "$serial_overlap_database" "$incomplete_database" "$cleanup_database"' EXIT
+marker_rerun_database="$(mktemp /tmp/aircost-reference-marker-rerun.XXXXXX.sqlite3)"
+marker_mismatch_database="$(mktemp /tmp/aircost-reference-marker-mismatch.XXXXXX.sqlite3)"
+marker_damage_database="$(mktemp /tmp/aircost-reference-marker-damage.XXXXXX.sqlite3)"
+marker_unexpected_database="$(mktemp /tmp/aircost-reference-marker-unexpected.XXXXXX.sqlite3)"
+trap 'rm -f "$test_database" "$approval_database" "$component_database" "$duplicate_price_database" "$overlap_database" "$serial_overlap_database" "$incomplete_database" "$cleanup_database" "$marker_rerun_database" "$marker_mismatch_database" "$marker_damage_database" "$marker_unexpected_database"' EXIT
 
 sqlite3 -bail "$test_database" \
   ".read $repository_root/schema/sqlite.sql" \
@@ -53,6 +58,59 @@ expect_failure() {
   fi
 }
 
+sqlite3 -bail "$marker_rerun_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  "UPDATE schema_migration_contracts
+   SET installed_at = '2000-01-01 00:00:00'
+   WHERE migration_name = '20260819_reference_catalog_cutover';" \
+  ".read $repository_root/schema/sqlite.sql" \
+  ".read $repository_root/tests/schema/aircraft_reference_catalog.sqlite.sql" \
+  "UPDATE sqlite_sequence SET seq = 41
+   WHERE name = 'aircraft_reference_prices';" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+test "$(sqlite3 "$marker_rerun_database" \
+  "SELECT installed_at FROM schema_migration_contracts
+   WHERE migration_name = '20260819_reference_catalog_cutover'")" = \
+  "2000-01-01 00:00:00"
+test "$(sqlite3 "$marker_rerun_database" \
+  "SELECT id || ':' || configuration_basis
+   FROM aircraft_reference_prices")" = "1:full_standard_configuration"
+test "$(sqlite3 "$marker_rerun_database" \
+  "SELECT seq FROM sqlite_sequence
+   WHERE name = 'aircraft_reference_prices'")" = "41"
+
+sqlite3 -bail "$marker_mismatch_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  "UPDATE schema_migration_contracts
+   SET contract_fingerprint = '0000000000000000000000000000000000000000000000000000000000000000'
+   WHERE migration_name = '20260819_reference_catalog_cutover';"
+expect_failure "$marker_mismatch_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  "CHECK constraint failed"
+
+sqlite3 -bail "$marker_damage_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  "DROP TABLE official_dollar_normalization_facts;"
+expect_failure "$marker_damage_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "CHECK constraint failed"
+test "$(sqlite3 "$marker_damage_database" \
+  "SELECT count(*) FROM sqlite_schema
+   WHERE type = 'table' AND name = 'official_dollar_normalization_facts'")" = "0"
+
+sqlite3 -bail "$marker_unexpected_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  "CREATE INDEX unexpected_reference_price_index
+   ON aircraft_reference_prices(amount);"
+expect_failure "$marker_unexpected_database" \
+  ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "CHECK constraint failed"
+test "$(sqlite3 "$marker_unexpected_database" \
+  "SELECT count(*) FROM sqlite_schema
+   WHERE type = 'index' AND name = 'unexpected_reference_price_index'")" = "1"
+
 expect_failure "$test_database" \
   "UPDATE aircraft_reference_prices SET amount = 1 WHERE id = 1" \
   "reference profile facts are immutable"
@@ -80,13 +138,38 @@ sqlite3 -bail "$test_database" "
   INSERT INTO official_dollar_normalization_facts (
     source_year, target_year, index_series, source_index_value,
     target_index_value, normalization_factor, evidence_claim_id
-  ) VALUES (2019, 2026, 'Official CPI', 250, 300, 1.2, 2);
+  ) VALUES (2019, 2026, 'Official CPI', 250, 300, 1.2, 5);
 "
 test "$(sqlite3 "$test_database" \
   "SELECT normalization_factor FROM official_dollar_normalization_facts WHERE source_year=2019 AND target_year=2026")" = "1.2"
 expect_failure "$test_database" \
   "UPDATE official_dollar_normalization_facts SET normalization_factor = 1 WHERE id = 1" \
   "official dollar normalization facts are immutable"
+
+cp "$test_database" "$duplicate_price_database"
+sqlite3 -bail "$duplicate_price_database" "
+  INSERT INTO aircraft_identity_decisions (
+    resolution_case_id, entity_kind, decision_action, decision_status,
+    decision_payload_json, deterministic_validation_json,
+    deterministic_validation_passed, rationale, decided_at
+  ) VALUES (1, 'reference_profile', 'approve_new', 'approved', '{}', '{}', 1,
+    'duplicate-price guard', '2026-08-19');
+  INSERT INTO aircraft_identity_decision_claims
+    (decision_id, evidence_claim_id, evidence_role)
+  SELECT max(id), 1, 'identity' FROM aircraft_identity_decisions;
+  INSERT INTO aircraft_reference_configuration_versions (
+    aircraft_reference_configuration_id, model_year, revision,
+    supersedes_version_id, approval_decision_id
+  ) SELECT 1, 2020, 2, 1, max(id) FROM aircraft_identity_decisions;
+  INSERT INTO aircraft_reference_prices (
+    aircraft_reference_configuration_version_id, price_kind, amount, currency,
+    price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+  ) VALUES (2, 'equipped_msrp', 789900, 'USD', 2020,
+    'full_standard_configuration', 'direct_model_year', 3);
+"
+expect_failure "$duplicate_price_database" \
+  "INSERT INTO aircraft_reference_prices (aircraft_reference_configuration_version_id, price_kind, amount, currency, price_reference_year, configuration_basis, evidence_kind, evidence_claim_id) VALUES (2, 'equipped_msrp', 799900, 'USD', 2020, 'full_standard_configuration', 'direct_model_year', 3)" \
+  "UNIQUE constraint failed: aircraft_reference_prices.aircraft_reference_configuration_version_id, aircraft_reference_prices.price_kind, aircraft_reference_prices.currency"
 
 cp "$test_database" "$approval_database"
 expect_failure "$approval_database" "
@@ -143,17 +226,17 @@ expect_failure "$overlap_database" "
   INSERT INTO aircraft_reference_applicability_scopes (
     aircraft_reference_configuration_version_id, aircraft_market_id,
     applies_to_all_serials, evidence_claim_id
-  ) VALUES (2, 1, 1, 1);
+  ) VALUES (2, (SELECT id FROM aircraft_markets WHERE code = 'US'), 1, 2);
   INSERT INTO aircraft_reference_prices (
     aircraft_reference_configuration_version_id, price_kind, amount, currency,
     price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
   ) VALUES (2, 'equipped_msrp', 789900, 'USD', 2019,
-    'full_standard_configuration', 'direct_model_year', 1);
+    'full_standard_configuration', 'direct_model_year', 3);
   INSERT INTO aircraft_reference_fact_set_attestations (
     aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id
   ) VALUES
-    (2, 'avionics', 1), (2, 'engines', 1),
-    (2, 'propellers', 1), (2, 'features', 1);
+    (2, 'avionics', 4), (2, 'engines', 4),
+    (2, 'propellers', 4), (2, 'features', 4);
   UPDATE aircraft_reference_configuration_versions
   SET publication_state = 'published', published_at = '2026-07-21'
   WHERE id = 2;
@@ -227,15 +310,15 @@ serial_profile_sql() {
       aircraft_reference_configuration_version_id, price_kind, amount, currency,
       price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
     ) SELECT max(id), 'equipped_msrp', 799900, 'USD', 2021,
-        'full_standard_configuration', 'direct_model_year', 1
+        'full_standard_configuration', 'direct_model_year', 3
       FROM aircraft_reference_configuration_versions;
     INSERT INTO aircraft_reference_fact_set_attestations (
       aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id
     )
-    SELECT max(id), 'avionics', 1 FROM aircraft_reference_configuration_versions
-    UNION ALL SELECT max(id), 'engines', 1 FROM aircraft_reference_configuration_versions
-    UNION ALL SELECT max(id), 'propellers', 1 FROM aircraft_reference_configuration_versions
-    UNION ALL SELECT max(id), 'features', 1 FROM aircraft_reference_configuration_versions;
+    SELECT max(id), 'avionics', 4 FROM aircraft_reference_configuration_versions
+    UNION ALL SELECT max(id), 'engines', 4 FROM aircraft_reference_configuration_versions
+    UNION ALL SELECT max(id), 'propellers', 4 FROM aircraft_reference_configuration_versions
+    UNION ALL SELECT max(id), 'features', 4 FROM aircraft_reference_configuration_versions;
     UPDATE aircraft_reference_configuration_versions
     SET publication_state = 'published', published_at = '2026-08-19'
     WHERE approval_decision_id = (
@@ -256,45 +339,45 @@ sz999_key="0110131A0020000000039990000000399900"
 
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'reject caller defined serial key domain' \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR199', '$s100_key', '$sr199_key', 1" \
-  "1, 0, $natural_scheme_a, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 1")" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR199', '$s100_key', '$sr199_key', 2" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 2")" \
   "reference serial sort keys must be recomputed from canonical display values"
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'reject unrelated serial prefix' \
-  "1, 0, $natural_scheme_a, 'ZZ', 'SR100', 'SR199', '$sr100_key', '$sr199_key', 1" \
-  "1, 0, $natural_scheme_a, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 1")" \
-  "reference serial applicability requires canonical sort keys"
+  "1, 0, $natural_scheme_a, 'ZZ', 'SR100', 'SR199', '$sr100_key', '$sr199_key', 2" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 2")" \
+  "reference serial applicability requires the universal natural-order key"
 
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'overlap across S and SR prefixes' \
-  "1, 0, $natural_scheme_a, 'S', 'S100', 'SR200', '$s100_key', '$sr200_key', 1" \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR300', '$sr100_key', '$sr300_key', 1")" \
+  "1, 0, $natural_scheme_a, 'S', 'S100', 'SR200', '$s100_key', '$sr200_key', 2" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR300', '$sr100_key', '$sr300_key', 2")" \
   "reference profile contains overlapping applicability scopes"
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'overlap across null and SR prefixes' \
-  "1, 0, $natural_scheme_a, NULL, 'S100', 'SZ999', '$s100_key', '$sz999_key', 1" \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 1")" \
+  "1, 0, $natural_scheme_a, NULL, 'S100', 'SZ999', '$s100_key', '$sz999_key', 2" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 2")" \
   "reference profile contains overlapping applicability scopes"
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'overlap across serial schemes' \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 1" \
-  "1, 0, $natural_scheme_b, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 1")" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 2" \
+  "1, 0, $natural_scheme_b, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 2")" \
   "reference profile contains overlapping applicability scopes"
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'overlap at inclusive serial boundary' \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 1" \
-  "1, 0, $natural_scheme_a, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 1")" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 2" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 2")" \
   "reference profile contains overlapping applicability scopes"
 expect_failure "$serial_overlap_database" "$(serial_profile_sql \
   'all serials overlaps bounded serials' \
-  "1, 1, NULL, NULL, NULL, NULL, NULL, NULL, 1" \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 1")" \
+  "1, 1, NULL, NULL, NULL, NULL, NULL, NULL, 2" \
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR200', '$sr100_key', '$sr200_key', 2")" \
   "reference profile contains overlapping applicability scopes"
 
 sqlite3 -bail "$serial_overlap_database" "$(serial_profile_sql \
   'disjoint adjacent serial ranges' \
-  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR199', '$sr100_key', '$sr199_key', 1" \
-  "1, 0, $natural_scheme_b, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 1")"
+  "1, 0, $natural_scheme_a, 'SR', 'SR100', 'SR199', '$sr100_key', '$sr199_key', 2" \
+  "1, 0, $natural_scheme_b, 'SR', 'SR200', 'SR300', '$sr200_key', '$sr300_key', 2")"
 test "$(sqlite3 "$serial_overlap_database" \
   "SELECT publication_state FROM aircraft_reference_configuration_versions WHERE model_year=2021")" = "published"
 
@@ -314,12 +397,12 @@ sqlite3 -bail "$incomplete_database" "
   INSERT INTO aircraft_reference_applicability_scopes (
     aircraft_reference_configuration_version_id, aircraft_market_id,
     applies_to_all_serials, evidence_claim_id
-  ) VALUES (2, 1, 1, 1);
+  ) VALUES (2, 1, 1, 2);
   INSERT INTO aircraft_reference_prices (
     aircraft_reference_configuration_version_id, price_kind, amount, currency,
     price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
   ) VALUES (2, 'equipped_msrp', 799900, 'USD', 2020,
-    'full_standard_configuration', 'direct_model_year', 1);
+    'full_standard_configuration', 'direct_model_year', 3);
 "
 expect_failure "$incomplete_database" "
   UPDATE aircraft_reference_configuration_versions

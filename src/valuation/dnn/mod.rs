@@ -191,6 +191,21 @@ impl ValuationModel for DnnValuationModel {
                 .map(|(_, prediction)| *prediction)
                 .collect::<Vec<_>>(),
         );
+        let factory_predictions = self.member_predictions(&query.factory_configuration_query())?;
+        let modeled_factory_configuration_anchor_usd = median(
+            factory_predictions
+                .iter()
+                .map(|(_, prediction)| prediction.log_value)
+                .collect(),
+        )
+        .exp();
+        if !modeled_factory_configuration_anchor_usd.is_finite()
+            || modeled_factory_configuration_anchor_usd <= 0.0
+        {
+            return Err(ValuationError::InvalidArtifact(
+                "DNN produced an invalid factory configuration anchor".to_string(),
+            ));
+        }
         let utilization = self.utilization(query);
         let mut depreciation = Vec::with_capacity(31);
         let mut previous_value = estimated_value;
@@ -269,6 +284,7 @@ impl ValuationModel for DnnValuationModel {
                 depreciation[last - 1].one_year_depreciation_fraction;
         }
         Ok(ValuationEstimate {
+            modeled_factory_configuration_anchor_usd,
             estimated_value_usd: estimated_value,
             low_value_usd: estimated_value * (-reported_error).exp(),
             high_value_usd: estimated_value * reported_error.exp(),
@@ -350,7 +366,17 @@ mod tests {
         assert_eq!(artifact.metadata.capacity, DnnCapacity::PriorOnly);
         let model = DnnValuationModel::load(&artifact, None).unwrap();
         let estimate = model.estimate(&row.query()).unwrap();
+        let factory_estimate = model
+            .estimate(&row.query().factory_configuration_query())
+            .unwrap();
         assert!((estimate.estimated_value_usd / row.asking_price_usd - 1.0).abs() < 1e-4);
+        assert!(
+            (estimate.modeled_factory_configuration_anchor_usd
+                / factory_estimate.estimated_value_usd
+                - 1.0)
+                .abs()
+                < 1e-10
+        );
         assert_eq!(estimate.support, SupportGrade::Low);
         assert_eq!(estimate.depreciation.len(), 31);
         assert!(estimate.depreciation.windows(2).all(|points| {

@@ -450,15 +450,9 @@ pub async fn submit_plugin_html_with_progress(
         if listing.ingestion_state != "ready"
             && bound_source_serial_receipt_exists(db, user.id, existing.id, listing_id).await?
         {
-            listing = finalize_signed_source_listing_after_receipt(
-                db,
-                user.id,
-                listing_id,
-                existing.id,
-                extractor,
-                Some(&request.rendered_html),
-            )
-            .await?;
+            listing =
+                finalize_signed_source_listing_after_receipt(db, user.id, listing_id, existing.id)
+                    .await?;
         }
         return Ok(PluginSubmissionOutcome {
             submission: existing,
@@ -690,17 +684,8 @@ pub async fn submit_plugin_html_with_progress(
             )
         })?;
         listing = Some(
-            finalize_signed_source_listing_after_receipt(
-                db,
-                user.id,
-                listing_id,
-                submission.id,
-                extractor,
-                preview
-                    .as_ref()
-                    .and_then(|preview| preview.context_text.as_deref()),
-            )
-            .await?,
+            finalize_signed_source_listing_after_receipt(db, user.id, listing_id, submission.id)
+                .await?,
         );
     }
 
@@ -838,8 +823,6 @@ pub async fn reprocess_plugin_submission(
                             user.id,
                             existing_listing_id,
                             stored.id,
-                            Some(extractor),
-                            parsed_preview.context_text.as_deref(),
                         )
                         .await?;
                     }
@@ -987,17 +970,8 @@ pub async fn reprocess_plugin_submission(
             )
         })?;
         listing = Some(
-            finalize_signed_source_listing_after_receipt(
-                db,
-                user.id,
-                listing_id,
-                submission.id,
-                extractor,
-                preview
-                    .as_ref()
-                    .and_then(|preview| preview.context_text.as_deref()),
-            )
-            .await?,
+            finalize_signed_source_listing_after_receipt(db, user.id, listing_id, submission.id)
+                .await?,
         );
     }
 
@@ -1236,15 +1210,9 @@ async fn recover_bound_source_correction(
         source_serial_correction.as_ref(),
     )
     .await?;
-    let listing = finalize_signed_source_listing_after_receipt(
-        db,
-        user.id,
-        listing_id,
-        submission.id,
-        extractor,
-        preview.context_text.as_deref(),
-    )
-    .await?;
+    let listing =
+        finalize_signed_source_listing_after_receipt(db, user.id, listing_id, submission.id)
+            .await?;
     Ok(PluginSubmissionOutcome {
         submission: submission.clone(),
         preview: Some(preview),
@@ -2190,15 +2158,7 @@ pub async fn materialize_plugin_submission_checkpoint(
     .await;
     materialized?;
     let listing = if source_serial_correction.is_some() {
-        finalize_signed_source_listing_after_receipt(
-            db,
-            user.id,
-            listing_id,
-            stored.id,
-            Some(extractor),
-            preview.context_text.as_deref(),
-        )
-        .await?
+        finalize_signed_source_listing_after_receipt(db, user.id, listing_id, stored.id).await?
     } else {
         get_listing(db, user.id, listing_id).await?
     };

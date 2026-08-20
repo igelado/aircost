@@ -24,6 +24,24 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 
+-- A marker-present rerun must reject incompatible provenance before any
+-- CREATE IF NOT EXISTS statement can accept or heal later schema objects.
+CREATE TEMP TABLE reference_catalog_cutover_contract_preflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO reference_catalog_cutover_contract_preflight (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+  FROM schema_migration_contracts
+  WHERE migration_name = '20260819_reference_catalog_cutover'
+    AND (
+      contract_version <> 1
+      OR contract_fingerprint <>
+        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+    )
+) THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_cutover_contract_preflight;
+
 CREATE TABLE IF NOT EXISTS engine_manufacturers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -2024,18 +2042,6 @@ FROM avionics_catalog_human_consolidation_guard human_guard
 JOIN avionics_catalog_human_consolidation_claim claim
  ON claim.authorization_sha256 = human_guard.authorization_sha256
  AND claim.survivor_model_id = human_guard.survivor_model_id;
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260819_reference_catalog_cutover', 1,
-  '6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -5168,6 +5174,7 @@ OR NOT EXISTS (
     AND claim.validation_status = 'validated'
     AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
 )
+OR (NEW.revision = 1) <> (NEW.supersedes_version_id IS NULL)
 OR (
   NEW.supersedes_version_id IS NOT NULL
   AND NOT EXISTS (
@@ -5180,8 +5187,9 @@ OR (
       AND previous.publication_state = 'published'
   )
 )
-OR (NEW.revision = 1) <> (NEW.supersedes_version_id IS NULL)
-BEGIN SELECT RAISE(ABORT, 'reference profile requires building state, approved evidence, and a valid predecessor'); END;
+BEGIN
+  SELECT RAISE(ABORT, 'reference profile requires building state, approved evidence, and its exact predecessor');
+END;
 
 -- Profile children may only be assembled while the parent is building.
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_scope_building_insert
@@ -5222,7 +5230,9 @@ WHEN NEW.applies_to_all_serials = 0 AND (
     )
   )
 )
-BEGIN SELECT RAISE(ABORT, 'reference serial applicability requires canonical sort keys'); END;
+BEGIN
+  SELECT RAISE(ABORT, 'reference serial applicability requires the universal natural-order key');
+END;
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_scope_key_recompute_insert
 AFTER INSERT ON aircraft_reference_applicability_scopes
 WHEN EXISTS (
@@ -5422,16 +5432,18 @@ BEGIN
     SELECT COUNT(*) FROM aircraft_reference_fact_set_attestations attestation
     WHERE attestation.aircraft_reference_configuration_version_id = NEW.id
   );
-  SELECT RAISE(ABORT, 'published reference profile requires direct exact-year primary price evidence')
-  WHERE NOT EXISTS (
-    SELECT 1
+  SELECT RAISE(ABORT, 'published reference profile requires exactly one direct exact-model-year full-configuration equipped MSRP with primary price evidence')
+  WHERE 1 <> (
+    SELECT COUNT(*)
     FROM aircraft_reference_prices price
     JOIN curation_evidence_claims claim ON claim.id = price.evidence_claim_id
     JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
     WHERE price.aircraft_reference_configuration_version_id = NEW.id
-      AND price.price_kind IN ('base_msrp', 'equipped_msrp')
+      AND price.currency = 'USD'
+      AND price.price_kind = 'equipped_msrp'
       AND price.evidence_kind = 'direct_model_year'
       AND price.configuration_basis = 'full_standard_configuration'
+      AND claim.claim_kind = 'price'
       AND claim.validation_status = 'validated'
       AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
   );
@@ -5455,50 +5467,40 @@ BEGIN
     WHERE propeller.aircraft_reference_configuration_version_id = NEW.id
       AND model.id IS NULL
   );
-  SELECT RAISE(ABORT, 'published reference profile requires valuation-ready factory avionics')
-  WHERE EXISTS (
-    SELECT 1 FROM aircraft_reference_avionics fact
-    JOIN avionics_models model ON model.id = fact.avionics_model_id
-    WHERE fact.aircraft_reference_configuration_version_id = NEW.id
-      AND (model.catalog_status <> 'approved'
-        OR model.introduced_year IS NULL
-        OR model.estimated_unit_value_usd IS NULL
-        OR model.estimated_unit_value_usd < 0
-        OR model.value_basis <> 'installed_contribution'
-        OR model.replacement_cost_usd IS NULL
-        OR model.replacement_cost_usd < model.estimated_unit_value_usd
-        OR model.value_reference_year NOT BETWEEN 1900 AND 2200
-        OR trim(coalesce(model.value_source, '')) = '')
-  );
   SELECT RAISE(ABORT, 'published reference profile facts require validated primary evidence')
   WHERE EXISTS (
     SELECT 1
     FROM (
-      SELECT evidence_claim_id FROM aircraft_reference_applicability_scopes
+      SELECT evidence_claim_id, 'applicability' AS evidence_domain FROM aircraft_reference_applicability_scopes
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_prices
+      SELECT evidence_claim_id, 'price' FROM aircraft_reference_prices
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_avionics
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_avionics
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_engines
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_engines
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_propellers
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_propellers
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_features
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_features
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_fact_set_attestations
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_fact_set_attestations
       WHERE aircraft_reference_configuration_version_id = NEW.id
     ) fact
     JOIN curation_evidence_claims claim ON claim.id = fact.evidence_claim_id
     JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
     WHERE claim.validation_status <> 'validated'
        OR source.source_tier NOT IN ('manufacturer_primary', 'regulator_primary')
+       OR (fact.evidence_domain = 'applicability' AND claim.claim_kind <> 'applicability')
+       OR (fact.evidence_domain = 'price' AND claim.claim_kind <> 'price')
+       OR (fact.evidence_domain = 'factory' AND claim.claim_kind NOT IN (
+         'standard_equipment', 'package_composition', 'specification'
+       ))
   );
   SELECT RAISE(ABORT, 'reference profile contains overlapping applicability scopes')
   WHERE EXISTS (
@@ -5522,8 +5524,16 @@ BEGIN
   WHERE EXISTS (
     SELECT 1
     FROM aircraft_reference_applicability_scopes candidate
+    JOIN aircraft_markets candidate_market
+      ON candidate_market.id = candidate.aircraft_market_id
     JOIN aircraft_reference_applicability_scopes existing
       ON existing.aircraft_market_id = candidate.aircraft_market_id
+      OR candidate_market.code = 'GLOBAL'
+      OR EXISTS (
+        SELECT 1 FROM aircraft_markets existing_market
+        WHERE existing_market.id = existing.aircraft_market_id
+          AND existing_market.code = 'GLOBAL'
+      )
     JOIN aircraft_reference_configuration_versions existing_version
       ON existing_version.id = existing.aircraft_reference_configuration_version_id
     WHERE candidate.aircraft_reference_configuration_version_id = NEW.id
@@ -9441,3 +9451,14 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,
   contract_fingerprint = excluded.contract_fingerprint,
   installed_at = excluded.installed_at;
+
+-- This completion marker is deliberately last: every cutover relation,
+-- trigger, and canonical definition must exist before provenance is recorded.
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260819_reference_catalog_cutover', 1,
+  'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;

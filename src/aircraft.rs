@@ -142,11 +142,7 @@ struct AircraftListingPointRow {
 #[derive(Clone, Debug, FromRow)]
 struct AvionicsEstimateRow {
     avionics_model_id: i64,
-    manufacturer: String,
-    model: String,
     quantity: i64,
-    installed_value_contribution_usd: Option<f64>,
-    value_reference_year: Option<i64>,
     valuation_scope: String,
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
@@ -236,8 +232,6 @@ pub struct AircraftReferenceValuationBasis {
     pub dollar_normalization_factor: f64,
     pub dollar_normalization_fact_id: Option<i64>,
     pub full_standard_configuration_price_usd: f64,
-    pub listing_current_avionics_delta_usd: f64,
-    pub avionics_delta_curve_policy: String,
     pub nominal_dollar_year: i64,
 }
 
@@ -732,68 +726,28 @@ async fn reference_valuation_basis(
     let factory = reference_avionics_estimates(db, reference.version_id).await?;
     let listing = listing_avionics_estimates(db, listing_id).await?;
     let memberships = avionics_suite_memberships(db).await?;
-    let effective = effective_avionics_rows(&factory, &listing, &memberships);
-    let factory_quantities = factory
+    let factory_effective = effective_avionics_rows(&factory, &[], &memberships);
+    let listing_effective = effective_avionics_rows(&factory, &listing, &memberships);
+    let factory_quantities = factory_effective
         .iter()
         .map(|row| (row.avionics_model_id, row.quantity))
         .collect::<BTreeMap<_, _>>();
-    let effective_quantities = effective
+    let effective_quantities = listing_effective
         .iter()
         .map(|row| (row.avionics_model_id, row.quantity))
         .collect::<BTreeMap<_, _>>();
-    let rows_by_id = factory
-        .iter()
-        .chain(listing.iter())
-        .map(|row| (row.avionics_model_id, row))
-        .collect::<BTreeMap<_, _>>();
-    let component_ids = factory_quantities
-        .keys()
-        .chain(effective_quantities.keys())
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut delta = 0.0;
-    for component_id in component_ids {
-        let quantity_change = effective_quantities
-            .get(&component_id)
-            .copied()
-            .unwrap_or_default()
-            - factory_quantities
-                .get(&component_id)
-                .copied()
-                .unwrap_or_default();
-        if quantity_change == 0 {
-            continue;
-        }
-        let row = rows_by_id
-            .get(&component_id)
-            .expect("quantity map components came from reference/listing rows");
-        let Some(value) = row.installed_value_contribution_usd else {
-            return Ok(Err(ReferenceGap::new(
-                "listing_avionics_value_missing",
-                format!(
-                    "avionics product {} {} has no approved installed-contribution value",
-                    row.manufacturer, row.model
-                ),
-            )));
-        };
-        if row.value_reference_year != Some(valuation_year) {
-            return Ok(Err(ReferenceGap::new(
-                "avionics_value_dollar_normalization_missing",
-                format!(
-                    "avionics product {} {} is valued in {:?} dollars, not valuation-year {} dollars",
-                    row.manufacturer, row.model, row.value_reference_year, valuation_year
-                ),
-            )));
-        }
-        delta += value * quantity_change as f64;
+    if factory_quantities != effective_quantities {
+        return Ok(Err(ReferenceGap::new(
+            "avionics_value_fact_missing",
+            "the listing avionics configuration differs from the published factory baseline, but no immutable evidence-backed avionics installed-value facts are available",
+        )));
     }
     if !normalized_price.normalized_amount_usd.is_finite()
         || normalized_price.normalized_amount_usd <= 0.0
-        || !delta.is_finite()
     {
         return Ok(Err(ReferenceGap::new(
             "reference_valuation_basis_invalid",
-            "factory standard-configuration price or current avionics delta is invalid",
+            "factory standard-configuration price is invalid",
         )));
     }
     Ok(Ok(AircraftReferenceValuationBasis {
@@ -803,8 +757,6 @@ async fn reference_valuation_basis(
         dollar_normalization_factor: normalized_price.normalization_factor,
         dollar_normalization_fact_id: normalized_price.official_normalization_fact_id,
         full_standard_configuration_price_usd: normalized_price.normalized_amount_usd,
-        listing_current_avionics_delta_usd: delta,
-        avionics_delta_curve_policy: "constant_valuation_year_dollars".to_string(),
         nominal_dollar_year: valuation_year,
     }))
 }
@@ -813,12 +765,7 @@ fn ground_estimate_to_reference(
     estimate: &mut crate::valuation::ValuationEstimate,
     reference: &AircraftReferenceValuationBasis,
 ) -> StoreResult<()> {
-    let modeled_configuration_anchor = estimate.breakdown.global_anchor_usd
-        * estimate.breakdown.category_factor
-        * estimate.breakdown.manufacturer_factor
-        * estimate.breakdown.model_factor
-        * estimate.breakdown.variant_factor
-        * estimate.breakdown.optional_features_factor;
+    let modeled_configuration_anchor = estimate.modeled_factory_configuration_anchor_usd;
     if !modeled_configuration_anchor.is_finite() || modeled_configuration_anchor <= 0.0 {
         return Err(AircraftStoreError::Model(
             "valuation model produced an invalid configuration anchor".to_string(),
@@ -836,51 +783,35 @@ fn ground_estimate_to_reference(
         point.estimated_value_usd *= scale;
         point.low_value_usd *= scale;
         point.high_value_usd *= scale;
-        point.depreciation_usd *= scale;
     }
+    estimate.modeled_factory_configuration_anchor_usd =
+        reference.full_standard_configuration_price_usd;
     estimate.breakdown.global_anchor_usd = reference.full_standard_configuration_price_usd;
     estimate.breakdown.category_factor = 1.0;
     estimate.breakdown.manufacturer_factor = 1.0;
     estimate.breakdown.model_factor = 1.0;
     estimate.breakdown.variant_factor = 1.0;
     estimate.breakdown.optional_features_factor = 1.0;
-    apply_current_avionics_delta(estimate, reference.listing_current_avionics_delta_usd)?;
-    Ok(())
-}
-
-/// Installed-contribution values are current resale contributions, not new
-/// aircraft MSRP. The delta is therefore applied after aircraft age/hour
-/// scaling and held constant in valuation-year dollars across the displayed
-/// curve until a separate avionics depreciation model is approved.
-fn apply_current_avionics_delta(
-    estimate: &mut crate::valuation::ValuationEstimate,
-    delta_usd: f64,
-) -> StoreResult<()> {
-    for value in [
-        &mut estimate.estimated_value_usd,
-        &mut estimate.low_value_usd,
-        &mut estimate.high_value_usd,
-    ] {
-        *value += delta_usd;
-        if !value.is_finite() || *value <= 0.0 {
-            return Err(AircraftStoreError::Model(
-                "current-dollar avionics delta produced an invalid valuation".to_string(),
-            ));
-        }
-    }
+    estimate.estimated_error_fraction = ((estimate.high_value_usd / estimate.estimated_value_usd)
+        - 1.0)
+        .max(1.0 - estimate.low_value_usd / estimate.estimated_value_usd);
+    let current_value = estimate.estimated_value_usd;
     for point in &mut estimate.depreciation {
-        for value in [
-            &mut point.estimated_value_usd,
-            &mut point.low_value_usd,
-            &mut point.high_value_usd,
-        ] {
-            *value += delta_usd;
-            if !value.is_finite() || *value <= 0.0 {
-                return Err(AircraftStoreError::Model(
-                    "current-dollar avionics delta produced an invalid curve point".to_string(),
-                ));
-            }
-        }
+        point.depreciation_usd = (current_value - point.estimated_value_usd).max(0.0);
+        point.depreciation_fraction = point.depreciation_usd / current_value;
+        point.estimated_error_fraction = ((point.high_value_usd / point.estimated_value_usd) - 1.0)
+            .max(1.0 - point.low_value_usd / point.estimated_value_usd);
+    }
+    for index in 0..estimate.depreciation.len().saturating_sub(1) {
+        estimate.depreciation[index].one_year_depreciation_fraction = (1.0
+            - estimate.depreciation[index + 1].estimated_value_usd
+                / estimate.depreciation[index].estimated_value_usd)
+            .max(0.0);
+    }
+    if estimate.depreciation.len() > 1 {
+        let last = estimate.depreciation.len() - 1;
+        estimate.depreciation[last].one_year_depreciation_fraction =
+            estimate.depreciation[last - 1].one_year_depreciation_fraction;
     }
     Ok(())
 }
@@ -895,19 +826,7 @@ async fn listing_avionics_estimates(
         r#"
         SELECT
           model.id AS avionics_model_id,
-          mfr.name AS manufacturer,
-          model.name AS model,
           link.quantity,
-          CASE
-            WHEN model.value_basis = 'installed_contribution'
-              AND model.estimated_unit_value_usd >= 0
-              AND model.replacement_cost_usd >= model.estimated_unit_value_usd
-              AND model.value_reference_year IS NOT NULL
-              AND model.value_source IS NOT NULL
-              AND TRIM(model.value_source) <> ''
-            THEN model.estimated_unit_value_usd
-          END AS installed_value_contribution_usd,
-          model.value_reference_year,
           model.valuation_scope,
           link.configuration_action,
           link.replaces_avionics_model_id,
@@ -915,8 +834,6 @@ async fn listing_avionics_estimates(
         FROM aircraft_sale_listing_avionics link
         JOIN avionics_models model
           ON model.id = link.avionics_model_id
-        JOIN avionics_manufacturers mfr
-          ON mfr.id = model.avionics_manufacturer_id
         WHERE link.aircraft_sale_listing_id = ?
           AND link.source IN ('listing', 'listing_review')
           AND model.catalog_status = 'approved'
@@ -945,19 +862,7 @@ async fn reference_avionics_estimates(
         r#"
         SELECT
           model.id AS avionics_model_id,
-          mfr.name AS manufacturer,
-          model.name AS model,
           reference_avionics.quantity,
-          CASE
-            WHEN model.value_basis = 'installed_contribution'
-              AND model.estimated_unit_value_usd >= 0
-              AND model.replacement_cost_usd >= model.estimated_unit_value_usd
-              AND model.value_reference_year IS NOT NULL
-              AND model.value_source IS NOT NULL
-              AND TRIM(model.value_source) <> ''
-            THEN model.estimated_unit_value_usd
-          END AS installed_value_contribution_usd,
-          model.value_reference_year,
           model.valuation_scope,
           'installed' AS configuration_action,
           NULL AS replaces_avionics_model_id,
@@ -965,8 +870,6 @@ async fn reference_avionics_estimates(
         FROM aircraft_reference_avionics reference_avionics
         JOIN avionics_models model
           ON model.id = reference_avionics.avionics_model_id
-        JOIN avionics_manufacturers mfr
-          ON mfr.id = model.avionics_manufacturer_id
         JOIN aircraft_reference_configuration_versions reference_version
           ON reference_version.id = reference_avionics.aircraft_reference_configuration_version_id
         WHERE reference_avionics.aircraft_reference_configuration_version_id = ?
@@ -1064,7 +967,19 @@ pub(crate) fn resolve_avionics_configuration(
     for link in &high_confidence_deltas {
         if matches!(link.configuration_action.as_str(), "replaces" | "removes") {
             if let Some(replaced_id) = link.replaces_avionics_model_id {
-                quantities.remove(&replaced_id);
+                let removed_quantity = quantities.remove(&replaced_id).unwrap_or_default();
+                for membership in suite_memberships
+                    .iter()
+                    .filter(|membership| membership.suite_model_id == replaced_id)
+                {
+                    if let Some(component_quantity) =
+                        quantities.get_mut(&membership.component_model_id)
+                    {
+                        *component_quantity = component_quantity.saturating_sub(
+                            removed_quantity.saturating_mul(membership.quantity.max(1)),
+                        );
+                    }
+                }
             }
         }
     }
@@ -1141,6 +1056,8 @@ fn option_from_row(row: AircraftVariantOptionRow) -> AircraftVariantOption {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         aircraft_listing_value_with_model, aircraft_option_for_variant, aircraft_options,
         avionics_suite_memberships, ground_estimate_to_reference, listing_avionics_estimates,
@@ -1507,8 +1424,66 @@ mod tests {
     }
 
     #[test]
-    fn current_avionics_upgrades_and_removals_are_not_aircraft_depreciated() {
+    fn factory_suite_and_explicit_bundled_components_resolve_to_one_baseline() {
+        let factory = vec![
+            AvionicsConfigurationLink {
+                valuation_scope: "integrated_suite".to_string(),
+                ..link(10, 1, "installed", None, "high")
+            },
+            link(11, 2, "installed", None, "high"),
+        ];
+        let memberships = vec![AvionicsSuiteMembership {
+            suite_model_id: 10,
+            component_model_id: 11,
+            quantity: 2,
+        }];
+
+        assert_eq!(
+            resolve_avionics_configuration(&factory, &[], &memberships),
+            BTreeMap::from([(10, 1)])
+        );
+    }
+
+    #[test]
+    fn suite_replacement_is_detected_after_symmetric_bundle_resolution() {
+        let factory = vec![
+            AvionicsConfigurationLink {
+                valuation_scope: "integrated_suite".to_string(),
+                ..link(10, 1, "installed", None, "high")
+            },
+            link(11, 2, "installed", None, "high"),
+        ];
+        let listing = vec![
+            AvionicsConfigurationLink {
+                valuation_scope: "integrated_suite".to_string(),
+                ..link(20, 1, "replaces", Some(10), "high")
+            },
+            link(21, 2, "installed", None, "high"),
+        ];
+        let memberships = vec![
+            AvionicsSuiteMembership {
+                suite_model_id: 10,
+                component_model_id: 11,
+                quantity: 2,
+            },
+            AvionicsSuiteMembership {
+                suite_model_id: 20,
+                component_model_id: 21,
+                quantity: 2,
+            },
+        ];
+
+        let factory_resolved = resolve_avionics_configuration(&factory, &[], &memberships);
+        let listing_resolved = resolve_avionics_configuration(&factory, &listing, &memberships);
+        assert_eq!(factory_resolved, BTreeMap::from([(10, 1)]));
+        assert_eq!(listing_resolved, BTreeMap::from([(20, 1)]));
+        assert_ne!(factory_resolved, listing_resolved);
+    }
+
+    #[test]
+    fn reference_grounding_uses_explicit_model_anchor_and_recomputes_derived_values() {
         let mut estimate = ValuationEstimate {
+            modeled_factory_configuration_anchor_usd: 200_000.0,
             estimated_value_usd: 100_000.0,
             low_value_usd: 80_000.0,
             high_value_usd: 120_000.0,
@@ -1529,22 +1504,37 @@ mod tests {
                 variant_factor: 1.0,
                 optional_features_factor: 1.0,
             },
-            depreciation: vec![DepreciationPoint {
-                horizon_years: 0,
-                valuation_year: 2026,
-                age_years: 10.0,
-                airframe_hours: Some(1_000.0),
-                estimated_value_usd: 100_000.0,
-                low_value_usd: 80_000.0,
-                high_value_usd: 120_000.0,
-                depreciation_usd: 100_000.0,
-                depreciation_fraction: 0.5,
-                one_year_depreciation_fraction: 0.05,
-                estimated_error_fraction: 0.2,
-                support: SupportGrade::High,
-            }],
+            depreciation: vec![
+                DepreciationPoint {
+                    horizon_years: 0,
+                    valuation_year: 2026,
+                    age_years: 10.0,
+                    airframe_hours: Some(1_000.0),
+                    estimated_value_usd: 100_000.0,
+                    low_value_usd: 80_000.0,
+                    high_value_usd: 120_000.0,
+                    depreciation_usd: 99.0,
+                    depreciation_fraction: 0.99,
+                    one_year_depreciation_fraction: 0.99,
+                    estimated_error_fraction: 0.99,
+                    support: SupportGrade::High,
+                },
+                DepreciationPoint {
+                    horizon_years: 1,
+                    valuation_year: 2027,
+                    age_years: 11.0,
+                    airframe_hours: Some(1_100.0),
+                    estimated_value_usd: 90_000.0,
+                    low_value_usd: 72_000.0,
+                    high_value_usd: 108_000.0,
+                    depreciation_usd: 99.0,
+                    depreciation_fraction: 0.99,
+                    one_year_depreciation_fraction: 0.99,
+                    estimated_error_fraction: 0.99,
+                    support: SupportGrade::High,
+                },
+            ],
         };
-        let mut removal_estimate = estimate.clone();
         let reference = AircraftReferenceValuationBasis {
             reference_configuration_version_id: 42,
             direct_cited_standard_configuration_price_usd: 480_000.0,
@@ -1552,29 +1542,24 @@ mod tests {
             dollar_normalization_factor: 1.0,
             dollar_normalization_fact_id: None,
             full_standard_configuration_price_usd: 480_000.0,
-            listing_current_avionics_delta_usd: 10_000.0,
-            avionics_delta_curve_policy: "constant_valuation_year_dollars".to_string(),
             nominal_dollar_year: 2026,
-        };
-        let removal_reference = AircraftReferenceValuationBasis {
-            listing_current_avionics_delta_usd: -10_000.0,
-            ..reference.clone()
         };
 
         ground_estimate_to_reference(&mut estimate, &reference).unwrap();
-        ground_estimate_to_reference(&mut removal_estimate, &removal_reference).unwrap();
 
-        assert_eq!(estimate.estimated_value_usd, 250_000.0);
-        assert_eq!(removal_estimate.estimated_value_usd, 230_000.0);
+        assert_eq!(estimate.estimated_value_usd, 240_000.0);
+        assert_eq!(estimate.modeled_factory_configuration_anchor_usd, 480_000.0);
         assert_eq!(estimate.breakdown.global_anchor_usd, 480_000.0);
         assert_eq!(estimate.breakdown.manufacturer_factor, 1.0);
-        assert_eq!(estimate.depreciation[0].estimated_value_usd, 250_000.0);
-        assert_eq!(
-            removal_estimate.depreciation[0].estimated_value_usd,
-            230_000.0
-        );
-        assert_eq!(estimate.depreciation[0].depreciation_usd, 240_000.0);
-        assert_eq!(removal_estimate.depreciation[0].depreciation_usd, 240_000.0);
+        assert_eq!(estimate.depreciation[0].estimated_value_usd, 240_000.0);
+        assert_eq!(estimate.depreciation[1].estimated_value_usd, 216_000.0);
+        assert_eq!(estimate.depreciation[0].depreciation_usd, 0.0);
+        assert_eq!(estimate.depreciation[1].depreciation_usd, 24_000.0);
+        assert!((estimate.depreciation[1].depreciation_fraction - 0.1).abs() < 1e-12);
+        assert!((estimate.depreciation[0].one_year_depreciation_fraction - 0.1).abs() < 1e-12);
+        assert!((estimate.depreciation[1].one_year_depreciation_fraction - 0.1).abs() < 1e-12);
+        assert!((estimate.estimated_error_fraction - 0.2).abs() < 1e-12);
+        assert!((estimate.depreciation[1].estimated_error_fraction - 0.2).abs() < 1e-12);
     }
 
     #[tokio::test]

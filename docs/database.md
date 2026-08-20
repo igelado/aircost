@@ -1784,7 +1784,10 @@ WHERE type = 'table'
 ```
 
 The contract must be version `1` with fingerprint
-`6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e`.
+`a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4`.
+Its `installed_at` value records the first successful installation and remains
+unchanged across schema reruns and application startups. A marker mismatch or
+marker-present damaged cutover contract fails before canonical DDL can heal it.
 Listing reference resolution uses only one complete published version matching
 the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
 scope. Missing and ambiguous matches remain ineligible for snapshots, training,

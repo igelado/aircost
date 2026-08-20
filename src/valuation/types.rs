@@ -209,6 +209,19 @@ impl ValuationQuery {
         (self.valuation_year - self.model_year).max(0) as f64
     }
 
+    /// The model-defined factory anchor keeps identity fixed while removing
+    /// age, utilization, and optional-equipment effects.
+    pub(crate) fn factory_configuration_query(&self) -> Self {
+        let mut query = self.clone();
+        query.valuation_year = query.model_year;
+        query.airframe_hours = Some(0.0);
+        query.engine_times.clear();
+        query.propeller_times.clear();
+        query.equipment_tokens.clear();
+        query.technical_field_count = 0;
+        query
+    }
+
     pub fn age_years(&self) -> Result<f64, ValuationError> {
         self.validate()?;
         Ok(self.age())
@@ -225,6 +238,7 @@ pub enum SupportGrade {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ValuationEstimate {
+    pub modeled_factory_configuration_anchor_usd: f64,
     pub estimated_value_usd: f64,
     pub low_value_usd: f64,
     pub high_value_usd: f64,

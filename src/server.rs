@@ -1941,7 +1941,7 @@ async fn resolve_listing_review_handler(
     // Gemini or avionics-catalog writes. This also repairs legacy pending
     // reviews that predate aircraft identity assignment. When explicitly
     // requested below, post-commit finalization repeats the check to close the
-    // publication race around network enrichment.
+    // publication race.
     let review = get_listing_review(&state.db, user.id, listing_id).await?;
     require_current_review_revisions(&review.review, &payload)?;
     preflight_listing_review_resolution(&state.db, &review.review, &payload).await?;
@@ -1954,7 +1954,7 @@ async fn resolve_listing_review_handler(
         .await?;
     let resolved = resolve_listing_review(&state.db, user.id, listing_id, &payload).await?;
     if payload.finalize_listing {
-        finalize_reviewed_listing_ingestion(&state.db, listing_id, state.extractor.as_ref(), None)
+        finalize_reviewed_listing_ingestion(&state.db, listing_id)
             .await
             .map_err(|error| ApiError::from(error).with_code("listing_finalization_failed"))?;
     }

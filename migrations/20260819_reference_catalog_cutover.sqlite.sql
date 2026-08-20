@@ -1,6 +1,125 @@
 PRAGMA foreign_keys = ON;
 BEGIN IMMEDIATE;
 
+-- Reject mismatched provenance and marker-present structural damage before any
+-- transition DDL can replace or recreate cutover objects.
+CREATE TEMP TABLE reference_catalog_cutover_rerun_preflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO reference_catalog_cutover_rerun_preflight (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+  FROM schema_migration_contracts
+  WHERE migration_name = '20260819_reference_catalog_cutover'
+    AND (
+      contract_version <> 1
+      OR contract_fingerprint <>
+        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+    )
+) OR (
+  EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+      AND contract_version = 1
+      AND contract_fingerprint =
+        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+  )
+  AND (
+    (SELECT count(*) FROM sqlite_schema
+     WHERE type = 'table' AND name IN (
+       'aircraft_reference_fact_set_attestations',
+       'official_dollar_normalization_facts'
+     )) <> 2
+    OR (SELECT count(*) FROM sqlite_schema
+        WHERE type = 'trigger' AND name IN (
+          'avionics_models_referenced_status_update',
+          'aircraft_valuation_projection_validate_insert',
+          'aircraft_reference_scope_canonical_insert',
+          'aircraft_reference_scope_key_recompute_insert',
+          'aircraft_reference_versions_require_approval',
+          'official_dollar_normalization_require_evidence',
+          'official_dollar_normalization_immutable_update',
+          'official_dollar_normalization_immutable_delete',
+          'aircraft_reference_price_building_insert',
+          'aircraft_reference_price_immutable_update',
+          'aircraft_reference_price_immutable_delete',
+          'aircraft_reference_fact_set_building_insert',
+          'aircraft_reference_fact_set_immutable_update',
+          'aircraft_reference_fact_set_immutable_delete',
+          'aircraft_reference_versions_publish',
+          'aircraft_serial_schemes_require_approval',
+          'aircraft_serial_schemes_preserve_ordering'
+        )) <> 17
+    OR (SELECT count(*) FROM pragma_table_info('aircraft_reference_prices')
+        WHERE name = 'configuration_basis'
+          AND upper(type) = 'TEXT'
+          AND "notnull" = 1
+          AND dflt_value = '''unknown'''
+          AND pk = 0) <> 1
+    OR (SELECT lower(hex(sha3(group_concat(
+          type || ':' || name || ':' || normalized_sql, '|'
+        ), 256)))
+        FROM (
+          SELECT
+            type,
+            name,
+            lower(replace(replace(replace(replace(
+              sql, char(9), ''
+            ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
+          FROM sqlite_schema
+          WHERE (type = 'table' AND name IN (
+            'aircraft_reference_prices',
+            'aircraft_reference_fact_set_attestations',
+            'official_dollar_normalization_facts'
+          )) OR (type = 'trigger' AND name IN (
+            'avionics_models_referenced_status_update',
+            'aircraft_valuation_projection_validate_insert',
+            'aircraft_reference_scope_canonical_insert',
+            'aircraft_reference_scope_key_recompute_insert',
+            'aircraft_reference_versions_require_approval',
+            'official_dollar_normalization_require_evidence',
+            'official_dollar_normalization_immutable_update',
+            'official_dollar_normalization_immutable_delete',
+            'aircraft_reference_price_building_insert',
+            'aircraft_reference_price_immutable_update',
+            'aircraft_reference_price_immutable_delete',
+            'aircraft_reference_fact_set_building_insert',
+            'aircraft_reference_fact_set_immutable_update',
+            'aircraft_reference_fact_set_immutable_delete',
+            'aircraft_reference_versions_publish',
+            'aircraft_serial_schemes_require_approval',
+            'aircraft_serial_schemes_preserve_ordering'
+          ))
+          ORDER BY type, name
+        )) <> '6ae94b46c1cd6c3c001833a16061eb3a43947ba5b90042749fa71e5ad5d6e9d9'
+    OR EXISTS (
+      SELECT 1
+      FROM sqlite_schema
+      WHERE tbl_name = 'aircraft_reference_prices'
+        AND type IN ('index', 'trigger')
+        AND name NOT IN (
+          'sqlite_autoindex_aircraft_reference_prices_1',
+          'aircraft_reference_price_building_insert',
+          'aircraft_reference_price_immutable_update',
+          'aircraft_reference_price_immutable_delete'
+        )
+    )
+    OR EXISTS (
+      SELECT 1 FROM sqlite_schema
+      WHERE type = 'table' AND name IN (
+        'aircraft_model_spec_versions',
+        'aircraft_model_variant_price_points',
+        'aircraft_model_variant_default_avionics',
+        'aircraft_model_variant_default_avionics_candidates',
+        'depreciation_profiles',
+        'depreciation_profile_fit_metadata',
+        'component_depreciation_profiles'
+      )
+    )
+  )
+) THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_cutover_rerun_preflight;
+
 DROP VIEW IF EXISTS aircraft_reference_serial_key_errors;
 CREATE VIEW aircraft_reference_serial_key_errors AS
 WITH RECURSIVE
@@ -121,16 +240,26 @@ UPDATE aircraft_serial_number_schemes
 SET normalization_version = 'natural_alphanumeric_segments_v1'
 WHERE normalization_version <> 'natural_alphanumeric_segments_v1';
 
-DROP TRIGGER IF EXISTS aircraft_serial_schemes_universal_order_insert;
-CREATE TRIGGER aircraft_serial_schemes_universal_order_insert
+DROP TRIGGER IF EXISTS aircraft_serial_schemes_require_approval;
+CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
 WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
-BEGIN SELECT RAISE(ABORT, 'serial schemes require the universal ordering version'); END;
-DROP TRIGGER IF EXISTS aircraft_serial_schemes_universal_order_update;
-CREATE TRIGGER aircraft_serial_schemes_universal_order_update
+OR NOT EXISTS (
+  SELECT 1 FROM aircraft_identity_decisions decision
+  JOIN aircraft_identity_decision_claims dc ON dc.decision_id = decision.id
+  JOIN curation_evidence_claims claim ON claim.id = dc.evidence_claim_id
+  WHERE decision.id = NEW.approval_decision_id
+    AND decision.decision_status = 'approved'
+    AND decision.decision_action = 'approve_new' AND decision.entity_kind = 'serial_scheme'
+    AND claim.validation_status = 'validated'
+)
+BEGIN SELECT RAISE(ABORT, 'serial scheme requires the universal ordering and an approved evidence-backed decision'); END;
+
+DROP TRIGGER IF EXISTS aircraft_serial_schemes_preserve_ordering;
+CREATE TRIGGER aircraft_serial_schemes_preserve_ordering
 BEFORE UPDATE OF normalization_version ON aircraft_serial_number_schemes
 WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
-BEGIN SELECT RAISE(ABORT, 'serial schemes require the universal ordering version'); END;
+BEGIN SELECT RAISE(ABORT, 'serial scheme ordering version is immutable'); END;
 
 -- The reference catalog is the only aircraft configuration/value authority.
 -- Drop dependent triggers first so the surviving trigger bodies cannot retain
@@ -259,11 +388,93 @@ BEGIN
   SELECT RAISE(ABORT, 'aircraft compatibility projection requires the active command, exact copied assignment provenance, and its fresh reserved hierarchy');
 END;
 
-ALTER TABLE aircraft_reference_prices
-  ADD COLUMN configuration_basis TEXT NOT NULL DEFAULT 'unknown'
-  CHECK (configuration_basis IN (
+-- Rebuild through a projection that supplies `unknown` only when the legacy
+-- table lacks configuration_basis. SQLite renames the appended duplicate on a
+-- current table, so the existing canonical value wins on exact reruns.
+CREATE TEMP TABLE reference_catalog_cutover_prices AS
+SELECT
+  id,
+  aircraft_reference_configuration_version_id,
+  price_kind,
+  amount,
+  currency,
+  price_reference_year,
+  configuration_basis,
+  evidence_kind,
+  evidence_claim_id,
+  created_at
+FROM (
+  SELECT *, 'unknown' AS configuration_basis
+  FROM aircraft_reference_prices
+);
+CREATE TEMP TABLE reference_catalog_cutover_price_sequence AS
+SELECT seq
+FROM sqlite_sequence
+WHERE name = 'aircraft_reference_prices';
+DROP TABLE aircraft_reference_prices;
+CREATE TABLE aircraft_reference_prices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  aircraft_reference_configuration_version_id INTEGER NOT NULL
+    REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE,
+  price_kind TEXT NOT NULL CHECK (price_kind IN (
+    'base_msrp', 'equipped_msrp', 'tier_increment', 'other_factory_price'
+  )),
+  amount REAL NOT NULL CHECK (amount > 0),
+  currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+  price_reference_year INTEGER NOT NULL CHECK (price_reference_year BETWEEN 1900 AND 2200),
+  configuration_basis TEXT NOT NULL DEFAULT 'unknown' CHECK (configuration_basis IN (
     'full_standard_configuration', 'base_aircraft_only', 'unknown'
-  ));
+  )),
+  evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+    'direct_model_year', 'direct_other_year', 'interpolated', 'inferred'
+  )),
+  evidence_claim_id INTEGER NOT NULL
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (aircraft_reference_configuration_version_id, price_kind, currency)
+);
+INSERT INTO aircraft_reference_prices (
+  id,
+  aircraft_reference_configuration_version_id,
+  price_kind,
+  amount,
+  currency,
+  price_reference_year,
+  configuration_basis,
+  evidence_kind,
+  evidence_claim_id,
+  created_at
+)
+SELECT
+  id,
+  aircraft_reference_configuration_version_id,
+  price_kind,
+  amount,
+  currency,
+  price_reference_year,
+  configuration_basis,
+  evidence_kind,
+  evidence_claim_id,
+  created_at
+FROM reference_catalog_cutover_prices;
+DELETE FROM sqlite_sequence WHERE name = 'aircraft_reference_prices';
+INSERT INTO sqlite_sequence (name, seq)
+SELECT 'aircraft_reference_prices', seq
+FROM reference_catalog_cutover_price_sequence;
+DROP TABLE reference_catalog_cutover_prices;
+DROP TABLE reference_catalog_cutover_price_sequence;
+
+CREATE TRIGGER aircraft_reference_price_immutable_update
+BEFORE UPDATE ON aircraft_reference_prices
+BEGIN SELECT RAISE(ABORT, 'reference profile facts are immutable'); END;
+CREATE TRIGGER aircraft_reference_price_immutable_delete
+BEFORE DELETE ON aircraft_reference_prices
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = OLD.aircraft_reference_configuration_version_id
+    AND version.publication_state <> 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
 
 DROP TRIGGER IF EXISTS aircraft_reference_scope_canonical_insert;
 CREATE TRIGGER aircraft_reference_scope_canonical_insert
@@ -311,7 +522,7 @@ BEGIN
   SELECT RAISE(ABORT, 'reference serial sort keys must be recomputed from canonical display values');
 END;
 
-DROP TRIGGER aircraft_reference_versions_require_approval;
+DROP TRIGGER IF EXISTS aircraft_reference_versions_require_approval;
 CREATE TRIGGER aircraft_reference_versions_require_approval
 BEFORE INSERT ON aircraft_reference_configuration_versions
 WHEN NEW.publication_state <> 'building'
@@ -344,7 +555,7 @@ BEGIN
   SELECT RAISE(ABORT, 'reference profile requires building state, approved evidence, and its exact predecessor');
 END;
 
-CREATE TABLE aircraft_reference_fact_set_attestations (
+CREATE TABLE IF NOT EXISTS aircraft_reference_fact_set_attestations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   aircraft_reference_configuration_version_id INTEGER NOT NULL
     REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE,
@@ -357,7 +568,7 @@ CREATE TABLE aircraft_reference_fact_set_attestations (
   UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
 );
 
-CREATE TABLE official_dollar_normalization_facts (
+CREATE TABLE IF NOT EXISTS official_dollar_normalization_facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   source_year INTEGER NOT NULL CHECK (source_year BETWEEN 1900 AND 2200),
   target_year INTEGER NOT NULL CHECK (target_year BETWEEN 1900 AND 2200),
@@ -376,6 +587,7 @@ CREATE TABLE official_dollar_normalization_facts (
   )
 );
 
+DROP TRIGGER IF EXISTS official_dollar_normalization_require_evidence;
 CREATE TRIGGER official_dollar_normalization_require_evidence
 BEFORE INSERT ON official_dollar_normalization_facts
 WHEN NOT EXISTS (
@@ -388,14 +600,16 @@ WHEN NOT EXISTS (
     AND source.source_tier = 'regulator_primary'
 )
 BEGIN SELECT RAISE(ABORT, 'dollar normalization requires validated official regulator evidence'); END;
+DROP TRIGGER IF EXISTS official_dollar_normalization_immutable_update;
 CREATE TRIGGER official_dollar_normalization_immutable_update
 BEFORE UPDATE ON official_dollar_normalization_facts
 BEGIN SELECT RAISE(ABORT, 'official dollar normalization facts are immutable'); END;
+DROP TRIGGER IF EXISTS official_dollar_normalization_immutable_delete;
 CREATE TRIGGER official_dollar_normalization_immutable_delete
 BEFORE DELETE ON official_dollar_normalization_facts
 BEGIN SELECT RAISE(ABORT, 'official dollar normalization facts are immutable'); END;
 
-DROP TRIGGER aircraft_reference_price_building_insert;
+DROP TRIGGER IF EXISTS aircraft_reference_price_building_insert;
 CREATE TRIGGER aircraft_reference_price_building_insert
 BEFORE INSERT ON aircraft_reference_prices
 WHEN NOT EXISTS (
@@ -405,6 +619,7 @@ WHEN NOT EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'reference price requires a building version'); END;
 
+DROP TRIGGER IF EXISTS aircraft_reference_fact_set_building_insert;
 CREATE TRIGGER aircraft_reference_fact_set_building_insert
 BEFORE INSERT ON aircraft_reference_fact_set_attestations
 WHEN NOT EXISTS (
@@ -413,9 +628,11 @@ WHEN NOT EXISTS (
     AND version.publication_state = 'building'
 )
 BEGIN SELECT RAISE(ABORT, 'reference fact-set attestation requires a building version'); END;
+DROP TRIGGER IF EXISTS aircraft_reference_fact_set_immutable_update;
 CREATE TRIGGER aircraft_reference_fact_set_immutable_update
 BEFORE UPDATE ON aircraft_reference_fact_set_attestations
 BEGIN SELECT RAISE(ABORT, 'reference profile facts are immutable'); END;
+DROP TRIGGER IF EXISTS aircraft_reference_fact_set_immutable_delete;
 CREATE TRIGGER aircraft_reference_fact_set_immutable_delete
 BEFORE DELETE ON aircraft_reference_fact_set_attestations
 WHEN EXISTS (
@@ -425,7 +642,7 @@ WHEN EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
 
-DROP TRIGGER aircraft_reference_versions_publish;
+DROP TRIGGER IF EXISTS aircraft_reference_versions_publish;
 CREATE TRIGGER aircraft_reference_versions_publish
 BEFORE UPDATE OF publication_state ON aircraft_reference_configuration_versions
 WHEN NEW.publication_state = 'published'
@@ -444,57 +661,68 @@ BEGIN
     SELECT COUNT(*) FROM aircraft_reference_fact_set_attestations attestation
     WHERE attestation.aircraft_reference_configuration_version_id = NEW.id
   );
-  SELECT RAISE(ABORT, 'published reference profile requires direct exact-model-year full-configuration primary price evidence')
-  WHERE NOT EXISTS (
-    SELECT 1
+  SELECT RAISE(ABORT, 'published reference profile requires exactly one direct exact-model-year full-configuration equipped MSRP with primary price evidence')
+  WHERE 1 <> (
+    SELECT COUNT(*)
     FROM aircraft_reference_prices price
     JOIN curation_evidence_claims claim ON claim.id = price.evidence_claim_id
     JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
     WHERE price.aircraft_reference_configuration_version_id = NEW.id
       AND price.currency = 'USD'
+      AND price.price_kind = 'equipped_msrp'
       AND price.evidence_kind = 'direct_model_year'
       AND price.configuration_basis = 'full_standard_configuration'
+      AND claim.claim_kind = 'price'
       AND claim.validation_status = 'validated'
       AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
   );
-  SELECT RAISE(ABORT, 'published reference profile requires valuation-ready factory avionics')
+  SELECT RAISE(ABORT, 'published reference profile requires approved engine catalog models')
   WHERE EXISTS (
     SELECT 1
-    FROM aircraft_reference_avionics fact
-    JOIN avionics_models model ON model.id = fact.avionics_model_id
-    WHERE fact.aircraft_reference_configuration_version_id = NEW.id
-      AND (model.catalog_status <> 'approved'
-        OR model.introduced_year IS NULL
-        OR model.estimated_unit_value_usd IS NULL
-        OR model.estimated_unit_value_usd < 0
-        OR model.value_basis <> 'installed_contribution'
-        OR model.replacement_cost_usd IS NULL
-        OR model.replacement_cost_usd < model.estimated_unit_value_usd
-        OR model.value_reference_year NOT BETWEEN 1900 AND 2200
-        OR TRIM(COALESCE(model.value_source, '')) = '')
+    FROM aircraft_reference_engines engine
+    LEFT JOIN aircraft_engine_catalog_models model
+      ON model.id = engine.aircraft_engine_catalog_model_id
+     AND model.catalog_status = 'approved'
+    WHERE engine.aircraft_reference_configuration_version_id = NEW.id
+      AND model.id IS NULL
+  );
+  SELECT RAISE(ABORT, 'published reference profile requires approved propeller catalog models')
+  WHERE EXISTS (
+    SELECT 1
+    FROM aircraft_reference_propellers propeller
+    LEFT JOIN aircraft_propeller_catalog_models model
+      ON model.id = propeller.aircraft_propeller_catalog_model_id
+     AND model.catalog_status = 'approved'
+    WHERE propeller.aircraft_reference_configuration_version_id = NEW.id
+      AND model.id IS NULL
   );
   SELECT RAISE(ABORT, 'published reference profile facts require validated primary evidence')
   WHERE EXISTS (
     SELECT 1 FROM (
-      SELECT evidence_claim_id FROM aircraft_reference_applicability_scopes
+      SELECT evidence_claim_id, 'applicability' AS evidence_domain FROM aircraft_reference_applicability_scopes
       WHERE aircraft_reference_configuration_version_id = NEW.id
-      UNION ALL SELECT evidence_claim_id FROM aircraft_reference_prices
+      UNION ALL SELECT evidence_claim_id, 'price' FROM aircraft_reference_prices
       WHERE aircraft_reference_configuration_version_id = NEW.id
-      UNION ALL SELECT evidence_claim_id FROM aircraft_reference_avionics
+      UNION ALL SELECT evidence_claim_id, 'factory' FROM aircraft_reference_avionics
       WHERE aircraft_reference_configuration_version_id = NEW.id
-      UNION ALL SELECT evidence_claim_id FROM aircraft_reference_engines
+      UNION ALL SELECT evidence_claim_id, 'factory' FROM aircraft_reference_engines
       WHERE aircraft_reference_configuration_version_id = NEW.id
-      UNION ALL SELECT evidence_claim_id FROM aircraft_reference_propellers
+      UNION ALL SELECT evidence_claim_id, 'factory' FROM aircraft_reference_propellers
       WHERE aircraft_reference_configuration_version_id = NEW.id
-      UNION ALL SELECT evidence_claim_id FROM aircraft_reference_features
+      UNION ALL SELECT evidence_claim_id, 'factory' FROM aircraft_reference_features
       WHERE aircraft_reference_configuration_version_id = NEW.id
-      UNION ALL SELECT evidence_claim_id FROM aircraft_reference_fact_set_attestations
+      UNION ALL SELECT evidence_claim_id, 'factory' FROM aircraft_reference_fact_set_attestations
       WHERE aircraft_reference_configuration_version_id = NEW.id
     ) fact
     JOIN curation_evidence_claims claim ON claim.id = fact.evidence_claim_id
     JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
     WHERE claim.validation_status <> 'validated'
        OR source.source_tier NOT IN ('manufacturer_primary', 'regulator_primary')
+       OR (fact.evidence_domain = 'applicability' AND claim.claim_kind <> 'applicability')
+       OR (fact.evidence_domain = 'price' AND claim.claim_kind <> 'price')
+       OR (fact.evidence_domain = 'factory' AND claim.claim_kind NOT IN (
+         'standard_equipment', 'package_composition', 'specification'
+       ))
   );
   SELECT RAISE(ABORT, 'reference profile contains overlapping applicability scopes')
   WHERE EXISTS (
@@ -516,8 +744,16 @@ BEGIN
   WHERE EXISTS (
     SELECT 1
     FROM aircraft_reference_applicability_scopes candidate
+    JOIN aircraft_markets candidate_market
+      ON candidate_market.id = candidate.aircraft_market_id
     JOIN aircraft_reference_applicability_scopes existing
       ON existing.aircraft_market_id = candidate.aircraft_market_id
+      OR candidate_market.code = 'GLOBAL'
+      OR EXISTS (
+        SELECT 1 FROM aircraft_markets existing_market
+        WHERE existing_market.id = existing.aircraft_market_id
+          AND existing_market.code = 'GLOBAL'
+      )
     JOIN aircraft_reference_configuration_versions existing_version
       ON existing_version.id = existing.aircraft_reference_configuration_version_id
     WHERE candidate.aircraft_reference_configuration_version_id = NEW.id
@@ -538,11 +774,8 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e', CURRENT_TIMESTAMP
+  'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4', CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

@@ -32,6 +32,7 @@ expect_migration_failure() {
 
 sqlite3 -bail "$test_database" \
   ".read $repository_root/schema/sqlite.sql" \
+  ".read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql" \
   ".read $repository_root/migrations/20260725_identity_deduplication_postconditions.sqlite.sql" \
   ".read $repository_root/migrations/20260725_identity_deduplication_postconditions.sqlite.sql"
 
@@ -40,6 +41,7 @@ sqlite3 -bail "$test_database" \
 # both products must have evidence-backed effective manufacturer memberships.
 sqlite3 -bail "$unauthorized_scope_database" <<SQL
 .read $repository_root/schema/sqlite.sql
+.read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql
 PRAGMA foreign_keys = ON;
 DROP INDEX idx_avionics_models_manufacturer_identifier;
 INSERT INTO avionics_manufacturers (name, normalized_name)
@@ -571,6 +573,7 @@ sqlite3 -bail "$test_database" \
 # migration quarantines it with a precise review reason instead of deleting it.
 sqlite3 -bail "$upgrade_database" \
   ".read $repository_root/schema/sqlite.sql" \
+  ".read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql" \
   "DROP TRIGGER IF EXISTS aircraft_sale_listings_ready_semantic_avionics" \
   "DROP TRIGGER IF EXISTS aircraft_sale_listings_ready_semantic_avionics_insert" \
   "DROP TRIGGER IF EXISTS listing_ready_requires_canonical_aircraft_update" \
@@ -614,6 +617,7 @@ test "$(sqlite3 "$upgrade_database" "SELECT count(*) FROM avionics_approved_prod
 # v6 triggers; it must not bless them by merely writing a new contract marker.
 sqlite3 -bail "$invalid_membership_database" <<SQL
 .read $repository_root/schema/sqlite.sql
+.read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql
 DROP TRIGGER avionics_manufacturer_membership_validate_insert;
 INSERT INTO avionics_manufacturers (name,normalized_name)
 VALUES ('Garmin','forged-garmin-key');
@@ -643,6 +647,7 @@ expect_migration_failure "$invalid_membership_database" \
 
 sqlite3 -bail "$invalid_product_database" <<SQL
 .read $repository_root/schema/sqlite.sql
+.read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql
 INSERT INTO avionics_manufacturers (name,normalized_name) VALUES ('Garmin','garmin');
 INSERT INTO avionics_manufacturer_identities (
   canonical_name,normalized_identity_key,identity_evidence_kind,

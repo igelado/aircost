@@ -251,7 +251,6 @@ struct ReferenceFactCounts {
     engines_complete: bool,
     propellers_complete: bool,
     features_complete: bool,
-    invalid_avionics_value_count: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -520,18 +519,23 @@ pub async fn listing_reference_status(
         r#"
         SELECT
           (SELECT COUNT(*) FROM aircraft_reference_prices price
+           JOIN curation_evidence_claims claim ON claim.id = price.evidence_claim_id
            WHERE price.aircraft_reference_configuration_version_id = version.id
+             AND price.price_kind = 'equipped_msrp'
              AND price.currency = 'USD'
              AND price.evidence_kind = 'direct_model_year'
-             AND price.configuration_basis = 'full_standard_configuration') AS full_price_count,
+             AND price.configuration_basis = 'full_standard_configuration'
+             AND claim.claim_kind = 'price') AS full_price_count,
           (SELECT price.amount FROM aircraft_reference_prices price
            WHERE price.aircraft_reference_configuration_version_id = version.id
+             AND price.price_kind = 'equipped_msrp'
              AND price.currency = 'USD'
              AND price.evidence_kind = 'direct_model_year'
              AND price.configuration_basis = 'full_standard_configuration'
            ORDER BY price.id LIMIT 1) AS price_usd,
           (SELECT price.price_reference_year FROM aircraft_reference_prices price
            WHERE price.aircraft_reference_configuration_version_id = version.id
+             AND price.price_kind = 'equipped_msrp'
              AND price.currency = 'USD'
              AND price.evidence_kind = 'direct_model_year'
              AND price.configuration_basis = 'full_standard_configuration'
@@ -555,19 +559,7 @@ pub async fn listing_reference_status(
              AND attestation.fact_set_kind = 'propellers') AS propellers_complete,
           EXISTS (SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
            WHERE attestation.aircraft_reference_configuration_version_id = version.id
-             AND attestation.fact_set_kind = 'features') AS features_complete,
-          (SELECT COUNT(*) FROM aircraft_reference_avionics fact
-           JOIN avionics_models model ON model.id = fact.avionics_model_id
-           WHERE fact.aircraft_reference_configuration_version_id = version.id
-             AND (model.catalog_status <> 'approved'
-               OR model.introduced_year IS NULL
-               OR model.estimated_unit_value_usd IS NULL
-               OR model.estimated_unit_value_usd < 0
-               OR model.value_basis <> 'installed_contribution'
-               OR model.replacement_cost_usd IS NULL
-               OR model.replacement_cost_usd < model.estimated_unit_value_usd
-               OR model.value_reference_year NOT BETWEEN 1900 AND 2200
-               OR TRIM(COALESCE(model.value_source, '')) = '')) AS invalid_avionics_value_count
+             AND attestation.fact_set_kind = 'features') AS features_complete
         FROM aircraft_reference_configuration_versions version
         WHERE version.id = ? AND version.publication_state = 'published'
         "#,
@@ -602,15 +594,6 @@ pub async fn listing_reference_status(
         gaps.push(ReferenceGap::new(
             "factory_feature_configuration_missing",
             "published profile has no curated material feature configuration",
-        ));
-    }
-    if facts.invalid_avionics_value_count > 0 {
-        gaps.push(ReferenceGap::new(
-            "factory_avionics_valuation_metadata_missing",
-            format!(
-                "{} factory avionics products lack approved installed-value metadata",
-                facts.invalid_avionics_value_count
-            ),
         ));
     }
     if !gaps.is_empty() {
@@ -1478,6 +1461,27 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let applicability_claim_id: i64 = sqlx::query_scalar(
+            "INSERT INTO curation_evidence_claims (evidence_source_id, claim_kind, subject_text, predicate_text, object_text, quoted_evidence, validation_status, validated_at) VALUES (?, 'applicability', 'test aircraft', 'applies in', 'GLOBAL', 'Primary source defines global applicability.', 'validated', '2026-08-19') RETURNING id",
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let price_claim_id: i64 = sqlx::query_scalar(
+            "INSERT INTO curation_evidence_claims (evidence_source_id, claim_kind, subject_text, predicate_text, object_text, quoted_evidence, validation_status, validated_at) VALUES (?, 'price', 'test aircraft', 'equipped MSRP', '500000 USD', 'Primary source states the equipped MSRP.', 'validated', '2026-08-19') RETURNING id",
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let factory_claim_id: i64 = sqlx::query_scalar(
+            "INSERT INTO curation_evidence_claims (evidence_source_id, claim_kind, subject_text, predicate_text, object_text, quoted_evidence, validation_status, validated_at) VALUES (?, 'standard_equipment', 'test aircraft', 'includes', 'factory equipment', 'Primary source defines the complete standard equipment.', 'validated', '2026-08-19') RETURNING id",
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         let official_index_source_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO curation_evidence_sources (
@@ -1720,12 +1724,12 @@ mod tests {
                 serial_prefix: None,
                 serial_from_display: None,
                 serial_to_display: None,
-                evidence_claim_id: claim_id,
+                evidence_claim_id: applicability_claim_id,
             }],
             price: ReferencePriceDraft {
                 direct_cited_amount_usd: 500_000.0,
                 direct_cited_nominal_dollar_year: 2020,
-                evidence_claim_id: claim_id,
+                evidence_claim_id: price_claim_id,
             },
             dollar_normalization: Some(ReferenceDollarNormalizationDraft {
                 source_nominal_dollar_year: 2020,
@@ -1740,25 +1744,25 @@ mod tests {
                 catalog_id: avionics_id,
                 quantity: 2,
                 included_in_tier: false,
-                evidence_claim_id: claim_id,
+                evidence_claim_id: factory_claim_id,
             }],
             engines: vec![ReferenceComponentDraft {
                 catalog_id: engine_id,
                 quantity: 1,
                 included_in_tier: false,
-                evidence_claim_id: claim_id,
+                evidence_claim_id: factory_claim_id,
             }],
             propellers: vec![ReferenceComponentDraft {
                 catalog_id: propeller_id,
                 quantity: 1,
                 included_in_tier: false,
-                evidence_claim_id: claim_id,
+                evidence_claim_id: factory_claim_id,
             }],
             features: vec![],
-            avionics_set_evidence_claim_id: claim_id,
-            engines_set_evidence_claim_id: claim_id,
-            propellers_set_evidence_claim_id: claim_id,
-            features_set_evidence_claim_id: claim_id,
+            avionics_set_evidence_claim_id: factory_claim_id,
+            engines_set_evidence_claim_id: factory_claim_id,
+            propellers_set_evidence_claim_id: factory_claim_id,
+            features_set_evidence_claim_id: factory_claim_id,
         };
 
         let mut typographic_overlap = draft.clone();
@@ -2002,6 +2006,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(retained_after_skip, "published");
+
+        let mut wrong_kind = replacement.clone();
+        wrong_kind.revision = 3;
+        wrong_kind.supersedes_version_id = Some(replacement_ids.version_id);
+        wrong_kind.profile_approval_decision_id = failed_decision_id;
+        wrong_kind.price.evidence_claim_id = claim_id;
+        assemble_and_publish_reference_version(&db, &wrong_kind)
+            .await
+            .expect_err("a primary identity claim must not be accepted as price evidence");
 
         let mut rejected = replacement.clone();
         rejected.revision = 3;

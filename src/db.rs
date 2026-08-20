@@ -290,8 +290,91 @@ END;
 const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
-    "6544308715783034b80b571df3740ad7829dc813d5c8e9d0dea80c783c09b27e";
+    "a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4";
+const REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL: &str =
+    include_str!("../migrations/20260819_reference_catalog_cutover.sqlite.sql");
+const REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL: &str =
+    include_str!("../migrations/20260819_reference_catalog_cutover.postgres.sql");
 
+const REFERENCE_CATALOG_CUTOVER_ROUTINES: &[&str] = &[
+    "aircraft_serial_natural_sort_key",
+    "validate_aircraft_serial_scheme_ordering",
+    "prevent_referenced_avionics_catalog_downgrade",
+    "invalidate_listing_avionics_authorization_for_capture",
+    "validate_aircraft_valuation_compatibility_projection",
+    "require_aircraft_catalog_approval",
+    "validate_aircraft_reference_version_insert",
+    "validate_faa_reference_reachability",
+    "preserve_assigned_aircraft_applicability",
+    "prevent_new_unresolved_aircraft_dimension",
+    "validate_official_dollar_normalization_fact",
+    "prevent_official_dollar_normalization_mutation",
+    "validate_aircraft_reference_child_insert",
+    "prevent_aircraft_reference_fact_mutation",
+    "validate_aircraft_reference_version_update",
+];
+
+const REFERENCE_CATALOG_CUTOVER_SQLITE_TRIGGERS: &[&str] = &[
+    "avionics_models_referenced_status_update",
+    "aircraft_valuation_projection_validate_insert",
+    "aircraft_reference_scope_canonical_insert",
+    "aircraft_reference_scope_key_recompute_insert",
+    "aircraft_reference_versions_require_approval",
+    "official_dollar_normalization_require_evidence",
+    "official_dollar_normalization_immutable_update",
+    "official_dollar_normalization_immutable_delete",
+    "aircraft_reference_price_building_insert",
+    "aircraft_reference_price_immutable_update",
+    "aircraft_reference_price_immutable_delete",
+    "aircraft_reference_fact_set_building_insert",
+    "aircraft_reference_fact_set_immutable_update",
+    "aircraft_reference_fact_set_immutable_delete",
+    "aircraft_reference_versions_publish",
+];
+const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_serial_schemes_require_approval
+BEFORE INSERT ON aircraft_serial_number_schemes
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+OR NOT EXISTS (
+  SELECT 1 FROM aircraft_identity_decisions decision
+  JOIN aircraft_identity_decision_claims dc ON dc.decision_id = decision.id
+  JOIN curation_evidence_claims claim ON claim.id = dc.evidence_claim_id
+  WHERE decision.id = NEW.approval_decision_id
+    AND decision.decision_status = 'approved'
+    AND decision.decision_action = 'approve_new' AND decision.entity_kind = 'serial_scheme'
+    AND claim.validation_status = 'validated'
+)
+BEGIN SELECT RAISE(ABORT, 'serial scheme requires the universal ordering and an approved evidence-backed decision'); END
+"#;
+const SQLITE_SERIAL_SCHEME_UPDATE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_serial_schemes_preserve_ordering
+BEFORE UPDATE OF normalization_version ON aircraft_serial_number_schemes
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+BEGIN SELECT RAISE(ABORT, 'serial scheme ordering version is immutable'); END
+"#;
+const SQLITE_REFERENCE_PRICES_FRESH_TABLE: &str = r#"
+CREATE TABLE aircraft_reference_prices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  aircraft_reference_configuration_version_id INTEGER NOT NULL
+    REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE,
+  price_kind TEXT NOT NULL CHECK (price_kind IN (
+    'base_msrp', 'equipped_msrp', 'tier_increment', 'other_factory_price'
+  )),
+  amount REAL NOT NULL CHECK (amount > 0),
+  currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+  price_reference_year INTEGER NOT NULL CHECK (price_reference_year BETWEEN 1900 AND 2200),
+  configuration_basis TEXT NOT NULL DEFAULT 'unknown' CHECK (configuration_basis IN (
+    'full_standard_configuration', 'base_aircraft_only', 'unknown'
+  )),
+  evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
+    'direct_model_year', 'direct_other_year', 'interpolated', 'inferred'
+  )),
+  evidence_claim_id INTEGER NOT NULL
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (aircraft_reference_configuration_version_id, price_kind, currency)
+)
+"#;
 #[derive(Clone)]
 pub struct AppDb {
     backend: DatabaseBackend,
@@ -359,6 +442,21 @@ struct PostgresFaaReferenceTriggerDefinition {
 }
 
 #[derive(sqlx::FromRow)]
+struct PostgresReferenceRoutineDefinition {
+    function_name: String,
+    function_oid_matches: bool,
+    function_source: String,
+    function_configuration: String,
+    function_language: String,
+    result_type: String,
+    identity_arguments: String,
+    security_definer: bool,
+    strict: bool,
+    volatility: String,
+    parallel_safety: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct PostgresFaaRegistryShape {
     relation_signature: Option<String>,
     column_signature: Option<String>,
@@ -407,6 +505,23 @@ const SQLITE_FAA_REGISTRY_OBJECTS: [(&str, &str); 24] = [
     ("trigger", "faa_registry_snapshots_require_exact_evidence"),
 ];
 
+#[derive(sqlx::FromRow)]
+struct PostgresReferenceColumnDefinition {
+    relation_name: String,
+    ordinal: i16,
+    column_name: String,
+    data_type: String,
+    not_null: bool,
+    identity_kind: String,
+    default_expression: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresReferenceConstraintDefinition {
+    relation_name: String,
+    constraint_type: String,
+    definition: String,
+}
 fn canonical_sql_definition(value: &str) -> String {
     let mut canonical = String::with_capacity(value.len());
     let mut characters = value.chars().peekable();
@@ -511,6 +626,73 @@ fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String>
         })
 }
 
+fn postgres_migration_function_source(function_name: &str) -> Option<&'static str> {
+    let inline_marker = format!("CREATE OR REPLACE FUNCTION public.{function_name}");
+    let wrapped_marker = format!("CREATE OR REPLACE FUNCTION\n  public.{function_name}");
+    let declaration = REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL
+        .split_once(&inline_marker)
+        .or_else(|| REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL.split_once(&wrapped_marker))?
+        .1;
+    let (body, delimiter) = if let Some((_, body)) = declaration.split_once("AS $function$") {
+        (body, "$function$")
+    } else if let Some((_, body)) = declaration.split_once("AS $$") {
+        (body, "$$")
+    } else {
+        return None;
+    };
+    body.split_once(delimiter).map(|(source, _)| source.trim())
+}
+
+fn sqlite_migration_definition(object_kind: &str, object_name: &str) -> Option<&'static str> {
+    let marker = format!("CREATE {object_kind} {object_name}");
+    let idempotent_marker = format!("CREATE {object_kind} IF NOT EXISTS {object_name}");
+    let start = REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL
+        .find(&marker)
+        .or_else(|| REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL.find(&idempotent_marker))?;
+    let definition = &REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL[start..];
+    let terminator = match object_kind {
+        "TABLE" => "\n);",
+        "TRIGGER" => "END;",
+        _ => return None,
+    };
+    let end = definition.find(terminator)? + terminator.len() - 1;
+    Some(&definition[..end])
+}
+
+fn postgres_schema_reference_trigger_definitions() -> Vec<String> {
+    let routine_markers = REFERENCE_CATALOG_CUTOVER_ROUTINES
+        .iter()
+        .filter(|name| **name != "aircraft_serial_natural_sort_key")
+        .map(|name| format!("executefunctionpublic.{name}()"))
+        .collect::<Vec<_>>();
+    let mut definitions = split_sql_statements(POSTGRES_SCHEMA_SQL)
+        .into_iter()
+        .map(|statement| canonical_sql_definition(statement))
+        .filter(|canonical_statement| {
+            routine_markers
+                .iter()
+                .any(|marker| canonical_statement.contains(marker))
+        })
+        .filter_map(|canonical_statement| {
+            canonical_statement
+                .find("createtrigger")
+                .map(|start| canonical_statement[start..].to_string())
+        })
+        .map(|definition| canonical_postgres_trigger_definition(&definition))
+        .collect::<Vec<_>>();
+    definitions.sort();
+    definitions
+}
+
+fn canonical_postgres_trigger_definition(value: &str) -> String {
+    canonical_sql_definition(value)
+        .replace("public.", "")
+        // pg_get_triggerdef emits multi-event trigger operations in canonical
+        // PostgreSQL order, which can differ from the order used in DDL.
+        .replace("beforeupdateordeleteon", "beforedeleteorupdateon")
+        .replace("afterupdateordeleteon", "afterdeleteorupdateon")
+}
+
 impl AppDb {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
@@ -525,9 +707,15 @@ impl AppDb {
             let db = Self {
                 backend: DatabaseBackend::Postgres(pool),
             };
-            db.ensure_required_migrations().await?;
-            db.initialize().await?;
-            db.ensure_required_migrations().await?;
+            db.ensure_required_migrations()
+                .await
+                .context("PostgreSQL pre-initialize migration gate failed")?;
+            db.initialize()
+                .await
+                .context("PostgreSQL schema initialization failed")?;
+            db.ensure_required_migrations()
+                .await
+                .context("PostgreSQL post-initialize migration gate failed")?;
             Ok(db)
         } else {
             ensure_sqlite_parent_directory(&database_url)?;
@@ -1235,6 +1423,7 @@ impl AppDb {
                               AND NOT actual.tgisinternal
                           )
                         )
+                      )
                     "#,
                 )
                 .fetch_one(pool)
@@ -1398,7 +1587,8 @@ impl AppDb {
                     "#,
                 )
                 .fetch_one(pool)
-                .await?
+                .await
+                .context("could not inspect PostgreSQL listing aircraft identity objects")?
             }
         };
         let missing_listing_aircraft_identity = missing_listing_aircraft_identity_objects
@@ -1557,6 +1747,7 @@ impl AppDb {
                               AND NOT actual.tgisinternal
                           )
                         )
+                      )
                     "#,
                 )
                 .fetch_one(pool)
@@ -3313,6 +3504,97 @@ impl AppDb {
         if missing_listing_replay_runs {
             bail!(listing_replay_runs_migration_required_message(self.kind()));
         }
+        let reference_catalog_cutover_started = match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let has_object = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE name IN (
+                        'aircraft_reference_configuration_versions',
+                        'aircraft_reference_fact_set_attestations',
+                        'official_dollar_normalization_facts',
+                        'aircraft_reference_fact_set_building_insert',
+                        'aircraft_reference_fact_set_immutable_update',
+                        'aircraft_reference_fact_set_immutable_delete'
+                      )
+                    ) OR EXISTS (
+                      SELECT 1 FROM pragma_table_info('aircraft_reference_prices')
+                      WHERE name = 'configuration_basis'
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0;
+                let has_ledger = sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migration_contracts')",
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0;
+                let has_marker = if has_ledger {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT EXISTS (SELECT 1 FROM schema_migration_contracts WHERE migration_name = ?)",
+                    )
+                    .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+                    .fetch_one(pool)
+                    .await?
+                        != 0
+                } else {
+                    false
+                };
+                has_object || has_marker
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let has_object = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT
+                      pg_catalog.to_regclass(
+                        'public.aircraft_reference_configuration_versions'
+                      ) IS NOT NULL
+                      OR pg_catalog.to_regclass(
+                        'public.aircraft_reference_fact_set_attestations'
+                      ) IS NOT NULL
+                      OR pg_catalog.to_regclass(
+                        'public.official_dollar_normalization_facts'
+                      ) IS NOT NULL
+                      OR EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_proc routine
+                        JOIN pg_catalog.pg_namespace namespace
+                          ON namespace.oid = routine.pronamespace
+                        WHERE namespace.nspname = 'public'
+                          AND routine.proname = ANY($1)
+                      )
+                    "#,
+                )
+                .bind(
+                    &REFERENCE_CATALOG_CUTOVER_ROUTINES
+                        .iter()
+                        .map(|name| (*name).to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .fetch_one(pool)
+                .await?;
+                let has_ledger = sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_catalog.to_regclass('public.schema_migration_contracts') IS NOT NULL",
+                )
+                .fetch_one(pool)
+                .await?;
+                let has_marker = if has_ledger {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS (SELECT 1 FROM public.schema_migration_contracts WHERE migration_name = $1)",
+                    )
+                    .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+                    .fetch_one(pool)
+                    .await?
+                } else {
+                    false
+                };
+                has_object || has_marker
+            }
+        };
         let invalid_reference_catalog_cutover_shape = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
@@ -3362,16 +3644,25 @@ impl AppDb {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
-                      to_regclass('aircraft_reference_configuration_versions') IS NOT NULL
+                      pg_catalog.to_regclass(
+                        'public.aircraft_reference_configuration_versions'
+                      ) IS NOT NULL
                       AND (
                         NOT EXISTS (
-                          SELECT 1 FROM information_schema.columns
-                          WHERE table_schema = current_schema()
-                            AND table_name = 'aircraft_reference_prices'
-                            AND column_name = 'configuration_basis'
+                          SELECT 1
+                          FROM pg_catalog.pg_attribute attribute
+                          WHERE attribute.attrelid = pg_catalog.to_regclass(
+                            'public.aircraft_reference_prices'
+                          )
+                            AND attribute.attname = 'configuration_basis'
+                            AND NOT attribute.attisdropped
                         )
-                        OR to_regclass('aircraft_reference_fact_set_attestations') IS NULL
-                        OR to_regclass('official_dollar_normalization_facts') IS NULL
+                        OR pg_catalog.to_regclass(
+                          'public.aircraft_reference_fact_set_attestations'
+                        ) IS NULL
+                        OR pg_catalog.to_regclass(
+                          'public.official_dollar_normalization_facts'
+                        ) IS NULL
                         OR EXISTS (
                           SELECT 1
                           FROM unnest(ARRAY[
@@ -3383,7 +3674,9 @@ impl AppDb {
                             'depreciation_profile_fit_metadata',
                             'component_depreciation_profiles'
                           ]) AS legacy(table_name)
-                          WHERE to_regclass(legacy.table_name) IS NOT NULL
+                          WHERE pg_catalog.to_regclass(
+                            'public.' || legacy.table_name
+                          ) IS NOT NULL
                         )
                       )
                     "#,
@@ -3392,10 +3685,18 @@ impl AppDb {
                 .await?
             }
         };
+        let invalid_reference_catalog_cutover_definitions = reference_catalog_cutover_started
+            && !self.reference_catalog_cutover_definitions_valid().await?;
         if invalid_reference_catalog_cutover_shape
+            || invalid_reference_catalog_cutover_definitions
             || self
                 .migration_contract_missing(
-                    "aircraft_reference_configuration_versions",
+                    match self.kind() {
+                        DatabaseKind::Sqlite => "aircraft_reference_configuration_versions",
+                        DatabaseKind::Postgres => {
+                            "public.aircraft_reference_configuration_versions"
+                        }
+                    },
                     REFERENCE_CATALOG_CUTOVER_MIGRATION,
                     REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION,
                     REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT,
@@ -4585,6 +4886,658 @@ impl AppDb {
         }
     }
 
+    async fn reference_catalog_cutover_definitions_valid(&self) -> Result<bool> {
+        match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let mut expected = Vec::new();
+                for table_name in [
+                    "aircraft_reference_fact_set_attestations",
+                    "official_dollar_normalization_facts",
+                ] {
+                    let Some(definition) = sqlite_migration_definition("TABLE", table_name) else {
+                        #[cfg(test)]
+                        eprintln!("missing cutover table definition for {table_name}");
+                        return Ok(false);
+                    };
+                    expected.push(("table", table_name, definition));
+                }
+                for trigger_name in REFERENCE_CATALOG_CUTOVER_SQLITE_TRIGGERS {
+                    let Some(definition) = sqlite_migration_definition("TRIGGER", trigger_name)
+                    else {
+                        #[cfg(test)]
+                        eprintln!("missing cutover trigger definition for {trigger_name}");
+                        return Ok(false);
+                    };
+                    expected.push(("trigger", *trigger_name, definition));
+                }
+                expected.push((
+                    "trigger",
+                    "aircraft_serial_schemes_require_approval",
+                    SQLITE_SERIAL_SCHEME_INSERT_TRIGGER,
+                ));
+                expected.push((
+                    "trigger",
+                    "aircraft_serial_schemes_preserve_ordering",
+                    SQLITE_SERIAL_SCHEME_UPDATE_TRIGGER,
+                ));
+                let definitions = sqlx::query_as::<_, (String, String, Option<String>)>(
+                    r#"
+                    SELECT type, name, sql
+                    FROM sqlite_schema
+                    WHERE (type = 'table' AND name IN (
+                      'aircraft_reference_fact_set_attestations',
+                      'official_dollar_normalization_facts'
+                    )) OR (type = 'trigger' AND name IN (
+                      'avionics_models_referenced_status_update',
+                      'aircraft_valuation_projection_validate_insert',
+                      'aircraft_reference_scope_canonical_insert',
+                      'aircraft_reference_scope_key_recompute_insert',
+                      'aircraft_reference_versions_require_approval',
+                      'official_dollar_normalization_require_evidence',
+                      'official_dollar_normalization_immutable_update',
+                      'official_dollar_normalization_immutable_delete',
+                      'aircraft_reference_price_building_insert',
+                      'aircraft_reference_price_immutable_update',
+                      'aircraft_reference_price_immutable_delete',
+                      'aircraft_reference_fact_set_building_insert',
+                      'aircraft_reference_fact_set_immutable_update',
+                      'aircraft_reference_fact_set_immutable_delete',
+                      'aircraft_reference_versions_publish',
+                      'aircraft_serial_schemes_require_approval',
+                      'aircraft_serial_schemes_preserve_ordering'
+                    ))
+                    ORDER BY type, name
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?;
+                expected.sort_by_key(|(kind, name, _)| (*kind, *name));
+                #[cfg(test)]
+                if definitions.len() != expected.len() {
+                    eprintln!(
+                        "reference cutover definition count actual={} expected={} actual_names={:?} expected_names={:?}",
+                        definitions.len(),
+                        expected.len(),
+                        definitions.iter().map(|row| (&row.0, &row.1)).collect::<Vec<_>>(),
+                        expected.iter().map(|row| (row.0, row.1)).collect::<Vec<_>>()
+                    );
+                }
+                let valid = definitions.len() == expected.len()
+                    && definitions.iter().zip(expected).all(
+                        |(
+                            (actual_kind, actual_name, actual_definition),
+                            (expected_kind, expected_name, expected_definition),
+                        )| {
+                            let matches = actual_kind == expected_kind
+                                && actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    let expected = canonical_sql_definition(expected_definition)
+                                        .replace(
+                                            "createtableifnotexists",
+                                            "createtable",
+                                        )
+                                        .replace(
+                                            "createtriggerifnotexists",
+                                            "createtrigger",
+                                        );
+                                    canonical_sql_definition(actual)
+                                        == expected
+                                });
+                            #[cfg(test)]
+                            if !matches {
+                                eprintln!(
+                                    "reference cutover mismatch {actual_kind}:{actual_name}\nactual={actual_definition:?}\nexpected={expected_definition}"
+                                );
+                            }
+                            matches
+                        },
+                    );
+                if !valid {
+                    return Ok(false);
+                }
+                let price_table_definition = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'aircraft_reference_prices'",
+                )
+                .fetch_one(pool)
+                .await?;
+                let Some(price_table_definition) = price_table_definition else {
+                    return Ok(false);
+                };
+                let canonical_price_table = canonical_sql_definition(&price_table_definition);
+                let valid_price_table = canonical_price_table
+                    == canonical_sql_definition(SQLITE_REFERENCE_PRICES_FRESH_TABLE);
+                let valid_price_column = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT COUNT(*) = 1
+                    FROM pragma_table_info('aircraft_reference_prices')
+                    WHERE name = 'configuration_basis'
+                      AND upper(type) = 'TEXT'
+                      AND "notnull" = 1
+                      AND dflt_value = '''unknown'''
+                      AND pk = 0
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0;
+                Ok(valid_price_table && valid_price_column)
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let routine_names = REFERENCE_CATALOG_CUTOVER_ROUTINES
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>();
+                let routines = sqlx::query_as::<_, PostgresReferenceRoutineDefinition>(
+                    r#"
+                    SELECT
+                      routine.proname AS function_name,
+                      routine.oid IS NOT DISTINCT FROM CASE routine.proname
+                        WHEN 'aircraft_serial_natural_sort_key' THEN
+                          pg_catalog.to_regprocedure(
+                            'public.aircraft_serial_natural_sort_key(pg_catalog.text)'
+                          )
+                        ELSE pg_catalog.to_regprocedure(
+                          'public.' || routine.proname || '()'
+                        )
+                      END AS function_oid_matches,
+                      routine.prosrc AS function_source,
+                      COALESCE(
+                        pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+                      ) AS function_configuration,
+                      language.lanname AS function_language,
+                      pg_catalog.format_type(routine.prorettype, NULL) AS result_type,
+                      pg_catalog.pg_get_function_identity_arguments(routine.oid)
+                        AS identity_arguments,
+                      routine.prosecdef AS security_definer,
+                      routine.proisstrict AS strict,
+                      routine.provolatile::text AS volatility,
+                      routine.proparallel::text AS parallel_safety
+                    FROM pg_catalog.pg_proc routine
+                    JOIN pg_catalog.pg_namespace namespace
+                      ON namespace.oid = routine.pronamespace
+                    JOIN pg_catalog.pg_language language
+                      ON language.oid = routine.prolang
+                    WHERE namespace.nspname = 'public'
+                      AND routine.proname = ANY($1)
+                    ORDER BY routine.proname, routine.oid
+                    "#,
+                )
+                .bind(&routine_names)
+                .fetch_all(pool)
+                .await
+                .context("could not inspect PostgreSQL reference-cutover routines")?;
+                if routines.len() != REFERENCE_CATALOG_CUTOVER_ROUTINES.len() {
+                    #[cfg(test)]
+                    eprintln!(
+                        "PostgreSQL reference routine count actual={} expected={} names={:?}",
+                        routines.len(),
+                        REFERENCE_CATALOG_CUTOVER_ROUTINES.len(),
+                        routines
+                            .iter()
+                            .map(|routine| routine.function_name.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    return Ok(false);
+                }
+                for routine in &routines {
+                    let Some(expected_source) =
+                        postgres_migration_function_source(&routine.function_name)
+                    else {
+                        #[cfg(test)]
+                        eprintln!(
+                            "missing PostgreSQL migration source for {}",
+                            routine.function_name
+                        );
+                        return Ok(false);
+                    };
+                    let natural_sort = routine.function_name == "aircraft_serial_natural_sort_key";
+                    if !routine.function_oid_matches
+                        || canonical_sql_definition(&routine.function_source)
+                            != canonical_sql_definition(expected_source)
+                        || routine.function_configuration != "search_path=pg_catalog"
+                        || routine.function_language != "plpgsql"
+                        || routine.result_type != if natural_sort { "text" } else { "trigger" }
+                        || routine.identity_arguments
+                            != if natural_sort {
+                                "serial_value text"
+                            } else {
+                                ""
+                            }
+                        || routine.security_definer
+                        || routine.strict != natural_sort
+                        || routine.volatility != if natural_sort { "i" } else { "v" }
+                        || routine.parallel_safety != if natural_sort { "s" } else { "u" }
+                    {
+                        #[cfg(test)]
+                        eprintln!(
+                            "PostgreSQL reference routine mismatch {}: oid={} source={} config={:?} language={:?} result={:?} args={:?} security_definer={} strict={} volatility={:?} parallel={:?}",
+                            routine.function_name,
+                            routine.function_oid_matches,
+                            canonical_sql_definition(&routine.function_source)
+                                == canonical_sql_definition(expected_source),
+                            routine.function_configuration,
+                            routine.function_language,
+                            routine.result_type,
+                            routine.identity_arguments,
+                            routine.security_definer,
+                            routine.strict,
+                            routine.volatility,
+                            routine.parallel_safety,
+                        );
+                        return Ok(false);
+                    }
+                }
+
+                let triggers = sqlx::query_as::<_, (String, String)>(
+                    r#"
+                    SELECT
+                      pg_catalog.pg_get_triggerdef(trigger_row.oid, true),
+                      trigger_row.tgenabled::text
+                    FROM pg_catalog.pg_trigger trigger_row
+                    JOIN pg_catalog.pg_class relation
+                      ON relation.oid = trigger_row.tgrelid
+                    JOIN pg_catalog.pg_namespace relation_namespace
+                      ON relation_namespace.oid = relation.relnamespace
+                    JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
+                    JOIN pg_catalog.pg_namespace function_namespace
+                      ON function_namespace.oid = routine.pronamespace
+                    WHERE NOT trigger_row.tgisinternal
+                      AND relation_namespace.nspname = 'public'
+                      AND function_namespace.nspname = 'public'
+                      AND routine.proname = ANY($1)
+                    "#,
+                )
+                .bind(&routine_names)
+                .fetch_all(pool)
+                .await
+                .context("could not inspect PostgreSQL reference-cutover trigger bindings")?;
+                let mut actual_triggers = triggers
+                    .iter()
+                    .map(|(definition, _)| canonical_postgres_trigger_definition(definition))
+                    .collect::<Vec<_>>();
+                actual_triggers.sort();
+                if triggers.iter().any(|(_, enabled)| enabled != "O")
+                    || actual_triggers != postgres_schema_reference_trigger_definitions()
+                {
+                    #[cfg(test)]
+                    {
+                        let expected_triggers = postgres_schema_reference_trigger_definitions();
+                        eprintln!(
+                            "PostgreSQL reference trigger mismatch: disabled={:?}\nactual-only={:#?}\nexpected-only={:#?}",
+                            triggers
+                                .iter()
+                                .filter(|(_, enabled)| enabled != "O")
+                                .collect::<Vec<_>>(),
+                            actual_triggers
+                                .iter()
+                                .filter(|definition| !expected_triggers.contains(definition))
+                                .collect::<Vec<_>>(),
+                            expected_triggers
+                                .iter()
+                                .filter(|definition| !actual_triggers.contains(definition))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    return Ok(false);
+                }
+
+                self.postgres_reference_catalog_relations_valid(pool).await
+            }
+        }
+    }
+
+    async fn postgres_reference_catalog_relations_valid(&self, pool: &PgPool) -> Result<bool> {
+        let relation_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM pg_catalog.pg_class relation
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.relkind = 'r'
+              AND relation.oid IN (
+                pg_catalog.to_regclass(
+                  'public.aircraft_reference_fact_set_attestations'
+                ),
+                pg_catalog.to_regclass(
+                  'public.official_dollar_normalization_facts'
+                )
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .context("could not inspect PostgreSQL reference-cutover relations")?;
+        if relation_count != 2 {
+            #[cfg(test)]
+            eprintln!("PostgreSQL reference relation count={relation_count}, expected=2");
+            return Ok(false);
+        }
+
+        let columns = sqlx::query_as::<_, PostgresReferenceColumnDefinition>(
+            r#"
+            SELECT
+              relation.relname AS relation_name,
+              attribute.attnum::smallint AS ordinal,
+              attribute.attname AS column_name,
+              pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                AS data_type,
+              attribute.attnotnull AS not_null,
+              attribute.attidentity::text AS identity_kind,
+              COALESCE(
+                pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid),
+                ''
+              ) AS default_expression
+            FROM pg_catalog.pg_class relation
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_attribute attribute
+              ON attribute.attrelid = relation.oid
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+            LEFT JOIN pg_catalog.pg_attrdef default_row
+              ON default_row.adrelid = relation.oid
+             AND default_row.adnum = attribute.attnum
+            WHERE namespace.nspname = 'public'
+              AND relation.oid IN (
+                pg_catalog.to_regclass(
+                  'public.aircraft_reference_fact_set_attestations'
+                ),
+                pg_catalog.to_regclass(
+                  'public.official_dollar_normalization_facts'
+                )
+              )
+            ORDER BY relation.relname, attribute.attnum
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("could not inspect PostgreSQL reference-cutover columns")?;
+        let expected_columns = [
+            (
+                "aircraft_reference_fact_set_attestations",
+                1_i16,
+                "id",
+                "bigint",
+                true,
+                "d",
+                "",
+            ),
+            (
+                "aircraft_reference_fact_set_attestations",
+                2,
+                "aircraft_reference_configuration_version_id",
+                "bigint",
+                true,
+                "",
+                "",
+            ),
+            (
+                "aircraft_reference_fact_set_attestations",
+                3,
+                "fact_set_kind",
+                "text",
+                true,
+                "",
+                "",
+            ),
+            (
+                "aircraft_reference_fact_set_attestations",
+                4,
+                "evidence_claim_id",
+                "bigint",
+                true,
+                "",
+                "",
+            ),
+            (
+                "aircraft_reference_fact_set_attestations",
+                5,
+                "created_at",
+                "timestamp with time zone",
+                true,
+                "",
+                "CURRENT_TIMESTAMP",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                1,
+                "id",
+                "bigint",
+                true,
+                "d",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                2,
+                "source_year",
+                "bigint",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                3,
+                "target_year",
+                "bigint",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                4,
+                "index_series",
+                "text",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                5,
+                "source_index_value",
+                "double precision",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                6,
+                "target_index_value",
+                "double precision",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                7,
+                "normalization_factor",
+                "double precision",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                8,
+                "evidence_claim_id",
+                "bigint",
+                true,
+                "",
+                "",
+            ),
+            (
+                "official_dollar_normalization_facts",
+                9,
+                "created_at",
+                "timestamp with time zone",
+                true,
+                "",
+                "CURRENT_TIMESTAMP",
+            ),
+        ];
+        if columns.len() != expected_columns.len()
+            || !columns
+                .iter()
+                .zip(expected_columns)
+                .all(|(actual, expected)| {
+                    actual.relation_name == expected.0
+                        && actual.ordinal == expected.1
+                        && actual.column_name == expected.2
+                        && actual.data_type == expected.3
+                        && actual.not_null == expected.4
+                        && actual.identity_kind == expected.5
+                        && actual.default_expression == expected.6
+                })
+        {
+            #[cfg(test)]
+            eprintln!(
+                "PostgreSQL reference column mismatch\nactual={:#?}",
+                columns
+                    .iter()
+                    .map(|column| (
+                        &column.relation_name,
+                        column.ordinal,
+                        &column.column_name,
+                        &column.data_type,
+                        column.not_null,
+                        &column.identity_kind,
+                        &column.default_expression,
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            return Ok(false);
+        }
+
+        let constraints = sqlx::query_as::<_, PostgresReferenceConstraintDefinition>(
+            r#"
+            SELECT
+              relation.relname AS relation_name,
+              constraint_row.contype::text AS constraint_type,
+              pg_catalog.pg_get_constraintdef(constraint_row.oid, true) AS definition
+            FROM pg_catalog.pg_constraint constraint_row
+            JOIN pg_catalog.pg_class relation
+              ON relation.oid = constraint_row.conrelid
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+              AND relation.oid IN (
+                pg_catalog.to_regclass(
+                  'public.aircraft_reference_fact_set_attestations'
+                ),
+                pg_catalog.to_regclass(
+                  'public.official_dollar_normalization_facts'
+                )
+              )
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("could not inspect PostgreSQL reference-cutover constraints")?;
+        let expected_constraints = [
+            ("aircraft_reference_fact_set_attestations", "c", "CHECK (fact_set_kind = ANY (ARRAY['avionics'::text, 'engines'::text, 'propellers'::text, 'features'::text]))"),
+            ("aircraft_reference_fact_set_attestations", "f", "FOREIGN KEY (aircraft_reference_configuration_version_id) REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE"),
+            ("aircraft_reference_fact_set_attestations", "f", "FOREIGN KEY (evidence_claim_id) REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT"),
+            ("aircraft_reference_fact_set_attestations", "p", "PRIMARY KEY (id)"),
+            ("aircraft_reference_fact_set_attestations", "u", "UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (source_year <> target_year)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (abs(normalization_factor - target_index_value / source_index_value) <= 0.000000001::double precision)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (length(btrim(index_series)) > 0)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (normalization_factor > 0::double precision)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (source_index_value > 0::double precision)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (source_year >= 1900 AND source_year <= 2200)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (target_index_value > 0::double precision)"),
+            ("official_dollar_normalization_facts", "c", "CHECK (target_year >= 1900 AND target_year <= 2200)"),
+            ("official_dollar_normalization_facts", "f", "FOREIGN KEY (evidence_claim_id) REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT"),
+            ("official_dollar_normalization_facts", "p", "PRIMARY KEY (id)"),
+            ("official_dollar_normalization_facts", "u", "UNIQUE (evidence_claim_id)"),
+            ("official_dollar_normalization_facts", "u", "UNIQUE (source_year, target_year)"),
+        ];
+        let mut actual_constraints = constraints
+            .iter()
+            .map(|constraint| {
+                (
+                    constraint.relation_name.as_str(),
+                    constraint.constraint_type.as_str(),
+                    canonical_sql_definition(&constraint.definition.replace("public.", "")),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual_constraints.sort();
+        let mut expected_constraints = expected_constraints
+            .iter()
+            .map(|constraint| {
+                (
+                    constraint.0,
+                    constraint.1,
+                    canonical_sql_definition(constraint.2),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected_constraints.sort();
+        if actual_constraints != expected_constraints {
+            #[cfg(test)]
+            eprintln!(
+                "PostgreSQL reference constraint mismatch\nactual-only={:#?}\nexpected-only={:#?}",
+                actual_constraints
+                    .iter()
+                    .filter(|constraint| !expected_constraints.contains(constraint))
+                    .collect::<Vec<_>>(),
+                expected_constraints
+                    .iter()
+                    .filter(|constraint| !actual_constraints.contains(constraint))
+                    .collect::<Vec<_>>()
+            );
+            return Ok(false);
+        }
+
+        let valid_price_basis = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT
+              EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_attribute attribute
+                LEFT JOIN pg_catalog.pg_attrdef default_row
+                  ON default_row.adrelid = attribute.attrelid
+                 AND default_row.adnum = attribute.attnum
+                WHERE attribute.attrelid = pg_catalog.to_regclass(
+                  'public.aircraft_reference_prices'
+                )
+                  AND attribute.attname = 'configuration_basis'
+                  AND attribute.atttypid = pg_catalog.to_regtype('pg_catalog.text')
+                  AND attribute.attnotnull
+                  AND NOT attribute.attisdropped
+                  AND pg_catalog.pg_get_expr(
+                    default_row.adbin, default_row.adrelid
+                  ) = '''unknown''::text'
+              )
+              AND 1 = (
+                SELECT COUNT(*)
+                FROM pg_catalog.pg_constraint constraint_row
+                WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                  'public.aircraft_reference_prices'
+                )
+                  AND constraint_row.contype = 'c'
+                  AND pg_catalog.pg_get_constraintdef(
+                    constraint_row.oid, true
+                  ) = 'CHECK (configuration_basis = ANY (ARRAY[''full_standard_configuration''::text, ''base_aircraft_only''::text, ''unknown''::text]))'
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .context("could not inspect PostgreSQL reference-price basis contract")?;
+        #[cfg(test)]
+        if !valid_price_basis {
+            eprintln!("PostgreSQL reference-price basis contract mismatch");
+        }
+        Ok(valid_price_basis)
+    }
     async fn aircraft_listing_identity_correction_definitions_valid(&self) -> Result<bool> {
         match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
@@ -5604,6 +6557,12 @@ impl AppDb {
     }
 
     async fn initialize(&self) -> Result<()> {
+        // Initialization is intentionally unable to heal a marker-present,
+        // partially damaged contract through CREATE IF NOT EXISTS. Attest the
+        // complete installed schema before executing any canonical DDL.
+        self.ensure_required_migrations()
+            .await
+            .context("schema initialization preflight failed")?;
         match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 let mut connection = pool.acquire().await?;
@@ -6301,12 +7260,9 @@ mod tests {
         AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION,
         AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
         AVIONICS_PRODUCT_REUSE_V2_CONTRACT_FINGERPRINT, AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION,
-        AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
-        DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_FINGERPRINT,
-        DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_CONTRACT_VERSION,
-        DEFAULT_AVIONICS_CANDIDATE_QUARANTINE_MIGRATION,
-        FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT, FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION,
-        FAA_RECORD_HASH_DOMAIN_MIGRATION, FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+        AVIONICS_PRODUCT_REUSE_V2_MIGRATION, FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT,
+        FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION, FAA_RECORD_HASH_DOMAIN_MIGRATION,
+        FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
         FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION, FAA_REFERENCE_REACHABILITY_MIGRATION,
         IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
@@ -6320,7 +7276,9 @@ mod tests {
         POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
         POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
         POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE, POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
-        POSTGRES_SCHEMA_SQL, SQLITE_SCHEMA_SQL, VALUATION_DATA_HARDENING_MIGRATION,
+        POSTGRES_SCHEMA_SQL, REFERENCE_CATALOG_CUTOVER_MIGRATION,
+        REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL, SQLITE_SCHEMA_SQL,
+        VALUATION_DATA_HARDENING_MIGRATION,
     };
 
     const LISTING_PENDING_REVIEWS_SQLITE_MIGRATION_SQL: &str =
@@ -7443,6 +8401,62 @@ mod tests {
         std::fs::remove_file(database_path).unwrap();
     }
 
+    async fn assert_corrupt_reference_cutover_schema_rejected(label: &str, statements: &[&str]) {
+        let (database_path, database_url) = unique_sqlite_test_database(label);
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let mut connection = pool.acquire().await.unwrap();
+        for statement in statements {
+            connection.execute(*statement).await.unwrap();
+        }
+        drop(connection);
+        drop(db);
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("startup must reject corrupt reference-cutover schema"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+        assert!(error.contains("20260819_reference_catalog_cutover.sqlite.sql"));
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_missing_or_mutated_reference_cutover_objects() {
+        for (label, statements) in [
+            (
+                "reference-cutover-missing-table",
+                vec!["DROP TABLE official_dollar_normalization_facts"],
+            ),
+            (
+                "reference-cutover-renamed-anchor",
+                vec!["ALTER TABLE official_dollar_normalization_facts RENAME TO official_dollar_normalization_facts_renamed"],
+            ),
+            (
+                "reference-cutover-missing-trigger",
+                vec!["DROP TRIGGER aircraft_reference_versions_publish"],
+            ),
+            (
+                "reference-cutover-mutated-trigger",
+                vec![
+                    "DROP TRIGGER aircraft_reference_versions_publish",
+                    "CREATE TRIGGER aircraft_reference_versions_publish BEFORE UPDATE OF publication_state ON aircraft_reference_configuration_versions BEGIN SELECT 1; END",
+                ],
+            ),
+            (
+                "reference-cutover-invalid-price-column",
+                vec![
+                    "ALTER TABLE aircraft_reference_prices RENAME TO aircraft_reference_prices_valid",
+                    "CREATE TABLE aircraft_reference_prices (id INTEGER PRIMARY KEY, configuration_basis INTEGER NOT NULL DEFAULT 0 CHECK (configuration_basis >= 0))",
+                ],
+            ),
+        ] {
+            assert_corrupt_reference_cutover_schema_rejected(label, &statements).await;
+        }
+    }
+
     #[tokio::test]
     async fn startup_rejects_same_name_nonunique_or_reordered_correction_indexes() {
         assert_corrupt_identity_correction_schema_rejected(
@@ -7562,8 +8576,215 @@ mod tests {
     async fn postgres_canonical_schema_passes_end_to_end_startup() {
         let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
             .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let installed_at_before: String = sqlx::query_scalar(
+            "SELECT installed_at FROM public.schema_migration_contracts WHERE migration_name = $1",
+        )
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let prices_before: String = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(price_row) ORDER BY id), '[]'::jsonb)::text FROM public.aircraft_reference_prices price_row",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let price_sequence_before: String = sqlx::query_scalar(
+            "SELECT last_value::text || ':' || is_called::text FROM public.aircraft_reference_prices_id_seq",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut migration_connection = pool.acquire().await.unwrap();
+        for statement in split_sql_statements(REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL) {
+            migration_connection.execute(statement).await.unwrap();
+        }
+        drop(migration_connection);
+        let prices_after: String = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(price_row) ORDER BY id), '[]'::jsonb)::text FROM public.aircraft_reference_prices price_row",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let price_sequence_after: String = sqlx::query_scalar(
+            "SELECT last_value::text || ':' || is_called::text FROM public.aircraft_reference_prices_id_seq",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(prices_after, prices_before);
+        assert_eq!(price_sequence_after, price_sequence_before);
+        let preflight = AppDb {
+            backend: DatabaseBackend::Postgres(pool),
+        };
+        assert!(preflight
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
         let db = AppDb::connect(&database_url).await.unwrap();
         db.ensure_required_migrations().await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let installed_at_after: String = sqlx::query_scalar(
+            "SELECT installed_at FROM public.schema_migration_contracts WHERE migration_name = $1",
+        )
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(installed_at_after, installed_at_before);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_reference_cutover_validation_rejects_adversarial_mutations() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let db = AppDb {
+            backend: DatabaseBackend::Postgres(pool.clone()),
+        };
+        assert!(db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+
+        pool.execute(
+            "CREATE INDEX unexpected_reference_price_index ON public.aircraft_reference_prices(amount)",
+        )
+        .await
+        .unwrap();
+        let mut migration_connection = pool.acquire().await.unwrap();
+        let mut migration_error = None;
+        for statement in split_sql_statements(REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL) {
+            if let Err(error) = migration_connection.execute(statement).await {
+                migration_error = Some(error.to_string());
+                break;
+            }
+        }
+        migration_connection.execute("ROLLBACK").await.unwrap();
+        drop(migration_connection);
+        let migration_error =
+            migration_error.expect("an unexpected attached object must reject migration rerun");
+        assert!(migration_error.contains("marker-present definition mismatch"));
+        let unexpected_index: Option<String> = sqlx::query_scalar(
+            "SELECT pg_catalog.to_regclass('public.unexpected_reference_price_index')::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unexpected_index.as_deref(),
+            Some("unexpected_reference_price_index")
+        );
+        pool.execute("DROP INDEX public.unexpected_reference_price_index")
+            .await
+            .unwrap();
+
+        pool.execute("DROP SCHEMA IF EXISTS reference_cutover_attacker CASCADE")
+            .await
+            .unwrap();
+        pool.execute("CREATE SCHEMA reference_cutover_attacker")
+            .await
+            .unwrap();
+        pool.execute(
+            "CREATE FUNCTION reference_cutover_attacker.validate_aircraft_reference_version_update() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'",
+        )
+        .await
+        .unwrap();
+        pool.execute("SET search_path = reference_cutover_attacker, public, pg_catalog")
+            .await
+            .unwrap();
+        assert!(db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+        pool.execute("RESET search_path").await.unwrap();
+
+        pool.execute(
+            "ALTER FUNCTION public.validate_aircraft_reference_version_update() SET search_path = public",
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+        pool.execute(
+            "ALTER FUNCTION public.validate_aircraft_reference_version_update() SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.aircraft_reference_configuration_versions DISABLE TRIGGER aircraft_reference_versions_validate_update",
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+        pool.execute(
+            "ALTER TABLE public.aircraft_reference_configuration_versions ENABLE TRIGGER aircraft_reference_versions_validate_update",
+        )
+        .await
+        .unwrap();
+
+        pool.execute(
+            "DROP TRIGGER aircraft_reference_price_building_insert ON public.aircraft_reference_prices",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER aircraft_reference_price_building_insert BEFORE INSERT ON public.aircraft_reference_prices FOR EACH ROW EXECUTE FUNCTION public.validate_aircraft_reference_version_update()",
+        )
+        .await
+        .unwrap();
+        assert!(!db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+        pool.execute(
+            "DROP TRIGGER aircraft_reference_price_building_insert ON public.aircraft_reference_prices",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER aircraft_reference_price_building_insert BEFORE INSERT ON public.aircraft_reference_prices FOR EACH ROW EXECUTE FUNCTION public.validate_aircraft_reference_child_insert()",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("DROP TABLE public.official_dollar_normalization_facts CASCADE")
+            .await
+            .unwrap();
+        assert!(!db
+            .reference_catalog_cutover_definitions_valid()
+            .await
+            .unwrap());
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("startup must not heal marker-present PostgreSQL cutover damage"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+        let missing_table: Option<String> = sqlx::query_scalar(
+            "SELECT pg_catalog.to_regclass('public.official_dollar_normalization_facts')::text",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(missing_table.is_none());
     }
 
     async fn install_faa_registry_functions(pool: &sqlx::PgPool) {
@@ -9850,6 +11071,89 @@ mod tests {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         db.initialize().await.unwrap();
         db.ensure_required_migrations().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_reference_cutover_install_timestamp() {
+        let (database_path, database_url) =
+            unique_sqlite_test_database("reference-cutover-marker-time");
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let sentinel = "2000-01-01 00:00:00";
+        sqlx::query(
+            "UPDATE schema_migration_contracts SET installed_at = ? WHERE migration_name = ?",
+        )
+        .bind(sentinel)
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+        drop(db);
+
+        let reopened = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = reopened.backend() else {
+            unreachable!()
+        };
+        let installed_at: String = sqlx::query_scalar(
+            "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(installed_at, sentinel);
+        drop(reopened);
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_rerun_rejects_marker_mismatch_before_initialization() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "UPDATE schema_migration_contracts SET contract_fingerprint = ? WHERE migration_name = ?",
+        )
+        .bind("0".repeat(64))
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = db
+            .initialize()
+            .await
+            .expect_err("a mismatched cutover marker must reject schema rerun");
+        let error = format!("{error:#}");
+        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+    }
+
+    #[tokio::test]
+    async fn schema_rerun_never_heals_marker_present_cutover_damage() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        pool.execute("DROP TABLE official_dollar_normalization_facts")
+            .await
+            .unwrap();
+
+        let error = db
+            .initialize()
+            .await
+            .expect_err("marker-present cutover damage must reject schema rerun");
+        let error = format!("{error:#}");
+        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+        let table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'official_dollar_normalization_facts'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(table_count, 0, "schema rerun must not heal the damage");
     }
 
     #[tokio::test]

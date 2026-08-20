@@ -1425,13 +1425,56 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let claim_id: i64 = sqlx::query_scalar(
+        let identity_claim_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO curation_evidence_claims (
               evidence_source_id, claim_kind, subject_text, predicate_text,
               object_text, quoted_evidence, validation_status, validated_at
-            ) VALUES (?, 'specification', 'fixture aircraft', 'defines',
-              'factory configuration',
+            ) VALUES (?, 'identity', 'fixture aircraft', 'identifies',
+              'exact aircraft configuration',
+              'Primary fixture source identifies the exact aircraft configuration.',
+              'validated', '2026-07-20') RETURNING id
+            "#,
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let applicability_claim_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'applicability', 'fixture aircraft', 'applies in',
+              'GLOBAL', 'Primary fixture source defines global applicability.',
+              'validated', '2026-07-20') RETURNING id
+            "#,
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let price_claim_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'price', 'fixture aircraft', 'equipped MSRP',
+              '250000 USD', 'Primary fixture source states the equipped MSRP.',
+              'validated', '2026-07-20') RETURNING id
+            "#,
+        )
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let factory_claim_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO curation_evidence_claims (
+              evidence_source_id, claim_kind, subject_text, predicate_text,
+              object_text, quoted_evidence, validation_status, validated_at
+            ) VALUES (?, 'standard_equipment', 'fixture aircraft', 'includes',
+              'complete factory equipment',
               'Primary fixture source defines the complete factory configuration.',
               'validated', '2026-07-20') RETURNING id
             "#,
@@ -1490,7 +1533,7 @@ mod tests {
                 "INSERT INTO aircraft_identity_decision_claims (decision_id, evidence_claim_id, evidence_role) VALUES (?, ?, 'identity')",
             )
             .bind(decision_id)
-            .bind(claim_id)
+            .bind(identity_claim_id)
             .execute(pool)
             .await
             .unwrap();
@@ -1523,22 +1566,22 @@ mod tests {
                     serial_prefix: None,
                     serial_from_display: None,
                     serial_to_display: None,
-                    evidence_claim_id: claim_id,
+                    evidence_claim_id: applicability_claim_id,
                 }],
                 price: ReferencePriceDraft {
                     direct_cited_amount_usd: 250_000.0,
                     direct_cited_nominal_dollar_year: 2026,
-                    evidence_claim_id: claim_id,
+                    evidence_claim_id: price_claim_id,
                 },
                 dollar_normalization: None,
                 avionics: vec![],
                 engines: vec![],
                 propellers: vec![],
                 features: vec![],
-                avionics_set_evidence_claim_id: claim_id,
-                engines_set_evidence_claim_id: claim_id,
-                propellers_set_evidence_claim_id: claim_id,
-                features_set_evidence_claim_id: claim_id,
+                avionics_set_evidence_claim_id: factory_claim_id,
+                engines_set_evidence_claim_id: factory_claim_id,
+                propellers_set_evidence_claim_id: factory_claim_id,
+                features_set_evidence_claim_id: factory_claim_id,
             },
         )
         .await
