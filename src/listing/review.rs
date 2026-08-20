@@ -9988,8 +9988,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use crate::aircraft::faa::{
-        parse_release, require_listing_faa_admission, store_release, ReleaseMetadata,
-        ReleaseReaders,
+        require_listing_faa_admission, store_release, ReleaseFixtureBuilder, ReleaseMetadata,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -11705,13 +11704,11 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         let master = format!(
             "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n{suffix},{serial_number},2072738,41528,2020\n"
         );
-        let release = parse_release(
+        let release = ReleaseFixtureBuilder::from_csv(
             ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
-            ReleaseReaders::new(
-                Cursor::new(master),
-                Cursor::new(AIRCRAFT_REFERENCE),
-                Cursor::new(ENGINE_REFERENCE),
-            ),
+            Cursor::new(master),
+            Cursor::new(AIRCRAFT_REFERENCE),
+            Cursor::new(ENGINE_REFERENCE),
             [n_number],
         )
         .expect("test FAA release should parse");

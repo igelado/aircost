@@ -20,7 +20,7 @@ pub use admission::{
 };
 pub use import::parse_release_archive;
 #[cfg(test)]
-pub(crate) use import::{parse_release, ReleaseReaders};
+pub(crate) use import::ReleaseFixtureBuilder;
 pub use lookup::{
     lookup_current, normalize_n_number, normalize_serial_key, require_eligible, BlockReason,
     Eligibility, LookupOutcome, NotApplicableReason, SerialMatch,
@@ -120,20 +120,74 @@ pub struct EngineReference {
 }
 
 /// Fully parsed, digest-verified release ready for atomic storage.
+///
+/// All fields are private so downstream safe Rust can persist only a release
+/// constructed by this module's archive parser. Tests inside this crate use a
+/// separate `cfg(test)` fixture builder that is absent from production builds.
+///
+/// ```compile_fail
+/// use aircost_rs::aircraft::faa::Release;
+///
+/// let fabricated = Release { /* parser-owned fields are private */ };
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Release {
-    pub metadata: ReleaseMetadata,
+    metadata: ReleaseMetadata,
     /// Digest over the release metadata and all three member identities/digests.
-    pub source_manifest_sha256: String,
+    source_manifest_sha256: String,
     /// Digest over the sorted, normalized N-numbers intentionally scanned.
-    pub target_set_sha256: String,
-    pub master: MemberProvenance,
-    pub aircraft_reference: MemberProvenance,
-    pub engine_reference: MemberProvenance,
-    pub coverage: Vec<TargetCoverage>,
-    pub aircraft: Vec<AircraftRecord>,
-    pub aircraft_references: Vec<AircraftReference>,
-    pub engine_references: Vec<EngineReference>,
+    target_set_sha256: String,
+    master: MemberProvenance,
+    aircraft_reference: MemberProvenance,
+    engine_reference: MemberProvenance,
+    coverage: Vec<TargetCoverage>,
+    aircraft: Vec<AircraftRecord>,
+    aircraft_references: Vec<AircraftReference>,
+    engine_references: Vec<EngineReference>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ReleaseMemberDigestSummary<'a> {
+    pub master: &'a str,
+    pub aircraft_reference: &'a str,
+    pub engine_reference: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ReleaseSummary<'a> {
+    pub snapshot_date: &'a str,
+    pub source_url: &'a str,
+    pub archive_sha256: &'a str,
+    pub source_manifest_sha256: &'a str,
+    pub target_set_sha256: &'a str,
+    pub member_sha256: ReleaseMemberDigestSummary<'a>,
+    pub target_count: usize,
+    pub matched_count: usize,
+    pub absent_count: usize,
+    pub aircraft_reference_count: usize,
+    pub engine_reference_count: usize,
+}
+
+impl Release {
+    pub fn summary(&self) -> ReleaseSummary<'_> {
+        ReleaseSummary {
+            snapshot_date: &self.metadata.snapshot_date,
+            source_url: &self.metadata.source_url,
+            archive_sha256: &self.metadata.archive_sha256,
+            source_manifest_sha256: &self.source_manifest_sha256,
+            target_set_sha256: &self.target_set_sha256,
+            member_sha256: ReleaseMemberDigestSummary {
+                master: &self.master.sha256,
+                aircraft_reference: &self.aircraft_reference.sha256,
+                engine_reference: &self.engine_reference.sha256,
+            },
+            target_count: self.coverage.len(),
+            matched_count: self.aircraft.len(),
+            absent_count: self.coverage.iter().filter(|row| !row.matched).count(),
+            aircraft_reference_count: self.aircraft_references.len(),
+            engine_reference_count: self.engine_references.len(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -203,7 +203,6 @@ async fn main() -> Result<()> {
         AdminCommand::ImportFaaRegistry {
             database,
             archive,
-            snapshot_date,
             explicit_targets,
             apply,
         } => {
@@ -219,10 +218,11 @@ async fn main() -> Result<()> {
                 let archive_file = File::open(&archive).with_context(|| {
                     format!("could not open FAA release ZIP {}", archive.display())
                 })?;
-                parse_release_archive(archive_file, snapshot_date, &parse_targets)
+                parse_release_archive(archive_file, &parse_targets)
             })
             .await
             .context("FAA registry parser task failed")??;
+            let release_summary = release.summary();
             let stored = if apply {
                 Some(store_release(&db, &release).await?)
             } else {
@@ -234,21 +234,17 @@ async fn main() -> Result<()> {
                     "dry_run": !apply,
                     "listing_targets": targets.listing_targets,
                     "explicit_targets": targets.explicit_targets,
-                    "snapshot_date": release.metadata.snapshot_date,
-                    "source_url": release.metadata.source_url,
-                    "archive_sha256": release.metadata.archive_sha256,
-                    "source_manifest_sha256": release.source_manifest_sha256,
-                    "target_set_sha256": release.target_set_sha256,
-                    "member_sha256": {
-                        "master": release.master.sha256,
-                        "aircraft_reference": release.aircraft_reference.sha256,
-                        "engine_reference": release.engine_reference.sha256,
-                    },
-                    "target_count": release.coverage.len(),
-                    "matched_count": release.aircraft.len(),
-                    "absent_count": release.coverage.iter().filter(|row| !row.matched).count(),
-                    "aircraft_reference_count": release.aircraft_references.len(),
-                    "engine_reference_count": release.engine_references.len(),
+                    "snapshot_date": release_summary.snapshot_date,
+                    "source_url": release_summary.source_url,
+                    "archive_sha256": release_summary.archive_sha256,
+                    "source_manifest_sha256": release_summary.source_manifest_sha256,
+                    "target_set_sha256": release_summary.target_set_sha256,
+                    "member_sha256": release_summary.member_sha256,
+                    "target_count": release_summary.target_count,
+                    "matched_count": release_summary.matched_count,
+                    "absent_count": release_summary.absent_count,
+                    "aircraft_reference_count": release_summary.aircraft_reference_count,
+                    "engine_reference_count": release_summary.engine_reference_count,
                     "stored": stored,
                     "canonical_catalog_writes": 0,
                 }))?
@@ -729,7 +725,6 @@ enum AdminCommand {
     ImportFaaRegistry {
         database: String,
         archive: PathBuf,
-        snapshot_date: String,
         explicit_targets: ExplicitNNumberTargets,
         apply: bool,
     },
@@ -1167,7 +1162,6 @@ fn parse_replay_listing_args(args: impl IntoIterator<Item = String>) -> Result<A
 fn parse_import_faa_registry_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     let mut database = None;
     let mut archive = None;
-    let mut snapshot_date = None;
     let mut include_n_numbers = Vec::new();
     let mut apply = false;
     let mut args = args.into_iter();
@@ -1182,9 +1176,6 @@ fn parse_import_faa_registry_args(args: impl IntoIterator<Item = String>) -> Res
                     args.next().context("--archive requires a value")?,
                 ));
             }
-            "--snapshot-date" => {
-                snapshot_date = Some(args.next().context("--snapshot-date requires a value")?);
-            }
             "--include-n-number" => {
                 include_n_numbers.push(args.next().context("--include-n-number requires a value")?);
             }
@@ -1198,23 +1189,11 @@ fn parse_import_faa_registry_args(args: impl IntoIterator<Item = String>) -> Res
         }
     }
 
-    let snapshot_date = snapshot_date.context("--snapshot-date is required")?;
-    if snapshot_date.len() != 10
-        || snapshot_date.as_bytes().get(4) != Some(&b'-')
-        || snapshot_date.as_bytes().get(7) != Some(&b'-')
-        || snapshot_date
-            .chars()
-            .enumerate()
-            .any(|(index, character)| index != 4 && index != 7 && !character.is_ascii_digit())
-    {
-        bail!("--snapshot-date must use YYYY-MM-DD");
-    }
     let explicit_targets = ExplicitNNumberTargets::parse(include_n_numbers)?;
 
     Ok(AdminCommand::ImportFaaRegistry {
         database: database_url_from_arg(database),
         archive: archive.context("--archive is required")?,
-        snapshot_date,
         explicit_targets,
         apply,
     })
@@ -2119,7 +2098,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; narrow FAA serial corrections atomically bind a private receipt-gated listing and exact retries resume it, while other failures compensate the new row.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip --snapshot-date YYYY-MM-DD [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; narrow FAA serial corrections atomically bind a private receipt-gated listing and exact retries resume it, while other failures compensate the new row.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -2168,8 +2147,6 @@ mod tests {
             "sqlite::memory:",
             "--archive",
             "/tmp/ReleasableAircraft.zip",
-            "--snapshot-date",
-            "2026-07-20",
         ]
         .into_iter()
         .map(str::to_string)
@@ -2182,7 +2159,6 @@ mod tests {
         let AdminCommand::ImportFaaRegistry {
             database,
             archive,
-            snapshot_date,
             explicit_targets,
             apply,
         } = command
@@ -2191,9 +2167,22 @@ mod tests {
         };
         assert_eq!(database, "sqlite::memory:");
         assert_eq!(archive, PathBuf::from("/tmp/ReleasableAircraft.zip"));
-        assert_eq!(snapshot_date, "2026-07-20");
         assert_eq!(explicit_targets, ExplicitNNumberTargets::default());
         assert!(!apply);
+    }
+
+    #[test]
+    fn import_faa_registry_cli_rejects_operator_supplied_snapshot_date() {
+        let mut args = faa_import_args();
+        args.extend(
+            ["--snapshot-date", "2026-07-20"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert!(parse_args(args)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown import-faa-registry argument: --snapshot-date"));
     }
 
     #[test]

@@ -101,7 +101,31 @@ const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
 const FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT: &str =
-    "dccd6ae9208a650fe5381000fc485e7700fb113bc23520a183e305b49d64ec15";
+    "6d06f3af7b5633cb3cd095d1ba9c7b7e7e348159e31d64a007a6addefe43fb62";
+const POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.aircraft_code = NEW.aircraft_code
+  ) THEN
+    RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.engine_code = NEW.engine_code
+  ) THEN
+    RAISE EXCEPTION 'FAA engine reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+"#;
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION: &str =
     "20260819_aircraft_listing_identity_corrections";
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
@@ -246,6 +270,32 @@ struct PostgresCorrectionTriggerDefinition {
     security_definer: bool,
     strict: bool,
     volatility: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresFaaReferenceTriggerDefinition {
+    trigger_name: String,
+    trigger_type: i16,
+    has_no_when_clause: bool,
+    has_no_update_columns: bool,
+    trigger_enabled: String,
+    trigger_argument_count: i16,
+    relation_schema: String,
+    relation_name: String,
+    relation_oid_matches: bool,
+    function_name: String,
+    function_schema: String,
+    function_oid_matches: bool,
+    function_source: String,
+    function_configuration: String,
+    function_language: String,
+    returns_trigger: bool,
+    function_argument_count: i16,
+    ordinary_function: bool,
+    security_definer: bool,
+    strict: bool,
+    volatility: String,
+    parallel_safety: String,
 }
 
 fn canonical_sql_definition(value: &str) -> String {
@@ -2807,17 +2857,21 @@ impl AppDb {
                 LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
             ));
         }
-        if matches!(self.backend(), DatabaseBackend::Postgres(_))
-            && self
-                .migration_contract_missing(
-                    "public.faa_registry_aircraft_references",
-                    FAA_REFERENCE_REACHABILITY_MIGRATION,
-                    FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
-                    FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
-                )
-                .await?
-        {
-            bail!(faa_reference_reachability_migration_required_message());
+        if matches!(self.backend(), DatabaseBackend::Postgres(_)) {
+            let missing_faa_reference_reachability =
+                self.faa_reference_reachability_schema_started().await?
+                    && (self
+                        .migration_contract_missing(
+                            "public.faa_registry_aircraft_references",
+                            FAA_REFERENCE_REACHABILITY_MIGRATION,
+                            FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
+                            FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+                        )
+                        .await?
+                        || !self.faa_reference_reachability_definitions_valid().await?);
+            if missing_faa_reference_reachability {
+                bail!(faa_reference_reachability_migration_required_message());
+            }
         }
         let missing_aircraft_listing_identity_correction_objects = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
@@ -3219,6 +3273,188 @@ impl AppDb {
                     ))
             }
         }
+    }
+
+    async fn faa_reference_reachability_definitions_valid(&self) -> Result<bool> {
+        let DatabaseBackend::Postgres(pool) = self.backend() else {
+            return Ok(true);
+        };
+        let definitions = sqlx::query_as::<_, PostgresFaaReferenceTriggerDefinition>(
+            r#"
+            SELECT
+              actual_trigger.tgname AS trigger_name,
+              actual_trigger.tgtype::smallint AS trigger_type,
+              actual_trigger.tgqual IS NULL AS has_no_when_clause,
+              pg_catalog.cardinality(actual_trigger.tgattr) = 0
+                AS has_no_update_columns,
+              actual_trigger.tgenabled::text AS trigger_enabled,
+              actual_trigger.tgnargs::smallint AS trigger_argument_count,
+              relation_namespace.nspname AS relation_schema,
+              relation.relname AS relation_name,
+              actual_trigger.tgrelid IS NOT DISTINCT FROM
+                CASE actual_trigger.tgname
+                  WHEN 'faa_registry_aircraft_references_reachable'
+                    THEN pg_catalog.to_regclass(
+                      'public.faa_registry_aircraft_references'
+                    )
+                  WHEN 'faa_registry_engine_references_reachable'
+                    THEN pg_catalog.to_regclass(
+                      'public.faa_registry_engine_references'
+                    )
+                END AS relation_oid_matches,
+              routine.proname AS function_name,
+              routine_namespace.nspname AS function_schema,
+              routine.oid IS NOT DISTINCT FROM
+                CASE actual_trigger.tgname
+                  WHEN 'faa_registry_aircraft_references_reachable'
+                    THEN pg_catalog.to_regprocedure(
+                      'public.validate_faa_aircraft_reference_reachability()'
+                    )
+                  WHEN 'faa_registry_engine_references_reachable'
+                    THEN pg_catalog.to_regprocedure(
+                      'public.validate_faa_engine_reference_reachability()'
+                    )
+                END AS function_oid_matches,
+              routine.prosrc AS function_source,
+              COALESCE(
+                pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+              ) AS function_configuration,
+              language.lanname AS function_language,
+              routine.prorettype = 'trigger'::pg_catalog.regtype AS returns_trigger,
+              routine.pronargs::smallint AS function_argument_count,
+              routine.prokind = 'f' AS ordinary_function,
+              routine.prosecdef AS security_definer,
+              routine.proisstrict AS strict,
+              routine.provolatile::text AS volatility,
+              routine.proparallel::text AS parallel_safety
+            FROM pg_catalog.pg_trigger actual_trigger
+            JOIN pg_catalog.pg_class relation
+              ON relation.oid = actual_trigger.tgrelid
+            JOIN pg_catalog.pg_namespace relation_namespace
+              ON relation_namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_proc routine ON routine.oid = actual_trigger.tgfoid
+            JOIN pg_catalog.pg_namespace routine_namespace
+              ON routine_namespace.oid = routine.pronamespace
+            JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+            WHERE NOT actual_trigger.tgisinternal
+              AND (
+                (
+                  actual_trigger.tgname =
+                    'faa_registry_aircraft_references_reachable'
+                  AND actual_trigger.tgrelid = pg_catalog.to_regclass(
+                    'public.faa_registry_aircraft_references'
+                  )
+                ) OR (
+                  actual_trigger.tgname =
+                    'faa_registry_engine_references_reachable'
+                  AND actual_trigger.tgrelid = pg_catalog.to_regclass(
+                    'public.faa_registry_engine_references'
+                  )
+                )
+              )
+            ORDER BY actual_trigger.tgname
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+        let expected = [
+            (
+                "faa_registry_aircraft_references_reachable",
+                "faa_registry_aircraft_references",
+                "validate_faa_aircraft_reference_reachability",
+                POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "faa_registry_engine_references_reachable",
+                "faa_registry_engine_references",
+                "validate_faa_engine_reference_reachability",
+                POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+        ];
+        Ok(definitions.len() == expected.len()
+            && definitions.iter().zip(expected).all(
+                |(actual, (trigger_name, relation_name, function_name, function_source))| {
+                    actual.trigger_name == trigger_name
+                        && actual.trigger_type == 7
+                        && actual.has_no_when_clause
+                        && actual.has_no_update_columns
+                        && actual.trigger_enabled == "O"
+                        && actual.trigger_argument_count == 0
+                        && actual.relation_schema == "public"
+                        && actual.relation_name == relation_name
+                        && actual.relation_oid_matches
+                        && actual.function_name == function_name
+                        && actual.function_schema == "public"
+                        && actual.function_oid_matches
+                        && canonical_sql_definition(&actual.function_source)
+                            == canonical_sql_definition(function_source)
+                        && actual.function_configuration == "search_path=pg_catalog"
+                        && actual.function_language == "plpgsql"
+                        && actual.returns_trigger
+                        && actual.function_argument_count == 0
+                        && actual.ordinary_function
+                        && !actual.security_definer
+                        && !actual.strict
+                        && actual.volatility == "v"
+                        && actual.parallel_safety == "u"
+                },
+            ))
+    }
+
+    async fn faa_reference_reachability_schema_started(&self) -> Result<bool> {
+        let DatabaseBackend::Postgres(pool) = self.backend() else {
+            return Ok(false);
+        };
+        let objects_started = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT
+              pg_catalog.to_regclass('public.faa_registry_aircraft') IS NOT NULL
+              OR pg_catalog.to_regclass(
+                'public.faa_registry_aircraft_references'
+              ) IS NOT NULL
+              OR pg_catalog.to_regclass(
+                'public.faa_registry_engine_references'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.validate_faa_aircraft_reference_reachability()'
+              ) IS NOT NULL
+              OR pg_catalog.to_regprocedure(
+                'public.validate_faa_engine_reference_reachability()'
+              ) IS NOT NULL
+              OR EXISTS (
+                SELECT 1 FROM pg_catalog.pg_trigger
+                WHERE NOT tgisinternal
+                  AND tgname IN (
+                    'faa_registry_aircraft_references_reachable',
+                    'faa_registry_engine_references_reachable'
+                  )
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await?;
+        if objects_started {
+            return Ok(true);
+        }
+        let ledger_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.to_regclass('public.schema_migration_contracts') IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await?;
+        if !ledger_exists {
+            return Ok(false);
+        }
+        Ok(sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+              SELECT 1 FROM public.schema_migration_contracts
+              WHERE migration_name = $1
+            )
+            "#,
+        )
+        .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
+        .fetch_one(pool)
+        .await?)
     }
 
     async fn migration_contract_missing(
@@ -4168,8 +4404,10 @@ mod tests {
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE, POSTGRES_SCHEMA_SQL, SQLITE_SCHEMA_SQL,
-        VALUATION_DATA_HARDENING_MIGRATION,
+        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
+        POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+        POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE, POSTGRES_SCHEMA_SQL,
+        SQLITE_SCHEMA_SQL, VALUATION_DATA_HARDENING_MIGRATION,
     };
 
     const LISTING_PENDING_REVIEWS_SQLITE_MIGRATION_SQL: &str =
@@ -4407,6 +4645,217 @@ mod tests {
         let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
             .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
         let db = AppDb::connect(&database_url).await.unwrap();
+        db.ensure_required_migrations().await.unwrap();
+    }
+
+    async fn install_faa_reference_reachability_functions(pool: &sqlx::PgPool) {
+        for (function_name, body) in [
+            (
+                "validate_faa_aircraft_reference_reachability",
+                POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+            (
+                "validate_faa_engine_reference_reachability",
+                POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
+            ),
+        ] {
+            let statement = format!(
+                "CREATE OR REPLACE FUNCTION public.{function_name}() RETURNS TRIGGER \
+                 LANGUAGE plpgsql AS $function${body}$function$ \
+                 SET search_path = pg_catalog"
+            );
+            pool.execute(statement.as_str()).await.unwrap();
+        }
+    }
+
+    async fn install_faa_reference_reachability_triggers(pool: &sqlx::PgPool) {
+        for (trigger_name, relation_name, function_name) in [
+            (
+                "faa_registry_aircraft_references_reachable",
+                "faa_registry_aircraft_references",
+                "validate_faa_aircraft_reference_reachability",
+            ),
+            (
+                "faa_registry_engine_references_reachable",
+                "faa_registry_engine_references",
+                "validate_faa_engine_reference_reachability",
+            ),
+        ] {
+            let drop_statement =
+                format!("DROP TRIGGER IF EXISTS {trigger_name} ON public.{relation_name}");
+            pool.execute(drop_statement.as_str()).await.unwrap();
+            let create_statement = format!(
+                "CREATE TRIGGER {trigger_name} BEFORE INSERT ON public.{relation_name} \
+                 FOR EACH ROW EXECUTE FUNCTION public.{function_name}()"
+            );
+            pool.execute(create_statement.as_str()).await.unwrap();
+        }
+    }
+
+    async fn assert_faa_reference_startup_rejected(db: &AppDb) {
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("database migration required before startup"),
+            "{error}"
+        );
+        assert!(
+            error.contains("20260819_faa_reference_reachability.postgres.sql")
+                || error.contains("20260722_aircraft_reference_catalog.postgres.sql"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_faa_reference_startup_attests_exact_objects() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        pool.execute("DROP SCHEMA public CASCADE").await.unwrap();
+        pool.execute("CREATE SCHEMA public").await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        for statement in split_sql_statements(POSTGRES_SCHEMA_SQL) {
+            connection.execute(statement).await.unwrap();
+        }
+        drop(connection);
+        let db = AppDb {
+            backend: DatabaseBackend::Postgres(pool.clone()),
+        };
+        assert!(db
+            .faa_reference_reachability_definitions_valid()
+            .await
+            .unwrap());
+        db.ensure_required_migrations().await.unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references DISABLE TRIGGER \
+             faa_registry_aircraft_references_reachable",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references ENABLE TRIGGER \
+             faa_registry_aircraft_references_reachable",
+        )
+        .await
+        .unwrap();
+
+        pool.execute(
+            "DROP TRIGGER faa_registry_aircraft_references_reachable \
+             ON public.faa_registry_aircraft_references",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER faa_registry_aircraft_references_reachable BEFORE INSERT \
+             ON public.faa_registry_aircraft_references FOR EACH ROW EXECUTE FUNCTION \
+             public.validate_faa_engine_reference_reachability()",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_reference_reachability_triggers(&pool).await;
+
+        pool.execute(
+            "CREATE OR REPLACE FUNCTION \
+             public.validate_faa_aircraft_reference_reachability() RETURNS TRIGGER \
+             LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$ \
+             SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_reference_reachability_functions(&pool).await;
+
+        pool.execute(
+            "ALTER FUNCTION public.validate_faa_aircraft_reference_reachability() PARALLEL SAFE",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        pool.execute(
+            "ALTER FUNCTION public.validate_faa_aircraft_reference_reachability() PARALLEL UNSAFE",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("CREATE SCHEMA attacker_schema").await.unwrap();
+        pool.execute(
+            "CREATE FUNCTION attacker_schema.validate_faa_aircraft_reference_reachability() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "DROP TRIGGER faa_registry_aircraft_references_reachable \
+             ON public.faa_registry_aircraft_references",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER faa_registry_aircraft_references_reachable BEFORE INSERT \
+             ON public.faa_registry_aircraft_references FOR EACH ROW EXECUTE FUNCTION \
+             attacker_schema.validate_faa_aircraft_reference_reachability()",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_reference_reachability_triggers(&pool).await;
+        pool.execute("DROP SCHEMA attacker_schema CASCADE")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references \
+             RENAME TO faa_registry_aircraft_references_missing",
+        )
+        .await
+        .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        pool.execute(
+            "ALTER TABLE public.faa_registry_aircraft_references_missing \
+             RENAME TO faa_registry_aircraft_references",
+        )
+        .await
+        .unwrap();
+
+        pool.execute("DROP FUNCTION public.validate_faa_engine_reference_reachability() CASCADE")
+            .await
+            .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        install_faa_reference_reachability_functions(&pool).await;
+        install_faa_reference_reachability_triggers(&pool).await;
+
+        sqlx::query("DELETE FROM public.schema_migration_contracts WHERE migration_name = $1")
+            .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_faa_reference_startup_rejected(&db).await;
+        sqlx::query(
+            "INSERT INTO public.schema_migration_contracts \
+             (migration_name, contract_version, contract_fingerprint) VALUES ($1, $2, $3)",
+        )
+        .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
+        .bind(FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION)
+        .bind(FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(db
+            .faa_reference_reachability_definitions_valid()
+            .await
+            .unwrap());
         db.ensure_required_migrations().await.unwrap();
     }
 

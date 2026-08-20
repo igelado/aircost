@@ -726,7 +726,9 @@ mod tests {
             writer.start_file(name, options).unwrap();
             writer.write_all(contents.as_bytes()).unwrap();
         }
-        parse_release_archive(writer.finish().unwrap(), "2026-07-20", targets).unwrap()
+        let mut archive = writer.finish().unwrap();
+        archive.set_position(0);
+        parse_release_archive(archive, targets).unwrap()
     }
 
     async fn temporary_db() -> (AppDb, std::path::PathBuf) {

@@ -4765,8 +4765,7 @@ mod tests {
     use serde_json::json;
 
     use crate::aircraft::faa::{
-        parse_release, require_listing_faa_admission, store_release, ReleaseMetadata,
-        ReleaseReaders,
+        require_listing_faa_admission, store_release, ReleaseFixtureBuilder, ReleaseMetadata,
     };
     use crate::avionics::catalog::{
         ApprovedAvionicsIdentity, AvionicsIdentityOutcome, CatalogError,
@@ -4806,13 +4805,11 @@ mod tests {
         let digest_seed = n_number.bytes().fold(0_u64, |state, byte| {
             state.wrapping_mul(31).wrapping_add(u64::from(byte))
         });
-        let release = parse_release(
+        let release = ReleaseFixtureBuilder::from_csv(
             ReleaseMetadata::official("2026-07-20", format!("{digest_seed:064x}")),
-            ReleaseReaders::new(
-                Cursor::new(master),
-                Cursor::new(FAA_AIRCRAFT_REFERENCE),
-                Cursor::new(FAA_ENGINE_REFERENCE),
-            ),
+            Cursor::new(master),
+            Cursor::new(FAA_AIRCRAFT_REFERENCE),
+            Cursor::new(FAA_ENGINE_REFERENCE),
             [n_number],
         )
         .expect("test FAA release should parse");

@@ -6419,7 +6419,7 @@ INSERT INTO public.schema_migration_contracts AS installed_contract (
 ) VALUES (
   '20260819_faa_reference_reachability',
   1,
-  'dccd6ae9208a650fe5381000fc485e7700fb113bc23520a183e305b49d64ec15',
+  '6d06f3af7b5633cb3cd095d1ba9c7b7e7e348159e31d64a007a6addefe43fb62',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET

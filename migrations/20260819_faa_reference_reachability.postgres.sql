@@ -18,7 +18,7 @@ BEGIN
       AND NOT (
         contract_version = 1
         AND contract_fingerprint =
-          'dccd6ae9208a650fe5381000fc485e7700fb113bc23520a183e305b49d64ec15'
+          '6d06f3af7b5633cb3cd095d1ba9c7b7e7e348159e31d64a007a6addefe43fb62'
       )
   ) THEN
     RAISE EXCEPTION
@@ -42,6 +42,45 @@ BEGIN
     OR pg_catalog.to_regprocedure(
          'public.validate_faa_engine_reference_reachability()'
        ) IS NOT NULL
+    OR NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_proc routine
+      JOIN pg_catalog.pg_namespace routine_namespace
+        ON routine_namespace.oid = routine.pronamespace
+      JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+      WHERE routine.oid = pg_catalog.to_regprocedure(
+        'public.validate_faa_reference_reachability()'
+      )
+        AND routine_namespace.nspname = 'public'
+        AND routine.prosrc = $old_function$
+BEGIN
+  IF TG_TABLE_NAME = 'faa_registry_aircraft_references' AND NOT EXISTS (
+    SELECT 1 FROM faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.aircraft_code = NEW.aircraft_code
+  ) THEN
+    RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
+  END IF;
+  IF TG_TABLE_NAME = 'faa_registry_engine_references' AND NOT EXISTS (
+    SELECT 1 FROM faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.engine_code = NEW.engine_code
+  ) THEN
+    RAISE EXCEPTION 'FAA engine reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+$old_function$
+        AND routine.proconfig IS NULL
+        AND language.lanname = 'plpgsql'
+        AND routine.prorettype = 'trigger'::pg_catalog.regtype
+        AND routine.pronargs = 0
+        AND routine.prokind = 'f'
+        AND NOT routine.prosecdef
+        AND NOT routine.proisstrict
+        AND routine.provolatile = 'v'
+        AND routine.proparallel = 'u'
+    )
     OR (
       SELECT COUNT(*)
       FROM pg_catalog.pg_trigger trigger_row
@@ -57,10 +96,60 @@ BEGIN
         AND trigger_row.tgfoid = pg_catalog.to_regprocedure(
           'public.validate_faa_reference_reachability()'
         )
+        AND trigger_row.tgtype = 7
+        AND trigger_row.tgenabled = 'O'
+        AND trigger_row.tgqual IS NULL
+        AND pg_catalog.cardinality(trigger_row.tgattr) = 0
+        AND trigger_row.tgnargs = 0
     ) <> 2
+    OR NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+      WHERE NOT trigger_row.tgisinternal
+        AND trigger_row.tgname =
+          'faa_registry_aircraft_references_reachable'
+        AND trigger_row.tgrelid = pg_catalog.to_regclass(
+          'public.faa_registry_aircraft_references'
+        )
+        AND trigger_row.tgfoid = pg_catalog.to_regprocedure(
+          'public.validate_faa_reference_reachability()'
+        )
+    )
+    OR NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+      WHERE NOT trigger_row.tgisinternal
+        AND trigger_row.tgname =
+          'faa_registry_engine_references_reachable'
+        AND trigger_row.tgrelid = pg_catalog.to_regclass(
+          'public.faa_registry_engine_references'
+        )
+        AND trigger_row.tgfoid = pg_catalog.to_regprocedure(
+          'public.validate_faa_reference_reachability()'
+        )
+    )
   ) THEN
     RAISE EXCEPTION
       'pre-migration FAA reference reachability objects have an unexpected shape';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.faa_registry_aircraft_references reference
+    WHERE NOT EXISTS (
+      SELECT 1 FROM public.faa_registry_aircraft aircraft
+      WHERE aircraft.snapshot_id = reference.snapshot_id
+        AND aircraft.aircraft_code = reference.aircraft_code
+    )
+  ) OR EXISTS (
+    SELECT 1
+    FROM public.faa_registry_engine_references reference
+    WHERE NOT EXISTS (
+      SELECT 1 FROM public.faa_registry_aircraft aircraft
+      WHERE aircraft.snapshot_id = reference.snapshot_id
+        AND aircraft.engine_code = reference.engine_code
+    )
+  ) THEN
+    RAISE EXCEPTION
+      'existing FAA reference rows are unreachable from target matches';
   END IF;
 END
 $migration_guard$;
@@ -119,12 +208,144 @@ BEFORE INSERT ON public.faa_registry_engine_references
 FOR EACH ROW
 EXECUTE FUNCTION public.validate_faa_engine_reference_reachability();
 
+DO $post_migration_guard$
+BEGIN
+  IF (
+    SELECT COUNT(*)
+    FROM pg_catalog.pg_trigger trigger_row
+    WHERE NOT trigger_row.tgisinternal
+      AND trigger_row.tgname IN (
+        'faa_registry_aircraft_references_reachable',
+        'faa_registry_engine_references_reachable'
+      )
+      AND trigger_row.tgrelid IN (
+        pg_catalog.to_regclass('public.faa_registry_aircraft_references'),
+        pg_catalog.to_regclass('public.faa_registry_engine_references')
+      )
+      AND trigger_row.tgtype = 7
+      AND trigger_row.tgenabled = 'O'
+      AND trigger_row.tgqual IS NULL
+      AND pg_catalog.cardinality(trigger_row.tgattr) = 0
+      AND trigger_row.tgnargs = 0
+  ) <> 2
+  OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+    WHERE trigger_row.tgname = 'faa_registry_aircraft_references_reachable'
+      AND trigger_row.tgrelid = pg_catalog.to_regclass(
+        'public.faa_registry_aircraft_references'
+      )
+      AND trigger_row.tgfoid = pg_catalog.to_regprocedure(
+        'public.validate_faa_aircraft_reference_reachability()'
+      )
+  )
+  OR NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+    WHERE trigger_row.tgname = 'faa_registry_engine_references_reachable'
+      AND trigger_row.tgrelid = pg_catalog.to_regclass(
+        'public.faa_registry_engine_references'
+      )
+      AND trigger_row.tgfoid = pg_catalog.to_regprocedure(
+        'public.validate_faa_engine_reference_reachability()'
+      )
+  )
+  OR NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace routine_namespace
+      ON routine_namespace.oid = routine.pronamespace
+    JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+    WHERE routine.oid = pg_catalog.to_regprocedure(
+      'public.validate_faa_aircraft_reference_reachability()'
+    )
+      AND routine_namespace.nspname = 'public'
+      AND routine.prosrc = $aircraft_function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.aircraft_code = NEW.aircraft_code
+  ) THEN
+    RAISE EXCEPTION
+      'FAA aircraft reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+$aircraft_function$
+      AND routine.proconfig = ARRAY['search_path=pg_catalog']
+      AND language.lanname = 'plpgsql'
+      AND routine.prorettype = 'trigger'::pg_catalog.regtype
+      AND routine.pronargs = 0
+      AND routine.prokind = 'f'
+      AND NOT routine.prosecdef
+      AND NOT routine.proisstrict
+      AND routine.provolatile = 'v'
+      AND routine.proparallel = 'u'
+  )
+  OR NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace routine_namespace
+      ON routine_namespace.oid = routine.pronamespace
+    JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+    WHERE routine.oid = pg_catalog.to_regprocedure(
+      'public.validate_faa_engine_reference_reachability()'
+    )
+      AND routine_namespace.nspname = 'public'
+      AND routine.prosrc = $engine_function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.faa_registry_aircraft aircraft
+    WHERE aircraft.snapshot_id = NEW.snapshot_id
+      AND aircraft.engine_code = NEW.engine_code
+  ) THEN
+    RAISE EXCEPTION
+      'FAA engine reference must be reachable from a target match';
+  END IF;
+  RETURN NEW;
+END;
+$engine_function$
+      AND routine.proconfig = ARRAY['search_path=pg_catalog']
+      AND language.lanname = 'plpgsql'
+      AND routine.prorettype = 'trigger'::pg_catalog.regtype
+      AND routine.pronargs = 0
+      AND routine.prokind = 'f'
+      AND NOT routine.prosecdef
+      AND NOT routine.proisstrict
+      AND routine.provolatile = 'v'
+      AND routine.proparallel = 'u'
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM public.faa_registry_aircraft_references reference
+    WHERE NOT EXISTS (
+      SELECT 1 FROM public.faa_registry_aircraft aircraft
+      WHERE aircraft.snapshot_id = reference.snapshot_id
+        AND aircraft.aircraft_code = reference.aircraft_code
+    )
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM public.faa_registry_engine_references reference
+    WHERE NOT EXISTS (
+      SELECT 1 FROM public.faa_registry_aircraft aircraft
+      WHERE aircraft.snapshot_id = reference.snapshot_id
+        AND aircraft.engine_code = reference.engine_code
+    )
+  ) THEN
+    RAISE EXCEPTION
+      'post-migration FAA reference reachability objects have an unexpected shape';
+  END IF;
+END
+$post_migration_guard$;
+
 INSERT INTO public.schema_migration_contracts AS installed_contract (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_faa_reference_reachability',
   1,
-  'dccd6ae9208a650fe5381000fc485e7700fb113bc23520a183e305b49d64ec15',
+  '6d06f3af7b5633cb3cd095d1ba9c7b7e7e348159e31d64a007a6addefe43fb62',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO UPDATE SET
