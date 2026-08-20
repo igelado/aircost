@@ -631,6 +631,14 @@ cargo run --bin aircost-admin -- import-faa-registry \
   --dry-run
 ```
 
+Dry run uses a diagnostic database connection rather than the normal startup
+path. SQLite must already exist and is opened read-only without schema
+initialization, migrations, WAL creation, or seed writes. PostgreSQL sessions
+set `default_transaction_read_only=on` before the first query and likewise do
+not initialize or migrate the schema. A dry run therefore diagnoses the exact
+installed contract; it cannot create a missing SQLite database or repair an
+old one as a side effect.
+
 The importer derives the release date from the shared, validated ZIP member
 date for `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`; there is no operator
 date override. Review the derived date and the JSON report's separate
@@ -668,8 +676,11 @@ The apply transaction is atomic. Reimporting the same archive and target set is
 idempotent; adding listings can require another target-scoped projection. Each
 projection is immutable, and several projections may refer to the same daily
 archive. For one curation case, all selected observations must resolve through
-projections with the same snapshot date, source URL, archive hash, and manifest
-hash.
+projections with the same snapshot date, source URL, archive hash, manifest
+hash, and the exact retained-record hash domain. The current immutable domain
+is `aircost-faa-master-retained-aircraft-projection-v1`; it participates in the
+source-manifest digest and every retained aircraft source-record digest, so a
+projection produced under another algorithm cannot alias a current one.
 
 The curation lookup always starts from the newest imported release. "Newest"
 means the greatest parser-derived snapshot date and projection ID; the code
@@ -690,7 +701,8 @@ Every new valuation snapshot freezes a versioned FAA admission manifest inside
 `selection_policy_json`. For each included listing it records the canonical
 N-number, normalized observed serial, FAA projection and release, archive hash,
 and exact FAA retained-projection record hash. The record hash uses only the
-stored non-PII aircraft fields under a versioned domain; archive and member
+stored non-PII aircraft fields under the immutable domain
+`aircost-faa-master-retained-aircraft-projection-v1`; archive and member
 hashes bind the original release bytes without putting discarded registrant or
 address fields into a row identifier. That manifest participates in both snapshot
 and row hashes. Snapshot creation repeats the exact admission audit immediately
@@ -1311,6 +1323,26 @@ avionics. Existing listings therefore do not need to be re-added. The FAA
 tables start empty and must be populated with `import-faa-registry` after the
 migration. Existing databases must be migrated before starting a binary that
 expects the clean catalog; fresh databases receive the same schema directly.
+
+After the base catalog migration, install the FAA projection reachability and
+record-hash-domain contracts in order:
+
+```text
+migrations/20260819_faa_reference_reachability.postgres.sql
+migrations/20260820_faa_record_hash_domain.postgres.sql
+migrations/20260820_faa_record_hash_domain.sqlite.sql
+```
+
+PostgreSQL databases apply both PostgreSQL files in that order. SQLite applies
+the SQLite record-domain file; the reachability contract is already enforced
+by the SQLite base objects. Each migration accepts only its exact predecessor
+shape and preserves the original `installed_at` on an exact rerun. A missing,
+nonempty legacy FAA projection is deliberately rejected: delete only those
+derived FAA projection rows and regenerate them by importing the exact retained
+FAA ZIP. Do not add the domain with ad hoc SQL, mechanically rehash rows, or
+relabel a legacy projection. The archive bytes and domain are both inputs to
+the authoritative hashes, so only importer regeneration establishes the new
+identity.
 
 Back up the database and test the matching migration on a copy. For SQLite,
 representative clean-catalog and FAA tables should all be absent before the

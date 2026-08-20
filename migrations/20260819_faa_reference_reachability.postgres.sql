@@ -19,6 +19,7 @@ DECLARE
   relation_signature TEXT;
   column_signature TEXT;
   constraint_signature TEXT;
+  foreign_key_signature TEXT;
   index_signature TEXT;
 BEGIN
   SELECT
@@ -42,6 +43,128 @@ BEGIN
           'faa_registry_engine_references',
           'faa_registry_snapshots'
         )
+    ),
+    (
+      SELECT pg_catalog.string_agg(
+        pg_catalog.format(
+          '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+          relation.relname,
+          constraint_namespace.nspname,
+          constraint_row.contype,
+          constraint_row.conname,
+          constraint_row.convalidated,
+          constraint_row.condeferrable,
+          constraint_row.condeferred,
+          constraint_row.connoinherit,
+          constraint_row.conislocal,
+          constraint_row.coninhcount,
+          referenced_namespace.nspname,
+          referenced_relation.relname,
+          referenced_index_namespace.nspname,
+          referenced_index.relname,
+          constraint_row.contypid = 0,
+          constraint_row.conparentid = 0,
+          constraint_row.confupdtype::text,
+          constraint_row.confdeltype::text,
+          constraint_row.confmatchtype::text,
+          COALESCE(constraint_row.conkey::text, ''),
+          COALESCE(constraint_row.confkey::text, ''),
+          COALESCE((
+            SELECT pg_catalog.string_agg(
+              operator_namespace.nspname || '.' || operator_row.oprname || '(' ||
+              left_namespace.nspname || '.' || left_type.typname || ',' ||
+              right_namespace.nspname || '.' || right_type.typname || ')',
+              ',' ORDER BY operator_key.ordinality
+            )
+            FROM pg_catalog.unnest(constraint_row.conpfeqop) WITH ORDINALITY
+              AS operator_key(operator_oid, ordinality)
+            JOIN pg_catalog.pg_operator operator_row
+              ON operator_row.oid = operator_key.operator_oid
+            JOIN pg_catalog.pg_namespace operator_namespace
+              ON operator_namespace.oid = operator_row.oprnamespace
+            JOIN pg_catalog.pg_type left_type
+              ON left_type.oid = operator_row.oprleft
+            JOIN pg_catalog.pg_namespace left_namespace
+              ON left_namespace.oid = left_type.typnamespace
+            JOIN pg_catalog.pg_type right_type
+              ON right_type.oid = operator_row.oprright
+            JOIN pg_catalog.pg_namespace right_namespace
+              ON right_namespace.oid = right_type.typnamespace
+          ), ''),
+          COALESCE((
+            SELECT pg_catalog.string_agg(
+              operator_namespace.nspname || '.' || operator_row.oprname || '(' ||
+              left_namespace.nspname || '.' || left_type.typname || ',' ||
+              right_namespace.nspname || '.' || right_type.typname || ')',
+              ',' ORDER BY operator_key.ordinality
+            )
+            FROM pg_catalog.unnest(constraint_row.conppeqop) WITH ORDINALITY
+              AS operator_key(operator_oid, ordinality)
+            JOIN pg_catalog.pg_operator operator_row
+              ON operator_row.oid = operator_key.operator_oid
+            JOIN pg_catalog.pg_namespace operator_namespace
+              ON operator_namespace.oid = operator_row.oprnamespace
+            JOIN pg_catalog.pg_type left_type
+              ON left_type.oid = operator_row.oprleft
+            JOIN pg_catalog.pg_namespace left_namespace
+              ON left_namespace.oid = left_type.typnamespace
+            JOIN pg_catalog.pg_type right_type
+              ON right_type.oid = operator_row.oprright
+            JOIN pg_catalog.pg_namespace right_namespace
+              ON right_namespace.oid = right_type.typnamespace
+          ), ''),
+          COALESCE((
+            SELECT pg_catalog.string_agg(
+              operator_namespace.nspname || '.' || operator_row.oprname || '(' ||
+              left_namespace.nspname || '.' || left_type.typname || ',' ||
+              right_namespace.nspname || '.' || right_type.typname || ')',
+              ',' ORDER BY operator_key.ordinality
+            )
+            FROM pg_catalog.unnest(constraint_row.conffeqop) WITH ORDINALITY
+              AS operator_key(operator_oid, ordinality)
+            JOIN pg_catalog.pg_operator operator_row
+              ON operator_row.oid = operator_key.operator_oid
+            JOIN pg_catalog.pg_namespace operator_namespace
+              ON operator_namespace.oid = operator_row.oprnamespace
+            JOIN pg_catalog.pg_type left_type
+              ON left_type.oid = operator_row.oprleft
+            JOIN pg_catalog.pg_namespace left_namespace
+              ON left_namespace.oid = left_type.typnamespace
+            JOIN pg_catalog.pg_type right_type
+              ON right_type.oid = operator_row.oprright
+            JOIN pg_catalog.pg_namespace right_namespace
+              ON right_namespace.oid = right_type.typnamespace
+          ), ''),
+          COALESCE(constraint_row.confdelsetcols::text, ''),
+          constraint_row.conexclop IS NULL,
+          constraint_row.conbin IS NULL,
+          ''
+        ), E'\n' ORDER BY relation.relname, constraint_row.conname
+      )
+      FROM pg_catalog.pg_constraint constraint_row
+      JOIN pg_catalog.pg_namespace constraint_namespace
+        ON constraint_namespace.oid = constraint_row.connamespace
+      JOIN pg_catalog.pg_class relation
+        ON relation.oid = constraint_row.conrelid
+      JOIN pg_catalog.pg_namespace relation_namespace
+        ON relation_namespace.oid = relation.relnamespace
+      JOIN pg_catalog.pg_class referenced_relation
+        ON referenced_relation.oid = constraint_row.confrelid
+      JOIN pg_catalog.pg_namespace referenced_namespace
+        ON referenced_namespace.oid = referenced_relation.relnamespace
+      JOIN pg_catalog.pg_class referenced_index
+        ON referenced_index.oid = constraint_row.conindid
+      JOIN pg_catalog.pg_namespace referenced_index_namespace
+        ON referenced_index_namespace.oid = referenced_index.relnamespace
+      WHERE relation_namespace.nspname = 'public'
+        AND relation.relname IN (
+          'faa_registry_aircraft',
+          'faa_registry_aircraft_references',
+          'faa_registry_coverage',
+          'faa_registry_engine_references',
+          'faa_registry_snapshots'
+        )
+        AND constraint_row.contype = 'f'
     ),
     (
       SELECT pg_catalog.string_agg(
@@ -126,8 +249,8 @@ BEGIN
           'faa_registry_snapshots'
         )
     )
-  INTO relation_signature, column_signature, constraint_signature,
-       index_signature;
+  INTO relation_signature, foreign_key_signature, column_signature,
+       constraint_signature, index_signature;
 
   IF relation_signature IS DISTINCT FROM $expected_relations$faa_registry_aircraft|r|p|f|f|f|f
 faa_registry_aircraft_references|r|p|f|f|f|f
@@ -229,6 +352,15 @@ faa_registry_snapshots|p|faa_registry_snapshots_pkey|t|PRIMARY KEY (id)
 faa_registry_snapshots|u|faa_registry_snapshots_archive_sha256_target_set_sha256_key|t|UNIQUE (archive_sha256, target_set_sha256)$expected_constraints$
   THEN
     RAISE EXCEPTION 'FAA registry projection constraints have an unexpected shape';
+  END IF;
+
+  IF foreign_key_signature IS DISTINCT FROM $expected_foreign_keys$faa_registry_aircraft|public|f|faa_registry_aircraft_snapshot_id_fkey|t|f|f|t|t|0|public|faa_registry_snapshots|public|faa_registry_snapshots_pkey|t|t|a|r|s|{1}|{1}|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)||t|t|
+faa_registry_aircraft_references|public|f|faa_registry_aircraft_references_snapshot_id_fkey|t|f|f|t|t|0|public|faa_registry_snapshots|public|faa_registry_snapshots_pkey|t|t|a|r|s|{1}|{1}|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)||t|t|
+faa_registry_coverage|public|f|faa_registry_coverage_snapshot_id_fkey|t|f|f|t|t|0|public|faa_registry_snapshots|public|faa_registry_snapshots_pkey|t|t|a|r|s|{1}|{1}|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)||t|t|
+faa_registry_engine_references|public|f|faa_registry_engine_references_snapshot_id_fkey|t|f|f|t|t|0|public|faa_registry_snapshots|public|faa_registry_snapshots_pkey|t|t|a|r|s|{1}|{1}|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)||t|t|
+faa_registry_snapshots|public|f|faa_registry_snapshots_evidence_source_id_fkey|t|f|f|t|t|0|public|curation_evidence_sources|public|curation_evidence_sources_pkey|t|t|a|r|s|{2}|{1}|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)|pg_catalog.=(pg_catalog.int8,pg_catalog.int8)||t|t|$expected_foreign_keys$
+  THEN
+    RAISE EXCEPTION 'FAA registry projection foreign keys have an unexpected shape';
   END IF;
 
   IF index_signature IS DISTINCT FROM $expected_indexes$faa_registry_aircraft|faa_registry_aircraft_pkey|t|t|t|t|CREATE UNIQUE INDEX faa_registry_aircraft_pkey ON public.faa_registry_aircraft USING btree (snapshot_id, n_number)
@@ -1206,7 +1338,7 @@ $engine_function$
 END
 $post_migration_guard$;
 
-INSERT INTO public.schema_migration_contracts AS installed_contract (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_faa_reference_reachability',
@@ -1214,12 +1346,6 @@ INSERT INTO public.schema_migration_contracts AS installed_contract (
   'fc6451ffe8e1ee2034e76480767d16d6c37463461d9e684687448b4d43f96bef',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at
-WHERE installed_contract.contract_version = EXCLUDED.contract_version
-  AND installed_contract.contract_fingerprint =
-      EXCLUDED.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

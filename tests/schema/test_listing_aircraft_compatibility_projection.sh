@@ -138,7 +138,7 @@ INSERT INTO faa_registry_snapshots (
   source_manifest_sha256, target_set_sha256,
   master_member_name, master_member_sha256,
   aircraft_member_name, aircraft_member_sha256,
-  engine_member_name, engine_member_sha256
+  engine_member_name, engine_member_sha256, record_hash_domain
 )
 SELECT id,
        CASE source_title
@@ -168,7 +168,8 @@ SELECT id,
        CASE source_title
          WHEN 'FAA projection release 1' THEN printf('%064d', 15)
          ELSE printf('%064d', 25)
-       END
+       END,
+       'aircost-faa-master-retained-aircraft-projection-v1'
 FROM curation_evidence_sources
 WHERE source_title LIKE 'FAA projection release %';
 

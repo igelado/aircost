@@ -113,13 +113,14 @@ INSERT INTO faa_registry_snapshots (
   source_manifest_sha256, target_set_sha256,
   master_member_name, master_member_sha256,
   aircraft_member_name, aircraft_member_sha256,
-  engine_member_name, engine_member_sha256
+  engine_member_name, engine_member_sha256, record_hash_domain
 )
 SELECT id, '2026-07-22', source_url, content_sha256,
   printf('%064d', 1), printf('%064d', 2),
   'MASTER.txt', printf('%064d', 3),
   'ACFTREF.txt', printf('%064d', 4),
-  'ENGINE.txt', printf('%064d', 5)
+  'ENGINE.txt', printf('%064d', 5),
+  'aircost-faa-master-retained-aircraft-projection-v1'
 FROM curation_evidence_sources WHERE source_title='FAA registry test release';
 INSERT INTO faa_registry_aircraft (
   snapshot_id, n_number, manufacturer_serial_raw, manufacturer_serial_key,

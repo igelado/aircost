@@ -38,6 +38,10 @@ pub const RELEASE_SOURCE_URL: &str =
 pub const MASTER_MEMBER_NAME: &str = "MASTER.txt";
 pub const AIRCRAFT_MEMBER_NAME: &str = "ACFTREF.txt";
 pub const ENGINE_MEMBER_NAME: &str = "ENGINE.txt";
+/// Domain separator prepended to every retained FAA MASTER projection hash.
+/// Stored snapshots must name this exact domain so a record digest is never
+/// interpreted without the algorithm and field set that produced it.
+pub const AIRCRAFT_RECORD_HASH_DOMAIN: &str = "aircost-faa-master-retained-aircraft-projection-v1";
 
 /// Provenance computed from one FAA release archive.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -160,6 +164,7 @@ pub struct ReleaseSummary<'a> {
     pub archive_sha256: &'a str,
     pub source_manifest_sha256: &'a str,
     pub target_set_sha256: &'a str,
+    pub record_hash_domain: &'a str,
     pub member_sha256: ReleaseMemberDigestSummary<'a>,
     pub target_count: usize,
     pub matched_count: usize,
@@ -176,6 +181,7 @@ impl Release {
             archive_sha256: &self.metadata.archive_sha256,
             source_manifest_sha256: &self.source_manifest_sha256,
             target_set_sha256: &self.target_set_sha256,
+            record_hash_domain: AIRCRAFT_RECORD_HASH_DOMAIN,
             member_sha256: ReleaseMemberDigestSummary {
                 master: &self.master.sha256,
                 aircraft_reference: &self.aircraft_reference.sha256,
@@ -207,6 +213,9 @@ pub struct Snapshot {
     pub archive_sha256: String,
     pub source_manifest_sha256: String,
     pub target_set_sha256: String,
+    /// Exact domain that defines every `source_record_sha256` in this
+    /// projection. It participates in snapshot identity and reuse.
+    pub record_hash_domain: String,
 }
 
 /// FAA facts joined deterministically through the opaque aircraft and engine

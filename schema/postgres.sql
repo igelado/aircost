@@ -5014,6 +5014,9 @@ CREATE TABLE IF NOT EXISTS public.faa_registry_snapshots (
   engine_member_name TEXT NOT NULL CHECK (engine_member_name = 'ENGINE.txt'),
   engine_member_sha256 TEXT NOT NULL,
   imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  record_hash_domain TEXT NOT NULL CHECK (
+    record_hash_domain = 'aircost-faa-master-retained-aircraft-projection-v1'
+  ),
   UNIQUE (archive_sha256, target_set_sha256),
   CHECK (snapshot_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
   CHECK (source_url ~ '^https://([^. /]+[.])*faa[.]gov/'),
@@ -6419,7 +6422,7 @@ BEFORE INSERT ON public.faa_registry_engine_references
 FOR EACH ROW
 EXECUTE FUNCTION public.validate_faa_engine_reference_reachability();
 
-INSERT INTO public.schema_migration_contracts AS installed_contract (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_faa_reference_reachability',
@@ -6427,13 +6430,7 @@ INSERT INTO public.schema_migration_contracts AS installed_contract (
   'fc6451ffe8e1ee2034e76480767d16d6c37463461d9e684687448b4d43f96bef',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at
-WHERE installed_contract.contract_version = EXCLUDED.contract_version
-  AND installed_contract.contract_fingerprint =
-      EXCLUDED.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION public.validate_faa_coverage()
 RETURNS TRIGGER AS $$
@@ -6487,6 +6484,16 @@ DROP TRIGGER IF EXISTS faa_registry_coverage_immutable ON faa_registry_coverage;
 CREATE TRIGGER faa_registry_coverage_immutable
 BEFORE UPDATE OR DELETE ON faa_registry_coverage
 FOR EACH ROW EXECUTE FUNCTION public.preserve_faa_registry_data();
+
+INSERT INTO public.schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260820_faa_record_hash_domain',
+  1,
+  'f124f573bf705da6c1e4b0a5c7a8df45ea5a4a5dc009a28eee012be42c691502',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;
 
 
 

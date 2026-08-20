@@ -8,6 +8,13 @@ The source must be a file-backed SQLite database. Replay commands open it with
 SQLite read-only mode and do not run schema initialization, migrations, or seed
 writes. The target must be a different database.
 
+FAA registry dry runs have the same boundary: they require an existing target
+database and use a dedicated read-only diagnostic connection. They do not
+create a SQLite file or upgrade either backend. Before materialization, import
+the exact retained FAA ZIP into the shadow database with `--apply`; projection
+hashes cannot be recovered by relabeling or mechanically rehashing legacy FAA
+rows.
+
 ## Phases
 
 All operational commands are dry-run unless `--apply` is supplied.

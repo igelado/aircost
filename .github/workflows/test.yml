@@ -58,10 +58,18 @@ jobs:
       - name: Check PostgreSQL FAA reference migration
         run: bash tests/schema/test_faa_reference_reachability_postgres.sh
 
+      - name: Check FAA record hash-domain migration
+        run: bash tests/schema/test_faa_record_hash_domain.sh
+
       - name: Check PostgreSQL FAA reference startup attestation
         run: >-
           cargo test postgres_faa_reference_startup_attests_exact_objects --
           --ignored --nocapture --test-threads=1
+
+      - name: Check FAA diagnostic read-only boundaries
+        run: |
+          cargo test diagnostic_postgres_connections_default_to_read_only -- --ignored --nocapture --test-threads=1
+          cargo test --bin aircost-admin import_faa_registry_dry_run_keeps_postgres_rows_and_markers_unchanged -- --ignored --nocapture --test-threads=1
 
       - name: Check avionics reuse-v2 migration
         run: bash tests/schema/test_avionics_product_reuse_v2.sh

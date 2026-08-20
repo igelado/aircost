@@ -1406,6 +1406,7 @@ fn target_set_digest(targets: &BTreeSet<String>) -> String {
 fn source_manifest_digest(metadata: &ReleaseMetadata, members: [&MemberProvenance; 3]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"aircost-faa-source-manifest-v1\0");
+    hash_manifest_value(&mut digest, super::AIRCRAFT_RECORD_HASH_DOMAIN);
     for value in [
         metadata.snapshot_date.as_str(),
         metadata.source_url.as_str(),
@@ -1434,7 +1435,8 @@ fn aircraft_projection_digest(
     year_manufactured: Option<u16>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"aircost-faa-master-retained-aircraft-projection-v1\0");
+    digest.update(super::AIRCRAFT_RECORD_HASH_DOMAIN.as_bytes());
+    digest.update([0]);
     hash_manifest_value(&mut digest, n_number);
     hash_optional_manifest_value(&mut digest, manufacturer_serial_raw);
     hash_optional_manifest_value(&mut digest, manufacturer_serial_key);

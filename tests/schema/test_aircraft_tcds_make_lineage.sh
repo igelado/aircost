@@ -170,12 +170,13 @@ INSERT INTO faa_registry_snapshots (
   evidence_source_id, snapshot_date, source_url, archive_sha256,
   source_manifest_sha256, target_set_sha256, master_member_name,
   master_member_sha256, aircraft_member_name, aircraft_member_sha256,
-  engine_member_name, engine_member_sha256
+  engine_member_name, engine_member_sha256, record_hash_domain
 )
 SELECT id, '2026-07-22', source_url, content_sha256,
   printf('%064d', 3), printf('%064d', 4), 'MASTER.txt',
   printf('%064d', 5), 'ACFTREF.txt', printf('%064d', 6),
-  'ENGINE.txt', printf('%064d', 7)
+  'ENGINE.txt', printf('%064d', 7),
+  'aircost-faa-master-retained-aircraft-projection-v1'
 FROM curation_evidence_sources WHERE source_title='FAA registry fixture';
 INSERT INTO faa_registry_aircraft (
   snapshot_id, n_number, manufacturer_serial_raw, manufacturer_serial_key,

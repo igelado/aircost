@@ -5302,6 +5302,9 @@ CREATE TABLE IF NOT EXISTS faa_registry_snapshots (
   engine_member_name TEXT NOT NULL CHECK (engine_member_name = 'ENGINE.txt'),
   engine_member_sha256 TEXT NOT NULL,
   imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  record_hash_domain TEXT NOT NULL CHECK (
+    record_hash_domain = 'aircost-faa-master-retained-aircraft-projection-v1'
+  ),
   UNIQUE (archive_sha256, target_set_sha256),
   CHECK (snapshot_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
   CHECK (source_url LIKE 'https://faa.gov/%' OR source_url LIKE 'https://%.faa.gov/%'),
@@ -5455,6 +5458,16 @@ BEGIN SELECT RAISE(ABORT, 'FAA registry coverage is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS faa_registry_coverage_immutable_delete
 BEFORE DELETE ON faa_registry_coverage
 BEGIN SELECT RAISE(ABORT, 'FAA registry coverage is immutable'); END;
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260820_faa_record_hash_domain',
+  1,
+  'f124f573bf705da6c1e4b0a5c7a8df45ea5a4a5dc009a28eee012be42c691502',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;
 
 
 

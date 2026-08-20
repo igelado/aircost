@@ -6,7 +6,7 @@ use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Sqlite, SqlitePool};
 
 use crate::db::{AppDb, DatabaseBackend};
 
-use super::{Release, Snapshot};
+use super::{Release, Snapshot, AIRCRAFT_RECORD_HASH_DOMAIN};
 
 const INSERT_BATCH_SIZE: usize = 500;
 
@@ -49,8 +49,8 @@ async fn store_sqlite(pool: &SqlitePool, release: &Release) -> Result<StoredSnap
           evidence_source_id, snapshot_date, source_url, archive_sha256, source_manifest_sha256,
           target_set_sha256, master_member_name, master_member_sha256,
           aircraft_member_name, aircraft_member_sha256,
-          engine_member_name, engine_member_sha256
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          engine_member_name, engine_member_sha256, record_hash_domain
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (archive_sha256, target_set_sha256) DO NOTHING
         RETURNING id
         "#,
@@ -67,6 +67,7 @@ async fn store_sqlite(pool: &SqlitePool, release: &Release) -> Result<StoredSnap
     .bind(&release.aircraft_reference.sha256)
     .bind(&release.engine_reference.member_name)
     .bind(&release.engine_reference.sha256)
+    .bind(AIRCRAFT_RECORD_HASH_DOMAIN)
     .fetch_optional(&mut *transaction)
     .await?;
     let Some(snapshot_id) = snapshot_id else {
@@ -114,8 +115,8 @@ async fn store_postgres(pool: &PgPool, release: &Release) -> Result<StoredSnapsh
           evidence_source_id, snapshot_date, source_url, archive_sha256, source_manifest_sha256,
           target_set_sha256, master_member_name, master_member_sha256,
           aircraft_member_name, aircraft_member_sha256,
-          engine_member_name, engine_member_sha256
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          engine_member_name, engine_member_sha256, record_hash_domain
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (archive_sha256, target_set_sha256) DO NOTHING
         RETURNING id
         "#,
@@ -132,6 +133,7 @@ async fn store_postgres(pool: &PgPool, release: &Release) -> Result<StoredSnapsh
     .bind(&release.aircraft_reference.sha256)
     .bind(&release.engine_reference.member_name)
     .bind(&release.engine_reference.sha256)
+    .bind(AIRCRAFT_RECORD_HASH_DOMAIN)
     .fetch_optional(&mut *transaction)
     .await?;
     let Some(snapshot_id) = snapshot_id else {
@@ -542,7 +544,7 @@ async fn find_sqlite(
     Ok(sqlx::query_as::<_, StoredRow>(
         r#"
         SELECT id, evidence_source_id, snapshot_date, source_url, archive_sha256, source_manifest_sha256,
-               target_set_sha256,
+               target_set_sha256, record_hash_domain,
                (SELECT count(*) FROM faa_registry_coverage coverage
                 WHERE coverage.snapshot_id = snapshot.id) AS target_count,
                (SELECT count(*) FROM faa_registry_aircraft aircraft
@@ -565,7 +567,7 @@ async fn find_postgres(
     Ok(sqlx::query_as::<_, StoredRow>(
         r#"
         SELECT id, evidence_source_id, snapshot_date, source_url, archive_sha256, source_manifest_sha256,
-               target_set_sha256,
+               target_set_sha256, record_hash_domain,
                (SELECT count(*) FROM faa_registry_coverage coverage
                 WHERE coverage.snapshot_id = snapshot.id) AS target_count,
                (SELECT count(*) FROM faa_registry_aircraft aircraft
@@ -581,8 +583,17 @@ async fn find_postgres(
 }
 
 fn existing_snapshot(row: StoredRow, release: &Release) -> Result<StoredSnapshot> {
+    if row.record_hash_domain != AIRCRAFT_RECORD_HASH_DOMAIN {
+        bail!(
+            "FAA archive projection uses record hash domain {:?}, expected {:?}; remove the projection and regenerate it from the exact release archive",
+            row.record_hash_domain,
+            AIRCRAFT_RECORD_HASH_DOMAIN
+        );
+    }
     if row.source_manifest_sha256 != release.source_manifest_sha256 {
-        bail!("FAA archive projection was already imported with different provenance");
+        bail!(
+            "FAA archive projection was already imported with different provenance; remove the projection and regenerate it from the exact release archive"
+        );
     }
     Ok(StoredSnapshot {
         snapshot: row.snapshot(),
@@ -607,6 +618,7 @@ fn stored_snapshot(
             archive_sha256: release.metadata.archive_sha256.clone(),
             source_manifest_sha256: release.source_manifest_sha256.clone(),
             target_set_sha256: release.target_set_sha256.clone(),
+            record_hash_domain: AIRCRAFT_RECORD_HASH_DOMAIN.to_string(),
         },
         inserted,
         target_count: release.coverage.len(),
@@ -685,6 +697,7 @@ struct StoredRow {
     archive_sha256: String,
     source_manifest_sha256: String,
     target_set_sha256: String,
+    record_hash_domain: String,
     target_count: i64,
     matched_count: i64,
 }
@@ -699,6 +712,7 @@ impl StoredRow {
             archive_sha256: self.archive_sha256.clone(),
             source_manifest_sha256: self.source_manifest_sha256.clone(),
             target_set_sha256: self.target_set_sha256.clone(),
+            record_hash_domain: self.record_hash_domain.clone(),
         }
     }
 }
@@ -760,6 +774,10 @@ mod tests {
         assert!(first.inserted);
         assert_eq!(first.target_count, 1);
         assert_eq!(first.matched_count, 1);
+        assert_eq!(
+            first.snapshot.record_hash_domain,
+            AIRCRAFT_RECORD_HASH_DOMAIN
+        );
 
         let repeated = store_release(&db, &first_release).await.unwrap();
         assert!(!repeated.inserted);
@@ -815,10 +833,11 @@ mod tests {
         .unwrap();
         assert_eq!(registry_rows, 2, "only one matched target per projection");
         assert_eq!(evidence_rows, 1, "same archive reuses exact FAA evidence");
-        let stored_digests = sqlx::query_as::<_, (String, String, String, String)>(
+        let stored_digests = sqlx::query_as::<_, (String, String, String, String, String)>(
             r#"
             SELECT archive_sha256, master_member_sha256,
-                   aircraft_member_sha256, engine_member_sha256
+                   aircraft_member_sha256, engine_member_sha256,
+                   record_hash_domain
             FROM faa_registry_snapshots
             WHERE id = ?
             "#,
@@ -831,6 +850,7 @@ mod tests {
         assert_eq!(stored_digests.1, expanded_release.master.sha256);
         assert_eq!(stored_digests.2, expanded_release.aircraft_reference.sha256);
         assert_eq!(stored_digests.3, expanded_release.engine_reference.sha256);
+        assert_eq!(stored_digests.4, AIRCRAFT_RECORD_HASH_DOMAIN);
         assert!(
             sqlx::query("UPDATE faa_registry_aircraft SET aircraft_code = 'x'")
                 .execute(pool)
@@ -840,5 +860,29 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn existing_snapshot_rejects_a_different_record_hash_domain() {
+        let release = release(&["N123AB"]);
+        let error = existing_snapshot(
+            StoredRow {
+                id: 1,
+                evidence_source_id: 2,
+                snapshot_date: release.metadata.snapshot_date.clone(),
+                source_url: release.metadata.source_url.clone(),
+                archive_sha256: release.metadata.archive_sha256.clone(),
+                source_manifest_sha256: release.source_manifest_sha256.clone(),
+                target_set_sha256: release.target_set_sha256.clone(),
+                record_hash_domain: "legacy-or-mismatched-domain".to_string(),
+                target_count: 1,
+                matched_count: 1,
+            },
+            &release,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("record hash domain"), "{error}");
+        assert!(error.contains("exact release archive"), "{error}");
     }
 }

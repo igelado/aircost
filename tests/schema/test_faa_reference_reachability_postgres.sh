@@ -8,6 +8,13 @@ reset_current_schema() {
   psql "$database_url" -v ON_ERROR_STOP=1 -q \
     -c 'DROP SCHEMA IF EXISTS attacker CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
   psql "$database_url" -v ON_ERROR_STOP=1 -q -f schema/postgres.sql
+  psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+DELETE FROM public.schema_migration_contracts
+WHERE migration_name = '20260820_faa_record_hash_domain';
+ALTER TABLE public.faa_registry_snapshots
+  DROP CONSTRAINT faa_registry_snapshots_record_hash_domain_check;
+ALTER TABLE public.faa_registry_snapshots DROP COLUMN record_hash_domain;
+SQL
 }
 
 downgrade_to_pre_v1() {
@@ -151,6 +158,72 @@ psql "$database_url" -v ON_ERROR_STOP=1 -q \
   -f tests/schema/faa_reference_reachability.postgres.sql
 psql "$database_url" -v ON_ERROR_STOP=1 -q \
   -f migrations/20260819_faa_reference_reachability.postgres.sql
+
+# Exact reruns preserve the original installation timestamp.
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c "UPDATE public.schema_migration_contracts SET installed_at = '2000-01-01' WHERE migration_name = '20260819_faa_reference_reachability'"
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -f migrations/20260819_faa_reference_reachability.postgres.sql
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
+  -c "SELECT installed_at FROM public.schema_migration_contracts WHERE migration_name = '20260819_faa_reference_reachability'" \
+  | grep -qx '2000-01-01'
+
+# A hostile caller search_path cannot make a same-named attacker parent satisfy
+# the marker-present FK contract, and the failed migration changes nothing.
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE SCHEMA attacker;
+CREATE TABLE attacker.faa_registry_snapshots (id BIGINT PRIMARY KEY);
+ALTER TABLE public.faa_registry_coverage
+  DROP CONSTRAINT faa_registry_coverage_snapshot_id_fkey;
+SET search_path = attacker, public;
+ALTER TABLE public.faa_registry_coverage
+  ADD CONSTRAINT faa_registry_coverage_snapshot_id_fkey
+  FOREIGN KEY (snapshot_id) REFERENCES faa_registry_snapshots(id)
+  ON DELETE RESTRICT;
+RESET search_path;
+SQL
+expect_migration_failure attacker-parent-current
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx 'attacker:1'
+SELECT referenced_namespace.nspname || ':' || (EXISTS (
+  SELECT 1 FROM public.schema_migration_contracts
+  WHERE migration_name = '20260819_faa_reference_reachability'
+))::int
+FROM pg_catalog.pg_constraint constraint_row
+JOIN pg_catalog.pg_class referenced_relation
+  ON referenced_relation.oid = constraint_row.confrelid
+JOIN pg_catalog.pg_namespace referenced_namespace
+  ON referenced_namespace.oid = referenced_relation.relnamespace
+WHERE constraint_row.conrelid = pg_catalog.to_regclass('public.faa_registry_coverage')
+  AND constraint_row.conname = 'faa_registry_coverage_snapshot_id_fkey';
+SQL
+
+reset_current_schema
+downgrade_to_pre_v1
+psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE SCHEMA attacker;
+CREATE TABLE attacker.faa_registry_snapshots (id BIGINT PRIMARY KEY);
+ALTER TABLE public.faa_registry_coverage
+  DROP CONSTRAINT faa_registry_coverage_snapshot_id_fkey;
+SET search_path = attacker, public;
+ALTER TABLE public.faa_registry_coverage
+  ADD CONSTRAINT faa_registry_coverage_snapshot_id_fkey
+  FOREIGN KEY (snapshot_id) REFERENCES faa_registry_snapshots(id)
+  ON DELETE RESTRICT;
+RESET search_path;
+SQL
+expect_migration_failure attacker-parent-old
+assert_pre_v1_survived_rollback
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx 'attacker'
+SELECT referenced_namespace.nspname
+FROM pg_catalog.pg_constraint constraint_row
+JOIN pg_catalog.pg_class referenced_relation
+  ON referenced_relation.oid = constraint_row.confrelid
+JOIN pg_catalog.pg_namespace referenced_namespace
+  ON referenced_namespace.oid = referenced_relation.relnamespace
+WHERE constraint_row.conrelid = pg_catalog.to_regclass('public.faa_registry_coverage')
+  AND constraint_row.conname = 'faa_registry_coverage_snapshot_id_fkey';
+SQL
 
 # A marker-present current schema is accepted only while its objects remain
 # exact. Tampering fails before the migration can replace the damaged object.

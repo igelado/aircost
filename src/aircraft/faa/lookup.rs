@@ -404,7 +404,7 @@ async fn latest_snapshot(db: &AppDb) -> Result<Option<Snapshot>> {
     let sql = db.sql(
         r#"
         SELECT id, evidence_source_id, snapshot_date, source_url, archive_sha256,
-               source_manifest_sha256, target_set_sha256
+               source_manifest_sha256, target_set_sha256, record_hash_domain
         FROM faa_registry_snapshots
         ORDER BY snapshot_date DESC, id DESC
         LIMIT 1
@@ -458,12 +458,13 @@ async fn covering_projection(
         r#"
         SELECT snapshot.id, snapshot.evidence_source_id, snapshot.snapshot_date, snapshot.source_url,
                snapshot.archive_sha256, snapshot.source_manifest_sha256,
-               snapshot.target_set_sha256
+               snapshot.target_set_sha256, snapshot.record_hash_domain
         FROM faa_registry_snapshots snapshot
         JOIN faa_registry_coverage coverage
           ON coverage.snapshot_id = snapshot.id
          AND coverage.n_number = ?
         WHERE snapshot.snapshot_date = ? AND snapshot.archive_sha256 = ?
+          AND snapshot.record_hash_domain = ?
         ORDER BY (
           SELECT count(*) FROM faa_registry_coverage target
           WHERE target.snapshot_id = snapshot.id
@@ -477,6 +478,7 @@ async fn covering_projection(
                 .bind(n_number)
                 .bind(&latest_release.snapshot_date)
                 .bind(&latest_release.archive_sha256)
+                .bind(&latest_release.record_hash_domain)
                 .fetch_optional(pool)
                 .await?
         }
@@ -485,6 +487,7 @@ async fn covering_projection(
                 .bind(n_number)
                 .bind(&latest_release.snapshot_date)
                 .bind(&latest_release.archive_sha256)
+                .bind(&latest_release.record_hash_domain)
                 .fetch_optional(pool)
                 .await?
         }
@@ -513,6 +516,7 @@ struct SnapshotRow {
     archive_sha256: String,
     source_manifest_sha256: String,
     target_set_sha256: String,
+    record_hash_domain: String,
 }
 
 impl From<SnapshotRow> for Snapshot {
@@ -525,6 +529,7 @@ impl From<SnapshotRow> for Snapshot {
             archive_sha256: row.archive_sha256,
             source_manifest_sha256: row.source_manifest_sha256,
             target_set_sha256: row.target_set_sha256,
+            record_hash_domain: row.record_hash_domain,
         }
     }
 }
@@ -618,6 +623,7 @@ mod tests {
             archive_sha256: "a".repeat(64),
             source_manifest_sha256: "b".repeat(64),
             target_set_sha256: "c".repeat(64),
+            record_hash_domain: crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN.to_string(),
         };
         let grounding = AircraftGrounding {
             snapshot: snapshot.clone(),

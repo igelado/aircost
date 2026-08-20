@@ -206,49 +206,8 @@ async fn main() -> Result<()> {
             explicit_targets,
             apply,
         } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
-            let targets = FaaImportTargets::merge(listing_targets(&db).await?, explicit_targets);
-            if targets.n_numbers.is_empty() {
-                bail!(
-                    "the database and --include-n-number arguments have no valid N-number targets for an FAA import"
-                );
-            }
-            let parse_targets = targets.n_numbers.clone();
-            let release = tokio::task::spawn_blocking(move || -> Result<_> {
-                let archive_file = File::open(&archive).with_context(|| {
-                    format!("could not open FAA release ZIP {}", archive.display())
-                })?;
-                parse_release_archive(archive_file, &parse_targets)
-            })
-            .await
-            .context("FAA registry parser task failed")??;
-            let release_summary = release.summary();
-            let stored = if apply {
-                Some(store_release(&db, &release).await?)
-            } else {
-                None
-            };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "dry_run": !apply,
-                    "listing_targets": targets.listing_targets,
-                    "explicit_targets": targets.explicit_targets,
-                    "snapshot_date": release_summary.snapshot_date,
-                    "source_url": release_summary.source_url,
-                    "archive_sha256": release_summary.archive_sha256,
-                    "source_manifest_sha256": release_summary.source_manifest_sha256,
-                    "target_set_sha256": release_summary.target_set_sha256,
-                    "member_sha256": release_summary.member_sha256,
-                    "target_count": release_summary.target_count,
-                    "matched_count": release_summary.matched_count,
-                    "absent_count": release_summary.absent_count,
-                    "aircraft_reference_count": release_summary.aircraft_reference_count,
-                    "engine_reference_count": release_summary.engine_reference_count,
-                    "stored": stored,
-                    "canonical_catalog_writes": 0,
-                }))?
-            );
+            let report = import_faa_registry(database, archive, explicit_targets, apply).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         AdminCommand::CurateAircraftHierarchy {
             database,
@@ -689,6 +648,58 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn import_faa_registry(
+    database: String,
+    archive: PathBuf,
+    explicit_targets: ExplicitNNumberTargets,
+    apply: bool,
+) -> Result<serde_json::Value> {
+    let db = if apply {
+        aircost_rs::db::AppDb::connect(&database).await?
+    } else {
+        aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+    };
+    let targets = FaaImportTargets::merge(listing_targets(&db).await?, explicit_targets);
+    if targets.n_numbers.is_empty() {
+        bail!(
+            "the database and --include-n-number arguments have no valid N-number targets for an FAA import"
+        );
+    }
+    let parse_targets = targets.n_numbers.clone();
+    let release = tokio::task::spawn_blocking(move || -> Result<_> {
+        let archive_file = File::open(&archive)
+            .with_context(|| format!("could not open FAA release ZIP {}", archive.display()))?;
+        parse_release_archive(archive_file, &parse_targets)
+    })
+    .await
+    .context("FAA registry parser task failed")??;
+    let release_summary = release.summary();
+    let stored = if apply {
+        Some(store_release(&db, &release).await?)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "dry_run": !apply,
+        "listing_targets": targets.listing_targets,
+        "explicit_targets": targets.explicit_targets,
+        "snapshot_date": release_summary.snapshot_date,
+        "source_url": release_summary.source_url,
+        "archive_sha256": release_summary.archive_sha256,
+        "source_manifest_sha256": release_summary.source_manifest_sha256,
+        "target_set_sha256": release_summary.target_set_sha256,
+        "record_hash_domain": release_summary.record_hash_domain,
+        "member_sha256": release_summary.member_sha256,
+        "target_count": release_summary.target_count,
+        "matched_count": release_summary.matched_count,
+        "absent_count": release_summary.absent_count,
+        "aircraft_reference_count": release_summary.aircraft_reference_count,
+        "engine_reference_count": release_summary.engine_reference_count,
+        "stored": stored,
+        "canonical_catalog_writes": 0,
+    }))
 }
 
 #[derive(Debug)]
@@ -2113,7 +2124,42 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
     use super::*;
+
+    fn unique_test_path(label: &str, extension: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "aircost-admin-{label}-{}-{nonce}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    fn write_faa_archive_fixture(path: &PathBuf) {
+        const MASTER: &str = "\u{feff}N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR,NAME,STREET,MODE S CODE\n123AB,182-01234,2072738,41528,2006,PRIVATE OWNER,SECRET ADDRESS,50000000\n";
+        const AIRCRAFT: &str = "\u{feff}CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED,TC-DATA-SHEET,TC-DATA-HOLDER\n2072738,CESSNA AIRCRAFT CO,182T,4,1,1,0,01,004,CLASS 1,0145,3A13,TEXTRON AVIATION INC\n";
+        const ENGINE: &str = "\u{feff}CODE,MFR,MODEL,TYPE,HORSEPOWER,THRUST\n41528,LYCOMING,IO-540-AB1A5,1,00230,000000\n";
+        let file = File::create(path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, contents) in [
+            ("MASTER.txt", MASTER),
+            ("ACFTREF.txt", AIRCRAFT),
+            ("ENGINE.txt", ENGINE),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
 
     fn operator_tcds_args() -> Vec<String> {
         [
@@ -2169,6 +2215,112 @@ mod tests {
         assert_eq!(archive, PathBuf::from("/tmp/ReleasableAircraft.zip"));
         assert_eq!(explicit_targets, ExplicitNNumberTargets::default());
         assert!(!apply);
+    }
+
+    #[tokio::test]
+    async fn import_faa_registry_dry_run_keeps_existing_sqlite_byte_exact() {
+        let database_path = unique_test_path("faa-dry-run", "sqlite3");
+        let archive_path = unique_test_path("faa-dry-run", "zip");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let db = aircost_rs::db::AppDb::connect(&database_url).await.unwrap();
+        db.close().await;
+        write_faa_archive_fixture(&archive_path);
+        let before = fs::read(&database_path).unwrap();
+
+        let report = import_faa_registry(
+            database_url,
+            archive_path.clone(),
+            ExplicitNNumberTargets::parse(vec!["N123AB".to_string()]).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["stored"], serde_json::Value::Null);
+        assert_eq!(fs::read(&database_path).unwrap(), before);
+        assert!(!PathBuf::from(format!("{}-wal", database_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", database_path.display())).exists());
+        fs::remove_file(database_path).unwrap();
+        fs::remove_file(archive_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_faa_registry_dry_run_keeps_missing_sqlite_absent() {
+        let database_path = unique_test_path("faa-dry-run-missing", "sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        assert!(!database_path.exists());
+        let error = import_faa_registry(
+            database_url,
+            unique_test_path("unused-faa-dry-run", "zip"),
+            ExplicitNNumberTargets::parse(vec!["N123AB".to_string()]).unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("could not open diagnostic SQLite database"));
+        assert!(!database_path.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn import_faa_registry_dry_run_keeps_postgres_rows_and_markers_unchanged() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let archive_path = unique_test_path("faa-pg-dry-run", "zip");
+        write_faa_archive_fixture(&archive_path);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let before_counts = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT (SELECT count(*) FROM public.faa_registry_snapshots), \
+                    (SELECT count(*) FROM public.curation_evidence_sources)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let before_markers = sqlx::query_as::<_, (String, String)>(
+            "SELECT migration_name, installed_at FROM public.schema_migration_contracts \
+             WHERE migration_name IN \
+               ('20260819_faa_reference_reachability', '20260820_faa_record_hash_domain') \
+             ORDER BY migration_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let report = import_faa_registry(
+            database_url,
+            archive_path.clone(),
+            ExplicitNNumberTargets::parse(vec!["N123AB".to_string()]).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["stored"], serde_json::Value::Null);
+        let after_counts = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT (SELECT count(*) FROM public.faa_registry_snapshots), \
+                    (SELECT count(*) FROM public.curation_evidence_sources)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let after_markers = sqlx::query_as::<_, (String, String)>(
+            "SELECT migration_name, installed_at FROM public.schema_migration_contracts \
+             WHERE migration_name IN \
+               ('20260819_faa_reference_reachability', '20260820_faa_record_hash_domain') \
+             ORDER BY migration_name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after_counts, before_counts);
+        assert_eq!(after_markers, before_markers);
+        pool.close().await;
+        fs::remove_file(archive_path).unwrap();
     }
 
     #[test]
