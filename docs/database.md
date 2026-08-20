@@ -125,11 +125,12 @@ from the submission when extraction succeeds.
 `listing_replay_runs`, `listing_replay_run_items`,
 `plugin_submission_materialization_receipts`
 
-Coordinate manifest-backed clean replay without copying capture or provider
-payloads. A run pins the trusted-manifest version, SHA-256, and member count and
-holds an owner-token heartbeat while active. Each unique run/submission member
-stores the expected capture SHA-256, independent typed extraction and
-materialization state, the exact successful extraction-checkpoint SHA-256,
+Coordinate manifest-backed clean replay without copying HTML or raw provider
+response envelopes into the replay ledger. A run pins the trusted-manifest
+version, SHA-256, and member count and holds an owner-token heartbeat while
+active. Each unique run/submission member stores the expected capture SHA-256,
+independent typed extraction and materialization state, the exact normalized
+successful extraction JSON and its checkpoint SHA-256 for immutable resume,
 attempts/timestamps, an optional resulting listing ID, and closed terminal
 rejection or retry-failure codes. A partial unique index
 permits one active replay owner across processes. Explicit stale recovery

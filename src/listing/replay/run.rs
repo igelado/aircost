@@ -1,8 +1,9 @@
 //! Durable, resumable coordination for trusted-capture replay.
 //!
-//! The ledger stores only manifest correlation, typed operational state, and
-//! bounded outcome codes. Capture bytes and extraction/provider payloads stay
-//! in `plugin_submissions` and the existing domain stores.
+//! The ledger stores manifest correlation, typed operational state, bounded
+//! outcome codes, and the exact normalized successful extraction JSON with its
+//! SHA-256 for immutable resume. It does not copy HTML or raw provider response
+//! envelopes from `plugin_submissions` and the existing domain stores.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
