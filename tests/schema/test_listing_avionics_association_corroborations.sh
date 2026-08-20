@@ -105,16 +105,18 @@ test -z "$(sqlite3 "$migration_database" "PRAGMA foreign_key_check")"
 
 sqlite3 -bail "$schema_database" \
   ".read $repository_root/schema/sqlite.sql"
+
+# This migration remains executable as the verified predecessor for upgrades,
+# but the canonical schema completed the authorization cutover and must not
+# recreate its retired corroboration objects.
 test "$(sqlite3 "$schema_database" \
-  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='aircraft_sale_listing_avionics_corroborations'")" = "1"
+  "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='aircraft_sale_listing_avionics_corroborations'")" = "0"
 test "$(sqlite3 "$schema_database" \
-  "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'listing_avionics_corroborations_%'")" = "3"
+  "SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'listing_avionics_corroborations_%'")" = "0"
 
 for definition in \
   "$repository_root/migrations/20260805_listing_avionics_association_corroborations.sqlite.sql" \
-  "$repository_root/migrations/20260805_listing_avionics_association_corroborations.postgres.sql" \
-  "$repository_root/schema/sqlite.sql" \
-  "$repository_root/schema/postgres.sql"
+  "$repository_root/migrations/20260805_listing_avionics_association_corroborations.postgres.sql"
 do
   rg -Uq \
     'AFTER UPDATE OF[[:space:]]+aircraft_sale_listing_id,[[:space:]]+avionics_model_id' \
@@ -123,9 +125,7 @@ done
 
 for definition in \
   "$repository_root/migrations/20260805_listing_avionics_association_corroborations.sqlite.sql" \
-  "$repository_root/migrations/20260805_listing_avionics_association_corroborations.postgres.sql" \
-  "$repository_root/schema/sqlite.sql" \
-  "$repository_root/schema/postgres.sql"
+  "$repository_root/migrations/20260805_listing_avionics_association_corroborations.postgres.sql"
 do
   rg -q \
     '20260805_listing_avionics_association_corroborations' \
