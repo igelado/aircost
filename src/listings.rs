@@ -791,6 +791,80 @@ pub(crate) async fn resume_signed_source_correction_listing(
     })
 }
 
+/// Deterministically rebuild every mutable child projection for an already
+/// atomically bound replay listing. The capture binding is only an ownership
+/// anchor; callers must not treat it as proof that materialization completed.
+pub(crate) async fn resume_bound_replay_listing(
+    db: &AppDb,
+    user_id: i64,
+    listing_id: i64,
+    preview: &ListingPreview,
+    extractor: Option<&GeminiListingExtractor>,
+) -> StoreResult<ListingCreationResult> {
+    let current = get_listing(db, user_id, listing_id).await?;
+    if current.ingestion_error.as_deref() == Some(SOURCE_IDENTITY_RECEIPT_PENDING) {
+        return resume_signed_source_correction_listing(
+            db, user_id, listing_id, preview, extractor,
+        )
+        .await;
+    }
+
+    let mut values = values_from_preview(preview, None)?;
+    let literal_identity_values = values.clone();
+    let admission = admit_aircraft_source_identity(
+        db,
+        values.registration_number.as_deref(),
+        values.serial_number.as_deref(),
+        preview.context_text.as_deref(),
+    )
+    .await
+    .map_err(listing_admission_error)?;
+    if admission.serial_correction.is_some() {
+        return Err(ListingStoreError::State(
+            "a replay listing requiring an FAA serial correction is missing its receipt gate"
+                .to_string(),
+        ));
+    }
+    apply_faa_grounding_identity(&mut values, &admission.grounding);
+    if current.created_by_user_id != user_id || current.source_url != values.source_url {
+        return Err(ListingStoreError::State(format!(
+            "bound replay listing {listing_id} changed before deterministic recovery"
+        )));
+    }
+    let resolved_avionics = resolve_listing_avionics_values(
+        db,
+        &mut values,
+        extractor,
+        preview.source_url.as_deref(),
+        preview.context_text.as_deref(),
+    )
+    .await?;
+    update_listing_values(
+        db,
+        listing_id,
+        &values,
+        &literal_identity_values,
+        false,
+        true,
+        false,
+    )
+    .await?;
+    replace_listing_pending_review(
+        db,
+        listing_id,
+        &resolved_avionics.pending_review_aspects,
+        false,
+    )
+    .await?;
+    finalize_listing_ingestion(db, listing_id, extractor, preview.context_text.as_deref()).await?;
+    Ok(ListingCreationResult {
+        listing: get_listing(db, user_id, listing_id).await?,
+        occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+        source_serial_correction: None,
+        created_new_listing: false,
+    })
+}
+
 pub(crate) async fn finalize_signed_source_listing_after_receipt(
     db: &AppDb,
     user_id: i64,
@@ -1063,12 +1137,6 @@ async fn insert_listing(
     source_identity_receipt_pending: bool,
     signed_source_binding: Option<&SignedSourceListingBinding>,
 ) -> StoreResult<i64> {
-    if signed_source_binding.is_some() && !source_identity_receipt_pending {
-        return Err(ListingStoreError::State(
-            "a signed-source binding may be attached here only to a receipt-gated correction"
-                .to_string(),
-        ));
-    }
     let aircraft_model_variant_id = pending_aircraft_compatibility_variant_id(db).await?;
     let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
     let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;

@@ -39,6 +39,7 @@ use aircost_rs::gemini::interactions::GeminiInteractionsClient;
 use aircost_rs::gemini::live_benchmark::LiveBenchmarkRunner;
 use aircost_rs::gemini::usage::Store as GeminiUsageStore;
 use aircost_rs::listing::backfill::{default_stage_limit, stage_legacy_listing_reviews};
+use aircost_rs::listing::replay::run::{replay_captures, ReplayCapturesRequest, ReplayPhase};
 use aircost_rs::listing::replay::{
     build_trusted_capture_manifest, import_trusted_capture_manifest,
     reconcile_replay_occurrence_dispositions, trusted_bound_capture_ids, TrustedCaptureManifest,
@@ -115,10 +116,49 @@ async fn main() -> Result<()> {
                     format!("could not read replay manifest {}", manifest.display())
                 })?)?;
             let source = aircost_rs::db::AppDb::connect_diagnostic(&source_database).await?;
-            let target = aircost_rs::db::AppDb::connect(&database).await?;
+            let target = if apply {
+                aircost_rs::db::AppDb::connect(&database).await?
+            } else {
+                aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+            };
             let report = import_trusted_capture_manifest(&source, &target, &manifest, apply)
                 .await
                 .map_err(anyhow::Error::msg)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AdminCommand::ReplayCaptures {
+            database,
+            manifest,
+            phase,
+            submission_id,
+            apply,
+            recover_stale,
+        } => {
+            let manifest: TrustedCaptureManifest =
+                serde_json::from_slice(&fs::read(&manifest).with_context(|| {
+                    format!("could not read replay manifest {}", manifest.display())
+                })?)?;
+            let db = if apply {
+                aircost_rs::db::AppDb::connect(&database).await?
+            } else {
+                aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+            };
+            let extractor = apply
+                .then(|| GeminiListingExtractor::from_environment_with_usage(&db))
+                .transpose()?;
+            let report = replay_captures(
+                &db,
+                extractor.as_ref(),
+                &ReplayCapturesRequest {
+                    manifest: &manifest,
+                    phase,
+                    submission_id,
+                    apply,
+                    recover_stale,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         AdminCommand::ReplayExtraction {
@@ -126,7 +166,11 @@ async fn main() -> Result<()> {
             submission_id,
             apply,
         } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let db = if apply {
+                aircost_rs::db::AppDb::connect(&database).await?
+            } else {
+                aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+            };
             let user = plugin_submission_owner(&db, submission_id).await?;
             if apply {
                 let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
@@ -156,7 +200,11 @@ async fn main() -> Result<()> {
             submission_id,
             apply,
         } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let db = if apply {
+                aircost_rs::db::AppDb::connect(&database).await?
+            } else {
+                aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+            };
             let owner = plugin_submission_owner(&db, submission_id).await?;
             let report = reconcile_replay_occurrence_dispositions(
                 &db,
@@ -174,7 +222,11 @@ async fn main() -> Result<()> {
             submission_id,
             apply,
         } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let db = if apply {
+                aircost_rs::db::AppDb::connect(&database).await?
+            } else {
+                aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+            };
             let owner = plugin_submission_owner(&db, submission_id).await?;
             if apply {
                 let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
@@ -720,6 +772,14 @@ enum AdminCommand {
         manifest: PathBuf,
         apply: bool,
     },
+    ReplayCaptures {
+        database: String,
+        manifest: PathBuf,
+        phase: ReplayPhase,
+        submission_id: Option<i64>,
+        apply: bool,
+        recover_stale: bool,
+    },
     ReplayExtraction {
         database: String,
         submission_id: i64,
@@ -929,6 +989,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     match command.as_str() {
         "export-replay-manifest" => parse_export_replay_manifest_args(args),
         "import-replay-manifest" => parse_import_replay_manifest_args(args),
+        "replay-captures" => parse_replay_captures_args(args),
         "replay-extraction" => parse_replay_extraction_args(args),
         "reconcile-replay-avionics" => parse_reconcile_replay_avionics_args(args),
         "replay-listing" => parse_replay_listing_args(args),
@@ -1043,6 +1104,66 @@ fn parse_import_replay_manifest_args(
         database: database_url_from_arg(database),
         manifest: manifest.context("--manifest is required")?,
         apply,
+    })
+}
+
+fn parse_replay_captures_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut manifest = None;
+    let mut phase = None;
+    let mut submission_id = None;
+    let mut apply = false;
+    let mut recover_stale = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--manifest" => {
+                manifest = Some(PathBuf::from(
+                    args.next().context("--manifest requires a value")?,
+                ));
+            }
+            "--phase" => {
+                let value = args.next().context("--phase requires a value")?;
+                phase = Some(match value.as_str() {
+                    "extraction" => ReplayPhase::Extraction,
+                    "materialization" => ReplayPhase::Materialization,
+                    _ => bail!("--phase must be extraction or materialization"),
+                });
+            }
+            "--submission-id" => {
+                let value = args.next().context("--submission-id requires a value")?;
+                submission_id = Some(
+                    value
+                        .parse::<i64>()
+                        .with_context(|| format!("invalid --submission-id value: {value}"))?,
+                );
+            }
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--recover-stale" => recover_stale = true,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown replay-captures argument: {arg}"),
+        }
+    }
+    if submission_id.is_some_and(|id| id <= 0) {
+        bail!("--submission-id must be positive");
+    }
+    if recover_stale && !apply {
+        bail!("--recover-stale requires --apply");
+    }
+    Ok(AdminCommand::ReplayCaptures {
+        database: database_url_from_arg(database),
+        manifest: manifest.context("--manifest is required")?,
+        phase: phase.context("--phase is required")?,
+        submission_id,
+        apply,
+        recover_stale,
     })
 }
 
@@ -2931,6 +3052,30 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         assert!(matches!(
             import,
             AdminCommand::ImportReplayManifest { apply: false, .. }
+        ));
+        let batch = parse_args(
+            [
+                "replay-captures",
+                "--manifest",
+                "/tmp/captures.json",
+                "--phase",
+                "materialization",
+                "--submission-id",
+                "7",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            batch,
+            AdminCommand::ReplayCaptures {
+                phase: ReplayPhase::Materialization,
+                submission_id: Some(7),
+                apply: false,
+                recover_stale: false,
+                ..
+            }
         ));
         let extraction = parse_args(
             ["replay-extraction", "--submission-id", "7"]

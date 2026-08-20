@@ -122,7 +122,8 @@ Store Chrome extension registrations and submitted rendered HTML. Submissions
 retain the HTML, extraction result or error, and the canonical listing created
 from the submission when extraction succeeds.
 
-`listing_replay_runs`, `listing_replay_run_items`
+`listing_replay_runs`, `listing_replay_run_items`,
+`plugin_submission_materialization_receipts`
 
 Coordinate manifest-backed clean replay without copying capture or provider
 payloads. A run pins the trusted-manifest version, SHA-256, and member count and
@@ -133,9 +134,13 @@ attempts/timestamps, an optional resulting listing ID, and closed terminal
 rejection or retry-failure codes. A partial unique index
 permits one active replay owner across processes. Explicit stale recovery
 fences the prior token; loss of ownership cancels the in-flight operation, and
-checkpoint and binding state are re-derived from `plugin_submissions` before a
-provider-backed retry. Checkpoint storage is first-writer immutable, and
-materialization compare-and-sets against the member's pinned checkpoint hash.
+checkpoint and exact completion state are re-derived before a provider-backed
+retry. Listing insertion and capture binding commit atomically. Binding alone
+does not imply completion: the exact receipt stores the bound listing plus
+rendered-capture and extraction-checkpoint hashes only after review and
+occurrence child projections finish. Checkpoint storage is first-writer
+immutable, and materialization compare-and-sets against the member's pinned
+checkpoint hash.
 The optional resulting
 listing foreign key uses `ON DELETE SET NULL`, so this operational history does
 not prevent ordinary listing deletion. Startup attests both complete replay

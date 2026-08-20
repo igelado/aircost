@@ -93,9 +93,15 @@ aircost-admin replay-captures --database SHADOW --manifest captures.json \
 The default is provider-free and read-only. `--submission-id ID` restricts one
 invocation without changing the manifest-backed run membership. Apply records
 independent extraction and materialization states, attempts, and timestamps.
+Dry-run opens the installed target through a no-initialize diagnostic
+connection, attests its schema contracts, and performs no seed, schema,
+migration-contract timestamp, or ledger writes.
 Before any provider-backed retry, it derives an already-committed checkpoint or
-capture binding from the authoritative submission and completes the ledger
-without repeating that work. Each successful extraction also pins the exact
+exact materialization-completion receipt from the authoritative stores and
+completes the ledger without repeating that work. A capture binding alone is
+only a resumable ownership anchor: if its receipt is absent, replay rebuilds
+the deterministic child projections and records completion last. Each
+successful extraction also pins the exact
 checkpoint SHA-256 in the run member; materialization refuses a different
 payload even when the signed capture itself is unchanged.
 
@@ -106,7 +112,8 @@ longer running; after one hour without a heartbeat, repeat the apply command
 with `--recover-stale`. The displaced token cannot commit a later ledger
 transition or replace the first committed extraction checkpoint. Loss of the
 heartbeat/owner lease cancels the in-flight provider operation promptly; resume
-then reconciles any authoritative checkpoint or listing commit before retrying.
+then reconciles any authoritative checkpoint or completion receipt before
+retrying.
 
 Each report includes `gemini_usage` with the explicit
 `manifest_phase_cumulative` scope. A stable correlation ID is derived from the

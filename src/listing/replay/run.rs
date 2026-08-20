@@ -232,7 +232,7 @@ pub async fn replay_captures(
                                 submission_id,
                                 &owner_token,
                                 state.checkpoint.as_ref(),
-                                state.canonical_listing_id,
+                                state.materialization_receipt_listing_id,
                                 )
                                 .await? =>
                             {
@@ -386,7 +386,7 @@ pub async fn replay_captures(
                     }
                 }
                 ReplayPhase::Materialization => {
-                    if let Some(listing_id) = state.canonical_listing_id {
+                    if let Some(listing_id) = state.materialization_receipt_listing_id {
                         finish_succeeded(
                             db,
                             run.id,
@@ -512,7 +512,9 @@ async fn reject_unclaimable_capture(
                extraction_completed_at = CURRENT_TIMESTAMP,
                terminal_rejection_phase = 'extraction',
                terminal_rejection_stage = 'capture_admission',
-               terminal_rejection_reason_code = ?, updated_at = CURRENT_TIMESTAMP
+               terminal_rejection_reason_code = ?,
+               last_failure_phase = NULL, last_failure_reason_code = NULL,
+               updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ? AND plugin_submission_id = ?
              AND extraction_state IN ('queued', 'failed')
              AND materialization_state = 'blocked'
@@ -536,8 +538,10 @@ async fn reject_unclaimable_capture(
 }
 
 /// Reconcile authoritative domain commits before materialization can claim an
-/// item. A bound listing proves both phases succeeded; a valid checkpoint
-/// proves extraction succeeded. The owner token fences a recovered worker.
+/// item. Only an exact completion receipt proves materialization succeeded; a
+/// binding without that receipt is a resumable partial commit. A valid
+/// checkpoint proves extraction succeeded. The owner token fences a recovered
+/// worker.
 async fn reconcile_materialization_domain_state(
     db: &AppDb,
     run_id: i64,
@@ -1356,7 +1360,7 @@ async fn dry_run_report(
                 counts.already_complete += 1
             }
             ReplayPhase::Extraction => counts.ready += 1,
-            ReplayPhase::Materialization if state.canonical_listing_id.is_some() => {
+            ReplayPhase::Materialization if state.materialization_receipt_listing_id.is_some() => {
                 counts.already_complete += 1
             }
             ReplayPhase::Materialization if state.checkpoint.is_some() => counts.ready += 1,
@@ -1490,19 +1494,21 @@ fn sum_optional_usage(
 }
 
 fn validate_closed_rejection(stage: &str, reason_code: &str) -> ReplayRunResult<()> {
-    const STAGES: &[&str] = &["capture_admission", "faa_aircraft_admission"];
-    const CODES: &[&str] = &[
-        "capture_authentication_failed",
-        "capture_not_found",
-        "capture_validation_failed",
-        "missing_registration",
-        "non_n_registration",
-        "invalid_n_number",
-        "serial_conflict",
-    ];
-    if !STAGES.contains(&stage) || !CODES.contains(&reason_code) {
+    let valid = match stage {
+        "capture_admission" => matches!(
+            reason_code,
+            "capture_authentication_failed" | "capture_not_found" | "capture_validation_failed"
+        ),
+        "faa_aircraft_admission" => matches!(
+            reason_code,
+            "missing_registration" | "non_n_registration" | "invalid_n_number" | "serial_conflict"
+        ),
+        _ => false,
+    };
+    if !valid {
         return Err(ReplayRunError::Validation(
-            "replay rejection is outside the closed operational vocabulary".to_string(),
+            "replay rejection stage/reason pairing is outside the closed operational vocabulary"
+                .to_string(),
         ));
     }
     Ok(())
@@ -1916,7 +1922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_listing_binding_closes_both_phases_without_a_provider_retry() {
+    async fn committed_completion_receipt_closes_both_phases_without_a_provider_retry() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let (manifest, submission_id, user) = signed_checkpoint(&db).await;
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -1945,6 +1951,23 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        let state = inspect_plugin_replay_capture_state(&db, user.id, submission_id)
+            .await
+            .unwrap();
+        let checkpoint = state.checkpoint.unwrap();
+        sqlx::query(
+            r#"INSERT INTO plugin_submission_materialization_receipts (
+                 plugin_submission_id, aircraft_sale_listing_id,
+                 rendered_html_sha256, extracted_listing_sha256
+               ) VALUES (?, ?, ?, ?)"#,
+        )
+        .bind(submission_id)
+        .bind(listing_id)
+        .bind(checkpoint.rendered_html_sha256)
+        .bind(checkpoint.extracted_listing_sha256)
+        .execute(pool)
+        .await
+        .unwrap();
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let report = replay_captures(
             &db,
@@ -1978,6 +2001,54 @@ mod tests {
                 0
             )
         );
+    }
+
+    #[tokio::test]
+    async fn binding_without_completion_receipt_remains_ready_for_recovery() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, user) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let variant_id: i64 =
+            sqlx::query_scalar("SELECT id FROM aircraft_model_variants ORDER BY id LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO aircraft_sale_listings (
+                 aircraft_model_variant_id, created_by_user_id, source_url, model_year,
+                 asking_price_usd, airframe_hours
+               ) VALUES (?, ?, 'https://example.test/resumable-capture', 2020, 200000, 500)
+               RETURNING id"#,
+        )
+        .bind(variant_id)
+        .bind(user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE plugin_submissions SET canonical_listing_id = ? WHERE id = ?")
+            .bind(listing_id)
+            .bind(submission_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let report = replay_captures(
+            &db,
+            None,
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Materialization,
+                submission_id: None,
+                apply: false,
+                recover_stale: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.counts.already_complete, 0);
+        assert_eq!(report.counts.ready, 1);
     }
 
     #[tokio::test]

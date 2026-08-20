@@ -23,7 +23,7 @@ use crate::listing::avionics::extraction::validate_unbound_current_avionics_extr
 use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{
     create_listing_with_progress_and_occurrence_dispositions,
-    finalize_signed_source_listing_after_receipt, get_listing,
+    finalize_signed_source_listing_after_receipt, get_listing, resume_bound_replay_listing,
     resume_signed_source_correction_listing, ListingCreationMode, ListingStoreError,
     SignedSourceCheckpointReplacement, SignedSourceListingBinding, SOURCE_IDENTITY_RECEIPT_PENDING,
 };
@@ -277,6 +277,7 @@ pub struct PluginReplayCaptureState {
     pub rendered_html_sha256: String,
     pub checkpoint: Option<PluginExtractionCheckpoint>,
     pub canonical_listing_id: Option<i64>,
+    pub materialization_receipt_listing_id: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -330,6 +331,13 @@ struct PluginCheckpointRow {
 #[derive(Debug, FromRow)]
 struct ListingIdRow {
     id: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct MaterializationReceiptRow {
+    aircraft_sale_listing_id: i64,
+    rendered_html_sha256: String,
+    extracted_listing_sha256: String,
 }
 
 pub async fn plugin_submission_owner(db: &AppDb, submission_id: i64) -> StoreResult<User> {
@@ -1631,6 +1639,100 @@ pub async fn preflight_plugin_submission_extraction(
     })
 }
 
+async fn exact_materialization_receipt_listing_id(
+    db: &AppDb,
+    stored: &PluginCheckpointRow,
+    extracted_listing_sha256: &str,
+) -> StoreResult<Option<i64>> {
+    let receipt = query_as_optional!(
+        db,
+        MaterializationReceiptRow,
+        r#"
+        SELECT aircraft_sale_listing_id, rendered_html_sha256, extracted_listing_sha256
+        FROM plugin_submission_materialization_receipts
+        WHERE plugin_submission_id = ?
+        "#,
+        stored.id
+    )?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    if stored.canonical_listing_id != Some(receipt.aircraft_sale_listing_id)
+        || receipt.rendered_html_sha256 != stored.rendered_html_sha256
+        || receipt.extracted_listing_sha256 != extracted_listing_sha256
+    {
+        return Err(PluginStoreError::Database(
+            "replay materialization receipt does not match its exact bound capture".to_string(),
+        ));
+    }
+    Ok(Some(receipt.aircraft_sale_listing_id))
+}
+
+async fn record_materialization_receipt(
+    db: &AppDb,
+    stored: &PluginCheckpointRow,
+    listing_id: i64,
+    extracted_listing_sha256: &str,
+) -> StoreResult<()> {
+    let sql = db.sql(
+        r#"
+        INSERT INTO plugin_submission_materialization_receipts (
+          plugin_submission_id, aircraft_sale_listing_id,
+          rendered_html_sha256, extracted_listing_sha256
+        )
+        SELECT submission.id, listing.id, submission.rendered_html_sha256, ?
+        FROM plugin_submissions submission
+        JOIN aircraft_sale_listings listing
+          ON listing.id = submission.canonical_listing_id
+        WHERE submission.id = ? AND submission.user_id = ?
+          AND submission.plugin_install_id = ? AND submission.source_url = ?
+          AND submission.rendered_html_sha256 = ? AND submission.signature_base64 = ?
+          AND submission.extracted_listing_json = ? AND submission.extraction_error IS NULL
+          AND submission.canonical_listing_id = ?
+          AND listing.created_by_user_id = submission.user_id
+          AND listing.source_url = submission.source_url
+        ON CONFLICT (plugin_submission_id) DO NOTHING
+        "#,
+    );
+    let changed = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => sqlx::query(&sql)
+            .bind(extracted_listing_sha256)
+            .bind(stored.id)
+            .bind(stored.user_id)
+            .bind(stored.plugin_install_id)
+            .bind(&stored.source_url)
+            .bind(&stored.rendered_html_sha256)
+            .bind(&stored.signature_base64)
+            .bind(stored.extracted_listing_json.as_deref())
+            .bind(listing_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        DatabaseBackend::Postgres(pool) => sqlx::query(&sql)
+            .bind(extracted_listing_sha256)
+            .bind(stored.id)
+            .bind(stored.user_id)
+            .bind(stored.plugin_install_id)
+            .bind(&stored.source_url)
+            .bind(&stored.rendered_html_sha256)
+            .bind(&stored.signature_base64)
+            .bind(stored.extracted_listing_json.as_deref())
+            .bind(listing_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    };
+    if changed == 0
+        && exact_materialization_receipt_listing_id(db, stored, extracted_listing_sha256).await?
+            != Some(listing_id)
+    {
+        return Err(PluginStoreError::Database(
+            "replay materialization completion could not be recorded exactly".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Provider-free inspection used by resumable replay coordination. Unlike the
 /// extraction-only preflight, this accepts an already-bound capture so a
 /// worker can reconcile a domain write that committed before its run ledger
@@ -1663,18 +1765,106 @@ pub async fn inspect_plugin_replay_capture_state(
             })
         })
         .transpose()?;
+    let materialization_receipt_listing_id = match checkpoint.as_ref() {
+        Some(checkpoint) => {
+            exact_materialization_receipt_listing_id(
+                db,
+                &stored,
+                &checkpoint.extracted_listing_sha256,
+            )
+            .await?
+        }
+        None => None,
+    };
     Ok(PluginReplayCaptureState {
         submission_id,
         rendered_html_sha256: stored.rendered_html_sha256,
         checkpoint,
         canonical_listing_id: stored.canonical_listing_id,
+        materialization_receipt_listing_id,
     })
+}
+
+async fn complete_bound_replay_materialization(
+    db: &AppDb,
+    user: &User,
+    stored: &PluginCheckpointRow,
+    extracted_listing_sha256: &str,
+    extractor: &GeminiListingExtractor,
+) -> StoreResult<SaleListing> {
+    let listing_id = stored.canonical_listing_id.ok_or_else(|| {
+        PluginStoreError::Database("bound replay recovery lost its listing identifier".to_string())
+    })?;
+    if exact_materialization_receipt_listing_id(db, stored, extracted_listing_sha256).await?
+        == Some(listing_id)
+    {
+        return get_listing(db, user.id, listing_id)
+            .await
+            .map_err(PluginStoreError::from);
+    }
+
+    let submission = plugin_submission_for_user(db, user.id, stored.id).await?;
+    let current = get_listing(db, user.id, listing_id).await?;
+    let listing = if current.ingestion_error.as_deref() == Some(SOURCE_IDENTITY_RECEIPT_PENDING) {
+        recover_bound_source_correction(
+            db,
+            user,
+            &submission,
+            listing_id,
+            Some(extractor),
+            &stored.rendered_html,
+        )
+        .await?
+        .listing
+        .ok_or_else(|| {
+            PluginStoreError::Database("recovered replay lost its corrected listing".to_string())
+        })?
+    } else if automatic_occurrence_disposition_count(db, stored.id).await? == 0 {
+        let extracted = stored.extracted_listing_json.as_deref().ok_or_else(|| {
+            PluginStoreError::Validation(
+                "bound replay capture has no extraction checkpoint".to_string(),
+            )
+        })?;
+        let (parsed_listing, identity_recovery) = parse_current_checkpoint_payload(extracted)?;
+        let preview = ListingPreview {
+            source_url: Some(stored.source_url.clone()),
+            parsed_listing,
+            warnings: Vec::new(),
+            identity_recovery,
+            context_text: Some(clean_listing_html(&stored.rendered_html)),
+        };
+        let resumed =
+            resume_bound_replay_listing(db, user.id, listing_id, &preview, Some(extractor)).await?;
+        attach_submission_to_pending_review_if_needed(
+            db,
+            user,
+            Some(&resumed.listing),
+            &submission,
+        )
+        .await?;
+        record_automatic_occurrence_dispositions(
+            db,
+            listing_id,
+            stored.id,
+            user.id,
+            &resumed.occurrence_dispositions,
+        )
+        .await
+        .map_err(PluginStoreError::Database)?;
+        resumed.listing
+    } else {
+        current
+    };
+    record_materialization_receipt(db, stored, listing_id, extracted_listing_sha256).await?;
+    Ok(listing)
 }
 
 /// Materialize one exact extraction checkpoint through the ordinary listing
 /// admission, aircraft, avionics, review, and finalization workflow. Listing
-/// extraction is never called. The final capture binding and historical
-/// observation timestamp update are one guarded transaction.
+/// extraction is never called. The listing insert and capture binding are one
+/// transaction; an exact completion receipt is written only after every child
+/// projection has finished, so a bound partial commit is resumed rather than
+/// mistaken for completion.
 pub async fn materialize_plugin_submission_checkpoint(
     db: &AppDb,
     user: &User,
@@ -1693,43 +1883,15 @@ pub async fn materialize_plugin_submission_checkpoint(
             "replay extraction checkpoint does not match the pinned checkpoint hash".to_string(),
         ));
     }
-    if let Some(listing_id) = stored.canonical_listing_id {
-        let submission = plugin_submission_for_user(db, user.id, stored.id).await?;
-        let listing = get_listing(db, user.id, listing_id).await?;
-        if listing.ingestion_error.as_deref() == Some(SOURCE_IDENTITY_RECEIPT_PENDING) {
-            let recovered = recover_bound_source_correction(
-                db,
-                user,
-                &submission,
-                listing_id,
-                Some(extractor),
-                &stored.rendered_html,
-            )
-            .await?;
-            return Ok(PluginListingReplayOutcome::Materialized {
-                submission_id,
-                listing: recovered.listing.ok_or_else(|| {
-                    PluginStoreError::Database(
-                        "recovered replay lost its corrected listing".to_string(),
-                    )
-                })?,
-            });
-        }
-        let listing = if listing.ingestion_state != "ready"
-            && bound_source_serial_receipt_exists(db, user.id, stored.id, listing_id).await?
-        {
-            finalize_signed_source_listing_after_receipt(
-                db,
-                user.id,
-                listing_id,
-                stored.id,
-                Some(extractor),
-                Some(&clean_listing_html(&stored.rendered_html)),
-            )
-            .await?
-        } else {
-            listing
-        };
+    if stored.canonical_listing_id.is_some() {
+        let listing = complete_bound_replay_materialization(
+            db,
+            user,
+            &stored,
+            expected_extracted_listing_sha256,
+            extractor,
+        )
+        .await?;
         return Ok(PluginListingReplayOutcome::Materialized {
             submission_id,
             listing,
@@ -1752,23 +1914,11 @@ pub async fn materialize_plugin_submission_checkpoint(
         identity_recovery,
         context_text: Some(clean_listing_html(&stored.rendered_html)),
     };
-    let preflight_source_correction = admit_aircraft_source_identity(
-        db,
-        preview.parsed_listing.registration_number.as_deref(),
-        preview.parsed_listing.serial_number.as_deref(),
-        preview.context_text.as_deref(),
-    )
-    .await
-    .ok()
-    .and_then(|admission| admission.serial_correction);
-    let signed_source_binding =
-        preflight_source_correction
-            .as_ref()
-            .map(|_| SignedSourceListingBinding {
-                submission_id: stored.id,
-                observed_at: stored.submitted_at.clone(),
-                checkpoint_replacement: None,
-            });
+    let signed_source_binding = SignedSourceListingBinding {
+        submission_id: stored.id,
+        observed_at: stored.submitted_at.clone(),
+        checkpoint_replacement: None,
+    };
     let existing_listing_ids =
         ensure_replay_source_is_unclaimed_and_snapshot(db, &stored.source_url).await?;
     let creation = create_listing_with_progress_and_occurrence_dispositions(
@@ -1779,17 +1929,29 @@ pub async fn materialize_plugin_submission_checkpoint(
         Some(extractor),
         None,
         ListingCreationMode::CreateOnly,
-        signed_source_binding.as_ref(),
+        Some(&signed_source_binding),
     )
     .await;
     if let Err(error) = &creation {
-        if preflight_source_correction.is_some() {
-            let retained = plugin_submission_for_user(db, user.id, stored.id).await?;
-            if retained.canonical_listing_id.is_some() {
-                return Err(PluginStoreError::Database(format!(
-                    "corrected replay stopped after its atomic listing binding: {error}"
-                )));
-            }
+        let retained = load_checkpoint_capture(db, user.id, stored.id).await?;
+        if retained.canonical_listing_id.is_some() {
+            return complete_bound_replay_materialization(
+                db,
+                user,
+                &retained,
+                expected_extracted_listing_sha256,
+                extractor,
+            )
+            .await
+            .map(|listing| PluginListingReplayOutcome::Materialized {
+                submission_id,
+                listing,
+            })
+            .map_err(|recovery| {
+                PluginStoreError::Database(format!(
+                    "replay stopped after its atomic listing binding ({error}); deterministic recovery is pending: {recovery}"
+                ))
+            });
         }
     }
     let created = match creation {
@@ -1822,9 +1984,6 @@ pub async fn materialize_plugin_submission_checkpoint(
     let listing_id = created.listing.id;
     let source_serial_correction = created.source_serial_correction.clone();
     let materialized = async {
-        if source_serial_correction.is_none() {
-            bind_replay_capture_and_timestamp(db, &stored, listing_id).await?;
-        }
         let bound_submission = PluginSubmission {
             id: stored.id,
             user_id: stored.user_id,
@@ -1866,20 +2025,7 @@ pub async fn materialize_plugin_submission_checkpoint(
         Ok::<(), PluginStoreError>(())
     }
     .await;
-    match materialized {
-        Ok(()) => {}
-        Err(error) if source_serial_correction.is_none() => {
-            compensate_replay_listing(db, &stored, listing_id)
-                .await
-                .map_err(|cleanup| {
-                    PluginStoreError::Database(format!(
-                        "replay failed ({error}) and its new listing could not be compensated: {cleanup}"
-                    ))
-                })?;
-            return Err(error);
-        }
-        Err(error) => return Err(error),
-    }
+    materialized?;
     let listing = if source_serial_correction.is_some() {
         finalize_signed_source_listing_after_receipt(
             db,
@@ -1893,6 +2039,8 @@ pub async fn materialize_plugin_submission_checkpoint(
     } else {
         get_listing(db, user.id, listing_id).await?
     };
+    record_materialization_receipt(db, &stored, listing_id, expected_extracted_listing_sha256)
+        .await?;
     Ok(PluginListingReplayOutcome::Materialized {
         submission_id,
         listing,
@@ -1944,79 +2092,6 @@ fn classify_replay_aircraft_admission(
                 Err(PluginReplayAdmissionBlock::CanonicalIdentityAssignmentMismatch)
             }
         },
-    }
-}
-
-async fn bind_replay_capture_and_timestamp(
-    db: &AppDb,
-    stored: &PluginCheckpointRow,
-    listing_id: i64,
-) -> StoreResult<()> {
-    let bind_submission = db.sql(
-        r#"
-        UPDATE plugin_submissions
-        SET canonical_listing_id = ?, extraction_error = NULL
-        WHERE id = ?
-          AND user_id = ?
-          AND plugin_install_id = ?
-          AND source_url = ?
-          AND rendered_html_sha256 = ?
-          AND signature_base64 = ?
-          AND extracted_listing_json = ?
-          AND extraction_error IS NULL
-          AND canonical_listing_id IS NULL
-        "#,
-    );
-    let set_observed_at = db.sql(
-        r#"
-        UPDATE aircraft_sale_listings
-        SET added_at = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-          AND created_by_user_id = ?
-          AND source_url = ?
-        "#,
-    );
-    macro_rules! bind_in_transaction {
-        ($pool:expr) => {{
-            let mut transaction = $pool.begin().await?;
-            let bound = sqlx::query(&bind_submission)
-                .bind(listing_id)
-                .bind(stored.id)
-                .bind(stored.user_id)
-                .bind(stored.plugin_install_id)
-                .bind(&stored.source_url)
-                .bind(&stored.rendered_html_sha256)
-                .bind(&stored.signature_base64)
-                .bind(stored.extracted_listing_json.as_deref())
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected();
-            if bound != 1 {
-                return Err(PluginStoreError::Database(
-                    "replay capture changed while its listing was being bound".to_string(),
-                ));
-            }
-            let timestamped = sqlx::query(&set_observed_at)
-                .bind(&stored.submitted_at)
-                .bind(listing_id)
-                .bind(stored.user_id)
-                .bind(&stored.source_url)
-                .execute(&mut *transaction)
-                .await?
-                .rows_affected();
-            if timestamped != 1 {
-                return Err(PluginStoreError::Database(
-                    "replayed listing changed before its observation timestamp was restored"
-                        .to_string(),
-                ));
-            }
-            transaction.commit().await?;
-            Ok::<(), PluginStoreError>(())
-        }};
-    }
-    match db.backend() {
-        DatabaseBackend::Sqlite(pool) => bind_in_transaction!(pool),
-        DatabaseBackend::Postgres(pool) => bind_in_transaction!(pool),
     }
 }
 
@@ -2627,8 +2702,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        bind_replay_capture_and_timestamp, classify_replay_aircraft_admission,
-        compensate_replay_listing, load_checkpoint_capture,
+        classify_replay_aircraft_admission, compensate_replay_listing, load_checkpoint_capture,
         materialize_plugin_submission_checkpoint as materialize_pinned_checkpoint,
         parse_current_checkpoint_payload, reprocess_plugin_submission, sha256_hex,
         signature_message, store_plugin_extraction_checkpoint, submit_plugin_html,
@@ -3132,7 +3206,7 @@ mod tests {
             install.id,
             source_url,
             html,
-            hash,
+            &hash,
             signature,
             extraction.as_str()
         )
@@ -3297,7 +3371,7 @@ mod tests {
             install.id,
             source_url,
             html,
-            hash,
+            &hash,
             signature,
             extraction.to_string()
         )
@@ -3368,6 +3442,116 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn ordinary_replay_post_bind_failure_resumes_before_writing_completion_receipt() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        store_release(&db, &replay_release("N482TW", "18283006"))
+            .await
+            .unwrap();
+        seed_replay_curated_aircraft(&db, user.id).await;
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let install = query_as_one!(
+            &db,
+            ListingIdRow,
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, ?) RETURNING id",
+            user.id,
+            BASE64_STANDARD.encode(key_pair.public_key().as_ref())
+        )
+        .unwrap();
+        let source_url = "https://example.test/replay-ordinary-post-bind-failure";
+        let html = "<html><body><p>N482TW serial 18283006</p></body></html>";
+        let hash = sha256_hex(html.as_bytes());
+        let signature = BASE64_STANDARD.encode(
+            key_pair
+                .sign(
+                    &rng,
+                    signature_message(install.id, source_url, &hash).as_bytes(),
+                )
+                .unwrap()
+                .as_ref(),
+        );
+        let mut extraction = serial_correction_extraction();
+        extraction["serial_number"] = json!("18283006");
+        let submission = query_as_one!(
+            &db,
+            ListingIdRow,
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at, rendered_html,
+                 rendered_html_sha256, signature_base64, extracted_listing_json
+               ) VALUES (?, ?, ?, '2026-07-20 12:34:56', ?, ?, ?, ?) RETURNING id"#,
+            user.id,
+            install.id,
+            source_url,
+            html,
+            &hash,
+            signature,
+            extraction.to_string()
+        )
+        .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER force_ordinary_replay_child_projection_failure
+               BEFORE INSERT ON aircraft_listing_identity_input_observations
+               BEGIN SELECT RAISE(ABORT, 'forced ordinary replay child projection failure'); END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let extractor =
+            crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        materialize_plugin_submission_checkpoint(&db, &user, submission.id, &extractor)
+            .await
+            .expect_err("a post-bind child failure must leave a resumable bound listing");
+        let partial: (i64, i64, i64) = sqlx::query_as(
+            r#"SELECT submission.canonical_listing_id,
+                      (SELECT count(*) FROM aircraft_sale_listings WHERE source_url = ?),
+                      (SELECT count(*) FROM plugin_submission_materialization_receipts
+                        WHERE plugin_submission_id = ?)
+               FROM plugin_submissions submission WHERE submission.id = ?"#,
+        )
+        .bind(source_url)
+        .bind(submission.id)
+        .bind(submission.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!((partial.1, partial.2), (1, 0));
+
+        sqlx::query("DROP TRIGGER force_ordinary_replay_child_projection_failure")
+            .execute(pool)
+            .await
+            .unwrap();
+        let recovered =
+            materialize_plugin_submission_checkpoint(&db, &user, submission.id, &extractor)
+                .await
+                .expect("an exact retry must finish the bound child projections");
+        let PluginListingReplayOutcome::Materialized { listing, .. } = recovered else {
+            panic!("ordinary replay recovery must materialize the listing");
+        };
+        assert_eq!(listing.id, partial.0);
+        let receipt: (i64, String, String) = sqlx::query_as(
+            r#"SELECT aircraft_sale_listing_id, rendered_html_sha256,
+                      extracted_listing_sha256
+               FROM plugin_submission_materialization_receipts
+               WHERE plugin_submission_id = ?"#,
+        )
+        .bind(submission.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt.0, listing.id);
+        assert_eq!(receipt.1, hash);
+        assert_eq!(receipt.2, sha256_hex(extraction.to_string().as_bytes()));
     }
 
     #[tokio::test]
@@ -3950,7 +4134,13 @@ mod tests {
             extraction_error: None,
             canonical_listing_id: None,
         };
-        bind_replay_capture_and_timestamp(&db, &stored, listing.id)
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE plugin_submissions SET canonical_listing_id = ? WHERE id = ?")
+            .bind(listing.id)
+            .bind(submission.id)
+            .execute(pool)
             .await
             .unwrap();
         compensate_replay_listing(&db, &stored, listing.id)

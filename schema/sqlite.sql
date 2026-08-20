@@ -3047,15 +3047,41 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
     AND extracted_listing_sha256 NOT GLOB '*[^0-9a-f]*'
   )),
   CHECK (
-    (terminal_rejection_phase IS NULL AND terminal_rejection_stage IS NULL
-      AND terminal_rejection_reason_code IS NULL)
+    (extraction_state = 'rejected' AND materialization_state = 'blocked'
+      AND terminal_rejection_phase = 'extraction'
+      AND terminal_rejection_stage = 'capture_admission'
+      AND terminal_rejection_reason_code IN (
+        'capture_authentication_failed', 'capture_not_found', 'capture_validation_failed'
+      ))
     OR
-    (terminal_rejection_phase IS NOT NULL AND terminal_rejection_stage IS NOT NULL
-      AND terminal_rejection_reason_code IS NOT NULL)
+    (extraction_state = 'succeeded' AND materialization_state = 'rejected'
+      AND terminal_rejection_phase = 'materialization'
+      AND (
+        (terminal_rejection_stage = 'capture_admission'
+          AND terminal_rejection_reason_code IN (
+            'capture_authentication_failed', 'capture_not_found', 'capture_validation_failed'
+          ))
+        OR
+        (terminal_rejection_stage = 'faa_aircraft_admission'
+          AND terminal_rejection_reason_code IN (
+            'missing_registration', 'non_n_registration', 'invalid_n_number', 'serial_conflict'
+          ))
+      ))
+    OR
+    (extraction_state <> 'rejected' AND materialization_state <> 'rejected'
+      AND terminal_rejection_phase IS NULL AND terminal_rejection_stage IS NULL
+      AND terminal_rejection_reason_code IS NULL)
   ),
   CHECK (
-    (last_failure_phase IS NULL AND last_failure_reason_code IS NULL)
-    OR (last_failure_phase IS NOT NULL AND last_failure_reason_code IS NOT NULL)
+    (extraction_state = 'failed' AND materialization_state = 'blocked'
+      AND last_failure_phase = 'extraction'
+      AND last_failure_reason_code IN ('database_error', 'operation_failed'))
+    OR
+    (extraction_state = 'succeeded' AND materialization_state = 'failed'
+      AND last_failure_phase = 'materialization' AND last_failure_reason_code IS NOT NULL)
+    OR
+    (extraction_state <> 'failed' AND materialization_state <> 'failed'
+      AND last_failure_phase IS NULL AND last_failure_reason_code IS NULL)
   ),
   CHECK (resulting_listing_id IS NULL OR materialization_state = 'succeeded'),
   CHECK ((extraction_state = 'succeeded') = (extracted_listing_sha256 IS NOT NULL)),
@@ -3067,11 +3093,27 @@ CREATE TABLE IF NOT EXISTS listing_replay_run_items (
 CREATE INDEX IF NOT EXISTS idx_listing_replay_run_items_phase
   ON listing_replay_run_items (run_id, extraction_state, materialization_state, position);
 
+CREATE TABLE IF NOT EXISTS plugin_submission_materialization_receipts (
+  plugin_submission_id INTEGER PRIMARY KEY
+    REFERENCES plugin_submissions(id) ON DELETE CASCADE,
+  aircraft_sale_listing_id INTEGER NOT NULL UNIQUE
+    REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
+  rendered_html_sha256 TEXT NOT NULL,
+  extracted_listing_sha256 TEXT NOT NULL,
+  completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (length(rendered_html_sha256) = 64),
+  CHECK (rendered_html_sha256 = lower(rendered_html_sha256)),
+  CHECK (rendered_html_sha256 NOT GLOB '*[^0-9a-f]*'),
+  CHECK (length(extracted_listing_sha256) = 64),
+  CHECK (extracted_listing_sha256 = lower(extracted_listing_sha256)),
+  CHECK (extracted_listing_sha256 NOT GLOB '*[^0-9a-f]*')
+);
+
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '3a42bf7af89b641ec62cedf520dadc665be97acbc440bb73f438406c2d3e911d',
+  'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,
