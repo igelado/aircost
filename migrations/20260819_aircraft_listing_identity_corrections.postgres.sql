@@ -15,9 +15,9 @@ BEGIN
     SELECT 1
     FROM public.schema_migration_contracts
     WHERE migration_name = '20260819_aircraft_listing_identity_corrections'
-      AND NOT (
-        contract_version = 1
-        AND contract_fingerprint =
+      AND (
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           '589a0716726d2ffd34bf84c08583198383c003228b769c88f094ac6bd9f677b8'
       )
   ) THEN

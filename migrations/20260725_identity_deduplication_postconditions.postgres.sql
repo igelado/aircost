@@ -19,8 +19,8 @@ BEGIN
     SELECT 1 FROM schema_migration_contracts
     WHERE migration_name = '20260725_identity_deduplication_postconditions'
       AND (
-        contract_version <> 6
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 6
+        OR contract_fingerprint IS DISTINCT FROM
           'cd001240b48a1480fd8bbee39b9ddedbba01d00fad45cbac315cec7a243cf133'
       )
   ) THEN

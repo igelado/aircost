@@ -24,8 +24,8 @@ BEGIN
     FROM schema_migration_contracts
     WHERE migration_name = '20260801_avionics_authoritative_source_origins'
       AND (
-        contract_version <> 2
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 2
+        OR contract_fingerprint IS DISTINCT FROM
           'f78087f6354d93d78dc8cebc895f285e38a91ca6f72dc2351acaaa88b49f9620'
       )
   ) THEN

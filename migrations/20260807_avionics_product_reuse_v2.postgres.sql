@@ -44,8 +44,8 @@ BEGIN
     FROM schema_migration_contracts
     WHERE migration_name = '20260807_avionics_product_reuse_v2'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc'
       )
   ) THEN

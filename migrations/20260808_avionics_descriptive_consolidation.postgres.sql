@@ -41,8 +41,8 @@ BEGIN
     WHERE migration_name =
           '20260808_avionics_descriptive_consolidation'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           '3aacf958efa7fb5e24c5897cf0369d40cb506b2a22444d629ea0a76462ce1a70'
       )
   ) THEN

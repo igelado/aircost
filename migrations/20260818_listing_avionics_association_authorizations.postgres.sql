@@ -27,8 +27,8 @@ BEGIN
     SELECT 1 FROM schema_migration_contracts
     WHERE migration_name = '20260818_listing_avionics_association_authorizations'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9'
       )
   ) THEN

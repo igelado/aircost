@@ -23,8 +23,8 @@ BEGIN
     SELECT 1 FROM schema_migration_contracts
     WHERE migration_name = '20260729_aircraft_catalog_retrieval_keys'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d'
       )
   ) THEN

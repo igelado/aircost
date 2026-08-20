@@ -23,13 +23,13 @@ BEGIN
     WHERE migration_name = '20260802_default_avionics_candidate_quarantine'
       AND NOT (
         (
-          contract_version = 1
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 1
+          AND contract_fingerprint IS NOT DISTINCT FROM
             'b50683c27b244cadf3cf88b226665f79051f678df9b30e0d01d0ca261464581f'
         )
         OR (
-          contract_version = 2
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 2
+          AND contract_fingerprint IS NOT DISTINCT FROM
             'b8a6ecd15acc0ce14f67bf37ff4387c0ded4d1c6669d2fc4698b6c0a6c209ba4'
         )
       )

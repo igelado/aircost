@@ -166,13 +166,17 @@ for migration in "${strict_migrations[@]}"; do
     fi
     [[ -n "$guard" ]]
     [[ "$guard" == *"$migration"* ]]
+    if [[ "$backend" == postgres ]]; then
+      [[ "$guard" == *"contract_version IS DISTINCT FROM"* ]]
+      [[ "$guard" == *"contract_fingerprint IS DISTINCT FROM"* ]]
+    fi
     [[ "$marker_insert" == *"ON CONFLICT (migration_name) DO NOTHING;"* ]]
     [[ "$marker_insert" != *"installed_at ="* ]]
   done
 done
 
 mapfile -t installed_at_rewriters < <(
-  rg -l 'installed_at = (EXCLUDED|excluded)[.]installed_at' \
+  grep -El 'installed_at = (EXCLUDED|excluded)[.]installed_at' \
     "$repository_root"/migrations/*.sql | sort
 )
 test "${#installed_at_rewriters[@]}" = 4
@@ -183,6 +187,11 @@ for migration in "${transition_migrations[@]}"; do
     marker_insert="$(extract_marker_insert "$file")"
     [[ "$marker_insert" == *"installed_at ="* ]]
     [[ "$marker_insert" == *"contract_version = 1"* ]]
+    if [[ "$backend" == postgres ]]; then
+      guard="$(extract_postgres_guard "$file")"
+      [[ "$guard" == *"contract_version IS NOT DISTINCT FROM"* ]]
+      [[ "$guard" == *"contract_fingerprint IS NOT DISTINCT FROM"* ]]
+    fi
   done
 done
 
@@ -209,8 +218,8 @@ DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 CREATE TABLE public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
-  contract_version BIGINT NOT NULL CHECK (contract_version > 0),
-  contract_fingerprint TEXT NOT NULL
+  contract_version BIGINT CHECK (contract_version > 0),
+  contract_fingerprint TEXT
     CHECK (contract_fingerprint ~ '^[0-9a-f]{64}$'),
   installed_at TEXT NOT NULL
 );
@@ -260,6 +269,21 @@ test_strict_contracts() {
     execute_sql "$backend" \
       "UPDATE schema_migration_contracts SET contract_fingerprint='$fingerprint' WHERE migration_name='$migration'"
 
+    if [[ "$backend" == postgres ]]; then
+      execute_sql "$backend" \
+        "UPDATE schema_migration_contracts SET contract_version=NULL WHERE migration_name='$migration'"
+      expect_guard_failure "$backend" "$file"
+      test "$(query_sql "$backend" \
+        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version IS NULL AND contract_fingerprint='$fingerprint' AND installed_at='$sentinel_installed_at'")" = 1
+      execute_sql "$backend" \
+        "UPDATE schema_migration_contracts SET contract_version=$version,contract_fingerprint=NULL WHERE migration_name='$migration'"
+      expect_guard_failure "$backend" "$file"
+      test "$(query_sql "$backend" \
+        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version=$version AND contract_fingerprint IS NULL AND installed_at='$sentinel_installed_at'")" = 1
+      execute_sql "$backend" \
+        "UPDATE schema_migration_contracts SET contract_fingerprint='$fingerprint' WHERE migration_name='$migration'"
+    fi
+
     execute_sql "$backend" \
       "DELETE FROM schema_migration_contracts WHERE migration_name='$migration'"
     execute_contract "$backend" "$file"
@@ -290,6 +314,16 @@ test_transition_contracts() {
       "$sentinel_installed_at"
 
     execute_sql "$backend" \
+      "DELETE FROM schema_migration_contracts WHERE migration_name='$migration'"
+    execute_contract "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT contract_version||':'||contract_fingerprint FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
+      "$current_version:$current_fingerprint"
+    test "$(query_sql "$backend" \
+      "SELECT installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" != \
+      "$sentinel_installed_at"
+
+    execute_sql "$backend" \
       "UPDATE schema_migration_contracts SET contract_version=1,contract_fingerprint='$old_fingerprint',installed_at='$sentinel_installed_at' WHERE migration_name='$migration'"
     execute_contract "$backend" "$file"
     test "$(query_sql "$backend" \
@@ -300,11 +334,38 @@ test_transition_contracts() {
       "$sentinel_installed_at"
 
     execute_sql "$backend" \
-      "UPDATE schema_migration_contracts SET contract_version=99,installed_at='$sentinel_installed_at' WHERE migration_name='$migration'"
+      "UPDATE schema_migration_contracts SET contract_version=99,contract_fingerprint='$current_fingerprint',installed_at='$sentinel_installed_at' WHERE migration_name='$migration'"
     expect_guard_failure "$backend" "$file"
     test "$(query_sql "$backend" \
       "SELECT contract_version||':'||installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
       "99:$sentinel_installed_at"
+
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_version=1,contract_fingerprint='$hostile_fingerprint' WHERE migration_name='$migration'"
+    expect_guard_failure "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
+      "1:$hostile_fingerprint:$sentinel_installed_at"
+
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_version=$current_version,contract_fingerprint='$hostile_fingerprint' WHERE migration_name='$migration'"
+    expect_guard_failure "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
+      "$current_version:$hostile_fingerprint:$sentinel_installed_at"
+
+    if [[ "$backend" == postgres ]]; then
+      execute_sql "$backend" \
+        "UPDATE schema_migration_contracts SET contract_version=NULL,contract_fingerprint='$current_fingerprint' WHERE migration_name='$migration'"
+      expect_guard_failure "$backend" "$file"
+      test "$(query_sql "$backend" \
+        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version IS NULL AND contract_fingerprint='$current_fingerprint' AND installed_at='$sentinel_installed_at'")" = 1
+      execute_sql "$backend" \
+        "UPDATE schema_migration_contracts SET contract_version=$current_version,contract_fingerprint=NULL WHERE migration_name='$migration'"
+      expect_guard_failure "$backend" "$file"
+      test "$(query_sql "$backend" \
+        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version=$current_version AND contract_fingerprint IS NULL AND installed_at='$sentinel_installed_at'")" = 1
+    fi
     execute_sql "$backend" \
       "UPDATE schema_migration_contracts SET contract_version=$current_version,contract_fingerprint='$current_fingerprint' WHERE migration_name='$migration'"
   done

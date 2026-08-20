@@ -22,8 +22,8 @@ BEGIN
     FROM schema_migration_contracts
     WHERE migration_name = '20260731_avionics_human_reviewed_consolidation'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           '93a641a0f653eacf0c8413bdb697a35c588fe34efc1419d30bf65146c8b2d55a'
       )
   ) THEN

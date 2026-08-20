@@ -24,13 +24,13 @@ BEGIN
     WHERE migration_name = '20260803_avionics_product_reuse_attestations'
       AND NOT (
         (
-          contract_version = 1
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 1
+          AND contract_fingerprint IS NOT DISTINCT FROM
             'edfe54b792fa91890bd1708ad23b58f4fd9f9c717b42147f5edb948d67ccd837'
         )
         OR (
-          contract_version = 2
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 2
+          AND contract_fingerprint IS NOT DISTINCT FROM
             '8ad6e935e1222a03e2da4848a9e3c6f4b7f50ee027a6e50ede3b692d034cae55'
         )
       )

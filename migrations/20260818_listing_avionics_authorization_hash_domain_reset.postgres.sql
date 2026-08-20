@@ -24,8 +24,8 @@ BEGIN
     WHERE migration_name =
             '20260818_listing_avionics_authorization_hash_domain_reset'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033'
       )
   ) THEN

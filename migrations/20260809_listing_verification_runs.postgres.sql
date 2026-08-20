@@ -19,8 +19,8 @@ BEGIN
     FROM schema_migration_contracts
     WHERE migration_name = '20260809_listing_verification_runs'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'a8beda24d71517ba07e4a81b2802b2fef97296ae6b2256a7ff493d6af5235232'
       )
   ) THEN

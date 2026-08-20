@@ -15,8 +15,8 @@ BEGIN
     SELECT 1 FROM schema_migration_contracts
     WHERE migration_name = '20260725_listing_aircraft_identity'
       AND (
-        contract_version <> 2
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 2
+        OR contract_fingerprint IS DISTINCT FROM
           '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be'
       )
   ) THEN

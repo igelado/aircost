@@ -20,8 +20,8 @@ BEGIN
     FROM schema_migration_contracts
     WHERE migration_name = '20260730_aircraft_tcds_make_lineage'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           '566485027d3df81bb5a90abcc0ce2b707e565bcbdc92ae3f007f527832fae735'
       )
   ) THEN

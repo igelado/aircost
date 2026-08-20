@@ -1555,9 +1555,10 @@ Rows in `schema_migration_contracts` are installation receipts, not mutable
 "latest version" records. A strict historical migration accepts either an
 absent receipt or its exact version and fingerprint. The first installation
 inserts the receipt; an exact rerun leaves `installed_at` unchanged; a
-different version or fingerprint aborts before domain objects can be repaired
-or replaced. Operators must investigate a mismatch instead of rerunning a
-migration to heal the marker.
+different version or fingerprint—including a null value exposed by a weakened
+receipt table—aborts before domain objects can be repaired or replaced.
+Operators must investigate a mismatch instead of rerunning a migration to heal
+the marker.
 
 The only historical in-place receipt upgrades are the documented version-1 to
 version-2 transitions in the default-avionics quarantine and avionics product
