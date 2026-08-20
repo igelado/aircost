@@ -148,6 +148,12 @@ table definitions on SQLite and the exact PostgreSQL column/type/nullability/
 default/identity, primary-key, unique, foreign-key/delete-action, check-
 vocabulary/hash, and index contracts. Same-name objects with weakened columns,
 constraints, or indexes do not satisfy the migration contract.
+Marker-present migration reruns perform that complete attestation before any
+replay DDL. They also reject unexpected attached indexes, triggers, policies,
+rules, inheritance, partitioning, row-security behavior, or nonordinary table
+kind/persistence. The original migration `installed_at` is an immutable install
+receipt: exact reruns and normal application startups validate the version and
+fingerprint but never replace its timestamp.
 
 `gemini_api_usage`
 
@@ -1346,8 +1352,11 @@ migrations/20260819_listing_replay_runs.postgres.sql
 ```
 
 The migration refuses a mismatched contract and refuses partially pre-existing
-replay objects without the exact installed contract. It is safe to apply a
-second time only after the exact contract and complete objects exist. For
+replay objects without the exact installed contract. A marker-present rerun
+attests the complete canonical tables, constraints, foreign-key targets and
+actions, indexes, and absence of unexpected attached behavior before any replay
+DDL. It never updates the existing marker's `installed_at`. It is safe to apply
+a second time only after the exact contract and complete objects exist. For
 SQLite, back up the database, run it in fail-fast mode, then check the contract,
 foreign keys, and integrity:
 

@@ -2,54 +2,558 @@
 
 BEGIN;
 
-CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
-  migration_name TEXT PRIMARY KEY,
-  contract_version INTEGER NOT NULL CHECK (contract_version > 0),
-  contract_fingerprint TEXT NOT NULL CHECK (contract_fingerprint ~ '^[0-9a-f]{64}$'),
-  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 DO $migration_guard$
+DECLARE
+  marker_is_present BOOLEAN;
+  contract_is_exact BOOLEAN;
+  check_signature TEXT;
 BEGIN
-  IF EXISTS (
+  SELECT EXISTS (
     SELECT 1 FROM public.schema_migration_contracts
     WHERE migration_name = '20260819_listing_replay_runs'
-      AND (contract_version <> 1 OR contract_fingerprint <>
-        'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d')
+  ) INTO marker_is_present;
+
+  IF marker_is_present AND NOT EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_listing_replay_runs'
+      AND contract_version = 1
+      AND contract_fingerprint =
+        'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d'
   ) THEN
     RAISE EXCEPTION 'installed listing replay runs migration has a different contract';
   END IF;
-  IF (
+
+  IF marker_is_present THEN
+                    WITH expected_columns(
+                      relation_name, ordinal_position, column_name, column_type,
+                      is_not_null, identity_kind, default_expression
+                    ) AS (
+                      VALUES
+                        ('listing_replay_runs', 1, 'id', 'bigint', TRUE, 'd', ''),
+                        ('listing_replay_runs', 2, 'manifest_version', 'bigint', TRUE, '', ''),
+                        ('listing_replay_runs', 3, 'manifest_sha256', 'text', TRUE, '', ''),
+                        ('listing_replay_runs', 4, 'manifest_capture_count', 'bigint', TRUE, '', ''),
+                        ('listing_replay_runs', 5, 'status', 'text', TRUE, '', '''queued''::text'),
+                        ('listing_replay_runs', 6, 'active_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 7, 'owner_token', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 8, 'heartbeat_at_epoch_seconds', 'bigint', FALSE, '', ''),
+                        ('listing_replay_runs', 9, 'started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 10, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_runs', 11, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_runs', 12, 'completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 1, 'id', 'bigint', TRUE, 'd', ''),
+                        ('listing_replay_run_items', 2, 'run_id', 'bigint', TRUE, '', ''),
+                        ('listing_replay_run_items', 3, 'plugin_submission_id', 'bigint', TRUE, '', ''),
+                        ('listing_replay_run_items', 4, 'position', 'bigint', TRUE, '', ''),
+                        ('listing_replay_run_items', 5, 'expected_rendered_html_sha256', 'text', TRUE, '', ''),
+                        ('listing_replay_run_items', 6, 'extracted_listing_sha256', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 7, 'extraction_state', 'text', TRUE, '', '''queued''::text'),
+                        ('listing_replay_run_items', 8, 'materialization_state', 'text', TRUE, '', '''blocked''::text'),
+                        ('listing_replay_run_items', 9, 'resulting_listing_id', 'bigint', FALSE, '', ''),
+                        ('listing_replay_run_items', 10, 'terminal_rejection_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 11, 'terminal_rejection_stage', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 12, 'terminal_rejection_reason_code', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 13, 'last_failure_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 14, 'last_failure_reason_code', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 15, 'extraction_attempt_count', 'bigint', TRUE, '', '0'),
+                        ('listing_replay_run_items', 16, 'materialization_attempt_count', 'bigint', TRUE, '', '0'),
+                        ('listing_replay_run_items', 17, 'extraction_started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 18, 'extraction_completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 19, 'materialization_started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 20, 'materialization_completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_run_items', 21, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_run_items', 22, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('plugin_submission_materialization_receipts', 1, 'plugin_submission_id', 'bigint', TRUE, '', ''),
+                        ('plugin_submission_materialization_receipts', 2, 'aircraft_sale_listing_id', 'bigint', TRUE, '', ''),
+                        ('plugin_submission_materialization_receipts', 3, 'rendered_html_sha256', 'text', TRUE, '', ''),
+                        ('plugin_submission_materialization_receipts', 4, 'extracted_listing_sha256', 'text', TRUE, '', ''),
+                        ('plugin_submission_materialization_receipts', 5, 'completed_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP')
+                    ), actual_columns AS (
+                      SELECT relation.relname::text AS relation_name,
+                        attribute.attnum::integer AS ordinal_position,
+                        attribute.attname::text AS column_name,
+                        pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                          AS column_type,
+                        attribute.attnotnull AS is_not_null,
+                        attribute.attidentity::text AS identity_kind,
+                        COALESCE(pg_catalog.pg_get_expr(
+                          default_value.adbin, default_value.adrelid
+                        ), '') AS default_expression
+                      FROM pg_catalog.pg_attribute attribute
+                      JOIN pg_catalog.pg_class relation
+                        ON relation.oid = attribute.attrelid
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      LEFT JOIN pg_catalog.pg_attrdef default_value
+                        ON default_value.adrelid = attribute.attrelid
+                       AND default_value.adnum = attribute.attnum
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname IN (
+                          'listing_replay_runs', 'listing_replay_run_items',
+                          'plugin_submission_materialization_receipts'
+                        )
+                        AND attribute.attnum > 0 AND NOT attribute.attisdropped
+                    ), replay_relations AS (
+                      SELECT relation.relname::text AS relation_name,
+                        relation.oid AS relation_oid,
+                        relation.relkind::text AS relation_kind,
+                        relation.relpersistence::text AS persistence,
+                        relation.relrowsecurity AS row_security,
+                        relation.relforcerowsecurity AS force_row_security,
+                        relation.relispartition AS is_partition,
+                        relation.relhasrules AS has_rules,
+                        relation.relhastriggers AS has_triggers,
+                        relation.relpartbound IS NOT NULL AS has_partition_bound
+                      FROM pg_catalog.pg_class relation
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname IN (
+                          'listing_replay_runs', 'listing_replay_run_items',
+                          'plugin_submission_materialization_receipts'
+                        )
+                    ), replay_indexes AS (
+                      SELECT
+                        index_relation.relname AS index_name,
+                        indexed_relation.oid AS relation_oid,
+                        index_definition.indisunique AS is_unique,
+                        index_definition.indisvalid AS is_valid,
+                        index_definition.indisready AS is_ready,
+                        index_definition.indpred IS NOT NULL AS is_partial,
+                        index_definition.indexprs IS NOT NULL AS has_expressions,
+                        index_definition.indnkeyatts AS key_attribute_count,
+                        index_definition.indnatts AS total_attribute_count,
+                        index_definition.indoption::text AS index_options,
+                        lower(pg_catalog.pg_get_expr(
+                          index_definition.indpred,
+                          index_definition.indrelid
+                        )) AS predicate,
+                        (
+                          SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                          FROM unnest(index_definition.indkey) WITH ORDINALITY
+                            AS key(attnum, ordinality)
+                          JOIN pg_catalog.pg_attribute attribute
+                            ON attribute.attrelid = index_definition.indrelid
+                           AND attribute.attnum = key.attnum
+                        ) AS columns
+                      FROM pg_catalog.pg_index index_definition
+                      JOIN pg_catalog.pg_class index_relation
+                        ON index_relation.oid = index_definition.indexrelid
+                      JOIN pg_catalog.pg_namespace index_namespace
+                        ON index_namespace.oid = index_relation.relnamespace
+                      JOIN pg_catalog.pg_class indexed_relation
+                        ON indexed_relation.oid = index_definition.indrelid
+                      WHERE index_namespace.nspname = 'public'
+                        AND index_relation.relname IN (
+                          'idx_listing_replay_runs_one_running',
+                          'idx_listing_replay_run_items_phase'
+                        )
+                    ), replay_attached_indexes AS (
+                      SELECT index_definition.indexrelid
+                      FROM pg_catalog.pg_index index_definition
+                      WHERE index_definition.indrelid IN (
+                        pg_catalog.to_regclass('public.listing_replay_runs'),
+                        pg_catalog.to_regclass('public.listing_replay_run_items'),
+                        pg_catalog.to_regclass(
+                          'public.plugin_submission_materialization_receipts'
+                        )
+                      )
+                    ), replay_unique_constraints AS (
+                      SELECT relation.relname::text AS relation_name, (
+                        SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                        FROM unnest(constraint_definition.conkey) WITH ORDINALITY
+                          AS key(attnum, ordinality)
+                        JOIN pg_catalog.pg_attribute attribute
+                          ON attribute.attrelid = constraint_definition.conrelid
+                         AND attribute.attnum = key.attnum
+                      ) AS columns,
+                        constraint_definition.convalidated AS is_validated,
+                        constraint_definition.condeferrable AS is_deferrable,
+                        constraint_definition.condeferred AS is_initially_deferred,
+                        backing_index.indisunique AS backing_is_unique,
+                        backing_index.indisprimary AS backing_is_primary,
+                        backing_index.indisvalid AS backing_is_valid,
+                        backing_index.indisready AS backing_is_ready,
+                        backing_index.indpred IS NOT NULL AS backing_is_partial,
+                        backing_index.indexprs IS NOT NULL AS backing_has_expressions
+                      FROM pg_catalog.pg_constraint constraint_definition
+                      JOIN pg_catalog.pg_class relation
+                        ON relation.oid = constraint_definition.conrelid
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      JOIN pg_catalog.pg_index backing_index
+                        ON backing_index.indexrelid = constraint_definition.conindid
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname IN (
+                          'listing_replay_runs', 'listing_replay_run_items',
+                          'plugin_submission_materialization_receipts'
+                        )
+                        AND constraint_definition.contype = 'u'
+                    ), replay_primary_keys AS (
+                      SELECT relation.relname::text AS relation_name, (
+                        SELECT array_agg(attribute.attname::text ORDER BY key.ordinality)
+                        FROM unnest(constraint_definition.conkey) WITH ORDINALITY
+                          AS key(attnum, ordinality)
+                        JOIN pg_catalog.pg_attribute attribute
+                          ON attribute.attrelid = constraint_definition.conrelid
+                         AND attribute.attnum = key.attnum
+                      ) AS columns,
+                        constraint_definition.convalidated AS is_validated,
+                        constraint_definition.condeferrable AS is_deferrable,
+                        constraint_definition.condeferred AS is_initially_deferred,
+                        backing_index.indisunique AS backing_is_unique,
+                        backing_index.indisprimary AS backing_is_primary,
+                        backing_index.indisvalid AS backing_is_valid,
+                        backing_index.indisready AS backing_is_ready,
+                        backing_index.indpred IS NOT NULL AS backing_is_partial,
+                        backing_index.indexprs IS NOT NULL AS backing_has_expressions
+                      FROM pg_catalog.pg_constraint constraint_definition
+                      JOIN pg_catalog.pg_class relation
+                        ON relation.oid = constraint_definition.conrelid
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      JOIN pg_catalog.pg_index backing_index
+                        ON backing_index.indexrelid = constraint_definition.conindid
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname IN (
+                          'listing_replay_runs', 'listing_replay_run_items',
+                          'plugin_submission_materialization_receipts'
+                        )
+                        AND constraint_definition.contype = 'p'
+                    ), replay_foreign_keys AS (
+                      SELECT child_namespace.nspname::text AS child_namespace,
+                        child.relname::text AS child_relation,
+                        child.oid AS child_oid,
+                        parent_namespace.nspname::text AS parent_namespace,
+                        parent.relname::text AS parent_relation,
+                        parent.oid AS parent_oid,
+                        (
+                          SELECT string_agg(attribute.attname::text, ',' ORDER BY key.ordinality)
+                          FROM unnest(constraint_definition.conkey) WITH ORDINALITY
+                            AS key(attnum, ordinality)
+                          JOIN pg_catalog.pg_attribute attribute
+                            ON attribute.attrelid = constraint_definition.conrelid
+                           AND attribute.attnum = key.attnum
+                        ) AS child_columns,
+                        (
+                          SELECT string_agg(attribute.attname::text, ',' ORDER BY key.ordinality)
+                          FROM unnest(constraint_definition.confkey) WITH ORDINALITY
+                            AS key(attnum, ordinality)
+                          JOIN pg_catalog.pg_attribute attribute
+                            ON attribute.attrelid = constraint_definition.confrelid
+                           AND attribute.attnum = key.attnum
+                        ) AS parent_columns,
+                        constraint_definition.convalidated AS is_validated,
+                        constraint_definition.condeferrable AS is_deferrable,
+                        constraint_definition.condeferred AS is_initially_deferred,
+                        constraint_definition.confmatchtype::text AS match_type,
+                        constraint_definition.confupdtype::text AS update_action,
+                        constraint_definition.confdeltype::text AS delete_action
+                      FROM pg_catalog.pg_constraint constraint_definition
+                      JOIN pg_catalog.pg_class child
+                        ON child.oid = constraint_definition.conrelid
+                      JOIN pg_catalog.pg_namespace child_namespace
+                        ON child_namespace.oid = child.relnamespace
+                      JOIN pg_catalog.pg_class parent
+                        ON parent.oid = constraint_definition.confrelid
+                      JOIN pg_catalog.pg_namespace parent_namespace
+                        ON parent_namespace.oid = parent.relnamespace
+                      WHERE child_namespace.nspname = 'public'
+                        AND child.relname IN (
+                          'listing_replay_run_items',
+                          'plugin_submission_materialization_receipts'
+                        )
+                        AND constraint_definition.contype = 'f'
+                    ), required_check_fragments(relation_name, fragment) AS (
+                      VALUES
+                        ('listing_replay_runs', 'manifest_version > 0'),
+                        ('listing_replay_runs', '^[0-9a-f]{64}$'),
+                        ('listing_replay_runs', 'manifest_capture_count > 0'),
+                        ('listing_replay_runs', 'status = ANY'),
+                        ('listing_replay_runs', 'active_phase = ANY'),
+                        ('listing_replay_runs', 'length(btrim(owner_token))'),
+                        ('listing_replay_runs', 'heartbeat_at_epoch_seconds IS NOT NULL'),
+                        ('listing_replay_run_items', '"position" >= 0'),
+                        ('listing_replay_run_items', 'expected_rendered_html_sha256'),
+                        ('listing_replay_run_items', 'extracted_listing_sha256'),
+                        ('listing_replay_run_items', 'extraction_state = ANY'),
+                        ('listing_replay_run_items', 'materialization_state = ANY'),
+                        ('listing_replay_run_items', 'terminal_rejection_phase = ANY'),
+                        ('listing_replay_run_items', 'faa_aircraft_admission'),
+                        ('listing_replay_run_items', 'capture_authentication_failed'),
+                        ('listing_replay_run_items', 'last_failure_phase = ANY'),
+                        ('listing_replay_run_items', 'faa_lookup_failed'),
+                        ('listing_replay_run_items', 'extraction_attempt_count >= 0'),
+                        ('listing_replay_run_items', 'materialization_attempt_count >= 0'),
+                        ('listing_replay_run_items', 'terminal_rejection_phase IS NULL'),
+                        ('listing_replay_run_items', 'last_failure_phase IS NULL'),
+                        ('listing_replay_run_items', 'resulting_listing_id IS NULL'),
+                        ('listing_replay_run_items', 'extracted_listing_sha256 IS NOT NULL'),
+                        ('listing_replay_run_items', 'extraction_state = ''succeeded'''),
+                        ('listing_replay_run_items', 'extraction_started_at IS NOT NULL'),
+                        ('listing_replay_run_items', 'materialization_started_at IS NOT NULL')
+                        ,('plugin_submission_materialization_receipts', 'rendered_html_sha256')
+                        ,('plugin_submission_materialization_receipts', 'extracted_listing_sha256')
+                    ), replay_checks AS (
+                      SELECT relation.relname::text AS relation_name,
+                        pg_catalog.pg_get_constraintdef(constraint_definition.oid)
+                          AS definition
+                      FROM pg_catalog.pg_constraint constraint_definition
+                      JOIN pg_catalog.pg_class relation
+                        ON relation.oid = constraint_definition.conrelid
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname IN (
+                          'listing_replay_runs', 'listing_replay_run_items',
+                          'plugin_submission_materialization_receipts'
+                        )
+                        AND constraint_definition.contype = 'c'
+                    )
+                    SELECT
+                      (SELECT COUNT(*) = 39 FROM actual_columns)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM expected_columns expected
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM actual_columns actual
+                          WHERE actual.relation_name = expected.relation_name
+                            AND actual.ordinal_position = expected.ordinal_position
+                            AND actual.column_name = expected.column_name
+                            AND actual.column_type = expected.column_type
+                            AND actual.is_not_null = expected.is_not_null
+                            AND actual.identity_kind = expected.identity_kind
+                            AND actual.default_expression = expected.default_expression
+                        )
+                      )
+                      AND (SELECT COUNT(*) = 3 FROM replay_relations)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM replay_relations
+                        WHERE relation_oid IS DISTINCT FROM pg_catalog.to_regclass(
+                          'public.' || relation_name
+                        )
+                          OR relation_kind <> 'r'
+                          OR persistence <> 'p'
+                          OR row_security OR force_row_security OR is_partition
+                          OR has_rules OR NOT has_triggers OR has_partition_bound
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE trigger_definition.tgrelid IN (
+                          pg_catalog.to_regclass('public.listing_replay_runs'),
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        ) AND NOT trigger_definition.tgisinternal
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_policy policy_definition
+                        WHERE policy_definition.polrelid IN (
+                          pg_catalog.to_regclass('public.listing_replay_runs'),
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        )
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_rewrite rule_definition
+                        WHERE rule_definition.ev_class IN (
+                          pg_catalog.to_regclass('public.listing_replay_runs'),
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        )
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                        WHERE inheritance.inhrelid IN (
+                          pg_catalog.to_regclass('public.listing_replay_runs'),
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        ) OR inheritance.inhparent IN (
+                          pg_catalog.to_regclass('public.listing_replay_runs'),
+                          pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.plugin_submission_materialization_receipts'
+                          )
+                        )
+                      )
+                      AND (SELECT COUNT(*) = 9 FROM replay_attached_indexes)
+                      AND (SELECT COUNT(*) = 1 FROM replay_indexes
+                       WHERE index_name = 'idx_listing_replay_runs_one_running'
+                         AND relation_oid = pg_catalog.to_regclass(
+                           'public.listing_replay_runs'
+                         )
+                         AND is_unique AND is_valid AND is_ready AND is_partial
+                         AND NOT has_expressions
+                         AND key_attribute_count = 1 AND total_attribute_count = 1
+                         AND index_options = '0'
+                         AND columns = ARRAY['status']::text[]
+                         AND pg_catalog.translate(
+                           predicate, E' \n\r\t()', ''
+                         ) IN ('status=''running''', 'status=''running''::text'))
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_indexes
+                       WHERE index_name = 'idx_listing_replay_run_items_phase'
+                         AND relation_oid = pg_catalog.to_regclass(
+                           'public.listing_replay_run_items'
+                         )
+                         AND NOT is_unique AND is_valid AND is_ready AND NOT is_partial
+                         AND NOT has_expressions
+                         AND key_attribute_count = 4 AND total_attribute_count = 4
+                         AND index_options = '0 0 0 0'
+                         AND columns = ARRAY[
+                           'run_id', 'extraction_state',
+                           'materialization_state', 'position'
+                         ]::text[])
+                      AND
+                      (SELECT COUNT(*) = 4 FROM replay_unique_constraints)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM replay_unique_constraints
+                        WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
+                          OR NOT backing_is_unique OR backing_is_primary
+                          OR NOT backing_is_valid OR NOT backing_is_ready
+                          OR backing_is_partial OR backing_has_expressions
+                      )
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE relation_name = 'listing_replay_runs'
+                         AND columns = ARRAY['manifest_sha256']::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE relation_name = 'listing_replay_run_items'
+                         AND columns = ARRAY['run_id', 'position']::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE relation_name = 'listing_replay_run_items'
+                         AND columns = ARRAY[
+                         'run_id', 'plugin_submission_id'
+                       ]::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE relation_name = 'plugin_submission_materialization_receipts'
+                         AND columns = ARRAY['aircraft_sale_listing_id']::text[])
+                      AND (SELECT COUNT(*) = 3 FROM replay_primary_keys)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM replay_primary_keys
+                        WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
+                          OR NOT backing_is_unique OR NOT backing_is_primary
+                          OR NOT backing_is_valid OR NOT backing_is_ready
+                          OR backing_is_partial OR backing_has_expressions
+                      )
+                      AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
+                           WHERE relation_name = 'listing_replay_runs'
+                             AND columns = ARRAY['id']::text[])
+                      AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
+                           WHERE relation_name = 'listing_replay_run_items'
+                             AND columns = ARRAY['id']::text[])
+                      AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
+                           WHERE relation_name = 'plugin_submission_materialization_receipts'
+                             AND columns = ARRAY['plugin_submission_id']::text[])
+                      AND (SELECT COUNT(*) = 5 FROM replay_foreign_keys)
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'listing_replay_run_items'
+                          AND child_oid = pg_catalog.to_regclass('public.listing_replay_run_items')
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'listing_replay_runs'
+                          AND parent_oid = pg_catalog.to_regclass('public.listing_replay_runs')
+                          AND child_columns = 'run_id' AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'c')
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'listing_replay_run_items'
+                          AND child_oid = pg_catalog.to_regclass('public.listing_replay_run_items')
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'plugin_submissions'
+                          AND parent_oid = pg_catalog.to_regclass('public.plugin_submissions')
+                          AND child_columns = 'plugin_submission_id'
+                          AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'listing_replay_run_items'
+                          AND child_oid = pg_catalog.to_regclass('public.listing_replay_run_items')
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'aircraft_sale_listings'
+                          AND parent_oid = pg_catalog.to_regclass('public.aircraft_sale_listings')
+                          AND child_columns = 'resulting_listing_id'
+                          AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'n')
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'plugin_submission_materialization_receipts'
+                          AND child_oid = pg_catalog.to_regclass('public.plugin_submission_materialization_receipts')
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'plugin_submissions'
+                          AND parent_oid = pg_catalog.to_regclass('public.plugin_submissions')
+                          AND child_columns = 'plugin_submission_id' AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'c')
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'plugin_submission_materialization_receipts'
+                          AND child_oid = pg_catalog.to_regclass('public.plugin_submission_materialization_receipts')
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'aircraft_sale_listings'
+                          AND parent_oid = pg_catalog.to_regclass('public.aircraft_sale_listings')
+                          AND child_columns = 'aircraft_sale_listing_id' AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'c')
+                      AND (SELECT COUNT(*) = 7 FROM replay_checks
+                           WHERE relation_name = 'listing_replay_runs')
+                      AND (SELECT COUNT(*) = 19 FROM replay_checks
+                           WHERE relation_name = 'listing_replay_run_items')
+                      AND (SELECT COUNT(*) = 2 FROM replay_checks
+                           WHERE relation_name = 'plugin_submission_materialization_receipts')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM required_check_fragments required
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM replay_checks actual
+                          WHERE actual.relation_name = required.relation_name
+                            AND position(required.fragment IN actual.definition) > 0
+                        )
+                      )
+                      INTO contract_is_exact;
+    SELECT pg_catalog.md5(pg_catalog.string_agg(
+      relation.relname::text || '|' || constraint_definition.conname::text || '|' ||
+      pg_catalog.pg_get_constraintdef(constraint_definition.oid) || E'\n',
+      '' ORDER BY relation.relname, constraint_definition.conname
+    ))
+    INTO check_signature
+    FROM pg_catalog.pg_constraint constraint_definition
+    JOIN pg_catalog.pg_class relation
+      ON relation.oid = constraint_definition.conrelid
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+      AND relation.relname IN (
+        'listing_replay_runs', 'listing_replay_run_items',
+        'plugin_submission_materialization_receipts'
+      )
+      AND constraint_definition.contype = 'c';
+
+    IF NOT COALESCE(contract_is_exact, FALSE)
+       OR check_signature IS DISTINCT FROM 'cca30d8412de563f1089046f15ee3298' THEN
+      RAISE EXCEPTION
+        'installed listing replay migration contract has noncanonical objects';
+    END IF;
+  ELSIF (
     pg_catalog.to_regclass('public.listing_replay_runs') IS NOT NULL
     OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NOT NULL
     OR pg_catalog.to_regclass('public.plugin_submission_materialization_receipts') IS NOT NULL
     OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NOT NULL
     OR pg_catalog.to_regclass('public.idx_listing_replay_run_items_phase') IS NOT NULL
-  ) AND NOT EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
-    WHERE migration_name = '20260819_listing_replay_runs'
-      AND contract_version = 1
-      AND contract_fingerprint =
-        'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d'
   ) THEN
     RAISE EXCEPTION
       'listing replay objects exist without the exact migration contract';
-  END IF;
-  IF EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
-    WHERE migration_name = '20260819_listing_replay_runs'
-      AND contract_version = 1
-      AND contract_fingerprint =
-        'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d'
-  ) AND (
-    pg_catalog.to_regclass('public.listing_replay_runs') IS NULL
-    OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NULL
-    OR pg_catalog.to_regclass('public.plugin_submission_materialization_receipts') IS NULL
-    OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NULL
-    OR pg_catalog.to_regclass('public.idx_listing_replay_run_items_phase') IS NULL
-  ) THEN
-    RAISE EXCEPTION
-      'installed listing replay migration contract has incomplete objects';
   END IF;
 END
 $migration_guard$;
@@ -197,9 +701,6 @@ INSERT INTO public.schema_migration_contracts (
   '20260819_listing_replay_runs', 1,
   'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d',
   CURRENT_TIMESTAMP
-) ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+) ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

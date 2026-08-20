@@ -3115,10 +3115,7 @@ INSERT INTO schema_migration_contracts (
   '20260819_listing_replay_runs', 1,
   'a66184d50fde51577b23422762e241a8222cad4c65709fadcfad19fbdbd3941d',
   CURRENT_TIMESTAMP
-) ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+) ON CONFLICT (migration_name) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
