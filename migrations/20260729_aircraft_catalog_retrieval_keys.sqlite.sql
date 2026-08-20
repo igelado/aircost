@@ -18,6 +18,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
 PRAGMA foreign_keys = ON;
 BEGIN IMMEDIATE;
 
+CREATE TEMP TABLE aircraft_retrieval_keys_migration_contract_guard (
+  accepted INTEGER NOT NULL CHECK (accepted = 1)
+);
+INSERT INTO aircraft_retrieval_keys_migration_contract_guard (accepted)
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260729_aircraft_catalog_retrieval_keys'
+  ) THEN 1
+  WHEN EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260729_aircraft_catalog_retrieval_keys'
+      AND contract_version = 1
+      AND contract_fingerprint =
+        'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d'
+  ) THEN 1
+  ELSE 0
+END;
+DROP TABLE aircraft_retrieval_keys_migration_contract_guard;
+
 DROP TABLE IF EXISTS temp.aircraft_catalog_retrieval_key_repairs;
 CREATE TEMP TABLE aircraft_catalog_retrieval_key_repairs (
   entity_kind TEXT NOT NULL,
@@ -509,10 +529,7 @@ INSERT INTO schema_migration_contracts (
   'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 DROP TABLE temp.aircraft_catalog_retrieval_key_repairs;
 

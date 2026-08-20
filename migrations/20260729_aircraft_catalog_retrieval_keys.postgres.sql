@@ -17,6 +17,23 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
 
 BEGIN;
 
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260729_aircraft_catalog_retrieval_keys'
+      AND (
+        contract_version <> 1
+        OR contract_fingerprint <>
+          'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed aircraft catalog retrieval keys migration has a different contract';
+  END IF;
+END
+$migration_guard$;
+
 CREATE OR REPLACE FUNCTION aircraft_retrieval_key(value TEXT)
 RETURNS TEXT
 LANGUAGE sql
@@ -305,9 +322,6 @@ INSERT INTO schema_migration_contracts (
   'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

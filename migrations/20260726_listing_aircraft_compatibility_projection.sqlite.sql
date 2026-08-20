@@ -13,6 +13,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 
+CREATE TEMP TABLE aircraft_compatibility_projection_migration_contract_guard (
+  accepted INTEGER NOT NULL CHECK (accepted = 1)
+);
+INSERT INTO aircraft_compatibility_projection_migration_contract_guard (accepted)
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260726_listing_aircraft_compatibility_projection'
+  ) THEN 1
+  WHEN EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260726_listing_aircraft_compatibility_projection'
+      AND contract_version = 2
+      AND contract_fingerprint =
+        '0a182d5972d62be3d906395df8d08b741bc3e23d713badf7596b360048aa45ba'
+  ) THEN 1
+  ELSE 0
+END;
+DROP TABLE aircraft_compatibility_projection_migration_contract_guard;
+
 -- Every unresolved new listing points at one schema-owned placeholder. Literal
 -- extracted labels live only in aircraft_identity_observations.
 CREATE TABLE IF NOT EXISTS aircraft_sale_listing_pending_compatibility_placeholder (
@@ -1177,9 +1197,6 @@ INSERT INTO schema_migration_contracts (
   '0a182d5972d62be3d906395df8d08b741bc3e23d713badf7596b360048aa45ba',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

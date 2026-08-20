@@ -1549,6 +1549,22 @@ After re-grounding, a successor assignment can restore readiness. The legacy
 `aircraft_model_variant_id` remains only a valuation compatibility projection;
 its display labels are not FAA or publication identity evidence.
 
+## Historical Migration Contract Provenance
+
+Rows in `schema_migration_contracts` are installation receipts, not mutable
+"latest version" records. A strict historical migration accepts either an
+absent receipt or its exact version and fingerprint. The first installation
+inserts the receipt; an exact rerun leaves `installed_at` unchanged; a
+different version or fingerprint aborts before domain objects can be repaired
+or replaced. Operators must investigate a mismatch instead of rerunning a
+migration to heal the marker.
+
+The only historical in-place receipt upgrades are the documented version-1 to
+version-2 transitions in the default-avionics quarantine and avionics product
+reuse-attestation migrations. They update `installed_at` only while moving the
+exact predecessor fingerprint to the exact version-2 fingerprint. An exact
+version-2 rerun is a no-op, and any other predecessor is rejected.
+
 ## Listing Aircraft Compatibility Projection Migration
 
 The compatibility bridge from curated aircraft identity to the valuation

@@ -9,6 +9,23 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(trim(migration_name)) > 0)
 );
 
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_listing_aircraft_identity'
+      AND (
+        contract_version <> 2
+        OR contract_fingerprint <>
+          '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed listing aircraft identity migration has a different contract';
+  END IF;
+END
+$migration_guard$;
+
 -- Immutable assignment versions retain every approved correction. The small
 -- current-pointer table is the only mutable state.
 -- N-registered listings are evaluated in the United States market. Aliases
@@ -926,9 +943,6 @@ INSERT INTO schema_migration_contracts (
   '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

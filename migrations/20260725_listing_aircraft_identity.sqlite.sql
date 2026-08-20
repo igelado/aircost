@@ -13,6 +13,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 
+CREATE TEMP TABLE listing_aircraft_identity_migration_contract_guard (
+  accepted INTEGER NOT NULL CHECK (accepted = 1)
+);
+INSERT INTO listing_aircraft_identity_migration_contract_guard (accepted)
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_listing_aircraft_identity'
+  ) THEN 1
+  WHEN EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_listing_aircraft_identity'
+      AND contract_version = 2
+      AND contract_fingerprint =
+        '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be'
+  ) THEN 1
+  ELSE 0
+END;
+DROP TABLE listing_aircraft_identity_migration_contract_guard;
+
 -- Immutable assignment versions retain every approved correction. The small
 -- current-pointer table is the only mutable state.
 -- N-registered listings are evaluated in the United States market. Aliases
@@ -861,10 +881,7 @@ INSERT INTO schema_migration_contracts (
   '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
 PRAGMA foreign_key_check;

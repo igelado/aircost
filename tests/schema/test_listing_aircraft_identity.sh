@@ -16,8 +16,8 @@ expect_failure() {
   fi
 }
 
-# A draft v1 SQLite table cannot be altered safely in place. The migration
-# must fail before replacing its v1 marker with the v2 contract.
+# A draft v1 contract is not an accepted predecessor. The provenance guard
+# must reject it before inspecting or changing the legacy domain tables.
 sqlite3 -bail "$old_v1_database" <<'SQL'
 CREATE TABLE schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
@@ -55,12 +55,10 @@ SQL
 if sqlite3 -bail "$old_v1_database" \
     ".read $repository_root/migrations/20260725_listing_aircraft_identity.sqlite.sql" \
     2>"$old_v1_error"; then
-  echo "Expected the draft v1 SQLite self-FK upgrade to fail" >&2
+  echo "Expected the draft v1 SQLite contract to fail closed" >&2
   exit 1
 fi
-grep -q \
-  "listing_aircraft_identity_v2_requires_self_fk_on_delete_cascade" \
-  "$old_v1_error"
+grep -q "CHECK constraint failed: accepted = 1" "$old_v1_error"
 test "$(sqlite3 "$old_v1_database" \
   "SELECT contract_version FROM schema_migration_contracts WHERE migration_name='20260725_listing_aircraft_identity'")" = "1"
 

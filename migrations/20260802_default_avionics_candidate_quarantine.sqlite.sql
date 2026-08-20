@@ -252,7 +252,10 @@ INSERT INTO schema_migration_contracts (
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,
   contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+  installed_at = excluded.installed_at
+WHERE schema_migration_contracts.contract_version = 1
+  AND schema_migration_contracts.contract_fingerprint =
+      'b50683c27b244cadf3cf88b226665f79051f678df9b30e0d01d0ca261464581f';
 
 COMMIT;
 PRAGMA foreign_key_check;

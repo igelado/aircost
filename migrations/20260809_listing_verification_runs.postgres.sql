@@ -138,9 +138,6 @@ INSERT INTO schema_migration_contracts (
   'a8beda24d71517ba07e4a81b2802b2fef97296ae6b2256a7ff493d6af5235232',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
