@@ -67,12 +67,84 @@ All operational commands are dry-run unless `--apply` is supplied.
    aircraft, avionics, review, and finalization workflow in create-only mode, so
    it cannot refresh or repair a preexisting listing. The listing observation
    timestamp is restored from the capture's `submitted_at`. FAA rejection is a
-   typed result and leaves the checkpoint unbound. For a narrow FAA serial
-   correction, listing insertion and checkpoint binding are one transaction.
+   typed result and leaves the checkpoint unbound. Only immutable source-policy
+   outcomes (missing, invalid, or non-N registration and serial conflict) are
+   terminal. Registry lookup failures, unavailable or insufficient snapshots,
+   and missing or mismatched canonical assignments remain retryable. For a
+   narrow FAA serial correction, listing insertion and checkpoint binding are
+   one transaction.
    A later failure retains that private receipt-gated pair, and an exact retry
    deterministically resumes child projections, writes one correction receipt,
-   and finalizes the same listing. Uncorrected replay failures still compensate
-   the newly created listing and binding.
+   and finalizes the same listing. Before binding, any listing-creation failure
+   rolls back the insert and exact capture CAS in their shared transaction; no
+   replay path scans for or deletes listings as compensation.
+   Install revocation does not invalidate an older signed capture: replay and
+   reprocess accept it only when its retained `submitted_at` is at or before
+   the retained install `revoked_at`. A capture timestamp after revocation is
+   rejected as an impossible signed-source history. The exact key and
+   revocation timestamp are pinned again by the atomic bind CAS.
+
+For a manifest-sized replay, use the durable batch coordinator instead of a
+shell loop:
+
+```text
+aircost-admin replay-captures --database SHADOW --manifest captures.json \
+  --phase extraction
+aircost-admin replay-captures --database SHADOW --manifest captures.json \
+  --phase extraction --apply
+aircost-admin replay-captures --database SHADOW --manifest captures.json \
+  --phase materialization --apply
+```
+
+Fatal database, heartbeat, or final-ledger errors intentionally leave the
+owner-fenced run in `running` state. After confirming that worker has stopped
+and the conservative heartbeat threshold has elapsed, resume it explicitly
+with `--recover-stale`; this requeues only the fenced in-flight item state.
+
+The default is provider-free and read-only. `--submission-id ID` restricts one
+invocation without changing the manifest-backed run membership. Apply records
+independent extraction and materialization states, attempts, and timestamps.
+Dry-run opens the installed target through a no-initialize diagnostic
+connection, attests its schema contracts, and performs no seed, schema,
+migration-contract timestamp, or ledger writes.
+Before any provider-backed retry, it derives an already-committed checkpoint or
+exact materialization-completion receipt from the authoritative stores and
+completes the ledger without repeating that work. A capture binding alone is
+only a resumable ownership anchor: if its receipt is absent, replay rebuilds
+the deterministic child projections and records completion last. Each
+successful extraction also pins both the exact normalized extraction JSON and
+its checkpoint SHA-256 in the run member; materialization refuses a different
+payload even when the signed capture itself is unchanged.
+
+Only one replay run may own mutations at a time. Its opaque owner token is
+heartbeated during long operations and fences every item completion. There is
+no automatic time-only takeover. If a worker was killed, first confirm it is no
+longer running; after one hour without a heartbeat, repeat the apply command
+with `--recover-stale`. The displaced token cannot commit a later ledger
+transition or replace the first committed extraction checkpoint. Loss of the
+heartbeat/owner lease cancels the in-flight provider operation promptly; resume
+then reconciles any authoritative checkpoint or completion receipt before
+retrying.
+
+Each report includes `gemini_usage` with the explicit
+`manifest_phase_cumulative` scope. A stable correlation ID is derived from the
+manifest fingerprint and phase, while each accounting row retains its exact
+submission source ID. The totals therefore include every request across
+resumptions of that phase: logical requests, transport attempts, retries,
+provider token/search counters, and estimated cost when the provider supplied
+complete billable usage. A retry that only reconciles an already-committed
+checkpoint makes no new request, but still reports the phase's earlier cost
+instead of losing durable attribution.
+
+The ledger stores no HTML, raw provider response envelope, or raw rejection
+message. For a successful extraction, it intentionally stores the exact
+normalized extraction JSON alongside its SHA-256. That immutable pair lets a
+resumed materialization prove it is using the checkpoint that the extraction
+phase committed. Terminal rejection stage and reason use a closed vocabulary;
+FAA source-policy rejections retain a stable policy reason code. Transient FAA
+lookup and mutable catalog/snapshot readiness failures use a separate closed
+retry-failure vocabulary; database and other operation failures likewise remain
+distinct from terminal rejection.
 
 ## Avionics terminal state
 

@@ -55,6 +55,14 @@ jobs:
       - name: Run unit tests
         run: cargo test
 
+      - name: Check PostgreSQL listing replay contract
+        run: |
+          cargo test postgres_listing_replay_fresh_migrated_idempotent_and_hostile_search_path -- --ignored --nocapture --test-threads=1
+          cargo test postgres_listing_replay_installed_at_survives_two_normal_startups -- --ignored --nocapture --test-threads=1
+          cargo test postgres_listing_replay_startup_rejects_weakened_column_constraint_and_index -- --ignored --nocapture --test-threads=1
+          cargo test postgres_listing_replay_rerun_rejects_unexpected_indexes_and_triggers -- --ignored --nocapture --test-threads=1
+          cargo test postgres_replay_ledger_rejects_invalid_state_outcome_pairings -- --ignored --nocapture --test-threads=1
+
       - name: Check PostgreSQL FAA reference migration
         run: bash tests/schema/test_faa_reference_reachability_postgres.sh
 

@@ -1545,11 +1545,12 @@ mod tests {
                     FROM aircraft_sale_listing_pending_compatibility_placeholder
                     WHERE singleton_id = 1
                   ),
-                  1, 'https://example.test/other', 2010, 175000, 'USD',
+                  1, 'https://example.test/other/' || ?, 2010, 175000, 'USD',
                   '2026-07-01T00:00:00Z', 'active', ?, ?, 1000
                 )
                 "#,
             )
+            .bind(registration)
             .bind(registration)
             .bind(serial)
             .execute(pool)

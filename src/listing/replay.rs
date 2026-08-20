@@ -15,6 +15,8 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::validate_source_url;
 use crate::plugin::{sha256_hex, verify_submission_signature};
 
+pub mod run;
+
 pub use crate::listing::avionics::disposition::OccurrenceDispositionReconciliation;
 
 pub async fn reconcile_replay_occurrence_dispositions(

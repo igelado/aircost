@@ -122,6 +122,42 @@ Store Chrome extension registrations and submitted rendered HTML. Submissions
 retain the HTML, extraction result or error, and the canonical listing created
 from the submission when extraction succeeds.
 
+`listing_replay_runs`, `listing_replay_run_items`,
+`plugin_submission_materialization_receipts`
+
+Coordinate manifest-backed clean replay without copying HTML or raw provider
+response envelopes into the replay ledger. A run pins the trusted-manifest
+version, SHA-256, and member count and holds an owner-token heartbeat while
+active. Each unique run/submission member stores the expected capture SHA-256,
+independent typed extraction and materialization state, the exact normalized
+successful extraction JSON and its checkpoint SHA-256 for immutable resume,
+attempts/timestamps, an optional resulting listing ID, and closed terminal
+rejection or retry-failure codes. A partial unique index
+permits one active replay owner across processes. Explicit stale recovery
+fences the prior token; loss of ownership cancels the in-flight operation, and
+checkpoint and exact completion state are re-derived before a provider-backed
+retry. Listing insertion and capture binding commit atomically. Binding alone
+does not imply completion: the exact receipt stores the bound listing plus
+rendered-capture and extraction-checkpoint hashes only after review and
+occurrence child projections finish. Checkpoint storage is first-writer
+immutable, and materialization compare-and-sets against the member's pinned
+checkpoint hash. A succeeded materialization must retain its non-null resulting
+listing ID. Both that result and the exact materialization receipt use
+`ON DELETE RESTRICT`, so replay provenance prevents deletion of the listing it
+proves was produced. Startup attests both complete replay
+table definitions on SQLite and the exact PostgreSQL column/type/nullability/
+default/identity, primary-key, unique, foreign-key/delete-action, check-
+vocabulary/hash, and full index/backing-index contracts, including key versus
+included attributes, collations, operator classes, options, predicates,
+expressions, null-distinctness, and lifecycle flags. Same-name objects with
+weakened columns, constraints, or indexes do not satisfy the migration contract.
+Marker-present migration reruns perform that complete attestation before any
+replay DDL. They also reject unexpected attached indexes, triggers, policies,
+rules, inheritance, partitioning, row-security behavior, or nonordinary table
+kind/persistence. The original migration `installed_at` is an immutable install
+receipt: exact reruns and normal application startups validate the version and
+fingerprint but never replace its timestamp.
+
 `gemini_api_usage`
 
 Stores one accounting row per logical Gemini provider request, including its
@@ -1306,6 +1342,40 @@ sqlite3 -readonly data/aircost.sqlite3 \
 
 The migration does not create a run, alter a listing, call a provider, or add
 usage rows.
+
+## Durable Listing Replay Runs
+
+Fresh databases receive the manifest replay ledger from the canonical schema.
+Existing databases must apply the matching additive migration before starting
+the new binary:
+
+```text
+migrations/20260819_listing_replay_runs.sqlite.sql
+migrations/20260819_listing_replay_runs.postgres.sql
+```
+
+The migration refuses a mismatched contract and refuses partially pre-existing
+replay objects without the exact installed contract. A marker-present rerun
+attests the complete canonical tables, constraints, foreign-key targets and
+actions, indexes, and absence of unexpected attached behavior before any replay
+DDL. It never updates the existing marker's `installed_at`. It is safe to apply
+a second time only after the exact contract and complete objects exist. For
+SQLite, back up the database, run it in fail-fast mode, then check the contract,
+foreign keys, and integrity:
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260819_listing_replay_runs.sqlite.sql"
+sqlite3 -readonly data/aircost.sqlite3 \
+  "SELECT contract_version, contract_fingerprint
+     FROM schema_migration_contracts
+    WHERE migration_name = '20260819_listing_replay_runs';
+   PRAGMA foreign_key_check;
+   PRAGMA integrity_check;"
+```
+
+The migration creates no replay run, listing, provider call, or copied capture
+payload.
 
 ## Aircraft Reference Catalog And FAA Projection Migration
 

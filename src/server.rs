@@ -2459,6 +2459,9 @@ impl From<ListingStoreError> for ApiError {
             ListingStoreError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
             ListingStoreError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
             ListingStoreError::State(message) => ApiError::new(StatusCode::CONFLICT, message),
+            ListingStoreError::AircraftAdmission(error) => {
+                ApiError::new(StatusCode::CONFLICT, error.to_string())
+            }
             ListingStoreError::Ingestion {
                 listing_id,
                 message,
@@ -2481,6 +2484,13 @@ impl From<PluginStoreError> for ApiError {
             }
             PluginStoreError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
             PluginStoreError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
+            PluginStoreError::AircraftAdmission(error) => {
+                ApiError::new(StatusCode::CONFLICT, error.to_string())
+            }
+            PluginStoreError::AdmissionBlocked(reason) => ApiError::new(
+                StatusCode::CONFLICT,
+                format!("replay admission is blocked: {}", reason.code()),
+            ),
             PluginStoreError::Database(message) => {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
             }
@@ -3175,7 +3185,8 @@ mod tests {
             INSERT INTO aircraft_sale_listings (
               aircraft_model_variant_id, created_by_user_id, source_url,
               model_year, asking_price_usd, airframe_hours
-            ) VALUES (?, ?, 'https://broker.example/aircraft/server-review', 2020, 450000, 900)
+            ) VALUES (?, ?, 'https://broker.example/aircraft/server-review/' ||
+              (SELECT COUNT(*) + 1 FROM aircraft_sale_listings), 2020, 450000, 900)
             RETURNING id
             "#,
         )
@@ -3201,19 +3212,25 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let source_url: String =
+            sqlx::query_scalar("SELECT source_url FROM aircraft_sale_listings WHERE id = ?")
+                .bind(listing_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
         let rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
         sqlx::query_scalar(
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
               rendered_html_sha256, signature_base64, canonical_listing_id
-            ) VALUES (?, ?, 'https://broker.example/aircraft/server-review', ?, ?,
-                      'test-signature', ?)
+            ) VALUES (?, ?, ?, ?, ?, 'test-signature', ?)
             RETURNING id
             "#,
         )
         .bind(owner_user_id)
         .bind(install_id)
+        .bind(source_url)
         .bind(rendered_html)
         .bind(rendered_html_sha256)
         .bind(listing_id)
