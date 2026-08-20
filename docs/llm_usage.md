@@ -696,12 +696,13 @@ reject; if it remains unsafe or correction fails, the outcome becomes
 `unresolved` rather than an automatic discard. An ordinary `unresolved`
 result—including unavailable classification, incomplete evidence, or an
 uncertain candidate—is a durable `pending_review` outcome rather than a
-quarantine. Provider, persistence, and enrichment failures tied to the
-listing, its FAA admission, or its listing-specific evidence remain real
-ingestion errors and can still quarantine a stored listing. A missing shared
-factory-reference prerequisite is different: after listing identity and
-component checks succeed, finalization returns the typed, derived
-`PendingReference` outcome and leaves the listing `incomplete`.
+quarantine. Provider, persistence, and enrichment failures tied to the listing,
+its FAA admission, or its listing-specific evidence remain real ingestion
+errors and can still quarantine a stored listing. Shared factory-reference
+readiness is separate: once those listing-specific checks succeed, finalization
+makes the listing `ready` and verified. Valuation reports a typed reference gap
+when the applicable factory specification, price, or configuration is
+unavailable; it does not move the valid listing back to `incomplete`.
 
 Catalog approvals take an optimistic fingerprint of the active catalog before
 the model calls, serialize the final write, and compare the fingerprint again
@@ -796,17 +797,17 @@ or restages the bundle and links.
 Mandatory FAA admission is checked before any review-driven catalog write. It
 is checked again after that transaction and before grounded metadata enrichment
 and final publication, closing the race around network calls. A source-backed
-listing becomes `ready` and verified only if FAA admission, full enrichment,
-and the readiness pass all succeed. A missing, incomplete, or not-yet-approved
-shared factory specification, model-year price, or factory configuration
-returns `PendingReference`: the listing remains `incomplete`, excluded from
-serving and training, and eligible for an independent automatic retry. An
-actual listing, FAA, or listing-specific enrichment failure is persisted as
-`quarantined`; neither path rolls back or holds a network request inside the
-catalog/link transaction. Associations explicitly corroborated by a reviewer
-use `listing_review` provenance with high installation confidence and are
-valuation-eligible wherever equivalent high-confidence `listing` associations
-are accepted.
+listing becomes `ready` and verified once FAA admission, listing-specific
+enrichment, and the listing readiness pass succeed. Missing, incomplete, or
+not-yet-approved shared factory specifications, model-year prices, and factory
+configurations are valuation gaps: they prevent that valuation row from being
+served, snapshotted, or used for training, but do not make the listing itself
+incomplete. An actual listing, FAA, or listing-specific enrichment failure is
+persisted as `quarantined`; neither path rolls back or holds a network request
+inside the catalog/link transaction. Associations explicitly corroborated by a
+reviewer use `listing_review` provenance with high installation confidence and
+are valuation-eligible wherever equivalent high-confidence `listing`
+associations are accepted.
 
 ## Grounded Product And Factory Facts
 

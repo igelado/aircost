@@ -16,7 +16,7 @@ BEGIN
       AND (
         contract_version <> 1
         OR contract_fingerprint <>
-          'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+          '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -28,7 +28,7 @@ BEGIN
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
   ) INTO exact_marker;
 
   IF exact_marker THEN
@@ -41,7 +41,6 @@ BEGIN
         ('validate_aircraft_valuation_compatibility_projection'),
         ('require_aircraft_catalog_approval'),
         ('validate_aircraft_reference_version_insert'),
-        ('validate_faa_reference_reachability'),
         ('preserve_assigned_aircraft_applicability'),
         ('prevent_new_unresolved_aircraft_dimension'),
         ('validate_official_dollar_normalization_fact'),
@@ -81,7 +80,9 @@ BEGIN
       SELECT
         'trigger:' || relation.relname || ':' || trigger_row.tgname,
         trigger_row.tgenabled::TEXT || ':' ||
-          pg_catalog.pg_get_triggerdef(trigger_row.oid, TRUE)
+          replace(
+            pg_catalog.pg_get_triggerdef(trigger_row.oid, TRUE), 'public.', ''
+          )
       FROM pg_catalog.pg_trigger trigger_row
       JOIN pg_catalog.pg_class relation
         ON relation.oid = trigger_row.tgrelid
@@ -123,11 +124,15 @@ BEGIN
       SELECT
         'constraint:' || relation.relname || ':' ||
           constraint_row.contype::TEXT || ':' ||
-          pg_catalog.md5(pg_catalog.pg_get_constraintdef(
-            constraint_row.oid, TRUE
+          pg_catalog.md5(replace(
+            pg_catalog.pg_get_constraintdef(constraint_row.oid, TRUE),
+            'public.', ''
           )),
         constraint_row.contype::TEXT || ':' ||
-          pg_catalog.pg_get_constraintdef(constraint_row.oid, TRUE)
+          replace(
+            pg_catalog.pg_get_constraintdef(constraint_row.oid, TRUE),
+            'public.', ''
+          )
       FROM pg_catalog.pg_constraint constraint_row
       JOIN pg_catalog.pg_class relation
         ON relation.oid = constraint_row.conrelid
@@ -138,7 +143,27 @@ BEGIN
       UNION ALL
       SELECT
         'index:' || relation.relname || ':' || index_relation.relname,
-        pg_catalog.pg_get_indexdef(index_row.indexrelid)
+        replace(
+          pg_catalog.pg_get_indexdef(index_row.indexrelid), 'public.', ''
+        ) || ':' ||
+          index_row.indisunique::TEXT || ':' ||
+          index_row.indisprimary::TEXT || ':' ||
+          index_row.indisvalid::TEXT || ':' ||
+          index_row.indisready::TEXT || ':' ||
+          index_row.indislive::TEXT || ':' ||
+          index_row.indisreplident::TEXT || ':' ||
+          index_row.indimmediate::TEXT || ':' ||
+          index_row.indnullsnotdistinct::TEXT || ':' ||
+          index_row.indnatts::TEXT || ':' || index_row.indnkeyatts::TEXT || ':' ||
+          index_relation.relpersistence::TEXT || ':' ||
+          COALESCE(backing_constraint.contype::TEXT, '') || ':' ||
+          COALESCE(backing_constraint.conname, '') || ':' ||
+          COALESCE(
+            replace(
+              pg_catalog.pg_get_constraintdef(backing_constraint.oid, TRUE),
+              'public.', ''
+            ), ''
+          )
       FROM pg_catalog.pg_index index_row
       JOIN pg_catalog.pg_class relation
         ON relation.oid = index_row.indrelid
@@ -147,6 +172,8 @@ BEGIN
       JOIN pg_catalog.pg_namespace namespace
         ON namespace.oid = relation.relnamespace
       JOIN relation_names expected ON expected.name = relation.relname
+      LEFT JOIN pg_catalog.pg_constraint backing_constraint
+        ON backing_constraint.conindid = index_row.indexrelid
       WHERE namespace.nspname = 'public'
     )
     SELECT
@@ -158,9 +185,9 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM objects;
 
-    IF actual_object_count <> 119
+    IF actual_object_count <> 116
        OR actual_definition_digest <>
-            'e3077e1a9a4b5b6fab85b729fb17ba7e' THEN
+            'db6081595739bd253ec04772246e23b9' THEN
       RAISE EXCEPTION
         'reference catalog cutover marker-present definition mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -562,34 +589,6 @@ END;
 $$ LANGUAGE plpgsql
 SET search_path = pg_catalog;
 
--- Keep shared trigger bodies table-specific. PostgreSQL's NEW/OLD records only
--- expose columns from the relation that fired the trigger.
-CREATE OR REPLACE FUNCTION public.validate_faa_reference_reachability()
-RETURNS TRIGGER AS $$
-BEGIN
-  IF TG_TABLE_NAME = 'faa_registry_aircraft_references' THEN
-    IF NOT EXISTS (
-      SELECT 1 FROM public.faa_registry_aircraft aircraft
-      WHERE aircraft.snapshot_id = NEW.snapshot_id
-        AND aircraft.aircraft_code = NEW.aircraft_code
-    ) THEN
-      RAISE EXCEPTION 'FAA aircraft reference must be reachable from a target match';
-    END IF;
-  END IF;
-  IF TG_TABLE_NAME = 'faa_registry_engine_references' THEN
-    IF NOT EXISTS (
-      SELECT 1 FROM public.faa_registry_aircraft aircraft
-      WHERE aircraft.snapshot_id = NEW.snapshot_id
-        AND aircraft.engine_code = NEW.engine_code
-    ) THEN
-      RAISE EXCEPTION 'FAA engine reference must be reachable from a target match';
-    END IF;
-  END IF;
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql
-SET search_path = pg_catalog;
-
 CREATE OR REPLACE FUNCTION public.preserve_assigned_aircraft_applicability()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -983,7 +982,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4', CURRENT_TIMESTAMP
+  '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

@@ -102,23 +102,15 @@ text, and confidence; a missing time is not converted to zero or copied from
 the airframe. High-confidence installed engine and propeller identities are
 linked separately from the factory configuration.
 
-`incomplete` also represents a successful listing-specific verification whose
-shared factory-reference data is not yet valuation-ready. In that case the
-finalizer returns a typed, derived `PendingReference` outcome: FAA/listing
-identity and installed-component checks are complete, but an applicable
-aircraft specification, model-year price, or factory-configuration reference
-still needs independent curation. The row remains unverified because the
-schema requires `is_verified` only for `ready` rows, and it remains excluded
-from serving, snapshots, and training. This is retryable reference work, not a
-listing failure, so it does not set `ingestion_error` or move the listing to
-`quarantined`.
-
-`PendingReference` is not another persistent status and has no companion
-table. It is derived by finalization from the current listing and shared
-reference catalog on every attempt. The database stores only the ordinary
-`incomplete` state and any independently useful approved reference facts; it
-does not store a Gemini prompt, response, URL-context dossier, or duplicate
-pending-reference record.
+Factory-reference readiness is deliberately independent of listing readiness.
+Once the FAA-backed identity and every listing-specific review and persistence
+check pass, the listing is `ready` and verified even when no applicable
+published factory configuration exists yet. Valuation resolves the shared
+reference separately and returns typed reference gaps instead of an estimate;
+snapshot and training construction likewise omit that unusable valuation row.
+Reference curation therefore never rewrites a valid listing back to
+`incomplete`, and there is no persistent or derived `PendingReference`
+listing outcome.
 
 `aircraft_sale_listing_facts`
 
@@ -389,13 +381,13 @@ Listings are created through either the web API or plugin submission path:
 12. If any avionics aspects remain unresolved, atomically upsert the complete
    one-row review bundle and set the listing to `pending_review`. Enrichment is
    skipped while that row exists.
-13. Otherwise, enrich and validate missing authoritative factory specs,
-   exact-model-year price evidence, factory avionics, and listing avionics
-   metadata.
-14. Mark the listing `ready` only after every readiness query passes. When all
-   listing-specific checks pass but shared factory-reference data is not yet
-   valuation-ready, return `PendingReference` and leave the row `incomplete`
-   for an independent retry. A failed listing/FAA admission, listing-specific
+13. Otherwise, complete and validate the remaining listing-specific evidence
+   and canonical associations. Resolve factory-reference readiness separately
+   for valuation; a missing model-year reference is reported as typed gaps and
+   does not block listing verification.
+14. Mark the listing `ready` after every listing-specific readiness query
+   passes, regardless of shared factory-reference availability. A failed
+   listing/FAA admission, listing-specific
    persistence, or listing-specific enrichment completion remains stored as
    `quarantined` with the error for inspection or reprocessing; expected
    identity uncertainty remains `pending_review` instead.
@@ -482,12 +474,12 @@ The server checks mandatory FAA admission before entering this catalog-writing
 transaction. The transaction rejects stale payload or catalog hashes, applies
 all catalog decisions and only the exact covered listing-link ID/role pairs,
 removes the bundle, and returns the listing to `incomplete`. After commit, the
-server rechecks FAA admission before ordinary grounded enrichment and final
-publication. Successful source-backed completion becomes `ready` and verified
-only after all readiness checks pass. Missing or not-yet-approved shared
-factory-reference data returns the derived `PendingReference` outcome and
-leaves the listing `incomplete`, so reference curation can be retried without
-repeating completed listing identity/component review. Actual FAA admission,
+server rechecks FAA admission before final publication. Successful
+source-backed completion becomes `ready` and verified after the
+listing-specific checks pass. Missing or not-yet-approved shared
+factory-reference data does not change that listing state: valuation reports
+the current typed reference gaps until independent reference publication makes
+an exact configuration available. Actual FAA admission,
 listing evidence, listing-specific persistence, and listing-specific
 enrichment failures become `quarantined`. If a new pending bundle appears
 while post-review enrichment is running, that bundle wins: the listing remains
@@ -1254,11 +1246,10 @@ links and pending review intact. If residual aspects remain, the listing stays
 `pending_review`; an all-pass result returns it to `incomplete`. The enclosing
 automatic verifier then finalizes only when the FAA-backed aircraft identity
 is assigned and no review aspects remain. A successful finalizer makes the
-listing `ready` and verified. A `PendingReference` finalization leaves it
-`incomplete` and reports which shared reference prerequisite is missing; a
-later automatic run retries that reference work independently. The outcome is
-derived rather than persisted, so retry does not replay or retrieve a stored
-Gemini dossier. Residual listing review remains `pending_review`, while actual
+listing `ready` and verified. Factory-reference resolution remains a separate
+valuation concern: missing prerequisites are returned as typed gaps without
+changing listing state or replaying a stored Gemini dossier. Residual listing
+review remains `pending_review`, while actual
 listing, FAA, or listing-specific finalization failures follow the quarantine
 path.
 
@@ -1784,7 +1775,7 @@ WHERE type = 'table'
 ```
 
 The contract must be version `1` with fingerprint
-`a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4`.
+`039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647`.
 Its `installed_at` value records the first successful installation and remains
 unchanged across schema reruns and application startups. A marker mismatch or
 marker-present damaged cutover contract fails before canonical DDL can heal it.

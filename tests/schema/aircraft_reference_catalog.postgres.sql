@@ -334,7 +334,6 @@ DECLARE
     'validate_aircraft_valuation_compatibility_projection',
     'require_aircraft_catalog_approval',
     'validate_aircraft_reference_version_insert',
-    'validate_faa_reference_reachability',
     'preserve_assigned_aircraft_applicability',
     'prevent_new_unresolved_aircraft_dimension',
     'validate_official_dollar_normalization_fact',
@@ -344,7 +343,7 @@ DECLARE
     'validate_aircraft_reference_version_update'
   ];
 BEGIN
-  IF 15 <> (
+  IF 14 <> (
     SELECT COUNT(*)
     FROM pg_catalog.pg_proc routine
     JOIN pg_catalog.pg_namespace namespace

@@ -14,7 +14,7 @@ SELECT CASE WHEN EXISTS (
     AND (
       contract_version <> 1
       OR contract_fingerprint <>
-        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
     )
 ) OR (
   EXISTS (
@@ -22,7 +22,7 @@ SELECT CASE WHEN EXISTS (
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
   )
   AND (
     (SELECT count(*) FROM sqlite_schema
@@ -60,50 +60,72 @@ SELECT CASE WHEN EXISTS (
           type || ':' || name || ':' || normalized_sql, '|'
         ), 256)))
         FROM (
-          SELECT
-            type,
-            name,
-            lower(replace(replace(replace(replace(
-              sql, char(9), ''
-            ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
-          FROM sqlite_schema
-          WHERE (type = 'table' AND name IN (
-            'aircraft_reference_prices',
-            'aircraft_reference_fact_set_attestations',
-            'official_dollar_normalization_facts'
-          )) OR (type = 'trigger' AND name IN (
-            'avionics_models_referenced_status_update',
-            'aircraft_valuation_projection_validate_insert',
-            'aircraft_reference_scope_canonical_insert',
-            'aircraft_reference_scope_key_recompute_insert',
-            'aircraft_reference_versions_require_approval',
-            'official_dollar_normalization_require_evidence',
-            'official_dollar_normalization_immutable_update',
-            'official_dollar_normalization_immutable_delete',
-            'aircraft_reference_price_building_insert',
-            'aircraft_reference_price_immutable_update',
-            'aircraft_reference_price_immutable_delete',
-            'aircraft_reference_fact_set_building_insert',
-            'aircraft_reference_fact_set_immutable_update',
-            'aircraft_reference_fact_set_immutable_delete',
-            'aircraft_reference_versions_publish',
-            'aircraft_serial_schemes_require_approval',
-            'aircraft_serial_schemes_preserve_ordering'
-          ))
+          SELECT type, name, normalized_sql
+          FROM (
+            SELECT
+              type,
+              name,
+              lower(replace(replace(replace(replace(
+                sql, char(9), ''
+              ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
+            FROM sqlite_schema
+            WHERE (type = 'table' AND name IN (
+              'aircraft_reference_prices',
+              'aircraft_reference_fact_set_attestations',
+              'official_dollar_normalization_facts'
+            )) OR (type = 'trigger' AND (
+              name IN (
+                'avionics_models_referenced_status_update',
+                'aircraft_valuation_projection_validate_insert',
+                'aircraft_reference_scope_canonical_insert',
+                'aircraft_reference_scope_key_recompute_insert',
+                'aircraft_reference_versions_require_approval',
+                'official_dollar_normalization_require_evidence',
+                'official_dollar_normalization_immutable_update',
+                'official_dollar_normalization_immutable_delete',
+                'aircraft_reference_price_building_insert',
+                'aircraft_reference_price_immutable_update',
+                'aircraft_reference_price_immutable_delete',
+                'aircraft_reference_fact_set_building_insert',
+                'aircraft_reference_fact_set_immutable_update',
+                'aircraft_reference_fact_set_immutable_delete',
+                'aircraft_reference_versions_publish',
+                'aircraft_serial_schemes_require_approval',
+                'aircraft_serial_schemes_preserve_ordering'
+              )
+              OR tbl_name IN (
+                'aircraft_reference_prices',
+                'aircraft_reference_fact_set_attestations',
+                'official_dollar_normalization_facts'
+              )
+            ))
+            UNION ALL
+            SELECT
+              'index' AS type,
+              protected_relation.relation_name || ':' || index_row.name AS name,
+              index_row.[unique] || ':' || index_row.origin || ':' ||
+                index_row.partial || ':' || COALESCE((
+                  SELECT group_concat(index_column.signature, ',')
+                  FROM (
+                    SELECT
+                      xinfo.seqno || ':' || xinfo.cid || ':' ||
+                      COALESCE(xinfo.name, '') || ':' || xinfo.desc || ':' ||
+                      xinfo.coll || ':' || xinfo.key AS signature
+                    FROM pragma_index_xinfo(index_row.name) xinfo
+                    ORDER BY xinfo.seqno
+                  ) index_column
+                ), '') AS normalized_sql
+            FROM (
+              SELECT 'aircraft_reference_prices' AS relation_name
+              UNION ALL
+              SELECT 'aircraft_reference_fact_set_attestations'
+              UNION ALL
+              SELECT 'official_dollar_normalization_facts'
+            ) protected_relation
+            JOIN pragma_index_list(protected_relation.relation_name) index_row
+          ) exact_object
           ORDER BY type, name
-        )) <> '6ae94b46c1cd6c3c001833a16061eb3a43947ba5b90042749fa71e5ad5d6e9d9'
-    OR EXISTS (
-      SELECT 1
-      FROM sqlite_schema
-      WHERE tbl_name = 'aircraft_reference_prices'
-        AND type IN ('index', 'trigger')
-        AND name NOT IN (
-          'sqlite_autoindex_aircraft_reference_prices_1',
-          'aircraft_reference_price_building_insert',
-          'aircraft_reference_price_immutable_update',
-          'aircraft_reference_price_immutable_delete'
-        )
-    )
+        )) <> '9ef50133da8e63ad020fb3fc74ec3c66230f200616783315e96cf6dd9912acb1'
     OR EXISTS (
       SELECT 1 FROM sqlite_schema
       WHERE type = 'table' AND name IN (
@@ -774,7 +796,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4', CURRENT_TIMESTAMP
+  '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

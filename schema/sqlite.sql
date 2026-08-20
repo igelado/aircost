@@ -37,7 +37,7 @@ SELECT CASE WHEN EXISTS (
     AND (
       contract_version <> 1
       OR contract_fingerprint <>
-        'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4'
+        '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647'
     )
 ) THEN 0 ELSE 1 END;
 DROP TABLE reference_catalog_cutover_contract_preflight;
@@ -9458,7 +9458,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'a18d0e07d9f4982b1cbdad8942e5c4d5972d67c5bbed1d1d082a04399ad598f4',
+  '039f72c03b3d2ba9538a4705ce7bda744fe02a322d018895c536604d280fe647',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

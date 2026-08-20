@@ -102,14 +102,31 @@ test "$(sqlite3 "$marker_damage_database" \
 
 sqlite3 -bail "$marker_unexpected_database" \
   ".read $repository_root/schema/sqlite.sql" \
-  "CREATE INDEX unexpected_reference_price_index
-   ON aircraft_reference_prices(amount);"
+  "CREATE TRIGGER unexpected_reference_price_trigger
+     BEFORE INSERT ON aircraft_reference_prices BEGIN SELECT 1; END;
+   CREATE TRIGGER unexpected_reference_fact_set_trigger
+     BEFORE INSERT ON aircraft_reference_fact_set_attestations BEGIN SELECT 1; END;
+   CREATE TRIGGER unexpected_reference_normalization_trigger
+     BEFORE INSERT ON official_dollar_normalization_facts BEGIN SELECT 1; END;
+   CREATE INDEX unexpected_reference_price_index
+     ON aircraft_reference_prices(amount);
+   CREATE INDEX unexpected_reference_fact_set_index
+     ON aircraft_reference_fact_set_attestations(evidence_claim_id);
+   CREATE INDEX unexpected_reference_normalization_index
+     ON official_dollar_normalization_facts(index_series);"
 expect_failure "$marker_unexpected_database" \
   ".read $repository_root/migrations/20260819_reference_catalog_cutover.sqlite.sql" \
   "CHECK constraint failed"
 test "$(sqlite3 "$marker_unexpected_database" \
   "SELECT count(*) FROM sqlite_schema
-   WHERE type = 'index' AND name = 'unexpected_reference_price_index'")" = "1"
+   WHERE name IN (
+     'unexpected_reference_price_trigger',
+     'unexpected_reference_fact_set_trigger',
+     'unexpected_reference_normalization_trigger',
+     'unexpected_reference_price_index',
+     'unexpected_reference_fact_set_index',
+     'unexpected_reference_normalization_index'
+   )")" = "6"
 
 expect_failure "$test_database" \
   "UPDATE aircraft_reference_prices SET amount = 1 WHERE id = 1" \
