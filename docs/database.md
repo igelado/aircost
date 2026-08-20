@@ -628,22 +628,21 @@ all parsing, schema, target-coverage, and digest checks without writing:
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
   --archive /tmp/ReleasableAircraft.zip \
-  --snapshot-date YYYY-MM-DD \
   --dry-run
 ```
 
-`--snapshot-date` is the date represented by that daily FAA release, not the
-listing model year or an arbitrary import date. Review the JSON report's
-separate `listing_counts` and `pending_submission_counts`, requested and
-accepted explicit targets, target count, matched and absent counts, member
-hashes, archive hash, manifest hash, and target-set hash. Apply the same
-validated archive explicitly:
+The importer derives the release date from the shared, validated ZIP member
+date for `MASTER.txt`, `ACFTREF.txt`, and `ENGINE.txt`; there is no operator
+date override. Review the derived date and the JSON report's separate
+`listing_counts` and `pending_submission_counts`, requested and accepted
+explicit targets, target count, matched and absent counts, member hashes,
+archive hash, manifest hash, and target-set hash. Apply the same validated
+archive explicitly:
 
 ```sh
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
   --archive /tmp/ReleasableAircraft.zip \
-  --snapshot-date YYYY-MM-DD \
   --apply
 ```
 
@@ -654,7 +653,6 @@ add the flag once per aircraft to both the dry run and the corresponding apply:
 cargo run --bin aircost-admin -- import-faa-registry \
   --database /absolute/path/to/aircost.sqlite3 \
   --archive /tmp/ReleasableAircraft.zip \
-  --snapshot-date YYYY-MM-DD \
   --include-n-number N1925X \
   --dry-run
 ```
@@ -674,18 +672,19 @@ projections with the same snapshot date, source URL, archive hash, and manifest
 hash.
 
 The curation lookup always starts from the newest imported release. "Newest"
-means the greatest operator-supplied snapshot date and projection ID; the code
+means the greatest parser-derived snapshot date and projection ID; the code
 does not impose a maximum age or contact the FAA during lookup. Operations must
-therefore verify the date against the downloaded members and refresh the import
-on the intended cadence. A target must have a coverage row in a projection of
-that exact release. No snapshot, no current-release coverage, an `absent`
-result, an ambiguous result, or a serial conflict blocks every listing-backed
-workflow. Missing, foreign, and malformed registrations are also blocked. New
-and updated listings are rejected before mutation. Pre-policy rows are not
-deleted automatically, but they are excluded from avionics/reference curation,
-valuation snapshot creation, training, and comparable serving. The curation
-report records why an existing observation was excluded. If no source-exact
-observation in a cluster passes the FAA gate, Gemini is not called.
+therefore verify that the derived date matches the official download and
+refresh the import on the intended cadence. A target must have a coverage row
+in a projection of that exact release. No snapshot, no current-release
+coverage, an `absent` result, an ambiguous result, or a serial conflict blocks
+every listing-backed workflow. Missing, foreign, and malformed registrations
+are also blocked. New and updated listings are rejected before mutation.
+Pre-policy rows are not deleted automatically, but they are excluded from
+avionics/reference curation, valuation snapshot creation, training, and
+comparable serving. The curation report records why an existing observation was
+excluded. If no source-exact observation in a cluster passes the FAA gate,
+Gemini is not called.
 
 Every new valuation snapshot freezes a versioned FAA admission manifest inside
 `selection_policy_json`. For each included listing it records the canonical

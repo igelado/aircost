@@ -186,6 +186,76 @@ FROM pg_catalog.pg_proc routine
 WHERE routine.oid = pg_catalog.to_regprocedure('public.validate_faa_coverage()');
 SQL
 
+# Projection-table drift is rejected before any current object is replaced.
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'ALTER TABLE public.faa_registry_coverage DROP CONSTRAINT faa_registry_coverage_lookup_status_check'
+expect_migration_failure dropped-current-coverage-constraint
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '0:1'
+SELECT
+  (EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid = pg_catalog.to_regclass('public.faa_registry_coverage')
+      AND conname = 'faa_registry_coverage_lookup_status_check'
+  ))::int || ':' || (EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_faa_reference_reachability'
+  ))::int;
+SQL
+
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE FUNCTION public.unexpected_faa_trigger_function()
+RETURNS TRIGGER LANGUAGE plpgsql
+AS $function$BEGIN RETURN NEW; END;$function$
+SET search_path = pg_catalog;
+CREATE TRIGGER unexpected_faa_trigger BEFORE INSERT
+ON public.faa_registry_aircraft FOR EACH ROW
+EXECUTE FUNCTION public.unexpected_faa_trigger_function();
+SQL
+expect_migration_failure unexpected-current-trigger
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1:1'
+SELECT
+  (EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgrelid = pg_catalog.to_regclass('public.faa_registry_aircraft')
+      AND tgname = 'unexpected_faa_trigger'
+      AND NOT tgisinternal
+  ))::int || ':' || (EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_faa_reference_reachability'
+  ))::int;
+SQL
+
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'CREATE INDEX unexpected_faa_index ON public.faa_registry_engine_references (model_name)'
+expect_migration_failure unexpected-current-index
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1:1'
+SELECT
+  (pg_catalog.to_regclass('public.unexpected_faa_index') IS NOT NULL)::int || ':' ||
+  (EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_faa_reference_reachability'
+  ))::int;
+SQL
+
+reset_current_schema
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT unexpected_faa_constraint CHECK (length(lookup_status) > 0)'
+expect_migration_failure unexpected-current-constraint
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1:1'
+SELECT
+  (EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+    WHERE conrelid = pg_catalog.to_regclass('public.faa_registry_coverage')
+      AND conname = 'unexpected_faa_constraint'
+  ))::int || ':' || (EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_faa_reference_reachability'
+  ))::int;
+SQL
+
 # Exact main/pre-v1 shape upgrades, remains usable, and is idempotent.
 reset_current_schema
 downgrade_to_pre_v1
@@ -235,6 +305,67 @@ psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1'
 SELECT (routine.prosrc = 'BEGIN RETURN NEW; END;')::int
 FROM pg_catalog.pg_proc routine
 WHERE routine.oid = pg_catalog.to_regprocedure('public.validate_faa_coverage()');
+SQL
+
+# Marker absence authorizes only the exact historical shape; unrelated table
+# and attached-object drift remains intact after the rejected transaction.
+reset_current_schema
+downgrade_to_pre_v1
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'ALTER TABLE public.faa_registry_coverage DROP CONSTRAINT faa_registry_coverage_lookup_status_check'
+expect_migration_failure dropped-old-coverage-constraint
+assert_pre_v1_survived_rollback
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '0'
+SELECT (EXISTS (
+  SELECT 1 FROM pg_catalog.pg_constraint
+  WHERE conrelid = pg_catalog.to_regclass('public.faa_registry_coverage')
+    AND conname = 'faa_registry_coverage_lookup_status_check'
+))::int;
+SQL
+
+reset_current_schema
+downgrade_to_pre_v1
+psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE FUNCTION public.unexpected_faa_trigger_function()
+RETURNS TRIGGER LANGUAGE plpgsql
+AS $function$BEGIN RETURN NEW; END;$function$;
+CREATE TRIGGER unexpected_faa_trigger BEFORE INSERT
+ON public.faa_registry_aircraft FOR EACH ROW
+EXECUTE FUNCTION public.unexpected_faa_trigger_function();
+SQL
+expect_migration_failure unexpected-old-trigger
+assert_pre_v1_survived_rollback
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1'
+SELECT (EXISTS (
+  SELECT 1 FROM pg_catalog.pg_trigger
+  WHERE tgrelid = pg_catalog.to_regclass('public.faa_registry_aircraft')
+    AND tgname = 'unexpected_faa_trigger'
+    AND NOT tgisinternal
+))::int;
+SQL
+
+reset_current_schema
+downgrade_to_pre_v1
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'CREATE INDEX unexpected_faa_index ON public.faa_registry_engine_references (model_name)'
+expect_migration_failure unexpected-old-index
+assert_pre_v1_survived_rollback
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
+  -c "SELECT (pg_catalog.to_regclass('public.unexpected_faa_index') IS NOT NULL)::int" \
+  | grep -qx '1'
+
+reset_current_schema
+downgrade_to_pre_v1
+psql "$database_url" -v ON_ERROR_STOP=1 -q \
+  -c 'ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT unexpected_faa_constraint CHECK (length(lookup_status) > 0)'
+expect_migration_failure unexpected-old-constraint
+assert_pre_v1_survived_rollback
+psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1'
+SELECT (EXISTS (
+  SELECT 1 FROM pg_catalog.pg_constraint
+  WHERE conrelid = pg_catalog.to_regclass('public.faa_registry_coverage')
+    AND conname = 'unexpected_faa_constraint'
+))::int;
 SQL
 
 # Shadow objects and caller search_path cannot redirect the migration.

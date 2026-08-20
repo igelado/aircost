@@ -9,6 +9,246 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
+-- The historical and installed contracts share the same five projection
+-- relations. Refuse any relation, column, constraint, or index drift before
+-- replacing even one trigger or function. Exact string comparison is used
+-- instead of an extension-provided digest so the guard has no extension or
+-- caller-search-path dependency.
+DO $projection_shape_guard$
+DECLARE
+  relation_signature TEXT;
+  column_signature TEXT;
+  constraint_signature TEXT;
+  index_signature TEXT;
+BEGIN
+  SELECT
+    (
+      SELECT pg_catalog.string_agg(
+        pg_catalog.format(
+          '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+          relation.relkind, relation.relpersistence,
+          relation.relrowsecurity, relation.relforcerowsecurity,
+          relation.relispartition, relation.relhasrules
+        ), E'\n' ORDER BY relation.relname
+      )
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace relation_namespace
+        ON relation_namespace.oid = relation.relnamespace
+      WHERE relation_namespace.nspname = 'public'
+        AND relation.relname IN (
+          'faa_registry_aircraft',
+          'faa_registry_aircraft_references',
+          'faa_registry_coverage',
+          'faa_registry_engine_references',
+          'faa_registry_snapshots'
+        )
+    ),
+    (
+      SELECT pg_catalog.string_agg(
+        pg_catalog.format(
+          '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+          attribute.attnum, attribute.attname,
+          pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+          attribute.attnotnull, attribute.attidentity,
+          COALESCE(
+            pg_catalog.pg_get_expr(
+              attribute_default.adbin, attribute_default.adrelid
+            ), ''
+          )
+        ), E'\n' ORDER BY relation.relname, attribute.attnum
+      )
+      FROM pg_catalog.pg_class relation
+      JOIN pg_catalog.pg_namespace relation_namespace
+        ON relation_namespace.oid = relation.relnamespace
+      JOIN pg_catalog.pg_attribute attribute
+        ON attribute.attrelid = relation.oid
+       AND attribute.attnum > 0
+       AND NOT attribute.attisdropped
+      LEFT JOIN pg_catalog.pg_attrdef attribute_default
+        ON attribute_default.adrelid = relation.oid
+       AND attribute_default.adnum = attribute.attnum
+      WHERE relation_namespace.nspname = 'public'
+        AND relation.relname IN (
+          'faa_registry_aircraft',
+          'faa_registry_aircraft_references',
+          'faa_registry_coverage',
+          'faa_registry_engine_references',
+          'faa_registry_snapshots'
+        )
+    ),
+    (
+      SELECT pg_catalog.string_agg(
+        pg_catalog.format(
+          '%s|%s|%s|%s|%s', relation.relname,
+          constraint_row.contype, constraint_row.conname,
+          constraint_row.convalidated,
+          pg_catalog.pg_get_constraintdef(constraint_row.oid, FALSE)
+        ), E'\n' ORDER BY relation.relname,
+          constraint_row.contype, constraint_row.conname
+      )
+      FROM pg_catalog.pg_constraint constraint_row
+      JOIN pg_catalog.pg_class relation
+        ON relation.oid = constraint_row.conrelid
+      JOIN pg_catalog.pg_namespace relation_namespace
+        ON relation_namespace.oid = relation.relnamespace
+      WHERE relation_namespace.nspname = 'public'
+        AND relation.relname IN (
+          'faa_registry_aircraft',
+          'faa_registry_aircraft_references',
+          'faa_registry_coverage',
+          'faa_registry_engine_references',
+          'faa_registry_snapshots'
+        )
+    ),
+    (
+      SELECT pg_catalog.string_agg(
+        pg_catalog.format(
+          '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+          index_relation.relname, index_row.indisunique,
+          index_row.indisprimary, index_row.indisvalid,
+          index_row.indisready,
+          pg_catalog.pg_get_indexdef(index_relation.oid)
+        ), E'\n' ORDER BY relation.relname, index_relation.relname
+      )
+      FROM pg_catalog.pg_index index_row
+      JOIN pg_catalog.pg_class relation
+        ON relation.oid = index_row.indrelid
+      JOIN pg_catalog.pg_namespace relation_namespace
+        ON relation_namespace.oid = relation.relnamespace
+      JOIN pg_catalog.pg_class index_relation
+        ON index_relation.oid = index_row.indexrelid
+      WHERE relation_namespace.nspname = 'public'
+        AND relation.relname IN (
+          'faa_registry_aircraft',
+          'faa_registry_aircraft_references',
+          'faa_registry_coverage',
+          'faa_registry_engine_references',
+          'faa_registry_snapshots'
+        )
+    )
+  INTO relation_signature, column_signature, constraint_signature,
+       index_signature;
+
+  IF relation_signature IS DISTINCT FROM $expected_relations$faa_registry_aircraft|r|p|f|f|f|f
+faa_registry_aircraft_references|r|p|f|f|f|f
+faa_registry_coverage|r|p|f|f|f|f
+faa_registry_engine_references|r|p|f|f|f|f
+faa_registry_snapshots|r|p|f|f|f|f$expected_relations$
+  THEN
+    RAISE EXCEPTION 'FAA registry projection relations have an unexpected shape';
+  END IF;
+
+  IF column_signature IS DISTINCT FROM $expected_columns$faa_registry_aircraft|1|snapshot_id|bigint|t||
+faa_registry_aircraft|2|n_number|text|t||
+faa_registry_aircraft|3|manufacturer_serial_raw|text|f||
+faa_registry_aircraft|4|manufacturer_serial_key|text|f||
+faa_registry_aircraft|5|aircraft_code|text|t||
+faa_registry_aircraft|6|engine_code|text|f||
+faa_registry_aircraft|7|year_manufactured|bigint|f||
+faa_registry_aircraft|8|source_record_sha256|text|t||
+faa_registry_aircraft_references|1|snapshot_id|bigint|t||
+faa_registry_aircraft_references|2|aircraft_code|text|t||
+faa_registry_aircraft_references|3|manufacturer_name|text|f||
+faa_registry_aircraft_references|4|model_name|text|f||
+faa_registry_aircraft_references|5|aircraft_type_code|text|f||
+faa_registry_aircraft_references|6|engine_type_code|text|f||
+faa_registry_aircraft_references|7|category_code|text|f||
+faa_registry_aircraft_references|8|certification_indicator_code|text|f||
+faa_registry_aircraft_references|9|engine_count|bigint|f||
+faa_registry_aircraft_references|10|seat_count|bigint|f||
+faa_registry_aircraft_references|11|weight_class_code|text|f||
+faa_registry_aircraft_references|12|cruise_speed_mph|bigint|f||
+faa_registry_aircraft_references|13|type_certificate_data_sheet|text|f||
+faa_registry_aircraft_references|14|type_certificate_holder|text|f||
+faa_registry_coverage|1|snapshot_id|bigint|t||
+faa_registry_coverage|2|n_number|text|t||
+faa_registry_coverage|3|lookup_status|text|t||
+faa_registry_engine_references|1|snapshot_id|bigint|t||
+faa_registry_engine_references|2|engine_code|text|t||
+faa_registry_engine_references|3|manufacturer_name|text|f||
+faa_registry_engine_references|4|model_name|text|f||
+faa_registry_engine_references|5|engine_type_code|text|f||
+faa_registry_engine_references|6|horsepower|bigint|f||
+faa_registry_engine_references|7|thrust_pounds|bigint|f||
+faa_registry_snapshots|1|id|bigint|t|d|
+faa_registry_snapshots|2|evidence_source_id|bigint|t||
+faa_registry_snapshots|3|snapshot_date|text|t||
+faa_registry_snapshots|4|source_url|text|t||
+faa_registry_snapshots|5|archive_sha256|text|t||
+faa_registry_snapshots|6|source_manifest_sha256|text|t||
+faa_registry_snapshots|7|target_set_sha256|text|t||
+faa_registry_snapshots|8|master_member_name|text|t||
+faa_registry_snapshots|9|master_member_sha256|text|t||
+faa_registry_snapshots|10|aircraft_member_name|text|t||
+faa_registry_snapshots|11|aircraft_member_sha256|text|t||
+faa_registry_snapshots|12|engine_member_name|text|t||
+faa_registry_snapshots|13|engine_member_sha256|text|t||
+faa_registry_snapshots|14|imported_at|text|t||CURRENT_TIMESTAMP$expected_columns$
+  THEN
+    RAISE EXCEPTION 'FAA registry projection columns have an unexpected shape';
+  END IF;
+
+  IF constraint_signature IS DISTINCT FROM $expected_constraints$faa_registry_aircraft|c|faa_registry_aircraft_aircraft_code_check|t|CHECK ((length(TRIM(BOTH FROM aircraft_code)) > 0))
+faa_registry_aircraft|c|faa_registry_aircraft_engine_code_check|t|CHECK (((engine_code IS NULL) OR (length(TRIM(BOTH FROM engine_code)) > 0)))
+faa_registry_aircraft|c|faa_registry_aircraft_manufacturer_serial_key_check|t|CHECK (((manufacturer_serial_key IS NULL) OR (length(manufacturer_serial_key) > 0)))
+faa_registry_aircraft|c|faa_registry_aircraft_manufacturer_serial_raw_check|t|CHECK (((manufacturer_serial_raw IS NULL) OR (length(TRIM(BOTH FROM manufacturer_serial_raw)) > 0)))
+faa_registry_aircraft|c|faa_registry_aircraft_n_number_check|t|CHECK ((("left"(n_number, 1) = 'N'::text) AND ((length(n_number) >= 2) AND (length(n_number) <= 6))))
+faa_registry_aircraft|c|faa_registry_aircraft_source_record_sha256_check|t|CHECK ((source_record_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_aircraft|c|faa_registry_aircraft_year_manufactured_check|t|CHECK (((year_manufactured IS NULL) OR ((year_manufactured >= 1900) AND (year_manufactured <= 2200))))
+faa_registry_aircraft|f|faa_registry_aircraft_snapshot_id_fkey|t|FOREIGN KEY (snapshot_id) REFERENCES faa_registry_snapshots(id) ON DELETE RESTRICT
+faa_registry_aircraft|p|faa_registry_aircraft_pkey|t|PRIMARY KEY (snapshot_id, n_number)
+faa_registry_aircraft|u|faa_registry_aircraft_snapshot_id_source_record_sha256_key|t|UNIQUE (snapshot_id, source_record_sha256)
+faa_registry_aircraft_references|c|faa_registry_aircraft_references_aircraft_code_check|t|CHECK ((length(TRIM(BOTH FROM aircraft_code)) > 0))
+faa_registry_aircraft_references|c|faa_registry_aircraft_references_cruise_speed_mph_check|t|CHECK (((cruise_speed_mph IS NULL) OR (cruise_speed_mph >= 0)))
+faa_registry_aircraft_references|c|faa_registry_aircraft_references_engine_count_check|t|CHECK (((engine_count IS NULL) OR (engine_count >= 0)))
+faa_registry_aircraft_references|c|faa_registry_aircraft_references_seat_count_check|t|CHECK (((seat_count IS NULL) OR (seat_count >= 0)))
+faa_registry_aircraft_references|f|faa_registry_aircraft_references_snapshot_id_fkey|t|FOREIGN KEY (snapshot_id) REFERENCES faa_registry_snapshots(id) ON DELETE RESTRICT
+faa_registry_aircraft_references|p|faa_registry_aircraft_references_pkey|t|PRIMARY KEY (snapshot_id, aircraft_code)
+faa_registry_coverage|c|faa_registry_coverage_lookup_status_check|t|CHECK ((lookup_status = ANY (ARRAY['matched'::text, 'absent'::text])))
+faa_registry_coverage|c|faa_registry_coverage_n_number_check|t|CHECK ((("left"(n_number, 1) = 'N'::text) AND ((length(n_number) >= 2) AND (length(n_number) <= 6))))
+faa_registry_coverage|f|faa_registry_coverage_snapshot_id_fkey|t|FOREIGN KEY (snapshot_id) REFERENCES faa_registry_snapshots(id) ON DELETE RESTRICT
+faa_registry_coverage|p|faa_registry_coverage_pkey|t|PRIMARY KEY (snapshot_id, n_number)
+faa_registry_engine_references|c|faa_registry_engine_references_engine_code_check|t|CHECK ((length(TRIM(BOTH FROM engine_code)) > 0))
+faa_registry_engine_references|c|faa_registry_engine_references_horsepower_check|t|CHECK (((horsepower IS NULL) OR (horsepower >= 0)))
+faa_registry_engine_references|c|faa_registry_engine_references_thrust_pounds_check|t|CHECK (((thrust_pounds IS NULL) OR (thrust_pounds >= 0)))
+faa_registry_engine_references|f|faa_registry_engine_references_snapshot_id_fkey|t|FOREIGN KEY (snapshot_id) REFERENCES faa_registry_snapshots(id) ON DELETE RESTRICT
+faa_registry_engine_references|p|faa_registry_engine_references_pkey|t|PRIMARY KEY (snapshot_id, engine_code)
+faa_registry_snapshots|c|faa_registry_snapshots_aircraft_member_name_check|t|CHECK ((aircraft_member_name = 'ACFTREF.txt'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_aircraft_member_sha256_check|t|CHECK ((aircraft_member_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_archive_sha256_check|t|CHECK ((archive_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_engine_member_name_check|t|CHECK ((engine_member_name = 'ENGINE.txt'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_engine_member_sha256_check|t|CHECK ((engine_member_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_master_member_name_check|t|CHECK ((master_member_name = 'MASTER.txt'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_master_member_sha256_check|t|CHECK ((master_member_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_snapshot_date_check|t|CHECK ((snapshot_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_source_manifest_sha256_check|t|CHECK ((source_manifest_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_source_url_check|t|CHECK ((source_url ~ '^https://([^. /]+[.])*faa[.]gov/'::text))
+faa_registry_snapshots|c|faa_registry_snapshots_target_set_sha256_check|t|CHECK ((target_set_sha256 ~ '^[0-9a-f]{64}$'::text))
+faa_registry_snapshots|f|faa_registry_snapshots_evidence_source_id_fkey|t|FOREIGN KEY (evidence_source_id) REFERENCES curation_evidence_sources(id) ON DELETE RESTRICT
+faa_registry_snapshots|p|faa_registry_snapshots_pkey|t|PRIMARY KEY (id)
+faa_registry_snapshots|u|faa_registry_snapshots_archive_sha256_target_set_sha256_key|t|UNIQUE (archive_sha256, target_set_sha256)$expected_constraints$
+  THEN
+    RAISE EXCEPTION 'FAA registry projection constraints have an unexpected shape';
+  END IF;
+
+  IF index_signature IS DISTINCT FROM $expected_indexes$faa_registry_aircraft|faa_registry_aircraft_pkey|t|t|t|t|CREATE UNIQUE INDEX faa_registry_aircraft_pkey ON public.faa_registry_aircraft USING btree (snapshot_id, n_number)
+faa_registry_aircraft|faa_registry_aircraft_snapshot_id_source_record_sha256_key|t|f|t|t|CREATE UNIQUE INDEX faa_registry_aircraft_snapshot_id_source_record_sha256_key ON public.faa_registry_aircraft USING btree (snapshot_id, source_record_sha256)
+faa_registry_aircraft|idx_faa_registry_aircraft_code|f|f|t|t|CREATE INDEX idx_faa_registry_aircraft_code ON public.faa_registry_aircraft USING btree (snapshot_id, aircraft_code)
+faa_registry_aircraft|idx_faa_registry_aircraft_lineage_record|t|f|t|t|CREATE UNIQUE INDEX idx_faa_registry_aircraft_lineage_record ON public.faa_registry_aircraft USING btree (snapshot_id, n_number, source_record_sha256, manufacturer_serial_key, aircraft_code)
+faa_registry_aircraft|idx_faa_registry_engine_code|f|f|t|t|CREATE INDEX idx_faa_registry_engine_code ON public.faa_registry_aircraft USING btree (snapshot_id, engine_code)
+faa_registry_aircraft_references|faa_registry_aircraft_references_pkey|t|t|t|t|CREATE UNIQUE INDEX faa_registry_aircraft_references_pkey ON public.faa_registry_aircraft_references USING btree (snapshot_id, aircraft_code)
+faa_registry_coverage|faa_registry_coverage_pkey|t|t|t|t|CREATE UNIQUE INDEX faa_registry_coverage_pkey ON public.faa_registry_coverage USING btree (snapshot_id, n_number)
+faa_registry_coverage|idx_faa_registry_coverage_lookup|f|f|t|t|CREATE INDEX idx_faa_registry_coverage_lookup ON public.faa_registry_coverage USING btree (n_number, snapshot_id)
+faa_registry_engine_references|faa_registry_engine_references_pkey|t|t|t|t|CREATE UNIQUE INDEX faa_registry_engine_references_pkey ON public.faa_registry_engine_references USING btree (snapshot_id, engine_code)
+faa_registry_snapshots|faa_registry_snapshots_archive_sha256_target_set_sha256_key|t|f|t|t|CREATE UNIQUE INDEX faa_registry_snapshots_archive_sha256_target_set_sha256_key ON public.faa_registry_snapshots USING btree (archive_sha256, target_set_sha256)
+faa_registry_snapshots|faa_registry_snapshots_pkey|t|t|t|t|CREATE UNIQUE INDEX faa_registry_snapshots_pkey ON public.faa_registry_snapshots USING btree (id)
+faa_registry_snapshots|idx_faa_registry_snapshots_current|f|f|t|t|CREATE INDEX idx_faa_registry_snapshots_current ON public.faa_registry_snapshots USING btree (snapshot_date DESC, id DESC)$expected_indexes$
+  THEN
+    RAISE EXCEPTION 'FAA registry projection indexes have an unexpected shape';
+  END IF;
+END
+$projection_shape_guard$;
+
 -- Validate one and only one supported state before any FAA object is replaced:
 -- the exact historical contract when the marker is absent, or the exact
 -- installed contract when it is present. This makes reruns idempotent without
@@ -89,17 +329,17 @@ BEGIN
 
   SELECT COUNT(*) INTO trigger_name_count
   FROM pg_catalog.pg_trigger trigger_row
+  JOIN pg_catalog.pg_class relation ON relation.oid = trigger_row.tgrelid
+  JOIN pg_catalog.pg_namespace relation_namespace
+    ON relation_namespace.oid = relation.relnamespace
   WHERE NOT trigger_row.tgisinternal
-    AND trigger_row.tgname IN (
-      'faa_registry_snapshots_require_exact_evidence',
-      'faa_registry_aircraft_references_reachable',
-      'faa_registry_engine_references_reachable',
-      'faa_registry_coverage_consistent',
-      'faa_registry_snapshots_immutable',
-      'faa_registry_aircraft_immutable',
-      'faa_registry_aircraft_references_immutable',
-      'faa_registry_engine_references_immutable',
-      'faa_registry_coverage_immutable'
+    AND relation_namespace.nspname = 'public'
+    AND relation.relname IN (
+      'faa_registry_aircraft',
+      'faa_registry_aircraft_references',
+      'faa_registry_coverage',
+      'faa_registry_engine_references',
+      'faa_registry_snapshots'
     );
 
   IF marker_installed THEN
@@ -740,15 +980,17 @@ BEGIN
 
   SELECT COUNT(*) INTO trigger_name_count
   FROM pg_catalog.pg_trigger trigger_row
+  JOIN pg_catalog.pg_class relation ON relation.oid = trigger_row.tgrelid
+  JOIN pg_catalog.pg_namespace relation_namespace
+    ON relation_namespace.oid = relation.relnamespace
   WHERE NOT trigger_row.tgisinternal
-    AND trigger_row.tgname IN (
-      'faa_registry_snapshots_require_exact_evidence',
-      'faa_registry_coverage_consistent',
-      'faa_registry_snapshots_immutable',
-      'faa_registry_aircraft_immutable',
-      'faa_registry_aircraft_references_immutable',
-      'faa_registry_engine_references_immutable',
-      'faa_registry_coverage_immutable'
+    AND relation_namespace.nspname = 'public'
+    AND relation.relname IN (
+      'faa_registry_aircraft',
+      'faa_registry_aircraft_references',
+      'faa_registry_coverage',
+      'faa_registry_engine_references',
+      'faa_registry_snapshots'
     );
 
   WITH expected(function_name, function_source) AS (
@@ -808,7 +1050,7 @@ $immutability_function$)
     AND routine.provolatile = 'v'
     AND routine.proparallel = 'u';
 
-  IF trigger_matches <> 7 OR trigger_name_count <> 7 OR function_matches <> 3
+  IF trigger_matches <> 7 OR trigger_name_count <> 9 OR function_matches <> 3
   THEN
     RAISE EXCEPTION
       'post-migration FAA provenance objects have an unexpected shape';
@@ -819,6 +1061,22 @@ $post_provenance_guard$;
 DO $post_migration_guard$
 BEGIN
   IF (
+    SELECT COUNT(*)
+    FROM pg_catalog.pg_trigger trigger_row
+    JOIN pg_catalog.pg_class relation ON relation.oid = trigger_row.tgrelid
+    JOIN pg_catalog.pg_namespace relation_namespace
+      ON relation_namespace.oid = relation.relnamespace
+    WHERE NOT trigger_row.tgisinternal
+      AND relation_namespace.nspname = 'public'
+      AND relation.relname IN (
+        'faa_registry_aircraft',
+        'faa_registry_aircraft_references',
+        'faa_registry_coverage',
+        'faa_registry_engine_references',
+        'faa_registry_snapshots'
+      )
+  ) <> 9
+  OR (
     SELECT COUNT(*)
     FROM pg_catalog.pg_trigger trigger_row
     WHERE NOT trigger_row.tgisinternal

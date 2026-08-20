@@ -108,7 +108,7 @@ const FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT: &str =
 // broken class without exposing row data. Trigger and function definitions are
 // attested separately because their bodies need reviewable source constants.
 const POSTGRES_FAA_RELATION_SHAPE_FINGERPRINT: &str =
-    "c29403fcfccbb6ad92c39c743816f625b834c3f6b82c90cb37b25e70dcceefea";
+    "89fec02f98c47c310eff50a08c2ad3e36e1c384f815ca0cf68a60f26cc3d15a5";
 const POSTGRES_FAA_COLUMN_SHAPE_FINGERPRINT: &str =
     "db914acb21a67c75a86cdb72efc427de02ae935060e2a1fdcfd68e00c3534774";
 const POSTGRES_FAA_CONSTRAINT_SHAPE_FINGERPRINT: &str =
@@ -3472,16 +3472,13 @@ impl AppDb {
               ON routine_namespace.oid = routine.pronamespace
             JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
             WHERE NOT actual_trigger.tgisinternal
-              AND actual_trigger.tgname IN (
-                'faa_registry_snapshots_require_exact_evidence',
-                'faa_registry_aircraft_references_reachable',
-                'faa_registry_engine_references_reachable',
-                'faa_registry_coverage_consistent',
-                'faa_registry_snapshots_immutable',
-                'faa_registry_aircraft_immutable',
-                'faa_registry_aircraft_references_immutable',
-                'faa_registry_engine_references_immutable',
-                'faa_registry_coverage_immutable'
+              AND relation_namespace.nspname = 'public'
+              AND relation.relname IN (
+                'faa_registry_aircraft',
+                'faa_registry_aircraft_references',
+                'faa_registry_coverage',
+                'faa_registry_engine_references',
+                'faa_registry_snapshots'
               )
             ORDER BY actual_trigger.tgname
             "#,
@@ -3596,9 +3593,10 @@ impl AppDb {
               (
                 SELECT pg_catalog.string_agg(
                   pg_catalog.format(
-                    '%s|%s|%s|%s|%s', relation.relname, relation.relkind,
-                    relation.relpersistence, relation.relrowsecurity,
-                    relation.relispartition
+                    '%s|%s|%s|%s|%s|%s|%s', relation.relname,
+                    relation.relkind, relation.relpersistence,
+                    relation.relrowsecurity, relation.relforcerowsecurity,
+                    relation.relispartition, relation.relhasrules
                   ), E'\n' ORDER BY relation.relname
                 )
                 FROM pg_catalog.pg_class relation
@@ -3781,6 +3779,17 @@ impl AppDb {
               'faa_registry_snapshots_immutable_delete',
               'faa_registry_snapshots_immutable_update',
               'faa_registry_snapshots_require_exact_evidence'
+            )
+            OR (
+              type IN ('index', 'trigger')
+              AND tbl_name IN (
+                'faa_registry_aircraft',
+                'faa_registry_aircraft_references',
+                'faa_registry_coverage',
+                'faa_registry_engine_references',
+                'faa_registry_snapshots'
+              )
+              AND sql IS NOT NULL
             )
             ORDER BY type, name
             "#,
@@ -5418,6 +5427,56 @@ mod tests {
         assert!(error.contains("triggers or functions"), "{error}");
         install_faa_registry_functions(&pool).await;
 
+        pool.execute(
+            "CREATE FUNCTION public.unexpected_faa_trigger_function() RETURNS TRIGGER \
+             LANGUAGE plpgsql AS $function$BEGIN RETURN NEW; END;$function$ \
+             SET search_path = pg_catalog",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TRIGGER unexpected_faa_trigger BEFORE INSERT \
+             ON public.faa_registry_aircraft FOR EACH ROW EXECUTE FUNCTION \
+             public.unexpected_faa_trigger_function()",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("triggers or functions"), "{error}");
+        pool.execute("DROP TRIGGER unexpected_faa_trigger ON public.faa_registry_aircraft")
+            .await
+            .unwrap();
+        pool.execute("DROP FUNCTION public.unexpected_faa_trigger_function()")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "CREATE INDEX unexpected_faa_index \
+             ON public.faa_registry_engine_references (model_name)",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry indexes"), "{error}");
+        pool.execute("DROP INDEX public.unexpected_faa_index")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage ADD CONSTRAINT \
+             unexpected_faa_constraint CHECK (length(lookup_status) > 0)",
+        )
+        .await
+        .unwrap();
+        let error = assert_faa_reference_startup_rejected(&db).await;
+        assert!(error.contains("registry constraints"), "{error}");
+        pool.execute(
+            "ALTER TABLE public.faa_registry_coverage \
+             DROP CONSTRAINT unexpected_faa_constraint",
+        )
+        .await
+        .unwrap();
+
         pool.execute("DROP INDEX public.idx_faa_registry_coverage_lookup")
             .await
             .unwrap();
@@ -5474,6 +5533,38 @@ mod tests {
             unreachable!()
         };
         assert!(db.faa_registry_contract_valid().await.unwrap());
+
+        pool.execute(
+            "CREATE TRIGGER unexpected_faa_trigger BEFORE INSERT \
+             ON faa_registry_aircraft BEGIN SELECT 1; END",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SQLite FAA registry object set"), "{error}");
+        pool.execute("DROP TRIGGER unexpected_faa_trigger")
+            .await
+            .unwrap();
+
+        pool.execute(
+            "CREATE INDEX unexpected_faa_index \
+             ON faa_registry_engine_references(model_name)",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SQLite FAA registry object set"), "{error}");
+        pool.execute("DROP INDEX unexpected_faa_index")
+            .await
+            .unwrap();
 
         let evidence_trigger: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
@@ -5574,7 +5665,9 @@ mod tests {
                n_number TEXT NOT NULL, \
                lookup_status TEXT NOT NULL, \
                PRIMARY KEY (snapshot_id, n_number), \
-               CHECK (substr(n_number, 1, 1) = 'N' AND length(n_number) BETWEEN 2 AND 6) \
+               CHECK (substr(n_number, 1, 1) = 'N' AND length(n_number) BETWEEN 2 AND 6), \
+               CHECK (lookup_status IN ('matched', 'absent')), \
+               CONSTRAINT unexpected_faa_constraint CHECK (length(lookup_status) > 0) \
              )",
         )
         .await
