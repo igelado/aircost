@@ -2058,9 +2058,9 @@ mod tests {
         )
         .bind(manufacturer_id)
         .bind(model)
-        .bind(model.to_ascii_lowercase())
+        .bind(normalize_avionics_model_name(model))
         .bind(identifier)
-        .bind(identifier.to_ascii_lowercase())
+        .bind(normalize_avionics_identifier(identifier))
         .fetch_one(pool(db))
         .await
         .unwrap();

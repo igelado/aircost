@@ -230,6 +230,8 @@ JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
 LEFT JOIN owned_relations expected_relation ON expected_relation.name = relation.relname
 LEFT JOIN owned_routines expected_routine ON expected_routine.name = routine.proname
 WHERE NOT trigger_row.tgisinternal
+  AND trigger_row.tgname <>
+    'avionics_models_approved_concrete_model'
   AND namespace.nspname = 'public'
   AND (expected_relation.name IS NOT NULL OR expected_routine.name IS NOT NULL)
 UNION ALL
@@ -10469,6 +10471,53 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
   'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION public.enforce_avionics_approved_concrete_model()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF NEW.catalog_status = 'approved' AND (
+    NEW.normalized_name <> LOWER(BTRIM(NEW.normalized_name))
+    OR NEW.normalized_name !~ '^[a-z0-9]+( [a-z0-9]+)*$'
+  ) THEN
+    RAISE EXCEPTION 'approved avionics normalized_name is not canonical; canonicalize, correct, or demote it before retrying migration';
+  END IF;
+  IF NEW.catalog_status = 'approved' AND NEW.normalized_name IN (
+    '', 'unknown', 'generic', 'standard', 'factory', 'oem', 'various', 'multiple',
+    'avionics', 'avionics suite', 'integrated avionics', 'integrated avionics suite',
+    'glass panel', 'flight instruments', 'standard flight instruments',
+    'standard vfr avionics', 'standard ifr avionics', 'radio', 'radios', 'nav',
+    'com', 'nav com', 'gps nav com', 'navigation system', 'gps', 'autopilot',
+    'flight director', 'transponder', 'ads b', 'weather radar', 'audio panel',
+    'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
+    'traffic', 'active traffic', 'traffic advisory system', 'datalink', 'xm',
+    'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
+    'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
+    'taws', 'engine monitor', 'standby instrument', 'elt', 'adf', 'dme', 'ahrs',
+    'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'equipment'
+  ) THEN
+    RAISE EXCEPTION 'approved avionics model is a generic category; canonicalize, correct, or demote it before retrying migration';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS avionics_models_approved_concrete_model
+  ON public.avionics_models;
+CREATE TRIGGER avionics_models_approved_concrete_model
+BEFORE INSERT OR UPDATE OF catalog_status, normalized_name
+ON public.avionics_models
+FOR EACH ROW EXECUTE FUNCTION public.enforce_avionics_approved_concrete_model();
+
+INSERT INTO public.schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260821_avionics_approved_concrete_model', 1,
+  '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

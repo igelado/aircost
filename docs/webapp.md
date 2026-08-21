@@ -236,17 +236,16 @@ not covered, absent, ambiguous, or conflicts with the supplied serial number.
 Preview remains read-only and may still display extracted data that admission
 will reject.
 
-During creation or an explicit avionics replacement, one narrow tools-disabled
-fast path may discard an observation before grounded research: the classifier
-must return the exact response shape, classify it as `generic` with
-`very_high` confidence, set `model_identifies_single_unit=false`, and provide
-concrete non-empty indicators. Invalid, ambiguous, weaker, or failed answers
-continue normally. Automatic review also uses that one-call gate for retained
-current-schema observations whose product label is generic but whose
-capabilities, quantity, source evidence, action, and replacement graph are
-otherwise structurally valid. Only the same strict decision discards them;
-every other answer stays in manual review without grounded catalog calls.
-Structurally malformed observations bypass the classifier and remain pending.
+During creation or an explicit avionics replacement, a structurally valid
+observation whose complete typography-normalized model equals one entry in the
+closed generic equipment-category vocabulary is discarded before any local,
+catalog, or provider identity work. Automatic review uses the same
+provider-free rule only after capabilities, quantity, source evidence, action,
+and replacement graph pass structural validation. Whole-label equality is
+required; manufacturer names, capabilities, substrings, and fuzzy matches never
+authorize discard. Structurally malformed observations remain pending. Other
+observations that reach the grounded resolver retain its narrow tools-disabled
+concreteness classifier and normal grounded fallback.
 The grounded resolver has a separate discard path for a
 high-confidence structured `rejection_basis` and a basis-consistent,
 candidate-specific negative reason. For that path, the entire normalized
@@ -565,9 +564,9 @@ request plan and warns that finalization enrichment is additional. This is a
 cost warning, not a hard budget. The avionics totals include one tools-disabled
 concreteness-classifier request for every identity that reaches grounded
 curation; verified-local identities and successful closed-context candidate
-adjudications do not incur that request. They also include one request for each
-otherwise-valid current-schema generic label evaluated before terminal invalid
-retention; those observations never proceed to grounding from that path.
+adjudications do not incur that request. Exact whole-label generic categories
+contribute no requests; after structural validation they are discarded
+deterministically and never proceed to grounding.
 Deterministically FAA-rejected aircraft remain visible but are not selectable
 for another automatic identity run. A pending factory reference never blocks
 automatic listing verification. `GEMINI_API_KEY` enables extraction and

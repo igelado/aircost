@@ -355,17 +355,21 @@ Listings are created through either the web API or plugin submission path:
 6. Ask Gemini to confirm plausible candidate matches when string similarity is
    insufficient.
 7. Correct non-conforming variant labels when they include maker or model year.
-8. Build a similarity shortlist from the server catalog, then ask grounded
-   Gemini to select an existing ID, propose a verified new identity, reject
-   generic text, or fail unresolved. Similarity and exact normalized strings
-   are retrieval aids only. Every positive identity—including an already
-   approved match—undergoes an independent proposal attestation and
-   candidate-by-candidate collision review before it can be associated.
+8. Reject a structurally valid observation provider-free when its complete
+   normalized model is in the closed generic-category vocabulary. For every
+   other unresolved observation, build a similarity shortlist from the server
+   catalog, then ask grounded Gemini to select an existing ID, propose a
+   verified new identity, reject unsupported text, or fail unresolved.
+   Similarity and exact normalized strings are retrieval aids only. Every
+   positive identity—including an already approved match—undergoes an
+   independent proposal attestation and candidate-by-candidate collision
+   review before it can be associated.
 9. Keep only verified canonical outcomes. An approved identity can become a
    listing association. A primary candidate is automatically discarded as
-   generic or garbage only when Gemini returns high confidence, selects a
-   structured `rejection_basis`, and states a candidate-specific negative
-   `reason` consistent with that basis. The whole normalized reason must occur
+   unsupported for reasons outside the closed generic-category policy only
+   when Gemini returns high confidence, selects a structured
+   `rejection_basis`, and states a candidate-specific negative `reason`
+   consistent with that basis. The whole normalized reason must occur
    in one Google Search grounding support span linked to a cited source, and
    must explicitly name the observed model and its usable manufacturer.
    Identity-only, unrelated, fragmented, or contradictory citation support is
@@ -1168,12 +1172,11 @@ minimum baseline (candidate comparison succeeds and conditional relationship
 targets are skipped), all-positive baseline, and maximum validation envelope
 (every candidate falls through to classifier plus grounding). A legacy
 listing re-extraction is one baseline request and up to two with JSON repair.
-In addition, each structurally valid current-schema observation rejected by
-local validation only because its model is a generic label contributes exactly
-one tools-disabled classifier request to every plan total. A strict
-`very_high` generic/non-single-unit result discards it; every other result stays
-in review without grounding. Other invalid observations make no provider
-request.
+Structurally valid current-schema observations whose complete normalized model
+is in the closed generic-category vocabulary contribute zero requests to every
+plan total and are discarded deterministically. Structurally malformed
+observations stay in review without a provider request. Whole-label equality is
+required; similarity and partial overlap do not authorize discard.
 Transport retry attempts are reported separately and are not multiplied into
 these logical counts. Identity counts produced by legacy re-extraction, later
 verified-local reuse, fallback, and correction outcomes remain explicitly
