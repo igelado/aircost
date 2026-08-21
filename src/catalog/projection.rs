@@ -16,6 +16,8 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection};
 use crate::aircraft::faa::bridge::{FaaBridgeOutcome, LegacyFaaRepresentative};
 use crate::db::{AppDb, DatabaseBackend};
 
+pub(crate) mod current;
+
 const ROOT_TABLES: &[&str] = &[
     "aircraft_makes",
     "aircraft_model_families",

@@ -25,6 +25,7 @@ use super::{
 };
 use crate::aircraft::faa::bridge::rebuild_faa_projection;
 use crate::aircraft::faa::normalize_n_number;
+use crate::catalog::projection::current::CurrentCatalogProjection;
 use crate::catalog::projection::{project_reusable_catalog, required_faa_representatives};
 use crate::db::{database_url_from_arg, sqlite_database_urls_equal, AppDb, DatabaseBackend};
 
@@ -120,6 +121,7 @@ pub struct PrepareLegacyReplaySourceReport {
     pub n_number_count: usize,
     pub faa_archive_sha256: String,
     pub faa_snapshot_date: String,
+    pub catalog_projection_version: u32,
     pub catalog_fingerprint_sha256: String,
     pub applied_rows: usize,
     pub output_created: bool,
@@ -226,8 +228,9 @@ pub async fn prepare_legacy_replay_source(
         &representatives,
     )
     .await?;
-    let catalog = project_reusable_catalog(&mut source_snapshot, &target, &faa).await?;
+    let legacy_catalog = project_reusable_catalog(&mut source_snapshot, &target, &faa).await?;
     audit_prepared_target(&target, &faa.obsolete_hashes).await?;
+    let prepared_catalog = CurrentCatalogProjection::load(&target).await?;
     source_snapshot.rollback().await?;
     drop(source_connection);
     source_pool.close().await;
@@ -236,7 +239,7 @@ pub async fn prepare_legacy_replay_source(
 
     let faa_archive_sha256 = faa.report.archive_sha256.clone();
     let faa_snapshot_date = faa.report.snapshot_date.clone();
-    let applied_rows = capture_rows + catalog.applied_rows;
+    let applied_rows = capture_rows + legacy_catalog.applied_rows;
     if request.apply {
         checkpoint_prepared_target(&target).await?;
     }
@@ -244,6 +247,7 @@ pub async fn prepare_legacy_replay_source(
     let output_created = if let Some(file) = temporary.take() {
         let diagnostic = AppDb::connect_diagnostic(&target_url).await?;
         audit_prepared_target(&diagnostic, &faa.obsolete_hashes).await?;
+        prepared_catalog.require_reloaded_match(&diagnostic).await?;
         diagnostic.close().await;
         persist_prepared_output(file, request.output)?;
         true
@@ -263,7 +267,8 @@ pub async fn prepare_legacy_replay_source(
         n_number_count: captures.n_numbers.len(),
         faa_archive_sha256,
         faa_snapshot_date,
-        catalog_fingerprint_sha256: catalog.fingerprint_sha256,
+        catalog_projection_version: prepared_catalog.summary().version,
+        catalog_fingerprint_sha256: prepared_catalog.fingerprint_sha256().to_string(),
         applied_rows,
         output_created,
     })
