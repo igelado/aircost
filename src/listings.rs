@@ -5517,6 +5517,7 @@ mod tests {
             evidence: "The manual identifies the model and part number.".to_string(),
             reason: "Authoritative manufacturer manual.".to_string(),
             grounded_claim_source_urls: Vec::new(),
+            verified_local_reuse_proof: None,
         }
     }
 
