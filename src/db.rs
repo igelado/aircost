@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use sha3::Sha3_256;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Executor, PgPool, SqlitePool};
+use sqlx::{Connection, Executor, PgConnection, PgPool, SqliteConnection, SqlitePool};
 
 use crate::models::User;
 
@@ -18,6 +18,7 @@ const DEVELOPER_AUTH_SUBJECT: &str = "developer";
 const SQLITE_SCHEMA_SQL: &str = include_str!("../schema/sqlite.sql");
 const POSTGRES_SCHEMA_SQL: &str = include_str!("../schema/postgres.sql");
 const POSTGRES_SEARCH_PATH: &str = "public,pg_catalog,pg_temp";
+const POSTGRES_STARTUP_ADVISORY_LOCK_KEY: i64 = 0x0041_4952_434f_5354;
 const VALUATION_DATA_HARDENING_MIGRATION: &str = "20260720_valuation_data_hardening";
 const AVIONICS_CATALOG_CURATION_MIGRATION: &str = "20260721_avionics_catalog_curation";
 const AVIONICS_MULTI_TYPE_MIGRATION: &str = "20260721_avionics_multi_type";
@@ -452,6 +453,11 @@ pub(crate) enum DatabaseBackend {
     Postgres(PgPool),
 }
 
+enum GateConnection<'connection> {
+    Sqlite(&'connection mut SqliteConnection),
+    Postgres(&'connection mut PgConnection),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DatabaseKind {
     Sqlite,
@@ -781,6 +787,23 @@ fn canonical_postgres_trigger_definition(value: &str) -> String {
         .replace("afterupdateordeleteon", "afterdeleteorupdateon")
 }
 
+fn postgres_pool_options(max_connections: u32) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query(
+                    "SELECT pg_catalog.set_config( \
+                       'search_path', 'public,pg_catalog,pg_temp', false \
+                     )",
+                )
+                .execute(connection)
+                .await?;
+                Ok(())
+            })
+        })
+}
+
 impl AppDb {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
@@ -788,20 +811,7 @@ impl AppDb {
             let options = PgConnectOptions::from_str(&database_url)
                 .with_context(|| format!("invalid Postgres database URL {database_url}"))?
                 .options([("search_path", POSTGRES_SEARCH_PATH)]);
-            let pool = PgPoolOptions::new()
-                .max_connections(5)
-                .after_connect(|connection, _metadata| {
-                    Box::pin(async move {
-                        sqlx::query(
-                            "SELECT pg_catalog.set_config( \
-                               'search_path', 'public,pg_catalog,pg_temp', false \
-                             )",
-                        )
-                        .execute(connection)
-                        .await?;
-                        Ok(())
-                    })
-                })
+            let pool = postgres_pool_options(5)
                 .connect_with(options)
                 .await
                 .with_context(|| {
@@ -810,12 +820,7 @@ impl AppDb {
             let db = Self {
                 backend: DatabaseBackend::Postgres(pool),
             };
-            db.ensure_required_migrations()
-                .await
-                .context("PostgreSQL pre-initialize migration gate failed")?;
-            db.initialize()
-                .await
-                .context("PostgreSQL schema initialization failed")?;
+            db.initialize_transactionally().await?;
             db.ensure_required_migrations()
                 .await
                 .context("PostgreSQL post-initialize migration gate failed")?;
@@ -834,8 +839,7 @@ impl AppDb {
             let db = Self {
                 backend: DatabaseBackend::Sqlite(pool),
             };
-            db.ensure_required_migrations().await?;
-            db.initialize().await?;
+            db.initialize_transactionally().await?;
             db.ensure_required_migrations().await?;
             Ok(db)
         }
@@ -950,8 +954,26 @@ impl AppDb {
     }
 
     async fn ensure_required_migrations(&self) -> Result<()> {
-        let missing_valuation_hardening = match self.backend() {
+        match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Sqlite(&mut connection);
+                self.ensure_required_migrations_on(&mut connection).await
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Postgres(&mut connection);
+                self.ensure_required_migrations_on(&mut connection).await
+            }
+        }
+    }
+
+    async fn ensure_required_migrations_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<()> {
+        let missing_valuation_hardening = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                 SELECT
@@ -967,11 +989,11 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                 SELECT
@@ -985,7 +1007,7 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -998,8 +1020,8 @@ impl AppDb {
             ));
         }
 
-        let missing_avionics_curation = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_avionics_curation = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                 SELECT
@@ -1015,11 +1037,11 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                 SELECT
@@ -1033,7 +1055,7 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -1046,8 +1068,8 @@ impl AppDb {
             ));
         }
 
-        let missing_avionics_multi_type = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_avionics_multi_type = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                 SELECT
@@ -1070,11 +1092,11 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                 SELECT
@@ -1091,7 +1113,7 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -1099,8 +1121,8 @@ impl AppDb {
             bail!(avionics_multi_type_migration_required_message(self.kind()));
         }
 
-        let missing_aircraft_reference_catalog = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_aircraft_reference_catalog = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT
@@ -1144,11 +1166,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
@@ -1165,7 +1187,7 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -1175,8 +1197,8 @@ impl AppDb {
             ));
         }
 
-        let missing_listing_pending_reviews = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_listing_pending_reviews = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT
@@ -1198,11 +1220,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
@@ -1220,7 +1242,7 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -1230,8 +1252,8 @@ impl AppDb {
             ));
         }
 
-        let missing_identity_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_identity_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_objects(object_type, object_name, parent_name) AS (
@@ -1386,11 +1408,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_relations(object_name, relation_kind) AS (
@@ -1539,13 +1561,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_identity_deduplication_postconditions = missing_identity_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "avionics_models",
                     IDENTITY_DEDUPLICATION_POSTCONDITIONS_MIGRATION,
                     IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_VERSION,
@@ -1556,8 +1579,8 @@ impl AppDb {
             bail!(identity_deduplication_postconditions_migration_required_message(self.kind()));
         }
 
-        let missing_listing_aircraft_identity_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_listing_aircraft_identity_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_objects(object_type, object_name, parent_name) AS (
@@ -1626,11 +1649,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_relations(object_name, relation_kind) AS (
@@ -1699,14 +1722,15 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await
                 .context("could not inspect PostgreSQL listing aircraft identity objects")?
             }
         };
         let missing_listing_aircraft_identity = missing_listing_aircraft_identity_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "aircraft_sale_listings",
                     LISTING_AIRCRAFT_IDENTITY_MIGRATION,
                     LISTING_AIRCRAFT_IDENTITY_CONTRACT_VERSION,
@@ -1719,8 +1743,8 @@ impl AppDb {
             ));
         }
 
-        let missing_listing_aircraft_compatibility_projection_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_listing_aircraft_compatibility_projection_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_objects(object_type, object_name, parent_name) AS (
@@ -1786,11 +1810,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_relations(object_name, relation_kind) AS (
@@ -1863,14 +1887,15 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_listing_aircraft_compatibility_projection =
             missing_listing_aircraft_compatibility_projection_objects
                 || self
-                    .migration_contract_invalid(
+                    .migration_contract_invalid_on(
+                        connection,
                         "aircraft_sale_listings",
                         LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_MIGRATION,
                         LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_CONTRACT_VERSION,
@@ -1883,8 +1908,8 @@ impl AppDb {
             );
         }
 
-        let missing_no_supported_selection_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_no_supported_selection_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_triggers(trigger_name, parent_name) AS (
@@ -1926,11 +1951,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_triggers(parent_name, trigger_name) AS (
@@ -1978,13 +2003,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_no_supported_selection = missing_no_supported_selection_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "aircraft_identity_decisions",
                     AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_MIGRATION,
                     AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_CONTRACT_VERSION,
@@ -1995,8 +2021,8 @@ impl AppDb {
             bail!(aircraft_identity_no_supported_selection_migration_required_message(self.kind()));
         }
 
-        let missing_aircraft_catalog_retrieval_key_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_aircraft_catalog_retrieval_key_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_triggers(parent_name, trigger_name) AS (
@@ -2037,11 +2063,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_triggers(parent_name, trigger_name) AS (
@@ -2077,13 +2103,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_aircraft_catalog_retrieval_keys = missing_aircraft_catalog_retrieval_key_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "aircraft_makes",
                     AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
                     AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
@@ -2096,8 +2123,8 @@ impl AppDb {
             ));
         }
 
-        let missing_aircraft_tcds_make_lineage_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_aircraft_tcds_make_lineage_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_triggers(parent_name, trigger_name) AS (
@@ -2159,11 +2186,11 @@ impl AppDb {
                       ))
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_triggers(parent_name, trigger_name) AS (
@@ -2214,13 +2241,14 @@ impl AppDb {
                       ))
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_aircraft_tcds_make_lineage = missing_aircraft_tcds_make_lineage_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "aircraft_makes",
                     AIRCRAFT_TCDS_MAKE_LINEAGE_MIGRATION,
                     AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_VERSION,
@@ -2233,8 +2261,8 @@ impl AppDb {
             ));
         }
 
-        let missing_human_consolidation_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_human_consolidation_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_objects(object_type, object_name) AS (
@@ -2266,11 +2294,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_relations(object_name) AS (
@@ -2312,13 +2340,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_human_consolidation = missing_human_consolidation_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "avionics_models",
                     AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_MIGRATION,
                     AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_VERSION,
@@ -2329,7 +2358,8 @@ impl AppDb {
             bail!(avionics_human_reviewed_consolidation_migration_required_message(self.kind()));
         }
         let missing_descriptive_consolidation = self
-            .migration_contract_invalid(
+            .migration_contract_invalid_on(
+                connection,
                 "avionics_catalog_valid_human_consolidation_pairs",
                 AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
                 AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
@@ -2339,8 +2369,8 @@ impl AppDb {
         if missing_descriptive_consolidation {
             bail!(avionics_descriptive_consolidation_migration_required_message(self.kind()));
         }
-        let missing_grounded_exact_model_consolidation_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_grounded_exact_model_consolidation_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_objects(object_type, object_name) AS (
@@ -2371,11 +2401,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_relations(object_name) AS (
@@ -2419,14 +2449,15 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_grounded_exact_model_consolidation =
             missing_grounded_exact_model_consolidation_objects
                 || self
-                    .migration_contract_invalid(
+                    .migration_contract_invalid_on(
+                        connection,
                         "avionics_models",
                         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
                         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
@@ -2439,8 +2470,8 @@ impl AppDb {
             );
         }
 
-        let missing_avionics_source_origin_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_avionics_source_origin_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_objects(object_type, object_name) AS (
@@ -2471,11 +2502,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_relations(object_name) AS (
@@ -2513,13 +2544,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_avionics_source_origins = missing_avionics_source_origin_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "avionics_manufacturers",
                     AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION,
                     AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION,
@@ -2530,8 +2562,8 @@ impl AppDb {
             bail!(avionics_authoritative_source_origins_migration_required_message(self.kind()));
         }
 
-        let missing_avionics_reuse_attestation_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_avionics_reuse_attestation_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     WITH required_columns(
@@ -2735,11 +2767,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH required_columns(
@@ -2947,13 +2979,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_avionics_reuse_attestations = missing_avionics_reuse_attestation_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "avionics_models",
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION,
@@ -2961,7 +2994,8 @@ impl AppDb {
                 )
                 .await?
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "avionics_models",
                     AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
                     AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION,
@@ -2972,7 +3006,8 @@ impl AppDb {
             bail!(avionics_product_reuse_attestations_migration_required_message(self.kind()));
         }
         if self
-            .migration_contract_invalid(
+            .migration_contract_invalid_on(
+                connection,
                 "avionics_models",
                 AVIONICS_GROUNDED_EVIDENCE_REFRESH_MIGRATION,
                 AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_VERSION,
@@ -2982,8 +3017,8 @@ impl AppDb {
         {
             bail!(avionics_grounded_evidence_refresh_migration_required_message(self.kind()));
         }
-        let missing_listing_avionics_authorization_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_listing_avionics_authorization_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT
@@ -3037,11 +3072,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
@@ -3095,13 +3130,14 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let missing_listing_avionics_authorizations = missing_listing_avionics_authorization_objects
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     "aircraft_sale_listing_avionics",
                     LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
                     LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION,
@@ -3114,7 +3150,8 @@ impl AppDb {
             );
         }
         if self
-            .migration_contract_invalid(
+            .migration_contract_invalid_on(
+                connection,
                 "aircraft_sale_listing_avionics_authorizations",
                 LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
                 LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
@@ -3128,8 +3165,8 @@ impl AppDb {
                 )
             );
         }
-        let missing_occurrence_dispositions = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_occurrence_dispositions = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT EXISTS (
@@ -3142,18 +3179,18 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT to_regclass('plugin_submissions') IS NOT NULL
                        AND to_regclass('aircraft_sale_listing_avionics_dispositions') IS NULL
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -3165,11 +3202,12 @@ impl AppDb {
                 LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
             ));
         }
-        let faa_registry_schema_started = self.faa_registry_schema_started().await?;
-        let missing_faa_reference_contract = match self.backend() {
-            DatabaseBackend::Sqlite(_) => false,
-            DatabaseBackend::Postgres(_) => {
-                self.migration_contract_invalid(
+        let faa_registry_schema_started = self.faa_registry_schema_started_on(connection).await?;
+        let missing_faa_reference_contract = match &mut *connection {
+            GateConnection::Sqlite(_) => false,
+            GateConnection::Postgres(_) => {
+                self.migration_contract_invalid_on(
+                    connection,
                     "public.faa_registry_aircraft_references",
                     FAA_REFERENCE_REACHABILITY_MIGRATION,
                     FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
@@ -3179,7 +3217,8 @@ impl AppDb {
             }
         };
         let missing_faa_record_hash_domain_contract = self
-            .migration_contract_invalid(
+            .migration_contract_invalid_on(
+                connection,
                 match self.kind() {
                     DatabaseKind::Sqlite => "faa_registry_snapshots",
                     DatabaseKind::Postgres => "public.faa_registry_snapshots",
@@ -3198,7 +3237,7 @@ impl AppDb {
             let contract_problem = if missing_faa_reference_contract {
                 Some(String::from("migration contract marker"))
             } else {
-                self.faa_registry_contract_problem().await?
+                self.faa_registry_contract_problem_on(connection).await?
             };
             if let Some(problem) = contract_problem {
                 bail!(faa_registry_contract_required_message(
@@ -3207,8 +3246,8 @@ impl AppDb {
                 ));
             }
         }
-        let missing_aircraft_listing_identity_correction_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_aircraft_listing_identity_correction_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT EXISTS (
@@ -3245,11 +3284,11 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT pg_catalog.to_regclass('public.aircraft_sale_listings') IS NOT NULL AND (
@@ -3308,12 +3347,12 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
-        let aircraft_listing_identity_correction_schema_started = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let aircraft_listing_identity_correction_schema_started = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT EXISTS (
@@ -3334,11 +3373,11 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
@@ -3362,7 +3401,7 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -3373,14 +3412,15 @@ impl AppDb {
                 false
             } else {
                 !self
-                    .aircraft_listing_identity_correction_definitions_valid()
+                    .aircraft_listing_identity_correction_definitions_valid_on(connection)
                     .await?
             };
         let missing_aircraft_listing_identity_corrections =
             missing_aircraft_listing_identity_correction_objects
                 || invalid_aircraft_listing_identity_correction_definitions
                 || self
-                    .migration_contract_invalid(
+                    .migration_contract_invalid_on(
+                        connection,
                         match self.kind() {
                             DatabaseKind::Sqlite => {
                                 "aircraft_listing_identity_correction_decisions"
@@ -3397,8 +3437,8 @@ impl AppDb {
         if missing_aircraft_listing_identity_corrections {
             bail!(aircraft_listing_identity_corrections_migration_required_message(self.kind()));
         }
-        let missing_listing_replay_objects = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let missing_listing_replay_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                 SELECT EXISTS (
@@ -3474,11 +3514,11 @@ impl AppDb {
                 )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                 SELECT pg_catalog.to_regclass('public.plugin_submissions') IS NOT NULL
@@ -3530,12 +3570,12 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
-        let listing_replay_schema_started = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let listing_replay_schema_started = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                 SELECT EXISTS (
@@ -3558,11 +3598,11 @@ impl AppDb {
                 )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                 SELECT pg_catalog.to_regclass('public.listing_replay_runs') IS NOT NULL
@@ -3591,7 +3631,7 @@ impl AppDb {
                   )
                 "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -3599,12 +3639,13 @@ impl AppDb {
             if missing_listing_replay_objects || !listing_replay_schema_started {
                 false
             } else {
-                !self.listing_replay_definitions_valid().await?
+                !self.listing_replay_definitions_valid_on(connection).await?
             };
         let missing_listing_replay_runs = missing_listing_replay_objects
             || invalid_listing_replay_definitions
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     match self.kind() {
                         DatabaseKind::Sqlite => "listing_replay_runs",
                         DatabaseKind::Postgres => "public.listing_replay_runs",
@@ -3617,8 +3658,8 @@ impl AppDb {
         if missing_listing_replay_runs {
             bail!(listing_replay_runs_migration_required_message(self.kind()));
         }
-        let reference_catalog_cutover_started = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let reference_catalog_cutover_started = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 let has_object = sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT EXISTS (
@@ -3637,13 +3678,13 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0;
                 let has_ledger = sqlx::query_scalar::<_, i64>(
                     "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migration_contracts')",
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0;
                 let has_marker = if has_ledger {
@@ -3651,7 +3692,7 @@ impl AppDb {
                         "SELECT EXISTS (SELECT 1 FROM schema_migration_contracts WHERE migration_name = ?)",
                     )
                     .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
-                    .fetch_one(pool)
+                    .fetch_one(&mut **pool)
                     .await?
                         != 0
                 } else {
@@ -3659,7 +3700,7 @@ impl AppDb {
                 };
                 has_object || has_marker
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 let has_object = sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
@@ -3688,19 +3729,19 @@ impl AppDb {
                         .map(|name| (*name).to_string())
                         .collect::<Vec<_>>(),
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 let has_ledger = sqlx::query_scalar::<_, bool>(
                     "SELECT pg_catalog.to_regclass('public.schema_migration_contracts') IS NOT NULL",
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 let has_marker = if has_ledger {
                     sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS (SELECT 1 FROM public.schema_migration_contracts WHERE migration_name = $1)",
+                        "SELECT EXISTS (SELECT 1 FROM ONLY public.schema_migration_contracts WHERE migration_name = $1)",
                     )
                     .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
-                    .fetch_one(pool)
+                    .fetch_one(&mut **pool)
                     .await?
                 } else {
                     false
@@ -3708,8 +3749,8 @@ impl AppDb {
                 has_object || has_marker
             }
         };
-        let invalid_reference_catalog_cutover_shape = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let invalid_reference_catalog_cutover_shape = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT
@@ -3749,11 +3790,11 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT
@@ -3794,16 +3835,19 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         let invalid_reference_catalog_cutover_definitions = reference_catalog_cutover_started
-            && !self.reference_catalog_cutover_definitions_valid().await?;
+            && !self
+                .reference_catalog_cutover_definitions_valid_on(connection)
+                .await?;
         if invalid_reference_catalog_cutover_shape
             || invalid_reference_catalog_cutover_definitions
             || self
-                .migration_contract_invalid(
+                .migration_contract_invalid_on(
+                    connection,
                     match self.kind() {
                         DatabaseKind::Sqlite => "aircraft_reference_configuration_versions",
                         DatabaseKind::Postgres => {
@@ -3823,9 +3867,30 @@ impl AppDb {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn listing_replay_definitions_valid(&self) -> Result<bool> {
         match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Sqlite(&mut connection);
+                self.listing_replay_definitions_valid_on(&mut connection)
+                    .await
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Postgres(&mut connection);
+                self.listing_replay_definitions_valid_on(&mut connection)
+                    .await
+            }
+        }
+    }
+
+    async fn listing_replay_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 let table_definitions = sqlx::query_as::<_, (String, Option<String>)>(
                     r#"
                     SELECT name, sql FROM sqlite_schema
@@ -3837,7 +3902,7 @@ impl AppDb {
                     ORDER BY name
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let expected_table_definitions = [
                     (
@@ -3893,7 +3958,7 @@ impl AppDb {
                     WHERE name = 'idx_listing_replay_runs_one_running'
                     "#,
                 )
-                .fetch_optional(pool)
+                .fetch_optional(&mut **pool)
                 .await?;
                 let running_columns = sqlx::query_scalar::<_, String>(
                     r#"
@@ -3904,7 +3969,7 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_optional(pool)
+                .fetch_optional(&mut **pool)
                 .await?;
                 let phase_index = sqlx::query_as::<_, (i64, i64)>(
                     r#"
@@ -3913,7 +3978,7 @@ impl AppDb {
                     WHERE name = 'idx_listing_replay_run_items_phase'
                     "#,
                 )
-                .fetch_optional(pool)
+                .fetch_optional(&mut **pool)
                 .await?;
                 let phase_columns = sqlx::query_scalar::<_, String>(
                     r#"
@@ -3924,7 +3989,7 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_optional(pool)
+                .fetch_optional(&mut **pool)
                 .await?;
                 let attached_objects_are_closed = sqlx::query_scalar::<_, i64>(
                     r#"
@@ -3967,7 +4032,7 @@ impl AppDb {
                     ) = 6
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0;
                 let plugin_attached_triggers_are_closed = sqlx::query_scalar::<_, i64>(
@@ -3993,7 +4058,7 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0;
                 let unique_indexes = sqlx::query_as::<_, (String, i64, String, i64)>(
@@ -4004,7 +4069,7 @@ impl AppDb {
                     ORDER BY name
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let mut unique_column_sets = Vec::with_capacity(unique_indexes.len());
                 for (name, unique, origin, partial) in unique_indexes {
@@ -4016,7 +4081,7 @@ impl AppDb {
                         name.replace('\'', "''")
                     );
                     let columns = sqlx::query_scalar::<_, String>(&sql)
-                        .fetch_optional(pool)
+                        .fetch_optional(&mut **pool)
                         .await?;
                     if let Some(columns) = columns {
                         unique_column_sets.push(columns);
@@ -4052,7 +4117,7 @@ impl AppDb {
                     ORDER BY name
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let exact_guards_are_canonical = exact_guard_definitions.len()
                     == exact_guard_names.len()
@@ -4094,7 +4159,7 @@ impl AppDb {
                     && exact_guards_are_canonical
                     && unique_column_sets == ["run_id,plugin_submission_id", "run_id,position"])
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 let structural_contract = sqlx::query_scalar::<_, bool>(
                     r#"
                     WITH expected_columns(
@@ -4932,7 +4997,7 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 if !structural_contract {
                     return Ok(false);
@@ -4957,7 +5022,7 @@ impl AppDb {
                       )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 if function_fingerprint.as_deref()
                     != Some(POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT)
@@ -4982,7 +5047,7 @@ impl AppDb {
                     ORDER BY relation.relname, constraint_definition.conname
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let mut fingerprint = Sha256::new();
                 for (relation, name, definition) in checks {
@@ -4999,11 +5064,32 @@ impl AppDb {
         }
     }
 
+    #[cfg(test)]
     async fn reference_catalog_cutover_definitions_valid(&self) -> Result<bool> {
         match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Sqlite(&mut connection);
+                self.reference_catalog_cutover_definitions_valid_on(&mut connection)
+                    .await
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Postgres(&mut connection);
+                self.reference_catalog_cutover_definitions_valid_on(&mut connection)
+                    .await
+            }
+        }
+    }
+
+    async fn reference_catalog_cutover_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 if !self
-                    .sqlite_reference_catalog_object_contract_valid(pool)
+                    .sqlite_reference_catalog_object_contract_valid(&mut **pool)
                     .await?
                 {
                     return Ok(false);
@@ -5078,7 +5164,7 @@ impl AppDb {
                     ORDER BY type, name
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 expected.sort_by_key(|(kind, name, _)| (*kind, *name));
                 #[cfg(test)]
@@ -5127,7 +5213,7 @@ impl AppDb {
                 let price_table_definition = sqlx::query_scalar::<_, Option<String>>(
                     "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'aircraft_reference_prices'",
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 let Some(price_table_definition) = price_table_definition else {
                     return Ok(false);
@@ -5146,7 +5232,7 @@ impl AppDb {
                       AND pk = 0
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0;
                 let protected_index_signatures = sqlx::query_scalar::<_, String>(
@@ -5178,7 +5264,7 @@ impl AppDb {
                     ORDER BY protected_relation.relation_name, index_row.name
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let valid_indexes = protected_index_signatures.iter().map(String::as_str).eq(
                     REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES
@@ -5193,7 +5279,7 @@ impl AppDb {
                 }
                 Ok(valid_price_table && valid_price_column && valid_indexes)
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 let routine_names = REFERENCE_CATALOG_CUTOVER_ROUTINES
                     .iter()
                     .map(|name| (*name).to_string())
@@ -5234,7 +5320,7 @@ impl AppDb {
                     "#,
                 )
                 .bind(&routine_names)
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await
                 .context("could not inspect PostgreSQL reference-cutover routines")?;
                 if routines.len() != REFERENCE_CATALOG_CUTOVER_ROUTINES.len() {
@@ -5325,7 +5411,7 @@ impl AppDb {
                         .map(|name| (*name).to_string())
                         .collect::<Vec<_>>(),
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await
                 .context("could not inspect PostgreSQL reference-cutover trigger bindings")?;
                 let mut actual_triggers = triggers
@@ -5359,12 +5445,12 @@ impl AppDb {
                 }
 
                 if !self
-                    .postgres_reference_catalog_relations_valid(pool)
+                    .postgres_reference_catalog_relations_valid(&mut **pool)
                     .await?
                 {
                     return Ok(false);
                 }
-                self.postgres_reference_catalog_object_contract_valid(pool)
+                self.postgres_reference_catalog_object_contract_valid(&mut **pool)
                     .await
             }
         }
@@ -5372,7 +5458,7 @@ impl AppDb {
 
     async fn sqlite_reference_catalog_object_contract_valid(
         &self,
-        pool: &SqlitePool,
+        pool: &mut SqliteConnection,
     ) -> Result<bool> {
         let retired_relations = serde_json::to_string(REFERENCE_CATALOG_CUTOVER_RETIRED_RELATIONS)?;
         let retired_object_count = sqlx::query_scalar::<_, i64>(
@@ -5384,7 +5470,7 @@ impl AppDb {
         )
         .bind(&retired_relations)
         .bind(&retired_relations)
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await?;
         if retired_object_count != 0 {
             return Ok(false);
@@ -5483,7 +5569,7 @@ impl AppDb {
                 SELECT object_key, definition FROM objects ORDER BY object_key
                 "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *pool)
         .await
         .context("could not attest exact SQLite reference-cutover objects")?;
         let object_count = i64::try_from(objects.len())?;
@@ -5510,7 +5596,7 @@ impl AppDb {
 
     async fn postgres_reference_catalog_object_contract_valid(
         &self,
-        pool: &PgPool,
+        pool: &mut PgConnection,
     ) -> Result<bool> {
         let retired_relations = REFERENCE_CATALOG_CUTOVER_RETIRED_RELATIONS
             .iter()
@@ -5541,7 +5627,7 @@ impl AppDb {
         )
         .bind(&retired_relations)
         .bind(&retired_routines)
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await?;
         if retired_object_exists {
             return Ok(false);
@@ -5555,7 +5641,7 @@ impl AppDb {
         );
         let (object_count, definition_digest) =
             sqlx::query_as::<_, (i64, Option<String>)>(&contract_query)
-                .fetch_one(pool)
+                .fetch_one(&mut *pool)
                 .await
                 .context("could not attest exact PostgreSQL reference-cutover objects")?;
         let valid = object_count == REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT
@@ -5570,7 +5656,10 @@ impl AppDb {
         Ok(valid)
     }
 
-    async fn postgres_reference_catalog_relations_valid(&self, pool: &PgPool) -> Result<bool> {
+    async fn postgres_reference_catalog_relations_valid(
+        &self,
+        pool: &mut PgConnection,
+    ) -> Result<bool> {
         let relation_count = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)
@@ -5589,7 +5678,7 @@ impl AppDb {
               )
             "#,
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await
         .context("could not inspect PostgreSQL reference-cutover relations")?;
         if relation_count != 2 {
@@ -5634,7 +5723,7 @@ impl AppDb {
             ORDER BY relation.relname, attribute.attnum
             "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *pool)
         .await
         .context("could not inspect PostgreSQL reference-cutover columns")?;
         let expected_columns = [
@@ -5820,7 +5909,7 @@ impl AppDb {
               )
             "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *pool)
         .await
         .context("could not inspect PostgreSQL reference-cutover constraints")?;
         let expected_constraints = [
@@ -5913,7 +6002,7 @@ impl AppDb {
               )
             "#,
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await
         .context("could not inspect PostgreSQL reference-price basis contract")?;
         #[cfg(test)]
@@ -5922,9 +6011,30 @@ impl AppDb {
         }
         Ok(valid_price_basis)
     }
+    #[cfg(test)]
     async fn aircraft_listing_identity_correction_definitions_valid(&self) -> Result<bool> {
         match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Sqlite(&mut connection);
+                self.aircraft_listing_identity_correction_definitions_valid_on(&mut connection)
+                    .await
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Postgres(&mut connection);
+                self.aircraft_listing_identity_correction_definitions_valid_on(&mut connection)
+                    .await
+            }
+        }
+    }
+
+    async fn aircraft_listing_identity_correction_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 let definitions = sqlx::query_as::<_, (String, Option<String>)>(
                     r#"
                     SELECT name, sql
@@ -5940,7 +6050,7 @@ impl AppDb {
                     ORDER BY name
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let expected = [
                     (
@@ -5978,7 +6088,7 @@ impl AppDb {
                         },
                     ))
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 let definitions = sqlx::query_as::<_, PostgresCorrectionTriggerDefinition>(
                     r#"
                     SELECT
@@ -6064,7 +6174,7 @@ impl AppDb {
                     ORDER BY actual_trigger.tgname
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?;
                 let expected = [
                     (
@@ -6131,10 +6241,10 @@ impl AppDb {
         }
     }
 
-    async fn postgres_faa_registry_trigger_definitions_valid(&self) -> Result<bool> {
-        let DatabaseBackend::Postgres(pool) = self.backend() else {
-            return Ok(true);
-        };
+    async fn postgres_faa_registry_trigger_definitions_valid(
+        &self,
+        pool: &mut PgConnection,
+    ) -> Result<bool> {
         let definitions = sqlx::query_as::<_, PostgresFaaReferenceTriggerDefinition>(
             r#"
             SELECT
@@ -6184,7 +6294,7 @@ impl AppDb {
             ORDER BY actual_trigger.tgname
             "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *pool)
         .await?;
         let expected = [
             (
@@ -6284,10 +6394,10 @@ impl AppDb {
             ))
     }
 
-    async fn postgres_faa_registry_shape_problem(&self) -> Result<Option<String>> {
-        let DatabaseBackend::Postgres(pool) = self.backend() else {
-            return Ok(None);
-        };
+    async fn postgres_faa_registry_shape_problem(
+        &self,
+        pool: &mut PgConnection,
+    ) -> Result<Option<String>> {
         let shape = sqlx::query_as::<_, PostgresFaaRegistryShape>(
             r#"
             SELECT
@@ -6520,7 +6630,7 @@ impl AppDb {
               ) AS index_signature
             "#,
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await?;
         let Some(relation_signature) = shape.relation_signature else {
             return Ok(Some(String::from("PostgreSQL FAA registry relations")));
@@ -6572,12 +6682,12 @@ impl AppDb {
         Ok(None)
     }
 
-    async fn sqlite_faa_registry_definition_problem(&self) -> Result<Option<String>> {
-        let DatabaseBackend::Sqlite(pool) = self.backend() else {
-            return Ok(None);
-        };
+    async fn sqlite_faa_registry_definition_problem(
+        &self,
+        pool: &mut SqliteConnection,
+    ) -> Result<Option<String>> {
         let foreign_keys = sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
-            .fetch_one(pool)
+            .fetch_one(&mut *pool)
             .await?;
         if foreign_keys != 1 {
             return Ok(Some(String::from("SQLite PRAGMA foreign_keys")));
@@ -6626,7 +6736,7 @@ impl AppDb {
             ORDER BY type, name
             "#,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *pool)
         .await?;
         let mut expected = expected_sqlite_faa_registry_definitions();
         expected.sort_by(|left, right| {
@@ -6653,15 +6763,24 @@ impl AppDb {
         Ok(None)
     }
 
-    async fn faa_registry_contract_problem(&self) -> Result<Option<String>> {
-        let structure_problem = match self.backend() {
-            DatabaseBackend::Sqlite(_) => self.sqlite_faa_registry_definition_problem().await?,
-            DatabaseBackend::Postgres(_) => {
-                if let Some(problem) = self.postgres_faa_registry_shape_problem().await? {
+    async fn faa_registry_contract_problem_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<Option<String>> {
+        let structure_problem = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                self.sqlite_faa_registry_definition_problem(&mut **pool)
+                    .await?
+            }
+            GateConnection::Postgres(pool) => {
+                if let Some(problem) = self
+                    .postgres_faa_registry_shape_problem(&mut **pool)
+                    .await?
+                {
                     return Ok(Some(problem));
                 }
                 if !self
-                    .postgres_faa_registry_trigger_definitions_valid()
+                    .postgres_faa_registry_trigger_definitions_valid(&mut **pool)
                     .await?
                 {
                     return Ok(Some(String::from(
@@ -6674,24 +6793,24 @@ impl AppDb {
         if structure_problem.is_some() {
             return Ok(structure_problem);
         }
-        let mismatched_domain = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let mismatched_domain = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     "SELECT EXISTS (SELECT 1 FROM faa_registry_snapshots \
                      WHERE record_hash_domain IS NOT ?)",
                 )
                 .bind(crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN)
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS (SELECT 1 FROM public.faa_registry_snapshots \
                      WHERE record_hash_domain IS DISTINCT FROM $1)",
                 )
                 .bind(crate::aircraft::faa::AIRCRAFT_RECORD_HASH_DOMAIN)
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -6703,12 +6822,32 @@ impl AppDb {
 
     #[cfg(test)]
     async fn faa_registry_contract_valid(&self) -> Result<bool> {
-        Ok(self.faa_registry_contract_problem().await?.is_none())
+        match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Sqlite(&mut connection);
+                Ok(self
+                    .faa_registry_contract_problem_on(&mut connection)
+                    .await?
+                    .is_none())
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut connection = GateConnection::Postgres(&mut connection);
+                Ok(self
+                    .faa_registry_contract_problem_on(&mut connection)
+                    .await?
+                    .is_none())
+            }
+        }
     }
 
-    async fn faa_registry_schema_started(&self) -> Result<bool> {
-        let objects_started = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+    async fn faa_registry_schema_started_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        let objects_started = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
                     SELECT EXISTS (
@@ -6725,11 +6864,11 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
             SELECT
@@ -6774,20 +6913,20 @@ impl AppDb {
               )
             "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
         if objects_started {
             return Ok(true);
         }
-        let DatabaseBackend::Postgres(pool) = self.backend() else {
+        let GateConnection::Postgres(pool) = connection else {
             return Ok(false);
         };
         let ledger_exists = sqlx::query_scalar::<_, bool>(
             "SELECT pg_catalog.to_regclass('public.schema_migration_contracts') IS NOT NULL",
         )
-        .fetch_one(pool)
+        .fetch_one(&mut **pool)
         .await?;
         if !ledger_exists {
             return Ok(false);
@@ -6795,25 +6934,27 @@ impl AppDb {
         Ok(sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS (
-              SELECT 1 FROM public.schema_migration_contracts
+              SELECT 1 FROM ONLY public.schema_migration_contracts
               WHERE migration_name = $1
             )
             "#,
         )
         .bind(FAA_REFERENCE_REACHABILITY_MIGRATION)
-        .fetch_one(pool)
+        .fetch_one(&mut **pool)
         .await?)
     }
 
-    async fn migration_contract_invalid(
+    async fn migration_contract_invalid_on(
         &self,
+        connection: &mut GateConnection<'_>,
         anchor_object: &str,
         migration_name: &str,
         contract_version: i64,
         contract_fingerprint: &str,
     ) -> Result<bool> {
         Ok(self
-            .migration_contract_state(
+            .migration_contract_state_on(
+                connection,
                 anchor_object,
                 migration_name,
                 contract_version,
@@ -6823,14 +6964,17 @@ impl AppDb {
             == MigrationContractState::Invalid)
     }
 
-    async fn migration_ledger_has_expected_shape(&self) -> Result<bool> {
-        match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+    async fn migration_ledger_has_expected_shape_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 let actual_definition = sqlx::query_scalar::<_, String>(
                     "SELECT sql FROM sqlite_schema \
                      WHERE type = 'table' AND name = 'schema_migration_contracts'",
                 )
-                .fetch_optional(pool)
+                .fetch_optional(&mut **pool)
                 .await?;
                 let expected_definition = canonical_sqlite_table_definition(
                     SQLITE_SCHEMA_SQL,
@@ -6858,12 +7002,12 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0;
                 Ok(!attached_behavior)
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 let ordinary_table = sqlx::query_scalar::<_, bool>(
                     r#"
                     SELECT EXISTS (
@@ -6874,12 +7018,14 @@ impl AppDb {
                       WHERE namespace.nspname = 'public'
                         AND relation.relname = 'schema_migration_contracts'
                         AND relation.relkind = 'r'
+                        AND relation.relpersistence = 'p'
                         AND NOT relation.relispartition
                         AND NOT relation.relrowsecurity
                         AND NOT relation.relforcerowsecurity
                         AND NOT EXISTS (
                           SELECT 1 FROM pg_catalog.pg_inherits inheritance
                           WHERE inheritance.inhrelid = relation.oid
+                             OR inheritance.inhparent = relation.oid
                         )
                         AND NOT EXISTS (
                           SELECT 1 FROM pg_catalog.pg_trigger attached_trigger
@@ -6897,14 +7043,16 @@ impl AppDb {
                     )
                     "#,
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 if !ordinary_table {
+                    #[cfg(test)]
+                    eprintln!("PostgreSQL migration ledger relation shape mismatch");
                     return Ok(false);
                 }
 
                 let actual_columns =
-                    sqlx::query_as::<_, (String, String, bool, String, String, String)>(
+                    sqlx::query_as::<_, (String, String, bool, String, String, String, bool)>(
                         r#"
                     SELECT attribute.attname,
                            pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
@@ -6916,7 +7064,20 @@ impl AppDb {
                              ''
                            ),
                            attribute.attidentity::text,
-                           attribute.attgenerated::text
+                           attribute.attgenerated::text,
+                           attribute.attcollation = CASE
+                             WHEN attribute.atttypid = 'pg_catalog.text'::pg_catalog.regtype
+                             THEN (
+                               SELECT catalog_collation.oid
+                               FROM pg_catalog.pg_collation catalog_collation
+                               JOIN pg_catalog.pg_namespace collation_namespace
+                                 ON collation_namespace.oid =
+                                    catalog_collation.collnamespace
+                               WHERE collation_namespace.nspname = 'pg_catalog'
+                                 AND catalog_collation.collname = 'default'
+                             )
+                             ELSE 0::pg_catalog.oid
+                           END
                     FROM pg_catalog.pg_attribute attribute
                     LEFT JOIN pg_catalog.pg_attrdef default_value
                       ON default_value.adrelid = attribute.attrelid
@@ -6929,7 +7090,7 @@ impl AppDb {
                     ORDER BY attribute.attnum
                     "#,
                     )
-                    .fetch_all(pool)
+                    .fetch_all(&mut **pool)
                     .await?
                     .into_iter()
                     .map(
@@ -6940,6 +7101,7 @@ impl AppDb {
                             default_expression,
                             identity_kind,
                             generated_kind,
+                            canonical_collation,
                         )| {
                             (
                                 name,
@@ -6948,6 +7110,7 @@ impl AppDb {
                                 canonical_sql_definition(&default_expression),
                                 identity_kind,
                                 generated_kind,
+                                canonical_collation,
                             )
                         },
                     )
@@ -6960,6 +7123,7 @@ impl AppDb {
                         String::new(),
                         String::new(),
                         String::new(),
+                        true,
                     ),
                     (
                         "contract_version".to_owned(),
@@ -6968,6 +7132,7 @@ impl AppDb {
                         String::new(),
                         String::new(),
                         String::new(),
+                        true,
                     ),
                     (
                         "contract_fingerprint".to_owned(),
@@ -6976,6 +7141,7 @@ impl AppDb {
                         String::new(),
                         String::new(),
                         String::new(),
+                        true,
                     ),
                     (
                         "installed_at".to_owned(),
@@ -6984,60 +7150,174 @@ impl AppDb {
                         "current_timestamp".to_owned(),
                         String::new(),
                         String::new(),
+                        true,
                     ),
                 ];
                 if actual_columns != expected_columns {
+                    #[cfg(test)]
+                    eprintln!("PostgreSQL migration ledger column mismatch: {actual_columns:?}");
                     return Ok(false);
                 }
 
-                let mut actual_constraints = sqlx::query_as::<_, (String, String)>(
+                let mut actual_constraints = sqlx::query_as::<_, (String, String, String, bool)>(
                     r#"
-                    SELECT ledger_constraint.contype::text,
-                           pg_catalog.pg_get_constraintdef(ledger_constraint.oid)
+                    SELECT ledger_constraint.conname,
+                           ledger_constraint.contype::text,
+                           pg_catalog.pg_get_constraintdef(ledger_constraint.oid),
+                           ledger_constraint.convalidated
+                             AND NOT ledger_constraint.condeferrable
+                             AND NOT ledger_constraint.condeferred
+                             AND ledger_constraint.conparentid = 0
+                             AND ledger_constraint.conislocal
+                             AND ledger_constraint.coninhcount = 0
+                             AND ledger_constraint.connoinherit =
+                                   (ledger_constraint.contype = 'p')
+                             AND ledger_constraint.connamespace = (
+                               SELECT namespace.oid
+                               FROM pg_catalog.pg_namespace namespace
+                               WHERE namespace.nspname = 'public'
+                             )
+                             AND ledger_constraint.contypid = 0
+                             AND ledger_constraint.confrelid = 0
+                             AND CASE ledger_constraint.contype
+                               WHEN 'p' THEN ledger_constraint.conindid =
+                                 pg_catalog.to_regclass(
+                                   'public.schema_migration_contracts_pkey'
+                                 )
+                               ELSE ledger_constraint.conindid = 0
+                             END
                     FROM pg_catalog.pg_constraint ledger_constraint
                     WHERE ledger_constraint.conrelid = pg_catalog.to_regclass(
                             'public.schema_migration_contracts'
                           )
                     "#,
                 )
-                .fetch_all(pool)
+                .fetch_all(&mut **pool)
                 .await?
                 .into_iter()
-                .map(|(constraint_type, definition)| {
+                .map(|(name, constraint_type, definition, flags_are_exact)| {
                     let definition = canonical_sql_definition(&definition)
                         .replace("trim(bothfrommigration_name)", "btrim(migration_name)");
-                    (constraint_type, definition)
+                    (name, constraint_type, definition, flags_are_exact)
                 })
                 .collect::<Vec<_>>();
                 actual_constraints.sort();
                 let mut expected_constraints = vec![
                     (
+                        "schema_migration_contracts_contract_version_check".to_owned(),
                         "c".to_owned(),
                         canonical_sql_definition("CHECK ((contract_version > 0))"),
+                        true,
                     ),
                     (
+                        "schema_migration_contracts_contract_fingerprint_check".to_owned(),
                         "c".to_owned(),
                         canonical_sql_definition(
                             "CHECK ((contract_fingerprint ~ '^[0-9a-f]{64}$'::text))",
                         ),
+                        true,
                     ),
                     (
+                        "schema_migration_contracts_migration_name_check".to_owned(),
                         "c".to_owned(),
                         canonical_sql_definition("CHECK ((length(btrim(migration_name)) > 0))"),
+                        true,
                     ),
                     (
+                        "schema_migration_contracts_pkey".to_owned(),
                         "p".to_owned(),
                         canonical_sql_definition("PRIMARY KEY (migration_name)"),
+                        true,
                     ),
                 ];
                 expected_constraints.sort();
-                Ok(actual_constraints == expected_constraints)
+                if actual_constraints != expected_constraints {
+                    #[cfg(test)]
+                    eprintln!(
+                        "PostgreSQL migration ledger constraint mismatch: {actual_constraints:?}"
+                    );
+                    return Ok(false);
+                }
+
+                let index_is_exact = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT count(*) = 1 AND COALESCE(bool_and(
+                      index_relation.relnamespace = ledger_relation.relnamespace
+                      AND index_relation.relname = 'schema_migration_contracts_pkey'
+                      AND index_relation.relkind = 'i'
+                      AND index_relation.relpersistence = 'p'
+                      AND index_relation.reltablespace = 0
+                      AND index_relation.reloptions IS NULL
+                      AND access_method.amname = 'btree'
+                      AND index_row.indisunique
+                      AND NOT index_row.indnullsnotdistinct
+                      AND index_row.indisprimary
+                      AND NOT index_row.indisexclusion
+                      AND index_row.indimmediate
+                      AND NOT index_row.indisclustered
+                      AND index_row.indisvalid
+                      AND NOT index_row.indcheckxmin
+                      AND index_row.indisready
+                      AND index_row.indislive
+                      AND NOT index_row.indisreplident
+                      AND index_row.indnatts = 1
+                      AND index_row.indnkeyatts = 1
+                      AND index_row.indexprs IS NULL
+                      AND index_row.indpred IS NULL
+                      AND index_row.indkey[0] = (
+                        SELECT attribute.attnum
+                        FROM pg_catalog.pg_attribute attribute
+                        WHERE attribute.attrelid = ledger_relation.oid
+                          AND attribute.attname = 'migration_name'
+                          AND NOT attribute.attisdropped
+                      )
+                      AND index_row.indcollation[0] = (
+                        SELECT catalog_collation.oid
+                        FROM pg_catalog.pg_collation catalog_collation
+                        JOIN pg_catalog.pg_namespace collation_namespace
+                          ON collation_namespace.oid =
+                             catalog_collation.collnamespace
+                        WHERE collation_namespace.nspname = 'pg_catalog'
+                          AND catalog_collation.collname = 'default'
+                      )
+                      AND index_row.indclass[0] = (
+                        SELECT operator_class.oid
+                        FROM pg_catalog.pg_opclass operator_class
+                        JOIN pg_catalog.pg_namespace operator_namespace
+                          ON operator_namespace.oid = operator_class.opcnamespace
+                        WHERE operator_namespace.nspname = 'pg_catalog'
+                          AND operator_class.opcname = 'text_ops'
+                          AND operator_class.opcmethod = access_method.oid
+                      )
+                      AND index_row.indoption[0] = 0
+                    ), FALSE)
+                    FROM pg_catalog.pg_class ledger_relation
+                    JOIN pg_catalog.pg_namespace ledger_namespace
+                      ON ledger_namespace.oid = ledger_relation.relnamespace
+                    LEFT JOIN pg_catalog.pg_index index_row
+                      ON index_row.indrelid = ledger_relation.oid
+                    LEFT JOIN pg_catalog.pg_class index_relation
+                      ON index_relation.oid = index_row.indexrelid
+                    LEFT JOIN pg_catalog.pg_am access_method
+                      ON access_method.oid = index_relation.relam
+                    WHERE ledger_namespace.nspname = 'public'
+                      AND ledger_relation.relname = 'schema_migration_contracts'
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                #[cfg(test)]
+                if !index_is_exact {
+                    eprintln!("PostgreSQL migration ledger index mismatch");
+                }
+                Ok(index_is_exact)
             }
         }
     }
 
-    async fn migration_contract_state(
+    async fn migration_contract_state_on(
         &self,
+        connection: &mut GateConnection<'_>,
         anchor_object: &str,
         migration_name: &str,
         contract_version: i64,
@@ -7045,17 +7325,17 @@ impl AppDb {
     ) -> Result<MigrationContractState> {
         // An anchor and its exact receipt are one installation attestation.
         // Only their joint absence is fresh; every partial pairing is corrupt.
-        let anchor_exists = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let anchor_exists = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name = ?)",
                 )
                 .bind(anchor_object)
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 let anchor_object = if anchor_object.contains('.') {
                     Cow::Borrowed(anchor_object)
                 } else {
@@ -7063,27 +7343,27 @@ impl AppDb {
                 };
                 sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regclass($1::text) IS NOT NULL")
                     .bind(anchor_object.as_ref())
-                    .fetch_one(pool)
+                    .fetch_one(&mut **pool)
                     .await?
             }
         };
 
-        let ledger_exists = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let ledger_exists = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     "SELECT EXISTS (SELECT 1 FROM sqlite_schema \
                      WHERE name = 'schema_migration_contracts')",
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
                     != 0
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     "SELECT pg_catalog.to_regclass( \
                      'public.schema_migration_contracts') IS NOT NULL",
                 )
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -7095,13 +7375,15 @@ impl AppDb {
             });
         }
 
-        let ledger_has_expected_shape = self.migration_ledger_has_expected_shape().await?;
+        let ledger_has_expected_shape = self
+            .migration_ledger_has_expected_shape_on(connection)
+            .await?;
         if !ledger_has_expected_shape {
             return Ok(MigrationContractState::Invalid);
         }
 
-        let (receipt_exists, exact_contract_exists) = match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
+        let (receipt_exists, exact_contract_exists) = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
                 let (receipt_exists, exact_contract_exists) = sqlx::query_as::<_, (i64, i64)>(
                     r#"
                     SELECT
@@ -7121,20 +7403,20 @@ impl AppDb {
                 .bind(migration_name)
                 .bind(contract_version)
                 .bind(contract_fingerprint)
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?;
                 (receipt_exists != 0, exact_contract_exists != 0)
             }
-            DatabaseBackend::Postgres(pool) => {
+            GateConnection::Postgres(pool) => {
                 sqlx::query_as::<_, (bool, bool)>(
                     r#"
                     SELECT
                       EXISTS (
-                        SELECT 1 FROM public.schema_migration_contracts
+                        SELECT 1 FROM ONLY public.schema_migration_contracts
                         WHERE migration_name = $1
                       ),
                       EXISTS (
-                        SELECT 1 FROM public.schema_migration_contracts
+                        SELECT 1 FROM ONLY public.schema_migration_contracts
                         WHERE migration_name = $1
                           AND contract_version = $2
                           AND contract_fingerprint = $3
@@ -7144,7 +7426,7 @@ impl AppDb {
                 .bind(migration_name)
                 .bind(contract_version)
                 .bind(contract_fingerprint)
-                .fetch_one(pool)
+                .fetch_one(&mut **pool)
                 .await?
             }
         };
@@ -7157,65 +7439,157 @@ impl AppDb {
         )
     }
 
-    async fn initialize(&self) -> Result<()> {
-        // Initialization is intentionally unable to heal a marker-present,
-        // partially damaged contract through CREATE IF NOT EXISTS. Attest the
-        // complete installed schema before executing any canonical DDL.
-        self.ensure_required_migrations()
-            .await
-            .context("schema initialization preflight failed")?;
+    async fn initialize_transactionally(&self) -> Result<()> {
         match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
-                let mut connection = pool.acquire().await?;
-                for statement in split_sql_statements(SQLITE_SCHEMA_SQL) {
-                    connection.execute(statement).await?;
+                let mut transaction = pool
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .context("could not begin serialized SQLite schema initialization")?;
+                let initialization = async {
+                    let mut gate_connection = GateConnection::Sqlite(&mut transaction);
+                    self.ensure_required_migrations_on(&mut gate_connection)
+                        .await?;
+                    for statement in split_sql_statements(SQLITE_SCHEMA_SQL) {
+                        (&mut *transaction).execute(statement).await?;
+                    }
+                    sqlx::query(
+                        r#"
+                        INSERT INTO users (
+                          email, display_name, auth_provider, auth_subject
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT (auth_subject) DO NOTHING
+                        "#,
+                    )
+                    .bind(DEVELOPER_EMAIL)
+                    .bind("Developer")
+                    .bind("local")
+                    .bind(DEVELOPER_AUTH_SUBJECT)
+                    .execute(&mut *transaction)
+                    .await?;
+                    let mut gate_connection = GateConnection::Sqlite(&mut transaction);
+                    self.ensure_required_migrations_on(&mut gate_connection)
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                match initialization {
+                    Ok(()) => transaction
+                        .commit()
+                        .await
+                        .context("could not commit SQLite schema initialization"),
+                    Err(error) => {
+                        if let Err(rollback_error) = transaction.rollback().await {
+                            return Err(error.context(format!(
+                                "SQLite schema initialization rollback failed: {rollback_error}"
+                            )));
+                        }
+                        Err(error)
+                    }
                 }
             }
             DatabaseBackend::Postgres(pool) => {
                 let mut connection = pool.acquire().await?;
-                for statement in split_sql_statements(POSTGRES_SCHEMA_SQL) {
-                    connection.execute(statement).await?;
+                // A failed unlock or broken initialization session must never
+                // return a connection that may still own the session lock.
+                connection.close_on_drop();
+                sqlx::query("SELECT pg_catalog.pg_advisory_lock($1)")
+                    .bind(POSTGRES_STARTUP_ADVISORY_LOCK_KEY)
+                    .execute(&mut *connection)
+                    .await
+                    .context("could not serialize PostgreSQL schema initialization")?;
+                let ledger_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_catalog.to_regclass( \
+                           'public.schema_migration_contracts' \
+                         ) IS NOT NULL",
+                )
+                .fetch_one(&mut *connection)
+                .await
+                .context("could not inspect PostgreSQL migration receipt ledger")?;
+                let mut transaction = connection
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    .await
+                    .context("could not begin PostgreSQL schema initialization transaction")?;
+                let initialization = async {
+                    transaction
+                        .execute("SET LOCAL search_path = public, pg_catalog, pg_temp")
+                        .await?;
+                    if ledger_exists {
+                        transaction
+                            .execute(
+                                "LOCK TABLE public.schema_migration_contracts \
+                             IN SHARE ROW EXCLUSIVE MODE",
+                            )
+                            .await
+                            .context("could not lock PostgreSQL migration receipt ledger")?;
+                    }
+                    let mut gate_connection = GateConnection::Postgres(&mut transaction);
+                    self.ensure_required_migrations_on(&mut gate_connection)
+                        .await?;
+                    for statement in split_sql_statements(POSTGRES_SCHEMA_SQL) {
+                        (&mut *transaction).execute(statement).await?;
+                    }
+                    sqlx::query(
+                        r#"
+                        INSERT INTO public.users (
+                          email, display_name, auth_provider, auth_subject
+                        ) VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (auth_subject) DO NOTHING
+                        "#,
+                    )
+                    .bind(DEVELOPER_EMAIL)
+                    .bind("Developer")
+                    .bind("local")
+                    .bind(DEVELOPER_AUTH_SUBJECT)
+                    .execute(&mut *transaction)
+                    .await?;
+                    let mut gate_connection = GateConnection::Postgres(&mut transaction);
+                    self.ensure_required_migrations_on(&mut gate_connection)
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                let transaction_result = match initialization {
+                    Ok(()) => transaction
+                        .commit()
+                        .await
+                        .context("could not commit PostgreSQL schema initialization"),
+                    Err(error) => match transaction.rollback().await {
+                        Ok(()) => Err(error),
+                        Err(rollback_error) => Err(error.context(format!(
+                            "PostgreSQL schema initialization rollback failed: \
+                                 {rollback_error}"
+                        ))),
+                    },
+                };
+                let unlock_result =
+                    sqlx::query_scalar::<_, bool>("SELECT pg_catalog.pg_advisory_unlock($1)")
+                        .bind(POSTGRES_STARTUP_ADVISORY_LOCK_KEY)
+                        .fetch_one(&mut *connection)
+                        .await
+                        .context("could not release PostgreSQL schema initialization lock")
+                        .and_then(|unlocked| {
+                            if unlocked {
+                                Ok(())
+                            } else {
+                                bail!("PostgreSQL schema initialization lock was not owned")
+                            }
+                        });
+                match (transaction_result, unlock_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) => Err(error),
+                    (Ok(()), Err(error)) => Err(error),
+                    (Err(error), Err(unlock_error)) => Err(error.context(format!(
+                        "PostgreSQL schema initialization unlock failed: {unlock_error}"
+                    ))),
                 }
             }
         }
-        self.seed_developer_user().await?;
-        Ok(())
     }
 
-    async fn seed_developer_user(&self) -> Result<()> {
-        let sql = self.sql(
-            r#"
-            INSERT INTO users (
-              email,
-              display_name,
-              auth_provider,
-              auth_subject
-            )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (auth_subject) DO NOTHING
-            "#,
-        );
-        match self.backend() {
-            DatabaseBackend::Sqlite(pool) => {
-                sqlx::query(&sql)
-                    .bind(DEVELOPER_EMAIL)
-                    .bind("Developer")
-                    .bind("local")
-                    .bind(DEVELOPER_AUTH_SUBJECT)
-                    .execute(pool)
-                    .await?;
-            }
-            DatabaseBackend::Postgres(pool) => {
-                sqlx::query(&sql)
-                    .bind(DEVELOPER_EMAIL)
-                    .bind("Developer")
-                    .bind("local")
-                    .bind(DEVELOPER_AUTH_SUBJECT)
-                    .execute(pool)
-                    .await?;
-            }
-        }
-        Ok(())
+    #[cfg(test)]
+    async fn initialize(&self) -> Result<()> {
+        self.initialize_transactionally().await
     }
 }
 
@@ -7816,7 +8190,7 @@ pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use sha2::{Digest, Sha256};
     use sqlx::postgres::PgPoolOptions;
@@ -7979,6 +8353,13 @@ mod tests {
         ));
         let url = format!("sqlite://{}", path.display());
         (path, url)
+    }
+
+    fn connect_error(result: anyhow::Result<AppDb>) -> String {
+        match result {
+            Ok(_) => panic!("database startup unexpectedly succeeded"),
+            Err(error) => format!("{error:#}"),
+        }
     }
 
     fn canonical_receipt_statements(schema: &str) -> Vec<&str> {
@@ -8430,6 +8811,115 @@ mod tests {
             );
             reopened.close().await;
         }
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_startup_waits_for_receipt_writer_commit_or_rollback() {
+        for commit_writer in [true, false] {
+            let label = if commit_writer { "commit" } else { "rollback" };
+            let (database_path, database_url) =
+                unique_sqlite_test_database(&format!("writer-first-{label}"));
+            AppDb::connect(&database_url).await.unwrap().close().await;
+
+            let mut writer = SqliteConnection::connect(&database_url).await.unwrap();
+            writer.execute("BEGIN IMMEDIATE").await.unwrap();
+            sqlx::query("DELETE FROM schema_migration_contracts WHERE migration_name = ?")
+                .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+                .execute(&mut writer)
+                .await
+                .unwrap();
+
+            let startup_url = database_url.clone();
+            let mut startup = tokio::spawn(async move { AppDb::connect(&startup_url).await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut startup)
+                    .await
+                    .is_err(),
+                "startup must wait behind the writer's BEGIN IMMEDIATE"
+            );
+            writer
+                .execute(if commit_writer { "COMMIT" } else { "ROLLBACK" })
+                .await
+                .unwrap();
+
+            let startup_result = tokio::time::timeout(Duration::from_secs(20), startup)
+                .await
+                .expect("serialized SQLite startup timed out")
+                .unwrap();
+            if commit_writer {
+                let error = connect_error(startup_result);
+                assert!(
+                    error.contains("deterministic retrieval-key data repair"),
+                    "{error}"
+                );
+                let mut inspection = SqliteConnection::connect(&database_url).await.unwrap();
+                let receipt_exists: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM schema_migration_contracts \
+                     WHERE migration_name = ?)",
+                )
+                .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+                .fetch_one(&mut inspection)
+                .await
+                .unwrap();
+                assert_eq!(
+                    receipt_exists, 0,
+                    "rejected startup must not heal the receipt"
+                );
+            } else {
+                startup_result.unwrap().close().await;
+            }
+            std::fs::remove_file(database_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_fresh_startups_serialize_and_late_failure_rolls_back() {
+        let (database_path, database_url) = unique_sqlite_test_database("fresh-concurrency");
+        let first_url = database_url.clone();
+        let second_url = database_url.clone();
+        let (first, second) = tokio::join!(AppDb::connect(&first_url), AppDb::connect(&second_url));
+        first.unwrap().close().await;
+        second.unwrap().close().await;
+        let inspection = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 19);
+        inspection.close().await;
+        std::fs::remove_file(database_path).unwrap();
+
+        let (database_path, database_url) = unique_sqlite_test_database("late-rollback");
+        std::fs::File::create(&database_path).unwrap();
+        let setup = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        setup
+            .execute("CREATE TABLE users (sentinel TEXT NOT NULL)")
+            .await
+            .unwrap();
+        let before = sqlite_catalog_snapshot(&setup).await;
+        setup.close().await;
+
+        let error = connect_error(AppDb::connect(&database_url).await);
+        assert!(
+            error.contains("users") || error.contains("email"),
+            "{error}"
+        );
+        let inspection = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlite_catalog_snapshot(&inspection).await,
+            before,
+            "late seed failure must roll back every canonical SQLite DDL statement"
+        );
+        inspection.close().await;
         std::fs::remove_file(database_path).unwrap();
     }
 
@@ -9451,7 +9941,10 @@ mod tests {
             Ok(_) => panic!("startup must reject corrupt aircraft correction schema"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("immutable aircraft identity correction decisions"));
+        assert!(
+            error.contains("immutable aircraft identity correction decisions"),
+            "{error}"
+        );
         assert!(error.contains("20260819_aircraft_listing_identity_corrections.sqlite.sql"));
         std::fs::remove_file(database_path).unwrap();
     }
@@ -9473,7 +9966,10 @@ mod tests {
             Ok(_) => panic!("startup must reject corrupt reference-cutover schema"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+        assert!(
+            error.contains("canonical price-basis and complete-fact-set contract"),
+            "{error}"
+        );
         assert!(error.contains("20260819_reference_catalog_cutover.sqlite.sql"));
         std::fs::remove_file(database_path).unwrap();
     }
@@ -9503,7 +9999,10 @@ mod tests {
             Ok(_) => panic!("startup must reject unexpected protected reference object"),
             Err(error) => format!("{error:#}"),
         };
-        assert!(error.contains("canonical price-basis and complete-fact-set contract"));
+        assert!(
+            error.contains("canonical price-basis and complete-fact-set contract"),
+            "{error}"
+        );
 
         let inspection_pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -11169,7 +11668,7 @@ mod tests {
             r#"
             SELECT migration_name, contract_version::bigint,
                    contract_fingerprint, installed_at
-            FROM public.schema_migration_contracts
+            FROM ONLY public.schema_migration_contracts
             ORDER BY migration_name
             "#,
         )
@@ -11573,6 +12072,302 @@ mod tests {
             );
             reopened.close().await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_startup_rejects_noncanonical_ledger_storage_without_mutation() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        for label in ["unlogged", "collation", "extra-index"] {
+            let reset = reset_isolated_postgres(&database_url).await;
+            reset.close().await;
+            let initialized = AppDb::connect(&database_url).await.unwrap();
+            let DatabaseBackend::Postgres(pool) = initialized.backend() else {
+                unreachable!()
+            };
+            sqlx::query(
+                "UPDATE public.schema_migration_contracts \
+                 SET installed_at = 'sentinel:' || migration_name",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            match label {
+                "unlogged" => pool
+                    .execute("ALTER TABLE public.schema_migration_contracts SET UNLOGGED")
+                    .await
+                    .unwrap(),
+                "collation" => pool
+                    .execute(
+                        "ALTER TABLE public.schema_migration_contracts \
+                         ALTER COLUMN migration_name TYPE text COLLATE \"C\"",
+                    )
+                    .await
+                    .unwrap(),
+                "extra-index" => pool
+                    .execute(
+                        "CREATE INDEX hostile_migration_receipt_installed_at \
+                         ON public.schema_migration_contracts (installed_at)",
+                    )
+                    .await
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            let catalog_before = postgres_catalog_snapshot(pool).await;
+            let receipts_before = postgres_receipt_snapshot(pool).await;
+            initialized.close().await;
+
+            let error = connect_error(AppDb::connect(&database_url).await);
+            assert!(
+                error.contains("database migration required before startup"),
+                "{label}: {error}"
+            );
+            let inspection = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            assert_eq!(
+                postgres_catalog_snapshot(&inspection).await,
+                catalog_before,
+                "{label}: rejected startup must preserve catalog shape"
+            );
+            assert_eq!(
+                postgres_receipt_snapshot(&inspection).await,
+                receipts_before,
+                "{label}: rejected startup must preserve receipts"
+            );
+            match label {
+                "unlogged" => {
+                    let persistence: String = sqlx::query_scalar(
+                        "SELECT relpersistence::text FROM pg_catalog.pg_class \
+                         WHERE oid = 'public.schema_migration_contracts'::pg_catalog.regclass",
+                    )
+                    .fetch_one(&inspection)
+                    .await
+                    .unwrap();
+                    assert_eq!(persistence, "u");
+                }
+                "collation" => {
+                    let collation: String = sqlx::query_scalar(
+                        "SELECT catalog_collation.collname \
+                         FROM pg_catalog.pg_attribute attribute \
+                         JOIN pg_catalog.pg_collation catalog_collation \
+                           ON catalog_collation.oid = attribute.attcollation \
+                         WHERE attribute.attrelid = \
+                           'public.schema_migration_contracts'::pg_catalog.regclass \
+                           AND attribute.attname = 'migration_name'",
+                    )
+                    .fetch_one(&inspection)
+                    .await
+                    .unwrap();
+                    assert_eq!(collation, "C");
+                }
+                "extra-index" => {
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT pg_catalog.to_regclass( \
+                           'public.hostile_migration_receipt_installed_at' \
+                         ) IS NOT NULL",
+                    )
+                    .fetch_one(&inspection)
+                    .await
+                    .unwrap();
+                    assert!(exists);
+                }
+                _ => unreachable!(),
+            }
+            inspection.close().await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_inherited_child_receipt_cannot_satisfy_parent_ledger() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let initialized = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "DELETE FROM ONLY public.schema_migration_contracts \
+             WHERE migration_name = $1",
+        )
+        .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TABLE public.hostile_migration_receipt_child () \
+             INHERITS (public.schema_migration_contracts)",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO public.hostile_migration_receipt_child ( \
+               migration_name, contract_version, contract_fingerprint, installed_at \
+             ) VALUES ($1, $2, $3, 'child-only-sentinel')",
+        )
+        .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+        .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION)
+        .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT)
+        .execute(pool)
+        .await
+        .unwrap();
+        let catalog_before = postgres_catalog_snapshot(pool).await;
+        let parent_receipts_before = postgres_receipt_snapshot(pool).await;
+        initialized.close().await;
+
+        let error = connect_error(AppDb::connect(&database_url).await);
+        assert!(
+            error.contains("database migration required before startup"),
+            "{error}"
+        );
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(postgres_catalog_snapshot(&inspection).await, catalog_before);
+        assert_eq!(
+            postgres_receipt_snapshot(&inspection).await,
+            parent_receipts_before
+        );
+        let (parent_count, child_count): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM ONLY public.schema_migration_contracts \
+                     WHERE migration_name = $1), \
+                    (SELECT count(*) FROM public.hostile_migration_receipt_child \
+                     WHERE migration_name = $1)",
+        )
+        .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+        .fetch_one(&inspection)
+        .await
+        .unwrap();
+        assert_eq!((parent_count, child_count), (0, 1));
+        inspection.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_startup_waits_for_writer_and_fresh_startups_serialize() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        for commit_writer in [true, false] {
+            let reset = reset_isolated_postgres(&database_url).await;
+            reset.close().await;
+            AppDb::connect(&database_url).await.unwrap().close().await;
+            let writer_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            let mut writer = writer_pool.acquire().await.unwrap();
+            writer.execute("BEGIN").await.unwrap();
+            sqlx::query(
+                "DELETE FROM ONLY public.schema_migration_contracts \
+                 WHERE migration_name = $1",
+            )
+            .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+            let startup_url = database_url.clone();
+            let mut startup = tokio::spawn(async move { AppDb::connect(&startup_url).await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut startup)
+                    .await
+                    .is_err(),
+                "startup must wait for the receipt writer before taking its snapshot"
+            );
+            writer
+                .execute(if commit_writer { "COMMIT" } else { "ROLLBACK" })
+                .await
+                .unwrap();
+            drop(writer);
+            writer_pool.close().await;
+
+            let startup_result = tokio::time::timeout(Duration::from_secs(30), startup)
+                .await
+                .expect("serialized PostgreSQL startup timed out")
+                .unwrap();
+            if commit_writer {
+                let error = connect_error(startup_result);
+                assert!(
+                    error.contains("deterministic retrieval-key data repair"),
+                    "{error}"
+                );
+                let inspection = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&database_url)
+                    .await
+                    .unwrap();
+                let receipt_exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM ONLY public.schema_migration_contracts \
+                     WHERE migration_name = $1)",
+                )
+                .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+                .fetch_one(&inspection)
+                .await
+                .unwrap();
+                assert!(
+                    !receipt_exists,
+                    "rejected startup must not heal the receipt"
+                );
+                inspection.close().await;
+            } else {
+                startup_result.unwrap().close().await;
+            }
+        }
+
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let first_url = database_url.clone();
+        let second_url = database_url.clone();
+        let (first, second) = tokio::join!(AppDb::connect(&first_url), AppDb::connect(&second_url));
+        first.unwrap().close().await;
+        second.unwrap().close().await;
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 20);
+        inspection.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_late_initialization_failure_rolls_back_all_ddl() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let setup = reset_isolated_postgres(&database_url).await;
+        setup
+            .execute("CREATE TABLE public.users (sentinel TEXT NOT NULL)")
+            .await
+            .unwrap();
+        let before = postgres_catalog_snapshot(&setup).await;
+        setup.close().await;
+
+        let error = connect_error(AppDb::connect(&database_url).await);
+        assert!(
+            error.contains("email") || error.contains("users") || error.contains("column \"id\""),
+            "{error}"
+        );
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(
+            postgres_catalog_snapshot(&inspection).await,
+            before,
+            "late seed failure must roll back every canonical PostgreSQL DDL statement"
+        );
+        inspection.close().await;
     }
 
     #[tokio::test]
@@ -13167,7 +13962,10 @@ mod tests {
             .await
             .expect_err("validators alone must never attest that the data repair ran")
             .to_string();
-        assert!(error.contains("deterministic retrieval-key data repair"));
+        assert!(
+            error.contains("deterministic retrieval-key data repair"),
+            "{error}"
+        );
         assert!(error.contains("20260729_aircraft_catalog_retrieval_keys.sqlite.sql"));
     }
 
@@ -13195,7 +13993,10 @@ mod tests {
             Ok(_) => panic!("startup must not install a missing repair contract from fresh schema"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("deterministic retrieval-key data repair"));
+        assert!(
+            error.contains("deterministic retrieval-key data repair"),
+            "{error}"
+        );
 
         let inspection_pool = SqlitePoolOptions::new()
             .max_connections(1)

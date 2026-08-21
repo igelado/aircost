@@ -1586,18 +1586,33 @@ anchor and receipt is fresh, while an installed migration requires both its
 anchor and the exact receipt version and fingerprint. Every partial pairing,
 mismatch, or null marker is invalid. An existing receipt ledger must also match
 the canonical backend definition, including its table kind, columns, types,
-nullability, timestamp default, primary key, and checks. Invalid provenance is
-also any attached behavior: SQLite forbids ledger triggers and explicit
-indexes, while PostgreSQL forbids user triggers, rewrite rules, row-level
-security and policies, partition attachment, identity columns, and generated
-columns. Invalid provenance is rejected before canonical DDL and the rejected
-startup does not repair or otherwise mutate the schema or receipts. Canonical
-receipt seeds are insert-only, so normal startup preserves every original
-`installed_at` value; unknown historical receipts are allowed and preserved
-rather than rewritten. Every normal and diagnostic PostgreSQL pool connection
-pins `search_path` to `public, pg_catalog, pg_temp` (with `pg_temp` explicitly
-last), so URL or role defaults cannot redirect preflight lookups or canonical
-DDL into attacker-controlled schemas.
+nullability, collation, timestamp default, primary key, check definitions and
+constraint flags. PostgreSQL additionally requires a permanent, non-inherited
+ordinary table and exactly one canonical permanent btree primary-key index,
+including its key, collation, operator class, options, and validity flags.
+Receipt reads use `ONLY public.schema_migration_contracts`, so a child table
+cannot supply a missing parent receipt. Invalid provenance is also any attached
+behavior: SQLite forbids ledger triggers and explicit indexes, while PostgreSQL
+forbids extra indexes, user triggers, rewrite rules, row-level security and
+policies, partition attachment, identity columns, and generated columns.
+
+Startup performs both complete provenance gates, every canonical DDL statement,
+and the developer seed on one real SQLx transaction connection. SQLite starts
+with `BEGIN IMMEDIATE`. PostgreSQL first takes the process-wide session advisory
+lock, determines whether the qualified public ledger exists, then starts a
+repeatable-read transaction; an existing ledger is locked in `SHARE ROW
+EXCLUSIVE` mode before the first transaction snapshot read. The transaction
+pins its local search path, runs the full preflight, applies the schema, and runs
+the full postflight before commit. PostgreSQL explicitly releases and verifies
+the session lock, and discards the connection on every path so a failed unlock
+cannot leak lock ownership into the pool. A failed preflight or late DDL/seed/
+postflight error rolls back all startup changes. Canonical receipt seeds are
+insert-only, so normal startup preserves every original `installed_at` value;
+unknown historical receipts are allowed and preserved rather than rewritten.
+Every normal and diagnostic PostgreSQL pool connection pins `search_path` to
+`public, pg_catalog, pg_temp` (with `pg_temp` explicitly last), so URL or role
+defaults cannot redirect preflight lookups or canonical DDL into
+attacker-controlled schemas.
 
 ## Listing Aircraft Compatibility Projection Migration
 
