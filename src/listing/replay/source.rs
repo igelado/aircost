@@ -82,9 +82,9 @@ struct FrozenSourceAttestation {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LegacyCaptureSelection {
-    pub(crate) rows: Vec<SourceCaptureRow>,
-    pub(crate) n_numbers: Vec<String>,
+struct LegacyCaptureSelection {
+    rows: Vec<SourceCaptureRow>,
+    n_numbers: Vec<String>,
 }
 
 #[derive(FromRow)]
@@ -164,9 +164,7 @@ fn sqlite_path(database_url: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(raw))
 }
 
-pub(crate) async fn attest_frozen_source(
-    source: &mut SqliteConnection,
-) -> Result<FrozenSourceAttestation> {
+async fn attest_frozen_source(source: &mut SqliteConnection) -> Result<FrozenSourceAttestation> {
     attest_source_against(source, FROZEN_SOURCE_CONTRACT).await
 }
 
@@ -259,7 +257,7 @@ fn hash_rows(rows: impl IntoIterator<Item = String>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub(crate) async fn load_legacy_capture_selection(
+async fn load_legacy_capture_selection(
     source: &mut SqliteConnection,
     manifest: &TrustedCaptureManifest,
 ) -> Result<LegacyCaptureSelection> {
@@ -335,6 +333,13 @@ pub(crate) async fn load_legacy_capture_selection(
         n_numbers.insert(normalized);
         rows.push(row);
     }
+    if n_numbers.len() != rows.len() {
+        bail!(
+            "legacy replay manifest requires one distinct N-number per capture (captures={}, distinct_n_numbers={})",
+            rows.len(),
+            n_numbers.len()
+        );
+    }
     Ok(LegacyCaptureSelection {
         rows,
         n_numbers: n_numbers.into_iter().collect(),
@@ -353,6 +358,7 @@ async fn validate_capture_timestamps(
              AND (? IS NULL OR julianday(?) IS NOT NULL)
              AND julianday(?) IS NOT NULL
              AND julianday(?) >= julianday(?)
+             AND julianday(?) >= julianday(?)
              AND (? IS NULL OR julianday(?) >= julianday(?))
              AND julianday(?) >= julianday(?)
              AND (? IS NULL OR julianday(?) <= julianday(?))"#,
@@ -364,6 +370,8 @@ async fn validate_capture_timestamps(
     .bind(&row.plugin_install_revoked_at)
     .bind(&row.submitted_at)
     .bind(&row.user_updated_at)
+    .bind(&row.user_created_at)
+    .bind(&row.plugin_install_created_at)
     .bind(&row.user_created_at)
     .bind(&row.plugin_install_revoked_at)
     .bind(&row.plugin_install_revoked_at)
