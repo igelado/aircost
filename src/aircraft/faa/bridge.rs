@@ -45,12 +45,16 @@ pub(crate) struct CurrentFaaRepresentative {
 pub(crate) struct FaaBridgeOutcome {
     pub(crate) report: FaaBridgeReport,
     pub(crate) representative_remap: BTreeMap<LegacyFaaRepresentative, CurrentFaaRepresentative>,
+    pub(crate) obsolete_hash_replacements: BTreeMap<String, String>,
     pub(crate) obsolete_hashes: BTreeSet<String>,
+    pub(crate) legacy_evidence_source_ids: BTreeSet<i64>,
+    pub(crate) current_evidence_source_id: i64,
 }
 
 #[derive(FromRow)]
 struct LegacySnapshotRow {
     id: i64,
+    evidence_source_id: i64,
     source_url: String,
     master_member_name: String,
     master_member_sha256: String,
@@ -144,9 +148,21 @@ pub(crate) async fn rebuild_faa_projection(
             summary.archive_sha256
         );
     }
-    let obsolete_hashes =
+    let comparison =
         compare_legacy_projection(legacy_source, &release, capture_n_numbers, representatives)
             .await?;
+    if comparison
+        .obsolete_hashes
+        .contains(&release.source_manifest_sha256)
+        || release.aircraft.iter().any(|row| {
+            comparison
+                .obsolete_hashes
+                .contains(&row.source_record_sha256)
+        })
+    {
+        bail!("legacy FAA and current parser hash domains are not disjoint");
+    }
+    let obsolete_hashes = comparison.obsolete_hashes;
     let stored = store_release(target, &release).await?;
     let current = release
         .aircraft
@@ -181,8 +197,17 @@ pub(crate) async fn rebuild_faa_projection(
             stored_snapshot_id: stored.snapshot.id,
         },
         representative_remap,
+        obsolete_hash_replacements: comparison.hash_replacements,
         obsolete_hashes,
+        legacy_evidence_source_ids: comparison.evidence_source_ids,
+        current_evidence_source_id: stored.snapshot.evidence_source_id,
     })
+}
+
+struct LegacyComparison {
+    hash_replacements: BTreeMap<String, String>,
+    obsolete_hashes: BTreeSet<String>,
+    evidence_source_ids: BTreeSet<i64>,
 }
 
 async fn compare_legacy_projection(
@@ -190,7 +215,21 @@ async fn compare_legacy_projection(
     release: &Release,
     capture_n_numbers: &[String],
     representatives: &[LegacyFaaRepresentative],
-) -> Result<BTreeSet<String>> {
+) -> Result<LegacyComparison> {
+    let mut all_obsolete_hashes = BTreeSet::new();
+    for digest in sqlx::query_scalar::<_, String>(
+        r#"SELECT source_manifest_sha256 FROM faa_registry_snapshots
+           UNION SELECT source_record_sha256 FROM faa_registry_aircraft"#,
+    )
+    .fetch_all(&mut *source)
+    .await?
+    {
+        require_sha256(&digest, "legacy FAA projection")?;
+        all_obsolete_hashes.insert(digest);
+    }
+    if all_obsolete_hashes.is_empty() {
+        bail!("legacy FAA projection contains no hashes to attest");
+    }
     let mut selected = BTreeSet::new();
     for n_number in capture_n_numbers {
         let snapshot_id: i64 = sqlx::query_scalar(
@@ -219,10 +258,11 @@ async fn compare_legacy_projection(
             .map(|row| (row.snapshot_id, row.n_number.clone())),
     );
 
-    let mut obsolete_hashes = BTreeSet::new();
+    let mut obsolete_hashes = BTreeMap::new();
+    let mut evidence_source_ids = BTreeSet::new();
     for (snapshot_id, n_number) in selected {
         let snapshot = sqlx::query_as::<_, LegacySnapshotRow>(
-            r#"SELECT snapshot.id, snapshot.source_url,
+            r#"SELECT snapshot.id, snapshot.evidence_source_id, snapshot.source_url,
                       snapshot.master_member_name, snapshot.master_member_sha256,
                       snapshot.aircraft_member_name, snapshot.aircraft_member_sha256,
                       snapshot.engine_member_name, snapshot.engine_member_sha256,
@@ -244,13 +284,18 @@ async fn compare_legacy_projection(
             format!("legacy FAA snapshot {snapshot_id} does not cover representative {n_number}")
         })?;
         require_snapshot_provenance(&snapshot, release)?;
+        require_evidence_source(source, &snapshot, release).await?;
+        evidence_source_ids.insert(snapshot.evidence_source_id);
         let source_manifest_sha256: String = sqlx::query_scalar(
             "SELECT source_manifest_sha256 FROM faa_registry_snapshots WHERE id = ?",
         )
         .bind(snapshot.id)
         .fetch_one(&mut *source)
         .await?;
-        obsolete_hashes.insert(source_manifest_sha256);
+        obsolete_hashes.insert(
+            source_manifest_sha256,
+            release.source_manifest_sha256.clone(),
+        );
         let coverage = release
             .coverage
             .iter()
@@ -295,13 +340,51 @@ async fn compare_legacy_projection(
         .bind(&n_number)
         .fetch_one(&mut *source)
         .await?;
-        obsolete_hashes.insert(old_record_hash);
+        obsolete_hashes.insert(old_record_hash, current.source_record_sha256.clone());
         compare_aircraft_reference(source, snapshot.id, release, current).await?;
         if current.engine_code.is_some() {
             compare_engine_reference(source, snapshot.id, release, current).await?;
         }
     }
-    Ok(obsolete_hashes)
+    Ok(LegacyComparison {
+        hash_replacements: obsolete_hashes,
+        obsolete_hashes: all_obsolete_hashes,
+        evidence_source_ids,
+    })
+}
+
+fn require_sha256(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || value != value.to_ascii_lowercase()
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("{label} contains a non-canonical SHA-256 digest");
+    }
+    Ok(())
+}
+
+async fn require_evidence_source(
+    source: &mut SqliteConnection,
+    snapshot: &LegacySnapshotRow,
+    release: &Release,
+) -> Result<()> {
+    let valid: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM curation_evidence_sources
+           WHERE id = ? AND source_url = ? AND source_domain = 'faa.gov'
+             AND source_tier = 'regulator_primary' AND content_sha256 = ?"#,
+    )
+    .bind(snapshot.evidence_source_id)
+    .bind(&release.metadata.source_url)
+    .bind(&release.metadata.archive_sha256)
+    .fetch_one(&mut *source)
+    .await?;
+    if valid != 1 {
+        bail!(
+            "legacy FAA snapshot {} is not linked to exact regulator-primary archive evidence",
+            snapshot.id
+        );
+    }
+    Ok(())
 }
 
 fn require_snapshot_provenance(snapshot: &LegacySnapshotRow, release: &Release) -> Result<()> {
