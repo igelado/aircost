@@ -264,6 +264,22 @@ expect_postgres_failure() {
   fi
 }
 
+expect_postgres_failure_with_error() {
+  local reason="$1"
+  local expected_error="$2"
+  local output
+  if output="$(psql "$database_url" -v ON_ERROR_STOP=1 -q \
+    -f migrations/20260820_faa_record_hash_domain.postgres.sql 2>&1)"; then
+    echo "PostgreSQL FAA hash-domain migration unexpectedly accepted $reason" >&2
+    exit 1
+  fi
+  if [[ "$output" != *"$expected_error"* ]]; then
+    echo "PostgreSQL FAA hash-domain migration rejected $reason with an unexpected error" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
 reset_postgres
 psql "$database_url" -v ON_ERROR_STOP=1 -q \
   -c "UPDATE public.schema_migration_contracts SET installed_at='2000-01-01' WHERE migration_name='20260820_faa_record_hash_domain'"
@@ -272,6 +288,37 @@ psql "$database_url" -v ON_ERROR_STOP=1 -q \
 psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
   -c "SELECT installed_at FROM public.schema_migration_contracts WHERE migration_name='20260820_faa_record_hash_domain'" \
   | grep -qx '2000-01-01'
+
+# NULLs exposed by a weakened receipt table are mismatches, never exact
+# installed contracts. The malformed marker and hash-domain constraint retain
+# their identities after the transaction rejects them.
+for null_case in version fingerprint both; do
+  case "$null_case" in
+    version)
+      null_assignment='contract_version=NULL'
+      null_predicate="receipt.contract_version IS NULL AND receipt.contract_fingerprint='f124f573bf705da6c1e4b0a5c7a8df45ea5a4a5dc009a28eee012be42c691502'"
+      ;;
+    fingerprint)
+      null_assignment='contract_fingerprint=NULL'
+      null_predicate='receipt.contract_version=1 AND receipt.contract_fingerprint IS NULL'
+      ;;
+    both)
+      null_assignment='contract_version=NULL,contract_fingerprint=NULL'
+      null_predicate='receipt.contract_version IS NULL AND receipt.contract_fingerprint IS NULL'
+      ;;
+  esac
+  reset_postgres
+  psql "$database_url" -v ON_ERROR_STOP=1 -q \
+    -c "ALTER TABLE public.schema_migration_contracts ALTER COLUMN contract_version DROP NOT NULL, ALTER COLUMN contract_fingerprint DROP NOT NULL; UPDATE public.schema_migration_contracts SET $null_assignment,installed_at='2000-01-01' WHERE migration_name='20260820_faa_record_hash_domain'"
+  constraint_oid_before="$(psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
+    -c "SELECT oid FROM pg_catalog.pg_constraint WHERE conrelid=pg_catalog.to_regclass('public.faa_registry_snapshots') AND conname='faa_registry_snapshots_record_hash_domain_check'")"
+  expect_postgres_failure_with_error "NULL receipt $null_case" \
+    'installed FAA record hash domain migration has a different contract'
+  test "$(psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
+    -c "SELECT ($null_predicate)::int || ':' || receipt.installed_at || ':' || constraint_row.oid FROM public.schema_migration_contracts receipt CROSS JOIN pg_catalog.pg_constraint constraint_row WHERE receipt.migration_name='20260820_faa_record_hash_domain' AND constraint_row.conrelid=pg_catalog.to_regclass('public.faa_registry_snapshots') AND constraint_row.conname='faa_registry_snapshots_record_hash_domain_check'")" = \
+    "1:2000-01-01:$constraint_oid_before"
+done
+reset_postgres
 psql "$database_url" -v ON_ERROR_STOP=1 -q \
   -c "UPDATE public.schema_migration_contracts SET contract_fingerprint='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE migration_name='20260820_faa_record_hash_domain'"
 expect_postgres_failure mismatched-current-marker

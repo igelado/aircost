@@ -37,6 +37,16 @@ all_migrations=(
   "${strict_migrations[@]}"
   "${transition_migrations[@]}"
 )
+specialized_postgres_migrations=(
+  20260819_faa_reference_reachability
+  20260819_listing_replay_runs
+  20260819_reference_catalog_cutover
+  20260820_faa_record_hash_domain
+)
+all_postgres_migrations=(
+  "${all_migrations[@]}"
+  "${specialized_postgres_migrations[@]}"
+)
 
 extract_marker_insert() {
   awk '
@@ -112,7 +122,7 @@ contract_tuple() {
 
 assert_postgres_ledger_lock_placement() {
   local file="$1"
-  local transaction_line search_path_line create_line lock_line guard_line marker_line
+  local transaction_line search_path_line create_line lock_line first_guard_line marker_line
   local lock_statement
   test "$(grep -c '^SET LOCAL search_path = public, pg_catalog, pg_temp;$' "$file")" = 1
   test "$(grep -c '^LOCK TABLE public[.]schema_migration_contracts$' "$file")" = 1
@@ -124,8 +134,7 @@ assert_postgres_ledger_lock_placement() {
     "$file" | cut -d: -f1 || true)"
   lock_line="$(grep -n -m1 '^LOCK TABLE public[.]schema_migration_contracts$' \
     "$file" | cut -d: -f1)"
-  guard_line="$(grep -n -m1 '^DO [$]migration\(_contract\)\?_guard[$]$' \
-    "$file" | cut -d: -f1)"
+  first_guard_line="$(grep -n -m1 '^DO [$]' "$file" | cut -d: -f1)"
   marker_line="$(grep -n -m1 \
     '^INSERT INTO \(public[.]\)\?schema_migration_contracts' "$file" | \
     cut -d: -f1)"
@@ -138,8 +147,8 @@ assert_postgres_ledger_lock_placement() {
   else
     (( search_path_line < lock_line ))
   fi
-  (( lock_line < guard_line ))
-  (( guard_line < marker_line ))
+  (( lock_line < first_guard_line ))
+  (( first_guard_line < marker_line ))
 }
 
 execute_sql() {
@@ -235,6 +244,24 @@ expect_guard_failure() {
     exit 1
   fi
 }
+
+# Every receipt-bearing PostgreSQL migration has the same transaction-local
+# namespace and ledger-serialization envelope. The four specialized migrations
+# keep their dedicated state-shape tests outside this general behavior matrix.
+mapfile -t receipt_postgres_migrations < <(
+  grep -El '^INSERT INTO (public[.])?schema_migration_contracts' \
+    "$repository_root"/migrations/*.postgres.sql |
+    sed -E 's|.*/([^/]+)[.]postgres[.]sql|\1|' | sort
+)
+test "${#receipt_postgres_migrations[@]}" = 24
+test "${#all_postgres_migrations[@]}" = 24
+diff -u \
+  <(printf '%s\n' "${all_postgres_migrations[@]}" | sort) \
+  <(printf '%s\n' "${receipt_postgres_migrations[@]}")
+for migration in "${all_postgres_migrations[@]}"; do
+  assert_postgres_ledger_lock_placement \
+    "$repository_root/migrations/$migration.postgres.sql"
+done
 
 # Strict receipts are literal conflict no-ops. Only the two explicit v1-to-v2
 # migrations may assign installed_at.
