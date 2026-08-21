@@ -163,6 +163,19 @@ not persist prompts, provider envelopes, Search results, URL Context dossiers,
 or grounding evidence. Preview mode never performs this domain write, and an
 empty equipment extraction is not persisted.
 
+Before a fresh listing extraction checkpoint is stored, a narrower
+publisher-specific repair may correct typography in avionics occurrence
+evidence. It runs only for one structurally valid Controller capture with one
+exact `Avionics/Radios` field, copies one unique bounded visible span from that
+field, and changes only `source_evidence_text`. The copied span must be exactly
+equal to the model's evidence locator after case and non-alphanumeric
+typography are removed, must contain every primary and replacement identity,
+and must pass the existing full-source suffix and ambiguity gates. Exact
+visible evidence is never rewritten; distinct spellings, line joins, hidden
+text, variant suffixes, malformed fields, and non-Controller sources fail
+closed. The complete current extraction validator runs again before the
+checkpoint can be stored.
+
 ## Evidence Retention And Reuse
 
 Search and URL Context output is request-scoped working data, not a durable

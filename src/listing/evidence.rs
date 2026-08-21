@@ -359,7 +359,10 @@ impl ListingEvidenceContext {
     }
 }
 
-fn controller_avionics_evidence(source_url: &str, rendered_html: &str) -> Option<String> {
+pub(crate) fn controller_avionics_evidence(
+    source_url: &str,
+    rendered_html: &str,
+) -> Option<String> {
     if validate_controller_listing_source_url(source_url).is_err() {
         return None;
     }
@@ -383,15 +386,23 @@ fn controller_avionics_evidence(source_url: &str, rendered_html: &str) -> Option
             .copied()
             .filter(|element| element_has_exact_class_token(*element, CONTROLLER_SPECS_VALUE_CLASS))
             .collect::<Vec<_>>();
-        if labels.len() != 1 || values.len() != 1 {
+        let raw_claims_avionics_field = labels.iter().any(|label| {
+            normalized_controller_field_label(label.text().collect::<String>())
+                == CONTROLLER_AVIONICS_LABEL
+        });
+        let visible_claims_avionics_field = labels.iter().any(|label| {
+            normalized_controller_field_label(clean_publisher_multiline_element_text(
+                &document, *label,
+            )) == CONTROLLER_AVIONICS_LABEL
+        });
+        if !raw_claims_avionics_field && !visible_claims_avionics_field {
             continue;
         }
-        let label = clean_publisher_multiline_element_text(&document, labels[0])
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if label != CONTROLLER_AVIONICS_LABEL {
-            continue;
+        if labels.len() != 1 || values.len() != 1 {
+            return None;
+        }
+        if !visible_claims_avionics_field {
+            return None;
         }
         let value = clean_publisher_multiline_element_text(&document, values[0]);
         if value.is_empty() || accepted.replace(value).is_some() {
@@ -399,6 +410,14 @@ fn controller_avionics_evidence(source_url: &str, rendered_html: &str) -> Option
         }
     }
     accepted
+}
+
+fn normalized_controller_field_label(value: impl AsRef<str>) -> String {
+    value
+        .as_ref()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn element_has_exact_class_token(element: ElementRef<'_>, expected: &str) -> bool {
@@ -966,6 +985,23 @@ Garmin GTX 33 ADS-B compliant</div>
                 "a wrong label or class token must not authorize multiline semantics"
             );
         }
+    }
+
+    #[test]
+    fn controller_hidden_label_noise_cannot_hide_a_second_visible_avionics_field() {
+        const URL: &str = "https://www.controller.com/listing/for-sale/257737897/example";
+        let html = r#"<html><body>
+          <div class="detail__specs-wrapper">
+            <div class="detail__specs-label">Avionics/Radios</div>
+            <div class="detail__specs-value">Garmin GMA-1347</div>
+          </div>
+          <div class="detail__specs-wrapper">
+            <div class="detail__specs-label">Avionics/Radios<span hidden>x</span></div>
+            <div class="detail__specs-value">Garmin GMA-1347</div>
+          </div>
+        </body></html>"#;
+
+        assert_eq!(controller_avionics_evidence(URL, html), None);
     }
 
     #[test]
