@@ -1847,7 +1847,8 @@ fn generate_content_usage_metrics(
         thought_tokens,
         cached_tokens: counter("cachedContentTokenCount")
             .or_else(|| (!cached_content_requested).then_some(0)),
-        tool_tokens: counter("toolUsePromptTokenCount"),
+        tool_tokens: counter("toolUsePromptTokenCount")
+            .or_else(|| (!google_search_requested).then_some(0)),
         search_query_count: search_query_count.or_else(|| (!google_search_requested).then_some(0)),
     }
 }
@@ -5393,7 +5394,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_content_usage_derives_omitted_zero_thoughts_from_provider_total() {
+    fn no_tool_listing_extraction_derives_exact_omitted_zero_counters() {
         let response = json!({
             "usageMetadata": {
                 "promptTokenCount": 120,
@@ -5408,7 +5409,27 @@ mod tests {
         assert_eq!(metrics.output_tokens, Some(30));
         assert_eq!(metrics.thought_tokens, Some(0));
         assert_eq!(metrics.cached_tokens, Some(0));
+        assert_eq!(metrics.tool_tokens, Some(0));
         assert_eq!(metrics.search_query_count, Some(0));
+    }
+
+    #[test]
+    fn generate_content_usage_does_not_infer_tool_tokens_for_grounded_requests() {
+        let response = json!({
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 150
+            },
+            "candidates": [{
+                "groundingMetadata": {"webSearchQueries": ["Garmin GTX 345"]}
+            }]
+        });
+
+        let metrics = generate_content_usage_metrics(&response, true, false);
+
+        assert_eq!(metrics.tool_tokens, None);
+        assert_eq!(metrics.search_query_count, Some(1));
     }
 
     #[test]
