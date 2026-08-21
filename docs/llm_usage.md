@@ -111,11 +111,20 @@ job correlations, request fingerprint, provider counters, attempts, latency,
 validation outcome, error text, and an optional dated paid-list cost estimate.
 
 Provider counters are nullable. An explicitly reported zero is stored as zero,
-while an omitted counter remains null. Cost can be estimated only when the
-provider reports every counter required by the pricing calculation and the
+while an omitted counter remains null unless the exact request configuration
+proves that counter must be zero. Cost can be estimated only when every counter
+required by the pricing calculation is reported or exactly deduced and the
 model/tier has a dated pricing snapshot. Otherwise cost remains unknown: both
 `estimated_cost_microusd` and `pricing_snapshot_json` stay null rather than
 silently treating missing counters as zero.
+
+The request adapter records zero tool-use tokens only for a first-turn text or
+multimodal request that declared no tools, because tool input is then
+impossible. A client-managed stateless-history continuation may carry earlier
+tool calls and results even when its current tool declaration is empty, so an
+omitted counter remains unknown there. It likewise remains unknown when
+Search, URL Context, or a custom function was declared; task names and observed
+output do not substitute for the exact sent request.
 
 GenerateContent may omit `thoughtsTokenCount` when it is zero. When
 `totalTokenCount`, `promptTokenCount`, and `candidatesTokenCount` are present,

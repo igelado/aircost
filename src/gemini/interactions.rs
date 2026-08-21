@@ -914,6 +914,14 @@ impl CreateInteractionRequest {
             background: false,
         }
     }
+
+    fn tool_input_impossible(&self) -> bool {
+        self.tools.is_empty()
+            && matches!(
+                self.input,
+                InteractionInput::Text(_) | InteractionInput::Items(_)
+            )
+    }
 }
 
 fn validate_tool(tool: &InteractionTool) -> GeminiInteractionsResult<()> {
@@ -1281,6 +1289,7 @@ impl GeminiInteractionsClient {
                         &request.model,
                         request.service_tier.as_deref().unwrap_or("standard"),
                         &request.tools,
+                        request.tool_input_impossible(),
                     );
                     store
                         .finish(attempt, &outcome)
@@ -2639,14 +2648,18 @@ fn interaction_usage_outcome(
     requested_model: &str,
     service_tier: &str,
     tools: &[InteractionTool],
+    tool_input_impossible: bool,
 ) -> UsageOutcome {
     let metrics = response
         .interaction
         .usage
         .as_ref()
-        .map(|_| interaction_usage_metrics(response))
+        .map(|_| interaction_usage_metrics(response, tool_input_impossible))
         .unwrap_or_default();
     let cost = response.interaction.usage.as_ref().and_then(|_| {
+        if tools.is_empty() && !tool_input_impossible && metrics.tool_tokens.is_none() {
+            return None;
+        }
         estimate_paid_list_cost(
             requested_model,
             service_tier,
@@ -2709,7 +2722,10 @@ fn interaction_tool_use_billing(tools: &[InteractionTool]) -> ToolUseBilling {
     }
 }
 
-fn interaction_usage_metrics(response: &InteractionResponse) -> UsageMetrics {
+fn interaction_usage_metrics(
+    response: &InteractionResponse,
+    tool_input_impossible: bool,
+) -> UsageMetrics {
     let usage = response.raw.get("usage");
     let counter = |name: &str| {
         usage
@@ -2763,7 +2779,8 @@ fn interaction_usage_metrics(response: &InteractionResponse) -> UsageMetrics {
         cached_tokens: counter("total_cached_tokens")
             .or_else(|| modality_sum("cached_tokens_by_modality")),
         tool_tokens: counter("total_tool_use_tokens")
-            .or_else(|| modality_sum("tool_use_tokens_by_modality")),
+            .or_else(|| modality_sum("tool_use_tokens_by_modality"))
+            .or_else(|| tool_input_impossible.then_some(0)),
         search_query_count,
     }
 }
@@ -3878,7 +3895,7 @@ mod tests {
     #[test]
     fn maps_full_interaction_usage_and_withholds_ambiguous_mixed_tool_cost() {
         let response = response_from(grounded_fixture());
-        let metrics = interaction_usage_metrics(&response);
+        let metrics = interaction_usage_metrics(&response, false);
         assert_eq!(metrics.input_tokens, Some(100));
         assert_eq!(metrics.output_tokens, Some(25));
         assert_eq!(metrics.thought_tokens, Some(10));
@@ -3891,6 +3908,7 @@ mod tests {
             "gemini-3.5-flash",
             "standard",
             &[InteractionTool::GoogleSearch, InteractionTool::UrlContext],
+            false,
         );
         assert_eq!(outcome.status, UsageStatus::Completed);
         assert_eq!(
@@ -3909,6 +3927,7 @@ mod tests {
             "gemini-3.5-flash",
             "standard",
             &[InteractionTool::GoogleSearch],
+            false,
         )
         .cost
         .unwrap();
@@ -3930,6 +3949,7 @@ mod tests {
             "gemini-3.5-flash",
             "standard",
             &[InteractionTool::UrlContext],
+            false,
         )
         .cost
         .unwrap();
@@ -3977,13 +3997,116 @@ mod tests {
                 "total_tool_use_tokens": 0
             }
         }));
-        let metrics = interaction_usage_metrics(&response);
+        let metrics = interaction_usage_metrics(&response, true);
         assert_eq!(metrics.search_query_count, Some(0));
         assert!(
-            interaction_usage_outcome(&response, "gemini-3.5-flash", "standard", &[])
+            interaction_usage_outcome(&response, "gemini-3.5-flash", "standard", &[], true)
                 .cost
                 .is_some()
         );
+    }
+
+    #[test]
+    fn omitted_tool_usage_is_zero_only_when_interaction_tool_input_is_impossible() {
+        let response = response_from(json!({
+            "id": "interaction-optional-tool-usage",
+            "model": "gemini-3.5-flash-lite",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {"type": "model_output", "content": [{"type": "text", "text": "{}"}]}
+            ],
+            "usage": {
+                "total_input_tokens": 100,
+                "total_output_tokens": 25,
+                "total_thought_tokens": 0,
+                "total_cached_tokens": 0
+            }
+        }));
+
+        let no_tools = interaction_usage_metrics(&response, true);
+        assert_eq!(no_tools.tool_tokens, Some(0));
+        assert!(interaction_usage_outcome(
+            &response,
+            "gemini-3.5-flash-lite",
+            "standard",
+            &[],
+            true,
+        )
+        .cost
+        .is_some());
+
+        let grounded = interaction_usage_metrics(&response, false);
+        assert_eq!(grounded.tool_tokens, None);
+        assert!(interaction_usage_outcome(
+            &response,
+            "gemini-3.5-flash-lite",
+            "standard",
+            &[InteractionTool::UrlContext],
+            false,
+        )
+        .cost
+        .is_none());
+    }
+
+    #[test]
+    fn tools_disabled_stateless_history_keeps_omitted_tool_usage_unknown() {
+        let history = StatelessHistory::from_steps(vec![
+            json!({
+                "type": "user_input",
+                "content": [{"type": "text", "text": "Resolve this product."}]
+            }),
+            json!({
+                "type": "function_call",
+                "id": "catalog-1",
+                "name": "lookup_product",
+                "arguments": {"query": "GTN 650Xi"},
+                "signature": "catalog-call-signature"
+            }),
+            json!({
+                "type": "function_result",
+                "call_id": "catalog-1",
+                "name": "lookup_product",
+                "is_error": false,
+                "result": [{"type": "text", "text": "{\"id\":42}"}]
+            }),
+            json!({
+                "type": "user_input",
+                "content": [{"type": "text", "text": "Return only JSON."}]
+            }),
+        ])
+        .unwrap();
+        let request = CreateInteractionRequest::new("gemini-3.5-flash-lite", history);
+        request.validate().unwrap();
+        assert!(request.tools.is_empty());
+        assert!(!request.tool_input_impossible());
+
+        let response = response_from(json!({
+            "id": "interaction-history-usage",
+            "model": "gemini-3.5-flash-lite",
+            "object": "interaction",
+            "status": "completed",
+            "steps": [
+                {"type": "model_output", "content": [{"type": "text", "text": "{}"}]}
+            ],
+            "usage": {
+                "total_input_tokens": 100,
+                "total_output_tokens": 25,
+                "total_thought_tokens": 0,
+                "total_cached_tokens": 0
+            }
+        }));
+        let metrics = interaction_usage_metrics(&response, request.tool_input_impossible());
+        assert_eq!(metrics.tool_tokens, None);
+        assert!(interaction_usage_outcome(
+            &response,
+            &request.model,
+            "standard",
+            &request.tools,
+            request.tool_input_impossible(),
+        )
+        .cost
+        .is_none());
     }
 
     #[test]
