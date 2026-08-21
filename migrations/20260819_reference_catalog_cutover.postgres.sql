@@ -16,7 +16,7 @@ BEGIN
       AND (
         contract_version <> 1
         OR contract_fingerprint <>
-          '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
+          'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -28,7 +28,7 @@ BEGIN
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
+        'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
   ) INTO exact_marker;
 
   IF exact_marker THEN
@@ -190,12 +190,312 @@ BEGIN
        OR actual_definition_digest <>
             'd609ec15a4522b9ab15ae7d145e76c67' THEN
       RAISE EXCEPTION
-        'reference catalog cutover marker-present definition mismatch (% objects, digest %)',
+        'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
     END IF;
   END IF;
 END
 $reference_catalog_cutover_rerun_preflight$;
+
+-- One complete inventory drives the marker-absent preflight and the
+-- pre-marker postflight. It closes every relation touched by a replaced
+-- routine, every owned routine/trigger, every core reference relation, both
+-- new identity sequences, and every retired object this cutover removes.
+CREATE FUNCTION pg_temp.reference_catalog_cutover_owned_objects()
+RETURNS TABLE(object_key TEXT, definition TEXT)
+LANGUAGE sql
+SET search_path = pg_catalog
+AS $owned_objects$
+WITH
+active_routines(name) AS (
+  VALUES
+    ('aircraft_serial_natural_sort_key'),
+    ('validate_aircraft_serial_scheme_ordering'),
+    ('prevent_referenced_avionics_catalog_downgrade'),
+    ('invalidate_listing_avionics_authorization_for_capture'),
+    ('validate_aircraft_valuation_compatibility_projection'),
+    ('require_aircraft_catalog_approval'),
+    ('validate_aircraft_reference_version_insert'),
+    ('preserve_assigned_aircraft_applicability'),
+    ('prevent_new_unresolved_aircraft_dimension'),
+    ('validate_official_dollar_normalization_fact'),
+    ('prevent_official_dollar_normalization_mutation'),
+    ('validate_aircraft_reference_child_insert'),
+    ('prevent_aircraft_reference_fact_mutation'),
+    ('validate_aircraft_reference_version_update')
+),
+retired_routines(name) AS (
+  VALUES
+    ('require_approved_default_avionics_model'),
+    ('reject_active_default_avionics_candidate'),
+    ('preserve_pending_default_avionics_claim'),
+    ('require_exact_pending_default_avionics_admission'),
+    ('move_admitted_default_avionics_candidate'),
+    ('prevent_projected_aircraft_evidence_variant_move')
+),
+owned_routines(name) AS (
+  SELECT name FROM active_routines
+  UNION ALL SELECT name FROM retired_routines
+),
+protected_relations(name) AS (
+  VALUES
+    ('plugin_submissions'),
+    ('avionics_models'),
+    ('aircraft_engine_catalog_models'),
+    ('aircraft_propeller_catalog_models'),
+    ('aircraft_makes'),
+    ('aircraft_model_families'),
+    ('aircraft_designations'),
+    ('aircraft_make_aliases'),
+    ('aircraft_family_aliases'),
+    ('aircraft_designation_aliases'),
+    ('aircraft_designation_identifiers'),
+    ('aircraft_generations'),
+    ('aircraft_generation_designations'),
+    ('aircraft_factory_packages'),
+    ('aircraft_package_applicability'),
+    ('aircraft_reference_configurations'),
+    ('aircraft_serial_number_schemes'),
+    ('aircraft_feature_definitions'),
+    ('aircraft_reference_configuration_versions'),
+    ('aircraft_reference_applicability_scopes'),
+    ('aircraft_reference_prices'),
+    ('aircraft_reference_avionics'),
+    ('aircraft_reference_engines'),
+    ('aircraft_reference_propellers'),
+    ('aircraft_reference_features'),
+    ('aircraft_reference_fact_set_attestations'),
+    ('official_dollar_normalization_facts'),
+    ('aircraft_valuation_compatibility_projections'),
+    ('listing_verification_run_items')
+),
+retired_relations(name) AS (
+  VALUES
+    ('aircraft_model_spec_versions'),
+    ('aircraft_model_variant_price_points'),
+    ('aircraft_model_variant_default_avionics'),
+    ('aircraft_model_variant_default_avionics_candidates'),
+    ('depreciation_profiles'),
+    ('depreciation_profile_fit_metadata'),
+    ('component_depreciation_profiles')
+),
+owned_relations(name) AS (
+  SELECT name FROM protected_relations
+  UNION ALL SELECT name FROM retired_relations
+),
+relations AS (
+  SELECT relation.*
+  FROM pg_catalog.pg_class relation
+  JOIN pg_catalog.pg_namespace namespace
+    ON namespace.oid = relation.relnamespace
+  JOIN owned_relations expected ON expected.name = relation.relname
+  WHERE namespace.nspname = 'public'
+)
+SELECT
+  'routine:' || routine.proname || ':' ||
+    pg_catalog.pg_get_function_identity_arguments(routine.oid),
+  lower(pg_catalog.regexp_replace(routine.prosrc, '[[:space:]]', '', 'g')) || ':' ||
+    COALESCE(pg_catalog.array_to_string(routine.proconfig, E'\n'), '') || ':' ||
+    language.lanname || ':' ||
+    pg_catalog.format_type(routine.prorettype, NULL) || ':' ||
+    pg_catalog.pg_get_function_identity_arguments(routine.oid) || ':' ||
+    (routine.proowner = (SELECT usesysid FROM pg_catalog.pg_user
+      WHERE usename = CURRENT_USER))::TEXT || ':' ||
+    COALESCE(routine.proacl::TEXT, '') || ':' || routine.prokind::TEXT || ':' ||
+    routine.prosecdef::TEXT || ':' || routine.proleakproof::TEXT || ':' ||
+    routine.proisstrict::TEXT || ':' || routine.provolatile::TEXT || ':' ||
+    routine.proparallel::TEXT || ':' || routine.procost::TEXT || ':' ||
+    routine.prorows::TEXT || ':' || routine.prosupport::regproc::TEXT
+FROM pg_catalog.pg_proc routine
+JOIN pg_catalog.pg_namespace namespace ON namespace.oid = routine.pronamespace
+JOIN pg_catalog.pg_language language ON language.oid = routine.prolang
+JOIN owned_routines expected ON expected.name = routine.proname
+WHERE namespace.nspname = 'public'
+UNION ALL
+SELECT
+  'relation:' || relation.relname,
+  relation.relkind::TEXT || ':' || relation.relpersistence::TEXT || ':' ||
+    COALESCE(access_method.amname, '') || ':' || relation.relreplident::TEXT || ':' ||
+    relation.relrowsecurity::TEXT || ':' || relation.relforcerowsecurity::TEXT || ':' ||
+    (relation.relowner = (SELECT usesysid FROM pg_catalog.pg_user
+      WHERE usename = CURRENT_USER))::TEXT || ':' ||
+    COALESCE(relation.relacl::TEXT, '')
+FROM relations relation
+LEFT JOIN pg_catalog.pg_am access_method ON access_method.oid = relation.relam
+UNION ALL
+SELECT
+  'column:' || relation.relname || ':' || attribute.attnum::TEXT,
+  attribute.attname || ':' ||
+    pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || ':' ||
+    attribute.attnotnull::TEXT || ':' || attribute.attidentity::TEXT || ':' ||
+    attribute.attgenerated::TEXT || ':' || attribute.attstorage::TEXT || ':' ||
+    COALESCE(collation_namespace.nspname || '.' || collation_row.collname, '') || ':' ||
+    COALESCE(pg_catalog.pg_get_expr(default_row.adbin, default_row.adrelid), '')
+FROM relations relation
+JOIN pg_catalog.pg_attribute attribute
+  ON attribute.attrelid = relation.oid
+ AND attribute.attnum > 0
+ AND NOT attribute.attisdropped
+LEFT JOIN pg_catalog.pg_attrdef default_row
+  ON default_row.adrelid = relation.oid
+ AND default_row.adnum = attribute.attnum
+LEFT JOIN pg_catalog.pg_collation collation_row
+  ON collation_row.oid = attribute.attcollation
+LEFT JOIN pg_catalog.pg_namespace collation_namespace
+  ON collation_namespace.oid = collation_row.collnamespace
+UNION ALL
+SELECT
+  'constraint:' || relation.relname || ':' || constraint_row.conname,
+  constraint_row.contype::TEXT || ':' || constraint_row.convalidated::TEXT || ':' ||
+    constraint_row.condeferrable::TEXT || ':' || constraint_row.condeferred::TEXT || ':' ||
+    constraint_row.connoinherit::TEXT || ':' ||
+    replace(pg_catalog.pg_get_constraintdef(constraint_row.oid, TRUE), 'public.', '')
+FROM pg_catalog.pg_constraint constraint_row
+JOIN relations relation ON relation.oid = constraint_row.conrelid
+UNION ALL
+SELECT
+  'index:' || relation.relname || ':' || index_relation.relname,
+  replace(pg_catalog.pg_get_indexdef(index_row.indexrelid), 'public.', '') || ':' ||
+    index_row.indisunique::TEXT || ':' || index_row.indisprimary::TEXT || ':' ||
+    index_row.indisvalid::TEXT || ':' || index_row.indisready::TEXT || ':' ||
+    index_row.indislive::TEXT || ':' || index_row.indisreplident::TEXT || ':' ||
+    index_row.indimmediate::TEXT || ':' || index_row.indnullsnotdistinct::TEXT || ':' ||
+    index_row.indnatts::TEXT || ':' || index_row.indnkeyatts::TEXT || ':' ||
+    index_relation.relpersistence::TEXT || ':' ||
+    COALESCE(index_access_method.amname, '') || ':' ||
+    (index_relation.relowner = (SELECT usesysid FROM pg_catalog.pg_user
+      WHERE usename = CURRENT_USER))::TEXT || ':' ||
+    COALESCE(index_relation.relacl::TEXT, '') || ':' ||
+    COALESCE(backing_constraint.contype::TEXT, '') || ':' ||
+    COALESCE(backing_constraint.conname, '') || ':' ||
+    COALESCE(replace(
+      pg_catalog.pg_get_constraintdef(backing_constraint.oid, TRUE), 'public.', ''
+    ), '')
+FROM pg_catalog.pg_index index_row
+JOIN relations relation ON relation.oid = index_row.indrelid
+JOIN pg_catalog.pg_class index_relation ON index_relation.oid = index_row.indexrelid
+LEFT JOIN pg_catalog.pg_am index_access_method
+  ON index_access_method.oid = index_relation.relam
+LEFT JOIN pg_catalog.pg_constraint backing_constraint
+  ON backing_constraint.conindid = index_row.indexrelid
+ AND backing_constraint.conrelid = relation.oid
+ AND backing_constraint.contype IN ('p', 'u', 'x')
+UNION ALL
+SELECT
+  'trigger:' || relation.relname || ':' || trigger_row.tgname,
+  trigger_row.tgenabled::TEXT || ':' || replace(
+    pg_catalog.pg_get_triggerdef(trigger_row.oid, TRUE), 'public.', ''
+  )
+FROM pg_catalog.pg_trigger trigger_row
+JOIN pg_catalog.pg_class relation ON relation.oid = trigger_row.tgrelid
+JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
+LEFT JOIN owned_relations expected_relation ON expected_relation.name = relation.relname
+LEFT JOIN owned_routines expected_routine ON expected_routine.name = routine.proname
+WHERE NOT trigger_row.tgisinternal
+  AND namespace.nspname = 'public'
+  AND (expected_relation.name IS NOT NULL OR expected_routine.name IS NOT NULL)
+UNION ALL
+SELECT
+  'sequence:' || sequence_relation.relname,
+  pg_catalog.format_type(sequence_row.seqtypid, NULL) || ':' ||
+    sequence_row.seqstart::TEXT || ':' || sequence_row.seqincrement::TEXT || ':' ||
+    sequence_row.seqmax::TEXT || ':' || sequence_row.seqmin::TEXT || ':' ||
+    sequence_row.seqcache::TEXT || ':' || sequence_row.seqcycle::TEXT || ':' ||
+    sequence_relation.relpersistence::TEXT || ':' ||
+    (sequence_relation.relowner = (SELECT usesysid FROM pg_catalog.pg_user
+      WHERE usename = CURRENT_USER))::TEXT || ':' ||
+    COALESCE(sequence_relation.relacl::TEXT, '') || ':' ||
+    owner_relation.relname || ':' || owner_attribute.attname || ':' ||
+    dependency.deptype::TEXT
+FROM pg_catalog.pg_sequence sequence_row
+JOIN pg_catalog.pg_class sequence_relation
+  ON sequence_relation.oid = sequence_row.seqrelid
+JOIN pg_catalog.pg_namespace sequence_namespace
+  ON sequence_namespace.oid = sequence_relation.relnamespace
+JOIN pg_catalog.pg_depend dependency
+  ON dependency.classid = 'pg_catalog.pg_class'::regclass
+ AND dependency.objid = sequence_relation.oid
+ AND dependency.refclassid = 'pg_catalog.pg_class'::regclass
+ AND dependency.deptype IN ('a', 'i')
+JOIN relations owner_relation ON owner_relation.oid = dependency.refobjid
+JOIN pg_catalog.pg_attribute owner_attribute
+  ON owner_attribute.attrelid = owner_relation.oid
+ AND owner_attribute.attnum = dependency.refobjsubid
+WHERE sequence_namespace.nspname = 'public'
+$owned_objects$;
+
+DO $reference_catalog_cutover_owned_preflight$
+DECLARE
+  exact_marker BOOLEAN;
+  actual_object_count BIGINT;
+  actual_definition_digest TEXT;
+BEGIN
+  SELECT EXISTS (
+    SELECT 1 FROM public.schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+  ) INTO exact_marker;
+
+  SELECT count(*), pg_catalog.md5(pg_catalog.string_agg(
+    object_key || '=' || definition, E'\n' ORDER BY object_key
+  ))
+  INTO actual_object_count, actual_definition_digest
+  FROM pg_temp.reference_catalog_cutover_owned_objects();
+
+  IF exact_marker AND (
+    actual_object_count <> 793
+    OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68'
+  ) THEN
+    RAISE EXCEPTION
+      'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
+      actual_object_count, actual_definition_digest;
+  END IF;
+
+  IF NOT exact_marker AND (
+    actual_object_count <> 925
+    OR actual_definition_digest <> '379464a027df1c61f99c754b28ff4738'
+  ) THEN
+    RAISE EXCEPTION
+      'reference catalog cutover marker-absent pre-state mismatch (% objects, digest %)',
+      actual_object_count, actual_definition_digest;
+  END IF;
+
+  IF NOT exact_marker AND EXISTS (
+    SELECT 1 FROM public.listing_verification_run_items
+    WHERE status = 'pending_reference'
+      AND (
+        outcome_json IS NULL
+        OR pg_catalog.jsonb_typeof(outcome_json::jsonb) IS DISTINCT FROM 'object'
+        OR pg_catalog.jsonb_typeof(
+          outcome_json::jsonb -> 'finalization'
+        ) IS DISTINCT FROM 'object'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'reference catalog cutover pending-reference finalization shape mismatch';
+  END IF;
+END
+$reference_catalog_cutover_owned_preflight$;
+
+-- The predecessor relied on the database's default collation for serialized
+-- natural-sort keys. Pin the invariant to the bytewise ordering used by the
+-- canonical schema so upgraded and freshly-created databases are equivalent.
+ALTER TABLE public.aircraft_reference_applicability_scopes
+  DROP CONSTRAINT aircraft_reference_applicability_scopes_check;
+ALTER TABLE public.aircraft_reference_applicability_scopes
+  ADD CONSTRAINT aircraft_reference_applicability_scopes_check CHECK (
+    (applies_to_all_serials
+      AND aircraft_serial_number_scheme_id IS NULL
+      AND serial_prefix IS NULL
+      AND serial_from_display IS NULL AND serial_to_display IS NULL
+      AND serial_from_sort_key IS NULL AND serial_to_sort_key IS NULL)
+    OR
+    (NOT applies_to_all_serials
+      AND aircraft_serial_number_scheme_id IS NOT NULL
+      AND serial_from_display IS NOT NULL AND serial_to_display IS NOT NULL
+      AND serial_from_sort_key IS NOT NULL AND serial_to_sort_key IS NOT NULL
+      AND serial_from_sort_key COLLATE "C" <= serial_to_sort_key COLLATE "C")
+  );
 
 -- A marker-absent upgrade may rewrite the historical run-item contract only
 -- from its exact owned schema. Unexpected constraints, indexes, or triggers
@@ -1150,11 +1450,64 @@ END;
 $$ LANGUAGE plpgsql
 SET search_path = pg_catalog;
 
+DO $reference_catalog_cutover_owned_postflight$
+DECLARE
+  actual_object_count BIGINT;
+  actual_definition_digest TEXT;
+BEGIN
+  SELECT count(*), pg_catalog.md5(pg_catalog.string_agg(
+    object_key || '=' || definition, E'\n' ORDER BY object_key
+  ))
+  INTO actual_object_count, actual_definition_digest
+  FROM pg_temp.reference_catalog_cutover_owned_objects();
+
+  IF actual_object_count <> 793
+     OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+    RAISE EXCEPTION
+      'reference catalog cutover post-state mismatch (% objects, digest %)',
+      actual_object_count, actual_definition_digest;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_class relation
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'public'
+      AND relation.relname IN (
+        'aircraft_model_spec_versions',
+        'aircraft_model_variant_price_points',
+        'aircraft_model_variant_default_avionics',
+        'aircraft_model_variant_default_avionics_candidates',
+        'depreciation_profiles',
+        'depreciation_profile_fit_metadata',
+        'component_depreciation_profiles'
+      )
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_proc routine
+    JOIN pg_catalog.pg_namespace namespace
+      ON namespace.oid = routine.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND routine.proname IN (
+        'require_approved_default_avionics_model',
+        'reject_active_default_avionics_candidate',
+        'preserve_pending_default_avionics_claim',
+        'require_exact_pending_default_avionics_admission',
+        'move_admitted_default_avionics_candidate',
+        'prevent_projected_aircraft_evidence_variant_move'
+      )
+  ) THEN
+    RAISE EXCEPTION 'reference catalog cutover retired objects remain';
+  END IF;
+END
+$reference_catalog_cutover_owned_postflight$;
+
 INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455', CURRENT_TIMESTAMP
+  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

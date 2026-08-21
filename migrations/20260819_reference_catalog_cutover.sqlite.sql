@@ -1,202 +1,163 @@
 PRAGMA foreign_keys = ON;
 BEGIN IMMEDIATE;
 
--- Reject mismatched provenance and marker-present structural damage before any
--- transition DDL can replace or recreate cutover objects.
-CREATE TEMP TABLE reference_catalog_cutover_rerun_preflight (
+-- Snapshot every object this migration owns before any transition DDL. The
+-- exact historical shape is the only marker-absent input, and the exact
+-- canonical shape is the only marker-present input. Extra objects are never
+-- silently removed by a table rebuild or DROP TRIGGER.
+CREATE TEMP TABLE reference_catalog_cutover_owned_objects (
+  object_key TEXT PRIMARY KEY,
+  definition TEXT NOT NULL
+);
+INSERT INTO reference_catalog_cutover_owned_objects (object_key, definition)
+WITH
+core_relations(name) AS (
+  VALUES
+    ('plugin_submissions'),
+    ('avionics_models'),
+    ('aircraft_engine_catalog_models'),
+    ('aircraft_propeller_catalog_models'),
+    ('aircraft_makes'),
+    ('aircraft_model_families'),
+    ('aircraft_designations'),
+    ('aircraft_make_aliases'),
+    ('aircraft_family_aliases'),
+    ('aircraft_designation_aliases'),
+    ('aircraft_designation_identifiers'),
+    ('aircraft_generations'),
+    ('aircraft_generation_designations'),
+    ('aircraft_factory_packages'),
+    ('aircraft_package_applicability'),
+    ('aircraft_reference_configurations'),
+    ('aircraft_serial_number_schemes'),
+    ('aircraft_feature_definitions'),
+    ('aircraft_reference_configuration_versions'),
+    ('aircraft_reference_applicability_scopes'),
+    ('aircraft_reference_prices'),
+    ('aircraft_reference_avionics'),
+    ('aircraft_reference_engines'),
+    ('aircraft_reference_propellers'),
+    ('aircraft_reference_features'),
+    ('aircraft_reference_fact_set_attestations'),
+    ('official_dollar_normalization_facts'),
+    ('aircraft_valuation_compatibility_projections'),
+    ('listing_verification_run_items')
+),
+retired_relations(name) AS (
+  VALUES
+    ('aircraft_model_spec_versions'),
+    ('aircraft_model_variant_price_points'),
+    ('aircraft_model_variant_default_avionics'),
+    ('aircraft_model_variant_default_avionics_candidates'),
+    ('depreciation_profiles'),
+    ('depreciation_profile_fit_metadata'),
+    ('component_depreciation_profiles')
+),
+owned_relations(name) AS (
+  SELECT name FROM core_relations
+  UNION ALL SELECT name FROM retired_relations
+),
+owned_trigger_names(name) AS (
+  VALUES
+    ('avionics_models_referenced_status_update'),
+    ('aircraft_valuation_projection_validate_insert')
+)
+SELECT
+  schema_row.type || ':' || schema_row.name,
+  COALESCE(lower(replace(replace(replace(replace(
+    schema_row.sql, char(9), ''
+  ), char(10), ''), char(13), ''), ' ', '')), '')
+FROM sqlite_schema schema_row
+WHERE (
+  schema_row.type = 'table'
+  AND schema_row.name IN (SELECT name FROM owned_relations)
+) OR (
+  schema_row.name IN (SELECT name FROM retired_relations)
+  OR schema_row.tbl_name IN (SELECT name FROM retired_relations)
+) OR (
+  schema_row.type = 'view'
+  AND schema_row.name = 'aircraft_reference_serial_key_errors'
+) OR (
+  schema_row.type = 'trigger'
+  AND (
+    schema_row.tbl_name IN (SELECT name FROM owned_relations)
+    OR schema_row.name IN (SELECT name FROM owned_trigger_names)
+  )
+)
+UNION ALL
+SELECT
+  'index:' || relation.name || ':' || index_row.name,
+  index_row.[unique] || ':' || index_row.origin || ':' ||
+    index_row.partial || ':' || COALESCE(lower(replace(replace(replace(replace(
+      (SELECT sql FROM sqlite_schema WHERE type = 'index'
+       AND name = index_row.name), char(9), ''
+    ), char(10), ''), char(13), ''), ' ', '')), '') || ':' || COALESCE((
+      SELECT group_concat(index_column.signature, ',')
+      FROM (
+        SELECT
+          xinfo.seqno || ':' || xinfo.cid || ':' ||
+          COALESCE(xinfo.name, '') || ':' || xinfo.desc || ':' ||
+          xinfo.coll || ':' || xinfo.key AS signature
+        FROM pragma_index_xinfo(index_row.name) xinfo
+        ORDER BY xinfo.seqno
+      ) index_column
+    ), '')
+FROM owned_relations relation
+JOIN pragma_index_list(relation.name) index_row;
+
+CREATE TEMP TABLE reference_catalog_cutover_preflight (
   valid INTEGER NOT NULL CHECK (valid = 1)
 );
-INSERT INTO reference_catalog_cutover_rerun_preflight (valid)
-SELECT CASE WHEN EXISTS (
-  SELECT 1
-  FROM schema_migration_contracts
-  WHERE migration_name = '20260819_reference_catalog_cutover'
-    AND (
-      contract_version <> 1
-      OR contract_fingerprint <>
-        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
-    )
-) OR (
-  EXISTS (
+INSERT INTO reference_catalog_cutover_preflight (valid)
+SELECT CASE
+  WHEN EXISTS (
     SELECT 1 FROM schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
-      AND contract_version = 1
-      AND contract_fingerprint =
-        '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455'
-  )
-  AND (
-    (SELECT count(*) FROM sqlite_schema
-     WHERE type = 'table' AND name IN (
-       'aircraft_reference_fact_set_attestations',
-       'official_dollar_normalization_facts'
-     )) <> 2
-    OR (SELECT count(*) FROM sqlite_schema
-        WHERE type = 'trigger' AND name IN (
-          'avionics_models_referenced_status_update',
-          'aircraft_valuation_projection_validate_insert',
-          'aircraft_reference_scope_canonical_insert',
-          'aircraft_reference_scope_key_recompute_insert',
-          'aircraft_reference_versions_require_approval',
-          'official_dollar_normalization_require_evidence',
-          'official_dollar_normalization_immutable_update',
-          'official_dollar_normalization_immutable_delete',
-          'aircraft_reference_price_building_insert',
-          'aircraft_reference_price_immutable_update',
-          'aircraft_reference_price_immutable_delete',
-          'aircraft_reference_fact_set_building_insert',
-          'aircraft_reference_fact_set_immutable_update',
-          'aircraft_reference_fact_set_immutable_delete',
-          'aircraft_reference_versions_publish',
-          'aircraft_serial_schemes_require_approval',
-          'aircraft_serial_schemes_preserve_ordering'
-        )) <> 17
-    OR (SELECT count(*) FROM pragma_table_info('aircraft_reference_prices')
-        WHERE name = 'configuration_basis'
-          AND upper(type) = 'TEXT'
-          AND "notnull" = 1
-          AND dflt_value = '''unknown'''
-          AND pk = 0) <> 1
-    OR (SELECT lower(hex(sha3(group_concat(
-          type || ':' || name || ':' || normalized_sql, '|'
-        ), 256)))
-        FROM (
-          SELECT type, name, normalized_sql
-          FROM (
-            SELECT
-              type,
-              name,
-              lower(replace(replace(replace(replace(
-                sql, char(9), ''
-              ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
-            FROM sqlite_schema
-            WHERE (type = 'table' AND name IN (
-              'aircraft_reference_prices',
-              'aircraft_reference_fact_set_attestations',
-              'official_dollar_normalization_facts'
-            )) OR (type = 'trigger' AND (
-              name IN (
-                'avionics_models_referenced_status_update',
-                'aircraft_valuation_projection_validate_insert',
-                'aircraft_reference_scope_canonical_insert',
-                'aircraft_reference_scope_key_recompute_insert',
-                'aircraft_reference_versions_require_approval',
-                'official_dollar_normalization_require_evidence',
-                'official_dollar_normalization_immutable_update',
-                'official_dollar_normalization_immutable_delete',
-                'aircraft_reference_price_building_insert',
-                'aircraft_reference_price_immutable_update',
-                'aircraft_reference_price_immutable_delete',
-                'aircraft_reference_fact_set_building_insert',
-                'aircraft_reference_fact_set_immutable_update',
-                'aircraft_reference_fact_set_immutable_delete',
-                'aircraft_reference_versions_publish',
-                'aircraft_serial_schemes_require_approval',
-                'aircraft_serial_schemes_preserve_ordering'
-              )
-              OR tbl_name IN (
-                'aircraft_reference_prices',
-                'aircraft_reference_fact_set_attestations',
-                'official_dollar_normalization_facts'
-              )
-            ))
-            UNION ALL
-            SELECT
-              'index' AS type,
-              protected_relation.relation_name || ':' || index_row.name AS name,
-              index_row.[unique] || ':' || index_row.origin || ':' ||
-                index_row.partial || ':' || COALESCE((
-                  SELECT group_concat(index_column.signature, ',')
-                  FROM (
-                    SELECT
-                      xinfo.seqno || ':' || xinfo.cid || ':' ||
-                      COALESCE(xinfo.name, '') || ':' || xinfo.desc || ':' ||
-                      xinfo.coll || ':' || xinfo.key AS signature
-                    FROM pragma_index_xinfo(index_row.name) xinfo
-                    ORDER BY xinfo.seqno
-                  ) index_column
-                ), '') AS normalized_sql
-            FROM (
-              SELECT 'aircraft_reference_prices' AS relation_name
-              UNION ALL
-              SELECT 'aircraft_reference_fact_set_attestations'
-              UNION ALL
-              SELECT 'official_dollar_normalization_facts'
-            ) protected_relation
-            JOIN pragma_index_list(protected_relation.relation_name) index_row
-          ) exact_object
-          ORDER BY type, name
-        )) <> '9ef50133da8e63ad020fb3fc74ec3c66230f200616783315e96cf6dd9912acb1'
-    OR (SELECT count(*) FROM sqlite_schema
-        WHERE (type = 'table' AND name = 'listing_verification_run_items')
-           OR (type IN ('index', 'trigger')
-               AND tbl_name = 'listing_verification_run_items')) <> 6
-    OR (SELECT lower(hex(sha3(group_concat(
-          type || ':' || name || ':' || normalized_sql, '|'
-        ), 256)))
-        FROM (
-          SELECT type, name, lower(replace(replace(replace(replace(
-            sql, char(9), ''
-          ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
-          FROM sqlite_schema
-          WHERE (
-            type = 'table' AND name = 'listing_verification_run_items'
-          ) OR (
-            type IN ('index', 'trigger')
-            AND tbl_name = 'listing_verification_run_items'
-            AND sql IS NOT NULL
-          )
-          ORDER BY type, name
-        )) <> 'dab93c6d4c1d7f80e7297e528419ee99a0d6b5e1f9ad971bc4155ddd3f418e81'
-    OR EXISTS (
-      SELECT 1 FROM sqlite_schema
-      WHERE type = 'table' AND name IN (
-        'aircraft_model_spec_versions',
-        'aircraft_model_variant_price_points',
-        'aircraft_model_variant_default_avionics',
-        'aircraft_model_variant_default_avionics_candidates',
-        'depreciation_profiles',
-        'depreciation_profile_fit_metadata',
-        'component_depreciation_profiles'
+      AND (
+        contract_version <> 1
+        OR contract_fingerprint <>
+          'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
       )
-    )
-  )
-) THEN 0 ELSE 1 END;
-DROP TABLE reference_catalog_cutover_rerun_preflight;
-
--- A marker-absent upgrade may rebuild the historical run-item table only from
--- its exact owned schema. Unexpected constraints, indexes, or triggers are a
--- conflict to investigate, never objects for this migration to erase.
-CREATE TEMP TABLE reference_catalog_cutover_run_item_preflight (
-  valid INTEGER NOT NULL CHECK (valid = 1)
-);
-INSERT INTO reference_catalog_cutover_run_item_preflight (valid)
-SELECT CASE WHEN NOT EXISTS (
-  SELECT 1 FROM schema_migration_contracts
-  WHERE migration_name = '20260819_reference_catalog_cutover'
-) AND (
-  (SELECT count(*) FROM sqlite_schema
-   WHERE (type = 'table' AND name = 'listing_verification_run_items')
-      OR (type IN ('index', 'trigger')
-          AND tbl_name = 'listing_verification_run_items')) <> 6
-  OR (SELECT lower(hex(sha3(group_concat(
-        type || ':' || name || ':' || normalized_sql, '|'
-      ), 256)))
-      FROM (
-        SELECT type, name, lower(replace(replace(replace(replace(
-          sql, char(9), ''
-        ), char(10), ''), char(13), ''), ' ', '')) AS normalized_sql
-        FROM sqlite_schema
-        WHERE (
-          type = 'table' AND name = 'listing_verification_run_items'
-        ) OR (
-          type IN ('index', 'trigger')
-          AND tbl_name = 'listing_verification_run_items'
-          AND sql IS NOT NULL
+  ) THEN 0
+  WHEN EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+  ) AND (
+    (SELECT count(*) FROM reference_catalog_cutover_owned_objects) <>
+      213
+    OR (SELECT lower(hex(sha3(group_concat(
+          object_key || '=' || definition, '|'
+        ), 256))) FROM (
+          SELECT object_key, definition
+          FROM reference_catalog_cutover_owned_objects ORDER BY object_key
+        )) <> '82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1'
+  ) THEN 0
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+  ) AND (
+    (SELECT count(*) FROM reference_catalog_cutover_owned_objects) <>
+      238
+    OR (SELECT lower(hex(sha3(group_concat(
+          object_key || '=' || definition, '|'
+        ), 256))) FROM (
+          SELECT object_key, definition
+          FROM reference_catalog_cutover_owned_objects ORDER BY object_key
+        )) <> 'a2e2d5d3fdbc38847b9bddcebbf587c50447b3415ba3c7f1c3ed8a0b94605b45'
+    OR EXISTS (
+      SELECT 1 FROM listing_verification_run_items
+      WHERE status = 'pending_reference'
+        AND (
+          outcome_json IS NULL
+          OR json_type(outcome_json) IS NOT 'object'
+          OR json_type(outcome_json, '$.finalization') IS NOT 'object'
         )
-        ORDER BY type, name
-      )) <> '9995284c615eea7e025a34ee4f7e6fb24fc5f7e9c40414cb158879d6f227b00f'
-) THEN 0 ELSE 1 END;
-DROP TABLE reference_catalog_cutover_run_item_preflight;
+    )
+  ) THEN 0
+  ELSE 1
+END;
+DROP TABLE reference_catalog_cutover_preflight;
+DROP TABLE reference_catalog_cutover_owned_objects;
 
 -- Reference readiness is independent from listing verification. Rewrite the
 -- obsolete terminal run-item outcome before tightening the durable queue
@@ -296,7 +257,10 @@ SELECT
   CASE status WHEN 'pending_reference' THEN
     'Historical reference gating was removed; run verification again.'
     ELSE reason END,
-  created_at, updated_at, started_at, completed_at
+  created_at,
+  CASE status WHEN 'pending_reference' THEN CURRENT_TIMESTAMP
+    ELSE updated_at END,
+  started_at, completed_at
 FROM reference_catalog_cutover_legacy_run_items;
 
 DROP TABLE reference_catalog_cutover_legacy_run_items;
@@ -974,11 +938,151 @@ BEGIN
   );
 END;
 
+-- Marker publication is the commit point for the exact owned-object contract.
+-- Attest the completed transition in the same transaction so a partial or
+-- unexpectedly additive marker-absent upgrade rolls back without a marker.
+CREATE TEMP TABLE reference_catalog_cutover_post_objects (
+  object_key TEXT PRIMARY KEY,
+  definition TEXT NOT NULL
+);
+INSERT INTO reference_catalog_cutover_post_objects (object_key, definition)
+WITH
+core_relations(name) AS (
+  VALUES
+    ('plugin_submissions'),
+    ('avionics_models'),
+    ('aircraft_engine_catalog_models'),
+    ('aircraft_propeller_catalog_models'),
+    ('aircraft_makes'),
+    ('aircraft_model_families'),
+    ('aircraft_designations'),
+    ('aircraft_make_aliases'),
+    ('aircraft_family_aliases'),
+    ('aircraft_designation_aliases'),
+    ('aircraft_designation_identifiers'),
+    ('aircraft_generations'),
+    ('aircraft_generation_designations'),
+    ('aircraft_factory_packages'),
+    ('aircraft_package_applicability'),
+    ('aircraft_reference_configurations'),
+    ('aircraft_serial_number_schemes'),
+    ('aircraft_feature_definitions'),
+    ('aircraft_reference_configuration_versions'),
+    ('aircraft_reference_applicability_scopes'),
+    ('aircraft_reference_prices'),
+    ('aircraft_reference_avionics'),
+    ('aircraft_reference_engines'),
+    ('aircraft_reference_propellers'),
+    ('aircraft_reference_features'),
+    ('aircraft_reference_fact_set_attestations'),
+    ('official_dollar_normalization_facts'),
+    ('aircraft_valuation_compatibility_projections'),
+    ('listing_verification_run_items')
+),
+retired_relations(name) AS (
+  VALUES
+    ('aircraft_model_spec_versions'),
+    ('aircraft_model_variant_price_points'),
+    ('aircraft_model_variant_default_avionics'),
+    ('aircraft_model_variant_default_avionics_candidates'),
+    ('depreciation_profiles'),
+    ('depreciation_profile_fit_metadata'),
+    ('component_depreciation_profiles')
+),
+owned_relations(name) AS (
+  SELECT name FROM core_relations
+  UNION ALL SELECT name FROM retired_relations
+),
+owned_trigger_names(name) AS (
+  VALUES
+    ('avionics_models_referenced_status_update'),
+    ('aircraft_valuation_projection_validate_insert')
+)
+SELECT
+  schema_row.type || ':' || schema_row.name,
+  COALESCE(lower(replace(replace(replace(replace(
+    schema_row.sql, char(9), ''
+  ), char(10), ''), char(13), ''), ' ', '')), '')
+FROM sqlite_schema schema_row
+WHERE (
+  schema_row.type = 'table'
+  AND schema_row.name IN (SELECT name FROM owned_relations)
+) OR (
+  schema_row.name IN (SELECT name FROM retired_relations)
+  OR schema_row.tbl_name IN (SELECT name FROM retired_relations)
+) OR (
+  schema_row.type = 'view'
+  AND schema_row.name = 'aircraft_reference_serial_key_errors'
+) OR (
+  schema_row.type = 'trigger'
+  AND (
+    schema_row.tbl_name IN (SELECT name FROM owned_relations)
+    OR schema_row.name IN (SELECT name FROM owned_trigger_names)
+  )
+)
+UNION ALL
+SELECT
+  'index:' || relation.name || ':' || index_row.name,
+  index_row.[unique] || ':' || index_row.origin || ':' ||
+    index_row.partial || ':' || COALESCE(lower(replace(replace(replace(replace(
+      (SELECT sql FROM sqlite_schema WHERE type = 'index'
+       AND name = index_row.name), char(9), ''
+    ), char(10), ''), char(13), ''), ' ', '')), '') || ':' || COALESCE((
+      SELECT group_concat(index_column.signature, ',')
+      FROM (
+        SELECT
+          xinfo.seqno || ':' || xinfo.cid || ':' ||
+          COALESCE(xinfo.name, '') || ':' || xinfo.desc || ':' ||
+          xinfo.coll || ':' || xinfo.key AS signature
+        FROM pragma_index_xinfo(index_row.name) xinfo
+        ORDER BY xinfo.seqno
+      ) index_column
+    ), '')
+FROM owned_relations relation
+JOIN pragma_index_list(relation.name) index_row;
+
+CREATE TEMP TABLE reference_catalog_cutover_postflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO reference_catalog_cutover_postflight (valid)
+SELECT CASE WHEN
+  (SELECT count(*) FROM reference_catalog_cutover_post_objects) <>
+    213
+  OR (SELECT lower(hex(sha3(group_concat(
+        object_key || '=' || definition, '|'
+      ), 256))) FROM (
+        SELECT object_key, definition
+        FROM reference_catalog_cutover_post_objects ORDER BY object_key
+      )) <> '82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1'
+  OR EXISTS (
+    SELECT 1 FROM sqlite_schema
+    WHERE name IN (
+      'aircraft_model_spec_versions',
+      'aircraft_model_variant_price_points',
+      'aircraft_model_variant_default_avionics',
+      'aircraft_model_variant_default_avionics_candidates',
+      'depreciation_profiles',
+      'depreciation_profile_fit_metadata',
+      'component_depreciation_profiles'
+    ) OR tbl_name IN (
+      'aircraft_model_spec_versions',
+      'aircraft_model_variant_price_points',
+      'aircraft_model_variant_default_avionics',
+      'aircraft_model_variant_default_avionics_candidates',
+      'depreciation_profiles',
+      'depreciation_profile_fit_metadata',
+      'component_depreciation_profiles'
+    )
+  )
+THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_cutover_postflight;
+DROP TABLE reference_catalog_cutover_post_objects;
+
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  '8e5a542d55319ee8a4ba4e31a5d67de3b2ec827c93063b457ba46236bb622455', CURRENT_TIMESTAMP
+  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 
