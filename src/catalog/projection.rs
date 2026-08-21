@@ -1895,6 +1895,8 @@ async fn validate_projected_target(target: &AppDb, bundle: &ProjectionBundle) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aircraft::faa::bridge::FaaBridgeReport;
+    use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
 
     const ARCHIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const MANIFEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1967,5 +1969,117 @@ mod tests {
         .err()
         .expect("unsorted snapshot set must fail");
         assert!(error.to_string().contains("non-canonical snapshot_ids"));
+    }
+
+    #[tokio::test]
+    async fn projects_an_approved_avionics_product_into_a_fresh_current_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_url = format!(
+            "sqlite://{}",
+            directory.path().join("source.sqlite3").display()
+        );
+        let target_url = format!(
+            "sqlite://{}",
+            directory.path().join("target.sqlite3").display()
+        );
+        let source = AppDb::connect(&source_url).await.unwrap();
+        let target = AppDb::connect(&target_url).await.unwrap();
+        let DatabaseBackend::Sqlite(source_pool) = source.backend() else {
+            panic!("test source must be SQLite")
+        };
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Test Avionics', 'test avionics') RETURNING id",
+        )
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        ensure_test_manufacturer_identity(&source, manufacturer_id)
+            .await
+            .unwrap();
+        let type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Navigator', 'navigator') RETURNING id",
+        )
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        let model_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO avionics_models (
+                 avionics_manufacturer_id, name, normalized_name,
+                 manufacturer_identifier_kind, manufacturer_identifier,
+                 normalized_manufacturer_identifier, identity_source_url,
+                 identity_source_title, identity_evidence_text,
+                 identity_evidence_kind, identity_confidence, catalog_reviewed_at
+               ) VALUES (?, 'NAV 1', 'nav 1', 'manufacturer_model_number',
+                         'NAV-1', 'nav1', 'https://manufacturer.example/nav-1',
+                         'NAV 1 product page',
+                         'The manufacturer identifies NAV 1 as its exact product.',
+                         'authoritative_reference', 'very_high', CURRENT_TIMESTAMP)
+               RETURNING id"#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(type_id)
+        .execute(source_pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+            .bind(model_id)
+            .execute(source_pool)
+            .await
+            .unwrap();
+
+        let faa = FaaBridgeOutcome {
+            report: FaaBridgeReport {
+                archive_sha256: ARCHIVE.into(),
+                snapshot_date: "2026-07-21".into(),
+                target_count: 0,
+                matched_count: 0,
+                stored_snapshot_id: 1,
+            },
+            representative_remap: BTreeMap::new(),
+            obsolete_hash_replacements: BTreeMap::new(),
+            obsolete_hashes: BTreeSet::new(),
+            legacy_evidence_source_ids: BTreeSet::new(),
+            current_evidence_source_id: 1,
+        };
+        let mut source_connection = source_pool.acquire().await.unwrap();
+        let report = project_reusable_catalog(&mut source_connection, &target, &faa)
+            .await
+            .unwrap();
+        assert!(!report.fingerprint_sha256.is_empty());
+        let DatabaseBackend::Sqlite(target_pool) = target.backend() else {
+            panic!("test target must be SQLite")
+        };
+        let projected: (String, String, String) = sqlx::query_as(
+            r#"SELECT manufacturer.name, model.name, model.catalog_status
+               FROM avionics_models model
+               JOIN avionics_manufacturers manufacturer
+                 ON manufacturer.id = model.avionics_manufacturer_id
+               WHERE model.id = ?"#,
+        )
+        .bind(model_id)
+        .fetch_one(target_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            projected,
+            ("Test Avionics".into(), "NAV 1".into(), "approved".into())
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM gemini_api_usage")
+                .fetch_one(target_pool)
+                .await
+                .unwrap(),
+            0
+        );
+        drop(source_connection);
+        source.close().await;
+        target.close().await;
     }
 }

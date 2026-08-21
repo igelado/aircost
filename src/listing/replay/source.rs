@@ -1001,4 +1001,16 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn fresh_current_schema_satisfies_the_prepared_output_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("prepared.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let target = AppDb::connect(&database_url).await.unwrap();
+        audit_prepared_target(&target, &BTreeSet::new())
+            .await
+            .unwrap();
+        target.close().await;
+    }
 }
