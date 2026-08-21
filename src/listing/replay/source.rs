@@ -20,7 +20,7 @@ use super::{
     TrustedCaptureManifest,
 };
 use crate::aircraft::faa::normalize_n_number;
-use crate::db::database_url_from_arg;
+use crate::db::{database_url_from_arg, AppDb, DatabaseBackend};
 
 pub const LEGACY_SQLITE_SCHEMA_OBJECT_COUNT: usize = 575;
 pub const LEGACY_SQLITE_SCHEMA_SHA3_256: &str =
@@ -390,4 +390,165 @@ async fn validate_capture_timestamps(
         );
     }
     Ok(())
+}
+
+async fn import_legacy_captures(
+    target: &AppDb,
+    selection: &LegacyCaptureSelection,
+) -> Result<usize> {
+    let DatabaseBackend::Sqlite(pool) = target.backend() else {
+        bail!("legacy replay-source output must be SQLite");
+    };
+    let mut transaction = pool.begin().await?;
+    for row in &selection.rows {
+        let existing_user: Option<(String, String, String, String, String, String)> =
+            sqlx::query_as(
+                r#"SELECT email, display_name, auth_provider, auth_subject,
+                          created_at, updated_at FROM users WHERE id = ?"#,
+            )
+            .bind(row.user_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        match existing_user {
+            None => {
+                sqlx::query(
+                    r#"INSERT INTO users
+                         (id, email, display_name, auth_provider, auth_subject,
+                          created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+                )
+                .bind(row.user_id)
+                .bind(&row.user_email)
+                .bind(&row.user_display_name)
+                .bind(&row.user_auth_provider)
+                .bind(&row.user_auth_subject)
+                .bind(&row.user_created_at)
+                .bind(&row.user_updated_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            Some((email, display_name, provider, subject, created_at, updated_at)) => {
+                if (email, display_name, provider, subject)
+                    != (
+                        row.user_email.clone(),
+                        row.user_display_name.clone(),
+                        row.user_auth_provider.clone(),
+                        row.user_auth_subject.clone(),
+                    )
+                {
+                    bail!(
+                        "canonical target user id {} conflicts with selected capture owner",
+                        row.user_id
+                    );
+                }
+                if created_at != row.user_created_at || updated_at != row.user_updated_at {
+                    if row.user_email != crate::db::DEVELOPER_EMAIL {
+                        bail!(
+                            "target user id {} has non-canonical timestamp collision",
+                            row.user_id
+                        );
+                    }
+                    sqlx::query("UPDATE users SET created_at = ?, updated_at = ? WHERE id = ?")
+                        .bind(&row.user_created_at)
+                        .bind(&row.user_updated_at)
+                        .bind(row.user_id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+            }
+        }
+
+        sqlx::query(
+            r#"INSERT INTO plugin_installs
+                 (id, user_id, public_key_base64, created_at, revoked_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (id) DO NOTHING"#,
+        )
+        .bind(row.plugin_install_id)
+        .bind(row.user_id)
+        .bind(&row.plugin_public_key_base64)
+        .bind(&row.plugin_install_created_at)
+        .bind(&row.plugin_install_revoked_at)
+        .execute(&mut *transaction)
+        .await?;
+        let installed: (i64, String, String, Option<String>) = sqlx::query_as(
+            "SELECT user_id, public_key_base64, created_at, revoked_at FROM plugin_installs WHERE id = ?",
+        )
+        .bind(row.plugin_install_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if installed
+            != (
+                row.user_id,
+                row.plugin_public_key_base64.clone(),
+                row.plugin_install_created_at.clone(),
+                row.plugin_install_revoked_at.clone(),
+            )
+        {
+            bail!(
+                "target plugin install id {} conflicts with selected signed capture",
+                row.plugin_install_id
+            );
+        }
+
+        sqlx::query(
+            r#"INSERT INTO plugin_submissions
+                 (id, user_id, plugin_install_id, source_url, submitted_at,
+                  rendered_html, rendered_html_sha256, signature_base64,
+                  extracted_listing_json, extraction_error, canonical_listing_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)"#,
+        )
+        .bind(row.submission_id)
+        .bind(row.user_id)
+        .bind(row.plugin_install_id)
+        .bind(&row.source_url)
+        .bind(&row.submitted_at)
+        .bind(&row.rendered_html)
+        .bind(&row.rendered_html_sha256)
+        .bind(&row.signature_base64)
+        .execute(&mut *transaction)
+        .await?;
+        let stored: (
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            r#"SELECT user_id, plugin_install_id, source_url, submitted_at,
+                      rendered_html, rendered_html_sha256, signature_base64,
+                      extracted_listing_json, extraction_error,
+                      canonical_listing_id
+               FROM plugin_submissions WHERE id = ?"#,
+        )
+        .bind(row.submission_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if stored
+            != (
+                row.user_id,
+                row.plugin_install_id,
+                row.source_url.clone(),
+                row.submitted_at.clone(),
+                row.rendered_html.clone(),
+                row.rendered_html_sha256.clone(),
+                row.signature_base64.clone(),
+                None,
+                None,
+                None,
+            )
+        {
+            bail!(
+                "target capture {} differs from its frozen source boundary",
+                row.submission_id
+            );
+        }
+    }
+    transaction.commit().await?;
+    Ok(selection.rows.len())
 }
