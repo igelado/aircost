@@ -15,6 +15,53 @@ the exact retained FAA ZIP into the shadow database with `--apply`; projection
 hashes cannot be recovered by relabeling or mechanically rehashing legacy FAA
 rows.
 
+## Frozen legacy source preparation
+
+One historical SQLite source predates the versioned FAA retained-record hash
+domain and the resumable replay ledger. It is not opened through ordinary
+application startup and must never be repaired in place. The temporary
+`prepare-legacy-replay-source` command is the only admitted conversion:
+
+```text
+aircost-admin prepare-legacy-replay-source \
+  --source-database FROZEN_SOURCE \
+  --manifest captures.json \
+  --faa-archive ReleasableAircraft.zip \
+  --faa-archive-sha256 14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724 \
+  --output PREPARED_SOURCE
+aircost-admin prepare-legacy-replay-source \
+  --source-database FROZEN_SOURCE \
+  --manifest captures.json \
+  --faa-archive ReleasableAircraft.zip \
+  --faa-archive-sha256 14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724 \
+  --output PREPARED_SOURCE --apply
+```
+
+Dry run is the default and creates no output file. Both modes require the
+fixed, reviewed legacy schema and migration-receipt inventories, revalidate
+every selected signed capture and timestamp, hash the exact retained FAA ZIP,
+and parse that ZIP through the current privacy-minimizing importer. A
+different schema, receipt set, archive, manifest member, signature, owner,
+install, key, revocation instant, capture hash, or retained non-PII FAA fact is
+rejected.
+
+The output is a new current canonical-schema SQLite file. It contains only the
+selected users, installs, signed captures with all derived fields reset, the
+current-domain FAA projection rebuilt by the normal importer, and a typed
+provider-free projection of the reusable verified aircraft and avionics
+catalog closure. It does not copy listings, reviews, valuation data, provider
+usage, Gemini responses, or legacy FAA projection rows. FAA-bound claims,
+observations, resolution cases, decisions, and catalog bindings are rebuilt
+against the parsed current-domain records. An exhaustive final scan rejects
+any retained legacy FAA record or source-manifest digest.
+
+Apply builds a sibling temporary file and publishes it with a no-replace
+atomic rename only after current diagnostic startup, integrity, foreign-key,
+taint, and zero-provider-usage checks pass. Failure removes the temporary file
+and leaves the source unchanged and the requested output absent. This command
+is a one-time administrative bridge, not runtime compatibility; remove it after
+the reviewed source has been prepared and the clean rebuild has cut over.
+
 ## Phases
 
 All operational commands are dry-run unless `--apply` is supplied.
