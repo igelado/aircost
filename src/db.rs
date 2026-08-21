@@ -5,7 +5,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use sha3::Sha3_256;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, PgPool, SqlitePool};
 
@@ -17,6 +17,7 @@ pub const DEVELOPER_EMAIL: &str = "developer@localhost";
 const DEVELOPER_AUTH_SUBJECT: &str = "developer";
 const SQLITE_SCHEMA_SQL: &str = include_str!("../schema/sqlite.sql");
 const POSTGRES_SCHEMA_SQL: &str = include_str!("../schema/postgres.sql");
+const POSTGRES_SEARCH_PATH: &str = "public,pg_catalog,pg_temp";
 const VALUATION_DATA_HARDENING_MIGRATION: &str = "20260720_valuation_data_hardening";
 const AVIONICS_CATALOG_CURATION_MIGRATION: &str = "20260721_avionics_catalog_curation";
 const AVIONICS_MULTI_TYPE_MIGRATION: &str = "20260721_avionics_multi_type";
@@ -457,6 +458,13 @@ pub(crate) enum DatabaseKind {
     Postgres,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MigrationContractState {
+    Fresh,
+    Installed,
+    Invalid,
+}
+
 #[derive(sqlx::FromRow)]
 struct PostgresCorrectionTriggerDefinition {
     trigger_name: String,
@@ -777,9 +785,24 @@ impl AppDb {
     pub async fn connect(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
         if is_postgres_url(&database_url) {
+            let options = PgConnectOptions::from_str(&database_url)
+                .with_context(|| format!("invalid Postgres database URL {database_url}"))?
+                .options([("search_path", POSTGRES_SEARCH_PATH)]);
             let pool = PgPoolOptions::new()
                 .max_connections(5)
-                .connect(&database_url)
+                .after_connect(|connection, _metadata| {
+                    Box::pin(async move {
+                        sqlx::query(
+                            "SELECT pg_catalog.set_config( \
+                               'search_path', 'public,pg_catalog,pg_temp', false \
+                             )",
+                        )
+                        .execute(connection)
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .connect_with(options)
                 .await
                 .with_context(|| {
                     format!("could not connect to Postgres database {database_url}")
@@ -825,17 +848,27 @@ impl AppDb {
     pub async fn connect_diagnostic(database_url: &str) -> Result<Self> {
         let database_url = normalize_database_url(database_url);
         if is_postgres_url(&database_url) {
+            let options = PgConnectOptions::from_str(&database_url)
+                .with_context(|| format!("invalid Postgres database URL {database_url}"))?
+                .options([("search_path", POSTGRES_SEARCH_PATH)]);
             let pool = PgPoolOptions::new()
                 .max_connections(1)
                 .after_connect(|connection, _metadata| {
                     Box::pin(async move {
+                        sqlx::query(
+                            "SELECT pg_catalog.set_config( \
+                               'search_path', 'public,pg_catalog,pg_temp', false \
+                             )",
+                        )
+                        .execute(&mut *connection)
+                        .await?;
                         sqlx::query("SET default_transaction_read_only = on")
                             .execute(connection)
                             .await?;
                         Ok(())
                     })
                 })
-                .connect(&database_url)
+                .connect_with(options)
                 .await
                 .with_context(|| {
                     format!("could not open diagnostic Postgres database {database_url}")
@@ -1512,7 +1545,7 @@ impl AppDb {
         };
         let missing_identity_deduplication_postconditions = missing_identity_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "avionics_models",
                     IDENTITY_DEDUPLICATION_POSTCONDITIONS_MIGRATION,
                     IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_VERSION,
@@ -1673,7 +1706,7 @@ impl AppDb {
         };
         let missing_listing_aircraft_identity = missing_listing_aircraft_identity_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "aircraft_sale_listings",
                     LISTING_AIRCRAFT_IDENTITY_MIGRATION,
                     LISTING_AIRCRAFT_IDENTITY_CONTRACT_VERSION,
@@ -1837,7 +1870,7 @@ impl AppDb {
         let missing_listing_aircraft_compatibility_projection =
             missing_listing_aircraft_compatibility_projection_objects
                 || self
-                    .migration_contract_missing(
+                    .migration_contract_invalid(
                         "aircraft_sale_listings",
                         LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_MIGRATION,
                         LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_CONTRACT_VERSION,
@@ -1951,7 +1984,7 @@ impl AppDb {
         };
         let missing_no_supported_selection = missing_no_supported_selection_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "aircraft_identity_decisions",
                     AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_MIGRATION,
                     AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_CONTRACT_VERSION,
@@ -2050,7 +2083,7 @@ impl AppDb {
         };
         let missing_aircraft_catalog_retrieval_keys = missing_aircraft_catalog_retrieval_key_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "aircraft_makes",
                     AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
                     AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
@@ -2187,7 +2220,7 @@ impl AppDb {
         };
         let missing_aircraft_tcds_make_lineage = missing_aircraft_tcds_make_lineage_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "aircraft_makes",
                     AIRCRAFT_TCDS_MAKE_LINEAGE_MIGRATION,
                     AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_VERSION,
@@ -2285,7 +2318,7 @@ impl AppDb {
         };
         let missing_human_consolidation = missing_human_consolidation_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "avionics_models",
                     AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_MIGRATION,
                     AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_VERSION,
@@ -2296,7 +2329,7 @@ impl AppDb {
             bail!(avionics_human_reviewed_consolidation_migration_required_message(self.kind()));
         }
         let missing_descriptive_consolidation = self
-            .migration_contract_missing(
+            .migration_contract_invalid(
                 "avionics_catalog_valid_human_consolidation_pairs",
                 AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
                 AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
@@ -2393,7 +2426,7 @@ impl AppDb {
         let missing_grounded_exact_model_consolidation =
             missing_grounded_exact_model_consolidation_objects
                 || self
-                    .migration_contract_missing(
+                    .migration_contract_invalid(
                         "avionics_models",
                         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
                         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
@@ -2486,7 +2519,7 @@ impl AppDb {
         };
         let missing_avionics_source_origins = missing_avionics_source_origin_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "avionics_manufacturers",
                     AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION,
                     AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION,
@@ -2920,7 +2953,7 @@ impl AppDb {
         };
         let missing_avionics_reuse_attestations = missing_avionics_reuse_attestation_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "avionics_models",
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
                     AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION,
@@ -2928,7 +2961,7 @@ impl AppDb {
                 )
                 .await?
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "avionics_models",
                     AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
                     AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION,
@@ -2939,7 +2972,7 @@ impl AppDb {
             bail!(avionics_product_reuse_attestations_migration_required_message(self.kind()));
         }
         if self
-            .migration_contract_missing(
+            .migration_contract_invalid(
                 "avionics_models",
                 AVIONICS_GROUNDED_EVIDENCE_REFRESH_MIGRATION,
                 AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_VERSION,
@@ -3068,7 +3101,7 @@ impl AppDb {
         };
         let missing_listing_avionics_authorizations = missing_listing_avionics_authorization_objects
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     "aircraft_sale_listing_avionics",
                     LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
                     LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION,
@@ -3081,7 +3114,7 @@ impl AppDb {
             );
         }
         if self
-            .migration_contract_missing(
+            .migration_contract_invalid(
                 "aircraft_sale_listing_avionics_authorizations",
                 LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
                 LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
@@ -3136,7 +3169,7 @@ impl AppDb {
         let missing_faa_reference_contract = match self.backend() {
             DatabaseBackend::Sqlite(_) => false,
             DatabaseBackend::Postgres(_) => {
-                self.migration_contract_missing(
+                self.migration_contract_invalid(
                     "public.faa_registry_aircraft_references",
                     FAA_REFERENCE_REACHABILITY_MIGRATION,
                     FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
@@ -3146,7 +3179,7 @@ impl AppDb {
             }
         };
         let missing_faa_record_hash_domain_contract = self
-            .migration_contract_missing(
+            .migration_contract_invalid(
                 match self.kind() {
                     DatabaseKind::Sqlite => "faa_registry_snapshots",
                     DatabaseKind::Postgres => "public.faa_registry_snapshots",
@@ -3347,7 +3380,7 @@ impl AppDb {
             missing_aircraft_listing_identity_correction_objects
                 || invalid_aircraft_listing_identity_correction_definitions
                 || self
-                    .migration_contract_missing(
+                    .migration_contract_invalid(
                         match self.kind() {
                             DatabaseKind::Sqlite => {
                                 "aircraft_listing_identity_correction_decisions"
@@ -3571,7 +3604,7 @@ impl AppDb {
         let missing_listing_replay_runs = missing_listing_replay_objects
             || invalid_listing_replay_definitions
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     match self.kind() {
                         DatabaseKind::Sqlite => "listing_replay_runs",
                         DatabaseKind::Postgres => "public.listing_replay_runs",
@@ -3770,7 +3803,7 @@ impl AppDb {
         if invalid_reference_catalog_cutover_shape
             || invalid_reference_catalog_cutover_definitions
             || self
-                .migration_contract_missing(
+                .migration_contract_invalid(
                     match self.kind() {
                         DatabaseKind::Sqlite => "aircraft_reference_configuration_versions",
                         DatabaseKind::Postgres => {
@@ -6772,13 +6805,246 @@ impl AppDb {
         .await?)
     }
 
-    async fn migration_contract_missing(
+    async fn migration_contract_invalid(
         &self,
         anchor_object: &str,
         migration_name: &str,
         contract_version: i64,
         contract_fingerprint: &str,
     ) -> Result<bool> {
+        Ok(self
+            .migration_contract_state(
+                anchor_object,
+                migration_name,
+                contract_version,
+                contract_fingerprint,
+            )
+            .await?
+            == MigrationContractState::Invalid)
+    }
+
+    async fn migration_ledger_has_expected_shape(&self) -> Result<bool> {
+        match self.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let actual_definition = sqlx::query_scalar::<_, String>(
+                    "SELECT sql FROM sqlite_schema \
+                     WHERE type = 'table' AND name = 'schema_migration_contracts'",
+                )
+                .fetch_optional(pool)
+                .await?;
+                let expected_definition = canonical_sqlite_table_definition(
+                    SQLITE_SCHEMA_SQL,
+                    "schema_migration_contracts",
+                )
+                .expect("canonical SQLite schema must define the migration ledger");
+                if !actual_definition.is_some_and(|definition| {
+                    canonical_sql_definition(&definition) == expected_definition
+                }) {
+                    return Ok(false);
+                }
+                let attached_behavior = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1 FROM sqlite_schema
+                      WHERE tbl_name = 'schema_migration_contracts'
+                        AND (
+                          type = 'trigger'
+                          OR (type = 'index' AND sql IS NOT NULL)
+                        )
+                      UNION ALL
+                      SELECT 1 FROM sqlite_temp_schema
+                      WHERE tbl_name = 'schema_migration_contracts'
+                        AND type = 'trigger'
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?
+                    != 0;
+                Ok(!attached_behavior)
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let ordinary_table = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS (
+                      SELECT 1
+                      FROM pg_catalog.pg_class relation
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname = 'schema_migration_contracts'
+                        AND relation.relkind = 'r'
+                        AND NOT relation.relispartition
+                        AND NOT relation.relrowsecurity
+                        AND NOT relation.relforcerowsecurity
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                          WHERE inheritance.inhrelid = relation.oid
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_trigger attached_trigger
+                          WHERE attached_trigger.tgrelid = relation.oid
+                            AND NOT attached_trigger.tgisinternal
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_rewrite attached_rule
+                          WHERE attached_rule.ev_class = relation.oid
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_policy attached_policy
+                          WHERE attached_policy.polrelid = relation.oid
+                        )
+                    )
+                    "#,
+                )
+                .fetch_one(pool)
+                .await?;
+                if !ordinary_table {
+                    return Ok(false);
+                }
+
+                let actual_columns =
+                    sqlx::query_as::<_, (String, String, bool, String, String, String)>(
+                        r#"
+                    SELECT attribute.attname,
+                           pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+                           attribute.attnotnull,
+                           COALESCE(
+                             pg_catalog.pg_get_expr(
+                               default_value.adbin, default_value.adrelid
+                             ),
+                             ''
+                           ),
+                           attribute.attidentity::text,
+                           attribute.attgenerated::text
+                    FROM pg_catalog.pg_attribute attribute
+                    LEFT JOIN pg_catalog.pg_attrdef default_value
+                      ON default_value.adrelid = attribute.attrelid
+                     AND default_value.adnum = attribute.attnum
+                    WHERE attribute.attrelid = pg_catalog.to_regclass(
+                            'public.schema_migration_contracts'
+                          )
+                      AND attribute.attnum > 0
+                      AND NOT attribute.attisdropped
+                    ORDER BY attribute.attnum
+                    "#,
+                    )
+                    .fetch_all(pool)
+                    .await?
+                    .into_iter()
+                    .map(
+                        |(
+                            name,
+                            data_type,
+                            not_null,
+                            default_expression,
+                            identity_kind,
+                            generated_kind,
+                        )| {
+                            (
+                                name,
+                                data_type,
+                                not_null,
+                                canonical_sql_definition(&default_expression),
+                                identity_kind,
+                                generated_kind,
+                            )
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let expected_columns = vec![
+                    (
+                        "migration_name".to_owned(),
+                        "text".to_owned(),
+                        true,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    (
+                        "contract_version".to_owned(),
+                        "integer".to_owned(),
+                        true,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    (
+                        "contract_fingerprint".to_owned(),
+                        "text".to_owned(),
+                        true,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    (
+                        "installed_at".to_owned(),
+                        "text".to_owned(),
+                        true,
+                        "current_timestamp".to_owned(),
+                        String::new(),
+                        String::new(),
+                    ),
+                ];
+                if actual_columns != expected_columns {
+                    return Ok(false);
+                }
+
+                let mut actual_constraints = sqlx::query_as::<_, (String, String)>(
+                    r#"
+                    SELECT ledger_constraint.contype::text,
+                           pg_catalog.pg_get_constraintdef(ledger_constraint.oid)
+                    FROM pg_catalog.pg_constraint ledger_constraint
+                    WHERE ledger_constraint.conrelid = pg_catalog.to_regclass(
+                            'public.schema_migration_contracts'
+                          )
+                    "#,
+                )
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|(constraint_type, definition)| {
+                    let definition = canonical_sql_definition(&definition)
+                        .replace("trim(bothfrommigration_name)", "btrim(migration_name)");
+                    (constraint_type, definition)
+                })
+                .collect::<Vec<_>>();
+                actual_constraints.sort();
+                let mut expected_constraints = vec![
+                    (
+                        "c".to_owned(),
+                        canonical_sql_definition("CHECK ((contract_version > 0))"),
+                    ),
+                    (
+                        "c".to_owned(),
+                        canonical_sql_definition(
+                            "CHECK ((contract_fingerprint ~ '^[0-9a-f]{64}$'::text))",
+                        ),
+                    ),
+                    (
+                        "c".to_owned(),
+                        canonical_sql_definition("CHECK ((length(btrim(migration_name)) > 0))"),
+                    ),
+                    (
+                        "p".to_owned(),
+                        canonical_sql_definition("PRIMARY KEY (migration_name)"),
+                    ),
+                ];
+                expected_constraints.sort();
+                Ok(actual_constraints == expected_constraints)
+            }
+        }
+    }
+
+    async fn migration_contract_state(
+        &self,
+        anchor_object: &str,
+        migration_name: &str,
+        contract_version: i64,
+        contract_fingerprint: &str,
+    ) -> Result<MigrationContractState> {
+        // An anchor and its exact receipt are one installation attestation.
+        // Only their joint absence is fresh; every partial pairing is corrupt.
         let anchor_exists = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
@@ -6790,34 +7056,23 @@ impl AppDb {
                     != 0
             }
             DatabaseBackend::Postgres(pool) => {
+                let anchor_object = if anchor_object.contains('.') {
+                    Cow::Borrowed(anchor_object)
+                } else {
+                    Cow::Owned(format!("public.{anchor_object}"))
+                };
                 sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regclass($1::text) IS NOT NULL")
-                    .bind(anchor_object)
+                    .bind(anchor_object.as_ref())
                     .fetch_one(pool)
                     .await?
             }
         };
-        if !anchor_exists {
-            return Ok(false);
-        }
 
-        let ledger_has_expected_shape = match self.backend() {
+        let ledger_exists = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
-                    r#"
-                    SELECT
-                      EXISTS (
-                        SELECT 1 FROM sqlite_schema
-                        WHERE type = 'table' AND name = 'schema_migration_contracts'
-                      )
-                      AND (
-                        SELECT count(*)
-                        FROM pragma_table_info('schema_migration_contracts')
-                        WHERE (name = 'migration_name' AND upper(type) = 'TEXT')
-                           OR (name = 'contract_version' AND upper(type) = 'INTEGER')
-                           OR (name = 'contract_fingerprint' AND upper(type) = 'TEXT')
-                           OR (name = 'installed_at' AND upper(type) = 'TEXT')
-                      ) = 4
-                    "#,
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_schema \
+                     WHERE name = 'schema_migration_contracts')",
                 )
                 .fetch_one(pool)
                 .await?
@@ -6825,76 +7080,65 @@ impl AppDb {
             }
             DatabaseBackend::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
-                    r#"
-                    SELECT
-                      EXISTS (
-                        SELECT 1
-                        FROM pg_catalog.pg_class actual
-                        WHERE actual.oid = pg_catalog.to_regclass(
-                          'public.schema_migration_contracts'
-                        )
-                          AND actual.relkind = 'r'
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1
-                        FROM (
-                          VALUES
-                            ('migration_name', 'text'::regtype),
-                            ('contract_version', 'integer'::regtype),
-                            ('contract_fingerprint', 'text'::regtype),
-                            ('installed_at', 'text'::regtype)
-                        ) required(column_name, type_oid)
-                        WHERE NOT EXISTS (
-                          SELECT 1
-                          FROM pg_catalog.pg_attribute actual
-                          WHERE actual.attrelid = pg_catalog.to_regclass(
-                            'public.schema_migration_contracts'
-                          )
-                            AND actual.attname = required.column_name
-                            AND actual.atttypid = required.type_oid::oid
-                            AND NOT actual.attisdropped
-                        )
-                      )
-                    "#,
+                    "SELECT pg_catalog.to_regclass( \
+                     'public.schema_migration_contracts') IS NOT NULL",
                 )
                 .fetch_one(pool)
                 .await?
             }
         };
+        if !ledger_exists {
+            return Ok(if anchor_exists {
+                MigrationContractState::Invalid
+            } else {
+                MigrationContractState::Fresh
+            });
+        }
+
+        let ledger_has_expected_shape = self.migration_ledger_has_expected_shape().await?;
         if !ledger_has_expected_shape {
-            return Ok(true);
+            return Ok(MigrationContractState::Invalid);
         }
 
-        let exact_contract_exists = match self.backend() {
+        let (receipt_exists, exact_contract_exists) = match self.backend() {
             DatabaseBackend::Sqlite(pool) => {
-                sqlx::query_scalar::<_, i64>(
+                let (receipt_exists, exact_contract_exists) = sqlx::query_as::<_, (i64, i64)>(
                     r#"
-                    SELECT EXISTS (
-                      SELECT 1
-                      FROM schema_migration_contracts
-                      WHERE migration_name = ?
-                        AND contract_version = ?
-                        AND contract_fingerprint = ?
-                    )
+                    SELECT
+                      EXISTS (
+                        SELECT 1 FROM schema_migration_contracts
+                        WHERE migration_name = ?
+                      ),
+                      EXISTS (
+                        SELECT 1 FROM schema_migration_contracts
+                        WHERE migration_name = ?
+                          AND contract_version = ?
+                          AND contract_fingerprint = ?
+                      )
                     "#,
                 )
+                .bind(migration_name)
                 .bind(migration_name)
                 .bind(contract_version)
                 .bind(contract_fingerprint)
                 .fetch_one(pool)
-                .await?
-                    != 0
+                .await?;
+                (receipt_exists != 0, exact_contract_exists != 0)
             }
             DatabaseBackend::Postgres(pool) => {
-                sqlx::query_scalar::<_, bool>(
+                sqlx::query_as::<_, (bool, bool)>(
                     r#"
-                    SELECT EXISTS (
-                      SELECT 1
-                      FROM public.schema_migration_contracts
-                      WHERE migration_name = $1
-                        AND contract_version = $2
-                        AND contract_fingerprint = $3
-                    )
+                    SELECT
+                      EXISTS (
+                        SELECT 1 FROM public.schema_migration_contracts
+                        WHERE migration_name = $1
+                      ),
+                      EXISTS (
+                        SELECT 1 FROM public.schema_migration_contracts
+                        WHERE migration_name = $1
+                          AND contract_version = $2
+                          AND contract_fingerprint = $3
+                      )
                     "#,
                 )
                 .bind(migration_name)
@@ -6904,7 +7148,13 @@ impl AppDb {
                 .await?
             }
         };
-        Ok(!exact_contract_exists)
+        Ok(
+            match (anchor_exists, receipt_exists, exact_contract_exists) {
+                (false, false, false) => MigrationContractState::Fresh,
+                (true, true, true) => MigrationContractState::Installed,
+                _ => MigrationContractState::Invalid,
+            },
+        )
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -7564,6 +7814,7 @@ pub fn ensure_supported_database_url(database_url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7628,7 +7879,7 @@ mod tests {
         POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
         POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
         POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE, POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
-        POSTGRES_SCHEMA_SQL, REFERENCE_CATALOG_CUTOVER_MIGRATION,
+        POSTGRES_SCHEMA_SQL, POSTGRES_SEARCH_PATH, REFERENCE_CATALOG_CUTOVER_MIGRATION,
         REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL, SQLITE_SCHEMA_SQL,
         VALUATION_DATA_HARDENING_MIGRATION,
     };
@@ -7728,6 +7979,458 @@ mod tests {
         ));
         let url = format!("sqlite://{}", path.display());
         (path, url)
+    }
+
+    fn canonical_receipt_statements(schema: &str) -> Vec<&str> {
+        split_sql_statements(schema)
+            .into_iter()
+            .filter(|statement| {
+                let canonical = canonical_sql_definition(statement);
+                canonical.contains("insertintoschema_migration_contracts")
+                    || canonical.contains("insertintopublic.schema_migration_contracts")
+            })
+            .collect()
+    }
+
+    fn canonical_receipt_names(schema: &str) -> BTreeSet<String> {
+        canonical_receipt_statements(schema)
+            .into_iter()
+            .flat_map(|statement| {
+                statement
+                    .split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|value| {
+                        value.len() > 9
+                            && value.as_bytes()[..8].iter().all(u8::is_ascii_digit)
+                            && value.as_bytes()[8] == b'_'
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn canonical_receipts_are_insert_only_and_have_backend_parity() {
+        for (backend, schema) in [
+            ("SQLite", SQLITE_SCHEMA_SQL),
+            ("PostgreSQL", POSTGRES_SCHEMA_SQL),
+        ] {
+            for statement in canonical_receipt_statements(schema) {
+                let canonical = canonical_sql_definition(statement);
+                assert!(
+                    canonical.contains("onconflict(migration_name)donothing"),
+                    "{backend} canonical receipt is not insert-only: {statement}"
+                );
+                assert!(
+                    !canonical.contains("doupdate") && !canonical.contains("installed_at="),
+                    "{backend} canonical receipt can rewrite provenance: {statement}"
+                );
+            }
+        }
+
+        let sqlite_receipts = canonical_receipt_names(SQLITE_SCHEMA_SQL);
+        let postgres_receipts = canonical_receipt_names(POSTGRES_SCHEMA_SQL);
+        let postgres_only = postgres_receipts
+            .difference(&sqlite_receipts)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            postgres_only,
+            BTreeSet::from([FAA_REFERENCE_REACHABILITY_MIGRATION.to_owned()])
+        );
+        assert!(sqlite_receipts
+            .difference(&postgres_receipts)
+            .next()
+            .is_none());
+        assert_eq!(sqlite_receipts.len(), 19);
+        assert_eq!(postgres_receipts.len(), 20);
+        assert!(!sqlite_receipts.contains("20260802_default_avionics_candidate_quarantine"));
+    }
+
+    async fn sqlite_catalog_snapshot(pool: &sqlx::SqlitePool) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema \
+             ORDER BY type, name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn sqlite_receipt_snapshot(
+        pool: &sqlx::SqlitePool,
+    ) -> Vec<(String, Option<i64>, Option<String>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT migration_name, contract_version, contract_fingerprint, installed_at \
+             FROM schema_migration_contracts ORDER BY migration_name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sqlite_startup_rejects_anchorless_hostile_receipts_without_mutation() {
+        let expected_fingerprint = AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT;
+        let cases = [
+            (
+                "exact",
+                Some(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION),
+                Some(expected_fingerprint),
+            ),
+            ("wrong-version", Some(99), Some(expected_fingerprint)),
+            (
+                "wrong-fingerprint",
+                Some(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION),
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            ("null-version", None, Some(expected_fingerprint)),
+            (
+                "null-fingerprint",
+                Some(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION),
+                None,
+            ),
+            ("both-null", None, None),
+        ];
+
+        for (label, version, fingerprint) in cases {
+            let (database_path, database_url) =
+                unique_sqlite_test_database(&format!("anchorless-receipt-{label}"));
+            std::fs::File::create(&database_path).unwrap();
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            pool.execute(
+                r#"
+                CREATE TABLE schema_migration_contracts (
+                  migration_name TEXT PRIMARY KEY,
+                  contract_version INTEGER,
+                  contract_fingerprint TEXT,
+                  installed_at TEXT
+                )
+                "#,
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO schema_migration_contracts ( \
+                   migration_name, contract_version, contract_fingerprint, installed_at \
+                 ) VALUES (?, ?, ?, ?)",
+            )
+            .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+            .bind(version)
+            .bind(fingerprint)
+            .bind("1999-12-31T23:59:59Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+            let schema_before = sqlite_catalog_snapshot(&pool).await;
+            let receipts_before = sqlite_receipt_snapshot(&pool).await;
+            pool.close().await;
+
+            let error = match AppDb::connect(&database_url).await {
+                Ok(_) => panic!("{label}: anchorless receipt must reject startup"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("database migration required before startup"),
+                "{label}: {error}"
+            );
+
+            let inspection = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            assert_eq!(
+                sqlite_catalog_snapshot(&inspection).await,
+                schema_before,
+                "{label}: rejected startup must not create canonical objects"
+            );
+            assert_eq!(
+                sqlite_receipt_snapshot(&inspection).await,
+                receipts_before,
+                "{label}: rejected startup must not heal the receipt"
+            );
+            inspection.close().await;
+            std::fs::remove_file(database_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_startup_rejects_exact_receipts_in_impostor_ledgers_without_mutation() {
+        let cases = [
+            (
+                "missing-primary-key",
+                r#"
+                CREATE TABLE schema_migration_contracts (
+                  migration_name TEXT NOT NULL,
+                  contract_version INTEGER NOT NULL,
+                  contract_fingerprint TEXT NOT NULL,
+                  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  CHECK (length(trim(migration_name)) > 0),
+                  CHECK (typeof(contract_version) = 'integer' AND contract_version > 0),
+                  CHECK (length(contract_fingerprint) = 64),
+                  CHECK (contract_fingerprint = lower(contract_fingerprint)),
+                  CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
+                )
+                "#,
+            ),
+            (
+                "nullable-version",
+                r#"
+                CREATE TABLE schema_migration_contracts (
+                  migration_name TEXT PRIMARY KEY,
+                  contract_version INTEGER,
+                  contract_fingerprint TEXT NOT NULL,
+                  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  CHECK (length(trim(migration_name)) > 0),
+                  CHECK (typeof(contract_version) = 'integer' AND contract_version > 0),
+                  CHECK (length(contract_fingerprint) = 64),
+                  CHECK (contract_fingerprint = lower(contract_fingerprint)),
+                  CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
+                )
+                "#,
+            ),
+            (
+                "missing-default",
+                r#"
+                CREATE TABLE schema_migration_contracts (
+                  migration_name TEXT PRIMARY KEY,
+                  contract_version INTEGER NOT NULL,
+                  contract_fingerprint TEXT NOT NULL,
+                  installed_at TEXT NOT NULL,
+                  CHECK (length(trim(migration_name)) > 0),
+                  CHECK (typeof(contract_version) = 'integer' AND contract_version > 0),
+                  CHECK (length(contract_fingerprint) = 64),
+                  CHECK (contract_fingerprint = lower(contract_fingerprint)),
+                  CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
+                )
+                "#,
+            ),
+            (
+                "missing-checks",
+                r#"
+                CREATE TABLE schema_migration_contracts (
+                  migration_name TEXT PRIMARY KEY,
+                  contract_version INTEGER NOT NULL,
+                  contract_fingerprint TEXT NOT NULL,
+                  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                "#,
+            ),
+        ];
+
+        for (label, impostor_definition) in cases {
+            let (database_path, database_url) =
+                unique_sqlite_test_database(&format!("impostor-ledger-{label}"));
+            let initialized = AppDb::connect(&database_url).await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = initialized.backend() else {
+                unreachable!()
+            };
+            let receipts = sqlite_receipt_snapshot(pool).await;
+            assert!(!receipts.is_empty());
+            pool.execute("DROP TABLE schema_migration_contracts")
+                .await
+                .unwrap();
+            pool.execute(impostor_definition).await.unwrap();
+            for (migration_name, contract_version, contract_fingerprint, installed_at) in receipts {
+                sqlx::query(
+                    "INSERT INTO schema_migration_contracts ( \
+                       migration_name, contract_version, contract_fingerprint, installed_at \
+                     ) VALUES (?, ?, ?, ?)",
+                )
+                .bind(migration_name)
+                .bind(contract_version)
+                .bind(contract_fingerprint)
+                .bind(installed_at)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            let schema_before = sqlite_catalog_snapshot(pool).await;
+            let receipts_before = sqlite_receipt_snapshot(pool).await;
+            initialized.close().await;
+
+            let error = match AppDb::connect(&database_url).await {
+                Ok(_) => {
+                    panic!("{label}: exact receipts in an impostor ledger must reject startup")
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("database migration required before startup"),
+                "{label}: {error}"
+            );
+
+            let inspection = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            assert_eq!(
+                sqlite_catalog_snapshot(&inspection).await,
+                schema_before,
+                "{label}: rejected startup must not repair the ledger or other schema"
+            );
+            assert_eq!(
+                sqlite_receipt_snapshot(&inspection).await,
+                receipts_before,
+                "{label}: rejected startup must not replace exact receipts"
+            );
+            inspection.close().await;
+            std::fs::remove_file(database_path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_startup_rejects_attached_ledger_trigger_without_mutation() {
+        let (database_path, database_url) = unique_sqlite_test_database("ledger-trigger");
+        let initialized = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "UPDATE schema_migration_contracts \
+             SET installed_at = 'sentinel:' || migration_name",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        pool.execute(
+            r#"
+            CREATE TRIGGER schema_migration_contracts_mutate_before_insert
+            BEFORE INSERT ON schema_migration_contracts
+            BEGIN
+              UPDATE schema_migration_contracts
+              SET installed_at = 'trigger-mutated';
+            END
+            "#,
+        )
+        .await
+        .unwrap();
+        let schema_before = sqlite_catalog_snapshot(pool).await;
+        let receipts_before = sqlite_receipt_snapshot(pool).await;
+        assert!(receipts_before.iter().all(|receipt| receipt
+            .3
+            .as_deref()
+            .is_some_and(|installed_at| installed_at.starts_with("sentinel:"))));
+        initialized.close().await;
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("an attached ledger trigger must reject startup"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("database migration required before startup"),
+            "{error}"
+        );
+
+        let inspection = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(sqlite_catalog_snapshot(&inspection).await, schema_before);
+        assert_eq!(
+            sqlite_receipt_snapshot(&inspection).await,
+            receipts_before,
+            "rejected startup must not fire the hostile BEFORE INSERT trigger"
+        );
+        inspection.close().await;
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_startup_rejects_anchor_without_receipt_before_initialization() {
+        let (database_path, database_url) = unique_sqlite_test_database("anchor-without-receipt");
+        std::fs::File::create(&database_path).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE aircraft_makes (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        let schema_before = sqlite_catalog_snapshot(&pool).await;
+        pool.close().await;
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("an anchor without its receipt must reject startup"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("deterministic retrieval-key data repair"),
+            "{error}"
+        );
+
+        let inspection = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(sqlite_catalog_snapshot(&inspection).await, schema_before);
+        inspection.close().await;
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_all_receipt_timestamps_survive_two_normal_startups() {
+        let (database_path, database_url) = unique_sqlite_test_database("all-receipt-times");
+        let initialized = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO schema_migration_contracts (
+              migration_name, contract_version, contract_fingerprint, installed_at
+            ) VALUES (
+              '20260809_listing_verification_runs', 1,
+              'a8beda24d71517ba07e4a81b2802b2fef97296ae6b2256a7ff493d6af5235232',
+              'historical-sentinel'
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE schema_migration_contracts \
+             SET installed_at = 'sentinel:' || migration_name",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let expected = sqlite_receipt_snapshot(pool).await;
+        assert_eq!(expected.len(), 20);
+        assert!(expected
+            .iter()
+            .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
+        assert!(expected.iter().all(|receipt| receipt
+            .3
+            .as_deref()
+            .is_some_and(|installed_at| installed_at.starts_with("sentinel:"))));
+        initialized.close().await;
+
+        for startup in 1..=2 {
+            let reopened = AppDb::connect(&database_url).await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = reopened.backend() else {
+                unreachable!()
+            };
+            assert_eq!(
+                sqlite_receipt_snapshot(pool).await,
+                expected,
+                "startup {startup} must preserve every original install receipt"
+            );
+            reopened.close().await;
+        }
+        std::fs::remove_file(database_path).unwrap();
     }
 
     #[tokio::test]
@@ -10441,6 +11144,536 @@ mod tests {
         pool.execute("DROP SCHEMA public CASCADE").await.unwrap();
         pool.execute("CREATE SCHEMA public").await.unwrap();
         pool
+    }
+
+    async fn postgres_catalog_snapshot(pool: &sqlx::PgPool) -> Vec<(String, String)> {
+        sqlx::query_as(
+            r#"
+            SELECT relation.relkind::text, relation.relname
+            FROM pg_catalog.pg_class relation
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+            ORDER BY relation.relkind, relation.relname
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn postgres_receipt_snapshot(
+        pool: &sqlx::PgPool,
+    ) -> Vec<(String, Option<i64>, Option<String>, Option<String>)> {
+        sqlx::query_as(
+            r#"
+            SELECT migration_name, contract_version::bigint,
+                   contract_fingerprint, installed_at
+            FROM public.schema_migration_contracts
+            ORDER BY migration_name
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn postgres_ledger_behavior_snapshot(pool: &sqlx::PgPool) -> (i64, i64, bool, bool, i64) {
+        sqlx::query_as(
+            r#"
+            SELECT
+              (
+                SELECT count(*) FROM pg_catalog.pg_trigger attached_trigger
+                WHERE attached_trigger.tgrelid = relation.oid
+                  AND NOT attached_trigger.tgisinternal
+              ),
+              (
+                SELECT count(*) FROM pg_catalog.pg_rewrite attached_rule
+                WHERE attached_rule.ev_class = relation.oid
+              ),
+              relation.relrowsecurity,
+              relation.relforcerowsecurity,
+              (
+                SELECT count(*) FROM pg_catalog.pg_policy attached_policy
+                WHERE attached_policy.polrelid = relation.oid
+              )
+            FROM pg_catalog.pg_class relation
+            WHERE relation.oid = pg_catalog.to_regclass(
+              'public.schema_migration_contracts'
+            )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn postgres_attacker_schema_snapshot(pool: &sqlx::PgPool) -> (i64, i64, Option<String>) {
+        sqlx::query_as(
+            r#"
+            SELECT
+              (
+                SELECT count(*)
+                FROM pg_catalog.pg_class relation
+                JOIN pg_catalog.pg_namespace namespace
+                  ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = 'attacker_schema'
+              ),
+              (
+                SELECT count(*)
+                FROM attacker_schema.schema_migration_contracts
+              ),
+              (
+                SELECT max(installed_at)
+                FROM attacker_schema.schema_migration_contracts
+              )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_startup_rejects_anchor_receipt_xor_and_hostile_markers_without_mutation() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let expected_fingerprint = AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT;
+        let cases = [
+            (
+                "exact",
+                Some(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION),
+                Some(expected_fingerprint),
+            ),
+            ("wrong-version", Some(99), Some(expected_fingerprint)),
+            (
+                "wrong-fingerprint",
+                Some(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION),
+                Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            ),
+            ("null-version", None, Some(expected_fingerprint)),
+            (
+                "null-fingerprint",
+                Some(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION),
+                None,
+            ),
+            ("both-null", None, None),
+        ];
+
+        for (label, version, fingerprint) in cases {
+            let pool = reset_isolated_postgres(&database_url).await;
+            pool.execute(
+                r#"
+                CREATE TABLE public.schema_migration_contracts (
+                  migration_name TEXT PRIMARY KEY,
+                  contract_version INTEGER,
+                  contract_fingerprint TEXT,
+                  installed_at TEXT
+                )
+                "#,
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO public.schema_migration_contracts (
+                  migration_name, contract_version,
+                  contract_fingerprint, installed_at
+                ) VALUES ($1, $2::integer, $3, $4)
+                "#,
+            )
+            .bind(AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION)
+            .bind(version)
+            .bind(fingerprint)
+            .bind("1999-12-31T23:59:59Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+            let catalog_before = postgres_catalog_snapshot(&pool).await;
+            let receipts_before = postgres_receipt_snapshot(&pool).await;
+            pool.close().await;
+
+            let error = match AppDb::connect(&database_url).await {
+                Ok(_) => panic!("{label}: anchorless receipt must reject PostgreSQL startup"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("database migration required before startup"),
+                "{label}: {error}"
+            );
+
+            let inspection = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            assert_eq!(
+                postgres_catalog_snapshot(&inspection).await,
+                catalog_before,
+                "{label}: rejected startup must not create canonical objects"
+            );
+            assert_eq!(
+                postgres_receipt_snapshot(&inspection).await,
+                receipts_before,
+                "{label}: rejected startup must not heal the receipt"
+            );
+            inspection.close().await;
+        }
+
+        let pool = reset_isolated_postgres(&database_url).await;
+        pool.execute("CREATE TABLE public.aircraft_makes (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        let catalog_before = postgres_catalog_snapshot(&pool).await;
+        pool.close().await;
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("an anchor without its receipt must reject PostgreSQL startup"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("deterministic retrieval-key data repair"),
+            "{error}"
+        );
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(postgres_catalog_snapshot(&inspection).await, catalog_before);
+        inspection.close().await;
+
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let initialized = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        let receipts = postgres_receipt_snapshot(pool).await;
+        assert!(!receipts.is_empty());
+        pool.execute("DROP TABLE public.schema_migration_contracts")
+            .await
+            .unwrap();
+        pool.execute(
+            r#"
+            CREATE TABLE public.schema_migration_contracts (
+              migration_name TEXT,
+              contract_version INTEGER,
+              contract_fingerprint TEXT,
+              installed_at TEXT
+            )
+            "#,
+        )
+        .await
+        .unwrap();
+        for (migration_name, contract_version, contract_fingerprint, installed_at) in receipts {
+            sqlx::query(
+                r#"
+                INSERT INTO public.schema_migration_contracts (
+                  migration_name, contract_version,
+                  contract_fingerprint, installed_at
+                ) VALUES ($1, $2::integer, $3, $4)
+                "#,
+            )
+            .bind(migration_name)
+            .bind(contract_version)
+            .bind(contract_fingerprint)
+            .bind(installed_at)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let catalog_before = postgres_catalog_snapshot(pool).await;
+        let receipts_before = postgres_receipt_snapshot(pool).await;
+        initialized.close().await;
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("exact receipts in an impostor ledger must reject PostgreSQL startup"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("database migration required before startup"),
+            "{error}"
+        );
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        assert_eq!(postgres_catalog_snapshot(&inspection).await, catalog_before);
+        assert_eq!(
+            postgres_receipt_snapshot(&inspection).await,
+            receipts_before
+        );
+        inspection.close().await;
+
+        for label in ["statement-trigger", "rewrite-rule", "row-level-security"] {
+            let reset = reset_isolated_postgres(&database_url).await;
+            reset.close().await;
+            let initialized = AppDb::connect(&database_url).await.unwrap();
+            let DatabaseBackend::Postgres(pool) = initialized.backend() else {
+                unreachable!()
+            };
+            sqlx::query(
+                "UPDATE public.schema_migration_contracts \
+                 SET installed_at = 'sentinel:' || migration_name",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            match label {
+                "statement-trigger" => {
+                    pool.execute(
+                        r#"
+                        CREATE FUNCTION public.mutate_migration_receipts()
+                        RETURNS trigger
+                        LANGUAGE plpgsql
+                        AS $function$
+                        BEGIN
+                          UPDATE public.schema_migration_contracts
+                          SET installed_at = 'trigger-mutated';
+                          RETURN NULL;
+                        END
+                        $function$
+                        "#,
+                    )
+                    .await
+                    .unwrap();
+                    pool.execute(
+                        r#"
+                        CREATE TRIGGER mutate_migration_receipts_before_insert
+                        BEFORE INSERT ON public.schema_migration_contracts
+                        FOR EACH STATEMENT
+                        EXECUTE FUNCTION public.mutate_migration_receipts()
+                        "#,
+                    )
+                    .await
+                    .unwrap();
+                }
+                "rewrite-rule" => {
+                    pool.execute(
+                        r#"
+                        CREATE RULE mutate_migration_receipts_on_insert AS
+                        ON INSERT TO public.schema_migration_contracts
+                        DO ALSO
+                          UPDATE public.schema_migration_contracts
+                          SET installed_at = 'rule-mutated'
+                        "#,
+                    )
+                    .await
+                    .unwrap();
+                }
+                "row-level-security" => {
+                    pool.execute(
+                        "ALTER TABLE public.schema_migration_contracts \
+                         ENABLE ROW LEVEL SECURITY",
+                    )
+                    .await
+                    .unwrap();
+                    pool.execute(
+                        "CREATE POLICY migration_receipt_policy \
+                         ON public.schema_migration_contracts \
+                         USING (true) WITH CHECK (true)",
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let catalog_before = postgres_catalog_snapshot(pool).await;
+            let behavior_before = postgres_ledger_behavior_snapshot(pool).await;
+            let receipts_before = postgres_receipt_snapshot(pool).await;
+            assert!(receipts_before.iter().all(|receipt| receipt
+                .3
+                .as_deref()
+                .is_some_and(|installed_at| installed_at.starts_with("sentinel:"))));
+            initialized.close().await;
+
+            let error = match AppDb::connect(&database_url).await {
+                Ok(_) => panic!("{label}: attached ledger behavior must reject startup"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(
+                error.contains("database migration required before startup"),
+                "{label}: {error}"
+            );
+            let inspection = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            assert_eq!(postgres_catalog_snapshot(&inspection).await, catalog_before);
+            assert_eq!(
+                postgres_ledger_behavior_snapshot(&inspection).await,
+                behavior_before,
+                "{label}: rejected startup must not remove attached behavior"
+            );
+            assert_eq!(
+                postgres_receipt_snapshot(&inspection).await,
+                receipts_before,
+                "{label}: rejected startup must not run attached behavior"
+            );
+            inspection.close().await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_all_receipt_timestamps_survive_two_normal_startups() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+
+        let initialized = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO public.schema_migration_contracts (
+              migration_name, contract_version, contract_fingerprint, installed_at
+            ) VALUES (
+              '20260809_listing_verification_runs', 1,
+              'a8beda24d71517ba07e4a81b2802b2fef97296ae6b2256a7ff493d6af5235232',
+              'historical-sentinel'
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE public.schema_migration_contracts \
+             SET installed_at = 'sentinel:' || migration_name",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let expected = postgres_receipt_snapshot(pool).await;
+        assert_eq!(expected.len(), 21);
+        assert!(expected
+            .iter()
+            .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
+        assert!(expected.iter().all(|receipt| receipt
+            .3
+            .as_deref()
+            .is_some_and(|installed_at| installed_at.starts_with("sentinel:"))));
+        initialized.close().await;
+
+        for startup in 1..=2 {
+            let reopened = AppDb::connect(&database_url).await.unwrap();
+            let DatabaseBackend::Postgres(pool) = reopened.backend() else {
+                unreachable!()
+            };
+            assert_eq!(
+                postgres_receipt_snapshot(pool).await,
+                expected,
+                "startup {startup} must preserve every original PostgreSQL install receipt"
+            );
+            reopened.close().await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_startup_pins_search_path_and_ignores_attacker_shadows() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let separator = if database_url.contains('?') { '&' } else { '?' };
+        let hostile_url =
+            format!("{database_url}{separator}options%5Bsearch_path%5D=attacker_schema%2Cpublic");
+        let setup = reset_isolated_postgres(&database_url).await;
+        setup
+            .execute("CREATE SCHEMA attacker_schema")
+            .await
+            .unwrap();
+        setup
+            .execute(
+                r#"
+                CREATE TABLE attacker_schema.schema_migration_contracts (
+                  migration_name TEXT PRIMARY KEY,
+                  contract_version INTEGER NOT NULL CHECK (contract_version > 0),
+                  contract_fingerprint TEXT NOT NULL
+                    CHECK (contract_fingerprint ~ '^[0-9a-f]{64}$'),
+                  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  CHECK (length(trim(migration_name)) > 0)
+                )
+                "#,
+            )
+            .await
+            .unwrap();
+        setup
+            .execute(
+                r#"
+                INSERT INTO attacker_schema.schema_migration_contracts (
+                  migration_name, contract_version,
+                  contract_fingerprint, installed_at
+                ) VALUES (
+                  '20991231_attacker_sentinel', 1,
+                  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                  'attacker-sentinel'
+                )
+                "#,
+            )
+            .await
+            .unwrap();
+        let attacker_before = postgres_attacker_schema_snapshot(&setup).await;
+        setup.close().await;
+
+        let initialized = AppDb::connect(&hostile_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = initialized.backend() else {
+            unreachable!()
+        };
+        let search_path =
+            sqlx::query_scalar::<_, String>("SELECT pg_catalog.current_setting('search_path')")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(search_path.replace(' ', ""), POSTGRES_SEARCH_PATH);
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.to_regclass( \
+               'public.schema_migration_contracts' \
+             ) IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap());
+        assert_eq!(
+            postgres_attacker_schema_snapshot(pool).await,
+            attacker_before,
+            "hostile URL search_path must not redirect canonical startup writes"
+        );
+        initialized.close().await;
+
+        let diagnostic = AppDb::connect_diagnostic(&hostile_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = diagnostic.backend() else {
+            unreachable!()
+        };
+        let diagnostic_search_path =
+            sqlx::query_scalar::<_, String>("SELECT pg_catalog.current_setting('search_path')")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            diagnostic_search_path.replace(' ', ""),
+            POSTGRES_SEARCH_PATH
+        );
+        assert_eq!(
+            postgres_attacker_schema_snapshot(pool).await,
+            attacker_before
+        );
+        diagnostic.close().await;
+
+        let normal = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = normal.backend() else {
+            unreachable!()
+        };
+        assert_eq!(
+            postgres_attacker_schema_snapshot(pool).await,
+            attacker_before
+        );
+        normal.close().await;
     }
 
     async fn apply_postgres_listing_replay_migration(pool: &sqlx::PgPool, hostile: bool) {

@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS users (
 -- A contract row is installed only after every object for a migration exists.
 -- Startup treats the exact version and fingerprint as an atomic completion
 -- marker; object-name checks below that layer detect later schema damage.
+-- Canonical reruns only seed absent receipts; they never repair provenance or
+-- replace the original installation timestamp.
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL,
@@ -2394,10 +2396,7 @@ INSERT INTO schema_migration_contracts (
   '36f9ff06bf42fc769508ecfe578f4b4a11f2e0072b81efebed1dee8958654f2a',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 CREATE TRIGGER IF NOT EXISTS avionics_models_consolidation_identity_immutable
 BEFORE UPDATE OF catalog_status, avionics_manufacturer_id, name,
@@ -4488,13 +4487,7 @@ INSERT INTO schema_migration_contracts (
   '589a0716726d2ffd34bf84c08583198383c003228b769c88f094ac6bd9f677b8',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at
-WHERE schema_migration_contracts.contract_version = excluded.contract_version
-  AND schema_migration_contracts.contract_fingerprint =
-      excluded.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS aircraft_reference_profile_proposals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7983,10 +7976,7 @@ INSERT INTO schema_migration_contracts (
   '0a182d5972d62be3d906395df8d08b741bc3e23d713badf7596b360048aa45ba',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -7996,13 +7986,7 @@ INSERT INTO schema_migration_contracts (
   '3aacf958efa7fb5e24c5897cf0369d40cb506b2a22444d629ea0a76462ce1a70',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at
-WHERE schema_migration_contracts.contract_version = excluded.contract_version
-  AND schema_migration_contracts.contract_fingerprint =
-      excluded.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 -- Approved catalog truth is broader than no-grounding reuse eligibility.
 -- This positive-only cache is populated only by the current curation policy;
@@ -8126,10 +8110,7 @@ INSERT INTO schema_migration_contracts (
   '8ad6e935e1222a03e2da4848a9e3c6f4b7f50ee027a6e50ede3b692d034cae55',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -8139,10 +8120,7 @@ INSERT INTO schema_migration_contracts (
   'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -8152,10 +8130,7 @@ INSERT INTO schema_migration_contracts (
   '0c44e30c662d8f51c11f7db883251c1356cfda4d53957df038988c32d3b91399',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 -- Exact authorization for one listing-link component. Manufacturer-reuse
 -- authorizations bind the current global attestation; same-case authorizations
@@ -8481,10 +8456,7 @@ INSERT INTO schema_migration_contracts (
   'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -8494,23 +8466,7 @@ INSERT INTO schema_migration_contracts (
   'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260802_default_avionics_candidate_quarantine',
-  2,
-  'b8a6ecd15acc0ce14f67bf37ff4387c0ded4d1c6669d2fc4698b6c0a6c209ba4',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name,
@@ -8523,10 +8479,7 @@ INSERT INTO schema_migration_contracts (
   '93a641a0f653eacf0c8413bdb697a35c588fe34efc1419d30bf65146c8b2d55a',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -8536,10 +8489,7 @@ INSERT INTO schema_migration_contracts (
   'f78087f6354d93d78dc8cebc895f285e38a91ca6f72dc2351acaaa88b49f9620',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -8549,10 +8499,7 @@ INSERT INTO schema_migration_contracts (
   '2c61547aae5158dd0a5393ca49218f0f3aada7d9b87caf950fa27fe2953d7dee',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 -- Canonical aircraft hierarchy retrieval keys are mechanical lookup keys, not
 -- manufacturer aliases: lowercase ASCII alphanumerics with all other
@@ -8769,10 +8716,7 @@ INSERT INTO schema_migration_contracts (
   'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_faa_registry_aircraft_lineage_record
   ON faa_registry_aircraft (
@@ -9790,10 +9734,7 @@ INSERT INTO schema_migration_contracts (
   '566485027d3df81bb5a90abcc0ce2b707e565bcbdc92ae3f007f527832fae735',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 -- Re-materialize the exact post-DDL object set. Keeping a sqlite_schema-backed
 -- view alive across the schema would make every intervening DDL reprepare it.

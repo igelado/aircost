@@ -1580,9 +1580,24 @@ exact predecessor fingerprint to the exact version-2 fingerprint. An exact
 version-2 rerun is a no-op, and any other predecessor is rejected.
 
 Canonical schema application during process startup is a separate provenance
-contract. This standalone-migration hardening does not implement or claim
-startup receipt stability or startup mismatch rejection; those guarantees
-require their own schema guards and end-to-end startup tests.
+contract. Before executing canonical DDL, startup classifies every active
+migration as `Fresh`, `Installed`, or `Invalid`: only joint absence of its
+anchor and receipt is fresh, while an installed migration requires both its
+anchor and the exact receipt version and fingerprint. Every partial pairing,
+mismatch, or null marker is invalid. An existing receipt ledger must also match
+the canonical backend definition, including its table kind, columns, types,
+nullability, timestamp default, primary key, and checks. Invalid provenance is
+also any attached behavior: SQLite forbids ledger triggers and explicit
+indexes, while PostgreSQL forbids user triggers, rewrite rules, row-level
+security and policies, partition attachment, identity columns, and generated
+columns. Invalid provenance is rejected before canonical DDL and the rejected
+startup does not repair or otherwise mutate the schema or receipts. Canonical
+receipt seeds are insert-only, so normal startup preserves every original
+`installed_at` value; unknown historical receipts are allowed and preserved
+rather than rewritten. Every normal and diagnostic PostgreSQL pool connection
+pins `search_path` to `public, pg_catalog, pg_temp` (with `pg_temp` explicitly
+last), so URL or role defaults cannot redirect preflight lookups or canonical
+DDL into attacker-controlled schemas.
 
 ## Listing Aircraft Compatibility Projection Migration
 
