@@ -34,6 +34,59 @@ pub const LEGACY_SCHEMA_RECEIPT_SHA3_256: &str =
 pub const LEGACY_FAA_ARCHIVE_SHA256: &str =
     "14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724";
 
+const PREPARED_REPLAY_SOURCE_NONEMPTY_TABLES: &[&str] = &[
+    "aircraft_designation_aliases",
+    "aircraft_designation_faa_bindings",
+    "aircraft_designation_identifiers",
+    "aircraft_designations",
+    "aircraft_engine_catalog_models",
+    "aircraft_factory_packages",
+    "aircraft_family_aliases",
+    "aircraft_feature_definitions",
+    "aircraft_generation_designations",
+    "aircraft_generations",
+    "aircraft_identity_decision_claims",
+    "aircraft_identity_decisions",
+    "aircraft_identity_observations",
+    "aircraft_identity_resolution_cases",
+    "aircraft_make_aliases",
+    "aircraft_makes",
+    "aircraft_manufacturers",
+    "aircraft_markets",
+    "aircraft_model_families",
+    "aircraft_model_variants",
+    "aircraft_models",
+    "aircraft_package_applicability",
+    "aircraft_propeller_catalog_models",
+    "aircraft_sale_listing_pending_compatibility_placeholder",
+    "aircraft_serial_number_schemes",
+    "aircraft_tcds_make_lineage_bindings",
+    "avionics_approved_product_identities",
+    "avionics_authoritative_source_origins",
+    "avionics_manufacturer_canonical_keys",
+    "avionics_manufacturer_identities",
+    "avionics_manufacturer_identity_memberships",
+    "avionics_manufacturers",
+    "avionics_model_types",
+    "avionics_models",
+    "avionics_product_reuse_attestations",
+    "avionics_suite_components",
+    "avionics_types",
+    "component_depreciation_profiles",
+    "curation_evidence_claims",
+    "curation_evidence_sources",
+    "depreciation_profiles",
+    "faa_registry_aircraft",
+    "faa_registry_aircraft_references",
+    "faa_registry_coverage",
+    "faa_registry_engine_references",
+    "faa_registry_snapshots",
+    "plugin_installs",
+    "plugin_submissions",
+    "schema_migration_contracts",
+    "users",
+];
+
 pub struct PrepareLegacyReplaySourceRequest<'a> {
     pub source_database: &'a str,
     pub manifest: &'a TrustedCaptureManifest,
@@ -152,11 +205,20 @@ pub async fn prepare_legacy_replay_source(
     let faa_archive_sha256 = faa.report.archive_sha256.clone();
     let faa_snapshot_date = faa.report.snapshot_date.clone();
     let applied_rows = capture_rows + catalog.applied_rows;
+    if request.apply {
+        checkpoint_prepared_target(&target).await?;
+    }
     target.close().await;
     let output_created = if let Some(file) = temporary.take() {
         let diagnostic = AppDb::connect_diagnostic(&target_url).await?;
         audit_prepared_target(&diagnostic, &faa.obsolete_hashes).await?;
         diagnostic.close().await;
+        file.as_file().sync_all().with_context(|| {
+            format!(
+                "could not synchronize prepared replay source temporary file for {}",
+                request.output.display()
+            )
+        })?;
         file.persist_noclobber(request.output).with_context(|| {
             format!(
                 "could not atomically publish prepared replay source {}",
@@ -657,11 +719,14 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
     let DatabaseBackend::Sqlite(pool) = target.backend() else {
         bail!("prepared replay-source audit requires SQLite");
     };
-    let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
-        .fetch_one(pool)
+    let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_all(pool)
         .await?;
-    if quick_check != "ok" {
-        bail!("prepared replay source failed SQLite quick_check: {quick_check}");
+    if integrity.as_slice() != ["ok"] {
+        bail!(
+            "prepared replay source failed SQLite integrity_check: {}",
+            integrity.join("; ")
+        );
     }
     let foreign_key_errors: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
@@ -681,7 +746,16 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
     )
     .fetch_all(pool)
     .await?;
-    for table in tables {
+    for table in &tables {
+        if !PREPARED_REPLAY_SOURCE_NONEMPTY_TABLES.contains(&table.as_str()) {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {}", quote_identifier(table)))
+                    .fetch_one(pool)
+                    .await?;
+            if count != 0 {
+                bail!("prepared replay source contains {count} excluded artifact rows in {table}");
+            }
+        }
         let columns = sqlx::query(&format!("PRAGMA table_xinfo({})", quote_identifier(&table)))
             .fetch_all(pool)
             .await?;
@@ -701,16 +775,20 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
                 continue;
             }
             let sql = format!(
-                "SELECT COUNT(*) FROM {} WHERE instr(CAST({} AS TEXT), ?) > 0",
+                "SELECT COUNT(*) FROM {} WHERE instr(CAST({} AS BLOB), ?) > 0",
                 quote_identifier(&table),
                 quote_identifier(&name)
             );
             for obsolete in obsolete_hashes {
-                let count: i64 = sqlx::query_scalar(&sql)
-                    .bind(obsolete)
+                let ascii_count: i64 = sqlx::query_scalar(&sql)
+                    .bind(obsolete.as_bytes())
                     .fetch_one(pool)
                     .await?;
-                if count != 0 {
+                let binary_count: i64 = sqlx::query_scalar(&sql)
+                    .bind(decode_sha256(obsolete)?)
+                    .fetch_one(pool)
+                    .await?;
+                if ascii_count != 0 || binary_count != 0 {
                     bail!(
                         "prepared replay source retained obsolete FAA hash material in {table}.{name}"
                     );
@@ -721,6 +799,97 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
     Ok(())
 }
 
+async fn checkpoint_prepared_target(target: &AppDb) -> Result<()> {
+    let DatabaseBackend::Sqlite(pool) = target.backend() else {
+        bail!("prepared replay-source checkpoint requires SQLite");
+    };
+    let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(pool)
+        .await?;
+    if busy != 0 {
+        bail!("prepared replay source WAL checkpoint remained busy");
+    }
+    Ok(())
+}
+
+fn decode_sha256(value: &str) -> Result<Vec<u8>> {
+    if value.len() != 64
+        || value != value.to_ascii_lowercase()
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("obsolete FAA taint value is not a SHA-256 digest");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digits = std::str::from_utf8(pair).context("SHA-256 digest is not ASCII")?;
+            u8::from_str_radix(digits, 16).context("SHA-256 digest is not lowercase hexadecimal")
+        })
+        .collect()
+}
+
 fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_digest_material_includes_the_final_newline() {
+        let actual = hash_rows(["one\u{1f}two".to_string()]);
+        let mut expected = Sha3_256::new();
+        expected.update(b"one\x1ftwo\n");
+        assert_eq!(actual, format!("{:x}", expected.finalize()));
+    }
+
+    #[test]
+    fn taint_digest_decodes_to_exact_binary_sha256() {
+        let digest = format!("00{}ff", "ab".repeat(30));
+        let decoded = decode_sha256(&digest).unwrap();
+        assert_eq!(decoded.len(), 32);
+        assert_eq!(decoded[0], 0);
+        assert!(decoded[1..31].iter().all(|byte| *byte == 0xab));
+        assert_eq!(decoded[31], 0xff);
+        assert!(decode_sha256("not-a-digest").is_err());
+    }
+
+    #[test]
+    fn prepared_output_allowlist_excludes_every_derived_listing_artifact_class() {
+        for excluded in [
+            "aircraft_sale_listings",
+            "aircraft_sale_listing_identity_assignments",
+            "aircraft_listing_identity_correction_decisions",
+            "aircraft_sale_listing_pending_reviews",
+            "listing_replay_runs",
+            "listing_verification_runs",
+            "valuation_snapshots",
+            "valuation_model_versions",
+            "gemini_api_usage",
+            "aircraft_identity_resolution_candidates",
+            "avionics_manufacturer_alias_candidates",
+        ] {
+            assert!(!PREPARED_REPLAY_SOURCE_NONEMPTY_TABLES.contains(&excluded));
+        }
+        for retained in [
+            "plugin_submissions",
+            "faa_registry_snapshots",
+            "aircraft_identity_decisions",
+            "avionics_models",
+        ] {
+            assert!(PREPARED_REPLAY_SOURCE_NONEMPTY_TABLES.contains(&retained));
+        }
+    }
+
+    #[test]
+    fn legacy_source_url_rejects_uri_options() {
+        assert!(sqlite_path("sqlite:///tmp/frozen.sqlite3?mode=rw").is_err());
+        assert!(sqlite_path("sqlite:///tmp/frozen.sqlite3#fragment").is_err());
+        assert_eq!(
+            sqlite_path("sqlite:///tmp/frozen.sqlite3").unwrap(),
+            PathBuf::from("/tmp/frozen.sqlite3")
+        );
+    }
 }

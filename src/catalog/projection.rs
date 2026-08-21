@@ -132,7 +132,8 @@ pub(crate) async fn required_faa_representatives(
     )
     .fetch_all(&mut *source)
     .await?;
-    rows.into_iter()
+    let mut representatives = rows
+        .into_iter()
         .map(|(snapshot_id, n_number)| {
             let normalized =
                 crate::aircraft::faa::normalize_n_number(&n_number).with_context(|| {
@@ -146,7 +147,53 @@ pub(crate) async fn required_faa_representatives(
                 n_number,
             })
         })
-        .collect()
+        .collect::<Result<BTreeSet<_>>>()?;
+
+    let roots = selected_aircraft_roots(source).await?;
+    let decision_ids = roots
+        .values()
+        .flatten()
+        .filter_map(|row| row.nullable_integer("approval_decision_id").transpose())
+        .collect::<Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let hierarchy_claims: Vec<(i64, String, String)> = sqlx::query_as(&format!(
+        r#"SELECT DISTINCT claim.id, claim.object_text, claim.quoted_evidence
+           FROM aircraft_identity_decision_claims decision_claim
+           JOIN curation_evidence_claims claim
+             ON claim.id = decision_claim.evidence_claim_id
+           WHERE decision_claim.decision_id IN ({})
+             AND claim.evidence_source_id IN (
+               SELECT evidence_source_id FROM faa_registry_snapshots
+             )
+           ORDER BY claim.id"#,
+        decision_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+    .fetch_all(&mut *source)
+    .await?;
+    for (claim_id, object_text, quoted_evidence) in hierarchy_claims {
+        let Ok(object) = serde_json::from_str::<ServerFaaHierarchyObject>(&object_text) else {
+            continue;
+        };
+        let fact_kind = ServerFaaHierarchyFactKind::from_evidence_id(&object.evidence_id)
+            .with_context(|| format!("selected FAA hierarchy claim {claim_id} is invalid"))?;
+        if object.supports != ["hierarchy_identity"] {
+            bail!("selected FAA hierarchy claim {claim_id} has unsupported authority scope");
+        }
+        let parsed = parse_server_faa_hierarchy_claim(fact_kind, &quoted_evidence, claim_id)?;
+        let facts = load_legacy_hierarchy_facts(source, &parsed).await?;
+        validate_legacy_hierarchy_facts(&parsed, &facts, claim_id)?;
+        validate_server_faa_hierarchy_evidence_id(&object.evidence_id, &parsed, &facts, claim_id)?;
+        representatives.extend(facts.into_iter().map(|row| LegacyFaaRepresentative {
+            snapshot_id: row.snapshot_id,
+            n_number: row.n_number,
+        }));
+    }
+    Ok(representatives.into_iter().collect())
 }
 
 pub(crate) async fn project_reusable_catalog(
@@ -744,6 +791,70 @@ struct FaaIdentityObject {
     source_record_sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerFaaHierarchyObject {
+    evidence_id: String,
+    supports: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerFaaHierarchyFactKind {
+    Make,
+    Designation,
+}
+
+impl ServerFaaHierarchyFactKind {
+    fn from_evidence_id(value: &str) -> Result<Self> {
+        let (kind, digest) = if let Some(digest) = value.strip_prefix("server_faa_registry.make.") {
+            (Self::Make, digest)
+        } else if let Some(digest) = value.strip_prefix("server_faa_registry.designation.") {
+            (Self::Designation, digest)
+        } else {
+            bail!("server FAA hierarchy evidence ID has an unsupported kind");
+        };
+        require_lower_sha256(digest, "server FAA hierarchy evidence ID")?;
+        Ok(kind)
+    }
+
+    fn quote_prefix(self) -> &'static str {
+        match self {
+            Self::Make => "Imported FAA ACFTREF reports manufacturer_name=",
+            Self::Designation => "Imported FAA ACFTREF reports model_name=",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Make => "make",
+            Self::Designation => "designation",
+        }
+    }
+}
+
+struct ParsedServerFaaHierarchyClaim {
+    fact_kind: ServerFaaHierarchyFactKind,
+    reported_fact_debug: String,
+    snapshot_ids: BTreeSet<i64>,
+    snapshot_date: String,
+    archive_sha256: String,
+    source_manifest_sha256: String,
+    source_record_sha256s: BTreeSet<String>,
+    n_numbers: BTreeSet<String>,
+    aircraft_code: String,
+    provenance: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LegacyHierarchyFactRow {
+    snapshot_id: i64,
+    n_number: String,
+    aircraft_code: String,
+    manufacturer_name: Option<String>,
+    model_name: Option<String>,
+    source_record_sha256: String,
+}
+
 async fn remap_evidence_sources_and_faa_claims(
     source: &mut SqliteConnection,
     roots: &BTreeMap<String, Vec<ProjectionRow>>,
@@ -757,10 +868,6 @@ async fn remap_evidence_sources_and_faa_claims(
         .map(|(index, row)| Ok((row.integer("id")?, index)))
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut faa_claim_representatives = BTreeMap::new();
-    // The server_faa_registry hierarchy-claim shape used by TCDS lineage
-    // decisions is intentionally not treated as FaaIdentityEvidence. Until its
-    // separate typed rebuilder is added below, such a selected claim fails at
-    // the legacy-evidence closure check instead of being textually rewritten.
     for row in &roots["aircraft_designation_faa_bindings"] {
         let claim_id = row.integer("identity_evidence_claim_id")?;
         let claim = claims
@@ -779,7 +886,7 @@ async fn remap_evidence_sources_and_faa_claims(
         );
     }
 
-    let faa_claim_ids = faa_claim_representatives
+    let mut faa_claim_ids = faa_claim_representatives
         .keys()
         .copied()
         .collect::<BTreeSet<_>>();
@@ -789,92 +896,12 @@ async fn remap_evidence_sources_and_faa_claims(
             continue;
         }
         let claim_id = claim.integer("id")?;
-        let legacy = faa_claim_representatives.get(&claim_id).with_context(|| {
-            format!(
-                "selected claim {claim_id} uses legacy FAA evidence outside the typed representative closure"
-            )
-        })?;
-        let current = faa
-            .representative_remap
-            .get(legacy)
-            .context("typed FAA representative remap is missing")?;
-        if claim.string("claim_kind")? != "identity"
-            || claim.string("predicate_text")? != "FAA registered aircraft identity"
-            || claim.string("validation_status")? != "validated"
-            || claim.string("subject_text")? != legacy.n_number
-            || claim.value("citation_start") != Some(&Value::Null)
-            || claim.value("citation_end") != Some(&Value::Null)
-        {
-            bail!("legacy FAA claim {claim_id} does not have the exact typed identity shape");
+        if let Some(legacy) = faa_claim_representatives.get(&claim_id) {
+            rebuild_faa_identity_claim(source, claim, claim_id, legacy, faa).await?;
+        } else {
+            rebuild_server_faa_hierarchy_claim(source, claim, claim_id, faa).await?;
         }
-        let object: FaaIdentityObject = serde_json::from_str(claim.string("object_text")?)
-            .with_context(|| {
-                format!("legacy FAA claim {claim_id} object is not canonical identity JSON")
-            })?;
-        let legacy_fact: (String, String, Option<String>, Option<String>, String) = sqlx::query_as(
-            r#"SELECT aircraft.n_number, aircraft.aircraft_code,
-                          reference.manufacturer_name, reference.model_name,
-                          aircraft.source_record_sha256
-                   FROM faa_registry_aircraft aircraft
-                   JOIN faa_registry_aircraft_references reference
-                     ON reference.snapshot_id = aircraft.snapshot_id
-                    AND reference.aircraft_code = aircraft.aircraft_code
-                   WHERE aircraft.snapshot_id = ? AND aircraft.n_number = ?"#,
-        )
-        .bind(legacy.snapshot_id)
-        .bind(&legacy.n_number)
-        .fetch_optional(&mut *source)
-        .await?
-        .context("legacy FAA claim representative has no exact retained registry fact")?;
-        let manufacturer = legacy_fact
-            .2
-            .as_deref()
-            .context("legacy FAA identity claim has no ACFTREF manufacturer")?;
-        let model = legacy_fact
-            .3
-            .as_deref()
-            .context("legacy FAA identity claim has no ACFTREF model")?;
-        if object.aircraft_code != legacy_fact.1
-            || object.manufacturer != manufacturer
-            || object.model != model
-            || object.source_record_sha256 != legacy_fact.4
-            || faa
-                .obsolete_hash_replacements
-                .get(&legacy_fact.4)
-                .is_none_or(|replacement| replacement != &current.source_record_sha256)
-        {
-            bail!("legacy FAA claim {claim_id} disagrees with its typed registry representative");
-        }
-        let expected_quote = format!(
-            "FAA ACFTREF {}: {} {}; MASTER {} record sha256 {}",
-            legacy_fact.1, manufacturer, model, legacy.n_number, legacy_fact.4
-        );
-        if claim.string("quoted_evidence")? != expected_quote {
-            bail!("legacy FAA claim {claim_id} quote is not the exact registry identity receipt");
-        }
-        claim.set(
-            "evidence_source_id",
-            Value::from(faa.current_evidence_source_id),
-        )?;
-        claim.set(
-            "object_text",
-            Value::String(
-                serde_json::json!({
-                    "aircraft_code": legacy_fact.1,
-                    "manufacturer": manufacturer,
-                    "model": model,
-                    "source_record_sha256": current.source_record_sha256,
-                })
-                .to_string(),
-            ),
-        )?;
-        claim.set(
-            "quoted_evidence",
-            Value::String(format!(
-                "FAA ACFTREF {}: {} {}; MASTER {} record sha256 {}",
-                legacy_fact.1, manufacturer, model, legacy.n_number, current.source_record_sha256
-            )),
-        )?;
+        faa_claim_ids.insert(claim_id);
     }
 
     sources.retain(|row| {
@@ -918,6 +945,456 @@ async fn remap_evidence_sources_and_faa_claims(
                 format!("selected evidence claim references excluded source {old_id}")
             })?),
         )?;
+    }
+    Ok(())
+}
+
+async fn rebuild_faa_identity_claim(
+    source: &mut SqliteConnection,
+    claim: &mut ProjectionRow,
+    claim_id: i64,
+    legacy: &LegacyFaaRepresentative,
+    faa: &FaaBridgeOutcome,
+) -> Result<()> {
+    let current = faa
+        .representative_remap
+        .get(legacy)
+        .context("typed FAA representative remap is missing")?;
+    require_common_faa_claim_shape(claim, claim_id)?;
+    if claim.string("predicate_text")? != "FAA registered aircraft identity"
+        || claim.string("subject_text")? != legacy.n_number
+    {
+        bail!("legacy FAA claim {claim_id} does not have the exact typed identity shape");
+    }
+    let object: FaaIdentityObject = serde_json::from_str(claim.string("object_text")?)
+        .with_context(|| {
+            format!("legacy FAA claim {claim_id} object is not canonical identity JSON")
+        })?;
+    let legacy_fact: (String, String, Option<String>, Option<String>, String) = sqlx::query_as(
+        r#"SELECT aircraft.n_number, aircraft.aircraft_code,
+                  reference.manufacturer_name, reference.model_name,
+                  aircraft.source_record_sha256
+           FROM faa_registry_aircraft aircraft
+           JOIN faa_registry_aircraft_references reference
+             ON reference.snapshot_id = aircraft.snapshot_id
+            AND reference.aircraft_code = aircraft.aircraft_code
+           WHERE aircraft.snapshot_id = ? AND aircraft.n_number = ?"#,
+    )
+    .bind(legacy.snapshot_id)
+    .bind(&legacy.n_number)
+    .fetch_optional(&mut *source)
+    .await?
+    .context("legacy FAA claim representative has no exact retained registry fact")?;
+    let manufacturer = legacy_fact
+        .2
+        .as_deref()
+        .context("legacy FAA identity claim has no ACFTREF manufacturer")?;
+    let model = legacy_fact
+        .3
+        .as_deref()
+        .context("legacy FAA identity claim has no ACFTREF model")?;
+    if object.aircraft_code != legacy_fact.1
+        || object.manufacturer != manufacturer
+        || object.model != model
+        || object.source_record_sha256 != legacy_fact.4
+        || faa
+            .obsolete_hash_replacements
+            .get(&legacy_fact.4)
+            .is_none_or(|replacement| replacement != &current.source_record_sha256)
+    {
+        bail!("legacy FAA claim {claim_id} disagrees with its typed registry representative");
+    }
+    let expected_quote = format!(
+        "FAA ACFTREF {}: {} {}; MASTER {} record sha256 {}",
+        legacy_fact.1, manufacturer, model, legacy.n_number, legacy_fact.4
+    );
+    if claim.string("quoted_evidence")? != expected_quote {
+        bail!("legacy FAA claim {claim_id} quote is not the exact registry identity receipt");
+    }
+    claim.set(
+        "evidence_source_id",
+        Value::from(faa.current_evidence_source_id),
+    )?;
+    claim.set(
+        "object_text",
+        Value::String(
+            serde_json::json!({
+                "aircraft_code": legacy_fact.1,
+                "manufacturer": manufacturer,
+                "model": model,
+                "source_record_sha256": current.source_record_sha256,
+            })
+            .to_string(),
+        ),
+    )?;
+    claim.set(
+        "quoted_evidence",
+        Value::String(format!(
+            "FAA ACFTREF {}: {} {}; MASTER {} record sha256 {}",
+            legacy_fact.1, manufacturer, model, legacy.n_number, current.source_record_sha256
+        )),
+    )?;
+    Ok(())
+}
+
+async fn rebuild_server_faa_hierarchy_claim(
+    source: &mut SqliteConnection,
+    claim: &mut ProjectionRow,
+    claim_id: i64,
+    faa: &FaaBridgeOutcome,
+) -> Result<()> {
+    require_common_faa_claim_shape(claim, claim_id)?;
+    if claim.string("subject_text")? != "aircraft_model_hierarchy"
+        || claim.string("predicate_text")? != "supports verified aircraft hierarchy decision"
+    {
+        bail!("legacy FAA hierarchy claim {claim_id} has an unexpected subject or predicate");
+    }
+    let object: ServerFaaHierarchyObject = serde_json::from_str(claim.string("object_text")?)
+        .with_context(|| format!("legacy FAA hierarchy claim {claim_id} object is invalid"))?;
+    let fact_kind = ServerFaaHierarchyFactKind::from_evidence_id(&object.evidence_id)?;
+    if object.supports != ["hierarchy_identity"] {
+        bail!("legacy FAA hierarchy claim {claim_id} has unsupported authority scope");
+    }
+    let parsed =
+        parse_server_faa_hierarchy_claim(fact_kind, claim.string("quoted_evidence")?, claim_id)?;
+    if parsed.snapshot_date != faa.report.snapshot_date
+        || parsed.archive_sha256 != faa.report.archive_sha256
+        || faa
+            .obsolete_hash_replacements
+            .get(&parsed.source_manifest_sha256)
+            .is_none()
+    {
+        bail!("legacy FAA hierarchy claim {claim_id} references a different release");
+    }
+    let facts = load_legacy_hierarchy_facts(source, &parsed).await?;
+    validate_legacy_hierarchy_facts(&parsed, &facts, claim_id)?;
+    validate_server_faa_hierarchy_evidence_id(&object.evidence_id, &parsed, &facts, claim_id)?;
+    let fact_values = facts
+        .iter()
+        .map(|row| match parsed.fact_kind {
+            ServerFaaHierarchyFactKind::Make => row.manufacturer_name.as_deref(),
+            ServerFaaHierarchyFactKind::Designation => row.model_name.as_deref(),
+        })
+        .collect::<BTreeSet<_>>();
+    if fact_values.len() != 1 || fact_values.contains(&None) {
+        bail!("legacy FAA hierarchy claim {claim_id} does not resolve to one exact ACFTREF fact");
+    }
+    let fact_value = fact_values
+        .into_iter()
+        .next()
+        .flatten()
+        .context("FAA hierarchy fact unexpectedly disappeared")?;
+    if parsed.reported_fact_debug != format!("{fact_value:?}") {
+        bail!("legacy FAA hierarchy claim {claim_id} quote disagrees with ACFTREF");
+    }
+    let current_record_hashes = parsed
+        .source_record_sha256s
+        .iter()
+        .map(|old| {
+            faa.obsolete_hash_replacements
+                .get(old)
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "legacy FAA hierarchy claim {claim_id} has no parser-derived record remap"
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let current_manifest = faa
+        .obsolete_hash_replacements
+        .get(&parsed.source_manifest_sha256)
+        .context("legacy FAA hierarchy claim has no parser-derived manifest remap")?;
+    let current_record_hashes = current_record_hashes.into_iter().collect::<Vec<_>>();
+    claim.set(
+        "evidence_source_id",
+        Value::from(faa.current_evidence_source_id),
+    )?;
+    claim.set(
+        "object_text",
+        Value::String(
+            serde_json::json!({
+                "projection_domain": "aircost:catalog-faa-hierarchy-claim-projection:v1",
+                "fact_kind": parsed.fact_kind.as_str(),
+                "fact_value": fact_value,
+                "faa_snapshot_id": faa.report.stored_snapshot_id,
+                "faa_snapshot_date": faa.report.snapshot_date,
+                "faa_archive_sha256": faa.report.archive_sha256,
+                "faa_source_manifest_sha256": current_manifest,
+                "faa_aircraft_code": parsed.aircraft_code,
+                "faa_source_record_sha256s": current_record_hashes,
+                "supports": ["hierarchy_identity"],
+            })
+            .to_string(),
+        ),
+    )?;
+    claim.set(
+        "quoted_evidence",
+        Value::String(format!(
+            "Current FAA ACFTREF {} {}={:?}; retained MASTER record sha256s {}",
+            parsed.aircraft_code,
+            match parsed.fact_kind {
+                ServerFaaHierarchyFactKind::Make => "manufacturer_name",
+                ServerFaaHierarchyFactKind::Designation => "model_name",
+            },
+            fact_value,
+            current_record_hashes.join(",")
+        )),
+    )?;
+    Ok(())
+}
+
+fn require_common_faa_claim_shape(claim: &ProjectionRow, claim_id: i64) -> Result<()> {
+    if claim.string("claim_kind")? != "identity"
+        || claim.string("validation_status")? != "validated"
+        || claim.value("validated_at").is_none_or(Value::is_null)
+        || claim.value("citation_start") != Some(&Value::Null)
+        || claim.value("citation_end") != Some(&Value::Null)
+    {
+        bail!("legacy FAA claim {claim_id} is not one exact validated identity claim");
+    }
+    Ok(())
+}
+
+fn parse_server_faa_hierarchy_claim(
+    fact_kind: ServerFaaHierarchyFactKind,
+    quote: &str,
+    claim_id: i64,
+) -> Result<ParsedServerFaaHierarchyClaim> {
+    let rest = quote
+        .strip_prefix(fact_kind.quote_prefix())
+        .with_context(|| {
+            format!("legacy FAA hierarchy claim {claim_id} quote has the wrong fact prefix")
+        })?;
+    let (reported_fact_debug, rest) = required_split(rest, "; snapshot_ids=", claim_id)?;
+    let provenance = format!("snapshot_ids={rest}");
+    let (snapshot_ids, rest) = required_split(rest, "; snapshot_date=", claim_id)?;
+    let (snapshot_date, rest) = required_split(rest, "; archive_sha256=", claim_id)?;
+    let (archive_sha256, rest) = required_split(rest, "; source_manifest_sha256=", claim_id)?;
+    let (source_manifest_sha256, rest) = required_split(rest, "; source_record_sha256=", claim_id)?;
+    let (source_record_sha256s, rest) = required_split(rest, "; n_numbers=", claim_id)?;
+    let (n_numbers, rest) = required_split(rest, "; aircraft_code=", claim_id)?;
+    let (aircraft_code, rest) = required_split(rest, "; observations=", claim_id)?;
+    let (observations, case_token) = rest.rsplit_once("; case_token=").with_context(|| {
+        format!("legacy FAA hierarchy claim {claim_id} quote omits case provenance")
+    })?;
+    if reported_fact_debug.is_empty()
+        || observations.is_empty()
+        || case_token.trim().is_empty()
+        || aircraft_code.trim().is_empty()
+        || snapshot_date.len() != 10
+    {
+        bail!("legacy FAA hierarchy claim {claim_id} has incomplete provenance");
+    }
+    require_lower_sha256(archive_sha256, "FAA hierarchy archive")?;
+    require_lower_sha256(source_manifest_sha256, "FAA hierarchy source manifest")?;
+    let snapshot_ids = parse_sorted_i64_set(snapshot_ids, "snapshot_ids", claim_id)?;
+    let source_record_sha256s =
+        parse_sorted_text_set(source_record_sha256s, "source_record_sha256", claim_id)?;
+    for digest in &source_record_sha256s {
+        require_lower_sha256(digest, "FAA hierarchy source record")?;
+    }
+    let n_numbers = parse_sorted_text_set(n_numbers, "n_numbers", claim_id)?;
+    for n_number in &n_numbers {
+        let normalized = crate::aircraft::faa::normalize_n_number(n_number).with_context(|| {
+            format!("legacy FAA hierarchy claim {claim_id} has an invalid N-number")
+        })?;
+        if normalized != *n_number {
+            bail!("legacy FAA hierarchy claim {claim_id} has a non-canonical N-number");
+        }
+    }
+    Ok(ParsedServerFaaHierarchyClaim {
+        fact_kind,
+        reported_fact_debug: reported_fact_debug.to_string(),
+        snapshot_ids,
+        snapshot_date: snapshot_date.to_string(),
+        archive_sha256: archive_sha256.to_string(),
+        source_manifest_sha256: source_manifest_sha256.to_string(),
+        source_record_sha256s,
+        n_numbers,
+        aircraft_code: aircraft_code.to_string(),
+        provenance,
+    })
+}
+
+async fn load_legacy_hierarchy_facts(
+    source: &mut SqliteConnection,
+    parsed: &ParsedServerFaaHierarchyClaim,
+) -> Result<Vec<LegacyHierarchyFactRow>> {
+    let mut query = QueryBuilder::<Sqlite>::new(
+        r#"SELECT aircraft.snapshot_id, aircraft.n_number, aircraft.aircraft_code,
+                  reference.manufacturer_name, reference.model_name,
+                  aircraft.source_record_sha256
+           FROM faa_registry_aircraft aircraft
+           JOIN faa_registry_aircraft_references reference
+             ON reference.snapshot_id = aircraft.snapshot_id
+            AND reference.aircraft_code = aircraft.aircraft_code
+           WHERE aircraft.aircraft_code = "#,
+    );
+    query.push_bind(&parsed.aircraft_code);
+    query.push(" AND aircraft.snapshot_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for snapshot_id in &parsed.snapshot_ids {
+            separated.push_bind(snapshot_id);
+        }
+    }
+    query.push(") AND aircraft.n_number IN (");
+    {
+        let mut separated = query.separated(", ");
+        for n_number in &parsed.n_numbers {
+            separated.push_bind(n_number);
+        }
+    }
+    query.push(") AND aircraft.source_record_sha256 IN (");
+    {
+        let mut separated = query.separated(", ");
+        for digest in &parsed.source_record_sha256s {
+            separated.push_bind(digest);
+        }
+    }
+    query.push(") ORDER BY aircraft.snapshot_id, aircraft.n_number");
+    Ok(query.build_query_as().fetch_all(&mut *source).await?)
+}
+
+fn validate_legacy_hierarchy_facts(
+    parsed: &ParsedServerFaaHierarchyClaim,
+    facts: &[LegacyHierarchyFactRow],
+    claim_id: i64,
+) -> Result<()> {
+    if facts.is_empty()
+        || facts
+            .iter()
+            .map(|row| row.snapshot_id)
+            .collect::<BTreeSet<_>>()
+            != parsed.snapshot_ids
+        || facts
+            .iter()
+            .map(|row| row.n_number.clone())
+            .collect::<BTreeSet<_>>()
+            != parsed.n_numbers
+        || facts
+            .iter()
+            .map(|row| row.source_record_sha256.clone())
+            .collect::<BTreeSet<_>>()
+            != parsed.source_record_sha256s
+        || facts
+            .iter()
+            .any(|row| row.aircraft_code != parsed.aircraft_code)
+    {
+        bail!("legacy FAA hierarchy claim {claim_id} does not match its retained FAA rows");
+    }
+    Ok(())
+}
+
+fn validate_server_faa_hierarchy_evidence_id(
+    evidence_id: &str,
+    parsed: &ParsedServerFaaHierarchyClaim,
+    facts: &[LegacyHierarchyFactRow],
+    claim_id: i64,
+) -> Result<()> {
+    let fact_values = facts
+        .iter()
+        .map(|row| match parsed.fact_kind {
+            ServerFaaHierarchyFactKind::Make => row.manufacturer_name.as_deref(),
+            ServerFaaHierarchyFactKind::Designation => row.model_name.as_deref(),
+        })
+        .collect::<BTreeSet<_>>();
+    if fact_values.len() != 1 || fact_values.contains(&None) {
+        bail!("legacy FAA hierarchy claim {claim_id} does not resolve to one exact ACFTREF fact");
+    }
+    let fact_value = fact_values
+        .into_iter()
+        .next()
+        .flatten()
+        .context("FAA hierarchy fact unexpectedly disappeared")?;
+    let expected =
+        server_faa_hierarchy_evidence_id(parsed.fact_kind, fact_value, &parsed.provenance)?;
+    if evidence_id != expected {
+        bail!(
+            "legacy FAA hierarchy claim {claim_id} evidence ID does not authenticate its receipt"
+        );
+    }
+    Ok(())
+}
+
+fn server_faa_hierarchy_evidence_id(
+    fact_kind: ServerFaaHierarchyFactKind,
+    fact_value: &str,
+    provenance: &str,
+) -> Result<String> {
+    let case_token = provenance
+        .rsplit_once("; case_token=")
+        .map(|(_, case_token)| case_token)
+        .filter(|value| !value.trim().is_empty())
+        .context("FAA hierarchy provenance omits its case token")?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"aircost-server-faa-evidence-v1\0");
+    hasher.update(case_token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(fact_kind.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(fact_value.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(provenance.as_bytes());
+    Ok(format!(
+        "server_faa_registry.{}.{:x}",
+        fact_kind.as_str(),
+        hasher.finalize()
+    ))
+}
+
+fn required_split<'a>(value: &'a str, marker: &str, claim_id: i64) -> Result<(&'a str, &'a str)> {
+    value
+        .split_once(marker)
+        .with_context(|| format!("legacy FAA hierarchy claim {claim_id} quote omits {marker:?}"))
+}
+
+fn parse_sorted_i64_set(value: &str, field: &str, claim_id: i64) -> Result<BTreeSet<i64>> {
+    let values = value
+        .split(',')
+        .map(|part| part.parse::<i64>())
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .with_context(|| format!("legacy FAA hierarchy claim {claim_id} has invalid {field}"))?;
+    if values.is_empty()
+        || values.iter().any(|value| *value <= 0)
+        || values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+            != value
+    {
+        bail!("legacy FAA hierarchy claim {claim_id} has non-canonical {field}");
+    }
+    Ok(values)
+}
+
+fn parse_sorted_text_set(value: &str, field: &str, claim_id: i64) -> Result<BTreeSet<String>> {
+    let values = value
+        .split(',')
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if values.is_empty()
+        || values.iter().any(|value| value.is_empty())
+        || values
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+            != value
+    {
+        bail!("legacy FAA hierarchy claim {claim_id} has non-canonical {field}");
+    }
+    Ok(values)
+}
+
+fn require_lower_sha256(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || value != value.to_ascii_lowercase()
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("{label} is not one lowercase SHA-256 digest");
     }
     Ok(())
 }
@@ -1411,4 +1888,82 @@ async fn validate_projected_target(target: &AppDb, bundle: &ProjectionBundle) ->
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARCHIVE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MANIFEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RECORD: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn hierarchy_quote(snapshot_ids: &str, n_numbers: &str) -> String {
+        format!(
+            "Imported FAA ACFTREF reports manufacturer_name=\"CESSNA AIRCRAFT COMPANY\"; snapshot_ids={snapshot_ids}; snapshot_date=2026-07-21; archive_sha256={ARCHIVE}; source_manifest_sha256={MANIFEST}; source_record_sha256={RECORD}; n_numbers={n_numbers}; aircraft_code=2072738; observations=11:dddd:\"Cessna\":\"182\":\"182T\":2004; case_token=case-11"
+        )
+    }
+
+    fn hierarchy_fact() -> LegacyHierarchyFactRow {
+        LegacyHierarchyFactRow {
+            snapshot_id: 4,
+            n_number: "N123AB".into(),
+            aircraft_code: "2072738".into(),
+            manufacturer_name: Some("CESSNA AIRCRAFT COMPANY".into()),
+            model_name: Some("182T".into()),
+            source_record_sha256: RECORD.into(),
+        }
+    }
+
+    #[test]
+    fn parses_and_authenticates_exact_server_faa_hierarchy_receipt() {
+        let parsed = parse_server_faa_hierarchy_claim(
+            ServerFaaHierarchyFactKind::Make,
+            &hierarchy_quote("4", "N123AB"),
+            19,
+        )
+        .unwrap();
+        let facts = [hierarchy_fact()];
+        validate_legacy_hierarchy_facts(&parsed, &facts, 19).unwrap();
+        let evidence_id = server_faa_hierarchy_evidence_id(
+            ServerFaaHierarchyFactKind::Make,
+            "CESSNA AIRCRAFT COMPANY",
+            &parsed.provenance,
+        )
+        .unwrap();
+        validate_server_faa_hierarchy_evidence_id(&evidence_id, &parsed, &facts, 19).unwrap();
+        assert_eq!(parsed.snapshot_ids, BTreeSet::from([4]));
+        assert_eq!(parsed.n_numbers, BTreeSet::from(["N123AB".to_string()]));
+        assert_eq!(
+            parsed.source_record_sha256s,
+            BTreeSet::from([RECORD.into()])
+        );
+    }
+
+    #[test]
+    fn rejects_mutated_or_noncanonical_server_faa_hierarchy_receipt() {
+        let parsed = parse_server_faa_hierarchy_claim(
+            ServerFaaHierarchyFactKind::Make,
+            &hierarchy_quote("4", "N123AB"),
+            20,
+        )
+        .unwrap();
+        let facts = [hierarchy_fact()];
+        let wrong_id = format!("server_faa_registry.make.{}", "d".repeat(64));
+        assert!(
+            validate_server_faa_hierarchy_evidence_id(&wrong_id, &parsed, &facts, 20)
+                .unwrap_err()
+                .to_string()
+                .contains("does not authenticate")
+        );
+
+        let error = parse_server_faa_hierarchy_claim(
+            ServerFaaHierarchyFactKind::Make,
+            &hierarchy_quote("5,4", "N123AB"),
+            21,
+        )
+        .err()
+        .expect("unsorted snapshot set must fail");
+        assert!(error.to_string().contains("non-canonical snapshot_ids"));
+    }
 }
