@@ -236,10 +236,6 @@ struct CandidateScopeRow {
     serial_prefix: Option<String>,
     serial_from_sort_key: Option<String>,
     serial_to_sort_key: Option<String>,
-}
-
-#[derive(Debug, FromRow)]
-struct ReferenceFactCounts {
     full_price_count: i64,
     price_usd: Option<f64>,
     price_reference_year: Option<i64>,
@@ -251,6 +247,12 @@ struct ReferenceFactCounts {
     engines_complete: bool,
     propellers_complete: bool,
     features_complete: bool,
+}
+
+#[cfg(test)]
+struct CandidateSnapshotInterlock {
+    snapshot_selected: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug, FromRow)]
@@ -319,6 +321,20 @@ macro_rules! query_scalar_one {
 pub async fn listing_reference_status(
     db: &AppDb,
     listing_id: i64,
+) -> Result<ListingReferenceStatus, sqlx::Error> {
+    listing_reference_status_impl(
+        db,
+        listing_id,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn listing_reference_status_impl(
+    db: &AppDb,
+    listing_id: i64,
+    #[cfg(test)] interlock: Option<CandidateSnapshotInterlock>,
 ) -> Result<ListingReferenceStatus, sqlx::Error> {
     let identity = query_as_optional!(
         db,
@@ -462,7 +478,65 @@ pub async fn listing_reference_status(
                scope.applies_to_all_serials,
                scope.serial_prefix,
                scope.serial_from_sort_key,
-               scope.serial_to_sort_key
+               scope.serial_to_sort_key,
+               (SELECT COUNT(*) FROM aircraft_reference_prices price
+                JOIN curation_evidence_claims claim
+                  ON claim.id = price.evidence_claim_id
+                WHERE price.aircraft_reference_configuration_version_id = version.id
+                  AND price.price_kind = 'equipped_msrp'
+                  AND price.currency = 'USD'
+                  AND price.evidence_kind = 'direct_model_year'
+                  AND price.configuration_basis = 'full_standard_configuration'
+                  AND claim.claim_kind = 'price') AS full_price_count,
+               (SELECT price.amount FROM aircraft_reference_prices price
+                WHERE price.aircraft_reference_configuration_version_id = version.id
+                  AND price.price_kind = 'equipped_msrp'
+                  AND price.currency = 'USD'
+                  AND price.evidence_kind = 'direct_model_year'
+                  AND price.configuration_basis = 'full_standard_configuration'
+                ORDER BY price.id LIMIT 1) AS price_usd,
+               (SELECT price.price_reference_year
+                FROM aircraft_reference_prices price
+                WHERE price.aircraft_reference_configuration_version_id = version.id
+                  AND price.price_kind = 'equipped_msrp'
+                  AND price.currency = 'USD'
+                  AND price.evidence_kind = 'direct_model_year'
+                  AND price.configuration_basis = 'full_standard_configuration'
+                ORDER BY price.id LIMIT 1) AS price_reference_year,
+               (SELECT COUNT(*) FROM aircraft_reference_avionics fact
+                WHERE fact.aircraft_reference_configuration_version_id = version.id)
+                  AS avionics_count,
+               (SELECT CAST(COALESCE(SUM(fact.quantity), 0) AS BIGINT)
+                FROM aircraft_reference_engines fact
+                WHERE fact.aircraft_reference_configuration_version_id = version.id)
+                  AS engine_count,
+               (SELECT CAST(COALESCE(SUM(fact.quantity), 0) AS BIGINT)
+                FROM aircraft_reference_propellers fact
+                WHERE fact.aircraft_reference_configuration_version_id = version.id)
+                  AS propeller_count,
+               (SELECT COUNT(*) FROM aircraft_reference_features fact
+                WHERE fact.aircraft_reference_configuration_version_id = version.id)
+                  AS feature_count,
+               EXISTS (
+                 SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
+                 WHERE attestation.aircraft_reference_configuration_version_id = version.id
+                   AND attestation.fact_set_kind = 'avionics'
+               ) AS avionics_complete,
+               EXISTS (
+                 SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
+                 WHERE attestation.aircraft_reference_configuration_version_id = version.id
+                   AND attestation.fact_set_kind = 'engines'
+               ) AS engines_complete,
+               EXISTS (
+                 SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
+                 WHERE attestation.aircraft_reference_configuration_version_id = version.id
+                   AND attestation.fact_set_kind = 'propellers'
+               ) AS propellers_complete,
+               EXISTS (
+                 SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
+                 WHERE attestation.aircraft_reference_configuration_version_id = version.id
+                   AND attestation.fact_set_kind = 'features'
+               ) AS features_complete
         FROM aircraft_reference_configuration_versions version
         JOIN aircraft_reference_configurations configuration
           ON configuration.id = version.aircraft_reference_configuration_id
@@ -482,6 +556,17 @@ pub async fn listing_reference_status(
         identity.aircraft_factory_package_id,
         identity.model_year
     )?;
+    #[cfg(test)]
+    if let Some(interlock) = interlock {
+        interlock
+            .snapshot_selected
+            .send(())
+            .expect("reference-status interlock receiver must remain open");
+        interlock
+            .resume
+            .await
+            .expect("reference-status interlock sender must remain open");
+    }
     let mut candidates = BTreeMap::<i64, (CandidateScopeRow, BTreeSet<String>)>::new();
     for scope in scopes {
         if !scope_matches_serial(&scope, &serial, &serial_sort_key) {
@@ -513,86 +598,31 @@ pub async fn listing_reference_status(
         return Ok(status_with_gaps(listing_id, building_version_count, gaps));
     }
     let (_, (candidate, markets)) = candidates.into_iter().next().expect("one candidate");
-    let facts = query_as_optional!(
-        db,
-        ReferenceFactCounts,
-        r#"
-        SELECT
-          (SELECT COUNT(*) FROM aircraft_reference_prices price
-           JOIN curation_evidence_claims claim ON claim.id = price.evidence_claim_id
-           WHERE price.aircraft_reference_configuration_version_id = version.id
-             AND price.price_kind = 'equipped_msrp'
-             AND price.currency = 'USD'
-             AND price.evidence_kind = 'direct_model_year'
-             AND price.configuration_basis = 'full_standard_configuration'
-             AND claim.claim_kind = 'price') AS full_price_count,
-          (SELECT price.amount FROM aircraft_reference_prices price
-           WHERE price.aircraft_reference_configuration_version_id = version.id
-             AND price.price_kind = 'equipped_msrp'
-             AND price.currency = 'USD'
-             AND price.evidence_kind = 'direct_model_year'
-             AND price.configuration_basis = 'full_standard_configuration'
-           ORDER BY price.id LIMIT 1) AS price_usd,
-          (SELECT price.price_reference_year FROM aircraft_reference_prices price
-           WHERE price.aircraft_reference_configuration_version_id = version.id
-             AND price.price_kind = 'equipped_msrp'
-             AND price.currency = 'USD'
-             AND price.evidence_kind = 'direct_model_year'
-             AND price.configuration_basis = 'full_standard_configuration'
-           ORDER BY price.id LIMIT 1) AS price_reference_year,
-          (SELECT COUNT(*) FROM aircraft_reference_avionics fact
-           WHERE fact.aircraft_reference_configuration_version_id = version.id) AS avionics_count,
-          (SELECT CAST(COALESCE(SUM(fact.quantity), 0) AS BIGINT)
-           FROM aircraft_reference_engines fact
-           WHERE fact.aircraft_reference_configuration_version_id = version.id) AS engine_count,
-          (SELECT CAST(COALESCE(SUM(fact.quantity), 0) AS BIGINT)
-           FROM aircraft_reference_propellers fact
-           WHERE fact.aircraft_reference_configuration_version_id = version.id) AS propeller_count,
-          (SELECT COUNT(*) FROM aircraft_reference_features fact
-           WHERE fact.aircraft_reference_configuration_version_id = version.id) AS feature_count,
-          EXISTS (SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
-           WHERE attestation.aircraft_reference_configuration_version_id = version.id
-             AND attestation.fact_set_kind = 'avionics') AS avionics_complete,
-          EXISTS (SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
-           WHERE attestation.aircraft_reference_configuration_version_id = version.id
-             AND attestation.fact_set_kind = 'engines') AS engines_complete,
-          EXISTS (SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
-           WHERE attestation.aircraft_reference_configuration_version_id = version.id
-             AND attestation.fact_set_kind = 'propellers') AS propellers_complete,
-          EXISTS (SELECT 1 FROM aircraft_reference_fact_set_attestations attestation
-           WHERE attestation.aircraft_reference_configuration_version_id = version.id
-             AND attestation.fact_set_kind = 'features') AS features_complete
-        FROM aircraft_reference_configuration_versions version
-        WHERE version.id = ? AND version.publication_state = 'published'
-        "#,
-        candidate.version_id
-    )?
-    .expect("selected published version still exists");
-    if facts.full_price_count != 1 {
+    if candidate.full_price_count != 1 {
         gaps.push(ReferenceGap::new(
             "full_standard_configuration_price_missing",
             "published profile must contain exactly one direct USD full-configuration price",
         ));
     }
-    if !facts.engines_complete {
+    if !candidate.engines_complete {
         gaps.push(ReferenceGap::new(
             "factory_engine_configuration_missing",
             "published profile has no factory engine configuration",
         ));
     }
-    if !facts.propellers_complete {
+    if !candidate.propellers_complete {
         gaps.push(ReferenceGap::new(
             "factory_propeller_configuration_missing",
             "published profile has no factory propeller configuration",
         ));
     }
-    if !facts.avionics_complete {
+    if !candidate.avionics_complete {
         gaps.push(ReferenceGap::new(
             "factory_avionics_configuration_missing",
             "published profile has no curated factory avionics configuration",
         ));
     }
-    if !facts.features_complete {
+    if !candidate.features_complete {
         gaps.push(ReferenceGap::new(
             "factory_feature_configuration_missing",
             "published profile has no curated material feature configuration",
@@ -610,14 +640,16 @@ pub async fn listing_reference_status(
             display_name: candidate.display_name,
             model_year: candidate.model_year,
             market_codes: markets.into_iter().collect(),
-            price_usd: facts.price_usd.expect("one complete price has an amount"),
-            price_reference_year: facts
+            price_usd: candidate
+                .price_usd
+                .expect("one complete price has an amount"),
+            price_reference_year: candidate
                 .price_reference_year
                 .expect("one complete price has a reference year"),
-            avionics_count: facts.avionics_count,
-            engine_count: facts.engine_count,
-            propeller_count: facts.propeller_count,
-            feature_count: facts.feature_count,
+            avionics_count: candidate.avionics_count,
+            engine_count: candidate.engine_count,
+            propeller_count: candidate.propeller_count,
+            feature_count: candidate.feature_count,
         }),
         gaps,
         building_version_count,
@@ -1394,6 +1426,17 @@ mod tests {
             serial_prefix: None,
             serial_from_sort_key: from.map(aircraft_serial_sort_key),
             serial_to_sort_key: to.map(aircraft_serial_sort_key),
+            full_price_count: 1,
+            price_usd: Some(500_000.0),
+            price_reference_year: Some(2020),
+            avionics_count: 0,
+            engine_count: 1,
+            propeller_count: 1,
+            feature_count: 0,
+            avionics_complete: true,
+            engines_complete: true,
+            propellers_complete: true,
+            features_complete: true,
         }
     }
 
@@ -1426,6 +1469,205 @@ mod tests {
             .map(|scope| scope.version_id)
             .collect::<BTreeSet<_>>();
         assert_eq!(matching, BTreeSet::from([1, 2]));
+    }
+
+    #[tokio::test]
+    async fn listing_reference_status_keeps_candidate_and_facts_snapshot_coherent_during_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("reference-status-race.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        sqlx::raw_sql(include_str!(
+            "../../../tests/schema/aircraft_reference_catalog.sqlite.sql"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        let predecessor_price: f64 = sqlx::query_scalar(
+            "SELECT amount FROM aircraft_reference_prices \
+             WHERE aircraft_reference_configuration_version_id = 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let replacement_decision_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_identity_decisions (
+              resolution_case_id, entity_kind, decision_action, decision_status,
+              decision_payload_json, deterministic_validation_json,
+              deterministic_validation_passed, rationale, decided_at
+            ) VALUES (
+              1, 'reference_profile', 'approve_new', 'approved', '{}', '{}',
+              TRUE, 'race-safe replacement', '2026-08-21'
+            ) RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO aircraft_identity_decision_claims \
+             (decision_id, evidence_claim_id, evidence_role) \
+             VALUES (?, 1, 'identity')",
+        )
+        .bind(replacement_decision_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let replacement_version_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_reference_configuration_versions (
+              aircraft_reference_configuration_id, model_year, revision,
+              supersedes_version_id, approval_decision_id
+            ) VALUES (1, 2020, 2, 1, ?) RETURNING id
+            "#,
+        )
+        .bind(replacement_decision_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for statement in [
+            "INSERT INTO aircraft_reference_applicability_scopes (aircraft_reference_configuration_version_id, aircraft_market_id, applies_to_all_serials, evidence_claim_id) SELECT ?, aircraft_market_id, applies_to_all_serials, evidence_claim_id FROM aircraft_reference_applicability_scopes WHERE aircraft_reference_configuration_version_id = 1",
+            "INSERT INTO aircraft_reference_prices (aircraft_reference_configuration_version_id, price_kind, amount, currency, price_reference_year, configuration_basis, evidence_kind, evidence_claim_id) SELECT ?, price_kind, amount + 1000, currency, price_reference_year, configuration_basis, evidence_kind, evidence_claim_id FROM aircraft_reference_prices WHERE aircraft_reference_configuration_version_id = 1",
+            "INSERT INTO aircraft_reference_engines (aircraft_reference_configuration_version_id, aircraft_engine_catalog_model_id, quantity, equipment_role, evidence_claim_id) SELECT ?, aircraft_engine_catalog_model_id, quantity, equipment_role, evidence_claim_id FROM aircraft_reference_engines WHERE aircraft_reference_configuration_version_id = 1",
+            "INSERT INTO aircraft_reference_propellers (aircraft_reference_configuration_version_id, aircraft_propeller_catalog_model_id, quantity, equipment_role, evidence_claim_id) SELECT ?, aircraft_propeller_catalog_model_id, quantity, equipment_role, evidence_claim_id FROM aircraft_reference_propellers WHERE aircraft_reference_configuration_version_id = 1",
+            "INSERT INTO aircraft_reference_fact_set_attestations (aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id) SELECT ?, fact_set_kind, evidence_claim_id FROM aircraft_reference_fact_set_attestations WHERE aircraft_reference_configuration_version_id = 1",
+        ] {
+            sqlx::query(statement)
+                .bind(replacement_version_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO curation_evidence_sources (
+              source_url, source_title, source_domain, source_tier,
+              content_sha256, retrieved_at
+            ) VALUES (
+              'https://www.faa.gov/reference-status-race.zip',
+              'FAA reference status race fixture', 'faa.gov',
+              'regulator_primary',
+              '0000000000000000000000000000000000000000000000000000000000000000',
+              '2026-08-21'
+            );
+            INSERT INTO faa_registry_snapshots (
+              evidence_source_id, snapshot_date, source_url, archive_sha256,
+              source_manifest_sha256, target_set_sha256,
+              master_member_name, master_member_sha256,
+              aircraft_member_name, aircraft_member_sha256,
+              engine_member_name, engine_member_sha256, record_hash_domain
+            ) SELECT id, '2026-08-21', source_url, content_sha256,
+              '1111111111111111111111111111111111111111111111111111111111111111',
+              '2222222222222222222222222222222222222222222222222222222222222222',
+              'MASTER.txt',
+              '3333333333333333333333333333333333333333333333333333333333333333',
+              'ACFTREF.txt',
+              '4444444444444444444444444444444444444444444444444444444444444444',
+              'ENGINE.txt',
+              '5555555555555555555555555555555555555555555555555555555555555555',
+              'aircost-faa-master-retained-aircraft-projection-v1'
+            FROM curation_evidence_sources
+            WHERE source_title = 'FAA reference status race fixture';
+            INSERT INTO faa_registry_aircraft (
+              snapshot_id, n_number, manufacturer_serial_raw,
+              manufacturer_serial_key, aircraft_code, year_manufactured,
+              source_record_sha256
+            ) VALUES (
+              1, 'N123AB', 'SR100', 'SR100', 'SR22', 2020,
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            );
+            INSERT INTO faa_registry_coverage (snapshot_id, n_number, lookup_status)
+            VALUES (1, 'N123AB', 'matched');
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, registration_number, serial_number,
+              airframe_hours
+            ) SELECT placeholder.aircraft_model_variant_id, user.id,
+                'https://listing.test/reference-status-race', 2020, 500000,
+                'N123AB', 'SR100', 100
+              FROM aircraft_sale_listing_pending_compatibility_placeholder placeholder
+              JOIN users user ON user.auth_subject = 'schema-test'
+              WHERE placeholder.singleton_id = 1;
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let assignment_trigger_names = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'trigger' \
+               AND tbl_name IN ( \
+                 'aircraft_sale_listing_identity_assignments', \
+                 'aircraft_sale_listing_current_identity_assignments' \
+               )",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        for trigger_name in assignment_trigger_names {
+            let quoted_name = trigger_name.replace('"', "\"\"");
+            sqlx::query(&format!("DROP TRIGGER \"{quoted_name}\""))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO aircraft_sale_listing_identity_assignments (
+              aircraft_sale_listing_id, aircraft_make_id,
+              aircraft_model_family_id, aircraft_designation_id,
+              aircraft_generation_id, aircraft_factory_package_id,
+              identity_decision_id, identity_evidence_claim_id,
+              faa_registry_snapshot_id, faa_n_number, faa_source_record_sha256
+            ) VALUES (
+              1, 1, 1, 1, 1, 1, 3, 1, 1, 'N123AB',
+              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            );
+            INSERT INTO aircraft_sale_listing_current_identity_assignments (
+              aircraft_sale_listing_id, identity_assignment_id
+            ) VALUES (1, 1);
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let (snapshot_selected, wait_for_snapshot) = tokio::sync::oneshot::channel();
+        let (resume, wait_for_publish) = tokio::sync::oneshot::channel();
+        let status_db = db.clone();
+        let status_task = tokio::spawn(async move {
+            listing_reference_status_impl(
+                &status_db,
+                1,
+                Some(CandidateSnapshotInterlock {
+                    snapshot_selected,
+                    resume: wait_for_publish,
+                }),
+            )
+            .await
+        });
+        wait_for_snapshot.await.unwrap();
+        publish_reference_version(&db, replacement_version_id)
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+
+        let during_publish = status_task.await.unwrap().unwrap();
+        assert!(during_publish.ready, "{:?}", during_publish.gaps);
+        let during_publish_profile = during_publish.published.unwrap();
+        assert_eq!(during_publish_profile.version_id, 1);
+        assert_eq!(during_publish_profile.price_usd, predecessor_price);
+        let after_publish = listing_reference_status(&db, 1).await.unwrap();
+        assert!(after_publish.ready, "{:?}", after_publish.gaps);
+        let after_publish_profile = after_publish.published.unwrap();
+        assert_eq!(after_publish_profile.version_id, replacement_version_id);
+        assert_eq!(after_publish_profile.price_usd, predecessor_price + 1_000.0);
     }
 
     #[tokio::test]
