@@ -10,7 +10,7 @@
 
 BEGIN;
 
-SET LOCAL search_path = public, pg_catalog;
+SET LOCAL search_path = public, pg_catalog, pg_temp;
 
 CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,

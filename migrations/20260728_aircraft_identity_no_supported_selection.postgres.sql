@@ -11,7 +11,7 @@
 
 BEGIN;
 
-SET LOCAL search_path = public, pg_catalog;
+SET LOCAL search_path = public, pg_catalog, pg_temp;
 
 LOCK TABLE public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;

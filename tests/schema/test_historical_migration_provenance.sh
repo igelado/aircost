@@ -72,7 +72,7 @@ extract_postgres_ledger_lock() {
 }
 
 extract_postgres_search_path() {
-  grep -m1 '^SET LOCAL search_path = public, pg_catalog;$' "$1"
+  grep -m1 '^SET LOCAL search_path = public, pg_catalog, pg_temp;$' "$1"
 }
 
 contract_version() {
@@ -114,11 +114,11 @@ assert_postgres_ledger_lock_placement() {
   local file="$1"
   local transaction_line search_path_line create_line lock_line guard_line marker_line
   local lock_statement
-  test "$(grep -c '^SET LOCAL search_path = public, pg_catalog;$' "$file")" = 1
+  test "$(grep -c '^SET LOCAL search_path = public, pg_catalog, pg_temp;$' "$file")" = 1
   test "$(grep -c '^LOCK TABLE public[.]schema_migration_contracts$' "$file")" = 1
   transaction_line="$(grep -n -m1 '^BEGIN;$' "$file" | cut -d: -f1)"
   search_path_line="$(grep -n -m1 \
-    '^SET LOCAL search_path = public, pg_catalog;$' "$file" | cut -d: -f1)"
+    '^SET LOCAL search_path = public, pg_catalog, pg_temp;$' "$file" | cut -d: -f1)"
   create_line="$(grep -n -m1 \
     '^CREATE TABLE IF NOT EXISTS \(public[.]\)\?schema_migration_contracts' \
     "$file" | cut -d: -f1 || true)"
@@ -593,6 +593,65 @@ test_postgres_hostile_search_path_is_transaction_local() {
   execute_sql postgres 'DROP SCHEMA historical_provenance_attacker CASCADE'
 }
 
+test_postgres_temporary_shadows_are_searched_last() {
+  local migration file tuple version fingerprint session_output
+  migration=20260804_avionics_grounded_evidence_refresh
+  file="$repository_root/migrations/$migration.postgres.sql"
+  tuple="$(contract_tuple "$migration" postgres)"
+  version="${tuple%%:*}"
+  fingerprint="${tuple#*:}"
+
+  session_output="$({
+    echo 'CREATE TEMP TABLE schema_migration_contracts (LIKE public.schema_migration_contracts INCLUDING ALL);'
+    echo 'CREATE TEMP TABLE historical_migration_domain_probe (LIKE public.historical_migration_domain_probe INCLUDING ALL);'
+    echo 'INSERT INTO pg_temp.historical_migration_domain_probe VALUES (1,0);'
+    printf "INSERT INTO pg_temp.schema_migration_contracts VALUES ('%s',%s,'%s','%s');\n" \
+      "$migration" "$version" "$fingerprint" "$sentinel_installed_at"
+    printf "UPDATE public.schema_migration_contracts SET contract_version=NULL,contract_fingerprint='%s',installed_at='%s' WHERE migration_name='%s';\n" \
+      "$fingerprint" "$sentinel_installed_at" "$migration"
+    echo 'UPDATE public.historical_migration_domain_probe SET mutation_count=0 WHERE id=1;'
+    echo 'BEGIN;'
+    extract_postgres_search_path "$file"
+    extract_postgres_ledger_lock "$file"
+    extract_postgres_guard "$file"
+    echo 'UPDATE historical_migration_domain_probe SET mutation_count = mutation_count + 1 WHERE id = 1;'
+    extract_marker_insert "$file"
+    echo 'ROLLBACK;'
+    printf "SELECT 'reject_public_receipt|' || COALESCE(contract_version::text,'NULL') || '|' || COALESCE(contract_fingerprint,'NULL') || '|' || installed_at FROM public.schema_migration_contracts WHERE migration_name='%s';\n" "$migration"
+    printf "SELECT 'reject_temp_receipt|' || COALESCE(contract_version::text,'NULL') || '|' || COALESCE(contract_fingerprint,'NULL') || '|' || installed_at FROM pg_temp.schema_migration_contracts WHERE migration_name='%s';\n" "$migration"
+    echo "SELECT 'reject_public_probe|' || mutation_count FROM public.historical_migration_domain_probe WHERE id=1;"
+    echo "SELECT 'reject_temp_probe|' || mutation_count FROM pg_temp.historical_migration_domain_probe WHERE id=1;"
+
+    printf "UPDATE public.schema_migration_contracts SET contract_version=%s,contract_fingerprint='%s',installed_at='%s' WHERE migration_name='%s';\n" \
+      "$version" "$fingerprint" "$sentinel_installed_at" "$migration"
+    printf "UPDATE pg_temp.schema_migration_contracts SET contract_version=99,contract_fingerprint='%s',installed_at='%s' WHERE migration_name='%s';\n" \
+      "$hostile_fingerprint" "$sentinel_installed_at" "$migration"
+    echo 'UPDATE public.historical_migration_domain_probe SET mutation_count=0 WHERE id=1;'
+    echo 'UPDATE pg_temp.historical_migration_domain_probe SET mutation_count=0 WHERE id=1;'
+    echo 'BEGIN;'
+    extract_postgres_search_path "$file"
+    extract_postgres_ledger_lock "$file"
+    extract_postgres_guard "$file"
+    echo 'UPDATE historical_migration_domain_probe SET mutation_count = mutation_count + 1 WHERE id = 1;'
+    extract_marker_insert "$file"
+    echo 'COMMIT;'
+    printf "SELECT 'accept_public_receipt|' || contract_version || '|' || contract_fingerprint || '|' || installed_at FROM public.schema_migration_contracts WHERE migration_name='%s';\n" "$migration"
+    printf "SELECT 'accept_temp_receipt|' || contract_version || '|' || contract_fingerprint || '|' || installed_at FROM pg_temp.schema_migration_contracts WHERE migration_name='%s';\n" "$migration"
+    echo "SELECT 'accept_public_probe|' || mutation_count FROM public.historical_migration_domain_probe WHERE id=1;"
+    echo "SELECT 'accept_temp_probe|' || mutation_count FROM pg_temp.historical_migration_domain_probe WHERE id=1;"
+  } | psql "$database_url" -v ON_ERROR_STOP=0 -qAt 2>&1)"
+
+  [[ "$session_output" == *'installed avionics grounded-evidence refresh migration has a different contract'* ]]
+  [[ "$session_output" == *"reject_public_receipt|NULL|$fingerprint|$sentinel_installed_at"* ]]
+  [[ "$session_output" == *"reject_temp_receipt|$version|$fingerprint|$sentinel_installed_at"* ]]
+  [[ "$session_output" == *'reject_public_probe|0'* ]]
+  [[ "$session_output" == *'reject_temp_probe|0'* ]]
+  [[ "$session_output" == *"accept_public_receipt|$version|$fingerprint|$sentinel_installed_at"* ]]
+  [[ "$session_output" == *"accept_temp_receipt|99|$hostile_fingerprint|$sentinel_installed_at"* ]]
+  [[ "$session_output" == *'accept_public_probe|1'* ]]
+  [[ "$session_output" == *'accept_temp_probe|0'* ]]
+}
+
 for backend in sqlite postgres; do
   initialize_backend "$backend"
   test_strict_contracts "$backend"
@@ -601,5 +660,6 @@ done
 
 test_postgres_concurrent_receipt_writers
 test_postgres_hostile_search_path_is_transaction_local
+test_postgres_temporary_shadows_are_searched_last
 
 echo 'Historical migration provenance contracts passed'

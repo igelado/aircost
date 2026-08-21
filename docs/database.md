@@ -1560,16 +1560,18 @@ fingerprint—including a null value exposed by a weakened receipt table—abort
 before subsequent domain statements execute. Operators must investigate a
 mismatch instead of rerunning a migration to heal the marker.
 
-Each PostgreSQL file pins its transaction-local search path to `public` and
-`pg_catalog`, then holds a transaction-wide `SHARE ROW EXCLUSIVE` lock on
-`public.schema_migration_contracts` from before its guard through the final
-receipt insert. Shadow objects on the caller's search path cannot replace the
-canonical ledger or domain objects, and the caller's search path is restored
-at commit. A ledger writer that started first must commit before the guard
-reads the receipt, while a later writer waits until the migration commits. The
-guard and domain statements therefore cannot observe different committed
-receipt states during one standalone rerun. SQLite obtains the corresponding
-write serialization from `BEGIN IMMEDIATE`.
+Each PostgreSQL file pins its transaction-local search path to `public`,
+`pg_catalog`, and an explicitly last `pg_temp`, then holds a transaction-wide
+`SHARE ROW EXCLUSIVE` lock on `public.schema_migration_contracts` from before
+its guard through the final receipt insert. Explicitly placing `pg_temp` last
+prevents PostgreSQL's implicit temporary-relation precedence from replacing
+the canonical ledger or domain objects; shadows on the caller's search path
+are likewise ignored. The caller's search path is restored at commit. A ledger
+writer that started first must commit before the guard reads the receipt, while
+a later writer waits until the migration commits. The guard and domain
+statements therefore cannot observe different committed receipt states during
+one standalone rerun. SQLite obtains the corresponding write serialization
+from `BEGIN IMMEDIATE`.
 
 The only historical in-place receipt upgrades are the documented version-1 to
 version-2 transitions in the default-avionics quarantine and avionics product
