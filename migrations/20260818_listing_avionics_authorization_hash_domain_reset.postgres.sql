@@ -4,6 +4,11 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog;
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 -- Exclude old-binary authorization writers until both invalidation and the
 -- reset contract commit. SHARE ROW EXCLUSIVE conflicts with INSERT's ROW
 -- EXCLUSIVE lock while still allowing ordinary reads.

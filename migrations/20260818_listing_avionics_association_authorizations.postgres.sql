@@ -3,6 +3,11 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog;
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 DO $migration_guard$
 BEGIN
   IF NOT EXISTS (

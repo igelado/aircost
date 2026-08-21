@@ -18,6 +18,9 @@ strict_migrations=(
   20260730_aircraft_tcds_make_lineage
   20260731_avionics_human_reviewed_consolidation
   20260801_avionics_authoritative_source_origins
+  20260804_avionics_grounded_evidence_refresh
+  20260805_listing_avionics_association_corroborations
+  20260806_listing_avionics_collision_closure
   20260807_avionics_product_reuse_v2
   20260808_avionics_descriptive_consolidation
   20260809_listing_verification_runs
@@ -30,15 +33,9 @@ transition_migrations=(
   20260802_default_avionics_candidate_quarantine
   20260803_avionics_product_reuse_attestations
 )
-support_migrations=(
-  20260804_avionics_grounded_evidence_refresh
-  20260805_listing_avionics_association_corroborations
-  20260806_listing_avionics_collision_closure
-)
 all_migrations=(
   "${strict_migrations[@]}"
   "${transition_migrations[@]}"
-  "${support_migrations[@]}"
 )
 
 extract_marker_insert() {
@@ -64,6 +61,18 @@ extract_postgres_guard() {
     capture { print }
     capture && /^[$]migration(_contract)?_guard[$];$/ { exit }
   ' "$1"
+}
+
+extract_postgres_ledger_lock() {
+  awk '
+    /^LOCK TABLE public[.]schema_migration_contracts$/ { capture = 1 }
+    capture { print }
+    capture && /;$/ { exit }
+  ' "$1"
+}
+
+extract_postgres_search_path() {
+  grep -m1 '^SET LOCAL search_path = public, pg_catalog;$' "$1"
 }
 
 contract_version() {
@@ -101,6 +110,38 @@ contract_tuple() {
   printf '%s:%s' "$version" "$fingerprint"
 }
 
+assert_postgres_ledger_lock_placement() {
+  local file="$1"
+  local transaction_line search_path_line create_line lock_line guard_line marker_line
+  local lock_statement
+  test "$(grep -c '^SET LOCAL search_path = public, pg_catalog;$' "$file")" = 1
+  test "$(grep -c '^LOCK TABLE public[.]schema_migration_contracts$' "$file")" = 1
+  transaction_line="$(grep -n -m1 '^BEGIN;$' "$file" | cut -d: -f1)"
+  search_path_line="$(grep -n -m1 \
+    '^SET LOCAL search_path = public, pg_catalog;$' "$file" | cut -d: -f1)"
+  create_line="$(grep -n -m1 \
+    '^CREATE TABLE IF NOT EXISTS \(public[.]\)\?schema_migration_contracts' \
+    "$file" | cut -d: -f1 || true)"
+  lock_line="$(grep -n -m1 '^LOCK TABLE public[.]schema_migration_contracts$' \
+    "$file" | cut -d: -f1)"
+  guard_line="$(grep -n -m1 '^DO [$]migration\(_contract\)\?_guard[$]$' \
+    "$file" | cut -d: -f1)"
+  marker_line="$(grep -n -m1 \
+    '^INSERT INTO \(public[.]\)\?schema_migration_contracts' "$file" | \
+    cut -d: -f1)"
+  lock_statement="$(sed -n "${lock_line},$((lock_line + 1))p" "$file")"
+  [[ "$lock_statement" == $'LOCK TABLE public.schema_migration_contracts\nIN SHARE ROW EXCLUSIVE MODE;' ]]
+  (( transaction_line < search_path_line ))
+  if [[ -n "$create_line" ]]; then
+    (( search_path_line < create_line ))
+    (( create_line < lock_line ))
+  else
+    (( search_path_line < lock_line ))
+  fi
+  (( lock_line < guard_line ))
+  (( guard_line < marker_line ))
+}
+
 execute_sql() {
   local backend="$1"
   local statement="$2"
@@ -121,14 +162,19 @@ query_sql() {
   fi
 }
 
-execute_guard() {
+execute_guard_then_domain_probe() {
   local backend="$1"
   local file="$2"
   if [[ "$backend" == sqlite ]]; then
-    extract_sqlite_guard "$file" | sqlite3 -bail "$sqlite_database"
+    {
+      extract_sqlite_guard "$file"
+      echo 'UPDATE historical_migration_domain_probe SET mutation_count = mutation_count + 1 WHERE id = 1;'
+    } | sqlite3 -bail "$sqlite_database"
   else
-    extract_postgres_guard "$file" | \
-      psql "$database_url" -v ON_ERROR_STOP=1 -q
+    {
+      extract_postgres_guard "$file"
+      echo 'UPDATE historical_migration_domain_probe SET mutation_count = mutation_count + 1 WHERE id = 1;'
+    } | psql "$database_url" -v ON_ERROR_STOP=1 -q
   fi
 }
 
@@ -144,11 +190,48 @@ execute_contract() {
   fi
 }
 
+execute_postgres_transaction_contract() {
+  local file="$1"
+  {
+    echo 'BEGIN;'
+    extract_postgres_search_path "$file"
+    extract_postgres_ledger_lock "$file"
+    extract_postgres_guard "$file"
+    echo 'UPDATE historical_migration_domain_probe SET mutation_count = mutation_count + 1 WHERE id = 1;'
+    extract_marker_insert "$file"
+    echo 'COMMIT;'
+  } | psql "$database_url" -v ON_ERROR_STOP=1 -q
+}
+
+execute_postgres_hostile_search_path_contract() {
+  local file="$1"
+  {
+    echo 'SET search_path = historical_provenance_attacker, public;'
+    echo 'BEGIN;'
+    extract_postgres_search_path "$file"
+    extract_postgres_ledger_lock "$file"
+    extract_postgres_guard "$file"
+    echo 'UPDATE historical_migration_domain_probe SET mutation_count = mutation_count + 1 WHERE id = 1;'
+    extract_marker_insert "$file"
+    echo 'COMMIT;'
+    echo 'SHOW search_path;'
+  } | psql "$database_url" -v ON_ERROR_STOP=1 -qAt
+}
+
 expect_guard_failure() {
   local backend="$1"
   local file="$2"
-  if execute_guard "$backend" "$file" >/dev/null 2>&1; then
+  local domain_probe_before domain_probe_after
+  domain_probe_before="$(query_sql "$backend" \
+    'SELECT mutation_count FROM historical_migration_domain_probe WHERE id=1')"
+  if execute_guard_then_domain_probe "$backend" "$file" >/dev/null 2>&1; then
     echo "$backend guard unexpectedly accepted $(basename "$file")" >&2
+    exit 1
+  fi
+  domain_probe_after="$(query_sql "$backend" \
+    'SELECT mutation_count FROM historical_migration_domain_probe WHERE id=1')"
+  if [[ "$domain_probe_after" != "$domain_probe_before" ]]; then
+    echo "$backend guard changed domain state for $(basename "$file")" >&2
     exit 1
   fi
 }
@@ -169,6 +252,7 @@ for migration in "${strict_migrations[@]}"; do
     if [[ "$backend" == postgres ]]; then
       [[ "$guard" == *"contract_version IS DISTINCT FROM"* ]]
       [[ "$guard" == *"contract_fingerprint IS DISTINCT FROM"* ]]
+      assert_postgres_ledger_lock_placement "$file"
     fi
     [[ "$marker_insert" == *"ON CONFLICT (migration_name) DO NOTHING;"* ]]
     [[ "$marker_insert" != *"installed_at ="* ]]
@@ -191,6 +275,7 @@ for migration in "${transition_migrations[@]}"; do
       guard="$(extract_postgres_guard "$file")"
       [[ "$guard" == *"contract_version IS NOT DISTINCT FROM"* ]]
       [[ "$guard" == *"contract_fingerprint IS NOT DISTINCT FROM"* ]]
+      assert_postgres_ledger_lock_placement "$file"
     fi
   done
 done
@@ -201,8 +286,8 @@ initialize_backend() {
     sqlite3 -bail "$sqlite_database" <<'SQL'
 CREATE TABLE schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
-  contract_version INTEGER NOT NULL CHECK (contract_version > 0),
-  contract_fingerprint TEXT NOT NULL,
+  contract_version INTEGER CHECK (contract_version > 0),
+  contract_fingerprint TEXT,
   installed_at TEXT NOT NULL,
   CHECK (length(contract_fingerprint) = 64),
   CHECK (contract_fingerprint = lower(contract_fingerprint)),
@@ -211,6 +296,11 @@ CREATE TABLE schema_migration_contracts (
 CREATE TABLE avionics_catalog_consolidation_guard (
   authorization_id INTEGER PRIMARY KEY
 );
+CREATE TABLE historical_migration_domain_probe (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  mutation_count INTEGER NOT NULL
+);
+INSERT INTO historical_migration_domain_probe VALUES (1, 0);
 SQL
   else
     psql "$database_url" -v ON_ERROR_STOP=1 -q <<'SQL'
@@ -226,6 +316,11 @@ CREATE TABLE public.schema_migration_contracts (
 CREATE TABLE public.avionics_catalog_consolidation_guard (
   authorization_id BIGINT PRIMARY KEY
 );
+CREATE TABLE public.historical_migration_domain_probe (
+  id BIGINT PRIMARY KEY CHECK (id = 1),
+  mutation_count BIGINT NOT NULL
+);
+INSERT INTO public.historical_migration_domain_probe VALUES (1, 0);
 SQL
   fi
 
@@ -269,20 +364,18 @@ test_strict_contracts() {
     execute_sql "$backend" \
       "UPDATE schema_migration_contracts SET contract_fingerprint='$fingerprint' WHERE migration_name='$migration'"
 
-    if [[ "$backend" == postgres ]]; then
-      execute_sql "$backend" \
-        "UPDATE schema_migration_contracts SET contract_version=NULL WHERE migration_name='$migration'"
-      expect_guard_failure "$backend" "$file"
-      test "$(query_sql "$backend" \
-        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version IS NULL AND contract_fingerprint='$fingerprint' AND installed_at='$sentinel_installed_at'")" = 1
-      execute_sql "$backend" \
-        "UPDATE schema_migration_contracts SET contract_version=$version,contract_fingerprint=NULL WHERE migration_name='$migration'"
-      expect_guard_failure "$backend" "$file"
-      test "$(query_sql "$backend" \
-        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version=$version AND contract_fingerprint IS NULL AND installed_at='$sentinel_installed_at'")" = 1
-      execute_sql "$backend" \
-        "UPDATE schema_migration_contracts SET contract_fingerprint='$fingerprint' WHERE migration_name='$migration'"
-    fi
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_version=NULL WHERE migration_name='$migration'"
+    expect_guard_failure "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version IS NULL AND contract_fingerprint='$fingerprint' AND installed_at='$sentinel_installed_at'")" = 1
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_version=$version,contract_fingerprint=NULL WHERE migration_name='$migration'"
+    expect_guard_failure "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version=$version AND contract_fingerprint IS NULL AND installed_at='$sentinel_installed_at'")" = 1
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_fingerprint='$fingerprint' WHERE migration_name='$migration'"
 
     execute_sql "$backend" \
       "DELETE FROM schema_migration_contracts WHERE migration_name='$migration'"
@@ -354,21 +447,150 @@ test_transition_contracts() {
       "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
       "$current_version:$hostile_fingerprint:$sentinel_installed_at"
 
-    if [[ "$backend" == postgres ]]; then
-      execute_sql "$backend" \
-        "UPDATE schema_migration_contracts SET contract_version=NULL,contract_fingerprint='$current_fingerprint' WHERE migration_name='$migration'"
-      expect_guard_failure "$backend" "$file"
-      test "$(query_sql "$backend" \
-        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version IS NULL AND contract_fingerprint='$current_fingerprint' AND installed_at='$sentinel_installed_at'")" = 1
-      execute_sql "$backend" \
-        "UPDATE schema_migration_contracts SET contract_version=$current_version,contract_fingerprint=NULL WHERE migration_name='$migration'"
-      expect_guard_failure "$backend" "$file"
-      test "$(query_sql "$backend" \
-        "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version=$current_version AND contract_fingerprint IS NULL AND installed_at='$sentinel_installed_at'")" = 1
-    fi
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_version=NULL,contract_fingerprint='$current_fingerprint' WHERE migration_name='$migration'"
+    expect_guard_failure "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version IS NULL AND contract_fingerprint='$current_fingerprint' AND installed_at='$sentinel_installed_at'")" = 1
+    execute_sql "$backend" \
+      "UPDATE schema_migration_contracts SET contract_version=$current_version,contract_fingerprint=NULL WHERE migration_name='$migration'"
+    expect_guard_failure "$backend" "$file"
+    test "$(query_sql "$backend" \
+      "SELECT count(*) FROM schema_migration_contracts WHERE migration_name='$migration' AND contract_version=$current_version AND contract_fingerprint IS NULL AND installed_at='$sentinel_installed_at'")" = 1
     execute_sql "$backend" \
       "UPDATE schema_migration_contracts SET contract_version=$current_version,contract_fingerprint='$current_fingerprint' WHERE migration_name='$migration'"
   done
+}
+
+wait_for_postgres_writer_lock() {
+  local application_name="$1"
+  local attempt lock_count
+  for ((attempt = 0; attempt < 100; attempt += 1)); do
+    lock_count="$(query_sql postgres \
+      "SELECT count(*) FROM pg_catalog.pg_locks lock_row JOIN pg_catalog.pg_stat_activity activity ON activity.pid=lock_row.pid WHERE activity.application_name='$application_name' AND lock_row.relation='public.schema_migration_contracts'::regclass AND lock_row.mode='RowExclusiveLock' AND lock_row.granted")"
+    if [[ "$lock_count" = 1 ]]; then
+      return
+    fi
+    sleep 0.05
+  done
+  echo "PostgreSQL writer $application_name never acquired the ledger lock" >&2
+  return 1
+}
+
+start_postgres_receipt_writer() {
+  local application_name="$1"
+  local mutation="$2"
+  {
+    printf "SET application_name='%s';\n" "$application_name"
+    echo 'BEGIN;'
+    printf '%s;\n' "$mutation"
+    echo 'SELECT pg_sleep(2);'
+    echo 'COMMIT;'
+  } | psql "$database_url" -v ON_ERROR_STOP=1 -q >/dev/null &
+  postgres_writer_pid=$!
+  wait_for_postgres_writer_lock "$application_name"
+}
+
+expect_postgres_raced_rejection() {
+  local file="$1"
+  local expected_error="$2"
+  local domain_probe_before domain_probe_after rejection
+  domain_probe_before="$(query_sql postgres \
+    'SELECT mutation_count FROM historical_migration_domain_probe WHERE id=1')"
+  if rejection="$(execute_postgres_transaction_contract "$file" 2>&1)"; then
+    echo "PostgreSQL raced guard unexpectedly accepted $(basename "$file")" >&2
+    return 1
+  fi
+  wait "$postgres_writer_pid"
+  [[ "$rejection" == *"$expected_error"* ]]
+  domain_probe_after="$(query_sql postgres \
+    'SELECT mutation_count FROM historical_migration_domain_probe WHERE id=1')"
+  test "$domain_probe_after" = "$domain_probe_before"
+}
+
+test_postgres_concurrent_receipt_writers() {
+  local migration file tuple version fingerprint installed_at_before
+
+  migration=20260804_avionics_grounded_evidence_refresh
+  file="$repository_root/migrations/$migration.postgres.sql"
+  tuple="$(contract_tuple "$migration" postgres)"
+  version="${tuple%%:*}"
+  fingerprint="${tuple#*:}"
+  execute_sql postgres \
+    "UPDATE schema_migration_contracts SET contract_version=$version,contract_fingerprint='$fingerprint',installed_at='$sentinel_installed_at' WHERE migration_name='$migration'"
+  start_postgres_receipt_writer strict_existing_writer \
+    "UPDATE schema_migration_contracts SET contract_version=99 WHERE migration_name='$migration'"
+  expect_postgres_raced_rejection "$file" \
+    'installed avionics grounded-evidence refresh migration has a different contract'
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "99:$sentinel_installed_at"
+
+  migration=20260805_listing_avionics_association_corroborations
+  file="$repository_root/migrations/$migration.postgres.sql"
+  execute_sql postgres \
+    "DELETE FROM schema_migration_contracts WHERE migration_name='$migration'"
+  start_postgres_receipt_writer strict_absent_writer \
+    "INSERT INTO schema_migration_contracts VALUES ('$migration',99,'$hostile_fingerprint','$sentinel_installed_at')"
+  expect_postgres_raced_rejection "$file" \
+    'installed listing-avionics corroboration migration has a different contract'
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "99:$hostile_fingerprint:$sentinel_installed_at"
+
+  migration=20260802_default_avionics_candidate_quarantine
+  file="$repository_root/migrations/$migration.postgres.sql"
+  tuple="$(contract_tuple "$migration" postgres)"
+  version="${tuple%%:*}"
+  fingerprint="${tuple#*:}"
+  execute_sql postgres \
+    "DELETE FROM schema_migration_contracts WHERE migration_name='$migration'"
+  execute_sql postgres \
+    'UPDATE historical_migration_domain_probe SET mutation_count=0 WHERE id=1'
+  start_postgres_receipt_writer transition_predecessor_writer \
+    "INSERT INTO schema_migration_contracts VALUES ('$migration',1,'b50683c27b244cadf3cf88b226665f79051f678df9b30e0d01d0ca261464581f','$sentinel_installed_at')"
+  execute_postgres_transaction_contract "$file"
+  wait "$postgres_writer_pid"
+  test "$(query_sql postgres \
+    'SELECT mutation_count FROM historical_migration_domain_probe WHERE id=1')" = 1
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint FROM schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "$version:$fingerprint"
+  installed_at_before="$(query_sql postgres \
+    "SELECT installed_at FROM schema_migration_contracts WHERE migration_name='$migration'")"
+  test "$installed_at_before" != "$sentinel_installed_at"
+}
+
+test_postgres_hostile_search_path_is_transaction_local() {
+  local migration file tuple version fingerprint caller_search_path
+  migration=20260804_avionics_grounded_evidence_refresh
+  file="$repository_root/migrations/$migration.postgres.sql"
+  tuple="$(contract_tuple "$migration" postgres)"
+  version="${tuple%%:*}"
+  fingerprint="${tuple#*:}"
+
+  execute_sql postgres \
+    'DROP SCHEMA IF EXISTS historical_provenance_attacker CASCADE; CREATE SCHEMA historical_provenance_attacker'
+  execute_sql postgres \
+    'CREATE TABLE historical_provenance_attacker.schema_migration_contracts (LIKE public.schema_migration_contracts INCLUDING ALL); CREATE TABLE historical_provenance_attacker.historical_migration_domain_probe (LIKE public.historical_migration_domain_probe INCLUDING ALL); INSERT INTO historical_provenance_attacker.historical_migration_domain_probe VALUES (1,0)'
+  execute_sql postgres \
+    "INSERT INTO historical_provenance_attacker.schema_migration_contracts VALUES ('$migration',99,'$hostile_fingerprint','$sentinel_installed_at')"
+  execute_sql postgres \
+    "UPDATE public.schema_migration_contracts SET contract_version=$version,contract_fingerprint='$fingerprint',installed_at='$sentinel_installed_at' WHERE migration_name='$migration'; UPDATE public.historical_migration_domain_probe SET mutation_count=0 WHERE id=1"
+
+  caller_search_path="$(execute_postgres_hostile_search_path_contract "$file")"
+  test "$caller_search_path" = 'historical_provenance_attacker, public'
+  test "$(query_sql postgres \
+    'SELECT mutation_count FROM public.historical_migration_domain_probe WHERE id=1')" = 1
+  test "$(query_sql postgres \
+    'SELECT mutation_count FROM historical_provenance_attacker.historical_migration_domain_probe WHERE id=1')" = 0
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM public.schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "$version:$fingerprint:$sentinel_installed_at"
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM historical_provenance_attacker.schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "99:$hostile_fingerprint:$sentinel_installed_at"
+  execute_sql postgres 'DROP SCHEMA historical_provenance_attacker CASCADE'
 }
 
 for backend in sqlite postgres; do
@@ -376,5 +598,8 @@ for backend in sqlite postgres; do
   test_strict_contracts "$backend"
   test_transition_contracts "$backend"
 done
+
+test_postgres_concurrent_receipt_writers
+test_postgres_hostile_search_path_is_transaction_local
 
 echo 'Historical migration provenance contracts passed'

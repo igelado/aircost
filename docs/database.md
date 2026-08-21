@@ -1549,22 +1549,38 @@ After re-grounding, a successor assignment can restore readiness. The legacy
 `aircraft_model_variant_id` remains only a valuation compatibility projection;
 its display labels are not FAA or publication identity evidence.
 
-## Historical Migration Contract Provenance
+## Standalone Historical Migration Contract Provenance
 
-Rows in `schema_migration_contracts` are installation receipts, not mutable
-"latest version" records. A strict historical migration accepts either an
-absent receipt or its exact version and fingerprint. The first installation
-inserts the receipt; an exact rerun leaves `installed_at` unchanged; a
-different version or fingerprint—including a null value exposed by a weakened
-receipt table—aborts before domain objects can be repaired or replaced.
-Operators must investigate a mismatch instead of rerunning a migration to heal
-the marker.
+When a backend-specific historical migration file is run directly, its row in
+`schema_migration_contracts` is an installation receipt, not a mutable "latest
+version" record. A strict migration accepts either an absent receipt or its
+exact version and fingerprint. The first installation inserts the receipt; an
+exact standalone rerun leaves `installed_at` unchanged; a different version or
+fingerprint—including a null value exposed by a weakened receipt table—aborts
+before subsequent domain statements execute. Operators must investigate a
+mismatch instead of rerunning a migration to heal the marker.
+
+Each PostgreSQL file pins its transaction-local search path to `public` and
+`pg_catalog`, then holds a transaction-wide `SHARE ROW EXCLUSIVE` lock on
+`public.schema_migration_contracts` from before its guard through the final
+receipt insert. Shadow objects on the caller's search path cannot replace the
+canonical ledger or domain objects, and the caller's search path is restored
+at commit. A ledger writer that started first must commit before the guard
+reads the receipt, while a later writer waits until the migration commits. The
+guard and domain statements therefore cannot observe different committed
+receipt states during one standalone rerun. SQLite obtains the corresponding
+write serialization from `BEGIN IMMEDIATE`.
 
 The only historical in-place receipt upgrades are the documented version-1 to
 version-2 transitions in the default-avionics quarantine and avionics product
 reuse-attestation migrations. They update `installed_at` only while moving the
 exact predecessor fingerprint to the exact version-2 fingerprint. An exact
 version-2 rerun is a no-op, and any other predecessor is rejected.
+
+Canonical schema application during process startup is a separate provenance
+contract. This standalone-migration hardening does not implement or claim
+startup receipt stability or startup mismatch rejection; those guarantees
+require their own schema guards and end-to-end startup tests.
 
 ## Listing Aircraft Compatibility Projection Migration
 

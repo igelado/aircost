@@ -66,6 +66,9 @@ jobs:
       - name: Check historical migration provenance
         run: bash tests/schema/test_historical_migration_provenance.sh
 
+      - name: Check listing aircraft identity migration
+        run: bash tests/schema/test_listing_aircraft_identity.sh
+
       - name: Check PostgreSQL FAA reference migration
         run: bash tests/schema/test_faa_reference_reachability_postgres.sh
 

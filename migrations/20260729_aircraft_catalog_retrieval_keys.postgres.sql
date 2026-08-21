@@ -8,14 +8,19 @@
 -- Empty derived keys, scoped key collisions, and cross-make alias collisions
 -- abort the transaction before an immutable row is touched.
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+BEGIN;
+
+SET LOCAL search_path = public, pg_catalog;
+
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL,
   contract_fingerprint TEXT NOT NULL,
   installed_at TEXT NOT NULL
 );
 
-BEGIN;
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
