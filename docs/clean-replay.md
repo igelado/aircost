@@ -213,6 +213,15 @@ with `--recover-stale`; this requeues only the fenced in-flight item state.
 The default is provider-free and read-only. `--submission-id ID` restricts one
 invocation without changing the manifest-backed run membership. Apply records
 independent extraction and materialization states, attempts, and timestamps.
+An applied single-submission report includes `selected_item` with the exact
+phase state and its stable ledger reason code. A failed operation also includes
+one bounded `transient_error` classified as `schema`, `evidence`, `provider`, or
+`database`. That diagnostic is assembled only for the command response from
+fixed sanitized text; raw provider responses, prompts, listing content, and
+source dossiers are neither returned nor added to the durable replay ledger.
+Automation must stop when the selected state is `failed`, `rejected`, or
+`blocked`, even though the coordinator retains batch-style success exit status
+after recording an item-level outcome.
 Dry-run opens the installed target through a no-initialize diagnostic
 connection, attests its schema contracts, and performs no seed, schema,
 migration-contract timestamp, or ledger writes.
