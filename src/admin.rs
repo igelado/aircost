@@ -42,6 +42,9 @@ use aircost_rs::gemini::interactions::GeminiInteractionsClient;
 use aircost_rs::gemini::live_benchmark::LiveBenchmarkRunner;
 use aircost_rs::gemini::usage::Store as GeminiUsageStore;
 use aircost_rs::listing::backfill::{default_stage_limit, stage_legacy_listing_reviews};
+use aircost_rs::listing::replay::catalog::{
+    seed_replay_verified_catalog, SeedVerifiedCatalogRequest,
+};
 use aircost_rs::listing::replay::run::{replay_captures, ReplayCapturesRequest, ReplayPhase};
 use aircost_rs::listing::replay::source::{
     prepare_legacy_replay_source, PrepareLegacyReplaySourceRequest,
@@ -187,6 +190,36 @@ async fn main() -> Result<()> {
                 faa_archive: &faa_archive,
                 expected_faa_archive_sha256: &faa_archive_sha256,
                 output: &output,
+                apply,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        AdminCommand::SeedVerifiedCatalog {
+            source_database,
+            database,
+            expected_fingerprint_sha256,
+            apply,
+        } => {
+            if source_database == database
+                || ((!source_database.starts_with("postgres:")
+                    && !source_database.starts_with("postgresql:")
+                    && !database.starts_with("postgres:")
+                    && !database.starts_with("postgresql:"))
+                    && aircost_rs::db::sqlite_database_urls_equal(&source_database, &database)?)
+            {
+                bail!("catalog seed source and target databases must be different");
+            }
+            let source = aircost_rs::db::AppDb::connect_diagnostic(&source_database).await?;
+            let target = if apply {
+                aircost_rs::db::AppDb::connect(&database).await?
+            } else {
+                aircost_rs::db::AppDb::connect_diagnostic(&database).await?
+            };
+            let report = seed_replay_verified_catalog(SeedVerifiedCatalogRequest {
+                source: &source,
+                target: &target,
+                expected_fingerprint_sha256: &expected_fingerprint_sha256,
                 apply,
             })
             .await?;
@@ -801,6 +834,12 @@ enum AdminCommand {
         output: PathBuf,
         apply: bool,
     },
+    SeedVerifiedCatalog {
+        source_database: String,
+        database: String,
+        expected_fingerprint_sha256: String,
+        apply: bool,
+    },
     ReplayCaptures {
         database: String,
         manifest: PathBuf,
@@ -1000,6 +1039,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         "export-replay-manifest" => parse_export_replay_manifest_args(args),
         "import-replay-manifest" => parse_import_replay_manifest_args(args),
         "prepare-legacy-replay-source" => parse_prepare_legacy_replay_source_args(args),
+        "seed-verified-catalog" => parse_seed_verified_catalog_args(args),
         "replay-captures" => parse_replay_captures_args(args),
         "replay-extraction" => parse_replay_extraction_args(args),
         "reconcile-replay-avionics" => parse_reconcile_replay_avionics_args(args),
@@ -1203,6 +1243,56 @@ fn parse_prepare_legacy_replay_source_args(
         faa_archive: PathBuf::from(faa_archive.context("--faa-archive is required")?),
         faa_archive_sha256: faa_archive_sha256.context("--faa-archive-sha256 is required")?,
         output: PathBuf::from(output.context("--output is required")?),
+        apply,
+    })
+}
+
+fn parse_seed_verified_catalog_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<AdminCommand> {
+    let mut source_database = None;
+    let mut database = None;
+    let mut expected_fingerprint_sha256 = None;
+    let mut apply = false;
+    let mut apply_seen = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let (slot, option_name): (&mut Option<String>, &str) = match arg.as_str() {
+            "--source-database" => (&mut source_database, "--source-database"),
+            "--database" => (&mut database, "--database"),
+            "--catalog-fingerprint-sha256" => (
+                &mut expected_fingerprint_sha256,
+                "--catalog-fingerprint-sha256",
+            ),
+            "--apply" => {
+                if apply_seen {
+                    bail!("--apply may be supplied only once");
+                }
+                apply_seen = true;
+                apply = true;
+                continue;
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown seed-verified-catalog argument: {arg}"),
+        };
+        if slot.is_some() {
+            bail!("{option_name} may be supplied only once");
+        }
+        *slot = Some(
+            args.next()
+                .with_context(|| format!("{option_name} requires a value"))?,
+        );
+    }
+    Ok(AdminCommand::SeedVerifiedCatalog {
+        source_database: database_url_from_arg(Some(
+            source_database.context("--source-database is required")?,
+        )),
+        database: database_url_from_arg(Some(database.context("--database is required")?)),
+        expected_fingerprint_sha256: expected_fingerprint_sha256
+            .context("--catalog-fingerprint-sha256 is required")?,
         apply,
     })
 }
@@ -2186,7 +2276,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin prepare-legacy-replay-source --source-database SOURCE --source-database-sha256 HEX --manifest FILE --manifest-sha256 HEX --faa-archive ReleasableAircraft.zip --faa-archive-sha256 HEX --output FILE [--apply]\n    One-purpose, provider-free conversion of the exact frozen legacy SQLite source into a new current-schema replay source. It authenticates a private source snapshot and the exact reviewed manifest, rebuilds the FAA projection from the exact retained archive, and projects only the reusable verified catalog closure. Dry-run creates no file.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin prepare-legacy-replay-source --source-database SOURCE --source-database-sha256 HEX --manifest FILE --manifest-sha256 HEX --faa-archive ReleasableAircraft.zip --faa-archive-sha256 HEX --output FILE [--apply]\n    One-purpose, provider-free conversion of the exact frozen legacy SQLite source into a new current-schema replay source. It authenticates a private source snapshot and the exact reviewed manifest, rebuilds the FAA projection from the exact retained archive, and projects only the reusable verified catalog closure. Dry-run creates no file.\n  aircost-admin seed-verified-catalog --source-database PREPARED --catalog-fingerprint-sha256 HEX --database TARGET [--apply]\n    Installs exactly the fingerprinted current verified catalog closure into a clean replay target while preserving imported signed captures. It is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -3188,6 +3278,65 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         );
         assert_eq!(output, PathBuf::from("/tmp/prepared.sqlite3"));
         assert!(!apply);
+    }
+
+    #[test]
+    fn verified_catalog_seed_cli_is_exact_and_dry_run_by_default() {
+        let digest = "a".repeat(64);
+        let command = parse_args([
+            "seed-verified-catalog".to_string(),
+            "--source-database".to_string(),
+            "/tmp/prepared.sqlite3".to_string(),
+            "--database".to_string(),
+            "/tmp/shadow.sqlite3".to_string(),
+            "--catalog-fingerprint-sha256".to_string(),
+            digest.clone(),
+        ])
+        .unwrap();
+        let AdminCommand::SeedVerifiedCatalog {
+            source_database,
+            database,
+            expected_fingerprint_sha256,
+            apply,
+        } = command
+        else {
+            panic!("expected seed-verified-catalog command")
+        };
+        assert_eq!(source_database, "sqlite:///tmp/prepared.sqlite3");
+        assert_eq!(database, "sqlite:///tmp/shadow.sqlite3");
+        assert_eq!(expected_fingerprint_sha256, digest);
+        assert!(!apply);
+
+        for omitted in [
+            "--source-database",
+            "--database",
+            "--catalog-fingerprint-sha256",
+        ] {
+            let values = [
+                ("--source-database", "/tmp/prepared.sqlite3"),
+                ("--database", "/tmp/shadow.sqlite3"),
+                (
+                    "--catalog-fingerprint-sha256",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+            ];
+            let mut arguments = vec!["seed-verified-catalog".to_string()];
+            for (name, value) in values {
+                if name != omitted {
+                    arguments.extend([name.to_string(), value.to_string()]);
+                }
+            }
+            assert!(parse_args(arguments)
+                .unwrap_err()
+                .to_string()
+                .contains("is required"));
+        }
+        assert!(
+            parse_args(["seed-verified-catalog".to_string(), "--dry-run".to_string(),])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::Acquire;
+use sqlx::{Acquire, Connection, PgConnection, SqliteConnection};
 
 use super::{canonical_row, ids, in_predicate, ProjectionRow, ROOT_TABLES};
 use crate::db::{AppDb, DatabaseBackend};
@@ -81,13 +81,19 @@ pub(crate) struct RequiredCatalogUser {
     pub auth_subject: String,
 }
 
-/// Opaque current-schema catalog snapshot. Consumers compare or report it;
-/// later seed work can build a writer against this boundary without teaching
-/// the bridge how current rows are selected or canonicalized.
+/// Opaque current-schema catalog snapshot. Consumers compare or report it; the
+/// sibling seed writer consumes this boundary without teaching the bridge how
+/// current rows are selected or canonicalized.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CurrentCatalogProjection {
     summary: CurrentCatalogProjectionSummary,
+    rows: Vec<ProjectionRow>,
     canonical_rows: Vec<String>,
+}
+
+enum ProjectionReader<'connection> {
+    Sqlite(&'connection mut SqliteConnection),
+    Postgres(&'connection mut PgConnection),
 }
 
 #[derive(Serialize)]
@@ -106,14 +112,30 @@ struct FingerprintTableCount<'table> {
 
 impl CurrentCatalogProjection {
     pub(crate) async fn load(source: &AppDb) -> Result<Self> {
-        let DatabaseBackend::Sqlite(pool) = source.backend() else {
-            bail!("current verified catalog projection currently requires SQLite");
-        };
-        let mut connection = pool.acquire().await?;
-        let mut snapshot = connection.begin().await?;
-        let projection = load_current_sqlite(&mut snapshot).await?;
-        snapshot.rollback().await?;
-        Ok(projection)
+        match source.backend() {
+            DatabaseBackend::Sqlite(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut snapshot = connection.begin().await?;
+                let projection = {
+                    let mut reader = ProjectionReader::Sqlite(&mut snapshot);
+                    load_current(&mut reader).await
+                };
+                snapshot.rollback().await?;
+                projection
+            }
+            DatabaseBackend::Postgres(pool) => {
+                let mut connection = pool.acquire().await?;
+                let mut snapshot = connection
+                    .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    .await?;
+                let projection = {
+                    let mut reader = ProjectionReader::Postgres(&mut snapshot);
+                    load_current(&mut reader).await
+                };
+                snapshot.rollback().await?;
+                projection
+            }
+        }
     }
 
     pub(crate) fn summary(&self) -> &CurrentCatalogProjectionSummary {
@@ -124,22 +146,38 @@ impl CurrentCatalogProjection {
         &self.summary.fingerprint_sha256
     }
 
-    pub(crate) async fn require_reloaded_match(&self, source: &AppDb) -> Result<()> {
-        let reloaded = Self::load(source).await?;
+    pub(super) fn rows(&self) -> &[ProjectionRow] {
+        &self.rows
+    }
+
+    pub(super) async fn load_sqlite_connection(connection: &mut SqliteConnection) -> Result<Self> {
+        let mut reader = ProjectionReader::Sqlite(connection);
+        load_current(&mut reader).await
+    }
+
+    pub(super) async fn load_postgres_connection(connection: &mut PgConnection) -> Result<Self> {
+        let mut reader = ProjectionReader::Postgres(connection);
+        load_current(&mut reader).await
+    }
+
+    pub(super) fn require_exact_match(&self, reloaded: Self, scope: &str) -> Result<()> {
         if reloaded != *self {
             bail!(
-                "reopened current catalog fingerprint {} differs from prepared fingerprint {}",
+                "{scope} current catalog fingerprint {} differs from prepared fingerprint {}",
                 reloaded.fingerprint_sha256(),
                 self.fingerprint_sha256()
             );
         }
         Ok(())
     }
+
+    pub(crate) async fn require_reloaded_match(&self, source: &AppDb) -> Result<()> {
+        let reloaded = Self::load(source).await?;
+        self.require_exact_match(reloaded, "reopened")
+    }
 }
 
-async fn load_current_sqlite(
-    source: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<CurrentCatalogProjection> {
+async fn load_current(source: &mut ProjectionReader<'_>) -> Result<CurrentCatalogProjection> {
     let mut roots = selected_aircraft_roots(source).await?;
     let decision_ids = required_aircraft_decision_ids(&roots)?;
     let decisions = fetch(
@@ -304,7 +342,7 @@ async fn load_current_sqlite(
         &format!(
             "{} OR {}",
             in_predicate("merged_identity_id", &identity_ids),
-            in_predicate("canonical_identity_id", &identity_ids)
+            in_predicate("survivor_identity_id", &identity_ids)
         ),
     )
     .await?;
@@ -496,6 +534,7 @@ fn assemble(
             table_counts,
             required_users,
         },
+        rows,
         canonical_rows,
     })
 }
@@ -713,15 +752,22 @@ fn require_lower_sha256(value: &str, label: &str) -> Result<()> {
 }
 
 async fn fetch(
-    source: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &mut ProjectionReader<'_>,
     table: &str,
     predicate: &str,
 ) -> Result<Vec<ProjectionRow>> {
-    super::fetch_rows(&mut **source, table, predicate).await
+    match source {
+        ProjectionReader::Sqlite(connection) => {
+            super::fetch_rows(&mut **connection, table, predicate).await
+        }
+        ProjectionReader::Postgres(connection) => {
+            fetch_rows_postgres(&mut **connection, table, predicate).await
+        }
+    }
 }
 
 async fn selected_aircraft_roots(
-    source: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &mut ProjectionReader<'_>,
 ) -> Result<BTreeMap<String, Vec<ProjectionRow>>> {
     let mut roots = BTreeMap::new();
     let makes = fetch(source, "aircraft_makes", "1 = 1").await?;
@@ -878,7 +924,7 @@ fn validate_aircraft_approval_decisions(
 }
 
 async fn selected_markets(
-    source: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &mut ProjectionReader<'_>,
     roots: &BTreeMap<String, Vec<ProjectionRow>>,
 ) -> Result<Vec<ProjectionRow>> {
     let mut selected = roots
@@ -906,6 +952,95 @@ async fn selected_markets(
             return Ok(rows);
         }
     }
+}
+
+async fn fetch_rows_postgres(
+    connection: &mut PgConnection,
+    table: &str,
+    predicate: &str,
+) -> Result<Vec<ProjectionRow>> {
+    let columns: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT attribute.attname,
+                  COALESCE(
+                    pg_catalog.array_position(
+                      primary_index.indkey::smallint[],
+                      attribute.attnum::smallint
+                    ),
+                    0
+                  )::bigint AS primary_key_position
+           FROM pg_catalog.pg_attribute attribute
+           JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
+           JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+           LEFT JOIN pg_catalog.pg_index primary_index
+             ON primary_index.indrelid = relation.oid
+            AND primary_index.indisprimary
+           WHERE namespace.nspname = 'public'
+             AND relation.relname = $1
+             AND relation.relkind IN ('r', 'p')
+             AND attribute.attnum > 0
+             AND NOT attribute.attisdropped
+           ORDER BY attribute.attnum"#,
+    )
+    .bind(table)
+    .fetch_all(&mut *connection)
+    .await?;
+    if columns.is_empty() {
+        bail!("required source/target table {table} is missing");
+    }
+    let arguments = columns
+        .iter()
+        .flat_map(|(column, _)| {
+            [
+                format!("'{}'", column.replace('\'', "''")),
+                format!("{}", super::quoted_identifier(column)),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut keys = columns
+        .iter()
+        .filter(|(_, position)| *position > 0)
+        .collect::<Vec<_>>();
+    keys.sort_by_key(|(_, position)| *position);
+    let order = if keys.is_empty() {
+        columns.iter().collect::<Vec<_>>()
+    } else {
+        keys
+    }
+    .into_iter()
+    .map(|(column, _)| super::quoted_identifier(column))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let sql = format!(
+        "SELECT pg_catalog.json_build_object({arguments})::text \
+         FROM public.{} WHERE {predicate} ORDER BY {order}",
+        super::quoted_identifier(table)
+    );
+    let rows = sqlx::query_scalar::<_, String>(&sql)
+        .fetch_all(&mut *connection)
+        .await?;
+    rows.into_iter()
+        .map(|json| {
+            let mut object = serde_json::from_str::<Value>(&json)?
+                .as_object()
+                .cloned()
+                .context("database JSON projection was not an object")?;
+            let values = columns
+                .iter()
+                .map(|(column, _)| {
+                    let value = object
+                        .remove(column)
+                        .with_context(|| format!("database JSON omitted {table}.{column}"))?;
+                    super::canonicalize_value(table, column, value)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ProjectionRow {
+                table: table.to_string(),
+                columns: columns.iter().map(|(column, _)| column.clone()).collect(),
+                values,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

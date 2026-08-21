@@ -17,6 +17,7 @@ use crate::aircraft::faa::bridge::{FaaBridgeOutcome, LegacyFaaRepresentative};
 use crate::db::{AppDb, DatabaseBackend};
 
 pub(crate) mod current;
+pub(crate) mod seed;
 
 const ROOT_TABLES: &[&str] = &[
     "aircraft_makes",
@@ -269,7 +270,7 @@ async fn build_bundle(
         &format!(
             "{} OR {}",
             in_predicate("merged_identity_id", &identity_ids),
-            in_predicate("canonical_identity_id", &identity_ids)
+            in_predicate("survivor_identity_id", &identity_ids)
         ),
     )
     .await?;
