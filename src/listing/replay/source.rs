@@ -183,7 +183,7 @@ pub async fn prepare_legacy_replay_source(
     let captures = load_legacy_capture_selection(&mut source_snapshot, request.manifest).await?;
     let representatives = required_faa_representatives(&mut source_snapshot).await?;
 
-    let output_parent = request.output.parent().unwrap_or_else(|| Path::new("."));
+    let output_parent = output_parent(request.output)?;
     let mut temporary = request
         .apply
         .then(|| NamedTempFile::new_in(output_parent))
@@ -273,15 +273,35 @@ fn validate_prepare_request(request: &PrepareLegacyReplaySourceRequest<'_>) -> R
             request.output.display()
         );
     }
-    let parent = request.output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = output_parent(request.output)?;
     if !parent.is_dir() {
         bail!("prepared replay-source output parent does not exist");
     }
-    let output_url = database_url_from_arg(Some(request.output.to_string_lossy().into_owned()));
+    let output_url = database_url_from_arg(Some(
+        parent
+            .join(
+                request
+                    .output
+                    .file_name()
+                    .context("prepared replay-source output has no file name")?,
+            )
+            .to_string_lossy()
+            .into_owned(),
+    ));
     if sqlite_database_urls_equal(request.source_database, &output_url)? {
         bail!("legacy source and prepared replay-source output must be different files");
     }
     Ok(())
+}
+
+fn output_parent(output: &Path) -> Result<&Path> {
+    if output.file_name().is_none() {
+        bail!("prepared replay-source output has no file name");
+    }
+    Ok(output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(".")))
 }
 
 pub(crate) async fn open_frozen_source(source_database: &str) -> Result<SqlitePool> {
@@ -893,5 +913,18 @@ mod tests {
             sqlite_path("sqlite:///tmp/frozen.sqlite3").unwrap(),
             PathBuf::from("/tmp/frozen.sqlite3")
         );
+    }
+
+    #[test]
+    fn relative_output_file_uses_the_current_directory() {
+        assert_eq!(
+            output_parent(Path::new("prepared.sqlite3")).unwrap(),
+            Path::new(".")
+        );
+        assert_eq!(
+            output_parent(Path::new("artifacts/prepared.sqlite3")).unwrap(),
+            Path::new("artifacts")
+        );
+        assert!(output_parent(Path::new("/")).is_err());
     }
 }

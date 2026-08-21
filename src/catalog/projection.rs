@@ -157,6 +157,9 @@ pub(crate) async fn required_faa_representatives(
         .collect::<Result<BTreeSet<_>>>()?
         .into_iter()
         .collect::<Vec<_>>();
+    if decision_ids.is_empty() {
+        return Ok(representatives.into_iter().collect());
+    }
     let hierarchy_claims: Vec<(i64, String, String)> = sqlx::query_as(&format!(
         r#"SELECT DISTINCT claim.id, claim.object_text, claim.quoted_evidence
            FROM aircraft_identity_decision_claims decision_claim
