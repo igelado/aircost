@@ -150,13 +150,7 @@ pub(crate) async fn required_faa_representatives(
         .collect::<Result<BTreeSet<_>>>()?;
 
     let roots = selected_aircraft_roots(source).await?;
-    let decision_ids = roots
-        .values()
-        .flatten()
-        .filter_map(|row| row.nullable_integer("approval_decision_id").transpose())
-        .collect::<Result<BTreeSet<_>>>()?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let decision_ids = required_aircraft_decision_ids(&roots)?;
     if decision_ids.is_empty() {
         return Ok(representatives.into_iter().collect());
     }
@@ -333,26 +327,14 @@ async fn build_bundle(
     }
 
     let mut roots = selected_aircraft_roots(source).await?;
-    let decision_ids = roots
-        .values()
-        .flatten()
-        .filter_map(|row| row.nullable_integer("approval_decision_id").transpose())
-        .collect::<Result<BTreeSet<_>>>()?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let decision_ids = required_aircraft_decision_ids(&roots)?;
     let mut decisions = fetch(
         source,
         "aircraft_identity_decisions",
         &in_predicate("id", &decision_ids),
     )
     .await?;
-    if decisions.len() != decision_ids.len()
-        || decisions
-            .iter()
-            .any(|row| row.value("decision_status").and_then(Value::as_str) != Some("approved"))
-    {
-        bail!("aircraft catalog closure has a missing or non-approved decision");
-    }
+    validate_aircraft_approval_decisions(&decision_ids, &decisions)?;
     let mut cases = fetch(
         source,
         "aircraft_identity_resolution_cases",
@@ -616,6 +598,52 @@ async fn selected_aircraft_roots(
         .await?,
     );
     Ok(roots)
+}
+
+fn required_aircraft_decision_ids(
+    roots: &BTreeMap<String, Vec<ProjectionRow>>,
+) -> Result<Vec<i64>> {
+    let mut decision_ids = BTreeSet::new();
+    for row in roots.values().flatten() {
+        if row.value("approval_decision_id").is_none() {
+            continue;
+        }
+        let row_id = row.value("id").map(Value::to_string).unwrap_or_else(|| {
+            row.values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        });
+        let decision_id = row
+            .nullable_integer("approval_decision_id")?
+            .with_context(|| {
+                format!(
+                    "selected aircraft catalog root {} row {} has no approval decision",
+                    row.table, row_id
+                )
+            })?;
+        decision_ids.insert(decision_id);
+    }
+    Ok(decision_ids.into_iter().collect())
+}
+
+fn validate_aircraft_approval_decisions(
+    required_ids: &[i64],
+    decisions: &[ProjectionRow],
+) -> Result<()> {
+    let actual_ids = decisions
+        .iter()
+        .map(|row| row.integer("id"))
+        .collect::<Result<BTreeSet<_>>>()?;
+    if actual_ids != required_ids.iter().copied().collect::<BTreeSet<_>>()
+        || decisions
+            .iter()
+            .any(|row| row.value("decision_status").and_then(Value::as_str) != Some("approved"))
+    {
+        bail!("aircraft catalog closure has a missing or non-approved exact decision");
+    }
+    Ok(())
 }
 
 async fn selected_markets(
@@ -1969,6 +1997,58 @@ mod tests {
         .err()
         .expect("unsorted snapshot set must fail");
         assert!(error.to_string().contains("non-canonical snapshot_ids"));
+    }
+
+    #[test]
+    fn aircraft_catalog_roots_require_their_own_exact_approved_decision() {
+        let mut roots = BTreeMap::new();
+        roots.insert(
+            "aircraft_makes".into(),
+            vec![ProjectionRow {
+                table: "aircraft_makes".into(),
+                columns: vec!["id".into(), "approval_decision_id".into()],
+                values: vec![Value::from(1), Value::Null],
+            }],
+        );
+        let error = required_aircraft_decision_ids(&roots).unwrap_err();
+        assert!(error.to_string().contains("has no approval decision"));
+
+        roots.insert(
+            "aircraft_makes".into(),
+            vec![ProjectionRow {
+                table: "aircraft_makes".into(),
+                columns: vec!["id".into(), "approval_decision_id".into()],
+                values: vec![Value::from(1), Value::from(7)],
+            }],
+        );
+        roots.insert(
+            "aircraft_designation_faa_bindings".into(),
+            vec![ProjectionRow {
+                table: "aircraft_designation_faa_bindings".into(),
+                columns: vec!["aircraft_designation_id".into()],
+                values: vec![Value::from(2)],
+            }],
+        );
+        let required = required_aircraft_decision_ids(&roots).unwrap();
+        assert_eq!(required, [7]);
+
+        let pending = vec![ProjectionRow {
+            table: "aircraft_identity_decisions".into(),
+            columns: vec!["id".into(), "decision_status".into()],
+            values: vec![Value::from(7), Value::String("pending".into())],
+        }];
+        assert!(validate_aircraft_approval_decisions(&required, &pending)
+            .unwrap_err()
+            .to_string()
+            .contains("non-approved exact decision"));
+
+        let approved = vec![ProjectionRow {
+            table: "aircraft_identity_decisions".into(),
+            columns: vec!["id".into(), "decision_status".into()],
+            values: vec![Value::from(7), Value::String("approved".into())],
+        }];
+        validate_aircraft_approval_decisions(&required, &approved).unwrap();
+        assert!(validate_aircraft_approval_decisions(&[8], &approved).is_err());
     }
 
     #[tokio::test]

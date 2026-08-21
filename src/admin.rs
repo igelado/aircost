@@ -167,7 +167,9 @@ async fn main() -> Result<()> {
         }
         AdminCommand::PrepareLegacyReplaySource {
             source_database,
+            source_database_sha256,
             manifest,
+            manifest_sha256,
             faa_archive,
             faa_archive_sha256,
             output,
@@ -179,7 +181,9 @@ async fn main() -> Result<()> {
                 })?)?;
             let report = prepare_legacy_replay_source(PrepareLegacyReplaySourceRequest {
                 source_database: &source_database,
+                expected_source_database_sha256: &source_database_sha256,
                 manifest: &manifest,
+                expected_manifest_sha256: &manifest_sha256,
                 faa_archive: &faa_archive,
                 expected_faa_archive_sha256: &faa_archive_sha256,
                 output: &output,
@@ -789,7 +793,9 @@ enum AdminCommand {
     },
     PrepareLegacyReplaySource {
         source_database: String,
+        source_database_sha256: String,
         manifest: PathBuf,
+        manifest_sha256: String,
         faa_archive: PathBuf,
         faa_archive_sha256: String,
         output: PathBuf,
@@ -1146,7 +1152,9 @@ fn parse_prepare_legacy_replay_source_args(
     args: impl IntoIterator<Item = String>,
 ) -> Result<AdminCommand> {
     let mut source_database = None;
+    let mut source_database_sha256 = None;
     let mut manifest = None;
+    let mut manifest_sha256 = None;
     let mut faa_archive = None;
     let mut faa_archive_sha256 = None;
     let mut output = None;
@@ -1157,7 +1165,9 @@ fn parse_prepare_legacy_replay_source_args(
     while let Some(arg) = args.next() {
         let (slot, option_name): (&mut Option<String>, &str) = match arg.as_str() {
             "--source-database" => (&mut source_database, "--source-database"),
+            "--source-database-sha256" => (&mut source_database_sha256, "--source-database-sha256"),
             "--manifest" => (&mut manifest, "--manifest"),
+            "--manifest-sha256" => (&mut manifest_sha256, "--manifest-sha256"),
             "--faa-archive" => (&mut faa_archive, "--faa-archive"),
             "--faa-archive-sha256" => (&mut faa_archive_sha256, "--faa-archive-sha256"),
             "--output" => (&mut output, "--output"),
@@ -1186,7 +1196,10 @@ fn parse_prepare_legacy_replay_source_args(
 
     Ok(AdminCommand::PrepareLegacyReplaySource {
         source_database: source_database.context("--source-database is required")?,
+        source_database_sha256: source_database_sha256
+            .context("--source-database-sha256 is required")?,
         manifest: PathBuf::from(manifest.context("--manifest is required")?),
+        manifest_sha256: manifest_sha256.context("--manifest-sha256 is required")?,
         faa_archive: PathBuf::from(faa_archive.context("--faa-archive is required")?),
         faa_archive_sha256: faa_archive_sha256.context("--faa-archive-sha256 is required")?,
         output: PathBuf::from(output.context("--output is required")?),
@@ -2173,7 +2186,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin prepare-legacy-replay-source --source-database SOURCE --manifest FILE --faa-archive ReleasableAircraft.zip --faa-archive-sha256 HEX --output FILE [--apply]\n    One-purpose, provider-free conversion of the exact frozen legacy SQLite source into a new current-schema replay source. It revalidates signed captures, rebuilds the FAA projection from the exact retained archive, and projects only the reusable verified catalog closure. Dry-run creates no file.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin prepare-legacy-replay-source --source-database SOURCE --source-database-sha256 HEX --manifest FILE --manifest-sha256 HEX --faa-archive ReleasableAircraft.zip --faa-archive-sha256 HEX --output FILE [--apply]\n    One-purpose, provider-free conversion of the exact frozen legacy SQLite source into a new current-schema replay source. It authenticates a private source snapshot and the exact reviewed manifest, rebuilds the FAA projection from the exact retained archive, and projects only the reusable verified catalog closure. Dry-run creates no file.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -3128,8 +3141,12 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
                 "prepare-legacy-replay-source",
                 "--source-database",
                 "/tmp/frozen.sqlite3",
+                "--source-database-sha256",
+                "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc",
                 "--manifest",
                 "/tmp/captures.json",
+                "--manifest-sha256",
+                "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00",
                 "--faa-archive",
                 "/tmp/ReleasableAircraft.zip",
                 "--faa-archive-sha256",
@@ -3143,7 +3160,9 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
         .unwrap();
         let AdminCommand::PrepareLegacyReplaySource {
             source_database,
+            source_database_sha256,
             manifest,
+            manifest_sha256,
             faa_archive,
             faa_archive_sha256,
             output,
@@ -3153,7 +3172,15 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
             panic!("expected prepare-legacy-replay-source command")
         };
         assert_eq!(source_database, "/tmp/frozen.sqlite3");
+        assert_eq!(
+            source_database_sha256,
+            "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc"
+        );
         assert_eq!(manifest, PathBuf::from("/tmp/captures.json"));
+        assert_eq!(
+            manifest_sha256,
+            "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00"
+        );
         assert_eq!(faa_archive, PathBuf::from("/tmp/ReleasableAircraft.zip"));
         assert_eq!(
             faa_archive_sha256,
@@ -3167,7 +3194,15 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
     fn legacy_replay_source_cli_requires_each_explicit_boundary_once() {
         let required = [
             ("--source-database", "/tmp/frozen.sqlite3"),
+            (
+                "--source-database-sha256",
+                "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc",
+            ),
             ("--manifest", "/tmp/captures.json"),
+            (
+                "--manifest-sha256",
+                "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00",
+            ),
             ("--faa-archive", "/tmp/ReleasableAircraft.zip"),
             (
                 "--faa-archive-sha256",

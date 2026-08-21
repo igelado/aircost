@@ -6,15 +6,18 @@
 //! read-only.
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Acquire, FromRow, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempPath};
 
 use super::{
     entry_from_row, validate_source_capture, validate_trusted_capture_manifest, SourceCaptureRow,
@@ -31,6 +34,11 @@ pub const LEGACY_SQLITE_SCHEMA_SHA3_256: &str =
 pub const LEGACY_SCHEMA_RECEIPT_COUNT: usize = 19;
 pub const LEGACY_SCHEMA_RECEIPT_SHA3_256: &str =
     "7081e6098b4e11367b7a371301c4b6ff1e916104174d65906a723c41284dd639";
+pub const LEGACY_SOURCE_DATABASE_SHA256: &str =
+    "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc";
+pub const LEGACY_SOURCE_DATABASE_BYTES: u64 = 50_282_496;
+pub const LEGACY_CAPTURE_MANIFEST_SHA256: &str =
+    "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00";
 pub const LEGACY_FAA_ARCHIVE_SHA256: &str =
     "14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724";
 
@@ -89,7 +97,9 @@ const PREPARED_REPLAY_SOURCE_NONEMPTY_TABLES: &[&str] = &[
 
 pub struct PrepareLegacyReplaySourceRequest<'a> {
     pub source_database: &'a str,
+    pub expected_source_database_sha256: &'a str,
     pub manifest: &'a TrustedCaptureManifest,
+    pub expected_manifest_sha256: &'a str,
     pub faa_archive: &'a Path,
     pub expected_faa_archive_sha256: &'a str,
     pub output: &'a Path,
@@ -100,6 +110,7 @@ pub struct PrepareLegacyReplaySourceRequest<'a> {
 pub struct PrepareLegacyReplaySourceReport {
     pub dry_run: bool,
     pub provider_calls: u64,
+    pub source_database_sha256: String,
     pub source_schema_object_count: usize,
     pub source_schema_sha3_256: String,
     pub source_receipt_count: usize,
@@ -150,6 +161,11 @@ struct FrozenSourceAttestation {
     receipt_sha3_256: String,
 }
 
+struct FrozenSourceSnapshot {
+    path: TempPath,
+    sha256: String,
+}
+
 #[derive(Clone, Debug)]
 struct LegacyCaptureSelection {
     rows: Vec<SourceCaptureRow>,
@@ -176,7 +192,8 @@ pub async fn prepare_legacy_replay_source(
     request: PrepareLegacyReplaySourceRequest<'_>,
 ) -> Result<PrepareLegacyReplaySourceReport> {
     validate_prepare_request(&request)?;
-    let source_pool = open_frozen_source(request.source_database).await?;
+    let frozen_source = snapshot_frozen_source(request.source_database).await?;
+    let source_pool = open_frozen_snapshot(&frozen_source.path).await?;
     let mut source_connection = source_pool.acquire().await?;
     let mut source_snapshot = source_connection.begin().await?;
     let attestation = attest_frozen_source(&mut source_snapshot).await?;
@@ -214,6 +231,8 @@ pub async fn prepare_legacy_replay_source(
     source_snapshot.rollback().await?;
     drop(source_connection);
     source_pool.close().await;
+    let source_database_sha256 = frozen_source.sha256;
+    drop(frozen_source.path);
 
     let faa_archive_sha256 = faa.report.archive_sha256.clone();
     let faa_snapshot_date = faa.report.snapshot_date.clone();
@@ -226,18 +245,7 @@ pub async fn prepare_legacy_replay_source(
         let diagnostic = AppDb::connect_diagnostic(&target_url).await?;
         audit_prepared_target(&diagnostic, &faa.obsolete_hashes).await?;
         diagnostic.close().await;
-        file.as_file().sync_all().with_context(|| {
-            format!(
-                "could not synchronize prepared replay source temporary file for {}",
-                request.output.display()
-            )
-        })?;
-        file.persist_noclobber(request.output).with_context(|| {
-            format!(
-                "could not atomically publish prepared replay source {}",
-                request.output.display()
-            )
-        })?;
+        persist_prepared_output(file, request.output)?;
         true
     } else {
         false
@@ -245,6 +253,7 @@ pub async fn prepare_legacy_replay_source(
     Ok(PrepareLegacyReplaySourceReport {
         dry_run: !request.apply,
         provider_calls: 0,
+        source_database_sha256,
         source_schema_object_count: attestation.schema_object_count,
         source_schema_sha3_256: attestation.schema_sha3_256,
         source_receipt_count: attestation.receipt_count,
@@ -261,7 +270,8 @@ pub async fn prepare_legacy_replay_source(
 }
 
 fn validate_prepare_request(request: &PrepareLegacyReplaySourceRequest<'_>) -> Result<()> {
-    validate_trusted_capture_manifest(request.manifest).map_err(anyhow::Error::msg)?;
+    validate_source_database_boundary(request.expected_source_database_sha256)?;
+    validate_manifest_boundary(request.manifest, request.expected_manifest_sha256)?;
     if request.expected_faa_archive_sha256 != LEGACY_FAA_ARCHIVE_SHA256 {
         bail!(
             "legacy replay-source bridge accepts only historical FAA archive SHA-256 {LEGACY_FAA_ARCHIVE_SHA256}"
@@ -294,6 +304,34 @@ fn validate_prepare_request(request: &PrepareLegacyReplaySourceRequest<'_>) -> R
     Ok(())
 }
 
+fn validate_source_database_boundary(expected_sha256: &str) -> Result<()> {
+    if expected_sha256 != LEGACY_SOURCE_DATABASE_SHA256 {
+        bail!(
+            "legacy replay-source bridge accepts only frozen source database SHA-256 {LEGACY_SOURCE_DATABASE_SHA256}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_manifest_boundary(
+    manifest: &TrustedCaptureManifest,
+    expected_sha256: &str,
+) -> Result<()> {
+    validate_trusted_capture_manifest(manifest).map_err(anyhow::Error::msg)?;
+    if expected_sha256 != LEGACY_CAPTURE_MANIFEST_SHA256 {
+        bail!(
+            "legacy replay-source bridge accepts only capture manifest SHA-256 {LEGACY_CAPTURE_MANIFEST_SHA256}"
+        );
+    }
+    if manifest.manifest_sha256 != expected_sha256 {
+        bail!(
+            "legacy replay-source manifest fingerprint {} does not match required fingerprint {expected_sha256}",
+            manifest.manifest_sha256
+        );
+    }
+    Ok(())
+}
+
 fn output_parent(output: &Path) -> Result<&Path> {
     if output.file_name().is_none() {
         bail!("prepared replay-source output has no file name");
@@ -304,7 +342,7 @@ fn output_parent(output: &Path) -> Result<&Path> {
         .unwrap_or_else(|| Path::new(".")))
 }
 
-pub(crate) async fn open_frozen_source(source_database: &str) -> Result<SqlitePool> {
+async fn snapshot_frozen_source(source_database: &str) -> Result<FrozenSourceSnapshot> {
     let source_url = database_url_from_arg(Some(source_database.to_string()));
     if source_url == "sqlite::memory:"
         || source_url.starts_with("postgres://")
@@ -314,19 +352,110 @@ pub(crate) async fn open_frozen_source(source_database: &str) -> Result<SqlitePo
         bail!("legacy replay source must be a file-backed SQLite database");
     }
     let source_path = sqlite_path(&source_url)?;
-    let metadata = std::fs::metadata(&source_path).with_context(|| {
+    tokio::task::spawn_blocking(move || {
+        copy_private_source_snapshot(
+            &source_path,
+            LEGACY_SOURCE_DATABASE_SHA256,
+            LEGACY_SOURCE_DATABASE_BYTES,
+        )
+    })
+    .await
+    .context("frozen-source snapshot worker failed")?
+}
+
+fn copy_private_source_snapshot(
+    source_path: &Path,
+    expected_sha256: &str,
+    expected_bytes: u64,
+) -> Result<FrozenSourceSnapshot> {
+    reject_sqlite_sidecars(&source_path)?;
+    let mut source = OpenOptions::new()
+        .read(true)
+        .open(&source_path)
+        .with_context(|| {
+            format!(
+                "could not open frozen legacy replay source {}",
+                source_path.display()
+            )
+        })?;
+    let opened_metadata = source.metadata().with_context(|| {
         format!(
             "could not inspect legacy replay source {}",
             source_path.display()
         )
     })?;
-    if !metadata.is_file() {
+    if !opened_metadata.is_file() {
         bail!("legacy replay source must be a regular SQLite file");
     }
-    let options = SqliteConnectOptions::from_str(&source_url)
-        .with_context(|| format!("invalid legacy SQLite database URL {source_url}"))?
+    if opened_metadata.len() != expected_bytes {
+        bail!(
+            "frozen legacy replay source size {} does not match required size {expected_bytes}",
+            opened_metadata.len()
+        );
+    }
+
+    let mut snapshot =
+        NamedTempFile::new().context("could not create private frozen-source snapshot")?;
+    snapshot
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .context("could not restrict frozen-source snapshot permissions")?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    let mut copied_bytes = 0_u64;
+    loop {
+        let read = source.read(&mut buffer).with_context(|| {
+            format!(
+                "could not read frozen legacy replay source {}",
+                source_path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        copied_bytes = copied_bytes
+            .checked_add(read as u64)
+            .context("frozen legacy replay source byte count overflowed")?;
+        if copied_bytes > expected_bytes {
+            bail!("frozen legacy replay source grew while it was being snapshotted");
+        }
+        snapshot
+            .write_all(&buffer[..read])
+            .context("could not write private frozen-source snapshot")?;
+        hasher.update(&buffer[..read]);
+    }
+    snapshot
+        .flush()
+        .context("could not flush private frozen-source snapshot")?;
+    snapshot
+        .as_file()
+        .sync_all()
+        .context("could not synchronize private frozen-source snapshot")?;
+    reject_changed_source_path(&source_path, &opened_metadata)?;
+    reject_sqlite_sidecars(&source_path)?;
+    if copied_bytes != expected_bytes {
+        bail!(
+            "frozen legacy replay source copy has {copied_bytes} bytes instead of {expected_bytes}"
+        );
+    }
+    let sha256 = format!("{:x}", hasher.finalize());
+    if sha256 != expected_sha256 {
+        bail!(
+            "frozen legacy replay source SHA-256 {sha256} does not match required SHA-256 {expected_sha256}"
+        );
+    }
+    Ok(FrozenSourceSnapshot {
+        path: snapshot.into_temp_path(),
+        sha256,
+    })
+}
+
+async fn open_frozen_snapshot(snapshot_path: &Path) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::new()
+        .filename(snapshot_path)
         .create_if_missing(false)
         .read_only(true)
+        .immutable(true)
         .foreign_keys(true);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -342,11 +471,82 @@ pub(crate) async fn open_frozen_source(source_database: &str) -> Result<SqlitePo
         .await
         .with_context(|| {
             format!(
-                "could not open legacy replay source {} read-only",
-                source_path.display()
+                "could not open private frozen-source snapshot {} read-only",
+                snapshot_path.display()
             )
         })?;
     Ok(pool)
+}
+
+fn reject_sqlite_sidecars(source_path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = source_path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => bail!(
+                "frozen legacy replay source has forbidden SQLite sidecar {}",
+                sidecar.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not inspect SQLite sidecar {}", sidecar.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_changed_source_path(source_path: &Path, opened: &std::fs::Metadata) -> Result<()> {
+    let current = std::fs::metadata(source_path).with_context(|| {
+        format!(
+            "frozen legacy replay source path changed while it was being snapshotted: {}",
+            source_path.display()
+        )
+    })?;
+    if current.dev() != opened.dev()
+        || current.ino() != opened.ino()
+        || current.len() != opened.len()
+    {
+        bail!(
+            "frozen legacy replay source path changed while it was being snapshotted: {}",
+            source_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn persist_prepared_output(file: NamedTempFile, output: &Path) -> Result<()> {
+    file.as_file().sync_all().with_context(|| {
+        format!(
+            "could not synchronize prepared replay source temporary file for {}",
+            output.display()
+        )
+    })?;
+    let published = file.persist_noclobber(output).with_context(|| {
+        format!(
+            "could not atomically publish prepared replay source {}",
+            output.display()
+        )
+    })?;
+    published.sync_all().with_context(|| {
+        format!(
+            "could not synchronize published replay source {}",
+            output.display()
+        )
+    })?;
+    drop(published);
+    sync_parent_directory(output_parent(output)?)?;
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    File::open(parent)
+        .with_context(|| format!("could not open output parent {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("could not synchronize output parent {}", parent.display()))
 }
 
 fn sqlite_path(database_url: &str) -> Result<PathBuf> {
@@ -891,6 +1091,34 @@ fn quote_identifier(identifier: &str) -> String {
 mod tests {
     use super::*;
 
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn self_consistent_subset_manifest() -> TrustedCaptureManifest {
+        let captures = vec![super::super::TrustedCaptureEntry {
+            submission_id: 1,
+            user_id: 1,
+            user_email: "review@example.test".into(),
+            user_display_name: "Review".into(),
+            user_auth_provider: "local".into(),
+            user_auth_subject: "review".into(),
+            plugin_install_id: 1,
+            plugin_public_key_base64: "key".into(),
+            plugin_install_created_at: "2026-01-01 00:00:00".into(),
+            plugin_install_revoked_at: None,
+            source_url: "https://example.test/listing".into(),
+            submitted_at: "2026-01-02 00:00:00".into(),
+            rendered_html_sha256: "a".repeat(64),
+            signature_base64: "signature".into(),
+        }];
+        TrustedCaptureManifest {
+            version: 1,
+            manifest_sha256: super::super::manifest_fingerprint(&captures).unwrap(),
+            captures,
+        }
+    }
+
     #[test]
     fn frozen_digest_material_includes_the_final_newline() {
         let actual = hash_rows(["one\u{1f}two".to_string()]);
@@ -908,6 +1136,155 @@ mod tests {
         assert!(decoded[1..31].iter().all(|byte| *byte == 0xab));
         assert_eq!(decoded[31], 0xff);
         assert!(decode_sha256("not-a-digest").is_err());
+    }
+
+    #[test]
+    fn frozen_source_boundary_accepts_only_the_reviewed_digest() {
+        validate_source_database_boundary(LEGACY_SOURCE_DATABASE_SHA256).unwrap();
+        for rejected in ["A".repeat(64), "0".repeat(64), "not-a-digest".into()] {
+            let error = validate_source_database_boundary(&rejected).unwrap_err();
+            assert!(error.to_string().contains(LEGACY_SOURCE_DATABASE_SHA256));
+        }
+    }
+
+    #[test]
+    fn self_consistent_subset_manifest_cannot_cross_the_reviewed_boundary() {
+        let manifest = self_consistent_subset_manifest();
+        validate_trusted_capture_manifest(&manifest).unwrap();
+        let error =
+            validate_manifest_boundary(&manifest, LEGACY_CAPTURE_MANIFEST_SHA256).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match required fingerprint"));
+    }
+
+    #[test]
+    fn private_snapshot_authenticates_the_copied_bytes_and_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let bytes = b"exact frozen source bytes";
+        std::fs::write(&source_path, bytes).unwrap();
+        let snapshot =
+            copy_private_source_snapshot(&source_path, &sha256(bytes), bytes.len() as u64).unwrap();
+        assert_eq!(std::fs::read(&snapshot.path).unwrap(), bytes);
+        assert_eq!(snapshot.sha256, sha256(bytes));
+        assert_eq!(
+            std::fs::metadata(&snapshot.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn same_size_data_tampering_is_rejected_by_the_source_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let reviewed = b"reviewed";
+        std::fs::write(&source_path, reviewed).unwrap();
+        let reviewed_sha256 = sha256(reviewed);
+        std::fs::write(&source_path, b"tampered").unwrap();
+        let error =
+            copy_private_source_snapshot(&source_path, &reviewed_sha256, reviewed.len() as u64)
+                .err()
+                .expect("same-size tampering must fail");
+        assert!(error
+            .to_string()
+            .contains("does not match required SHA-256"));
+    }
+
+    #[test]
+    fn every_sqlite_sidecar_shape_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let bytes = b"source";
+        std::fs::write(&source_path, bytes).unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = source_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            std::fs::write(&sidecar, []).unwrap();
+            let error =
+                copy_private_source_snapshot(&source_path, &sha256(bytes), bytes.len() as u64)
+                    .err()
+                    .expect("sidecar must fail closed");
+            assert!(error.to_string().contains("forbidden SQLite sidecar"));
+            std::fs::remove_file(sidecar).unwrap();
+        }
+
+        let mut dangling = source_path.as_os_str().to_os_string();
+        dangling.push("-wal");
+        std::os::unix::fs::symlink(directory.path().join("missing"), &dangling).unwrap();
+        let error = copy_private_source_snapshot(&source_path, &sha256(bytes), bytes.len() as u64)
+            .err()
+            .expect("dangling sidecar must fail closed");
+        assert!(error.to_string().contains("forbidden SQLite sidecar"));
+    }
+
+    #[tokio::test]
+    async fn immutable_snapshot_survives_source_replacement_and_rejects_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let options = SqliteConnectOptions::new()
+            .filename(&source_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE retained (value TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO retained (value) VALUES ('exact')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        reject_sqlite_sidecars(&source_path).unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let snapshot = copy_private_source_snapshot(
+            &source_path,
+            &sha256(&source_bytes),
+            source_bytes.len() as u64,
+        )
+        .unwrap();
+
+        let displaced = directory.path().join("displaced.sqlite3");
+        std::fs::rename(&source_path, displaced).unwrap();
+        std::fs::write(&source_path, b"replacement").unwrap();
+        let snapshot_pool = open_frozen_snapshot(&snapshot.path).await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM retained")
+            .fetch_one(&snapshot_pool)
+            .await
+            .unwrap();
+        assert_eq!(value, "exact");
+        assert!(
+            sqlx::query("INSERT INTO retained (value) VALUES ('forbidden')")
+                .execute(&snapshot_pool)
+                .await
+                .is_err()
+        );
+        snapshot_pool.close().await;
+        reject_sqlite_sidecars(&snapshot.path).unwrap();
+    }
+
+    #[test]
+    fn publication_syncs_the_parent_and_remains_no_clobber() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("prepared.sqlite3");
+        let mut first = NamedTempFile::new_in(directory.path()).unwrap();
+        first.write_all(b"prepared").unwrap();
+        persist_prepared_output(first, &output).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"prepared");
+
+        let mut second = NamedTempFile::new_in(directory.path()).unwrap();
+        second.write_all(b"replacement").unwrap();
+        assert!(persist_prepared_output(second, &output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"prepared");
     }
 
     #[test]

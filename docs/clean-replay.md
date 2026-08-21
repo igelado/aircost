@@ -25,25 +25,33 @@ application startup and must never be repaired in place. The temporary
 ```text
 aircost-admin prepare-legacy-replay-source \
   --source-database FROZEN_SOURCE \
+  --source-database-sha256 3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc \
   --manifest captures.json \
+  --manifest-sha256 345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00 \
   --faa-archive ReleasableAircraft.zip \
   --faa-archive-sha256 14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724 \
   --output PREPARED_SOURCE
 aircost-admin prepare-legacy-replay-source \
   --source-database FROZEN_SOURCE \
+  --source-database-sha256 3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc \
   --manifest captures.json \
+  --manifest-sha256 345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00 \
   --faa-archive ReleasableAircraft.zip \
   --faa-archive-sha256 14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724 \
   --output PREPARED_SOURCE --apply
 ```
 
-Dry run is the default and creates no output file. Both modes require the
-fixed, reviewed legacy schema and migration-receipt inventories, revalidate
-every selected signed capture and timestamp, hash the exact retained FAA ZIP,
-and parse that ZIP through the current privacy-minimizing importer. A
-different schema, receipt set, archive, manifest member, signature, owner,
-install, key, revocation instant, capture hash, or retained non-PII FAA fact is
-rejected.
+Dry run is the default and creates no output file. Both modes require the exact
+reviewed source-database byte digest and semantic capture-manifest fingerprint,
+the fixed legacy schema and migration-receipt inventories, and the exact
+retained FAA ZIP. The source may not have a `-wal`, `-shm`, or `-journal`
+sidecar. The bridge opens the original file once, copies and hashes those same
+bytes into a private `0600` snapshot, and opens only that snapshot as immutable
+and read-only. It then revalidates every selected signed capture and timestamp
+and parses the FAA ZIP through the current privacy-minimizing importer. A
+different source byte, schema, receipt set, archive, manifest member,
+signature, owner, install, key, revocation instant, capture hash, or retained
+non-PII FAA fact is rejected.
 
 The output is a new current canonical-schema SQLite file. It contains only the
 selected users, installs, signed captures with all derived fields reset, the
@@ -57,10 +65,15 @@ any retained legacy FAA record or source-manifest digest.
 
 Apply builds a sibling temporary file and publishes it with a no-replace
 atomic rename only after current diagnostic startup, integrity, foreign-key,
-taint, and zero-provider-usage checks pass. Failure removes the temporary file
-and leaves the source unchanged and the requested output absent. This command
-is a one-time administrative bridge, not runtime compatibility; remove it after
-the reviewed source has been prepared and the clean rebuild has cut over.
+taint, and zero-provider-usage checks pass. It synchronizes both the published
+file and its parent directory before reporting success. Failures before the
+rename remove the temporary file and leave the requested output absent. A
+directory-synchronization failure occurs after publication and can therefore
+leave a complete output whose crash durability is uncertain; inspect that file
+before deciding whether to retain or remove it. The frozen source is never
+modified. This command is a one-time administrative bridge, not runtime
+compatibility; remove it after the reviewed source has been prepared and the
+clean rebuild has cut over.
 
 ## Phases
 
