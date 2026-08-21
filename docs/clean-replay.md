@@ -63,6 +63,18 @@ observations, resolution cases, decisions, and catalog bindings are rebuilt
 against the parsed current-domain records. An exhaustive final scan rejects
 any retained legacy FAA record or source-manifest digest.
 
+The reported catalog fingerprint is loaded from that finished current-schema
+output; it is not the legacy adapter's intermediate fingerprint. Version 1 uses
+the `aircost:current-verified-catalog-projection:v1` domain and binds an exact
+ordered table inventory (including zero-row tables), per-table counts, and
+canonical sorted rows. It covers the complete target-scoped rows of every FAA
+snapshot in the prepared source, approved aircraft hierarchy and its bounded
+provenance, and approved avionics closure. Capture, listing, review, valuation,
+provider, candidate, and history rows are outside the domain. Reviewer users
+are reported as dependencies but capture import remains their owner, so users
+are not catalog-fingerprinted. Apply closes and reopens the published candidate
+and requires the reloaded current-schema projection to match before publication.
+
 Apply builds a sibling temporary file and publishes it with a no-replace
 atomic rename only after current diagnostic startup, integrity, foreign-key,
 taint, and zero-provider-usage checks pass. It synchronizes both the published
