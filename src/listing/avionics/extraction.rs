@@ -5,12 +5,17 @@
 //! source URL. This module deliberately has no legacy parser or scalar
 //! capability fallback.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::extract::CURATED_AVIONICS_TYPES;
 use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
-use crate::listing::evidence::{ListingEvidenceContext, MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES};
+use crate::listing::evidence::{
+    controller_avionics_evidence, identity_span_has_boundaries, ListingEvidenceContext,
+    MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES,
+};
 use crate::models::ParsedAvionics;
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +81,149 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
         }
     }
     Ok(observations)
+}
+
+/// Replace only typography-drifted occurrence evidence with an exact visible
+/// span copied from one trusted Controller Avionics/Radios field.
+///
+/// This is deliberately an extraction-boundary repair, not product
+/// normalization. The model-produced evidence remains the identity-complete
+/// locator: after lowercasing and removing non-alphanumeric characters, a
+/// source span must be exactly equal to that locator. Every identity and
+/// action field stays model-produced and is revalidated unchanged.
+pub(crate) fn recover_controller_avionics_evidence_typography(
+    extracted_listing: &mut Value,
+    source_url: &str,
+    rendered_html: &str,
+) -> Result<bool, String> {
+    let observations = parse_current_avionics_extraction_value(extracted_listing)?;
+    let missing_exact_span = observations.iter().any(|observation| {
+        !listing_body_contains_exact_structurally_visible_text_span(
+            rendered_html,
+            observation
+                .source_evidence_text
+                .as_deref()
+                .expect("the canonical parser requires occurrence evidence"),
+        )
+    });
+    if !missing_exact_span {
+        return Ok(false);
+    }
+
+    let Some(controller_field) = controller_avionics_evidence(source_url, rendered_html) else {
+        return Ok(false);
+    };
+    let full_source = ListingEvidenceContext::from_cleaned_text(&controller_field);
+    let mut replacements = Vec::new();
+    for (index, observation) in observations.iter().enumerate() {
+        let evidence = observation
+            .source_evidence_text
+            .as_deref()
+            .expect("the canonical parser requires occurrence evidence");
+        if listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence) {
+            continue;
+        }
+        if !context_has_exact_identity(&full_source, &observation.manufacturer, &observation.model)
+            || observation.replaces.as_ref().is_some_and(|replacement| {
+                !context_has_exact_identity(
+                    &full_source,
+                    &replacement.manufacturer,
+                    &replacement.model,
+                )
+            })
+        {
+            return Ok(false);
+        }
+
+        let candidates = typography_equivalent_visible_spans(&controller_field, evidence)
+            .into_iter()
+            .filter(|candidate| {
+                listing_body_contains_exact_structurally_visible_text_span(rendered_html, candidate)
+            })
+            .filter(|candidate| {
+                let candidate_context = ListingEvidenceContext::from_cleaned_text(*candidate);
+                context_has_exact_identity(
+                    &candidate_context,
+                    &observation.manufacturer,
+                    &observation.model,
+                ) && observation.replaces.as_ref().is_none_or(|replacement| {
+                    context_has_exact_identity(
+                        &candidate_context,
+                        &replacement.manufacturer,
+                        &replacement.model,
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let mut candidates = candidates.into_iter();
+        let Some(candidate) = candidates.next() else {
+            return Ok(false);
+        };
+        if candidates.next().is_some() {
+            return Ok(false);
+        }
+        replacements.push((index, candidate.to_string()));
+    }
+
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+    let original = extracted_listing.clone();
+    let avionics = extracted_listing
+        .get_mut("avionics")
+        .and_then(Value::as_array_mut)
+        .expect("the canonical parser requires a top-level avionics array");
+    for (index, evidence) in replacements {
+        avionics[index]
+            .as_object_mut()
+            .expect("the canonical parser requires avionics objects")
+            .insert("source_evidence_text".to_string(), Value::String(evidence));
+    }
+
+    if let Err(error) =
+        validate_unbound_current_avionics_extraction(&extracted_listing.to_string(), rendered_html)
+    {
+        *extracted_listing = original;
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn typography_equivalent_visible_spans<'a>(source: &'a str, hint: &str) -> Vec<&'a str> {
+    let hint = normalize_evidence_typography(hint);
+    if hint.is_empty() {
+        return Vec::new();
+    }
+    let mut normalized = String::new();
+    let mut source_offsets = Vec::new();
+    for (offset, character) in source.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+            source_offsets.push(offset);
+        }
+    }
+    normalized
+        .match_indices(&hint)
+        .filter_map(|(normalized_start, _)| {
+            let source_start = source_offsets.get(normalized_start).copied()?;
+            let normalized_last = normalized_start.checked_add(hint.len())?.checked_sub(1)?;
+            let source_last = source_offsets.get(normalized_last).copied()?;
+            let source_end = source_last + source[source_last..].chars().next()?.len_utf8();
+            let candidate = &source[source_start..source_end];
+            (candidate.len() <= MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
+                && !candidate.contains(['\r', '\n'])
+                && identity_span_has_boundaries(source, source_start, source_end))
+            .then_some(candidate)
+        })
+        .collect()
+}
+
+fn normalize_evidence_typography(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 pub(crate) fn parse_current_avionics_extraction_json(
@@ -320,6 +468,59 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/257737897/example";
+
+    fn controller_html(field: &str) -> String {
+        format!(
+            r#"<html><head><meta content="Garmin GMA-1347"></head><body>
+            <div class="detail__specs-wrapper">
+              <div class="detail__specs-label">Avionics/Radios</div>
+              <div class="detail__specs-value">{field}</div>
+            </div>
+            </body></html>"#
+        )
+    }
+
+    fn installed(manufacturer: &str, model: &str, evidence: &str) -> Value {
+        serde_json::json!({
+            "avionics": [{
+                "manufacturer": manufacturer,
+                "model": model,
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]
+        })
+    }
+
+    fn replacement(evidence: &str) -> Value {
+        serde_json::json!({
+            "avionics": [{
+                "manufacturer": "Garmin",
+                "model": "GTN 750Xi",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "replaces",
+                "replaces": {
+                    "manufacturer": "Garmin",
+                    "model": "GNS 530W",
+                    "types": ["GPS"]
+                },
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]
+        })
+    }
+
+    fn evidence(payload: &Value) -> &str {
+        payload["avionics"][0]["source_evidence_text"]
+            .as_str()
+            .unwrap()
+    }
+
     fn bound<'a>(html: &'a str, hash: &'a str, json: &'a str) -> CurrentAvionicsExtraction<'a> {
         CurrentAvionicsExtraction {
             listing_id: 7,
@@ -425,5 +626,299 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn controller_recovery_copies_hyphen_case_and_entity_typography() {
+        for (field, hint, expected) in [
+            ("Garmin GMA-1347", "Garmin GMA 1347", "Garmin GMA-1347"),
+            ("GARMIN GMA 1347", "Garmin GMA 1347", "GARMIN GMA 1347"),
+            ("Garmin GMA&#45;1347", "Garmin GMA 1347", "Garmin GMA-1347"),
+        ] {
+            let html = controller_html(field);
+            let mut payload = installed("Garmin", "GMA 1347", hint);
+
+            assert!(recover_controller_avionics_evidence_typography(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap());
+            assert_eq!(evidence(&payload), expected);
+        }
+    }
+
+    #[test]
+    fn already_visible_evidence_stays_byte_identical() {
+        let html = controller_html("Garmin GMA-1347");
+        let mut payload = installed("Garmin", "GMA 1347", "Garmin GMA-1347");
+        let original = payload.clone();
+
+        assert!(!recover_controller_avionics_evidence_typography(
+            &mut payload,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn recovery_never_adds_or_removes_manufacturer_tokens() {
+        for (field, hint) in [
+            ("Garmin GMA-1347", "BendixKing Garmin GMA 1347"),
+            ("GMA-1347", "Garmin GMA 1347"),
+        ] {
+            let html = controller_html(field);
+            let mut payload = installed("Garmin", "GMA 1347", hint);
+            let original = payload.clone();
+
+            assert!(!recover_controller_avionics_evidence_typography(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap());
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn meaningful_product_suffixes_are_not_typography() {
+        for (model, hint, field) in [
+            ("G1000", "Garmin G1000", "Garmin G1000 NXi"),
+            ("GDC 74", "Garmin GDC 74", "Garmin GDC-74A"),
+            ("GTX 33", "Garmin GTX 33", "Garmin GTX 33 ES"),
+            ("GNS 430", "Garmin GNS 430", "Garmin GNS-430W"),
+        ] {
+            let html = controller_html(field);
+            let mut payload = installed("Garmin", model, hint);
+            let original = payload.clone();
+
+            assert!(!recover_controller_avionics_evidence_typography(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap());
+            assert_eq!(payload, original, "{field:?} must fail closed");
+        }
+    }
+
+    #[test]
+    fn distinct_spellings_are_ambiguous_but_repeated_exact_spans_are_safe() {
+        let html = controller_html("Garmin GMA-1347\nGarmin GMA 1347");
+        let mut ambiguous = installed("Garmin", "GMA 1347", "garmin gma1347");
+        let original = ambiguous.clone();
+        assert!(!recover_controller_avionics_evidence_typography(
+            &mut ambiguous,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(ambiguous, original);
+
+        let html = controller_html("Garmin GMA-1347\nGarmin GMA-1347");
+        let mut repeated = installed("Garmin", "GMA 1347", "garmin gma1347");
+        assert!(recover_controller_avionics_evidence_typography(
+            &mut repeated,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(evidence(&repeated), "Garmin GMA-1347");
+    }
+
+    #[test]
+    fn hidden_metadata_script_and_multiple_or_invalid_fields_fail_closed() {
+        let cases = [
+            controller_html("<span hidden>Garmin GMA-1347</span>"),
+            controller_html("<script>Garmin GMA-1347</script>Not the product"),
+            r#"<html><head><meta content="Garmin GMA-1347"></head><body>Not the product</body></html>"#
+                .to_string(),
+            r#"<html><body>
+               <div class="detail__specs-wrapper">
+                 <div class="detail__specs-label">Avionics/Radios</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div>
+               <div class="detail__specs-wrapper">
+                 <div class="detail__specs-label">Avionics/Radios</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div>
+               </body></html>"#
+                .to_string(),
+            r#"<html><body>
+               <div class="detail__specs-wrapper">
+                 <div class="detail__specs-label">Avionics/Radios</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div>
+               <div class="detail__specs-wrapper">
+                 <div class="detail__specs-label" hidden>Avionics/Radios</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div>
+               </body></html>"#
+                .to_string(),
+            r#"<html><body>
+               <div class="detail__specs-wrapper">
+                 <div class="detail__specs-label">Avionics/Radios</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div>
+               <div class="detail__specs-wrapper">
+                 <div class="detail__specs-label">Avionics/Radios<span hidden>x</span></div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div>
+               </body></html>"#
+                .to_string(),
+            r#"<html><body><div class="detail__specs-wrapper">
+                 <div class="detail__specs-label">Avionics/Radios</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+                 <div class="detail__specs-value">Garmin GMA-1347</div>
+               </div></body></html>"#
+                .to_string(),
+        ];
+        for html in cases {
+            let mut payload = installed("Garmin", "GMA 1347", "Garmin GMA 1347");
+            let original = payload.clone();
+            assert!(!recover_controller_avionics_evidence_typography(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap());
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn recovery_is_controller_only_and_keeps_the_evidence_byte_bound() {
+        let html = controller_html("Garmin GMA-1347");
+        let mut wrong_source = installed("Garmin", "GMA 1347", "Garmin GMA 1347");
+        let original = wrong_source.clone();
+        assert!(!recover_controller_avionics_evidence_typography(
+            &mut wrong_source,
+            "https://example.test/listing/257737897",
+            &html,
+        )
+        .unwrap());
+        assert_eq!(wrong_source, original);
+
+        let long_suffix = "x".repeat(MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES);
+        let field = format!("Garmin GMA-1347 {long_suffix}");
+        let hint = format!("Garmin GMA 1347 {long_suffix}");
+        let html = controller_html(&field);
+        let mut oversized = installed("Garmin", "GMA 1347", &hint);
+        let original = oversized.clone();
+        assert!(recover_controller_avionics_evidence_typography(
+            &mut oversized,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap_err()
+        .contains("bounded listing-evidence limit"));
+        assert_eq!(oversized, original);
+    }
+
+    #[test]
+    fn replacement_recovery_requires_both_identities_in_one_contiguous_span() {
+        let html = controller_html("Garmin GTN-750Xi replaces Garmin GNS-530W");
+        let mut payload = replacement("Garmin GTN 750Xi replaces Garmin GNS 530W");
+        assert!(recover_controller_avionics_evidence_typography(
+            &mut payload,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(
+            evidence(&payload),
+            "Garmin GTN-750Xi replaces Garmin GNS-530W"
+        );
+
+        for (field, hint) in [
+            (
+                "Garmin GTN-750Xi\nreplaces Garmin GNS-530W",
+                "Garmin GTN 750Xi replaces Garmin GNS 530W",
+            ),
+            ("Garmin GTN-750Xi\nGarmin GNS-530W", "Garmin GTN 750Xi"),
+        ] {
+            let html = controller_html(field);
+            let mut payload = replacement(hint);
+            let original = payload.clone();
+            assert!(!recover_controller_avionics_evidence_typography(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap());
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn recovery_changes_no_non_evidence_value() {
+        let html = controller_html("Garmin GMA-1347");
+        let mut payload = installed("Garmin", "GMA 1347", "garmin gma 1347");
+        payload["aircraft_marker"] = serde_json::json!({
+            "manufacturer": "Cessna",
+            "serial": "unchanged",
+            "nested": [1, 2, 3]
+        });
+        let mut expected = payload.clone();
+        expected["avionics"][0]["source_evidence_text"] =
+            Value::String("Garmin GMA-1347".to_string());
+
+        assert!(recover_controller_avionics_evidence_typography(
+            &mut payload,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn structural_failures_are_not_recovered() {
+        let html = controller_html("Garmin GMA-1347");
+        let mut cases = Vec::new();
+        for (field, value, expected_error) in [
+            ("manufacturer", Value::String(String::new()), "manufacturer"),
+            (
+                "quantity",
+                Value::String("one".to_string()),
+                "quantity must be an explicit integer",
+            ),
+            (
+                "configuration_action",
+                Value::String("upgrades".to_string()),
+                "configuration_action",
+            ),
+            (
+                "source_confidence",
+                Value::String("certain".to_string()),
+                "source_confidence",
+            ),
+        ] {
+            let mut payload = installed("Garmin", "GMA 1347", "Garmin GMA 1347");
+            payload["avionics"][0][field] = value;
+            cases.push((payload, expected_error));
+        }
+        let mut invalid_types = installed("Garmin", "GMA 1347", "Garmin GMA 1347");
+        invalid_types["avionics"][0]["types"] = Value::String("Flight Display".to_string());
+        cases.push((invalid_types, "scalar type payloads"));
+        let mut invalid_replacement = installed("Garmin", "GMA 1347", "Garmin GMA 1347");
+        invalid_replacement["avionics"][0]["configuration_action"] =
+            Value::String("replaces".to_string());
+        cases.push((invalid_replacement, "requires one replacement object"));
+
+        for (mut payload, expected_error) in cases {
+            let original = payload.clone();
+            assert!(recover_controller_avionics_evidence_typography(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap_err()
+            .contains(expected_error));
+            assert_eq!(payload, original);
+        }
     }
 }
