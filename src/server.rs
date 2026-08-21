@@ -2643,6 +2643,7 @@ mod tests {
             ),
             reason: "The admitted manufacturer source confirms the exact identity.".to_string(),
             grounded_claim_source_urls: vec![final_source_url.to_string()],
+            verified_local_reuse_proof: None,
         };
         assert!(approved.evidence.chars().count() > 128);
 

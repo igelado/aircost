@@ -25,6 +25,9 @@ use crate::avionics::catalog::{
     exact_product_identity_signal_is_present, ApprovedProductAssociationRequest,
     ApprovedProductAssociationResolver, PendingProductAttestationCommitGuard,
 };
+pub(super) use crate::avionics::catalog::{
+    ActiveCollisionCatalogFingerprintRow, ACTIVE_COLLISION_CATALOG_ROWS_SQL,
+};
 use crate::avionics::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
     stage_batch_manufacturer_alias_collision_postgres,
@@ -916,16 +919,6 @@ pub(crate) struct CatalogFingerprintRow {
     pub(crate) identity_evidence_text: Option<String>,
 }
 
-#[derive(Clone, Debug, FromRow)]
-pub(super) struct ActiveCollisionCatalogFingerprintRow {
-    pub(super) id: i64,
-    catalog_status: String,
-    effective_manufacturer_identity_id: Option<i64>,
-    model: String,
-    manufacturer_identifier_kind: Option<String>,
-    manufacturer_identifier: Option<String>,
-}
-
 #[derive(Clone, Debug)]
 struct CatalogFingerprintProduct {
     id: i64,
@@ -1193,24 +1186,6 @@ const APPROVED_CATALOG_ROWS_SQL: &str = r#"
       ON graph.avionics_model_id = model.id
     WHERE model.catalog_status = 'approved'
     ORDER BY model.id, capability.normalized_name, capability.id
-"#;
-
-pub(super) const ACTIVE_COLLISION_CATALOG_ROWS_SQL: &str = r#"
-    SELECT
-      model.id,
-      model.catalog_status,
-      effective_manufacturer.avionics_manufacturer_identity_id
-        AS effective_manufacturer_identity_id,
-      model.name AS model,
-      model.manufacturer_identifier_kind,
-      model.manufacturer_identifier
-    FROM avionics_models model
-    LEFT JOIN avionics_manufacturer_effective_memberships effective_manufacturer
-      ON effective_manufacturer.avionics_manufacturer_id =
-         model.avionics_manufacturer_id
-    WHERE model.catalog_status IN ('approved', 'unreviewed')
-    ORDER BY model.id,
-             effective_manufacturer.avionics_manufacturer_identity_id
 "#;
 
 fn sha256_hex(bytes: &[u8]) -> String {
