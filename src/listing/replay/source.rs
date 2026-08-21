@@ -368,7 +368,9 @@ fn copy_private_source_snapshot(
     expected_sha256: &str,
     expected_bytes: u64,
 ) -> Result<FrozenSourceSnapshot> {
+    let initial_path_metadata = inspect_unaliased_source_path(source_path)?;
     reject_sqlite_sidecars(&source_path)?;
+    reject_changed_source_path(source_path, &initial_path_metadata)?;
     let mut source = OpenOptions::new()
         .read(true)
         .open(&source_path)
@@ -386,6 +388,18 @@ fn copy_private_source_snapshot(
     })?;
     if !opened_metadata.is_file() {
         bail!("legacy replay source must be a regular SQLite file");
+    }
+    if opened_metadata.nlink() != 1 {
+        bail!("legacy replay source must have exactly one hard link");
+    }
+    if opened_metadata.dev() != initial_path_metadata.dev()
+        || opened_metadata.ino() != initial_path_metadata.ino()
+        || opened_metadata.len() != initial_path_metadata.len()
+    {
+        bail!(
+            "frozen legacy replay source path changed while it was being opened: {}",
+            source_path.display()
+        );
     }
     if opened_metadata.len() != expected_bytes {
         bail!(
@@ -433,6 +447,7 @@ fn copy_private_source_snapshot(
         .context("could not synchronize private frozen-source snapshot")?;
     reject_changed_source_path(&source_path, &opened_metadata)?;
     reject_sqlite_sidecars(&source_path)?;
+    reject_changed_source_path(&source_path, &opened_metadata)?;
     if copied_bytes != expected_bytes {
         bail!(
             "frozen legacy replay source copy has {copied_bytes} bytes instead of {expected_bytes}"
@@ -448,6 +463,28 @@ fn copy_private_source_snapshot(
         path: snapshot.into_temp_path(),
         sha256,
     })
+}
+
+fn inspect_unaliased_source_path(source_path: &Path) -> Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(source_path).with_context(|| {
+        format!(
+            "could not inspect frozen legacy replay source path {}",
+            source_path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "legacy replay source path must be a regular file, not a symbolic link or special file: {}",
+            source_path.display()
+        );
+    }
+    if metadata.nlink() != 1 {
+        bail!(
+            "legacy replay source path must have exactly one hard link: {}",
+            source_path.display()
+        );
+    }
+    Ok(metadata)
 }
 
 async fn open_frozen_snapshot(snapshot_path: &Path) -> Result<SqlitePool> {
@@ -500,13 +537,15 @@ fn reject_sqlite_sidecars(source_path: &Path) -> Result<()> {
 }
 
 fn reject_changed_source_path(source_path: &Path, opened: &std::fs::Metadata) -> Result<()> {
-    let current = std::fs::metadata(source_path).with_context(|| {
+    let current = std::fs::symlink_metadata(source_path).with_context(|| {
         format!(
             "frozen legacy replay source path changed while it was being snapshotted: {}",
             source_path.display()
         )
     })?;
-    if current.dev() != opened.dev()
+    if !current.file_type().is_file()
+        || current.nlink() != 1
+        || current.dev() != opened.dev()
         || current.ino() != opened.ino()
         || current.len() != opened.len()
     {
@@ -1221,6 +1260,37 @@ mod tests {
             .err()
             .expect("dangling sidecar must fail closed");
         assert!(error.to_string().contains("forbidden SQLite sidecar"));
+    }
+
+    #[test]
+    fn symlink_source_cannot_hide_a_real_target_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let real_source = directory.path().join("real.sqlite3");
+        let alias_source = directory.path().join("alias.sqlite3");
+        let bytes = b"source";
+        std::fs::write(&real_source, bytes).unwrap();
+        std::fs::write(directory.path().join("real.sqlite3-wal"), b"uncheckpointed").unwrap();
+        std::os::unix::fs::symlink(&real_source, &alias_source).unwrap();
+
+        let error = copy_private_source_snapshot(&alias_source, &sha256(bytes), bytes.len() as u64)
+            .err()
+            .expect("a symlink source must fail before alias-relative sidecar checks");
+        assert!(error.to_string().contains("symbolic link"));
+    }
+
+    #[test]
+    fn hard_link_alias_source_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let real_source = directory.path().join("real.sqlite3");
+        let alias_source = directory.path().join("alias.sqlite3");
+        let bytes = b"source";
+        std::fs::write(&real_source, bytes).unwrap();
+        std::fs::hard_link(&real_source, &alias_source).unwrap();
+
+        let error = copy_private_source_snapshot(&alias_source, &sha256(bytes), bytes.len() as u64)
+            .err()
+            .expect("a multiply-linked source inode must fail closed");
+        assert!(error.to_string().contains("exactly one hard link"));
     }
 
     #[tokio::test]
