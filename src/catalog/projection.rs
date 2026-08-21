@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sqlx::SqliteConnection;
 
-use crate::aircraft::faa::bridge::LegacyFaaRepresentative;
+use crate::aircraft::faa::bridge::{FaaBridgeOutcome, LegacyFaaRepresentative};
 use crate::db::AppDb;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -25,7 +25,7 @@ pub(crate) struct CatalogProjectionReport {
 pub(crate) async fn project_reusable_catalog(
     _source: &mut SqliteConnection,
     _target: &AppDb,
-    _apply: bool,
+    _faa: &FaaBridgeOutcome,
 ) -> Result<CatalogProjectionReport> {
     Ok(CatalogProjectionReport::default())
 }

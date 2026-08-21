@@ -244,6 +244,13 @@ async fn compare_legacy_projection(
             format!("legacy FAA snapshot {snapshot_id} does not cover representative {n_number}")
         })?;
         require_snapshot_provenance(&snapshot, release)?;
+        let source_manifest_sha256: String = sqlx::query_scalar(
+            "SELECT source_manifest_sha256 FROM faa_registry_snapshots WHERE id = ?",
+        )
+        .bind(snapshot.id)
+        .fetch_one(&mut *source)
+        .await?;
+        obsolete_hashes.insert(source_manifest_sha256);
         let coverage = release
             .coverage
             .iter()
@@ -280,20 +287,15 @@ async fn compare_legacy_projection(
         .await?
         .context("legacy matched FAA coverage has no retained MASTER projection")?;
         compare_aircraft(&legacy, current)?;
-        let old_hashes: (String, String) = sqlx::query_as(
-            r#"SELECT snapshot.source_manifest_sha256,
-                      aircraft.source_record_sha256
-               FROM faa_registry_snapshots snapshot
-               JOIN faa_registry_aircraft aircraft
-                 ON aircraft.snapshot_id = snapshot.id
-               WHERE snapshot.id = ? AND aircraft.n_number = ?"#,
+        let old_record_hash: String = sqlx::query_scalar(
+            r#"SELECT source_record_sha256 FROM faa_registry_aircraft
+               WHERE snapshot_id = ? AND n_number = ?"#,
         )
         .bind(snapshot.id)
         .bind(&n_number)
         .fetch_one(&mut *source)
         .await?;
-        obsolete_hashes.insert(old_hashes.0);
-        obsolete_hashes.insert(old_hashes.1);
+        obsolete_hashes.insert(old_record_hash);
         compare_aircraft_reference(source, snapshot.id, release, current).await?;
         if current.engine_code.is_some() {
             compare_engine_reference(source, snapshot.id, release, current).await?;

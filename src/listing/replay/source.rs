@@ -13,14 +13,17 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha3::{Digest, Sha3_256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{FromRow, SqliteConnection, SqlitePool};
+use sqlx::{Acquire, FromRow, Row, SqliteConnection, SqlitePool};
+use tempfile::NamedTempFile;
 
 use super::{
     entry_from_row, validate_source_capture, validate_trusted_capture_manifest, SourceCaptureRow,
     TrustedCaptureManifest,
 };
+use crate::aircraft::faa::bridge::rebuild_faa_projection;
 use crate::aircraft::faa::normalize_n_number;
-use crate::db::{database_url_from_arg, AppDb, DatabaseBackend};
+use crate::catalog::projection::{project_reusable_catalog, required_faa_representatives};
+use crate::db::{database_url_from_arg, sqlite_database_urls_equal, AppDb, DatabaseBackend};
 
 pub const LEGACY_SQLITE_SCHEMA_OBJECT_COUNT: usize = 575;
 pub const LEGACY_SQLITE_SCHEMA_SHA3_256: &str =
@@ -104,9 +107,106 @@ struct MigrationReceiptRow {
 }
 
 pub async fn prepare_legacy_replay_source(
-    _request: PrepareLegacyReplaySourceRequest<'_>,
+    request: PrepareLegacyReplaySourceRequest<'_>,
 ) -> Result<PrepareLegacyReplaySourceReport> {
-    anyhow::bail!("legacy replay-source bridge is not yet initialized")
+    validate_prepare_request(&request)?;
+    let source_pool = open_frozen_source(request.source_database).await?;
+    let mut source_connection = source_pool.acquire().await?;
+    let mut source_snapshot = source_connection.begin().await?;
+    let attestation = attest_frozen_source(&mut source_snapshot).await?;
+    let captures = load_legacy_capture_selection(&mut source_snapshot, request.manifest).await?;
+    let representatives = required_faa_representatives(&mut source_snapshot).await?;
+
+    let output_parent = request.output.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = request
+        .apply
+        .then(|| NamedTempFile::new_in(output_parent))
+        .transpose()
+        .with_context(|| {
+            format!(
+                "could not create sibling temporary output in {}",
+                output_parent.display()
+            )
+        })?;
+    let target_url = temporary
+        .as_ref()
+        .map(|file| database_url_from_arg(Some(file.path().to_string_lossy().into_owned())))
+        .unwrap_or_else(|| "sqlite::memory:".to_string());
+    let target = AppDb::connect(&target_url).await?;
+    let capture_rows = import_legacy_captures(&target, &captures).await?;
+    let faa = rebuild_faa_projection(
+        &mut source_snapshot,
+        &target,
+        request.faa_archive,
+        request.expected_faa_archive_sha256,
+        &captures.n_numbers,
+        &representatives,
+    )
+    .await?;
+    let catalog = project_reusable_catalog(&mut source_snapshot, &target, &faa).await?;
+    audit_prepared_target(&target, &faa.obsolete_hashes).await?;
+    source_snapshot.rollback().await?;
+    drop(source_connection);
+    source_pool.close().await;
+
+    let faa_archive_sha256 = faa.report.archive_sha256.clone();
+    let faa_snapshot_date = faa.report.snapshot_date.clone();
+    let applied_rows = capture_rows + catalog.applied_rows;
+    target.close().await;
+    let output_created = if let Some(file) = temporary.take() {
+        let diagnostic = AppDb::connect_diagnostic(&target_url).await?;
+        audit_prepared_target(&diagnostic, &faa.obsolete_hashes).await?;
+        diagnostic.close().await;
+        file.persist_noclobber(request.output).with_context(|| {
+            format!(
+                "could not atomically publish prepared replay source {}",
+                request.output.display()
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    Ok(PrepareLegacyReplaySourceReport {
+        dry_run: !request.apply,
+        provider_calls: 0,
+        source_schema_object_count: attestation.schema_object_count,
+        source_schema_sha3_256: attestation.schema_sha3_256,
+        source_receipt_count: attestation.receipt_count,
+        source_receipt_sha3_256: attestation.receipt_sha3_256,
+        manifest_sha256: request.manifest.manifest_sha256.clone(),
+        capture_count: captures.rows.len(),
+        n_number_count: captures.n_numbers.len(),
+        faa_archive_sha256,
+        faa_snapshot_date,
+        catalog_fingerprint_sha256: catalog.fingerprint_sha256,
+        applied_rows,
+        output_created,
+    })
+}
+
+fn validate_prepare_request(request: &PrepareLegacyReplaySourceRequest<'_>) -> Result<()> {
+    validate_trusted_capture_manifest(request.manifest).map_err(anyhow::Error::msg)?;
+    if request.expected_faa_archive_sha256 != LEGACY_FAA_ARCHIVE_SHA256 {
+        bail!(
+            "legacy replay-source bridge accepts only historical FAA archive SHA-256 {LEGACY_FAA_ARCHIVE_SHA256}"
+        );
+    }
+    if request.output.exists() {
+        bail!(
+            "prepared replay-source output already exists: {}",
+            request.output.display()
+        );
+    }
+    let parent = request.output.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        bail!("prepared replay-source output parent does not exist");
+    }
+    let output_url = database_url_from_arg(Some(request.output.to_string_lossy().into_owned()));
+    if sqlite_database_urls_equal(request.source_database, &output_url)? {
+        bail!("legacy source and prepared replay-source output must be different files");
+    }
+    Ok(())
 }
 
 pub(crate) async fn open_frozen_source(source_database: &str) -> Result<SqlitePool> {
@@ -551,4 +651,76 @@ async fn import_legacy_captures(
     }
     transaction.commit().await?;
     Ok(selection.rows.len())
+}
+
+async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String>) -> Result<()> {
+    let DatabaseBackend::Sqlite(pool) = target.backend() else {
+        bail!("prepared replay-source audit requires SQLite");
+    };
+    let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
+        .fetch_one(pool)
+        .await?;
+    if quick_check != "ok" {
+        bail!("prepared replay source failed SQLite quick_check: {quick_check}");
+    }
+    let foreign_key_errors: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(pool)
+            .await?;
+    if foreign_key_errors != 0 {
+        bail!("prepared replay source has {foreign_key_errors} foreign-key violations");
+    }
+    let provider_calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+        .fetch_one(pool)
+        .await?;
+    if provider_calls != 0 {
+        bail!("prepared replay source contains {provider_calls} provider-accounting rows");
+    }
+    let tables = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    for table in tables {
+        let columns = sqlx::query(&format!("PRAGMA table_xinfo({})", quote_identifier(&table)))
+            .fetch_all(pool)
+            .await?;
+        for column in columns {
+            let name: String = column.try_get("name")?;
+            let declared_type: String = column.try_get("type")?;
+            let upper = declared_type.to_ascii_uppercase();
+            let lower_name = name.to_ascii_lowercase();
+            let text_bearing = upper.contains("TEXT")
+                || upper.contains("CHAR")
+                || upper.contains("CLOB")
+                || upper.contains("BLOB")
+                || lower_name.contains("json")
+                || lower_name.contains("hash")
+                || lower_name.contains("sha256");
+            if !text_bearing {
+                continue;
+            }
+            let sql = format!(
+                "SELECT COUNT(*) FROM {} WHERE instr(CAST({} AS TEXT), ?) > 0",
+                quote_identifier(&table),
+                quote_identifier(&name)
+            );
+            for obsolete in obsolete_hashes {
+                let count: i64 = sqlx::query_scalar(&sql)
+                    .bind(obsolete)
+                    .fetch_one(pool)
+                    .await?;
+                if count != 0 {
+                    bail!(
+                        "prepared replay source retained obsolete FAA hash material in {table}.{name}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
