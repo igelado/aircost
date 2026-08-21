@@ -135,4 +135,15 @@ do
     "$definition"
 done
 
+for definition in \
+  "$repository_root/schema/sqlite.sql" \
+  "$repository_root/schema/postgres.sql"
+do
+  if rg -q 'aircraft_sale_listing_avionics_corroborations|listing_avionics_association_v1' \
+      "$definition"; then
+    echo "Current schema unexpectedly retains legacy corroboration evidence" >&2
+    exit 1
+  fi
+done
+
 echo "Listing-avionics association corroboration schema contract passed"

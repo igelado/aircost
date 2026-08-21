@@ -65,17 +65,18 @@ const completeAvionics = {
 test("joins listing contexts and keeps reference-only work visible", () => {
   const rows = pipelineRowsFromResponse(response([{
     listing_id: 73,
-    status: "pending_reference",
-    final_ingestion_state: "incomplete",
+    status: "verified",
+    final_ingestion_state: "ready",
     aircraft: currentAircraft,
     avionics: completeAvionics,
-    finalization: {
+    reference: {
       status: "pending_reference",
-      reason_code: "factory_reference_pending",
-      reason: "Raw backend detail",
-      gemini_used: false,
-      catalog_writes: 0,
+      configuration_version_id: null,
+      configuration_name: null,
+      building_version_count: 0,
+      gaps: [{ message: "Factory reference pending" }],
     },
+    finalization: { ...currentAircraft, status: "ready" },
   }], [{
     listing_id: 73,
     label: "2007 Cessna 182T",
@@ -89,7 +90,7 @@ test("joins listing contexts and keeps reference-only work visible", () => {
   assert.equal(rows[0].registrationNumber, "N123AB");
   assert.equal(rows[0].reference.label, "Reference pending");
   assert.equal(rows[0].hasPendingReview, false);
-  assert.match(rows[0].reason, /factory reference data/);
+  assert.match(rows[0].reason, /Factory reference pending/);
   assert.equal(rows[0].gemini.kind, "none");
 });
 
@@ -108,6 +109,10 @@ test("falls back safely when listing context is absent", () => {
       status: "skipped",
       remaining_review_aspects: 3,
     },
+    reference: {
+      status: "pending_reference",
+      gaps: [{ message: "Factory reference pending" }],
+    },
     finalization: {
       ...currentAircraft,
       status: "not_attempted",
@@ -118,6 +123,7 @@ test("falls back safely when listing context is absent", () => {
   assert.equal(rows[0].aircraft.label, "Verification needed");
   assert.equal(rows[0].gemini.kind, "required");
   assert.equal(rows[0].hasPendingReview, false);
+  assert.match(rows[0].reason, /canonical catalog assignment/);
 });
 
 test("classifies retained avionics as possibly using Gemini and manual only from context", () => {
@@ -132,6 +138,10 @@ test("classifies retained avionics as possibly using Gemini and manual only from
       reason_code: "automatic_verification_available",
       remaining_review_aspects: 4,
     },
+    reference: {
+      status: "pending_reference",
+      gaps: [{ message: "Factory reference pending" }],
+    },
     finalization: {
       ...currentAircraft,
       status: "not_attempted",
@@ -144,6 +154,7 @@ test("classifies retained avionics as possibly using Gemini and manual only from
 
   assert.equal(rows[0].gemini.kind, "possible");
   assert.equal(rows[0].hasPendingReview, true);
+  assert.match(rows[0].reason, /ready for automatic equipment checks/);
   assert.equal(pipelineSummary(rows).manualReview, 1);
 });
 
@@ -213,11 +224,12 @@ test("groups preflight rows into four exclusive operator backlog categories", ()
     },
     {
       listing_id: 34,
-      status: "pending_reference",
-      final_ingestion_state: "incomplete",
+      status: "verified",
+      final_ingestion_state: "ready",
       aircraft: currentAircraft,
       avionics: completeAvionics,
-      finalization: { ...currentAircraft, status: "pending_reference" },
+      reference: { status: "pending_reference" },
+      finalization: { ...currentAircraft, status: "ready" },
     },
     {
       listing_id: 35,
@@ -229,11 +241,12 @@ test("groups preflight rows into four exclusive operator backlog categories", ()
     },
     {
       listing_id: 36,
-      status: "pending_reference",
-      final_ingestion_state: "incomplete",
+      status: "verified",
+      final_ingestion_state: "ready",
       aircraft: currentAircraft,
       avionics: { ...completeAvionics, status: "already_verified" },
-      finalization: { ...currentAircraft, status: "pending_reference" },
+      reference: { status: "pending_reference" },
+      finalization: { ...currentAircraft, status: "ready" },
     },
   ]));
 
@@ -386,7 +399,7 @@ test("creates a secure idempotency key with an insecure-context fallback", () =>
   );
 });
 
-test("excludes reference-only and deterministically FAA-rejected rows", () => {
+test("keeps reference-pending listings eligible and excludes FAA rejections", () => {
   const base = {
     status: "pending_review",
     finalIngestionState: "pending_review",
@@ -397,9 +410,8 @@ test("excludes reference-only and deterministically FAA-rejected rows", () => {
   assert.equal(pipelineAutomaticEligibility(base).eligible, true);
   assert.equal(pipelineAutomaticEligibility({
     ...base,
-    status: "pending_reference",
     reference: { status: "pending_reference" },
-  }).eligible, false);
+  }).eligible, true);
   assert.equal(pipelineAutomaticEligibility({
     ...base,
     aircraft: { status: "rejected" },
@@ -415,7 +427,6 @@ test("normalizes durable run progress and terminal item outcomes", () => {
     running_items: 1,
     verified_items: 1,
     pending_review_items: 1,
-    pending_reference_items: 0,
     blocked_items: 0,
     failed_items: 0,
     cancelled_items: 0,
@@ -446,7 +457,6 @@ test("recognizes stopped runs and provides accessible status copy", () => {
   ]);
   assert.equal(view.terminal, true);
   assert.equal(view.counts.cancelled, 1);
-  assert.equal(verificationRunStatusView("pending_reference").label, "Reference pending");
   assert.equal(verificationRunStatusView("future").label, "Status unavailable");
 });
 

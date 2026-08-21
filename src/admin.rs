@@ -11,11 +11,14 @@ use aircost_rs::aircraft::curation::workflow::{
     curate_aircraft_hierarchy_observations_with_config,
     curate_aircraft_hierarchy_observations_with_operator_tcds,
 };
-use aircost_rs::aircraft::enrich_aircraft_specs_from_plugin_submissions;
 use aircost_rs::aircraft::faa::{
     drs::{parse_operator_supplied_current_tcds, CurrentTcdsMetadata, DrsClient, TcdsDocument},
     listing_targets, parse_release_archive, require_listing_faa_admission, store_release,
     ExplicitNNumberTargets, FaaImportTargets,
+};
+use aircost_rs::aircraft::reference::persistence::{
+    assemble_and_publish_reference_version, preview_reference_version,
+    ApprovedReferenceVersionDraft,
 };
 use aircost_rs::aircraft::verification::AircraftVerificationServices;
 use aircost_rs::avionics::consolidation::{
@@ -24,12 +27,12 @@ use aircost_rs::avionics::consolidation::{
 };
 use aircost_rs::avionics::{
     curate_avionics_models_with_gemini, enrich_listing_avionics_metadata,
-    enrich_missing_avionics_metadata, enrich_model_year_avionics_and_price_points,
+    enrich_missing_avionics_metadata,
 };
 use aircost_rs::cleanup::cleanup_orphan_records;
 use aircost_rs::db::{database_url_from_arg, DEFAULT_DATABASE_PATH};
 use aircost_rs::extract::GeminiListingExtractor;
-use aircost_rs::fit::{fit_depreciation_profiles, fit_structural_valuation};
+use aircost_rs::fit::fit_structural_valuation;
 use aircost_rs::gemini::benchmark::{
     execute as execute_gemini_benchmark, load_suite as load_gemini_benchmark_suite,
     BenchmarkPricing, BenchmarkSelection, BenchmarkTaskKind,
@@ -67,6 +70,39 @@ use anyhow::{bail, Context, Result};
 async fn main() -> Result<()> {
     let command = parse_args(env::args().skip(1))?;
     match command {
+        AdminCommand::PublishAircraftReference {
+            database,
+            draft,
+            apply,
+        } => {
+            let db = aircost_rs::db::AppDb::connect(&database).await?;
+            let input = File::open(&draft)
+                .with_context(|| format!("could not open reference draft {}", draft.display()))?;
+            let normalized: ApprovedReferenceVersionDraft = serde_json::from_reader(input)
+                .with_context(|| {
+                    format!(
+                        "reference draft {} is not valid normalized reference JSON",
+                        draft.display()
+                    )
+                })?;
+            let ids = if apply {
+                assemble_and_publish_reference_version(&db, &normalized).await?
+            } else {
+                preview_reference_version(&db, &normalized).await?
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": !apply,
+                    "validated_normalized_draft": true,
+                    "database_publication_gates_passed": true,
+                    "configuration_id": ids.configuration_id,
+                    "version_id": ids.version_id,
+                    "persisted": apply,
+                    "stored_provider_dossiers": 0,
+                }))?
+            );
+        }
         AdminCommand::ExportReplayManifest {
             database,
             output,
@@ -559,58 +595,6 @@ async fn main() -> Result<()> {
             let report = curate_avionics_models_with_gemini(&db, &extractor, apply, limit).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        AdminCommand::EnrichModelYearAvionics {
-            database,
-            apply,
-            limit,
-            value_reference_year,
-            refresh_existing,
-        } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
-            let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
-            let report = enrich_model_year_avionics_and_price_points(
-                &db,
-                &extractor,
-                apply,
-                limit,
-                value_reference_year,
-                refresh_existing,
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        AdminCommand::EnrichAircraftSpecs {
-            database,
-            apply,
-            limit,
-            value_reference_year,
-            refresh_existing,
-        } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
-            let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
-            let report = enrich_aircraft_specs_from_plugin_submissions(
-                &db,
-                &extractor,
-                apply,
-                limit,
-                value_reference_year,
-                refresh_existing,
-            )
-            .await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        AdminCommand::FitDepreciation {
-            database,
-            apply,
-            min_model_samples,
-            value_reference_year,
-        } => {
-            let db = aircost_rs::db::AppDb::connect(&database).await?;
-            let report =
-                fit_depreciation_profiles(&db, apply, min_model_samples, value_reference_year)
-                    .await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
         AdminCommand::SnapshotValuations {
             database,
             apply,
@@ -759,6 +743,11 @@ async fn import_faa_registry(
 
 #[derive(Debug)]
 enum AdminCommand {
+    PublishAircraftReference {
+        database: String,
+        draft: PathBuf,
+        apply: bool,
+    },
     ExportReplayManifest {
         database: String,
         output: PathBuf,
@@ -857,26 +846,6 @@ enum AdminCommand {
         database: String,
         apply: bool,
         limit: i64,
-    },
-    EnrichModelYearAvionics {
-        database: String,
-        apply: bool,
-        limit: i64,
-        value_reference_year: Option<i64>,
-        refresh_existing: bool,
-    },
-    EnrichAircraftSpecs {
-        database: String,
-        apply: bool,
-        limit: i64,
-        value_reference_year: Option<i64>,
-        refresh_existing: bool,
-    },
-    FitDepreciation {
-        database: String,
-        apply: bool,
-        min_model_samples: usize,
-        value_reference_year: Option<i64>,
     },
     SnapshotValuations {
         database: String,
@@ -987,6 +956,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     };
 
     match command.as_str() {
+        "publish-aircraft-reference" => parse_publish_aircraft_reference_args(args),
         "export-replay-manifest" => parse_export_replay_manifest_args(args),
         "import-replay-manifest" => parse_import_replay_manifest_args(args),
         "replay-captures" => parse_replay_captures_args(args),
@@ -1003,9 +973,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         "enrich-avionics" => parse_enrich_avionics_args(args),
         "cleanup-orphans" => parse_cleanup_orphans_args(args),
         "curate-avionics" => parse_curate_avionics_args(args),
-        "enrich-model-year-avionics" => parse_enrich_model_year_avionics_args(args),
-        "enrich-aircraft-specs" => parse_enrich_aircraft_specs_args(args),
-        "fit-depreciation" => parse_fit_depreciation_args(args),
         "snapshot-valuations" => parse_snapshot_valuations_args(args),
         "fit-valuation" => parse_fit_valuation_args(args),
         "validate-valuation" => parse_model_version_args(args, false),
@@ -1016,6 +983,39 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         }
         _ => bail!("unknown admin command: {command}"),
     }
+}
+
+fn parse_publish_aircraft_reference_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<AdminCommand> {
+    let mut database = None;
+    let mut draft = None;
+    let mut apply = false;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--database" | "--database-url" => {
+                database = Some(args.next().context("--database requires a value")?);
+            }
+            "--draft" => {
+                draft = Some(PathBuf::from(
+                    args.next().context("--draft requires a value")?,
+                ));
+            }
+            "--apply" => apply = true,
+            "--dry-run" => apply = false,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ => bail!("unknown publish-aircraft-reference argument: {arg}"),
+        }
+    }
+    Ok(AdminCommand::PublishAircraftReference {
+        database: database_url_from_arg(database),
+        draft: draft.context("--draft is required")?,
+        apply,
+    })
 }
 
 fn parse_export_replay_manifest_args(
@@ -1851,53 +1851,6 @@ fn parse_consolidate_legacy_avionics_args(
     })
 }
 
-fn parse_fit_depreciation_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
-    let mut database = None;
-    let mut apply = false;
-    let mut min_model_samples = 4_usize;
-    let mut value_reference_year = None;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--database" | "--database-url" => {
-                database = Some(args.next().context("--database requires a value")?);
-            }
-            "--apply" => apply = true,
-            "--dry-run" => apply = false,
-            "--min-model-samples" => {
-                let value = args
-                    .next()
-                    .context("--min-model-samples requires a value")?;
-                min_model_samples = value
-                    .parse::<usize>()
-                    .with_context(|| format!("invalid --min-model-samples value: {value}"))?;
-            }
-            "--value-reference-year" => {
-                let value = args
-                    .next()
-                    .context("--value-reference-year requires a value")?;
-                value_reference_year =
-                    Some(value.parse::<i64>().with_context(|| {
-                        format!("invalid --value-reference-year value: {value}")
-                    })?);
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            _ => bail!("unknown fit-depreciation argument: {arg}"),
-        }
-    }
-
-    Ok(AdminCommand::FitDepreciation {
-        database: database_url_from_arg(database),
-        apply,
-        min_model_samples,
-        value_reference_year,
-    })
-}
-
 fn parse_snapshot_valuations_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     let mut database = None;
     let mut apply = false;
@@ -2017,56 +1970,6 @@ fn parse_model_version_args(
     }
 }
 
-fn parse_enrich_aircraft_specs_args(
-    args: impl IntoIterator<Item = String>,
-) -> Result<AdminCommand> {
-    let mut database = None;
-    let mut apply = false;
-    let mut limit = 10_i64;
-    let mut value_reference_year = None;
-    let mut refresh_existing = false;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--database" | "--database-url" => {
-                database = Some(args.next().context("--database requires a value")?);
-            }
-            "--apply" => apply = true,
-            "--dry-run" => apply = false,
-            "--refresh-existing" => refresh_existing = true,
-            "--limit" => {
-                let value = args.next().context("--limit requires a value")?;
-                limit = value
-                    .parse::<i64>()
-                    .with_context(|| format!("invalid --limit value: {value}"))?;
-            }
-            "--value-reference-year" => {
-                let value = args
-                    .next()
-                    .context("--value-reference-year requires a value")?;
-                value_reference_year =
-                    Some(value.parse::<i64>().with_context(|| {
-                        format!("invalid --value-reference-year value: {value}")
-                    })?);
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            _ => bail!("unknown enrich-aircraft-specs argument: {arg}"),
-        }
-    }
-
-    Ok(AdminCommand::EnrichAircraftSpecs {
-        database: database_url_from_arg(database),
-        apply,
-        limit,
-        value_reference_year,
-        refresh_existing,
-    })
-}
-
 fn parse_cleanup_orphans_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
     let mut database = None;
     let mut args = args.into_iter();
@@ -2120,56 +2023,6 @@ fn parse_curate_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
         database: database_url_from_arg(database),
         apply,
         limit,
-    })
-}
-
-fn parse_enrich_model_year_avionics_args(
-    args: impl IntoIterator<Item = String>,
-) -> Result<AdminCommand> {
-    let mut database = None;
-    let mut apply = false;
-    let mut limit = 10_i64;
-    let mut value_reference_year = None;
-    let mut refresh_existing = false;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--database" | "--database-url" => {
-                database = Some(args.next().context("--database requires a value")?);
-            }
-            "--apply" => apply = true,
-            "--dry-run" => apply = false,
-            "--refresh-existing" => refresh_existing = true,
-            "--limit" => {
-                let value = args.next().context("--limit requires a value")?;
-                limit = value
-                    .parse::<i64>()
-                    .with_context(|| format!("invalid --limit value: {value}"))?;
-            }
-            "--value-reference-year" => {
-                let value = args
-                    .next()
-                    .context("--value-reference-year requires a value")?;
-                value_reference_year =
-                    Some(value.parse::<i64>().with_context(|| {
-                        format!("invalid --value-reference-year value: {value}")
-                    })?);
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            _ => bail!("unknown enrich-model-year-avionics argument: {arg}"),
-        }
-    }
-
-    Ok(AdminCommand::EnrichModelYearAvionics {
-        database: database_url_from_arg(database),
-        apply,
-        limit,
-        value_reference_year,
-        refresh_existing,
     })
 }
 
@@ -2233,7 +2086,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-model-year-avionics [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-aircraft-specs [--limit 10] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-depreciation [legacy] [--min-model-samples 4] [--value-reference-year 2026] [--apply] [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -2321,6 +2174,59 @@ mod tests {
         .into_iter()
         .map(str::to_string)
         .collect()
+    }
+
+    #[test]
+    fn publish_aircraft_reference_cli_is_dry_run_by_default() {
+        let AdminCommand::PublishAircraftReference {
+            database,
+            draft,
+            apply,
+        } = parse_args(
+            [
+                "publish-aircraft-reference",
+                "--database",
+                "sqlite::memory:",
+                "--draft",
+                "/tmp/reference.json",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap()
+        else {
+            panic!("expected publish-aircraft-reference command")
+        };
+        assert_eq!(database, "sqlite::memory:");
+        assert_eq!(draft, PathBuf::from("/tmp/reference.json"));
+        assert!(!apply);
+    }
+
+    #[test]
+    fn publish_aircraft_reference_cli_requires_draft_and_explicit_apply() {
+        let error = parse_args(
+            ["publish-aircraft-reference"]
+                .into_iter()
+                .map(str::to_string),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--draft is required"));
+
+        let command = parse_args(
+            [
+                "publish-aircraft-reference",
+                "--draft",
+                "/tmp/reference.json",
+                "--apply",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .unwrap();
+        assert!(matches!(
+            command,
+            AdminCommand::PublishAircraftReference { apply: true, .. }
+        ));
     }
 
     #[test]

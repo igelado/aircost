@@ -216,6 +216,8 @@ impl ValuationModel for StructuralModel {
 
     fn estimate(&self, query: &ValuationQuery) -> Result<ValuationEstimate, ValuationError> {
         let (value_now, breakdown) = self.predict_value(query)?;
+        let modeled_factory_configuration_anchor_usd =
+            self.predict_value(&query.factory_configuration_query())?.0;
         let support = self.support(query);
         let base_q80 = self.q80(query, support);
         let utilization = self.utilization(query);
@@ -250,6 +252,7 @@ impl ValuationModel for StructuralModel {
         }
         let error_multiplier = base_q80.exp();
         Ok(ValuationEstimate {
+            modeled_factory_configuration_anchor_usd,
             estimated_value_usd: value_now,
             low_value_usd: value_now / error_multiplier,
             high_value_usd: value_now * error_multiplier,
@@ -782,7 +785,7 @@ pub(crate) fn support_for_counts_with_hours(
 }
 
 pub(crate) fn age_factor(floor: f64, decay: f64, age: f64) -> f64 {
-    crate::depreciation::listing_only_age_residual_fraction(age, floor, decay)
+    floor + (1.0 - floor) * (-decay * age.max(0.0)).exp()
 }
 
 fn dot(left: &[f64], right: &[f64]) -> f64 {
@@ -844,6 +847,12 @@ mod tests {
                     equipment_tokens: vec![],
                     valuation_facts: vec![],
                     technical_field_count: 4,
+                    factory_reference: Some(crate::valuation::FactoryReferenceFeature {
+                        configuration_id: 1,
+                        version_id: 1,
+                        full_standard_configuration_price_usd: 500_000.0,
+                        nominal_dollar_year: 2026,
+                    }),
                 }
             })
             .collect()
@@ -891,6 +900,12 @@ mod tests {
             propeller_times: vec![],
             equipment_tokens: vec![],
             technical_field_count: 0,
+            factory_reference: Some(crate::valuation::FactoryReferenceFeature {
+                configuration_id: 1,
+                version_id: 1,
+                full_standard_configuration_price_usd: 500_000.0,
+                nominal_dollar_year: 2026,
+            }),
         };
         let estimate = model.estimate(&query).unwrap();
         assert!(estimate.estimated_value_usd.is_finite());
@@ -962,6 +977,12 @@ mod tests {
             propeller_times: vec![],
             equipment_tokens: vec![],
             technical_field_count: 0,
+            factory_reference: Some(crate::valuation::FactoryReferenceFeature {
+                configuration_id: 1,
+                version_id: 1,
+                full_standard_configuration_price_usd: 500_000.0,
+                nominal_dollar_year: 2026,
+            }),
         };
         let global = model.estimate(&base_query).unwrap().estimated_value_usd;
         let mut manufacturer_query = base_query.clone();

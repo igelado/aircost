@@ -35,7 +35,6 @@ pub enum VerificationRunItemStatus {
     Running,
     Verified,
     PendingReview,
-    PendingReference,
     Blocked,
     Failed,
     Cancelled,
@@ -60,7 +59,6 @@ pub struct VerificationRun {
     pub running_items: i64,
     pub verified_items: i64,
     pub pending_review_items: i64,
-    pub pending_reference_items: i64,
     pub blocked_items: i64,
     pub failed_items: i64,
     pub cancelled_items: i64,
@@ -199,7 +197,6 @@ struct RunViewRow {
     running_items: i64,
     verified_items: i64,
     pending_review_items: i64,
-    pending_reference_items: i64,
     blocked_items: i64,
     failed_items: i64,
     cancelled_items: i64,
@@ -256,7 +253,6 @@ fn parse_item_status(value: &str) -> VerificationRunResult<VerificationRunItemSt
         "running" => Ok(VerificationRunItemStatus::Running),
         "verified" => Ok(VerificationRunItemStatus::Verified),
         "pending_review" => Ok(VerificationRunItemStatus::PendingReview),
-        "pending_reference" => Ok(VerificationRunItemStatus::PendingReference),
         "blocked" => Ok(VerificationRunItemStatus::Blocked),
         "failed" => Ok(VerificationRunItemStatus::Failed),
         "cancelled" => Ok(VerificationRunItemStatus::Cancelled),
@@ -278,7 +274,6 @@ impl RunViewRow {
             running_items: self.running_items,
             verified_items: self.verified_items,
             pending_review_items: self.pending_review_items,
-            pending_reference_items: self.pending_reference_items,
             blocked_items: self.blocked_items,
             failed_items: self.failed_items,
             cancelled_items: self.cancelled_items,
@@ -507,8 +502,6 @@ pub async fn get_verification_run(
             AS verified_items,
           COALESCE(SUM(CASE WHEN item.status = 'pending_review' THEN 1 ELSE 0 END), 0)
             AS pending_review_items,
-          COALESCE(SUM(CASE WHEN item.status = 'pending_reference' THEN 1 ELSE 0 END), 0)
-            AS pending_reference_items,
           COALESCE(SUM(CASE WHEN item.status = 'blocked' THEN 1 ELSE 0 END), 0)
             AS blocked_items,
           COALESCE(SUM(CASE WHEN item.status = 'failed' THEN 1 ELSE 0 END), 0)
@@ -747,12 +740,7 @@ pub async fn complete_verification_run_item(
     validate_token(lease_token)?;
     if !matches!(
         outcome.status.as_str(),
-        "verified"
-            | "already_verified"
-            | "pending_review"
-            | "pending_reference"
-            | "blocked"
-            | "stale"
+        "verified" | "already_verified" | "pending_review" | "blocked" | "stale"
     ) {
         return Err(VerificationRunError::Validation(
             "failed or unknown verification outcomes must use the sanitized failure boundary"
@@ -950,7 +938,6 @@ fn item_status_label(status: VerificationRunItemStatus) -> &'static str {
         VerificationRunItemStatus::Running => "running",
         VerificationRunItemStatus::Verified => "verified",
         VerificationRunItemStatus::PendingReview => "pending_review",
-        VerificationRunItemStatus::PendingReference => "pending_reference",
         VerificationRunItemStatus::Blocked => "blocked",
         VerificationRunItemStatus::Failed => "failed",
         VerificationRunItemStatus::Cancelled => "cancelled",
@@ -963,7 +950,6 @@ fn terminal_outcome(
     let status = match outcome.status.as_str() {
         "verified" | "already_verified" => VerificationRunItemStatus::Verified,
         "pending_review" => VerificationRunItemStatus::PendingReview,
-        "pending_reference" => VerificationRunItemStatus::PendingReference,
         "blocked" | "stale" => VerificationRunItemStatus::Blocked,
         _ => VerificationRunItemStatus::Failed,
     };
@@ -1215,7 +1201,8 @@ mod tests {
     use super::*;
     use crate::db::DEVELOPER_EMAIL;
     use crate::listing::verification::{
-        ListingAvionicsVerificationStage, ListingVerificationStage,
+        ListingAvionicsVerificationStage, ListingReferenceVerificationStage,
+        ListingVerificationStage,
     };
 
     fn sqlite_pool(db: &AppDb) -> &sqlx::SqlitePool {
@@ -1320,6 +1307,17 @@ mod tests {
                 safely_discarded: 0,
                 remaining_review_aspects: usize::from(status == "pending_review"),
                 gemini_used: false,
+            },
+            reference: ListingReferenceVerificationStage {
+                status: if matches!(status, "verified" | "already_verified") {
+                    "ready".to_string()
+                } else {
+                    "pending_reference".to_string()
+                },
+                configuration_version_id: None,
+                configuration_name: None,
+                building_version_count: 0,
+                gaps: Vec::new(),
             },
             finalization: ListingVerificationStage {
                 status: if matches!(status, "verified" | "already_verified") {

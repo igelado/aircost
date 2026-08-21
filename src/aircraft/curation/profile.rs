@@ -389,13 +389,14 @@ fn validate_research(
         return;
     };
     if price.amount_usd <= 0
-        || price.price_reference_year != research.target.model_year
+        || !(MIN_AIRCRAFT_MODEL_YEAR..=MAX_AIRCRAFT_MODEL_YEAR)
+            .contains(&price.price_reference_year)
         || !price.direct_exact_model_year
         || price.basis != ResearchedPriceBasis::FullStandardConfiguration
     {
         issues.push(issue(
             "invalid_exact_year_reference_price",
-            "price must directly state this model year's full standard configuration",
+            "price must directly state this model year's full standard configuration and its actual nominal-dollar year",
         ));
     }
     require_claim_kind(
@@ -461,7 +462,7 @@ Prefer the model-year manufacturer price/specification sheet, order guide, broch
 
 For every standard component return the physical product identity, quantity, inclusion basis, authoritative model/part/SKU identifier when available, and evidence IDs. Do not split a multifunction avionics unit by capability and do not treat a capability label (AHRS, ADF, ELT, GPS, display) as a product identity. A suite may be recorded separately from its member hardware only when primary documentation defines both.
 
-Return a new-aircraft price only when a primary source directly states the price for this exact model year and clearly establishes that the amount covers the full standard configuration. Do not interpolate, inflate, use a current replacement price, use a used listing price, or subtract retail avionics prices from historical MSRP. If no qualifying price exists, return null.
+Return a new-aircraft price only when a primary source directly states the price for this exact model year and clearly establishes that the amount covers the full standard configuration. `price_reference_year` is the actual nominal-dollar year stated by the document and may differ from model year; never rewrite it to model year. Do not interpolate, inflate, use a current replacement price, use a used listing price, or subtract retail avionics prices from historical MSRP. If no qualifying price exists, return null.
 
 Target:
 {}"#,

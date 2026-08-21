@@ -2,7 +2,6 @@ pub mod aircraft;
 pub mod avionics;
 pub mod cleanup;
 pub mod db;
-pub mod depreciation;
 pub mod extract;
 pub mod fit;
 pub mod gemini;

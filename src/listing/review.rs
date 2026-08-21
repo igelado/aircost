@@ -1135,12 +1135,6 @@ const SELECT_GLOBAL_LEGACY_REFERENCES_SQL: &str = r#"
     SELECT reference_kind, reference_count
     FROM (
       SELECT
-        'aircraft_model_variant_default_avionics.avionics_model_id' AS reference_kind,
-        COUNT(*) AS reference_count
-      FROM aircraft_model_variant_default_avionics
-      WHERE avionics_model_id = ?
-      UNION ALL
-      SELECT
         'aircraft_reference_avionics.avionics_model_id' AS reference_kind,
         COUNT(*) AS reference_count
       FROM aircraft_reference_avionics
@@ -8225,11 +8219,9 @@ async fn legacy_global_references(
             .bind(target_id)
             .bind(target_id)
             .bind(target_id)
-            .bind(target_id)
             .fetch_all(pool)
             .await?),
         DatabaseBackend::Postgres(pool) => Ok(sqlx::query_as::<_, GlobalCatalogReferenceRow>(&sql)
-            .bind(target_id)
             .bind(target_id)
             .bind(target_id)
             .bind(target_id)
@@ -9439,7 +9431,6 @@ pub async fn resolve_listing_review(
                                         _,
                                         GlobalCatalogReferenceRow,
                                     >(&select_global_legacy_references)
-                                    .bind(target_id)
                                     .bind(target_id)
                                     .bind(target_id)
                                     .bind(target_id)
@@ -17426,7 +17417,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     }
 
     #[tokio::test]
-    async fn create_rejects_in_place_promotion_with_global_catalog_references() {
+    async fn create_rejects_in_place_promotion_with_global_suite_references() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
         let legacy_id = insert_unreviewed_product(&db, "GTX-345", "GTX345", "Transponder").await;
@@ -17434,7 +17425,6 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         let pool = sqlite_pool(&db);
         for trigger in [
             "aircraft_sale_listing_avionics_approved_insert",
-            "aircraft_model_variant_default_avionics_approved_insert",
             "avionics_suite_components_approved_insert",
         ] {
             sqlx::query(&format!("DROP TRIGGER {trigger}"))
@@ -17454,27 +17444,6 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .bind(listing_id)
         .bind(legacy_id)
         .fetch_one(pool)
-        .await
-        .unwrap();
-        let variant_id: i64 = sqlx::query_scalar(
-            "SELECT aircraft_model_variant_id FROM aircraft_sale_listings WHERE id = ?",
-        )
-        .bind(listing_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_model_variant_default_avionics (
-              aircraft_model_variant_id, model_year, avionics_model_id, quantity,
-              source_url, source_title, source_notes, source_confidence
-            ) VALUES (?, 2020, ?, 1, 'https://cessna.txtav.com/',
-                      'Cessna equipment reference', 'factory default', 'high')
-            "#,
-        )
-        .bind(variant_id)
-        .bind(legacy_id)
-        .execute(pool)
         .await
         .unwrap();
         sqlx::query(
@@ -17547,7 +17516,6 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             panic!("expected a catalog-reference conflict, got {error}");
         };
         assert!(message.contains("global avionics catalog/reference data"));
-        assert!(message.contains("aircraft_model_variant_default_avionics.avionics_model_id (1)"));
         assert!(message.contains("avionics_suite_components.suite_model_id (1)"));
         assert!(message.contains("avionics_suite_components.component_model_id (1)"));
         let transaction_error = resolve_listing_review(&db, user_id, listing_id, &request)
@@ -17570,22 +17538,14 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             ("GTX-345".to_string(), "unreviewed".to_string())
         );
         let retained_global_references: i64 = sqlx::query_scalar(
-            r#"
-            SELECT
-              (SELECT COUNT(*) FROM aircraft_model_variant_default_avionics
-               WHERE avionics_model_id = ?)
-              +
-              (SELECT COUNT(*) FROM avionics_suite_components
-               WHERE suite_model_id = ? OR component_model_id = ?)
-            "#,
+            "SELECT COUNT(*) FROM avionics_suite_components WHERE suite_model_id = ? OR component_model_id = ?",
         )
-        .bind(legacy_id)
         .bind(legacy_id)
         .bind(legacy_id)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(retained_global_references, 3);
+        assert_eq!(retained_global_references, 2);
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
         )

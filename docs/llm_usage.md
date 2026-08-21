@@ -548,6 +548,13 @@ primary evidence:
 - Marketplace listings provide exact observations about their own advertised
   aircraft only. They cannot define factory defaults or approve catalog facts.
 
+For bounded factory applicability, Gemini may identify the approved
+make-specific serial-shape scheme and return source-visible display bounds and
+an optional prefix. It never supplies database sort keys. The application
+normalizes the displays and derives the universal natural-order key; SQLite and
+PostgreSQL recompute it independently before accepting the row. Different
+scheme IDs or prefixes therefore cannot create separate overlap domains.
+
 Alongside the local FAA evidence, Google Search and URL Context remain necessary
 for facts outside registry scope. Grounded citations, successful tool traces,
 live catalog candidate searches, exact source observations, and the FAA
@@ -689,12 +696,13 @@ reject; if it remains unsafe or correction fails, the outcome becomes
 `unresolved` rather than an automatic discard. An ordinary `unresolved`
 result—including unavailable classification, incomplete evidence, or an
 uncertain candidate—is a durable `pending_review` outcome rather than a
-quarantine. Provider, persistence, and enrichment failures tied to the
-listing, its FAA admission, or its listing-specific evidence remain real
-ingestion errors and can still quarantine a stored listing. A missing shared
-factory-reference prerequisite is different: after listing identity and
-component checks succeed, finalization returns the typed, derived
-`PendingReference` outcome and leaves the listing `incomplete`.
+quarantine. Provider, persistence, and enrichment failures tied to the listing,
+its FAA admission, or its listing-specific evidence remain real ingestion
+errors and can still quarantine a stored listing. Shared factory-reference
+readiness is separate: once those listing-specific checks succeed, finalization
+makes the listing `ready` and verified. Valuation reports a typed reference gap
+when the applicable factory specification, price, or configuration is
+unavailable; it does not move the valid listing back to `incomplete`.
 
 Catalog approvals take an optimistic fingerprint of the active catalog before
 the model calls, serialize the final write, and compare the fingerprint again
@@ -789,68 +797,87 @@ or restages the bundle and links.
 Mandatory FAA admission is checked before any review-driven catalog write. It
 is checked again after that transaction and before grounded metadata enrichment
 and final publication, closing the race around network calls. A source-backed
-listing becomes `ready` and verified only if FAA admission, full enrichment,
-and the readiness pass all succeed. A missing, incomplete, or not-yet-approved
-shared factory specification, model-year price, or factory configuration
-returns `PendingReference`: the listing remains `incomplete`, excluded from
-serving and training, and eligible for an independent automatic retry. An
-actual listing, FAA, or listing-specific enrichment failure is persisted as
-`quarantined`; neither path rolls back or holds a network request inside the
-catalog/link transaction. Associations explicitly corroborated by a reviewer
-use `listing_review` provenance with high installation confidence and are
-valuation-eligible wherever equivalent high-confidence `listing` associations
-are accepted.
+listing becomes `ready` and verified once FAA admission, listing-specific
+enrichment, and the listing readiness pass succeed. Missing, incomplete, or
+not-yet-approved shared factory specifications, model-year prices, and factory
+configurations are valuation gaps: they prevent that valuation row from being
+served, snapshotted, or used for training, but do not make the listing itself
+incomplete. An actual listing, FAA, or listing-specific enrichment failure is
+persisted as `quarantined`; neither path rolls back or holds a network request
+inside the catalog/link transaction. Associations explicitly corroborated by a
+reviewer use `listing_review` provenance with high installation confidence and
+are valuation-eligible wherever equivalent high-confidence `listing`
+associations are accepted.
 
-## Grounded Metadata
+## Grounded Product And Factory Facts
 
-The metadata request enables Gemini's Google Search tool for factual metadata:
+Gemini research is staged by claim type. Search discovery finds candidate
+primary documents; URL Context verifies the exact resolved URLs; a
+tools-disabled schema pass converts only verified claims into normalized facts;
+and independent adjudication binds those facts to existing approved catalog and
+decision IDs. Search output, URL-context windows, prompts, and provider
+responses are request-scoped and are discarded after adjudication.
 
-- avionics introduction year, installed resale contribution, and replacement
-  cost
-- default/factory avionics by aircraft variant and model year
-- model-year new-price points
-- variant-level aircraft specs, engine model, propeller model, TBOs, overhaul
-  costs, fuel burn, and maintenance assumptions
+Aircraft factory-reference research covers the exact reviewed
+make/family/designation/generation/package, model year, market, and serial scope.
+It must independently establish:
 
-Grounded prompts require source URL, source title, confidence, and non-null
-values for fields that the database needs.
+- a direct USD price for the full standard configuration and the nominal dollar
+  year in which that price was published;
+- the complete standard avionics, engine, propeller, and material-feature sets;
+  and
+- primary-source applicability for every normalized fact.
 
-The provider can still decline to call an enabled Search tool. Production
-metadata enrichment currently validates the returned values and independently
-resolves product identities, but does not yet reject the value payload solely
-because the metadata request omitted observed Search/citation evidence. The
-benchmark does reject that condition. Until evidence discovery is moved to a
-forced-tool workflow, a plausible URL in metadata output is not proof that the
-year or dollar values were grounded.
+The four fact sets each carry a completeness claim, including when the reviewed
+set is empty. A marketplace listing can motivate research but cannot establish
+a reusable factory configuration or price. Manufacturer evidence is primary
+for commercial configuration and price; FAA evidence remains controlling for
+registration, serial, certification, and production facts within its scope.
 
-Confidence alone is not valuation eligibility. The local validators also
-classify provenance and purpose:
+The persistence boundary accepts a strict normalized JSON draft containing only
+approved catalog IDs, approval-decision IDs, validated claim IDs, applicability,
+and normalized values. The exact insert-and-publication transaction is exercised
+in rollback-only mode by default:
 
-- Factory specs and reusable engine/propeller costs require an authoritative
-  reference. A sale-listing page, including a generic marketplace listing URL,
-  is rejected as factory evidence.
-- New-price anchors require direct evidence for the exact model year. Inferred,
-  interpolated, other-year, homepage-only, or unexplained discontinuous values
-  may be retained for review but cannot drive valuation.
-- Avionics prompts return installed resale contribution and replacement cost as
-  separate values and retain the value source. Factory-default avionics must
-  cite factory/reference evidence, not an ordinary sale page. Named integrated
-  suites and every contained unit must independently resolve to approved
-  catalog identities so the suite and its components are not counted twice.
+The draft's `direct_cited_amount_usd` and
+`direct_cited_nominal_dollar_year` fields must reproduce the cited nominal
+MSRP. They must never contain a model-generated inflation adjustment. A
+separate optional `dollar_normalization` fact contains the source/target years,
+official index series, both official index values, their exact factor, and a
+validated regulator-primary claim ID. Gemini may structure already-grounded
+values, but database gates—not model confidence—admit the fact. Serving and
+snapshot creation consume it directly; a missing pair is the deterministic
+`reference_price_dollar_normalization_missing` gap rather than another Gemini
+task.
 
-LLM completion does not make a listing ready by itself. The database row starts
-`incomplete`; deterministic readiness queries recheck all evidence. Expected
-avionics uncertainty is persisted as `pending_review` and skips enrichment.
-When those listing-specific checks are complete but the shared reference
-catalog cannot yet supply valuation-ready factory data, finalization returns
-`PendingReference` and leaves the row `incomplete`. That outcome is recomputed
-from current listing/reference state on retry; it is not stored in a second
-status column or table, and no Gemini prompt, response, or complete URL-context
-dossier is retained for it. Failed FAA/listing admission, invalid listing
-evidence, or another actual listing-specific completion error is persisted as
-`quarantined`. `incomplete`, `pending_review`, and `quarantined` rows all remain
-excluded from snapshots, training, and serving until their respective
-reference, review, or repair path succeeds.
+```sh
+cargo run --bin aircost-admin -- \
+  publish-aircraft-reference --draft normalized-reference.json
+```
+
+`--apply` persists and publishes the version only after database gates recheck
+all primary evidence, complete fact sets, the exact-model-year full-configuration
+price, valuation-ready avionics, and non-overlapping applicability. A correction
+atomically supersedes its exact published predecessor and publishes the higher
+revision; any failure rolls both state changes back.
+
+Confidence alone is not valuation eligibility. Avionics identities must resolve
+to approved concrete products or named suites; integrated suite membership must
+be explicit so bundled units are not counted twice. Installed contribution and
+replacement cost remain separate facts. Reference and avionics dollar values
+retain their actual nominal year. Official regulator-backed index facts perform
+the only accepted valuation-year conversion; serving fails closed when the
+exact pair is absent. Installed-contribution values are current resale values:
+the full listing delta is applied after factory-aircraft age/hour scaling and
+held constant in valuation-year dollars across the displayed curve.
+
+LLM completion does not make a listing ready by itself. Deterministic readiness
+rechecks the current exact FAA assignment, listing-specific avionics, and the
+unique complete published reference applicable to the FAA serial. Reference
+gaps are recomputed from current state and are not stored in a second pending
+table. Expected avionics uncertainty remains `pending_review`; failed aircraft
+admission or invalid listing evidence is quarantined. All non-ready states stay
+out of snapshots, training, and serving.
 
 ## Normalization Philosophy
 

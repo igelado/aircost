@@ -340,7 +340,6 @@ function avionicsCatalogRow(item) {
   const catalogUsage = document.createElement("small");
   catalogUsage.textContent = [
     `${formatNumber(view.eligibleListingCount, 0)} eligible`,
-    `${formatNumber(view.defaultUsageCount, 0)} default`,
     `${formatNumber(view.referenceUsageCount, 0)} reference`,
     `${formatNumber(view.suiteUsageCount, 0)} suite`,
   ].join(" · ");
@@ -415,7 +414,6 @@ function avionicsView(item) {
     replacementCost: item?.valuation?.replacement_cost_usd,
     listingCount: nonnegativeInteger(item?.usage?.visible_listings, 0),
     eligibleListingCount: nonnegativeInteger(item?.usage?.valuation_eligible_listings, 0),
-    defaultUsageCount: nonnegativeInteger(item?.usage?.legacy_defaults, 0),
     referenceUsageCount: nonnegativeInteger(item?.usage?.reference_configurations, 0),
     suiteUsageCount: nonnegativeInteger(item?.usage?.suite_relationships, 0),
     complete: typeof item?.completeness?.complete === "boolean"
@@ -610,7 +608,6 @@ function renderAvionicsDetail(detail) {
     detailCollectionSection("Suite components", detail.suite_components, describeSuiteComponent),
     detailCollectionSection("Suite memberships", detail.suite_memberships, describeSuiteMembership),
     detailCollectionSection("Listing occurrences", detail.listing_occurrences, describeListingOccurrence),
-    detailCollectionSection("Legacy default configurations", detail.legacy_defaults, describeLegacyDefault),
     detailCollectionSection("Reference configurations", detail.reference_configurations, describeReferenceConfiguration),
   ];
 
@@ -730,20 +727,6 @@ function describeListingOccurrence(item) {
       item.source_notes,
       item.source_confidence && `Confidence ${displayLabel(item.source_confidence)}`,
       item.ingestion_error,
-    ]),
-    url: item.source_url,
-  };
-}
-
-function describeLegacyDefault(item) {
-  return {
-    primary: item.aircraft || `Legacy default ${item.id || "-"}`,
-    secondary: detailMetadata([
-      item.model_year,
-      quantityMetadata(item.quantity),
-      item.source_title,
-      item.source_notes,
-      item.source_confidence && `Confidence ${displayLabel(item.source_confidence)}`,
     ]),
     url: item.source_url,
   };

@@ -24,54 +24,366 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 
-CREATE TABLE IF NOT EXISTS depreciation_profiles (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE,
-  age_decay_rate REAL NOT NULL,
-  long_run_residual_fraction REAL NOT NULL,
-  new_to_used_discount_fraction REAL NOT NULL,
-  new_to_used_discount_years REAL NOT NULL,
-  airframe_doubling_discount REAL NOT NULL,
-  max_airframe_premium REAL NOT NULL,
-  max_airframe_discount REAL NOT NULL,
-  replacement_floor_fraction REAL NOT NULL DEFAULT 0,
-  minimum_value_fraction REAL NOT NULL,
-  high_time_threshold_hours REAL,
-  high_time_discount_at_double_threshold REAL NOT NULL,
-  is_system_profile INTEGER NOT NULL DEFAULT 0 CHECK (is_system_profile IN (0, 1)),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+-- A marker-present rerun must reject incompatible provenance before any
+-- CREATE IF NOT EXISTS statement can accept or heal later schema objects.
+CREATE TEMP TABLE reference_catalog_cutover_contract_preflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
 );
+INSERT INTO reference_catalog_cutover_contract_preflight (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1
+  FROM schema_migration_contracts
+  WHERE migration_name = '20260819_reference_catalog_cutover'
+    AND (
+      contract_version IS NOT 1
+      OR contract_fingerprint IS NOT
+        'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
+    )
+) THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_cutover_contract_preflight;
 
-CREATE TABLE IF NOT EXISTS depreciation_profile_fit_metadata (
-  depreciation_profile_id INTEGER PRIMARY KEY
-    REFERENCES depreciation_profiles(id) ON DELETE CASCADE,
-  fit_scope TEXT NOT NULL CHECK (fit_scope IN ('global', 'category', 'model')),
-  fit_scope_key TEXT NOT NULL,
-  fit_category TEXT NOT NULL,
-  sample_count INTEGER NOT NULL,
-  rmse_usd REAL NOT NULL,
-  mae_fraction REAL NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (fit_scope, fit_scope_key)
+
+-- SQLite library builds do not expose the shell's sha3() helper. Keep the
+-- canonical schema independently fail-closed by comparing the complete
+-- expected object relation rather than relying on a shell-only SQL function.
+CREATE TEMP TABLE reference_catalog_schema_expected_objects (
+  object_key TEXT PRIMARY KEY,
+  definition TEXT NOT NULL
 );
+INSERT INTO reference_catalog_schema_expected_objects (object_key, definition)
+VALUES
+('index:aircraft_designation_aliases:idx_aircraft_designation_aliases_scope', '1:c:0:createuniqueindexidx_aircraft_designation_aliases_scopeonaircraft_designation_aliases(aircraft_designation_id,normalized_alias,coalesce(aircraft_market_id,0)):0:1:aircraft_designation_id:0:BINARY:1,1:3:normalized_alias:0:BINARY:1,2:-2::0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_designation_aliases:sqlite_autoindex_aircraft_designation_aliases_1', '1:u:0::0:7:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_designation_aliases:sqlite_autoindex_aircraft_designation_aliases_2', '1:u:0::0:1:aircraft_designation_id:0:BINARY:1,1:3:normalized_alias:0:BINARY:1,2:6:aircraft_market_id:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_designation_identifiers:idx_aircraft_designation_identifiers_scope', '1:c:0:createuniqueindexidx_aircraft_designation_identifiers_scopeonaircraft_designation_identifiers(aircraft_designation_id,authority,identifier_kind,normalized_identifier_value,coalesce(aircraft_market_id,0)):0:1:aircraft_designation_id:0:BINARY:1,1:2:authority:0:BINARY:1,2:3:identifier_kind:0:BINARY:1,3:5:normalized_identifier_value:0:BINARY:1,4:-2::0:BINARY:1,5:-1::0:BINARY:0'),
+('index:aircraft_designation_identifiers:sqlite_autoindex_aircraft_designation_identifiers_1', '1:u:0::0:9:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_designation_identifiers:sqlite_autoindex_aircraft_designation_identifiers_2', '1:u:0::0:1:aircraft_designation_id:0:BINARY:1,1:2:authority:0:BINARY:1,2:3:identifier_kind:0:BINARY:1,3:5:normalized_identifier_value:0:BINARY:1,4:8:aircraft_market_id:0:BINARY:1,5:-1::0:BINARY:0'),
+('index:aircraft_designations:sqlite_autoindex_aircraft_designations_1', '1:u:0::0:5:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_designations:sqlite_autoindex_aircraft_designations_2', '1:u:0::0:1:aircraft_model_family_id:0:BINARY:1,1:3:normalized_official_designation:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_designations:sqlite_autoindex_aircraft_designations_3', '1:u:0::0:0:id:0:BINARY:1,1:1:aircraft_model_family_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_engine_catalog_models:sqlite_autoindex_aircraft_engine_catalog_models_1', '1:u:0::0:11:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_engine_catalog_models:sqlite_autoindex_aircraft_engine_catalog_models_2', '1:u:0::0:2:normalized_manufacturer_name:0:BINARY:1,1:4:normalized_model_name:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_engine_catalog_models:sqlite_autoindex_aircraft_engine_catalog_models_3', '1:u:0::0:6:normalized_identifier_authority:0:BINARY:1,1:7:identifier_kind:0:BINARY:1,2:9:normalized_authoritative_identifier:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_factory_packages:sqlite_autoindex_aircraft_factory_packages_1', '1:u:0::0:6:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_factory_packages:sqlite_autoindex_aircraft_factory_packages_2', '1:u:0::0:1:aircraft_model_family_id:0:BINARY:1,1:3:normalized_name:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_factory_packages:sqlite_autoindex_aircraft_factory_packages_3', '1:u:0::0:0:id:0:BINARY:1,1:1:aircraft_model_family_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_family_aliases:idx_aircraft_family_aliases_scope', '1:c:0:createuniqueindexidx_aircraft_family_aliases_scopeonaircraft_family_aliases(aircraft_model_family_id,normalized_alias,coalesce(aircraft_market_id,0)):0:1:aircraft_model_family_id:0:BINARY:1,1:3:normalized_alias:0:BINARY:1,2:-2::0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_family_aliases:sqlite_autoindex_aircraft_family_aliases_1', '1:u:0::0:7:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_family_aliases:sqlite_autoindex_aircraft_family_aliases_2', '1:u:0::0:1:aircraft_model_family_id:0:BINARY:1,1:3:normalized_alias:0:BINARY:1,2:6:aircraft_market_id:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_feature_definitions:sqlite_autoindex_aircraft_feature_definitions_1', '1:u:0::0:1:feature_key:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_feature_definitions:sqlite_autoindex_aircraft_feature_definitions_2', '1:u:0::0:5:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_generation_designations:sqlite_autoindex_aircraft_generation_designations_1', '1:u:0::0:2:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_generation_designations:sqlite_autoindex_aircraft_generation_designations_2', '1:pk:0::0:0:aircraft_generation_id:0:BINARY:1,1:1:aircraft_designation_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_generations:sqlite_autoindex_aircraft_generations_1', '1:u:0::0:5:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_generations:sqlite_autoindex_aircraft_generations_2', '1:u:0::0:1:aircraft_model_family_id:0:BINARY:1,1:3:normalized_name:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_generations:sqlite_autoindex_aircraft_generations_3', '1:u:0::0:0:id:0:BINARY:1,1:1:aircraft_model_family_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_make_aliases:idx_aircraft_make_aliases_scope', '1:c:0:createuniqueindexidx_aircraft_make_aliases_scopeonaircraft_make_aliases(aircraft_make_id,normalized_alias,coalesce(aircraft_market_id,0)):0:1:aircraft_make_id:0:BINARY:1,1:3:normalized_alias:0:BINARY:1,2:-2::0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_make_aliases:sqlite_autoindex_aircraft_make_aliases_1', '1:u:0::0:7:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_make_aliases:sqlite_autoindex_aircraft_make_aliases_2', '1:u:0::0:1:aircraft_make_id:0:BINARY:1,1:3:normalized_alias:0:BINARY:1,2:6:aircraft_market_id:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_makes:sqlite_autoindex_aircraft_makes_1', '1:u:0::0:2:normalized_name:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_makes:sqlite_autoindex_aircraft_makes_2', '1:u:0::0:3:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_model_families:sqlite_autoindex_aircraft_model_families_1', '1:u:0::0:4:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_model_families:sqlite_autoindex_aircraft_model_families_2', '1:u:0::0:1:aircraft_make_id:0:BINARY:1,1:3:normalized_name:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_model_families:sqlite_autoindex_aircraft_model_families_3', '1:u:0::0:0:id:0:BINARY:1,1:1:aircraft_make_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_package_applicability:idx_aircraft_package_applicability_scope', '1:c:0:createuniqueindexidx_aircraft_package_applicability_scopeonaircraft_package_applicability(aircraft_factory_package_id,aircraft_designation_id,coalesce(aircraft_generation_id,0),coalesce(valid_from_model_year,0),coalesce(valid_to_model_year,0)):0:1:aircraft_factory_package_id:0:BINARY:1,1:2:aircraft_designation_id:0:BINARY:1,2:-2::0:BINARY:1,3:-2::0:BINARY:1,4:-2::0:BINARY:1,5:-1::0:BINARY:0'),
+('index:aircraft_package_applicability:sqlite_autoindex_aircraft_package_applicability_1', '1:u:0::0:6:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_package_applicability:sqlite_autoindex_aircraft_package_applicability_2', '1:u:0::0:1:aircraft_factory_package_id:0:BINARY:1,1:2:aircraft_designation_id:0:BINARY:1,2:3:aircraft_generation_id:0:BINARY:1,3:4:valid_from_model_year:0:BINARY:1,4:5:valid_to_model_year:0:BINARY:1,5:-1::0:BINARY:0'),
+('index:aircraft_propeller_catalog_models:sqlite_autoindex_aircraft_propeller_catalog_models_1', '1:u:0::0:11:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_propeller_catalog_models:sqlite_autoindex_aircraft_propeller_catalog_models_2', '1:u:0::0:2:normalized_manufacturer_name:0:BINARY:1,1:4:normalized_model_name:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_propeller_catalog_models:sqlite_autoindex_aircraft_propeller_catalog_models_3', '1:u:0::0:6:normalized_identifier_authority:0:BINARY:1,1:7:identifier_kind:0:BINARY:1,2:9:normalized_authoritative_identifier:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_reference_applicability_scopes:idx_aircraft_reference_scope_market', '0:c:0:createindexidx_aircraft_reference_scope_marketonaircraft_reference_applicability_scopes(aircraft_market_id,aircraft_serial_number_scheme_id,serial_from_sort_key,serial_to_sort_key):0:2:aircraft_market_id:0:BINARY:1,1:4:aircraft_serial_number_scheme_id:0:BINARY:1,2:8:serial_from_sort_key:0:BINARY:1,3:9:serial_to_sort_key:0:BINARY:1,4:-1::0:BINARY:0'),
+('index:aircraft_reference_applicability_scopes:sqlite_autoindex_aircraft_reference_applicability_scopes_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:aircraft_market_id:0:BINARY:1,2:4:aircraft_serial_number_scheme_id:0:BINARY:1,3:5:serial_prefix:0:BINARY:1,4:8:serial_from_sort_key:0:BINARY:1,5:9:serial_to_sort_key:0:BINARY:1,6:-1::0:BINARY:0'),
+('index:aircraft_reference_avionics:sqlite_autoindex_aircraft_reference_avionics_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:avionics_model_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_reference_configuration_versions:idx_aircraft_reference_versions_lookup', '0:c:0:createindexidx_aircraft_reference_versions_lookuponaircraft_reference_configuration_versions(aircraft_reference_configuration_id,model_year,publication_state,revision):0:1:aircraft_reference_configuration_id:0:BINARY:1,1:2:model_year:0:BINARY:1,2:5:publication_state:0:BINARY:1,3:3:revision:0:BINARY:1,4:-1::0:BINARY:0'),
+('index:aircraft_reference_configuration_versions:sqlite_autoindex_aircraft_reference_configuration_versions_1', '1:u:0::0:6:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_reference_configuration_versions:sqlite_autoindex_aircraft_reference_configuration_versions_2', '1:u:0::0:1:aircraft_reference_configuration_id:0:BINARY:1,1:2:model_year:0:BINARY:1,2:3:revision:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_reference_configuration_versions:sqlite_autoindex_aircraft_reference_configuration_versions_3', '1:u:0::0:4:supersedes_version_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_reference_configurations:idx_aircraft_reference_config_base_generation', '1:c:1:createuniqueindexidx_aircraft_reference_config_base_generationonaircraft_reference_configurations(aircraft_designation_id,aircraft_generation_id)whereconfiguration_kind=''base''andaircraft_generation_idisnotnull:0:2:aircraft_designation_id:0:BINARY:1,1:3:aircraft_generation_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_reference_configurations:idx_aircraft_reference_config_base_no_generation', '1:c:1:createuniqueindexidx_aircraft_reference_config_base_no_generationonaircraft_reference_configurations(aircraft_designation_id)whereconfiguration_kind=''base''andaircraft_generation_idisnull:0:2:aircraft_designation_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_reference_configurations:idx_aircraft_reference_config_tier_generation', '1:c:1:createuniqueindexidx_aircraft_reference_config_tier_generationonaircraft_reference_configurations(aircraft_designation_id,aircraft_generation_id,tier_package_id)whereconfiguration_kind=''tier''andaircraft_generation_idisnotnull:0:2:aircraft_designation_id:0:BINARY:1,1:3:aircraft_generation_id:0:BINARY:1,2:4:tier_package_id:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_reference_configurations:idx_aircraft_reference_config_tier_no_generation', '1:c:1:createuniqueindexidx_aircraft_reference_config_tier_no_generationonaircraft_reference_configurations(aircraft_designation_id,tier_package_id)whereconfiguration_kind=''tier''andaircraft_generation_idisnull:0:2:aircraft_designation_id:0:BINARY:1,1:4:tier_package_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_reference_configurations:sqlite_autoindex_aircraft_reference_configurations_1', '1:u:0::0:7:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_reference_engines:sqlite_autoindex_aircraft_reference_engines_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:aircraft_engine_catalog_model_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_reference_features:sqlite_autoindex_aircraft_reference_features_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:aircraft_feature_definition_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_reference_propellers:sqlite_autoindex_aircraft_reference_propellers_1', '1:u:0::0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:aircraft_propeller_catalog_model_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:aircraft_serial_number_schemes:sqlite_autoindex_aircraft_serial_number_schemes_1', '1:u:0::0:5:approval_decision_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:aircraft_serial_number_schemes:sqlite_autoindex_aircraft_serial_number_schemes_2', '1:u:0::0:1:aircraft_make_id:0:BINARY:1,1:2:name:0:BINARY:1,2:3:normalization_version:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:aircraft_valuation_compatibility_projections:idx_aircraft_valuation_projection_identity', '1:c:0:createuniqueindexidx_aircraft_valuation_projection_identityonaircraft_valuation_compatibility_projections(aircraft_make_id,aircraft_model_family_id,aircraft_designation_id,coalesce(aircraft_generation_id,0),coalesce(aircraft_factory_package_id,0)):0:1:aircraft_make_id:0:BINARY:1,1:2:aircraft_model_family_id:0:BINARY:1,2:3:aircraft_designation_id:0:BINARY:1,3:-2::0:BINARY:1,4:-2::0:BINARY:1,5:-1::0:BINARY:0'),
+('index:avionics_models:idx_avionics_models_approved_manufacturer_name', '1:c:1:createuniqueindexidx_avionics_models_approved_manufacturer_nameonavionics_models(avionics_manufacturer_id,normalized_name)wherecatalog_status=''approved'':0:1:avionics_manufacturer_id:0:BINARY:1,1:3:normalized_name:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:avionics_models:idx_avionics_models_manufacturer_identifier', '1:c:1:createuniqueindexidx_avionics_models_manufacturer_identifieronavionics_models(avionics_manufacturer_id,manufacturer_identifier_kind,normalized_manufacturer_identifier)wherenormalized_manufacturer_identifierisnotnullandlength(trim(normalized_manufacturer_identifier))>0:0:1:avionics_manufacturer_id:0:BINARY:1,1:5:manufacturer_identifier_kind:0:BINARY:1,2:7:normalized_manufacturer_identifier:0:BINARY:1,3:-1::0:BINARY:0'),
+('index:listing_verification_run_items:idx_listing_verification_run_items_claim', '0:c:0:createindexidx_listing_verification_run_items_claimonlisting_verification_run_items(run_id,status,position,id):0:1:run_id:0:BINARY:1,1:4:status:0:BINARY:1,2:3:position:0:BINARY:1,3:0:id:0:BINARY:1,4:-1::0:BINARY:0'),
+('index:listing_verification_run_items:idx_listing_verification_run_items_one_active_listing', '1:c:1:createuniqueindexidx_listing_verification_run_items_one_active_listingonlisting_verification_run_items(listing_id)wherestatusin(''queued'',''running''):0:2:listing_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:listing_verification_run_items:idx_listing_verification_run_items_one_running_per_run', '1:c:1:createuniqueindexidx_listing_verification_run_items_one_running_per_runonlisting_verification_run_items(run_id)wherestatus=''running'':0:1:run_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:listing_verification_run_items:sqlite_autoindex_listing_verification_run_items_1', '1:u:0::0:1:run_id:0:BINARY:1,1:3:position:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:listing_verification_run_items:sqlite_autoindex_listing_verification_run_items_2', '1:u:0::0:1:run_id:0:BINARY:1,1:2:listing_id:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_1', '1:u:0::0:7:evidence_claim_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_2', '1:u:0::0:1:source_year:0:BINARY:1,1:2:target_year:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:plugin_submissions:idx_plugin_submissions_listing', '0:c:0:createindexidx_plugin_submissions_listingonplugin_submissions(canonical_listing_id):0:10:canonical_listing_id:0:BINARY:1,1:-1::0:BINARY:0'),
+('index:plugin_submissions:idx_plugin_submissions_user', '0:c:0:createindexidx_plugin_submissions_useronplugin_submissions(user_id,submitted_at):0:1:user_id:0:BINARY:1,1:4:submitted_at:0:BINARY:1,2:-1::0:BINARY:0'),
+('index:plugin_submissions:uq_plugin_submissions_signed_capture', '1:c:0:createuniqueindexuq_plugin_submissions_signed_captureonplugin_submissions(user_id,plugin_install_id,source_url,rendered_html_sha256):0:1:user_id:0:BINARY:1,1:2:plugin_install_id:0:BINARY:1,2:3:source_url:0:BINARY:1,3:6:rendered_html_sha256:0:BINARY:1,4:-1::0:BINARY:0'),
+('table:aircraft_designation_aliases', 'createtableaircraft_designation_aliases(idintegerprimarykeyautoincrement,aircraft_designation_idintegernotnullreferencesaircraft_designations(id)ondeletecascade,aliastextnotnull,normalized_aliastextnotnull,valid_from_model_yearinteger,valid_to_model_yearinteger,aircraft_market_idintegerreferencesaircraft_markets(id)ondeleterestrict,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_designation_id,normalized_alias,aircraft_market_id),check(valid_from_model_yearisnullorvalid_to_model_yearisnullorvalid_to_model_year>=valid_from_model_year))'),
+('table:aircraft_designation_identifiers', 'createtableaircraft_designation_identifiers(idintegerprimarykeyautoincrement,aircraft_designation_idintegernotnullreferencesaircraft_designations(id)ondeletecascade,authoritytextnotnull,identifier_kindtextnotnullcheck(identifier_kindin(''manufacturer_model_code'',''type_certificate_model'',''type_certificate_number'',''icao_type_designator'',''other_authoritative'')),identifier_valuetextnotnull,normalized_identifier_valuetextnotnull,valid_from_model_yearinteger,valid_to_model_yearinteger,aircraft_market_idintegerreferencesaircraft_markets(id)ondeleterestrict,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_designation_id,authority,identifier_kind,normalized_identifier_value,aircraft_market_id),check(length(trim(authority))>0),check(length(trim(normalized_identifier_value))>0),check(valid_from_model_yearisnullorvalid_to_model_yearisnullorvalid_to_model_year>=valid_from_model_year))'),
+('table:aircraft_designations', 'createtableaircraft_designations(idintegerprimarykeyautoincrement,aircraft_model_family_idintegernotnullreferencesaircraft_model_families(id)ondeleterestrict,official_designationtextnotnull,normalized_official_designationtextnotnull,display_nametextnotnull,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,unique(aircraft_model_family_id,normalized_official_designation),unique(id,aircraft_model_family_id),check(length(trim(official_designation))>0),check(length(trim(normalized_official_designation))>0),check(length(trim(display_name))>0))'),
+('table:aircraft_engine_catalog_models', 'createtableaircraft_engine_catalog_models(idintegerprimarykeyautoincrement,manufacturer_nametextnotnull,normalized_manufacturer_nametextnotnull,model_nametextnotnull,normalized_model_nametextnotnull,identifier_authoritytextnotnull,normalized_identifier_authoritytextnotnull,identifier_kindtextnotnullcheck(identifier_kindin(''manufacturer_model_code'',''regulator_model_designation'',''manufacturer_part_number'')),authoritative_identifiertextnotnull,normalized_authoritative_identifiertextnotnull,catalog_statustextnotnulldefault''approved''check(catalog_status=''approved''),approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,identity_evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,check(length(trim(manufacturer_name))>0),check(length(trim(normalized_manufacturer_name))>0),check(length(trim(model_name))>0),check(length(trim(normalized_model_name))>0),check(length(trim(identifier_authority))>0),check(length(trim(normalized_identifier_authority))>0),check(length(trim(authoritative_identifier))>0),check(length(trim(normalized_authoritative_identifier))>0),unique(normalized_manufacturer_name,normalized_model_name),unique(normalized_identifier_authority,identifier_kind,normalized_authoritative_identifier))'),
+('table:aircraft_factory_packages', 'createtableaircraft_factory_packages(idintegerprimarykeyautoincrement,aircraft_model_family_idintegernotnullreferencesaircraft_model_families(id)ondeleterestrict,nametextnotnull,normalized_nametextnotnull,package_kindtextnotnullcheck(package_kindin(''trim_tier'',''option_bundle'',''special_edition'')),exclusivity_grouptext,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,unique(aircraft_model_family_id,normalized_name),unique(id,aircraft_model_family_id),check(package_kind<>''trim_tier''orlength(trim(exclusivity_group))>0))'),
+('table:aircraft_family_aliases', 'createtableaircraft_family_aliases(idintegerprimarykeyautoincrement,aircraft_model_family_idintegernotnullreferencesaircraft_model_families(id)ondeletecascade,aliastextnotnull,normalized_aliastextnotnull,valid_from_model_yearinteger,valid_to_model_yearinteger,aircraft_market_idintegerreferencesaircraft_markets(id)ondeleterestrict,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_model_family_id,normalized_alias,aircraft_market_id),check(valid_from_model_yearisnullorvalid_to_model_yearisnullorvalid_to_model_year>=valid_from_model_year))'),
+('table:aircraft_feature_definitions', 'createtableaircraft_feature_definitions(idintegerprimarykeyautoincrement,feature_keytextnotnullunique,display_nametextnotnull,value_typetextnotnullcheck(value_typein(''boolean'',''number'',''text'')),canonical_unittext,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,check((value_type=''number'')orcanonical_unitisnull))'),
+('table:aircraft_generation_designations', 'createtableaircraft_generation_designations(aircraft_generation_idintegernotnullreferencesaircraft_generations(id)ondeletecascade,aircraft_designation_idintegernotnullreferencesaircraft_designations(id)ondeletecascade,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,primarykey(aircraft_generation_id,aircraft_designation_id))'),
+('table:aircraft_generations', 'createtableaircraft_generations(idintegerprimarykeyautoincrement,aircraft_model_family_idintegernotnullreferencesaircraft_model_families(id)ondeleterestrict,nametextnotnull,normalized_nametextnotnull,ordinalintegercheck(ordinalisnullorordinal>=0),approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,unique(aircraft_model_family_id,normalized_name),unique(id,aircraft_model_family_id))'),
+('table:aircraft_make_aliases', 'createtableaircraft_make_aliases(idintegerprimarykeyautoincrement,aircraft_make_idintegernotnullreferencesaircraft_makes(id)ondeletecascade,aliastextnotnull,normalized_aliastextnotnull,valid_from_model_yearinteger,valid_to_model_yearinteger,aircraft_market_idintegerreferencesaircraft_markets(id)ondeleterestrict,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_make_id,normalized_alias,aircraft_market_id),check(valid_from_model_yearisnullorvalid_from_model_yearbetween1900and2200),check(valid_to_model_yearisnullorvalid_to_model_yearbetween1900and2200),check(valid_from_model_yearisnullorvalid_to_model_yearisnullorvalid_to_model_year>=valid_from_model_year))'),
+('table:aircraft_makes', 'createtableaircraft_makes(idintegerprimarykeyautoincrement,nametextnotnull,normalized_nametextnotnullunique,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,check(length(trim(name))>0),check(length(trim(normalized_name))>0))'),
+('table:aircraft_model_families', 'createtableaircraft_model_families(idintegerprimarykeyautoincrement,aircraft_make_idintegernotnullreferencesaircraft_makes(id)ondeleterestrict,nametextnotnull,normalized_nametextnotnull,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,unique(aircraft_make_id,normalized_name),unique(id,aircraft_make_id),check(length(trim(name))>0),check(length(trim(normalized_name))>0))'),
+('table:aircraft_package_applicability', 'createtableaircraft_package_applicability(idintegerprimarykeyautoincrement,aircraft_factory_package_idintegernotnullreferencesaircraft_factory_packages(id)ondeletecascade,aircraft_designation_idintegernotnullreferencesaircraft_designations(id)ondeletecascade,aircraft_generation_idintegerreferencesaircraft_generations(id)ondeletecascade,valid_from_model_yearinteger,valid_to_model_yearinteger,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_factory_package_id,aircraft_designation_id,aircraft_generation_id,valid_from_model_year,valid_to_model_year),check(valid_from_model_yearisnullorvalid_to_model_yearisnullorvalid_to_model_year>=valid_from_model_year))'),
+('table:aircraft_propeller_catalog_models', 'createtableaircraft_propeller_catalog_models(idintegerprimarykeyautoincrement,manufacturer_nametextnotnull,normalized_manufacturer_nametextnotnull,model_nametextnotnull,normalized_model_nametextnotnull,identifier_authoritytextnotnull,normalized_identifier_authoritytextnotnull,identifier_kindtextnotnullcheck(identifier_kindin(''manufacturer_model_code'',''regulator_model_designation'',''manufacturer_part_number'')),authoritative_identifiertextnotnull,normalized_authoritative_identifiertextnotnull,catalog_statustextnotnulldefault''approved''check(catalog_status=''approved''),approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,identity_evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,check(length(trim(manufacturer_name))>0),check(length(trim(normalized_manufacturer_name))>0),check(length(trim(model_name))>0),check(length(trim(normalized_model_name))>0),check(length(trim(identifier_authority))>0),check(length(trim(normalized_identifier_authority))>0),check(length(trim(authoritative_identifier))>0),check(length(trim(normalized_authoritative_identifier))>0),unique(normalized_manufacturer_name,normalized_model_name),unique(normalized_identifier_authority,identifier_kind,normalized_authoritative_identifier))'),
+('table:aircraft_reference_applicability_scopes', 'createtableaircraft_reference_applicability_scopes(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,aircraft_market_idintegernotnullreferencesaircraft_markets(id)ondeleterestrict,applies_to_all_serialsintegernotnulldefault1check(applies_to_all_serialsin(0,1)),aircraft_serial_number_scheme_idintegerreferencesaircraft_serial_number_schemes(id)ondeleterestrict,serial_prefixtext,serial_from_displaytext,serial_to_displaytext,serial_from_sort_keytext,serial_to_sort_keytext,evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,check((applies_to_all_serials=1andaircraft_serial_number_scheme_idisnullandserial_prefixisnullandserial_from_displayisnullandserial_to_displayisnullandserial_from_sort_keyisnullandserial_to_sort_keyisnull)or(applies_to_all_serials=0andaircraft_serial_number_scheme_idisnotnullandserial_from_displayisnotnullandserial_to_displayisnotnullandserial_from_sort_keyisnotnullandserial_to_sort_keyisnotnullandserial_from_sort_key<=serial_to_sort_key)),unique(aircraft_reference_configuration_version_id,aircraft_market_id,aircraft_serial_number_scheme_id,serial_prefix,serial_from_sort_key,serial_to_sort_key))'),
+('table:aircraft_reference_avionics', 'createtableaircraft_reference_avionics(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,avionics_model_idintegernotnullreferencesavionics_models(id)ondeleterestrict,quantityintegernotnullcheck(quantity>0),equipment_roletextnotnullcheck(equipment_rolein(''standard'',''included_in_tier'')),evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_version_id,avionics_model_id))'),
+('table:aircraft_reference_configuration_versions', 'createtableaircraft_reference_configuration_versions(idintegerprimarykeyautoincrement,aircraft_reference_configuration_idintegernotnullreferencesaircraft_reference_configurations(id)ondeleterestrict,model_yearintegernotnullcheck(model_yearbetween1900and2200),revisionintegernotnullcheck(revision>=1),supersedes_version_idintegerreferencesaircraft_reference_configuration_versions(id)ondeleterestrict,publication_statetextnotnulldefault''building''check(publication_statein(''building'',''published'',''superseded'')),approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,published_attext,superseded_attext,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_id,model_year,revision),unique(supersedes_version_id),check(supersedes_version_idisnullorsupersedes_version_id<>id),check((publication_state=''building''andpublished_atisnullandsuperseded_atisnull)or(publication_state=''published''andpublished_atisnotnullandsuperseded_atisnull)or(publication_state=''superseded''andpublished_atisnotnullandsuperseded_atisnotnull)))'),
+('table:aircraft_reference_configurations', 'createtableaircraft_reference_configurations(idintegerprimarykeyautoincrement,aircraft_model_family_idintegernotnull,aircraft_designation_idintegernotnull,aircraft_generation_idinteger,tier_package_idinteger,configuration_kindtextnotnullcheck(configuration_kindin(''base'',''tier'')),display_nametextnotnull,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,foreignkey(aircraft_designation_id,aircraft_model_family_id)referencesaircraft_designations(id,aircraft_model_family_id)ondeleterestrict,foreignkey(aircraft_generation_id,aircraft_model_family_id)referencesaircraft_generations(id,aircraft_model_family_id)ondeleterestrict,foreignkey(tier_package_id,aircraft_model_family_id)referencesaircraft_factory_packages(id,aircraft_model_family_id)ondeleterestrict,check((configuration_kind=''base''andtier_package_idisnull)or(configuration_kind=''tier''andtier_package_idisnotnull)))'),
+('table:aircraft_reference_engines', 'createtableaircraft_reference_engines(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,aircraft_engine_catalog_model_idintegernotnullreferencesaircraft_engine_catalog_models(id)ondeleterestrict,quantityintegernotnullcheck(quantity>0),equipment_roletextnotnullcheck(equipment_rolein(''standard'',''included_in_tier'')),evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_version_id,aircraft_engine_catalog_model_id))'),
+('table:aircraft_reference_fact_set_attestations', 'createtableaircraft_reference_fact_set_attestations(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,fact_set_kindtextnotnullcheck(fact_set_kindin(''avionics'',''engines'',''propellers'',''features'')),evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_version_id,fact_set_kind))'),
+('table:aircraft_reference_features', 'createtableaircraft_reference_features(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,aircraft_feature_definition_idintegernotnullreferencesaircraft_feature_definitions(id)ondeleterestrict,boolean_valueintegercheck(boolean_valueisnullorboolean_valuein(0,1)),number_valuereal,text_valuetext,evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_version_id,aircraft_feature_definition_id),check((boolean_valueisnotnull)+(number_valueisnotnull)+(text_valueisnotnull)=1))'),
+('table:aircraft_reference_prices', 'createtableaircraft_reference_prices(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,price_kindtextnotnullcheck(price_kindin(''base_msrp'',''equipped_msrp'',''tier_increment'',''other_factory_price'')),amountrealnotnullcheck(amount>0),currencytextnotnullcheck(length(currency)=3andcurrency=upper(currency)),price_reference_yearintegernotnullcheck(price_reference_yearbetween1900and2200),configuration_basistextnotnulldefault''unknown''check(configuration_basisin(''full_standard_configuration'',''base_aircraft_only'',''unknown'')),evidence_kindtextnotnullcheck(evidence_kindin(''direct_model_year'',''direct_other_year'',''interpolated'',''inferred'')),evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_version_id,price_kind,currency))'),
+('table:aircraft_reference_propellers', 'createtableaircraft_reference_propellers(idintegerprimarykeyautoincrement,aircraft_reference_configuration_version_idintegernotnullreferencesaircraft_reference_configuration_versions(id)ondeletecascade,aircraft_propeller_catalog_model_idintegernotnullreferencesaircraft_propeller_catalog_models(id)ondeleterestrict,quantityintegernotnullcheck(quantity>0),equipment_roletextnotnullcheck(equipment_rolein(''standard'',''included_in_tier'')),evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_reference_configuration_version_id,aircraft_propeller_catalog_model_id))'),
+('table:aircraft_serial_number_schemes', 'createtableaircraft_serial_number_schemes(idintegerprimarykeyautoincrement,aircraft_make_idintegernotnullreferencesaircraft_makes(id)ondeleterestrict,nametextnotnull,normalization_versiontextnotnull,validation_patterntextnotnull,approval_decision_idintegernotnulluniquereferencesaircraft_identity_decisions(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(aircraft_make_id,name,normalization_version))'),
+('table:aircraft_valuation_compatibility_projections', 'createtableaircraft_valuation_compatibility_projections(aircraft_model_variant_idintegerprimarykeyreferencesaircraft_model_variants(id)ondeleterestrict,aircraft_make_idintegernotnull,aircraft_model_family_idintegernotnull,aircraft_designation_idintegernotnull,aircraft_generation_idinteger,aircraft_factory_package_idinteger,created_from_aircraft_sale_listing_idintegernotnull,created_from_identity_assignment_idintegernotnull,identity_decision_idintegernotnullreferencesaircraft_identity_decisions(id)ondeleterestrict,identity_evidence_claim_idintegernotnullreferencescuration_evidence_claims(id)ondeleterestrict,faa_registry_snapshot_idintegernotnullreferencesfaa_registry_snapshots(id)ondeleterestrict,faa_n_numbertextnotnull,faa_source_record_sha256textnotnull,created_attextnotnulldefaultcurrent_timestamp,foreignkey(aircraft_model_family_id,aircraft_make_id)referencesaircraft_model_families(id,aircraft_make_id)ondeleterestrict,foreignkey(aircraft_designation_id,aircraft_model_family_id)referencesaircraft_designations(id,aircraft_model_family_id)ondeleterestrict,foreignkey(aircraft_generation_id,aircraft_model_family_id)referencesaircraft_generations(id,aircraft_model_family_id)ondeleterestrict,foreignkey(aircraft_factory_package_id,aircraft_model_family_id)referencesaircraft_factory_packages(id,aircraft_model_family_id)ondeleterestrict,foreignkey(faa_registry_snapshot_id,faa_n_number)referencesfaa_registry_aircraft(snapshot_id,n_number)ondeleterestrict,foreignkey(faa_registry_snapshot_id,faa_source_record_sha256)referencesfaa_registry_aircraft(snapshot_id,source_record_sha256)ondeleterestrict,check(aircraft_make_id>0),check(aircraft_model_family_id>0),check(aircraft_designation_id>0),check(aircraft_generation_idisnulloraircraft_generation_id>0),check(aircraft_factory_package_idisnulloraircraft_factory_package_id>0),check(created_from_aircraft_sale_listing_id>0),check(created_from_identity_assignment_id>0))'),
+('table:avionics_models', 'createtableavionics_models(idintegerprimarykeyautoincrement,avionics_manufacturer_idintegernotnullreferencesavionics_manufacturers(id),nametextnotnull,normalized_nametextnotnull,catalog_statustextnotnulldefault''unreviewed''check(catalog_statusin(''unreviewed'',''approved'',''rejected'')),manufacturer_identifier_kindtextcheck(manufacturer_identifier_kindisnullormanufacturer_identifier_kindin(''manufacturer_part_number'',''manufacturer_model_number'',''sku'')),manufacturer_identifiertext,normalized_manufacturer_identifiertext,identity_source_urltext,identity_source_titletext,identity_evidence_texttext,identity_evidence_kindtextnotnulldefault''unreviewed''check(identity_evidence_kindin(''authoritative_reference'',''listing_only'',''unreviewed'')),identity_confidencetextcheck(identity_confidenceisnulloridentity_confidencein(''very_high'',''high'',''medium'',''low'')),catalog_reviewed_attext,introduced_yearinteger,discontinued_yearinteger,estimated_unit_value_usdreal,value_basistextnotnulldefault''unreviewed''check(value_basisin(''installed_contribution'',''replacement_cost'',''unreviewed'')),replacement_cost_usdreal,value_reference_yearinteger,value_sourcetext,valuation_scopetextnotnulldefault''unit''check(valuation_scopein(''unit'',''integrated_suite'')),created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,check((manufacturer_identifier_kindisnullandmanufacturer_identifierisnullandnormalized_manufacturer_identifierisnull)or(manufacturer_identifier_kindisnotnullandmanufacturer_identifierisnotnullandlength(trim(manufacturer_identifier))>0andnormalized_manufacturer_identifierisnotnullandlength(trim(normalized_manufacturer_identifier))>0)),check(catalog_status=''unreviewed''or(catalog_reviewed_atisnotnullandlength(trim(catalog_reviewed_at))>0)),check(catalog_status<>''approved''or(length(trim(name))>0andlength(trim(normalized_name))>0andlower(trim(normalized_name))notin(''unknown'',''generic'',''standard'',''factory'',''oem'',''various'',''multiple'',''avionics'',''avionicssuite'',''integratedavionics'',''integratedavionicssuite'',''glasspanel'',''flightinstruments'',''standardflightinstruments'',''standardvfravionics'',''standardifravionics'',''radio'',''radios'',''navcom'',''navigationsystem'',''gps'',''autopilot'',''transponder'',''adsb'',''weatherradar'',''audiopanel'',''display'',''equipment'')andinstr(''''||lower(trim(normalized_name))||'''',''series'')=0andinstr(''''||lower(trim(normalized_name))||'''',''family'')=0andmanufacturer_identifier_kindisnotnullandmanufacturer_identifierisnotnullandlength(trim(manufacturer_identifier))>0andnormalized_manufacturer_identifierisnotnullandlength(trim(normalized_manufacturer_identifier))>0andidentity_source_urlisnotnullandlength(trim(identity_source_url))>0andidentity_source_titleisnotnullandlength(trim(identity_source_title))>0andidentity_evidence_textisnotnullandlength(trim(identity_evidence_text))>0andidentity_evidence_kind=''authoritative_reference''andidentity_confidence=''very_high''andcatalog_reviewed_atisnotnullandlength(trim(catalog_reviewed_at))>0andlower(identity_source_url)notlike''%/listing/%''andlower(identity_source_url)notlike''%/listings/%''andlower(identity_source_url)notlike''%/aircraft-for-sale/%''andlower(identity_source_url)notlike''%/classifieds/%'')),check(value_basis<>''installed_contribution''or(estimated_unit_value_usd>=0andreplacement_cost_usd>=estimated_unit_value_usdandvalue_reference_yearbetween1900and2200andvalue_sourceisnotnullandlength(trim(value_source))>0)))'),
+('table:listing_verification_run_items', 'createtablelisting_verification_run_items(idintegerprimarykeyautoincrement,run_idintegernotnullreferenceslisting_verification_runs(id)ondeletecascade,listing_idintegernotnullreferencesaircraft_sale_listings(id)ondeletecascade,positionintegernotnullcheck(position>=0),statustextnotnulldefault''queued''constraintlisting_verification_run_items_status_checkcheck(statusin(''queued'',''running'',''verified'',''pending_review'',''blocked'',''failed'',''cancelled'')),attempt_countintegernotnulldefault0check(attempt_count>=0),lease_tokentext,lease_expires_at_epoch_secondsinteger,outcome_jsontext,reason_codetext,reasontext,created_attextnotnulldefaultcurrent_timestamp,updated_attextnotnulldefaultcurrent_timestamp,started_attext,completed_attext,unique(run_id,position),unique(run_id,listing_id),check(lease_tokenisnullorlength(trim(lease_token))between1and200),check((status=''running''andlease_tokenisnotnullandlease_expires_at_epoch_secondsisnotnullandstarted_atisnotnullandcompleted_atisnull)or(status<>''running''andlease_tokenisnullandlease_expires_at_epoch_secondsisnull)),constraintlisting_verification_run_items_completion_checkcheck((statusin(''queued'',''running'')andcompleted_atisnull)or(statusin(''verified'',''pending_review'',''blocked'',''failed'',''cancelled'')andcompleted_atisnotnull)),check(outcome_jsonisnullor(length(outcome_json)between2and65536andjson_valid(outcome_json)andjson_type(outcome_json)=''object'')),constraintlisting_verification_run_items_outcome_required_checkcheck(statusnotin(''verified'',''pending_review'',''blocked'')oroutcome_jsonisnotnull),check(reason_codeisnullorlength(trim(reason_code))between1and100),check(reasonisnullorlength(trim(reason))between1and2000))'),
+('table:official_dollar_normalization_facts', 'createtableofficial_dollar_normalization_facts(idintegerprimarykeyautoincrement,source_yearintegernotnullcheck(source_yearbetween1900and2200),target_yearintegernotnullcheck(target_yearbetween1900and2200),index_seriestextnotnullcheck(length(trim(index_series))>0),source_index_valuerealnotnullcheck(source_index_value>0),target_index_valuerealnotnullcheck(target_index_value>0),normalization_factorrealnotnullcheck(normalization_factor>0),evidence_claim_idintegernotnulluniquereferencescuration_evidence_claims(id)ondeleterestrict,created_attextnotnulldefaultcurrent_timestamp,unique(source_year,target_year),check(source_year<>target_year),check(abs(normalization_factor-(target_index_value/source_index_value))<=0.000000001))'),
+('table:plugin_submissions', 'createtableplugin_submissions(idintegerprimarykeyautoincrement,user_idintegernotnullreferencesusers(id),plugin_install_idintegernotnullreferencesplugin_installs(id),source_urltextnotnull,submitted_attextnotnulldefaultcurrent_timestamp,rendered_htmltextnotnull,rendered_html_sha256textnotnull,signature_base64textnotnull,extracted_listing_jsontext,extraction_errortext,canonical_listing_idintegerreferencesaircraft_sale_listings(id)ondeletesetnull)'),
+('trigger:aircraft_aliases_require_approval_designation', 'createtriggeraircraft_aliases_require_approval_designationbeforeinsertonaircraft_designation_aliaseswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''alias''andclaim.validation_status=''validated'')beginselectraise(abort,''aircraftaliasrequiresanapprovedevidence-backeddecision'');end'),
+('trigger:aircraft_aliases_require_approval_family', 'createtriggeraircraft_aliases_require_approval_familybeforeinsertonaircraft_family_aliaseswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''alias''andclaim.validation_status=''validated'')beginselectraise(abort,''aircraftaliasrequiresanapprovedevidence-backeddecision'');end'),
+('trigger:aircraft_aliases_require_approval_make', 'createtriggeraircraft_aliases_require_approval_makebeforeinsertonaircraft_make_aliaseswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''alias''andclaim.validation_status=''validated'')beginselectraise(abort,''aircraftaliasrequiresanapprovedevidence-backeddecision'');end'),
+('trigger:aircraft_designations_require_approval', 'createtriggeraircraft_designations_require_approvalbeforeinsertonaircraft_designationswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''designation''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''aircraftdesignationrequiresanapprovedprimary-sourcedecision'');end'),
+('trigger:aircraft_engine_catalog_models_immutable_delete', 'createtriggeraircraft_engine_catalog_models_immutable_deletebeforedeleteonaircraft_engine_catalog_modelsbeginselectraise(abort,''approvedenginecatalogmodelsareimmutable'');end'),
+('trigger:aircraft_engine_catalog_models_immutable_update', 'createtriggeraircraft_engine_catalog_models_immutable_updatebeforeupdateonaircraft_engine_catalog_modelsbeginselectraise(abort,''approvedenginecatalogmodelsareimmutable'');end'),
+('trigger:aircraft_engine_catalog_models_require_approval', 'createtriggeraircraft_engine_catalog_models_require_approvalbeforeinsertonaircraft_engine_catalog_modelswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdecision_claimondecision_claim.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=decision_claim.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''engine_model''anddecision_claim.evidence_claim_id=new.identity_evidence_claim_idanddecision_claim.evidence_rolein(''identity'',''specification'')andclaim.claim_kindin(''identity'',''specification'')andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''enginecatalogmodelrequiresanapprovedprimary-sourceidentifier'');end'),
+('trigger:aircraft_families_require_approval', 'createtriggeraircraft_families_require_approvalbeforeinsertonaircraft_model_familieswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''family''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''aircraftfamilyrequiresanapprovedprimary-sourcedecision'');end'),
+('trigger:aircraft_family_retrieval_key_validate_insert', 'createtriggeraircraft_family_retrieval_key_validate_insertbeforeinsertonaircraft_model_familiesbeginselectraise(abort,''aircraftfamilyrequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_family_retrieval_key_validate_update', 'createtriggeraircraft_family_retrieval_key_validate_updatebeforeupdateofname,normalized_nameonaircraft_model_familiesbeginselectraise(abort,''aircraftfamilyrequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_feature_definitions_require_approval', 'createtriggeraircraft_feature_definitions_require_approvalbeforeinsertonaircraft_feature_definitionswhennotexists(select1fromaircraft_identity_decisionswhereid=new.approval_decision_idanddecision_status=''approved''anddecision_action=''approve_new''andentity_kind=''feature_definition'')beginselectraise(abort,''featuredefinitionrequiresanapproveddecision'');end'),
+('trigger:aircraft_generation_designations_require_approval', 'createtriggeraircraft_generation_designations_require_approvalbeforeinsertonaircraft_generation_designationswhennotexists(select1fromaircraft_identity_decisionswhereid=new.approval_decision_idanddecision_status=''approved''anddecision_action=''approve_new''andentity_kind=''generation_designation'')ornotexists(select1fromaircraft_generationsgenerationjoinaircraft_designationsdesignationondesignation.id=new.aircraft_designation_idwheregeneration.id=new.aircraft_generation_idandgeneration.aircraft_model_family_id=designation.aircraft_model_family_id)beginselectraise(abort,''generation/designationlinkrequiresapprovalwithinonefamily'');end'),
+('trigger:aircraft_generation_retrieval_key_validate_insert', 'createtriggeraircraft_generation_retrieval_key_validate_insertbeforeinsertonaircraft_generationsbeginselectraise(abort,''aircraftgenerationrequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_generation_retrieval_key_validate_update', 'createtriggeraircraft_generation_retrieval_key_validate_updatebeforeupdateofname,normalized_nameonaircraft_generationsbeginselectraise(abort,''aircraftgenerationrequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_generations_require_approval', 'createtriggeraircraft_generations_require_approvalbeforeinsertonaircraft_generationswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''generation''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''aircraftgenerationrequiresanapprovedprimary-sourcedecision'');end'),
+('trigger:aircraft_identifiers_require_approval', 'createtriggeraircraft_identifiers_require_approvalbeforeinsertonaircraft_designation_identifierswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''identifier''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''aircraftidentifierrequiresanapprovedprimary-sourcedecision'');end'),
+('trigger:aircraft_make_alias_identity_collision', 'createtriggeraircraft_make_alias_identity_collisionbeforeinsertonaircraft_make_aliaseswhenexists(select1fromaircraft_make_aliasesexisting_aliasleftjoinaircraft_marketsexisting_marketonexisting_market.id=existing_alias.aircraft_market_idleftjoinaircraft_marketsnew_marketonnew_market.id=new.aircraft_market_idwhereexisting_alias.aircraft_make_id<>new.aircraft_make_idandexisting_alias.normalized_alias=new.normalized_aliasand(existing_alias.valid_to_model_yearisnullornew.valid_from_model_yearisnullorexisting_alias.valid_to_model_year>=new.valid_from_model_year)and(new.valid_to_model_yearisnullorexisting_alias.valid_from_model_yearisnullornew.valid_to_model_year>=existing_alias.valid_from_model_year)and(existing_alias.aircraft_market_idisnullornew.aircraft_market_idisnullorexisting_alias.aircraft_market_id=new.aircraft_market_idorexisting_market.code=''global''ornew_market.code=''global''))orexists(select1fromaircraft_makesother_makewhereother_make.id<>new.aircraft_make_idand(other_make.normalized_name=new.normalized_aliasorlower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(other_make.name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))=replace(new.normalized_alias,'''','''')))beginselectraise(abort,''aircraftmakealiasoverlapsanothercanonicalmakeinmarket/yearscope'');end'),
+('trigger:aircraft_make_alias_identity_immutable_delete', 'createtriggeraircraft_make_alias_identity_immutable_deletebeforedeleteonaircraft_make_aliasesbeginselectraise(abort,''approvedaircraftmakealiasesareimmutable'');end'),
+('trigger:aircraft_make_alias_identity_immutable_update', 'createtriggeraircraft_make_alias_identity_immutable_updatebeforeupdateonaircraft_make_aliasesbeginselectraise(abort,''approvedaircraftmakealiasesareimmutable'');end'),
+('trigger:aircraft_make_alias_identity_key_validate', 'createtriggeraircraft_make_alias_identity_key_validatebeforeinsertonaircraft_make_aliaseswhennew.normalized_alias=''''ornew.normalized_alias<>trim(new.normalized_alias)ornew.normalized_alias<>lower(new.normalized_alias)ornew.normalized_aliasglob''*[^a-z0-9]*''orinstr(new.normalized_alias,'''')>0orreplace(new.normalized_alias,'''','''')<>lower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(new.alias),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))beginselectraise(abort,''aircraftmakealiasrequiresitsdeterministicnormalizedretrievalkey'');end'),
+('trigger:aircraft_make_alias_tcds_lineage_collision', 'createtriggeraircraft_make_alias_tcds_lineage_collisionbeforeinsertonaircraft_make_aliaseswhenexists(select1fromaircraft_tcds_make_lineage_bindingsbindingwherebinding.aircraft_make_id<>new.aircraft_make_idandlower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(new.alias),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))=lower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(binding.faa_manufacturer_name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'','''')))beginselectraise(abort,''aircraftmakealiascollideswithanapprovedfaa/tcdslineagelabel'');end'),
+('trigger:aircraft_make_identity_alias_collision_insert', 'createtriggeraircraft_make_identity_alias_collision_insertbeforeinsertonaircraft_makeswhenexists(select1fromaircraft_make_aliasesaliaswherelower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(new.name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))=replace(alias.normalized_alias,'''',''''))beginselectraise(abort,''canonicalaircraftmakecollideswithanapprovedalias'');end'),
+('trigger:aircraft_make_identity_alias_collision_update', 'createtriggeraircraft_make_identity_alias_collision_updatebeforeupdateofname,normalized_nameonaircraft_makeswhenexists(select1fromaircraft_make_aliasesaliaswherealias.aircraft_make_id<>old.idandlower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(new.name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))=replace(alias.normalized_alias,'''',''''))beginselectraise(abort,''canonicalaircraftmakecollideswithanapprovedalias'');end'),
+('trigger:aircraft_make_retrieval_key_validate_insert', 'createtriggeraircraft_make_retrieval_key_validate_insertbeforeinsertonaircraft_makesbeginselectraise(abort,''aircraftmakerequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_make_retrieval_key_validate_update', 'createtriggeraircraft_make_retrieval_key_validate_updatebeforeupdateofname,normalized_nameonaircraft_makesbeginselectraise(abort,''aircraftmakerequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_make_tcds_lineage_collision_insert', 'createtriggeraircraft_make_tcds_lineage_collision_insertbeforeinsertonaircraft_makeswhenexists(select1fromaircraft_tcds_make_lineage_bindingsbindingwherelower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(new.name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))=lower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(binding.faa_manufacturer_name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'','''')))beginselectraise(abort,''canonicalaircraftmakecollideswithanapprovedfaa/tcdslineagelabel'');end'),
+('trigger:aircraft_make_tcds_lineage_collision_update', 'createtriggeraircraft_make_tcds_lineage_collision_updatebeforeupdateofname,normalized_nameonaircraft_makeswhenexists(select1fromaircraft_tcds_make_lineage_bindingsbindingwherebinding.aircraft_make_id<>old.idandlower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(new.name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'',''''))=lower(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(trim(binding.faa_manufacturer_name),'''',''''),''-'',''''),''.'',''''),''/'',''''),''_'',''''),'','',''''),''&'',''''),char(39),''''),''('',''''),'')'','''')))beginselectraise(abort,''canonicalaircraftmakecollideswithanapprovedfaa/tcdslineagelabel'');end'),
+('trigger:aircraft_makes_require_approval', 'createtriggeraircraft_makes_require_approvalbeforeinsertonaircraft_makeswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdecision_claimondecision_claim.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=decision_claim.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''make''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''aircraftmakerequiresanapprovedprimary-sourcedecision'');end'),
+('trigger:aircraft_package_applicability_require_approval', 'createtriggeraircraft_package_applicability_require_approvalbeforeinsertonaircraft_package_applicabilitywhennotexists(select1fromaircraft_identity_decisionswhereid=new.approval_decision_idanddecision_status=''approved''anddecision_action=''approve_new''andentity_kind=''package_applicability'')ornotexists(select1fromaircraft_factory_packagespackagejoinaircraft_designationsdesignationondesignation.id=new.aircraft_designation_idleftjoinaircraft_generationsgenerationongeneration.id=new.aircraft_generation_idwherepackage.id=new.aircraft_factory_package_idandpackage.aircraft_model_family_id=designation.aircraft_model_family_idand(new.aircraft_generation_idisnullorgeneration.aircraft_model_family_id=designation.aircraft_model_family_id))beginselectraise(abort,''packageapplicabilityrequiresapprovalwithinonefamily'');end'),
+('trigger:aircraft_package_retrieval_key_validate_insert', 'createtriggeraircraft_package_retrieval_key_validate_insertbeforeinsertonaircraft_factory_packagesbeginselectraise(abort,''aircraftpackagerequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_package_retrieval_key_validate_update', 'createtriggeraircraft_package_retrieval_key_validate_updatebeforeupdateofname,normalized_nameonaircraft_factory_packagesbeginselectraise(abort,''aircraftpackagerequiresitsdeterministicretrievalkey'')wherenew.normalized_name<>(withrecursivenormalized(character_offset,normalized_name)as(values(1,'''')unionallselectcharacter_offset+1,casewhensubstr(new.name,character_offset,1)glob''[a-za-z0-9]''thennormalized_name||lower(substr(new.name,character_offset,1))whennormalized_name<>''''andsubstr(normalized_name,-1,1)<>''''thennormalized_name||''''elsenormalized_nameendfromnormalizedwherecharacter_offset<=length(new.name))selectrtrim(normalized_name)fromnormalizedwherecharacter_offset>length(new.name));end'),
+('trigger:aircraft_packages_require_approval', 'createtriggeraircraft_packages_require_approvalbeforeinsertonaircraft_factory_packageswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''package''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''aircraftpackagerequiresanapprovedprimary-sourcedecision'');end'),
+('trigger:aircraft_propeller_catalog_models_immutable_delete', 'createtriggeraircraft_propeller_catalog_models_immutable_deletebeforedeleteonaircraft_propeller_catalog_modelsbeginselectraise(abort,''approvedpropellercatalogmodelsareimmutable'');end'),
+('trigger:aircraft_propeller_catalog_models_immutable_update', 'createtriggeraircraft_propeller_catalog_models_immutable_updatebeforeupdateonaircraft_propeller_catalog_modelsbeginselectraise(abort,''approvedpropellercatalogmodelsareimmutable'');end'),
+('trigger:aircraft_propeller_catalog_models_require_approval', 'createtriggeraircraft_propeller_catalog_models_require_approvalbeforeinsertonaircraft_propeller_catalog_modelswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdecision_claimondecision_claim.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=decision_claim.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''propeller_model''anddecision_claim.evidence_claim_id=new.identity_evidence_claim_idanddecision_claim.evidence_rolein(''identity'',''specification'')andclaim.claim_kindin(''identity'',''specification'')andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))beginselectraise(abort,''propellercatalogmodelrequiresanapprovedprimary-sourceidentifier'');end'),
+('trigger:aircraft_reference_avionics_building_insert', 'createtriggeraircraft_reference_avionics_building_insertbeforeinsertonaircraft_reference_avionicswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')ornotexists(select1fromavionics_modelsmodelwheremodel.id=new.avionics_model_idandmodel.catalog_status=''approved'')beginselectraise(abort,''referenceavionicsrequiresabuildingversionandapprovedproduct'');end'),
+('trigger:aircraft_reference_avionics_immutable_delete', 'createtriggeraircraft_reference_avionics_immutable_deletebeforedeleteonaircraft_reference_avionicswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_avionics_immutable_update', 'createtriggeraircraft_reference_avionics_immutable_updatebeforeupdateonaircraft_reference_avionicswhennot(new.id=old.idandnew.aircraft_reference_configuration_version_id=old.aircraft_reference_configuration_version_idandnew.avionics_model_idisnotold.avionics_model_idandnew.quantity=old.quantityandnew.equipment_role=old.equipment_roleandnew.evidence_claim_id=old.evidence_claim_idandnew.created_at=old.created_atandexists(select1fromavionics_catalog_authorized_consolidationsguardjoinavionics_modelssurvivoronsurvivor.id=guard.survivor_model_idjoinavionics_modelslegacyonlegacy.id=old.avionics_model_idwhereguard.duplicate_model_id=old.avionics_model_idandguard.survivor_model_id=new.avionics_model_id))beginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_configurations_require_approval', 'createtriggeraircraft_reference_configurations_require_approvalbeforeinsertonaircraft_reference_configurationswhennotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''reference_configuration''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))or(new.aircraft_generation_idisnotnullandnotexists(select1fromaircraft_generation_designationslinkwherelink.aircraft_generation_id=new.aircraft_generation_idandlink.aircraft_designation_id=new.aircraft_designation_id))or(new.tier_package_idisnotnullandnotexists(select1fromaircraft_factory_packagespackagejoinaircraft_package_applicabilityapplicabilityonapplicability.aircraft_factory_package_id=package.idwherepackage.id=new.tier_package_idandpackage.package_kind=''trim_tier''andapplicability.aircraft_designation_id=new.aircraft_designation_idand(applicability.aircraft_generation_idisnullorapplicability.aircraft_generation_id=new.aircraft_generation_id)))beginselectraise(abort,''referenceconfigurationrequiresapprovedapplicableidentitydimensions'');end'),
+('trigger:aircraft_reference_engines_building_insert', 'createtriggeraircraft_reference_engines_building_insertbeforeinsertonaircraft_reference_engineswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')ornotexists(select1fromaircraft_engine_catalog_modelsmodelwheremodel.id=new.aircraft_engine_catalog_model_idandmodel.catalog_status=''approved'')beginselectraise(abort,''referenceenginerequiresabuildingversionandapprovedcatalogmodel'');end'),
+('trigger:aircraft_reference_engines_immutable_delete', 'createtriggeraircraft_reference_engines_immutable_deletebeforedeleteonaircraft_reference_engineswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_engines_immutable_update', 'createtriggeraircraft_reference_engines_immutable_updatebeforeupdateonaircraft_reference_enginesbeginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_fact_set_building_insert', 'createtriggeraircraft_reference_fact_set_building_insertbeforeinsertonaircraft_reference_fact_set_attestationswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')beginselectraise(abort,''referencefact-setattestationrequiresabuildingversion'');end'),
+('trigger:aircraft_reference_fact_set_immutable_delete', 'createtriggeraircraft_reference_fact_set_immutable_deletebeforedeleteonaircraft_reference_fact_set_attestationswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_fact_set_immutable_update', 'createtriggeraircraft_reference_fact_set_immutable_updatebeforeupdateonaircraft_reference_fact_set_attestationsbeginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_features_building_insert', 'createtriggeraircraft_reference_features_building_insertbeforeinsertonaircraft_reference_featureswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')ornotexists(select1fromaircraft_feature_definitionsdefinitionwheredefinition.id=new.aircraft_feature_definition_idand((definition.value_type=''boolean''andnew.boolean_valueisnotnull)or(definition.value_type=''number''andnew.number_valueisnotnull)or(definition.value_type=''text''andnew.text_valueisnotnull)))beginselectraise(abort,''referencefeaturevaluedoesnotmatchitsdefinition'');end'),
+('trigger:aircraft_reference_features_immutable_delete', 'createtriggeraircraft_reference_features_immutable_deletebeforedeleteonaircraft_reference_featureswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_features_immutable_update', 'createtriggeraircraft_reference_features_immutable_updatebeforeupdateonaircraft_reference_featuresbeginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_price_building_insert', 'createtriggeraircraft_reference_price_building_insertbeforeinsertonaircraft_reference_priceswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')beginselectraise(abort,''referencepricerequiresabuildingversion'');end'),
+('trigger:aircraft_reference_price_immutable_delete', 'createtriggeraircraft_reference_price_immutable_deletebeforedeleteonaircraft_reference_priceswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_price_immutable_update', 'createtriggeraircraft_reference_price_immutable_updatebeforeupdateonaircraft_reference_pricesbeginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_propellers_building_insert', 'createtriggeraircraft_reference_propellers_building_insertbeforeinsertonaircraft_reference_propellerswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')ornotexists(select1fromaircraft_propeller_catalog_modelsmodelwheremodel.id=new.aircraft_propeller_catalog_model_idandmodel.catalog_status=''approved'')beginselectraise(abort,''referencepropellerrequiresabuildingversionandapprovedcatalogmodel'');end'),
+('trigger:aircraft_reference_propellers_immutable_delete', 'createtriggeraircraft_reference_propellers_immutable_deletebeforedeleteonaircraft_reference_propellerswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_propellers_immutable_update', 'createtriggeraircraft_reference_propellers_immutable_updatebeforeupdateonaircraft_reference_propellersbeginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_scope_building_insert', 'createtriggeraircraft_reference_scope_building_insertbeforeinsertonaircraft_reference_applicability_scopeswhennotexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=new.aircraft_reference_configuration_version_idandversion.publication_state=''building'')beginselectraise(abort,''referenceprofilechildrenrequireabuildingversion'');end'),
+('trigger:aircraft_reference_scope_canonical_insert', 'createtriggeraircraft_reference_scope_canonical_insertbeforeinsertonaircraft_reference_applicability_scopeswhennew.applies_to_all_serials=0and(new.serial_from_sort_key<>upper(new.serial_from_sort_key)ornew.serial_to_sort_key<>upper(new.serial_to_sort_key)ornew.serial_from_sort_keyglob''*[^a-f0-9]*''ornew.serial_to_sort_keyglob''*[^a-f0-9]*''orsubstr(new.serial_from_sort_key,1,2)<>''01''orsubstr(new.serial_to_sort_key,1,2)<>''01''orsubstr(new.serial_from_sort_key,-2)<>''00''orsubstr(new.serial_to_sort_key,-2)<>''00''ornew.serial_from_sort_keycollatebinary>new.serial_to_sort_keycollatebinaryornotexists(select1fromaircraft_serial_number_schemesschemewherescheme.id=new.aircraft_serial_number_scheme_idandscheme.normalization_version=''natural_alphanumeric_segments_v1'')or(new.serial_prefixisnotnulland(new.serial_prefix<>upper(new.serial_prefix)ornew.serial_prefixglob''*[^a-z0-9]*''orsubstr(new.serial_from_display,1,length(new.serial_prefix))<>new.serial_prefixorsubstr(new.serial_to_display,1,length(new.serial_prefix))<>new.serial_prefix)))beginselectraise(abort,''referenceserialapplicabilityrequirestheuniversalnatural-orderkey'');end'),
+('trigger:aircraft_reference_scope_immutable_delete', 'createtriggeraircraft_reference_scope_immutable_deletebeforedeleteonaircraft_reference_applicability_scopeswhenexists(select1fromaircraft_reference_configuration_versionsversionwhereversion.id=old.aircraft_reference_configuration_version_idandversion.publication_state<>''building'')beginselectraise(abort,''publishedreferenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_scope_immutable_update', 'createtriggeraircraft_reference_scope_immutable_updatebeforeupdateonaircraft_reference_applicability_scopesbeginselectraise(abort,''referenceprofilefactsareimmutable'');end'),
+('trigger:aircraft_reference_scope_key_recompute_insert', 'createtriggeraircraft_reference_scope_key_recompute_insertafterinsertonaircraft_reference_applicability_scopeswhenexists(select1fromaircraft_reference_serial_key_errorserrorwhereerror.scope_id=new.id)beginselectraise(abort,''referenceserialsortkeysmustberecomputedfromcanonicaldisplayvalues'');end'),
+('trigger:aircraft_reference_versions_immutable', 'createtriggeraircraft_reference_versions_immutablebeforeupdateonaircraft_reference_configuration_versionswhenold.publication_statein(''published'',''superseded'')andnot(old.publication_state=''published''andnew.publication_state=''superseded''andnew.superseded_atisnotnullandnew.id=old.idandnew.aircraft_reference_configuration_id=old.aircraft_reference_configuration_idandnew.model_year=old.model_yearandnew.revision=old.revisionandnew.approval_decision_id=old.approval_decision_idandnew.published_at=old.published_atandnew.supersedes_version_idisold.supersedes_version_id)beginselectraise(abort,''publishedreferenceprofileversionsareimmutable'');end'),
+('trigger:aircraft_reference_versions_publish', 'createtriggeraircraft_reference_versions_publishbeforeupdateofpublication_stateonaircraft_reference_configuration_versionswhennew.publication_state=''published''beginselectraise(abort,''onlyabuildingreferenceprofilecanbepublished'')whereold.publication_state<>''building'';selectraise(abort,''publishedreferenceprofilerequirespublished_at'')wherenew.published_atisnull;selectraise(abort,''publishedreferenceprofilerequiresapplicability'')wherenotexists(select1fromaircraft_reference_applicability_scopesscopewherescope.aircraft_reference_configuration_version_id=new.id);selectraise(abort,''publishedreferenceprofilerequirescompletefactoryfact-setattestations'')where4<>(selectcount(*)fromaircraft_reference_fact_set_attestationsattestationwhereattestation.aircraft_reference_configuration_version_id=new.id);selectraise(abort,''publishedreferenceprofilerequiresexactlyonedirectexact-model-yearfull-configurationequippedmsrpwithprimarypriceevidence'')where1<>(selectcount(*)fromaircraft_reference_pricespricejoincuration_evidence_claimsclaimonclaim.id=price.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwhereprice.aircraft_reference_configuration_version_id=new.idandprice.currency=''usd''andprice.price_kind=''equipped_msrp''andprice.evidence_kind=''direct_model_year''andprice.configuration_basis=''full_standard_configuration''andclaim.claim_kind=''price''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''));selectraise(abort,''publishedreferenceprofilerequiresapprovedenginecatalogmodels'')whereexists(select1fromaircraft_reference_enginesengineleftjoinaircraft_engine_catalog_modelsmodelonmodel.id=engine.aircraft_engine_catalog_model_idandmodel.catalog_status=''approved''whereengine.aircraft_reference_configuration_version_id=new.idandmodel.idisnull);selectraise(abort,''publishedreferenceprofilerequiresapprovedpropellercatalogmodels'')whereexists(select1fromaircraft_reference_propellerspropellerleftjoinaircraft_propeller_catalog_modelsmodelonmodel.id=propeller.aircraft_propeller_catalog_model_idandmodel.catalog_status=''approved''wherepropeller.aircraft_reference_configuration_version_id=new.idandmodel.idisnull);selectraise(abort,''publishedreferenceprofilefactsrequirevalidatedprimaryevidence'')whereexists(select1from(selectevidence_claim_id,''applicability''asevidence_domainfromaircraft_reference_applicability_scopeswhereaircraft_reference_configuration_version_id=new.idunionallselectevidence_claim_id,''price''fromaircraft_reference_priceswhereaircraft_reference_configuration_version_id=new.idunionallselectevidence_claim_id,''factory''fromaircraft_reference_avionicswhereaircraft_reference_configuration_version_id=new.idunionallselectevidence_claim_id,''factory''fromaircraft_reference_engineswhereaircraft_reference_configuration_version_id=new.idunionallselectevidence_claim_id,''factory''fromaircraft_reference_propellerswhereaircraft_reference_configuration_version_id=new.idunionallselectevidence_claim_id,''factory''fromaircraft_reference_featureswhereaircraft_reference_configuration_version_id=new.idunionallselectevidence_claim_id,''factory''fromaircraft_reference_fact_set_attestationswhereaircraft_reference_configuration_version_id=new.id)factjoincuration_evidence_claimsclaimonclaim.id=fact.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwhereclaim.validation_status<>''validated''orsource.source_tiernotin(''manufacturer_primary'',''regulator_primary'')or(fact.evidence_domain=''applicability''andclaim.claim_kind<>''applicability'')or(fact.evidence_domain=''price''andclaim.claim_kind<>''price'')or(fact.evidence_domain=''factory''andclaim.claim_kindnotin(''standard_equipment'',''package_composition'',''specification'')));selectraise(abort,''referenceprofilecontainsoverlappingapplicabilityscopes'')whereexists(select1fromaircraft_reference_applicability_scopesleft_scopejoinaircraft_reference_applicability_scopesright_scopeonright_scope.aircraft_reference_configuration_version_id=left_scope.aircraft_reference_configuration_version_idandright_scope.id>left_scope.idandright_scope.aircraft_market_id=left_scope.aircraft_market_idwhereleft_scope.aircraft_reference_configuration_version_id=new.idand(left_scope.applies_to_all_serials=1orright_scope.applies_to_all_serials=1or(left_scope.serial_from_sort_keycollatebinary<=right_scope.serial_to_sort_keycollatebinaryandright_scope.serial_from_sort_keycollatebinary<=left_scope.serial_to_sort_keycollatebinary)));selectraise(abort,''publishedreferenceprofileapplicabilityoverlapsanexistingversion'')whereexists(select1fromaircraft_reference_applicability_scopescandidatejoinaircraft_marketscandidate_marketoncandidate_market.id=candidate.aircraft_market_idjoinaircraft_reference_applicability_scopesexistingonexisting.aircraft_market_id=candidate.aircraft_market_idorcandidate_market.code=''global''orexists(select1fromaircraft_marketsexisting_marketwhereexisting_market.id=existing.aircraft_market_idandexisting_market.code=''global'')joinaircraft_reference_configuration_versionsexisting_versiononexisting_version.id=existing.aircraft_reference_configuration_version_idwherecandidate.aircraft_reference_configuration_version_id=new.idandexisting_version.id<>new.idandexisting_version.aircraft_reference_configuration_id=new.aircraft_reference_configuration_idandexisting_version.model_year=new.model_yearandexisting_version.publication_state=''published''and(candidate.applies_to_all_serials=1orexisting.applies_to_all_serials=1or(candidate.serial_from_sort_keycollatebinary<=existing.serial_to_sort_keycollatebinaryandexisting.serial_from_sort_keycollatebinary<=candidate.serial_to_sort_keycollatebinary)));end'),
+('trigger:aircraft_reference_versions_require_approval', 'createtriggeraircraft_reference_versions_require_approvalbeforeinsertonaircraft_reference_configuration_versionswhennew.publication_state<>''building''ornotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''reference_profile''andclaim.validation_status=''validated''andsource.source_tierin(''manufacturer_primary'',''regulator_primary''))or(new.revision=1)<>(new.supersedes_version_idisnull)or(new.supersedes_version_idisnotnullandnotexists(select1fromaircraft_reference_configuration_versionspreviouswhereprevious.id=new.supersedes_version_idandprevious.aircraft_reference_configuration_id=new.aircraft_reference_configuration_idandprevious.model_year=new.model_yearandprevious.revision=new.revision-1andprevious.publication_state=''published''))beginselectraise(abort,''referenceprofilerequiresbuildingstate,approvedevidence,anditsexactpredecessor'');end'),
+('trigger:aircraft_serial_schemes_preserve_ordering', 'createtriggeraircraft_serial_schemes_preserve_orderingbeforeupdateofnormalization_versiononaircraft_serial_number_schemeswhennew.normalization_version<>''natural_alphanumeric_segments_v1''beginselectraise(abort,''serialschemeorderingversionisimmutable'');end'),
+('trigger:aircraft_serial_schemes_require_approval', 'createtriggeraircraft_serial_schemes_require_approvalbeforeinsertonaircraft_serial_number_schemeswhennew.normalization_version<>''natural_alphanumeric_segments_v1''ornotexists(select1fromaircraft_identity_decisionsdecisionjoinaircraft_identity_decision_claimsdcondc.decision_id=decision.idjoincuration_evidence_claimsclaimonclaim.id=dc.evidence_claim_idwheredecision.id=new.approval_decision_idanddecision.decision_status=''approved''anddecision.decision_action=''approve_new''anddecision.entity_kind=''serial_scheme''andclaim.validation_status=''validated'')beginselectraise(abort,''serialschemerequirestheuniversalorderingandanapprovedevidence-backeddecision'');end'),
+('trigger:aircraft_valuation_projection_immutable_delete', 'createtriggeraircraft_valuation_projection_immutable_deletebeforedeleteonaircraft_valuation_compatibility_projectionsbeginselectraise(abort,''aircraftcompatibilityprojectionsareimmutable'');end'),
+('trigger:aircraft_valuation_projection_immutable_update', 'createtriggeraircraft_valuation_projection_immutable_updatebeforeupdateonaircraft_valuation_compatibility_projectionsbeginselectraise(abort,''aircraftcompatibilityprojectionsareimmutable'');end'),
+('trigger:aircraft_valuation_projection_validate_insert', 'createtriggeraircraft_valuation_projection_validate_insertbeforeinsertonaircraft_valuation_compatibility_projectionswhennotexists(select1fromaircraft_valuation_projection_transitionstransitionjoinaircraft_sale_listing_identity_assignmentsassignmentonassignment.id=transition.identity_assignment_idandassignment.aircraft_sale_listing_id=transition.aircraft_sale_listing_idjoinaircraft_makesmakeonmake.id=assignment.aircraft_make_idjoinaircraft_model_familiesfamilyonfamily.id=assignment.aircraft_model_family_idandfamily.aircraft_make_id=make.idjoinaircraft_designationsdesignationondesignation.id=assignment.aircraft_designation_idanddesignation.aircraft_model_family_id=family.idleftjoinaircraft_generationsgenerationongeneration.id=assignment.aircraft_generation_idandgeneration.aircraft_model_family_id=family.idleftjoinaircraft_factory_packagespackageonpackage.id=assignment.aircraft_factory_package_idandpackage.aircraft_model_family_id=family.idjoinaircraft_model_variantslegacy_variantonlegacy_variant.id=new.aircraft_model_variant_idjoinaircraft_modelslegacy_modelonlegacy_model.id=legacy_variant.aircraft_model_idjoinaircraft_manufacturerslegacy_manufactureronlegacy_manufacturer.id=legacy_model.aircraft_manufacturer_idwhereassignment.aircraft_make_id=new.aircraft_make_idandassignment.aircraft_model_family_id=new.aircraft_model_family_idandassignment.aircraft_designation_id=new.aircraft_designation_idandassignment.aircraft_generation_idisnew.aircraft_generation_idandassignment.aircraft_factory_package_idisnew.aircraft_factory_package_idandassignment.aircraft_sale_listing_id=new.created_from_aircraft_sale_listing_idandassignment.id=new.created_from_identity_assignment_idandassignment.identity_decision_id=new.identity_decision_idandassignment.identity_evidence_claim_id=new.identity_evidence_claim_idandassignment.faa_registry_snapshot_id=new.faa_registry_snapshot_idandassignment.faa_n_number=new.faa_n_numberandassignment.faa_source_record_sha256=new.faa_source_record_sha256andlegacy_manufacturer.name=make.nameandlegacy_manufacturer.normalized_name=''__aircost_projection_make_''||make.id||''__''andlegacy_model.name=family.nameandlegacy_model.normalized_name=''__aircost_projection_family_''||family.id||''__''andlegacy_variant.name=designation.official_designation||casewhengeneration.idisnullthen''''else''/''||generation.nameend||casewhenpackage.idisnullthen''''else''/''||package.nameendandlegacy_variant.normalized_name=''__aircost_projection_identity_''||designation.id||''_''||coalesce(generation.id,0)||''_''||coalesce(package.id,0)||''__''and(assignment.aircraft_generation_idisnullorexists(select1fromaircraft_generation_designationsapplicabilitywhereapplicability.aircraft_generation_id=assignment.aircraft_generation_idandapplicability.aircraft_designation_id=assignment.aircraft_designation_id))and(assignment.aircraft_factory_package_idisnullorexists(select1fromaircraft_package_applicabilityapplicabilitywhereapplicability.aircraft_factory_package_id=assignment.aircraft_factory_package_idandapplicability.aircraft_designation_id=assignment.aircraft_designation_idand(applicability.aircraft_generation_idisnullorapplicability.aircraft_generation_idisassignment.aircraft_generation_id)))andnotexists(select1fromaircraft_sale_listingschildwherechild.aircraft_model_variant_id=legacy_variant.id)andnotexists(select1fromrental_aircraft_offeringschildwherechild.aircraft_model_variant_id=legacy_variant.id))beginselectraise(abort,''aircraftcompatibilityprojectionrequirestheactivecommand,exactcopiedassignmentprovenance,anditsfreshreservedhierarchy'');end'),
+('trigger:assigned_aircraft_designation_immutable_delete', 'createtriggerassigned_aircraft_designation_immutable_deletebeforedeleteonaircraft_designationswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_designation_id=old.id)beginselectraise(abort,''assignedaircraftdesignationsareimmutable'');end'),
+('trigger:assigned_aircraft_designation_immutable_update', 'createtriggerassigned_aircraft_designation_immutable_updatebeforeupdateonaircraft_designationswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_designation_id=old.id)beginselectraise(abort,''assignedaircraftdesignationsareimmutable'');end'),
+('trigger:assigned_aircraft_family_immutable_delete', 'createtriggerassigned_aircraft_family_immutable_deletebeforedeleteonaircraft_model_familieswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_model_family_id=old.id)beginselectraise(abort,''assignedaircraftmodelfamiliesareimmutable'');end'),
+('trigger:assigned_aircraft_family_immutable_update', 'createtriggerassigned_aircraft_family_immutable_updatebeforeupdateonaircraft_model_familieswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_model_family_id=old.id)beginselectraise(abort,''assignedaircraftmodelfamiliesareimmutable'');end'),
+('trigger:assigned_aircraft_generation_immutable_delete', 'createtriggerassigned_aircraft_generation_immutable_deletebeforedeleteonaircraft_generationswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_generation_id=old.id)beginselectraise(abort,''assignedaircraftgenerationsareimmutable'');end'),
+('trigger:assigned_aircraft_generation_immutable_update', 'createtriggerassigned_aircraft_generation_immutable_updatebeforeupdateonaircraft_generationswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_generation_id=old.id)beginselectraise(abort,''assignedaircraftgenerationsareimmutable'');end'),
+('trigger:assigned_aircraft_make_immutable_delete', 'createtriggerassigned_aircraft_make_immutable_deletebeforedeleteonaircraft_makeswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_make_id=old.id)beginselectraise(abort,''assignedaircraftmakesareimmutable'');end'),
+('trigger:assigned_aircraft_make_immutable_update', 'createtriggerassigned_aircraft_make_immutable_updatebeforeupdateonaircraft_makeswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_make_id=old.id)beginselectraise(abort,''assignedaircraftmakesareimmutable'');end'),
+('trigger:assigned_aircraft_package_immutable_delete', 'createtriggerassigned_aircraft_package_immutable_deletebeforedeleteonaircraft_factory_packageswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_factory_package_id=old.id)beginselectraise(abort,''assignedaircraftfactorypackagesareimmutable'');end'),
+('trigger:assigned_aircraft_package_immutable_update', 'createtriggerassigned_aircraft_package_immutable_updatebeforeupdateonaircraft_factory_packageswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_factory_package_id=old.id)beginselectraise(abort,''assignedaircraftfactorypackagesareimmutable'');end'),
+('trigger:assigned_generation_designation_immutable_delete', 'createtriggerassigned_generation_designation_immutable_deletebeforedeleteonaircraft_generation_designationswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_generation_id=old.aircraft_generation_idandassignment.aircraft_designation_id=old.aircraft_designation_id)beginselectraise(abort,''assignedgeneration/designationapplicabilityisimmutable'');end'),
+('trigger:assigned_generation_designation_immutable_update', 'createtriggerassigned_generation_designation_immutable_updatebeforeupdateonaircraft_generation_designationswhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_generation_id=old.aircraft_generation_idandassignment.aircraft_designation_id=old.aircraft_designation_id)beginselectraise(abort,''assignedgeneration/designationapplicabilityisimmutable'');end'),
+('trigger:assigned_generation_dimension_requires_resolution', 'createtriggerassigned_generation_dimension_requires_resolutionbeforeinsertonaircraft_generation_designationswhenexists(select1fromaircraft_sale_listing_current_identity_assignmentscurrent_assignmentjoinaircraft_sale_listing_identity_assignmentsassignmentonassignment.id=current_assignment.identity_assignment_idandassignment.aircraft_sale_listing_id=current_assignment.aircraft_sale_listing_idjoinaircraft_sale_listingslistingonlisting.id=current_assignment.aircraft_sale_listing_idwherelisting.ingestion_state=''ready''andassignment.aircraft_designation_id=new.aircraft_designation_idandassignment.aircraft_generation_idisnull)beginselectraise(abort,''addingagenerationdimensionrequiresresolvingaffectedreadylistingassignmentsfirst'');end'),
+('trigger:assigned_package_applicability_immutable_delete', 'createtriggerassigned_package_applicability_immutable_deletebeforedeleteonaircraft_package_applicabilitywhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_factory_package_id=old.aircraft_factory_package_idandassignment.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorassignment.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''assignedpackageapplicabilityisimmutable'');end'),
+('trigger:assigned_package_applicability_immutable_update', 'createtriggerassigned_package_applicability_immutable_updatebeforeupdateonaircraft_package_applicabilitywhenexists(select1fromaircraft_sale_listing_identity_assignmentsassignmentwhereassignment.aircraft_factory_package_id=old.aircraft_factory_package_idandassignment.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorassignment.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''assignedpackageapplicabilityisimmutable'');end'),
+('trigger:assigned_trim_tier_dimension_requires_resolution', 'createtriggerassigned_trim_tier_dimension_requires_resolutionbeforeinsertonaircraft_package_applicabilitywhenexists(select1fromaircraft_factory_packagespackagecrossjoinaircraft_sale_listing_current_identity_assignmentscurrent_assignmentjoinaircraft_sale_listing_identity_assignmentsassignmentonassignment.id=current_assignment.identity_assignment_idandassignment.aircraft_sale_listing_id=current_assignment.aircraft_sale_listing_idjoinaircraft_sale_listingslistingonlisting.id=current_assignment.aircraft_sale_listing_idwherepackage.id=new.aircraft_factory_package_idandpackage.package_kind=''trim_tier''andlisting.ingestion_state=''ready''andassignment.aircraft_designation_id=new.aircraft_designation_idandassignment.aircraft_factory_package_idisnulland(new.aircraft_generation_idisnullorassignment.aircraft_generation_id=new.aircraft_generation_id)and(new.valid_from_model_yearisnullornew.valid_from_model_year<=listing.model_year)and(new.valid_to_model_yearisnullornew.valid_to_model_year>=listing.model_year))beginselectraise(abort,''addingatrim-tierdimensionrequiresresolvingaffectedreadylistingassignmentsfirst'');end'),
+('trigger:avionics_models_approved_delete_guard', 'createtriggeravionics_models_approved_delete_guardbeforedeleteonavionics_modelswhenold.catalog_status=''approved''andnotexists(select1fromavionics_catalog_authorized_consolidationsauthorizationjoinavionics_modelssurvivoronsurvivor.id=authorization.survivor_model_idwhereauthorization.duplicate_model_id=old.idandsurvivor.catalog_status=''approved'')beginselectraise(abort,''approvedavionicsproductdeletionrequiresexactconsolidationauthorization'');end'),
+('trigger:avionics_models_approved_identity_immutable', 'createtriggeravionics_models_approved_identity_immutablebeforeupdateonavionics_modelswhenold.catalog_status=''approved''and(new.catalog_statusisnotold.catalog_statusornew.avionics_manufacturer_idisnotold.avionics_manufacturer_idornew.nameisnotold.nameornew.normalized_nameisnotold.normalized_nameornew.manufacturer_identifier_kindisnotold.manufacturer_identifier_kindornew.manufacturer_identifierisnotold.manufacturer_identifierornew.normalized_manufacturer_identifierisnotold.normalized_manufacturer_identifier)beginselectraise(abort,''approvedavionicsproductcannotbedemotedorrewritecanonicalidentity'');end'),
+('trigger:avionics_models_approved_types_insert', 'createtriggeravionics_models_approved_types_insertbeforeinsertonavionics_modelswhennew.catalog_status=''approved''beginselectraise(abort,''avionicsapprovalmustbestagedfromanunreviewedproduct'');end'),
+('trigger:avionics_models_approved_types_update', 'createtriggeravionics_models_approved_types_updatebeforeupdateofcatalog_statusonavionics_modelswhennew.catalog_status=''approved''andnotexists(select1fromavionics_model_typesmembershipwheremembership.avionics_model_id=new.id)beginselectraise(abort,''approvedavionicsmodelrequiresatleastonetype'');end'),
+('trigger:avionics_models_canonical_identity_sync_update', 'createtriggeravionics_models_canonical_identity_sync_updateafterupdateofcatalog_status,avionics_manufacturer_id,normalized_name,normalized_manufacturer_identifieronavionics_modelswhennew.catalog_status=''approved''begininsertintoavionics_approved_product_identities(avionics_model_id,avionics_manufacturer_identity_id,canonical_product_key,manufacturer_identifier_kind,canonical_identifier_key)selectnew.id,manufacturer_identity.avionics_manufacturer_identity_id,lower(replace(replace(replace(replace(replace(trim(new.normalized_name),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'','''')),new.manufacturer_identifier_kind,lower(replace(replace(replace(replace(replace(trim(new.normalized_manufacturer_identifier),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'',''''))fromavionics_manufacturer_effective_membershipsmanufacturer_identitywheremanufacturer_identity.avionics_manufacturer_id=new.avionics_manufacturer_idonconflict(avionics_model_id)doupdatesetavionics_manufacturer_identity_id=excluded.avionics_manufacturer_identity_id,canonical_product_key=excluded.canonical_product_key,manufacturer_identifier_kind=excluded.manufacturer_identifier_kind,canonical_identifier_key=excluded.canonical_identifier_key,updated_at=current_timestamp;end'),
+('trigger:avionics_models_canonical_identity_validate_update', 'createtriggeravionics_models_canonical_identity_validate_updatebeforeupdateofcatalog_status,avionics_manufacturer_id,normalized_name,normalized_manufacturer_identifieronavionics_modelswhennew.catalog_status=''approved''and(notexists(select1fromavionics_manufacturer_effective_membershipsmanufacturer_identitywheremanufacturer_identity.avionics_manufacturer_id=new.avionics_manufacturer_id)orlength(lower(replace(replace(replace(replace(replace(trim(new.normalized_name),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'','''')))=0orlength(lower(replace(replace(replace(replace(replace(trim(new.normalized_manufacturer_identifier),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'','''')))=0ornew.nameglob''*[^a-za-z0-9./_-]*''ornew.normalized_nameglob''*[^a-za-z0-9./_-]*''orlower(replace(replace(replace(replace(replace(trim(new.name),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'',''''))<>lower(replace(replace(replace(replace(replace(trim(new.normalized_name),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'',''''))ornew.manufacturer_identifierisnullornew.manufacturer_identifierglob''*[^a-za-z0-9./_-]*''ornew.normalized_manufacturer_identifierglob''*[^a-za-z0-9./_-]*''orlower(replace(replace(replace(replace(replace(trim(new.manufacturer_identifier),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'',''''))<>lower(replace(replace(replace(replace(replace(trim(new.normalized_manufacturer_identifier),'''',''''),''-'',''''),''/'',''''),''.'',''''),''_'','''')))beginselectraise(abort,''approvedavionicsproductrequiresdeterministiccanonicalidentitykeys'');end'),
+('trigger:avionics_models_consolidation_identity_immutable', 'createtriggeravionics_models_consolidation_identity_immutablebeforeupdateofcatalog_status,avionics_manufacturer_id,name,normalized_name,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifieronavionics_modelswhenexists(select1fromavionics_catalog_consolidation_guardguardwhereguard.duplicate_model_id=old.idorguard.survivor_model_id=old.idunionallselect1fromavionics_catalog_grounded_consolidation_guardgrounded_guardwheregrounded_guard.duplicate_model_id=old.idorgrounded_guard.survivor_model_id=old.idunionallselect1fromavionics_catalog_human_consolidation_guardguardwhereguard.duplicate_model_id=old.idorguard.survivor_model_id=old.id)beginselectraise(abort,''guardedavionicsconsolidationidentitiesareimmutable'');end'),
+('trigger:avionics_models_referenced_status_update', 'createtriggeravionics_models_referenced_status_updatebeforeupdateofcatalog_statusonavionics_modelswhennew.catalog_status<>''approved''and(exists(select1fromaircraft_sale_listing_avionicslisting_linkwherelisting_link.avionics_model_id=old.idorlisting_link.replaces_avionics_model_id=old.id)orexists(select1fromavionics_suite_componentssuite_linkwheresuite_link.suite_model_id=old.idorsuite_link.component_model_id=old.id)orexists(select1fromaircraft_reference_avionicsreference_linkwherereference_link.avionics_model_id=old.id))beginselectraise(abort,''referencedavionicscatalogentrycannotbeunapproved'');end'),
+('trigger:compatibility_projected_designation_immutable_delete', 'createtriggercompatibility_projected_designation_immutable_deletebeforedeleteonaircraft_designationswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_designation_id=old.id)beginselectraise(abort,''compatibility-projectedcanonicalaircraftdesignationsareimmutable'');end'),
+('trigger:compatibility_projected_designation_immutable_update', 'createtriggercompatibility_projected_designation_immutable_updatebeforeupdateonaircraft_designationswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_designation_id=old.id)beginselectraise(abort,''compatibility-projectedcanonicalaircraftdesignationsareimmutable'');end'),
+('trigger:compatibility_projected_family_immutable_delete', 'createtriggercompatibility_projected_family_immutable_deletebeforedeleteonaircraft_model_familieswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_model_family_id=old.id)beginselectraise(abort,''compatibility-projectedcanonicalaircraftfamiliesareimmutable'');end'),
+('trigger:compatibility_projected_family_immutable_update', 'createtriggercompatibility_projected_family_immutable_updatebeforeupdateonaircraft_model_familieswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_model_family_id=old.id)beginselectraise(abort,''compatibility-projectedcanonicalaircraftfamiliesareimmutable'');end'),
+('trigger:compatibility_projected_generation_immutable_delete', 'createtriggercompatibility_projected_generation_immutable_deletebeforedeleteonaircraft_generationswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_generation_id=old.id)beginselectraise(abort,''compatibility-projectedaircraftgenerationsareimmutable'');end'),
+('trigger:compatibility_projected_generation_immutable_update', 'createtriggercompatibility_projected_generation_immutable_updatebeforeupdateonaircraft_generationswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_generation_id=old.id)beginselectraise(abort,''compatibility-projectedaircraftgenerationsareimmutable'');end'),
+('trigger:compatibility_projected_generation_link_immutable_delete', 'createtriggercompatibility_projected_generation_link_immutable_deletebeforedeleteonaircraft_generation_designationswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_generation_id=old.aircraft_generation_idandprojection.aircraft_designation_id=old.aircraft_designation_id)beginselectraise(abort,''compatibility-projectedgenerationapplicabilityisimmutable'');end'),
+('trigger:compatibility_projected_generation_link_immutable_update', 'createtriggercompatibility_projected_generation_link_immutable_updatebeforeupdateonaircraft_generation_designationswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_generation_id=old.aircraft_generation_idandprojection.aircraft_designation_id=old.aircraft_designation_id)beginselectraise(abort,''compatibility-projectedgenerationapplicabilityisimmutable'');end'),
+('trigger:compatibility_projected_make_immutable_delete', 'createtriggercompatibility_projected_make_immutable_deletebeforedeleteonaircraft_makeswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_make_id=old.id)beginselectraise(abort,''compatibility-projectedcanonicalaircraftmakesareimmutable'');end'),
+('trigger:compatibility_projected_make_immutable_update', 'createtriggercompatibility_projected_make_immutable_updatebeforeupdateonaircraft_makeswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_make_id=old.id)beginselectraise(abort,''compatibility-projectedcanonicalaircraftmakesareimmutable'');end'),
+('trigger:compatibility_projected_package_immutable_delete', 'createtriggercompatibility_projected_package_immutable_deletebeforedeleteonaircraft_factory_packageswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.id)beginselectraise(abort,''compatibility-projectedaircraftpackagesareimmutable'');end'),
+('trigger:compatibility_projected_package_immutable_update', 'createtriggercompatibility_projected_package_immutable_updatebeforeupdateonaircraft_factory_packageswhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.id)beginselectraise(abort,''compatibility-projectedaircraftpackagesareimmutable'');end'),
+('trigger:compatibility_projected_package_link_immutable_delete', 'createtriggercompatibility_projected_package_link_immutable_deletebeforedeleteonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
+('trigger:compatibility_projected_package_link_immutable_update', 'createtriggercompatibility_projected_package_link_immutable_updatebeforeupdateonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
+('trigger:listing_avionics_authorizations_invalidate_capture_delete', 'createtriggerlisting_avionics_authorizations_invalidate_capture_deleteafterdeleteonplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));end'),
+('trigger:listing_avionics_authorizations_invalidate_capture_update', 'createtriggerlisting_avionics_authorizations_invalidate_capture_updateafterupdateofcanonical_listing_id,rendered_html,rendered_html_sha256onplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));end'),
+('trigger:listing_avionics_authorizations_invalidate_model_proof_update', 'createtriggerlisting_avionics_authorizations_invalidate_model_proof_updateafterupdateofavionics_manufacturer_id,name,normalized_name,catalog_status,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_textonavionics_modelsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereauthorization_kind=''same_case_grounded''andavionics_model_id=old.id;end'),
+('trigger:official_dollar_normalization_immutable_delete', 'createtriggerofficial_dollar_normalization_immutable_deletebeforedeleteonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
+('trigger:official_dollar_normalization_immutable_update', 'createtriggerofficial_dollar_normalization_immutable_updatebeforeupdateonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
+('trigger:official_dollar_normalization_require_evidence', 'createtriggerofficial_dollar_normalization_require_evidencebeforeinsertonofficial_dollar_normalization_factswhennotexists(select1fromcuration_evidence_claimsclaimjoincuration_evidence_sourcessourceonsource.id=claim.evidence_source_idwhereclaim.id=new.evidence_claim_idandclaim.validation_status=''validated''andclaim.claim_kindin(''price'',''specification'')andsource.source_tier=''regulator_primary'')beginselectraise(abort,''dollarnormalizationrequiresvalidatedofficialregulatorevidence'');end'),
+('trigger:plugin_submissions_replay_checkpoint_immutable', 'createtriggerplugin_submissions_replay_checkpoint_immutablebeforeupdateonplugin_submissionswhen(exists(select1fromlisting_replay_run_itemsitemwhereitem.plugin_submission_id=old.idanditem.extraction_state=''succeeded'')orexists(select1fromplugin_submission_materialization_receiptsreceiptwherereceipt.plugin_submission_id=old.id))and(not(new.idisold.id)ornot(new.user_idisold.user_id)ornot(new.plugin_install_idisold.plugin_install_id)ornot(new.source_urlisold.source_url)ornot(new.submitted_atisold.submitted_at)ornot(new.rendered_htmlisold.rendered_html)ornot(new.rendered_html_sha256isold.rendered_html_sha256)ornot(new.signature_base64isold.signature_base64)ornot(new.extracted_listing_jsonisold.extracted_listing_json)ornot(new.extraction_errorisold.extraction_error)ornot(new.canonical_listing_idisold.canonical_listing_idor(old.canonical_listing_idisnullandnew.canonical_listing_idisnotnullandnotexists(select1fromplugin_submission_materialization_receiptsreceiptwherereceipt.plugin_submission_id=old.id)andexists(select1fromaircraft_sale_listingslistingwherelisting.id=new.canonical_listing_idandlisting.created_by_user_id=old.user_idandlisting.source_url=old.source_url))))beginselectraise(abort,''replaycheckpointcaptureisimmutable'');end'),
+('view:aircraft_reference_serial_key_errors', 'createviewaircraft_reference_serial_key_errorsaswithrecursivebounds(scope_id,bound_name,serial_value,stored_key)as(selectid,''from'',serial_from_display,serial_from_sort_keyfromaircraft_reference_applicability_scopeswhereapplies_to_all_serials=0unionallselectid,''to'',serial_to_display,serial_to_sort_keyfromaircraft_reference_applicability_scopeswhereapplies_to_all_serials=0),state(scope_id,bound_name,serial_value,stored_key,position,segment,alpha_hex,numeric_segment,encoded)as(selectscope_id,bound_name,serial_value,stored_key,2,substr(serial_value,1,1),casewhensubstr(serial_value,1,1)glob''[0-9]''then''''elseprintf(''%02x'',instr(''abcdefghijklmnopqrstuvwxyz'',substr(serial_value,1,1)))end,substr(serial_value,1,1)glob''[0-9]'',''01''fromboundsunionallselectscope_id,bound_name,serial_value,stored_key,position+1,casewhen(substr(serial_value,position,1)glob''[0-9]'')=numeric_segmentthensegment||substr(serial_value,position,1)elsesubstr(serial_value,position,1)end,casewhen(substr(serial_value,position,1)glob''[0-9]'')=numeric_segmentthenalpha_hex||casewhennumeric_segmentthen''''elseprintf(''%02x'',instr(''abcdefghijklmnopqrstuvwxyz'',substr(serial_value,position,1)))endelsecasewhensubstr(serial_value,position,1)glob''[0-9]''then''''elseprintf(''%02x'',instr(''abcdefghijklmnopqrstuvwxyz'',substr(serial_value,position,1)))endend,substr(serial_value,position,1)glob''[0-9]'',casewhen(substr(serial_value,position,1)glob''[0-9]'')=numeric_segmentthenencodedelseencoded||casewhennumeric_segmentthen''20''||printf(''%08x'',length(casewhentrim(segment,''0'')=''''then''0''elseltrim(segment,''0'')end))||casewhentrim(segment,''0'')=''''then''0''elseltrim(segment,''0'')end||printf(''%08x'',length(segment))||segmentelse''10''||alpha_hex||''00''endendfromstatewhereposition<=length(serial_value)),expected(scope_id,bound_name,expected_key)as(selectscope_id,bound_name,encoded||casewhennumeric_segmentthen''20''||printf(''%08x'',length(casewhentrim(segment,''0'')=''''then''0''elseltrim(segment,''0'')end))||casewhentrim(segment,''0'')=''''then''0''elseltrim(segment,''0'')end||printf(''%08x'',length(segment))||segmentelse''10''||alpha_hex||''00''end||''00''fromstatewhereposition=length(serial_value)+1)selectbounds.scope_id,bounds.bound_name,bounds.serial_value,bounds.stored_key,expected.expected_keyfromboundsleftjoinexpectedonexpected.scope_id=bounds.scope_idandexpected.bound_name=bounds.bound_namewherebounds.serial_valueisnullorbounds.serial_value=''''orbounds.serial_value<>upper(bounds.serial_value)orbounds.serial_valueglob''*[^a-z0-9]*''orexpected.expected_keyisnullorbounds.stored_keyisnotexpected.expected_key');
 
-CREATE INDEX IF NOT EXISTS idx_depreciation_profile_fit_metadata_category
-  ON depreciation_profile_fit_metadata (fit_category);
 
-CREATE TABLE IF NOT EXISTS component_depreciation_profiles (
-  component_type TEXT PRIMARY KEY
-    CHECK (component_type IN ('engine', 'propeller', 'avionics')),
-  age_decay_rate REAL,
-  long_run_residual_fraction REAL,
-  baseline_life_fraction REAL,
-  sample_count INTEGER NOT NULL DEFAULT 0,
-  rmse_usd REAL,
-  mae_fraction REAL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+-- A marker asserts the exact complete cutover, not permission for later
+-- CREATE IF NOT EXISTS statements to heal damaged or additive owned objects.
+CREATE TEMP TABLE reference_catalog_schema_owned_objects AS
+WITH
+protected_relations(name) AS (
+  VALUES
+    ('plugin_submissions'),
+    ('avionics_models'),
+    ('aircraft_engine_catalog_models'),
+    ('aircraft_propeller_catalog_models'),
+    ('aircraft_makes'),
+    ('aircraft_model_families'),
+    ('aircraft_designations'),
+    ('aircraft_make_aliases'),
+    ('aircraft_family_aliases'),
+    ('aircraft_designation_aliases'),
+    ('aircraft_designation_identifiers'),
+    ('aircraft_generations'),
+    ('aircraft_generation_designations'),
+    ('aircraft_factory_packages'),
+    ('aircraft_package_applicability'),
+    ('aircraft_reference_configurations'),
+    ('aircraft_serial_number_schemes'),
+    ('aircraft_feature_definitions'),
+    ('aircraft_reference_configuration_versions'),
+    ('aircraft_reference_applicability_scopes'),
+    ('aircraft_reference_prices'),
+    ('aircraft_reference_avionics'),
+    ('aircraft_reference_engines'),
+    ('aircraft_reference_propellers'),
+    ('aircraft_reference_features'),
+    ('aircraft_reference_fact_set_attestations'),
+    ('official_dollar_normalization_facts'),
+    ('aircraft_valuation_compatibility_projections'),
+    ('listing_verification_run_items')
+),
+retired_relations(name) AS (
+  VALUES
+    ('aircraft_model_spec_versions'),
+    ('aircraft_model_variant_price_points'),
+    ('aircraft_model_variant_default_avionics'),
+    ('aircraft_model_variant_default_avionics_candidates'),
+    ('depreciation_profiles'),
+    ('depreciation_profile_fit_metadata'),
+    ('component_depreciation_profiles')
+),
+owned_relations(name) AS (
+  SELECT name FROM protected_relations
+  UNION ALL SELECT name FROM retired_relations
+)
+SELECT
+  schema_row.type || ':' || schema_row.name AS object_key,
+  COALESCE(lower(replace(replace(replace(replace(
+    schema_row.sql, char(9), ''
+  ), char(10), ''), char(13), ''), ' ', '')), '') AS definition
+FROM sqlite_schema schema_row
+WHERE (
+  schema_row.type = 'table'
+  AND schema_row.name IN (SELECT name FROM owned_relations)
+) OR (
+  schema_row.name IN (SELECT name FROM retired_relations)
+  OR schema_row.tbl_name IN (SELECT name FROM retired_relations)
+) OR (
+  schema_row.type = 'view'
+  AND schema_row.name = 'aircraft_reference_serial_key_errors'
+) OR (
+  schema_row.type = 'trigger'
+  AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
+)
+UNION ALL
+SELECT
+  'index:' || relation.name || ':' || index_row.name,
+  index_row.[unique] || ':' || index_row.origin || ':' ||
+    index_row.partial || ':' || COALESCE(lower(replace(replace(replace(replace(
+      (SELECT sql FROM sqlite_schema WHERE type = 'index'
+       AND name = index_row.name), char(9), ''
+    ), char(10), ''), char(13), ''), ' ', '')), '') || ':' || COALESCE((
+      SELECT group_concat(index_column.signature, ',')
+      FROM (
+        SELECT
+          xinfo.seqno || ':' || xinfo.cid || ':' ||
+          COALESCE(xinfo.name, '') || ':' || xinfo.desc || ':' ||
+          xinfo.coll || ':' || xinfo.key AS signature
+        FROM pragma_index_xinfo(index_row.name) xinfo
+        ORDER BY xinfo.seqno
+      ) index_column
+    ), '')
+FROM owned_relations relation
+JOIN pragma_index_list(relation.name) index_row;
+
+CREATE TEMP TABLE reference_catalog_schema_definition_preflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
 );
+INSERT INTO reference_catalog_schema_definition_preflight (valid)
+SELECT CASE WHEN EXISTS (
+  SELECT 1 FROM schema_migration_contracts
+  WHERE migration_name = '20260819_reference_catalog_cutover'
+) AND (
+  (SELECT count(*) FROM reference_catalog_schema_owned_objects) <>
+    213
+  OR EXISTS (
+    SELECT object_key, definition
+    FROM reference_catalog_schema_owned_objects
+    EXCEPT
+    SELECT object_key, definition
+    FROM reference_catalog_schema_expected_objects
+  )
+  OR EXISTS (
+    SELECT object_key, definition
+    FROM reference_catalog_schema_expected_objects
+    EXCEPT
+    SELECT object_key, definition
+    FROM reference_catalog_schema_owned_objects
+  )
+) THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_schema_definition_preflight;
+DROP TABLE reference_catalog_schema_owned_objects;
 
 CREATE TABLE IF NOT EXISTS engine_manufacturers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,93 +501,6 @@ CREATE TABLE IF NOT EXISTS aircraft_model_variants (
 
 CREATE INDEX IF NOT EXISTS idx_aircraft_model_variants_model
   ON aircraft_model_variants (aircraft_model_id);
-
-CREATE TABLE IF NOT EXISTS aircraft_model_spec_versions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  aircraft_model_id INTEGER NOT NULL REFERENCES aircraft_models(id),
-  aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
-  effective_from TEXT NOT NULL,
-  effective_to TEXT,
-  depreciation_profile_id INTEGER REFERENCES depreciation_profiles(id),
-  average_inflation_rate REAL NOT NULL DEFAULT 0.025,
-  fuel_burn_gph REAL,
-  oil_quarts_per_hour REAL,
-  oil_price_per_quart_usd REAL,
-  engine_model_id INTEGER REFERENCES engine_models(id),
-  engine_count INTEGER NOT NULL DEFAULT 1,
-  engine_tbo_hours REAL,
-  engine_overhaul_cost_usd REAL,
-  engine_value_baseline_life_fraction REAL NOT NULL DEFAULT 0.5,
-  propeller_model_id INTEGER REFERENCES propeller_models(id),
-  propeller_count INTEGER NOT NULL DEFAULT 1,
-  propeller_tbo_hours REAL,
-  propeller_overhaul_cost_usd REAL,
-  propeller_value_baseline_life_fraction REAL NOT NULL DEFAULT 0.5,
-  annual_inspection_usd REAL,
-  other_maintenance_per_hour REAL,
-  source_url TEXT,
-  configuration_scope TEXT NOT NULL DEFAULT 'unreviewed'
-    CHECK (configuration_scope IN ('factory_default', 'listing_specific', 'unreviewed')),
-  source_confidence TEXT
-    CHECK (source_confidence IS NULL OR source_confidence IN ('high', 'medium', 'low')),
-  evidence_kind TEXT NOT NULL DEFAULT 'unreviewed'
-    CHECK (evidence_kind IN ('authoritative_reference', 'listing_only', 'unreviewed')),
-  is_valuation_eligible INTEGER NOT NULL DEFAULT 0
-    CHECK (is_valuation_eligible IN (0, 1)),
-  created_by_user_id INTEGER REFERENCES users(id),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CHECK (effective_to IS NULL OR effective_to > effective_from),
-  CHECK (
-    is_valuation_eligible = 0
-    OR (
-      configuration_scope = 'factory_default'
-      AND source_confidence = 'high'
-      AND evidence_kind = 'authoritative_reference'
-      AND source_url IS NOT NULL
-      AND length(trim(source_url)) > 0
-    )
-  )
-);
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_model_spec_versions_model
-  ON aircraft_model_spec_versions (
-    aircraft_model_id,
-    aircraft_model_variant_id,
-    effective_from
-  );
-
-CREATE TABLE IF NOT EXISTS aircraft_model_variant_price_points (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
-  model_year INTEGER NOT NULL,
-  purchase_price_new_usd REAL NOT NULL,
-  purchase_price_reference_year INTEGER NOT NULL,
-  source_url TEXT NOT NULL,
-  source_title TEXT NOT NULL,
-  source_notes TEXT NOT NULL,
-  source_confidence TEXT NOT NULL,
-  evidence_kind TEXT NOT NULL DEFAULT 'unreviewed'
-    CHECK (evidence_kind IN (
-      'direct_model_year', 'direct_other_year', 'interpolated', 'inferred', 'unreviewed'
-    )),
-  is_valuation_eligible INTEGER NOT NULL DEFAULT 0
-    CHECK (is_valuation_eligible IN (0, 1)),
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (aircraft_model_variant_id, model_year),
-  CHECK (
-    is_valuation_eligible = 0
-    OR (
-      source_confidence = 'high'
-      AND evidence_kind = 'direct_model_year'
-      AND purchase_price_reference_year = model_year
-    )
-  )
-);
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_model_variant_price_points_lookup
-  ON aircraft_model_variant_price_points (aircraft_model_variant_id, model_year);
 
 CREATE TABLE IF NOT EXISTS avionics_manufacturers (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2499,160 +2724,6 @@ BEGIN
   SELECT RAISE(ABORT, 'avionics suite membership requires approved catalog entries');
 END;
 
-CREATE TABLE IF NOT EXISTS aircraft_model_variant_default_avionics (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
-  model_year INTEGER NOT NULL,
-  avionics_model_id INTEGER NOT NULL REFERENCES avionics_models(id),
-  quantity INTEGER NOT NULL DEFAULT 1,
-  source_url TEXT NOT NULL,
-  source_title TEXT NOT NULL,
-  source_notes TEXT NOT NULL,
-  source_confidence TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (aircraft_model_variant_id, model_year, avionics_model_id)
-);
-
-CREATE TRIGGER IF NOT EXISTS aircraft_model_variant_default_avionics_approved_insert
-BEFORE INSERT ON aircraft_model_variant_default_avionics
-WHEN NOT EXISTS (
-  SELECT 1
-  FROM avionics_models model
-  WHERE model.id = NEW.avionics_model_id
-    AND model.catalog_status = 'approved'
-)
-BEGIN
-  SELECT RAISE(ABORT, 'default avionics association requires an approved catalog entry');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_model_variant_default_avionics_approved_update
-BEFORE UPDATE OF avionics_model_id ON aircraft_model_variant_default_avionics
-WHEN NEW.avionics_model_id IS NOT OLD.avionics_model_id
-AND NOT EXISTS (
-  SELECT 1
-  FROM avionics_models model
-  WHERE model.id = NEW.avionics_model_id
-    AND model.catalog_status = 'approved'
-)
-AND NOT EXISTS (
-  SELECT 1
-  FROM avionics_catalog_authorized_consolidations guard
-  JOIN avionics_models survivor ON survivor.id = guard.survivor_model_id
-  JOIN avionics_models legacy ON legacy.id = OLD.avionics_model_id
-  WHERE guard.duplicate_model_id = OLD.avionics_model_id
-    AND guard.survivor_model_id = NEW.avionics_model_id
-    AND survivor.catalog_status = 'unreviewed'
-    AND legacy.catalog_status = 'unreviewed'
-)
-BEGIN
-  SELECT RAISE(ABORT, 'default avionics association requires an approved catalog entry');
-END;
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_model_variant_default_avionics_lookup
-  ON aircraft_model_variant_default_avionics (aircraft_model_variant_id, model_year);
-
--- Unverified factory-default claims are deliberately separate from canonical
--- defaults. This table itself means pending; rejection deletes the row, while
--- exact insertion into the canonical table atomically admits and removes it.
-CREATE TABLE IF NOT EXISTS aircraft_model_variant_default_avionics_candidates (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  quarantined_default_avionics_id INTEGER UNIQUE,
-  aircraft_model_variant_id INTEGER NOT NULL
-    REFERENCES aircraft_model_variants(id) ON DELETE RESTRICT,
-  model_year INTEGER NOT NULL,
-  avionics_model_id INTEGER NOT NULL
-    REFERENCES avionics_models(id) ON DELETE RESTRICT,
-  quantity INTEGER NOT NULL,
-  source_url TEXT NOT NULL,
-  source_title TEXT NOT NULL,
-  source_notes TEXT NOT NULL,
-  source_confidence TEXT NOT NULL,
-  pending_reason TEXT NOT NULL DEFAULT 'factory_default_claim_unverified',
-  quarantined_created_at TEXT,
-  quarantined_updated_at TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE (aircraft_model_variant_id, model_year, avionics_model_id),
-  CHECK (pending_reason IN (
-    'catalog_product_unverified', 'factory_default_claim_unverified'
-  )),
-  CHECK (
-    (
-      quarantined_default_avionics_id IS NULL
-      AND quarantined_created_at IS NULL
-      AND quarantined_updated_at IS NULL
-    )
-    OR (
-      quarantined_default_avionics_id > 0
-      AND quarantined_created_at IS NOT NULL
-      AND quarantined_updated_at IS NOT NULL
-    )
-  )
-);
-
-CREATE INDEX IF NOT EXISTS idx_aircraft_default_avionics_candidates_product
-  ON aircraft_model_variant_default_avionics_candidates (
-    avionics_model_id, aircraft_model_variant_id, model_year, id
-  );
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_active_conflict_insert
-BEFORE INSERT ON aircraft_model_variant_default_avionics_candidates
-WHEN EXISTS (
-  SELECT 1
-  FROM aircraft_model_variant_default_avionics active
-  WHERE active.aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND active.model_year = NEW.model_year
-    AND active.avionics_model_id = NEW.avionics_model_id
-)
-BEGIN
-  SELECT RAISE(ABORT, 'default avionics claim already exists in the canonical table');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_claim_immutable
-BEFORE UPDATE ON aircraft_model_variant_default_avionics_candidates
-BEGIN
-  SELECT RAISE(ABORT, 'pending default avionics claims must be replaced, admitted, or rejected explicitly');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_admission_guard
-BEFORE INSERT ON aircraft_model_variant_default_avionics
-WHEN EXISTS (
-  SELECT 1
-  FROM aircraft_model_variant_default_avionics_candidates candidate
-  WHERE candidate.aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND candidate.model_year = NEW.model_year
-    AND candidate.avionics_model_id = NEW.avionics_model_id
-)
-AND NOT EXISTS (
-  SELECT 1
-  FROM aircraft_model_variant_default_avionics_candidates candidate
-  WHERE candidate.aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND candidate.model_year = NEW.model_year
-    AND candidate.avionics_model_id = NEW.avionics_model_id
-    AND candidate.quantity = NEW.quantity
-    AND candidate.source_url = NEW.source_url
-    AND candidate.source_title = NEW.source_title
-    AND candidate.source_notes = NEW.source_notes
-    AND candidate.source_confidence = NEW.source_confidence
-)
-BEGIN
-  SELECT RAISE(ABORT, 'canonical default admission must exactly match its pending claim');
-END;
-
-CREATE TRIGGER IF NOT EXISTS aircraft_default_avionics_candidate_admission_move
-AFTER INSERT ON aircraft_model_variant_default_avionics
-BEGIN
-  DELETE FROM aircraft_model_variant_default_avionics_candidates
-  WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id
-    AND model_year = NEW.model_year
-    AND avionics_model_id = NEW.avionics_model_id
-    AND quantity = NEW.quantity
-    AND source_url = NEW.source_url
-    AND source_title = NEW.source_title
-    AND source_notes = NEW.source_notes
-    AND source_confidence = NEW.source_confidence;
-END;
-
 CREATE TABLE IF NOT EXISTS aircraft_sale_listings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   aircraft_model_variant_id INTEGER NOT NULL REFERENCES aircraft_model_variants(id),
@@ -2890,9 +2961,9 @@ CREATE TABLE IF NOT EXISTS listing_verification_run_items (
     REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
   position INTEGER NOT NULL CHECK (position >= 0),
   status TEXT NOT NULL DEFAULT 'queued'
-    CHECK (status IN (
+    CONSTRAINT listing_verification_run_items_status_check CHECK (status IN (
       'queued', 'running', 'verified', 'pending_review',
-      'pending_reference', 'blocked', 'failed', 'cancelled'
+      'blocked', 'failed', 'cancelled'
     )),
   attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   lease_token TEXT,
@@ -2918,11 +2989,11 @@ CREATE TABLE IF NOT EXISTS listing_verification_run_items (
       AND lease_token IS NULL
       AND lease_expires_at_epoch_seconds IS NULL)
   ),
-  CHECK (
+  CONSTRAINT listing_verification_run_items_completion_check CHECK (
     (status IN ('queued', 'running') AND completed_at IS NULL)
     OR
     (status IN (
-      'verified', 'pending_review', 'pending_reference',
+      'verified', 'pending_review',
       'blocked', 'failed', 'cancelled'
     ) AND completed_at IS NOT NULL)
   ),
@@ -2934,9 +3005,9 @@ CREATE TABLE IF NOT EXISTS listing_verification_run_items (
       AND json_type(outcome_json) = 'object'
     )
   ),
-  CHECK (
+  CONSTRAINT listing_verification_run_items_outcome_required_check CHECK (
     status NOT IN (
-      'verified', 'pending_review', 'pending_reference', 'blocked'
+      'verified', 'pending_review', 'blocked'
     )
     OR outcome_json IS NOT NULL
   ),
@@ -3807,11 +3878,6 @@ AND (
     FROM aircraft_sale_listing_avionics listing_link
     WHERE listing_link.avionics_model_id = OLD.id
        OR listing_link.replaces_avionics_model_id = OLD.id
-  )
-  OR EXISTS (
-    SELECT 1
-    FROM aircraft_model_variant_default_avionics default_link
-    WHERE default_link.avionics_model_id = OLD.id
   )
   OR EXISTS (
     SELECT 1
@@ -4884,6 +4950,86 @@ CREATE INDEX IF NOT EXISTS idx_aircraft_reference_scope_market
     serial_from_sort_key, serial_to_sort_key
   );
 
+-- Recompute every stored bound from its canonical display value. This view is
+-- also used by the insert trigger so direct SQL cannot create a second,
+-- caller-defined ordering domain.
+CREATE VIEW IF NOT EXISTS aircraft_reference_serial_key_errors AS
+WITH RECURSIVE
+bounds(scope_id, bound_name, serial_value, stored_key) AS (
+  SELECT id, 'from', serial_from_display, serial_from_sort_key
+  FROM aircraft_reference_applicability_scopes
+  WHERE applies_to_all_serials = 0
+  UNION ALL
+  SELECT id, 'to', serial_to_display, serial_to_sort_key
+  FROM aircraft_reference_applicability_scopes
+  WHERE applies_to_all_serials = 0
+),
+state(
+  scope_id, bound_name, serial_value, stored_key,
+  position, segment, alpha_hex, numeric_segment, encoded
+) AS (
+  SELECT
+    scope_id, bound_name, serial_value, stored_key, 2,
+    substr(serial_value, 1, 1),
+    CASE WHEN substr(serial_value, 1, 1) GLOB '[0-9]' THEN ''
+      ELSE printf('%02X', instr(
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, 1, 1)
+      )) END,
+    substr(serial_value, 1, 1) GLOB '[0-9]', '01'
+  FROM bounds
+  UNION ALL
+  SELECT
+    scope_id, bound_name, serial_value, stored_key, position + 1,
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN segment || substr(serial_value, position, 1)
+      ELSE substr(serial_value, position, 1) END,
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN alpha_hex || CASE WHEN numeric_segment THEN '' ELSE printf(
+        '%02X', instr('ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, position, 1))
+      ) END
+      ELSE CASE WHEN substr(serial_value, position, 1) GLOB '[0-9]' THEN ''
+        ELSE printf('%02X', instr(
+          'ABCDEFGHIJKLMNOPQRSTUVWXYZ', substr(serial_value, position, 1)
+        )) END END,
+    substr(serial_value, position, 1) GLOB '[0-9]',
+    CASE WHEN (substr(serial_value, position, 1) GLOB '[0-9]') = numeric_segment
+      THEN encoded
+      ELSE encoded || CASE WHEN numeric_segment THEN
+        '20'
+        || printf('%08X', length(CASE WHEN trim(segment, '0') = ''
+          THEN '0' ELSE ltrim(segment, '0') END))
+        || CASE WHEN trim(segment, '0') = '' THEN '0' ELSE ltrim(segment, '0') END
+        || printf('%08X', length(segment)) || segment
+      ELSE '10' || alpha_hex || '00' END END
+  FROM state
+  WHERE position <= length(serial_value)
+),
+expected(scope_id, bound_name, expected_key) AS (
+  SELECT scope_id, bound_name,
+    encoded || CASE WHEN numeric_segment THEN
+      '20'
+      || printf('%08X', length(CASE WHEN trim(segment, '0') = ''
+        THEN '0' ELSE ltrim(segment, '0') END))
+      || CASE WHEN trim(segment, '0') = '' THEN '0' ELSE ltrim(segment, '0') END
+      || printf('%08X', length(segment)) || segment
+    ELSE '10' || alpha_hex || '00' END || '00'
+  FROM state
+  WHERE position = length(serial_value) + 1
+)
+SELECT
+  bounds.scope_id, bounds.bound_name, bounds.serial_value,
+  bounds.stored_key, expected.expected_key
+FROM bounds
+LEFT JOIN expected
+  ON expected.scope_id = bounds.scope_id
+ AND expected.bound_name = bounds.bound_name
+WHERE bounds.serial_value IS NULL
+   OR bounds.serial_value = ''
+   OR bounds.serial_value <> upper(bounds.serial_value)
+   OR bounds.serial_value GLOB '*[^A-Z0-9]*'
+   OR expected.expected_key IS NULL
+   OR bounds.stored_key IS NOT expected.expected_key;
+
 CREATE TABLE IF NOT EXISTS aircraft_reference_prices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   aircraft_reference_configuration_version_id INTEGER NOT NULL
@@ -4894,6 +5040,9 @@ CREATE TABLE IF NOT EXISTS aircraft_reference_prices (
   amount REAL NOT NULL CHECK (amount > 0),
   currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
   price_reference_year INTEGER NOT NULL CHECK (price_reference_year BETWEEN 1900 AND 2200),
+  configuration_basis TEXT NOT NULL DEFAULT 'unknown' CHECK (configuration_basis IN (
+    'full_standard_configuration', 'base_aircraft_only', 'unknown'
+  )),
   evidence_kind TEXT NOT NULL CHECK (evidence_kind IN (
     'direct_model_year', 'direct_other_year', 'interpolated', 'inferred'
   )),
@@ -4982,6 +5131,57 @@ CREATE TABLE IF NOT EXISTS aircraft_reference_features (
     (boolean_value IS NOT NULL) + (number_value IS NOT NULL) + (text_value IS NOT NULL) = 1
   )
 );
+
+CREATE TABLE IF NOT EXISTS aircraft_reference_fact_set_attestations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  aircraft_reference_configuration_version_id INTEGER NOT NULL
+    REFERENCES aircraft_reference_configuration_versions(id) ON DELETE CASCADE,
+  fact_set_kind TEXT NOT NULL CHECK (fact_set_kind IN (
+    'avionics', 'engines', 'propellers', 'features'
+  )),
+  evidence_claim_id INTEGER NOT NULL
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (aircraft_reference_configuration_version_id, fact_set_kind)
+);
+
+CREATE TABLE IF NOT EXISTS official_dollar_normalization_facts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_year INTEGER NOT NULL CHECK (source_year BETWEEN 1900 AND 2200),
+  target_year INTEGER NOT NULL CHECK (target_year BETWEEN 1900 AND 2200),
+  index_series TEXT NOT NULL CHECK (length(trim(index_series)) > 0),
+  source_index_value REAL NOT NULL CHECK (source_index_value > 0),
+  target_index_value REAL NOT NULL CHECK (target_index_value > 0),
+  normalization_factor REAL NOT NULL CHECK (normalization_factor > 0),
+  evidence_claim_id INTEGER NOT NULL UNIQUE
+    REFERENCES curation_evidence_claims(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (source_year, target_year),
+  CHECK (source_year <> target_year),
+  CHECK (
+    abs(normalization_factor - (target_index_value / source_index_value))
+      <= 0.000000001
+  )
+);
+
+CREATE TRIGGER IF NOT EXISTS official_dollar_normalization_require_evidence
+BEFORE INSERT ON official_dollar_normalization_facts
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM curation_evidence_claims claim
+  JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
+  WHERE claim.id = NEW.evidence_claim_id
+    AND claim.validation_status = 'validated'
+    AND claim.claim_kind IN ('price', 'specification')
+    AND source.source_tier = 'regulator_primary'
+)
+BEGIN SELECT RAISE(ABORT, 'dollar normalization requires validated official regulator evidence'); END;
+CREATE TRIGGER IF NOT EXISTS official_dollar_normalization_immutable_update
+BEFORE UPDATE ON official_dollar_normalization_facts
+BEGIN SELECT RAISE(ABORT, 'official dollar normalization facts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS official_dollar_normalization_immutable_delete
+BEFORE DELETE ON official_dollar_normalization_facts
+BEGIN SELECT RAISE(ABORT, 'official dollar normalization facts are immutable'); END;
 
 -- Component catalog entries require an exact validated primary-source
 -- identifier claim linked to the matching approved decision.
@@ -5276,7 +5476,8 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
-WHEN NOT EXISTS (
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+OR NOT EXISTS (
   SELECT 1 FROM aircraft_identity_decisions decision
   JOIN aircraft_identity_decision_claims dc ON dc.decision_id = decision.id
   JOIN curation_evidence_claims claim ON claim.id = dc.evidence_claim_id
@@ -5285,7 +5486,11 @@ WHEN NOT EXISTS (
     AND decision.decision_action = 'approve_new' AND decision.entity_kind = 'serial_scheme'
     AND claim.validation_status = 'validated'
 )
-BEGIN SELECT RAISE(ABORT, 'serial scheme requires an approved evidence-backed decision'); END;
+BEGIN SELECT RAISE(ABORT, 'serial scheme requires the universal ordering and an approved evidence-backed decision'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_serial_schemes_preserve_ordering
+BEFORE UPDATE OF normalization_version ON aircraft_serial_number_schemes
+WHEN NEW.normalization_version <> 'natural_alphanumeric_segments_v1'
+BEGIN SELECT RAISE(ABORT, 'serial scheme ordering version is immutable'); END;
 
 CREATE TRIGGER IF NOT EXISTS aircraft_feature_definitions_require_approval
 BEFORE INSERT ON aircraft_feature_definitions
@@ -5312,6 +5517,7 @@ OR NOT EXISTS (
     AND claim.validation_status = 'validated'
     AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
 )
+OR (NEW.revision = 1) <> (NEW.supersedes_version_id IS NULL)
 OR (
   NEW.supersedes_version_id IS NOT NULL
   AND NOT EXISTS (
@@ -5320,10 +5526,13 @@ OR (
     WHERE previous.id = NEW.supersedes_version_id
       AND previous.aircraft_reference_configuration_id = NEW.aircraft_reference_configuration_id
       AND previous.model_year = NEW.model_year
+      AND previous.revision = NEW.revision - 1
       AND previous.publication_state = 'published'
   )
 )
-BEGIN SELECT RAISE(ABORT, 'reference profile requires building state, approved evidence, and a valid predecessor'); END;
+BEGIN
+  SELECT RAISE(ABORT, 'reference profile requires building state, approved evidence, and its exact predecessor');
+END;
 
 -- Profile children may only be assembled while the parent is building.
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_scope_building_insert
@@ -5334,6 +5543,46 @@ WHEN NOT EXISTS (
     AND version.publication_state = 'building'
 )
 BEGIN SELECT RAISE(ABORT, 'reference profile children require a building version'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_scope_canonical_insert
+BEFORE INSERT ON aircraft_reference_applicability_scopes
+WHEN NEW.applies_to_all_serials = 0 AND (
+  NEW.serial_from_sort_key <> upper(NEW.serial_from_sort_key)
+  OR NEW.serial_to_sort_key <> upper(NEW.serial_to_sort_key)
+  OR NEW.serial_from_sort_key GLOB '*[^A-F0-9]*'
+  OR NEW.serial_to_sort_key GLOB '*[^A-F0-9]*'
+  OR substr(NEW.serial_from_sort_key, 1, 2) <> '01'
+  OR substr(NEW.serial_to_sort_key, 1, 2) <> '01'
+  OR substr(NEW.serial_from_sort_key, -2) <> '00'
+  OR substr(NEW.serial_to_sort_key, -2) <> '00'
+  OR NEW.serial_from_sort_key COLLATE BINARY
+       > NEW.serial_to_sort_key COLLATE BINARY
+  OR NOT EXISTS (
+    SELECT 1 FROM aircraft_serial_number_schemes scheme
+    WHERE scheme.id = NEW.aircraft_serial_number_scheme_id
+      AND scheme.normalization_version = 'natural_alphanumeric_segments_v1'
+  )
+  OR (
+    NEW.serial_prefix IS NOT NULL
+    AND (
+      NEW.serial_prefix <> upper(NEW.serial_prefix)
+      OR NEW.serial_prefix GLOB '*[^A-Z0-9]*'
+      OR substr(NEW.serial_from_display, 1, length(NEW.serial_prefix))
+           <> NEW.serial_prefix
+      OR substr(NEW.serial_to_display, 1, length(NEW.serial_prefix))
+           <> NEW.serial_prefix
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'reference serial applicability requires the universal natural-order key');
+END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_scope_key_recompute_insert
+AFTER INSERT ON aircraft_reference_applicability_scopes
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_serial_key_errors error
+  WHERE error.scope_id = NEW.id
+)
+BEGIN SELECT RAISE(ABORT, 'reference serial sort keys must be recomputed from canonical display values'); END;
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_price_building_insert
 BEFORE INSERT ON aircraft_reference_prices
 WHEN NOT EXISTS (
@@ -5341,14 +5590,7 @@ WHEN NOT EXISTS (
   WHERE version.id = NEW.aircraft_reference_configuration_version_id
     AND version.publication_state = 'building'
 )
-OR (
-  NEW.evidence_kind = 'direct_model_year'
-  AND NEW.price_reference_year <> (
-    SELECT model_year FROM aircraft_reference_configuration_versions
-    WHERE id = NEW.aircraft_reference_configuration_version_id
-  )
-)
-BEGIN SELECT RAISE(ABORT, 'reference price requires a building version and consistent year'); END;
+BEGIN SELECT RAISE(ABORT, 'reference price requires a building version'); END;
 CREATE TRIGGER IF NOT EXISTS aircraft_reference_avionics_building_insert
 BEFORE INSERT ON aircraft_reference_avionics
 WHEN NOT EXISTS (
@@ -5404,6 +5646,14 @@ OR NOT EXISTS (
     )
 )
 BEGIN SELECT RAISE(ABORT, 'reference feature value does not match its definition'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_fact_set_building_insert
+BEFORE INSERT ON aircraft_reference_fact_set_attestations
+WHEN NOT EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = NEW.aircraft_reference_configuration_version_id
+    AND version.publication_state = 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'reference fact-set attestation requires a building version'); END;
 
 -- No profile fact can be changed after insertion. Correct data by publishing a
 -- replacement version rather than mutating a historical configuration.
@@ -5492,6 +5742,17 @@ WHEN EXISTS (
     AND version.publication_state <> 'building'
 )
 BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_fact_set_immutable_update
+BEFORE UPDATE ON aircraft_reference_fact_set_attestations
+BEGIN SELECT RAISE(ABORT, 'reference profile facts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS aircraft_reference_fact_set_immutable_delete
+BEFORE DELETE ON aircraft_reference_fact_set_attestations
+WHEN EXISTS (
+  SELECT 1 FROM aircraft_reference_configuration_versions version
+  WHERE version.id = OLD.aircraft_reference_configuration_version_id
+    AND version.publication_state <> 'building'
+)
+BEGIN SELECT RAISE(ABORT, 'published reference profile facts are immutable'); END;
 
 -- Publication requires a complete exact-year price and at least one applicable
 -- market/serial scope. It also rejects overlap with any already-published
@@ -5509,16 +5770,23 @@ BEGIN
     SELECT 1 FROM aircraft_reference_applicability_scopes scope
     WHERE scope.aircraft_reference_configuration_version_id = NEW.id
   );
-  SELECT RAISE(ABORT, 'published reference profile requires direct exact-year primary price evidence')
-  WHERE NOT EXISTS (
-    SELECT 1
+  SELECT RAISE(ABORT, 'published reference profile requires complete factory fact-set attestations')
+  WHERE 4 <> (
+    SELECT COUNT(*) FROM aircraft_reference_fact_set_attestations attestation
+    WHERE attestation.aircraft_reference_configuration_version_id = NEW.id
+  );
+  SELECT RAISE(ABORT, 'published reference profile requires exactly one direct exact-model-year full-configuration equipped MSRP with primary price evidence')
+  WHERE 1 <> (
+    SELECT COUNT(*)
     FROM aircraft_reference_prices price
     JOIN curation_evidence_claims claim ON claim.id = price.evidence_claim_id
     JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
     WHERE price.aircraft_reference_configuration_version_id = NEW.id
-      AND price.price_kind IN ('base_msrp', 'equipped_msrp')
+      AND price.currency = 'USD'
+      AND price.price_kind = 'equipped_msrp'
       AND price.evidence_kind = 'direct_model_year'
-      AND price.price_reference_year = NEW.model_year
+      AND price.configuration_basis = 'full_standard_configuration'
+      AND claim.claim_kind = 'price'
       AND claim.validation_status = 'validated'
       AND source.source_tier IN ('manufacturer_primary', 'regulator_primary')
   );
@@ -5546,28 +5814,36 @@ BEGIN
   WHERE EXISTS (
     SELECT 1
     FROM (
-      SELECT evidence_claim_id FROM aircraft_reference_applicability_scopes
+      SELECT evidence_claim_id, 'applicability' AS evidence_domain FROM aircraft_reference_applicability_scopes
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_prices
+      SELECT evidence_claim_id, 'price' FROM aircraft_reference_prices
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_avionics
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_avionics
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_engines
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_engines
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_propellers
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_propellers
       WHERE aircraft_reference_configuration_version_id = NEW.id
       UNION ALL
-      SELECT evidence_claim_id FROM aircraft_reference_features
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_features
+      WHERE aircraft_reference_configuration_version_id = NEW.id
+      UNION ALL
+      SELECT evidence_claim_id, 'factory' FROM aircraft_reference_fact_set_attestations
       WHERE aircraft_reference_configuration_version_id = NEW.id
     ) fact
     JOIN curation_evidence_claims claim ON claim.id = fact.evidence_claim_id
     JOIN curation_evidence_sources source ON source.id = claim.evidence_source_id
     WHERE claim.validation_status <> 'validated'
        OR source.source_tier NOT IN ('manufacturer_primary', 'regulator_primary')
+       OR (fact.evidence_domain = 'applicability' AND claim.claim_kind <> 'applicability')
+       OR (fact.evidence_domain = 'price' AND claim.claim_kind <> 'price')
+       OR (fact.evidence_domain = 'factory' AND claim.claim_kind NOT IN (
+         'standard_equipment', 'package_composition', 'specification'
+       ))
   );
   SELECT RAISE(ABORT, 'reference profile contains overlapping applicability scopes')
   WHERE EXISTS (
@@ -5581,20 +5857,26 @@ BEGIN
       AND (
         left_scope.applies_to_all_serials = 1
         OR right_scope.applies_to_all_serials = 1
-        OR (
-          left_scope.aircraft_serial_number_scheme_id = right_scope.aircraft_serial_number_scheme_id
-          AND coalesce(left_scope.serial_prefix, '') = coalesce(right_scope.serial_prefix, '')
-          AND left_scope.serial_from_sort_key <= right_scope.serial_to_sort_key
-          AND right_scope.serial_from_sort_key <= left_scope.serial_to_sort_key
-        )
+        OR (left_scope.serial_from_sort_key COLLATE BINARY
+              <= right_scope.serial_to_sort_key COLLATE BINARY
+          AND right_scope.serial_from_sort_key COLLATE BINARY
+              <= left_scope.serial_to_sort_key COLLATE BINARY)
       )
   );
   SELECT RAISE(ABORT, 'published reference profile applicability overlaps an existing version')
   WHERE EXISTS (
     SELECT 1
     FROM aircraft_reference_applicability_scopes candidate
+    JOIN aircraft_markets candidate_market
+      ON candidate_market.id = candidate.aircraft_market_id
     JOIN aircraft_reference_applicability_scopes existing
       ON existing.aircraft_market_id = candidate.aircraft_market_id
+      OR candidate_market.code = 'GLOBAL'
+      OR EXISTS (
+        SELECT 1 FROM aircraft_markets existing_market
+        WHERE existing_market.id = existing.aircraft_market_id
+          AND existing_market.code = 'GLOBAL'
+      )
     JOIN aircraft_reference_configuration_versions existing_version
       ON existing_version.id = existing.aircraft_reference_configuration_version_id
     WHERE candidate.aircraft_reference_configuration_version_id = NEW.id
@@ -5605,12 +5887,10 @@ BEGIN
       AND (
         candidate.applies_to_all_serials = 1
         OR existing.applies_to_all_serials = 1
-        OR (
-          candidate.aircraft_serial_number_scheme_id = existing.aircraft_serial_number_scheme_id
-          AND coalesce(candidate.serial_prefix, '') = coalesce(existing.serial_prefix, '')
-          AND candidate.serial_from_sort_key <= existing.serial_to_sort_key
-          AND existing.serial_from_sort_key <= candidate.serial_to_sort_key
-        )
+        OR (candidate.serial_from_sort_key COLLATE BINARY
+              <= existing.serial_to_sort_key COLLATE BINARY
+          AND existing.serial_from_sort_key COLLATE BINARY
+              <= candidate.serial_to_sort_key COLLATE BINARY)
       )
   );
 END;
@@ -7119,18 +7399,6 @@ WHEN NOT EXISTS (
       SELECT 1 FROM rental_aircraft_offerings child
       WHERE child.aircraft_model_variant_id = legacy_variant.id
     )
-    AND NOT EXISTS (
-      SELECT 1 FROM aircraft_model_spec_versions child
-      WHERE child.aircraft_model_variant_id = legacy_variant.id
-    )
-    AND NOT EXISTS (
-      SELECT 1 FROM aircraft_model_variant_price_points child
-      WHERE child.aircraft_model_variant_id = legacy_variant.id
-    )
-    AND NOT EXISTS (
-      SELECT 1 FROM aircraft_model_variant_default_avionics child
-      WHERE child.aircraft_model_variant_id = legacy_variant.id
-    )
 )
 BEGIN
   SELECT RAISE(ABORT, 'aircraft compatibility projection requires the active command, exact copied assignment provenance, and its fresh reserved hierarchy');
@@ -7706,43 +7974,6 @@ WHEN NEW.ingestion_state = 'ready'
 BEGIN
   SELECT RAISE(ABORT, 'pending aircraft compatibility placeholder cannot become ready');
 END;
-
--- Existing valuation rows may be inserted for a projected variant, but an
--- UPDATE cannot silently move evidence into or out of a canonical projection.
-CREATE TRIGGER IF NOT EXISTS projected_aircraft_spec_variant_move
-BEFORE UPDATE OF aircraft_model_variant_id ON aircraft_model_spec_versions
-WHEN NEW.aircraft_model_variant_id <> OLD.aircraft_model_variant_id
- AND (
-   EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-           WHERE aircraft_model_variant_id = OLD.aircraft_model_variant_id)
-   OR EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id)
- )
-BEGIN SELECT RAISE(ABORT, 'aircraft spec evidence cannot move into or out of a projected variant'); END;
-
-CREATE TRIGGER IF NOT EXISTS projected_aircraft_price_variant_move
-BEFORE UPDATE OF aircraft_model_variant_id
-ON aircraft_model_variant_price_points
-WHEN NEW.aircraft_model_variant_id <> OLD.aircraft_model_variant_id
- AND (
-   EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-           WHERE aircraft_model_variant_id = OLD.aircraft_model_variant_id)
-   OR EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id)
- )
-BEGIN SELECT RAISE(ABORT, 'aircraft price evidence cannot move into or out of a projected variant'); END;
-
-CREATE TRIGGER IF NOT EXISTS projected_aircraft_default_avionics_variant_move
-BEFORE UPDATE OF aircraft_model_variant_id
-ON aircraft_model_variant_default_avionics
-WHEN NEW.aircraft_model_variant_id <> OLD.aircraft_model_variant_id
- AND (
-   EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-           WHERE aircraft_model_variant_id = OLD.aircraft_model_variant_id)
-   OR EXISTS (SELECT 1 FROM aircraft_valuation_compatibility_projections
-              WHERE aircraft_model_variant_id = NEW.aircraft_model_variant_id)
- )
-BEGIN SELECT RAISE(ABORT, 'default avionics evidence cannot move into or out of a projected variant'); END;
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -9563,3 +9794,150 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = excluded.contract_version,
   contract_fingerprint = excluded.contract_fingerprint,
   installed_at = excluded.installed_at;
+
+-- Re-materialize the exact post-DDL object set. Keeping a sqlite_schema-backed
+-- view alive across the schema would make every intervening DDL reprepare it.
+CREATE TEMP TABLE reference_catalog_schema_owned_objects AS
+WITH
+protected_relations(name) AS (
+  VALUES
+    ('plugin_submissions'),
+    ('avionics_models'),
+    ('aircraft_engine_catalog_models'),
+    ('aircraft_propeller_catalog_models'),
+    ('aircraft_makes'),
+    ('aircraft_model_families'),
+    ('aircraft_designations'),
+    ('aircraft_make_aliases'),
+    ('aircraft_family_aliases'),
+    ('aircraft_designation_aliases'),
+    ('aircraft_designation_identifiers'),
+    ('aircraft_generations'),
+    ('aircraft_generation_designations'),
+    ('aircraft_factory_packages'),
+    ('aircraft_package_applicability'),
+    ('aircraft_reference_configurations'),
+    ('aircraft_serial_number_schemes'),
+    ('aircraft_feature_definitions'),
+    ('aircraft_reference_configuration_versions'),
+    ('aircraft_reference_applicability_scopes'),
+    ('aircraft_reference_prices'),
+    ('aircraft_reference_avionics'),
+    ('aircraft_reference_engines'),
+    ('aircraft_reference_propellers'),
+    ('aircraft_reference_features'),
+    ('aircraft_reference_fact_set_attestations'),
+    ('official_dollar_normalization_facts'),
+    ('aircraft_valuation_compatibility_projections'),
+    ('listing_verification_run_items')
+),
+retired_relations(name) AS (
+  VALUES
+    ('aircraft_model_spec_versions'),
+    ('aircraft_model_variant_price_points'),
+    ('aircraft_model_variant_default_avionics'),
+    ('aircraft_model_variant_default_avionics_candidates'),
+    ('depreciation_profiles'),
+    ('depreciation_profile_fit_metadata'),
+    ('component_depreciation_profiles')
+),
+owned_relations(name) AS (
+  SELECT name FROM protected_relations
+  UNION ALL SELECT name FROM retired_relations
+)
+SELECT
+  schema_row.type || ':' || schema_row.name AS object_key,
+  COALESCE(lower(replace(replace(replace(replace(
+    schema_row.sql, char(9), ''
+  ), char(10), ''), char(13), ''), ' ', '')), '') AS definition
+FROM sqlite_schema schema_row
+WHERE (
+  schema_row.type = 'table'
+  AND schema_row.name IN (SELECT name FROM owned_relations)
+) OR (
+  schema_row.name IN (SELECT name FROM retired_relations)
+  OR schema_row.tbl_name IN (SELECT name FROM retired_relations)
+) OR (
+  schema_row.type = 'view'
+  AND schema_row.name = 'aircraft_reference_serial_key_errors'
+) OR (
+  schema_row.type = 'trigger'
+  AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
+)
+UNION ALL
+SELECT
+  'index:' || relation.name || ':' || index_row.name,
+  index_row.[unique] || ':' || index_row.origin || ':' ||
+    index_row.partial || ':' || COALESCE(lower(replace(replace(replace(replace(
+      (SELECT sql FROM sqlite_schema WHERE type = 'index'
+       AND name = index_row.name), char(9), ''
+    ), char(10), ''), char(13), ''), ' ', '')), '') || ':' || COALESCE((
+      SELECT group_concat(index_column.signature, ',')
+      FROM (
+        SELECT
+          xinfo.seqno || ':' || xinfo.cid || ':' ||
+          COALESCE(xinfo.name, '') || ':' || xinfo.desc || ':' ||
+          xinfo.coll || ':' || xinfo.key AS signature
+        FROM pragma_index_xinfo(index_row.name) xinfo
+        ORDER BY xinfo.seqno
+      ) index_column
+    ), '')
+FROM owned_relations relation
+JOIN pragma_index_list(relation.name) index_row;
+
+CREATE TEMP TABLE reference_catalog_schema_postflight (
+  valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO reference_catalog_schema_postflight (valid)
+SELECT CASE WHEN
+  (SELECT count(*) FROM reference_catalog_schema_owned_objects) <>
+    213
+  OR EXISTS (
+    SELECT object_key, definition
+    FROM reference_catalog_schema_owned_objects
+    EXCEPT
+    SELECT object_key, definition
+    FROM reference_catalog_schema_expected_objects
+  )
+  OR EXISTS (
+    SELECT object_key, definition
+    FROM reference_catalog_schema_expected_objects
+    EXCEPT
+    SELECT object_key, definition
+    FROM reference_catalog_schema_owned_objects
+  )
+  OR EXISTS (
+    SELECT 1 FROM sqlite_schema
+    WHERE name IN (
+      'aircraft_model_spec_versions',
+      'aircraft_model_variant_price_points',
+      'aircraft_model_variant_default_avionics',
+      'aircraft_model_variant_default_avionics_candidates',
+      'depreciation_profiles',
+      'depreciation_profile_fit_metadata',
+      'component_depreciation_profiles'
+    ) OR tbl_name IN (
+      'aircraft_model_spec_versions',
+      'aircraft_model_variant_price_points',
+      'aircraft_model_variant_default_avionics',
+      'aircraft_model_variant_default_avionics_candidates',
+      'depreciation_profiles',
+      'depreciation_profile_fit_metadata',
+      'component_depreciation_profiles'
+    )
+  )
+THEN 0 ELSE 1 END;
+DROP TABLE reference_catalog_schema_postflight;
+DROP TABLE reference_catalog_schema_owned_objects;
+DROP TABLE reference_catalog_schema_expected_objects;
+
+-- This completion marker is deliberately last: every cutover relation,
+-- trigger, and canonical definition must exist before provenance is recorded.
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260819_reference_catalog_cutover', 1,
+  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;

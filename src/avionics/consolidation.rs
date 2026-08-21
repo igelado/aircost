@@ -252,10 +252,6 @@ pub struct ConsolidationChangeCounts {
     pub type_memberships_added: usize,
     pub listing_links_remapped: usize,
     pub listing_link_conflicts_coalesced: usize,
-    pub default_links_remapped: usize,
-    pub default_link_conflicts_coalesced: usize,
-    pub default_candidate_links_remapped: usize,
-    pub default_candidate_link_conflicts_coalesced: usize,
     pub reference_links_remapped: usize,
     pub reference_link_conflicts_coalesced: usize,
     pub suite_links_remapped: usize,
@@ -427,37 +423,6 @@ struct ListingLinkRow {
 }
 
 #[derive(Clone, Debug, FromRow)]
-struct DefaultLinkRow {
-    id: i64,
-    aircraft_model_variant_id: i64,
-    model_year: i64,
-    avionics_model_id: i64,
-    quantity: i64,
-    source_url: String,
-    source_title: String,
-    source_notes: String,
-    source_confidence: String,
-}
-
-#[derive(Clone, Debug, FromRow)]
-struct DefaultCandidateLinkRow {
-    id: i64,
-    quarantined_default_avionics_id: Option<i64>,
-    aircraft_model_variant_id: i64,
-    model_year: i64,
-    avionics_model_id: i64,
-    quantity: i64,
-    source_url: String,
-    source_title: String,
-    source_notes: String,
-    source_confidence: String,
-    pending_reason: String,
-    quarantined_created_at: Option<String>,
-    quarantined_updated_at: Option<String>,
-    created_at: String,
-}
-
-#[derive(Clone, Debug, FromRow)]
 struct ReferenceLinkRow {
     id: i64,
     aircraft_reference_configuration_version_id: i64,
@@ -505,8 +470,6 @@ struct CatalogState {
     models: Vec<ModelRow>,
     model_types: Vec<ModelTypeRow>,
     listing_links: Vec<ListingLinkRow>,
-    default_links: Vec<DefaultLinkRow>,
-    default_candidate_links: Vec<DefaultCandidateLinkRow>,
     reference_links: Vec<ReferenceLinkRow>,
     suite_links: Vec<SuiteLinkRow>,
     pending_reviews: Vec<PendingReviewRow>,
@@ -517,18 +480,6 @@ struct CatalogState {
 #[derive(Clone, Debug)]
 struct ListingLinkPlan {
     keeper: ListingLinkRow,
-    deleted_ids: Vec<i64>,
-}
-
-#[derive(Clone, Debug)]
-struct DefaultLinkPlan {
-    keeper: DefaultLinkRow,
-    deleted_ids: Vec<i64>,
-}
-
-#[derive(Clone, Debug)]
-struct DefaultCandidateLinkPlan {
-    keeper: DefaultCandidateLinkRow,
     deleted_ids: Vec<i64>,
 }
 
@@ -566,8 +517,6 @@ struct ConsolidationPlan {
     duplicate_ids: BTreeSet<i64>,
     type_ids_to_add: Vec<i64>,
     listing_links: Vec<ListingLinkPlan>,
-    default_links: Vec<DefaultLinkPlan>,
-    default_candidate_links: Vec<DefaultCandidateLinkPlan>,
     reference_links: Vec<ReferenceLinkPlan>,
     suite_original_rows_to_delete: Vec<(i64, i64)>,
     suite_links_to_upsert: Vec<SuiteLinkPlan>,
@@ -638,20 +587,6 @@ macro_rules! load_catalog_state {
                  ON listing.id = link.aircraft_sale_listing_id
                ORDER BY link.id"#,
         );
-        let defaults_sql = $db.sql(
-            r#"SELECT id, aircraft_model_variant_id, model_year, avionics_model_id,
-                      quantity, source_url, source_title, source_notes, source_confidence
-               FROM aircraft_model_variant_default_avionics ORDER BY id"#,
-        );
-        let default_candidates_sql = $db.sql(
-            r#"SELECT id, quarantined_default_avionics_id,
-                      aircraft_model_variant_id, model_year, avionics_model_id,
-                      quantity, source_url, source_title, source_notes,
-                      source_confidence, pending_reason,
-                      quarantined_created_at, quarantined_updated_at, created_at
-               FROM aircraft_model_variant_default_avionics_candidates
-               ORDER BY id"#,
-        );
         let references_sql = $db.sql(
             r#"SELECT link.id, link.aircraft_reference_configuration_version_id,
                       link.avionics_model_id, link.quantity, link.equipment_role,
@@ -703,13 +638,6 @@ macro_rules! load_catalog_state {
             listing_links: sqlx::query_as::<_, ListingLinkRow>(&listing_sql)
                 .fetch_all($executor)
                 .await?,
-            default_links: sqlx::query_as::<_, DefaultLinkRow>(&defaults_sql)
-                .fetch_all($executor)
-                .await?,
-            default_candidate_links:
-                sqlx::query_as::<_, DefaultCandidateLinkRow>(&default_candidates_sql)
-                    .fetch_all($executor)
-                    .await?,
             reference_links: sqlx::query_as::<_, ReferenceLinkRow>(&references_sql)
                 .fetch_all($executor)
                 .await?,
@@ -1337,151 +1265,6 @@ fn validate_post_remap_listing_action_graph(
     }
 }
 
-fn plan_default_links(
-    rows: &[DefaultLinkRow],
-    survivor_id: i64,
-    duplicate_ids: &BTreeSet<i64>,
-) -> Vec<DefaultLinkPlan> {
-    let mut grouped = BTreeMap::<(i64, i64, i64), Vec<DefaultLinkRow>>::new();
-    for row in rows {
-        grouped
-            .entry((
-                row.aircraft_model_variant_id,
-                row.model_year,
-                remap_model_id(row.avionics_model_id, survivor_id, duplicate_ids),
-            ))
-            .or_default()
-            .push(row.clone());
-    }
-    let mut plans = Vec::new();
-    for ((_variant_id, _year, mapped_model), mut group) in grouped {
-        if !group
-            .iter()
-            .any(|row| duplicate_ids.contains(&row.avionics_model_id))
-        {
-            continue;
-        }
-        group.sort_by_key(|row| (usize::from(row.avionics_model_id != survivor_id), row.id));
-        let mut keeper = group[0].clone();
-        keeper.avionics_model_id = mapped_model;
-        keeper.quantity = group
-            .iter()
-            .map(|row| row.quantity.max(1))
-            .max()
-            .unwrap_or(1);
-        keeper.source_confidence =
-            conservative_confidence(group.iter().map(|row| Some(row.source_confidence.as_str())))
-                .unwrap_or_else(|| "low".to_string());
-        let mut notes = group
-            .iter()
-            .map(|row| row.source_notes.clone())
-            .collect::<Vec<_>>();
-        if group
-            .iter()
-            .map(|row| (row.source_url.as_str(), row.source_title.as_str()))
-            .collect::<BTreeSet<_>>()
-            .len()
-            > 1
-        {
-            notes.extend(group.iter().map(|row| {
-                format!(
-                    "Catalog consolidation retained default-link {} evidence: {} ({})",
-                    row.id, row.source_title, row.source_url
-                )
-            }));
-        }
-        keeper.source_notes = combined_lines(notes);
-        let deleted_ids = group
-            .iter()
-            .filter(|row| row.id != keeper.id)
-            .map(|row| row.id)
-            .collect();
-        plans.push(DefaultLinkPlan {
-            keeper,
-            deleted_ids,
-        });
-    }
-    plans
-}
-
-fn default_candidate_claims_are_identical(
-    left: &DefaultCandidateLinkRow,
-    right: &DefaultCandidateLinkRow,
-) -> bool {
-    left.quarantined_default_avionics_id == right.quarantined_default_avionics_id
-        && left.aircraft_model_variant_id == right.aircraft_model_variant_id
-        && left.model_year == right.model_year
-        && left.quantity == right.quantity
-        && left.source_url == right.source_url
-        && left.source_title == right.source_title
-        && left.source_notes == right.source_notes
-        && left.source_confidence == right.source_confidence
-        && left.pending_reason == right.pending_reason
-        && left.quarantined_created_at == right.quarantined_created_at
-        && left.quarantined_updated_at == right.quarantined_updated_at
-}
-
-fn plan_default_candidate_links(
-    rows: &[DefaultCandidateLinkRow],
-    canonical_rows: &[DefaultLinkRow],
-    survivor_id: i64,
-    duplicate_ids: &BTreeSet<i64>,
-    blockers: &mut Vec<String>,
-) -> Vec<DefaultCandidateLinkPlan> {
-    let mut grouped = BTreeMap::<(i64, i64, i64), Vec<DefaultCandidateLinkRow>>::new();
-    for row in rows {
-        grouped
-            .entry((
-                row.aircraft_model_variant_id,
-                row.model_year,
-                remap_model_id(row.avionics_model_id, survivor_id, duplicate_ids),
-            ))
-            .or_default()
-            .push(row.clone());
-    }
-
-    let mut plans = Vec::new();
-    for ((variant_id, model_year, mapped_model_id), mut group) in grouped {
-        if !group
-            .iter()
-            .any(|row| duplicate_ids.contains(&row.avionics_model_id))
-        {
-            continue;
-        }
-        if canonical_rows.iter().any(|row| {
-            row.aircraft_model_variant_id == variant_id
-                && row.model_year == model_year
-                && row.avionics_model_id == mapped_model_id
-        }) {
-            blockers.push(format!(
-                "pending default avionics candidate would collide with canonical default for aircraft variant {variant_id}, year {model_year}, model {mapped_model_id}"
-            ));
-            continue;
-        }
-
-        group.sort_by_key(|row| (usize::from(row.avionics_model_id != survivor_id), row.id));
-        let keeper = &group[0];
-        if group
-            .iter()
-            .skip(1)
-            .any(|candidate| !default_candidate_claims_are_identical(keeper, candidate))
-        {
-            blockers.push(format!(
-                "pending default avionics candidates for aircraft variant {variant_id}, year {model_year}, model {mapped_model_id} contain conflicting claims and cannot be coalesced"
-            ));
-            continue;
-        }
-
-        let mut remapped_keeper = keeper.clone();
-        remapped_keeper.avionics_model_id = mapped_model_id;
-        plans.push(DefaultCandidateLinkPlan {
-            keeper: remapped_keeper,
-            deleted_ids: group.iter().map(|row| row.id).collect(),
-        });
-    }
-    plans
-}
-
 fn plan_reference_links(
     rows: &[ReferenceLinkRow],
     survivor_id: i64,
@@ -2027,14 +1810,6 @@ fn build_plan_with_authority(
         &duplicate_ids,
         &mut blockers,
     );
-    let default_links = plan_default_links(&state.default_links, survivor_id, &duplicate_ids);
-    let default_candidate_links = plan_default_candidate_links(
-        &state.default_candidate_links,
-        &state.default_links,
-        survivor_id,
-        &duplicate_ids,
-        &mut blockers,
-    );
     let reference_links = plan_reference_links(
         &state.reference_links,
         survivor_id,
@@ -2117,24 +1892,6 @@ fn build_plan_with_authority(
             .iter()
             .map(|plan| plan.deleted_ids.len())
             .sum(),
-        default_links_remapped: state
-            .default_links
-            .iter()
-            .filter(|row| duplicate_ids.contains(&row.avionics_model_id))
-            .count(),
-        default_link_conflicts_coalesced: default_links
-            .iter()
-            .map(|plan| plan.deleted_ids.len())
-            .sum(),
-        default_candidate_links_remapped: state
-            .default_candidate_links
-            .iter()
-            .filter(|row| duplicate_ids.contains(&row.avionics_model_id))
-            .count(),
-        default_candidate_link_conflicts_coalesced: default_candidate_links
-            .iter()
-            .map(|plan| plan.deleted_ids.len().saturating_sub(1))
-            .sum(),
         reference_links_remapped: state
             .reference_links
             .iter()
@@ -2175,8 +1932,6 @@ fn build_plan_with_authority(
         duplicate_ids,
         type_ids_to_add,
         listing_links,
-        default_links,
-        default_candidate_links,
         reference_links,
         suite_original_rows_to_delete,
         suite_links_to_upsert,
@@ -2974,16 +2729,6 @@ fn reference_strength(state: &CatalogState, model_id: i64) -> CanonicalLegacyRef
             row.avionics_model_id == model_id || row.replaces_avionics_model_id == Some(model_id)
         })
         .collect::<Vec<_>>();
-    let default_count = state
-        .default_links
-        .iter()
-        .filter(|row| row.avionics_model_id == model_id)
-        .count();
-    let default_candidate_count = state
-        .default_candidate_links
-        .iter()
-        .filter(|row| row.avionics_model_id == model_id)
-        .count();
     let reference_count = state
         .reference_links
         .iter()
@@ -2994,8 +2739,7 @@ fn reference_strength(state: &CatalogState, model_id: i64) -> CanonicalLegacyRef
         .iter()
         .filter(|row| row.suite_model_id == model_id || row.component_model_id == model_id)
         .count();
-    let global_reference_count =
-        default_count + default_candidate_count + reference_count + suite_count;
+    let global_reference_count = reference_count + suite_count;
     CanonicalLegacyReferenceStrength {
         global_reference_count,
         reviewer_confirmed_listing_reference_count: listing_rows
@@ -3185,7 +2929,7 @@ async fn consolidate_avionics_models_internal(
             "UPDATE avionics_models SET updated_at = updated_at WHERE id = ?",
         ),
         DatabaseBackend::Postgres(_) => db.sql(
-            "LOCK TABLE avionics_models, avionics_manufacturers, avionics_manufacturer_canonical_keys, avionics_manufacturer_identities, avionics_manufacturer_identity_memberships, avionics_manufacturer_identity_merges, avionics_manufacturer_alias_candidates, avionics_approved_product_identities, avionics_model_types, avionics_types, avionics_product_reuse_attestations, avionics_authoritative_source_origins, avionics_authoritative_source_origin_revocations, aircraft_sale_listings, aircraft_sale_listing_avionics, aircraft_model_variant_default_avionics, aircraft_model_variant_default_avionics_candidates, aircraft_reference_configuration_versions, aircraft_reference_avionics, avionics_suite_components, aircraft_sale_listing_pending_reviews, avionics_catalog_consolidation_guard, avionics_catalog_grounded_consolidation_authorizations, avionics_catalog_grounded_consolidation_guard, avionics_catalog_grounded_consolidation_claim, avionics_catalog_human_consolidation_authorizations, avionics_catalog_human_consolidation_members, avionics_catalog_human_consolidation_guard, avionics_catalog_human_consolidation_claim IN SHARE ROW EXCLUSIVE MODE",
+            "LOCK TABLE avionics_models, avionics_manufacturers, avionics_manufacturer_canonical_keys, avionics_manufacturer_identities, avionics_manufacturer_identity_memberships, avionics_manufacturer_identity_merges, avionics_manufacturer_alias_candidates, avionics_approved_product_identities, avionics_model_types, avionics_types, avionics_product_reuse_attestations, avionics_authoritative_source_origins, avionics_authoritative_source_origin_revocations, aircraft_sale_listings, aircraft_sale_listing_avionics, aircraft_reference_configuration_versions, aircraft_reference_avionics, avionics_suite_components, aircraft_sale_listing_pending_reviews, avionics_catalog_consolidation_guard, avionics_catalog_grounded_consolidation_authorizations, avionics_catalog_grounded_consolidation_guard, avionics_catalog_grounded_consolidation_claim, avionics_catalog_human_consolidation_authorizations, avionics_catalog_human_consolidation_members, avionics_catalog_human_consolidation_guard, avionics_catalog_human_consolidation_claim IN SHARE ROW EXCLUSIVE MODE",
         ),
     };
     let insert_guard = db.sql(
@@ -3274,23 +3018,6 @@ async fn consolidate_avionics_models_internal(
                configuration_action = ?, replaces_avionics_model_id = ?,
                source_confidence = ?, updated_at = CURRENT_TIMESTAMP
            WHERE id = ?"#,
-    );
-    let delete_default = db.sql("DELETE FROM aircraft_model_variant_default_avionics WHERE id = ?");
-    let update_default = db.sql(
-        r#"UPDATE aircraft_model_variant_default_avionics
-           SET avionics_model_id = ?, quantity = ?, source_notes = ?,
-               source_confidence = ?, updated_at = CURRENT_TIMESTAMP
-           WHERE id = ?"#,
-    );
-    let delete_default_candidate =
-        db.sql("DELETE FROM aircraft_model_variant_default_avionics_candidates WHERE id = ?");
-    let insert_default_candidate = db.sql(
-        r#"INSERT INTO aircraft_model_variant_default_avionics_candidates (
-             id, quarantined_default_avionics_id, aircraft_model_variant_id,
-             model_year, avionics_model_id, quantity, source_url, source_title,
-             source_notes, source_confidence, pending_reason,
-             quarantined_created_at, quarantined_updated_at, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     );
     let delete_reference = db.sql("DELETE FROM aircraft_reference_avionics WHERE id = ?");
     let update_reference =
@@ -3741,67 +3468,6 @@ async fn consolidate_avionics_models_internal(
                 if changed != 1 {
                     return Err(ConsolidationError::Conflict(format!(
                         "listing avionics link {} changed during consolidation",
-                        link.keeper.id
-                    )));
-                }
-            }
-            for link in &plan.default_links {
-                for deleted_id in &link.deleted_ids {
-                    sqlx::query(&delete_default)
-                        .bind(*deleted_id)
-                        .execute(&mut *transaction)
-                        .await?;
-                }
-                let changed = sqlx::query(&update_default)
-                    .bind(link.keeper.avionics_model_id)
-                    .bind(link.keeper.quantity)
-                    .bind(link.keeper.source_notes.as_str())
-                    .bind(link.keeper.source_confidence.as_str())
-                    .bind(link.keeper.id)
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected();
-                if changed != 1 {
-                    return Err(ConsolidationError::Conflict(format!(
-                        "default avionics link {} changed during consolidation",
-                        link.keeper.id
-                    )));
-                }
-            }
-            for link in &plan.default_candidate_links {
-                for deleted_id in &link.deleted_ids {
-                    let deleted = sqlx::query(&delete_default_candidate)
-                        .bind(*deleted_id)
-                        .execute(&mut *transaction)
-                        .await?
-                        .rows_affected();
-                    if deleted != 1 {
-                        return Err(ConsolidationError::Conflict(format!(
-                            "pending default avionics candidate {deleted_id} changed during consolidation"
-                        )));
-                    }
-                }
-                let inserted = sqlx::query(&insert_default_candidate)
-                    .bind(link.keeper.id)
-                    .bind(link.keeper.quarantined_default_avionics_id)
-                    .bind(link.keeper.aircraft_model_variant_id)
-                    .bind(link.keeper.model_year)
-                    .bind(link.keeper.avionics_model_id)
-                    .bind(link.keeper.quantity)
-                    .bind(link.keeper.source_url.as_str())
-                    .bind(link.keeper.source_title.as_str())
-                    .bind(link.keeper.source_notes.as_str())
-                    .bind(link.keeper.source_confidence.as_str())
-                    .bind(link.keeper.pending_reason.as_str())
-                    .bind(link.keeper.quarantined_created_at.as_deref())
-                    .bind(link.keeper.quarantined_updated_at.as_deref())
-                    .bind(link.keeper.created_at.as_str())
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected();
-                if inserted != 1 {
-                    return Err(ConsolidationError::Conflict(format!(
-                        "pending default avionics candidate {} could not be remapped",
                         link.keeper.id
                     )));
                 }
@@ -4341,8 +4007,6 @@ mod tests {
             models,
             model_types: Vec::new(),
             listing_links: Vec::new(),
-            default_links: Vec::new(),
-            default_candidate_links: Vec::new(),
             reference_links: Vec::new(),
             suite_links: Vec::new(),
             pending_reviews: Vec::new(),
@@ -4653,7 +4317,6 @@ mod tests {
         for trigger in [
             "aircraft_sale_listing_avionics_approved_insert",
             "aircraft_sale_listing_avionics_semantic_unique_insert",
-            "aircraft_model_variant_default_avionics_approved_insert",
             "avionics_suite_components_approved_insert",
             "aircraft_reference_versions_require_approval",
             "aircraft_reference_avionics_building_insert",
@@ -4844,34 +4507,6 @@ mod tests {
         .await
         .unwrap();
 
-        let variant_id: i64 = sqlx::query_scalar(
-            r#"SELECT variant.id
-               FROM aircraft_model_variants variant
-               JOIN aircraft_models model ON model.id = variant.aircraft_model_id
-               JOIN aircraft_manufacturers manufacturer
-                 ON manufacturer.id = model.aircraft_manufacturer_id
-               WHERE manufacturer.normalized_name = 'cessna'
-                 AND model.normalized_name = '182t'
-                 AND variant.normalized_name = 'standard'"#,
-        )
-        .fetch_one(pool(&db))
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO aircraft_model_variant_default_avionics (
-                 aircraft_model_variant_id, model_year, avionics_model_id,
-                 quantity, source_url, source_title, source_notes,
-                 source_confidence
-               ) VALUES (?, 2004, ?, 1, 'https://factory.example/kap140',
-                         'Factory equipment list', 'KAP 140 standard', 'high')"#,
-        )
-        .bind(variant_id)
-        .bind(second_id)
-        .execute(pool(&db))
-        .await
-        .unwrap();
-        insert_default_candidate(&db, 9137, second_id, "retained KAP 140 claim").await;
-
         let (_, component_id) = insert_legacy_model(
             &db,
             "Legacy Component",
@@ -5024,8 +4659,6 @@ mod tests {
         assert_eq!(capabilities, vec!["Autopilot"]);
         for table in [
             "aircraft_sale_listing_avionics",
-            "aircraft_model_variant_default_avionics",
-            "aircraft_model_variant_default_avionics_candidates",
             "aircraft_reference_avionics",
         ] {
             let remapped: i64 = sqlx::query_scalar(&format!(
@@ -5428,149 +5061,6 @@ mod tests {
                 .contains(&format!("omitted=[{omitted_descriptive_id}]")),
             "{error}"
         );
-    }
-
-    async fn insert_default_candidate(
-        db: &AppDb,
-        id: i64,
-        avionics_model_id: i64,
-        source_notes: &str,
-    ) {
-        let variant_id: i64 = sqlx::query_scalar(
-            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
-        )
-        .fetch_one(pool(db))
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO aircraft_model_variant_default_avionics_candidates (
-                 id, aircraft_model_variant_id, model_year, avionics_model_id,
-                 quantity, source_url, source_title, source_notes,
-                 source_confidence, pending_reason, created_at
-               ) VALUES (?, ?, 2004, ?, 1, 'https://oem.example/manual',
-                         'OEM manual', ?, 'high',
-                         'factory_default_claim_unverified',
-                         '2026-07-30 12:00:00')"#,
-        )
-        .bind(id)
-        .bind(variant_id)
-        .bind(avionics_model_id)
-        .bind(source_notes)
-        .execute(pool(db))
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn consolidation_remaps_default_candidate_without_mutating_its_claim() {
-        let db = test_db().await;
-        let (manufacturer_id, survivor_id) = insert_legacy_model(
-            &db,
-            "Garmin",
-            "garmin",
-            "G1000",
-            &["Integrated Flight Deck"],
-        )
-        .await;
-        let (_, duplicate_id) = insert_legacy_model(
-            &db,
-            "Garmin",
-            "garmin",
-            "G1000 Integrated Flight Deck",
-            &["Integrated Flight Deck"],
-        )
-        .await;
-        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
-        insert_default_candidate(&db, 137, duplicate_id, "exact retained claim").await;
-
-        let mut request = human_consolidation_request(&db, survivor_id, vec![duplicate_id]).await;
-        let preview = preview_human_reviewed_avionics_model_consolidation(&db, &request)
-            .await
-            .unwrap();
-        assert!(preview.consolidation.can_apply, "{preview:?}");
-        assert_eq!(
-            preview
-                .consolidation
-                .changes
-                .default_candidate_links_remapped,
-            1
-        );
-        assert_eq!(
-            preview
-                .consolidation
-                .changes
-                .default_candidate_link_conflicts_coalesced,
-            0
-        );
-        request.expected_authorization_sha256 = Some(preview.authorization.authorization_sha256);
-
-        consolidate_avionics_models_with_human_review(&db, &request)
-            .await
-            .unwrap();
-        let preserved: (i64, i64, String, String) = sqlx::query_as(
-            r#"SELECT id, avionics_model_id, source_notes, created_at
-               FROM aircraft_model_variant_default_avionics_candidates
-               WHERE id = 137"#,
-        )
-        .fetch_one(pool(&db))
-        .await
-        .unwrap();
-        assert_eq!(
-            preserved,
-            (
-                137,
-                survivor_id,
-                "exact retained claim".to_string(),
-                "2026-07-30 12:00:00".to_string()
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn consolidation_rejects_conflicting_default_candidates() {
-        let db = test_db().await;
-        let (manufacturer_id, survivor_id) = insert_legacy_model(
-            &db,
-            "Garmin",
-            "garmin",
-            "G1000",
-            &["Integrated Flight Deck"],
-        )
-        .await;
-        let (_, duplicate_id) = insert_legacy_model(
-            &db,
-            "Garmin",
-            "garmin",
-            "G1000 Integrated Flight Deck",
-            &["Integrated Flight Deck"],
-        )
-        .await;
-        establish_evidence_backed_manufacturer_identity(&db, manufacturer_id).await;
-        insert_default_candidate(&db, 136, survivor_id, "survivor claim").await;
-        insert_default_candidate(&db, 137, duplicate_id, "conflicting duplicate claim").await;
-
-        let mut request = human_consolidation_request(&db, survivor_id, vec![duplicate_id]).await;
-        let preview = preview_human_reviewed_avionics_model_consolidation(&db, &request)
-            .await
-            .unwrap();
-        assert!(!preview.consolidation.can_apply);
-        assert_eq!(
-            preview
-                .consolidation
-                .changes
-                .default_candidate_links_remapped,
-            1
-        );
-        assert!(preview
-            .consolidation
-            .blockers
-            .iter()
-            .any(|blocker| blocker.contains("conflicting claims")));
-        request.expected_authorization_sha256 = Some(preview.authorization.authorization_sha256);
-        assert!(matches!(
-            consolidate_avionics_models_with_human_review(&db, &request).await,
-            Err(ConsolidationError::Conflict(_))
-        ));
     }
 
     #[tokio::test]
@@ -6309,145 +5799,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(duplicate_count, 1);
-    }
-
-    #[tokio::test]
-    async fn consolidation_remaps_default_suite_and_reference_roles() {
-        let db = test_db().await;
-        let (survivor_manufacturer_id, survivor_id) =
-            insert_legacy_model(&db, "BendixKing", "bendixking", "KX 155", &["NAV"]).await;
-        let (_, duplicate_id) =
-            insert_legacy_model(&db, "Bendix King", "bendix king", "KX-155", &["COM"]).await;
-        set_legacy_identifier(&db, survivor_id, "KX-155", "kx155").await;
-        set_legacy_identifier(&db, duplicate_id, "KX 155", "kx155").await;
-        establish_evidence_backed_manufacturer_identity(&db, survivor_manufacturer_id).await;
-        let (_, component_id) = insert_legacy_model(
-            &db,
-            "Legacy Component",
-            "legacy component",
-            "KI 209",
-            &["CDI"],
-        )
-        .await;
-        insert_listing(&db).await;
-        let variant_id: i64 = sqlx::query_scalar(
-            r#"SELECT variant.id
-               FROM aircraft_model_variants variant
-               JOIN aircraft_models model ON model.id = variant.aircraft_model_id
-               JOIN aircraft_manufacturers manufacturer
-                 ON manufacturer.id = model.aircraft_manufacturer_id
-               WHERE manufacturer.normalized_name = 'cessna'
-                 AND model.normalized_name = '182t'
-                 AND variant.normalized_name = 'standard'"#,
-        )
-        .fetch_one(pool(&db))
-        .await
-        .unwrap();
-        allow_legacy_fixture_inserts(&db).await;
-
-        for (model_id, quantity, suffix) in
-            [(survivor_id, 1_i64, "first"), (duplicate_id, 3, "second")]
-        {
-            sqlx::query(
-                r#"INSERT INTO aircraft_model_variant_default_avionics (
-                     aircraft_model_variant_id, model_year, avionics_model_id,
-                     quantity, source_url, source_title, source_notes, source_confidence
-                   ) VALUES (?, 2004, ?, ?, ?, ?, ?, 'high')"#,
-            )
-            .bind(variant_id)
-            .bind(model_id)
-            .bind(quantity)
-            .bind(format!("https://evidence.example/{suffix}"))
-            .bind(format!("{suffix} source"))
-            .bind(format!("{suffix} notes"))
-            .execute(pool(&db))
-            .await
-            .unwrap();
-        }
-        sqlx::query(
-            "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, 1), (?, ?, 4), (?, ?, 1)",
-        )
-        .bind(survivor_id)
-        .bind(component_id)
-        .bind(duplicate_id)
-        .bind(component_id)
-        .bind(survivor_id)
-        .bind(duplicate_id)
-        .execute(pool(&db))
-        .await
-        .unwrap();
-
-        // Only the directly joined version row is relevant to consolidation.
-        // Foreign keys are disabled on this fixture connection so the test
-        // need not construct the unrelated aircraft-curation hierarchy.
-        let mut connection = pool(&db).acquire().await.unwrap();
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"INSERT INTO aircraft_reference_configuration_versions (
-                 id, aircraft_reference_configuration_id, model_year, revision,
-                 publication_state, approval_decision_id
-               ) VALUES (9001, 9001, 2004, 1, 'building', 9001)"#,
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"INSERT INTO aircraft_reference_avionics (
-                 aircraft_reference_configuration_version_id, avionics_model_id,
-                 quantity, equipment_role, evidence_claim_id
-               ) VALUES (9001, ?, 1, 'standard', 9001),
-                        (9001, ?, 3, 'standard', 9001)"#,
-        )
-        .bind(survivor_id)
-        .bind(duplicate_id)
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        drop(connection);
-
-        let request = AvionicsConsolidationRequest {
-            survivor_id,
-            duplicate_ids: vec![duplicate_id],
-        };
-        let preview = preview_avionics_model_consolidation(&db, &request)
-            .await
-            .unwrap();
-        assert!(preview.can_apply, "{:?}", preview.blockers);
-        assert_eq!(preview.changes.default_link_conflicts_coalesced, 1);
-        assert_eq!(preview.changes.reference_link_conflicts_coalesced, 1);
-        assert_eq!(preview.changes.suite_link_conflicts_coalesced, 1);
-        assert_eq!(preview.changes.suite_self_links_removed, 1);
-        consolidate_avionics_models(&db, &request).await.unwrap();
-
-        let default_link: (i64, i64) = sqlx::query_as(
-            "SELECT avionics_model_id, quantity FROM aircraft_model_variant_default_avionics WHERE aircraft_model_variant_id = ? AND model_year = 2004",
-        )
-        .bind(variant_id)
-        .fetch_one(pool(&db))
-        .await
-        .unwrap();
-        assert_eq!(default_link, (survivor_id, 3));
-        let suite_link: (i64, i64, i64) = sqlx::query_as(
-            "SELECT suite_model_id, component_model_id, quantity FROM avionics_suite_components",
-        )
-        .fetch_one(pool(&db))
-        .await
-        .unwrap();
-        assert_eq!(suite_link, (survivor_id, component_id, 4));
-        let reference_link: (i64, i64) = sqlx::query_as(
-            "SELECT avionics_model_id, quantity FROM aircraft_reference_avionics WHERE aircraft_reference_configuration_version_id = 9001",
-        )
-        .fetch_one(pool(&db))
-        .await
-        .unwrap();
-        assert_eq!(reference_link, (survivor_id, 3));
     }
 
     #[tokio::test]

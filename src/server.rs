@@ -126,11 +126,6 @@ const VERIFICATION_RUN_IDLE_POLL: Duration = Duration::from_secs(10);
 static VERIFICATION_RUN_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
-struct AircraftVariantQuery {
-    annual_hours: Option<f64>,
-}
-
-#[derive(Debug, Deserialize)]
 struct PluginSubmissionStatusQuery {
     source_url: String,
 }
@@ -1318,7 +1313,6 @@ fn verification_run_json(run: &VerificationRun) -> Value {
         "running_items": run.running_items,
         "verified_items": run.verified_items,
         "pending_review_items": run.pending_review_items,
-        "pending_reference_items": run.pending_reference_items,
         "blocked_items": run.blocked_items,
         "failed_items": run.failed_items,
         "cancelled_items": run.cancelled_items,
@@ -1946,7 +1940,7 @@ async fn resolve_listing_review_handler(
     // Gemini or avionics-catalog writes. This also repairs legacy pending
     // reviews that predate aircraft identity assignment. When explicitly
     // requested below, post-commit finalization repeats the check to close the
-    // publication race around network enrichment.
+    // publication race.
     let review = get_listing_review(&state.db, user.id, listing_id).await?;
     require_current_review_revisions(&review.review, &payload)?;
     preflight_listing_review_resolution(&state.db, &review.review, &payload).await?;
@@ -1959,7 +1953,7 @@ async fn resolve_listing_review_handler(
         .await?;
     let resolved = resolve_listing_review(&state.db, user.id, listing_id, &payload).await?;
     if payload.finalize_listing {
-        finalize_reviewed_listing_ingestion(&state.db, listing_id, state.extractor.as_ref(), None)
+        finalize_reviewed_listing_ingestion(&state.db, listing_id)
             .await
             .map_err(|error| ApiError::from(error).with_code("listing_finalization_failed"))?;
     }
@@ -2264,24 +2258,12 @@ async fn aircraft_variant_detail_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(variant_id): Path<i64>,
-    Query(query): Query<AircraftVariantQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let user = load_current_user(&state.db, &headers).await?;
-    let annual_hours = match query.annual_hours {
-        Some(value) if value.is_finite() && (0.0..=2_000.0).contains(&value) => Some(value),
-        Some(_) => {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "annual_hours must be between 0 and 2000".to_string(),
-            ));
-        }
-        None => None,
-    };
     let detail = aircraft_variant_detail_with_model(
         &state.db,
         user.id,
         variant_id,
-        annual_hours,
         state.valuation_model.as_ref(),
     )
     .await
@@ -2854,7 +2836,6 @@ mod tests {
             "current_listing_id",
             "failed_items",
             "id",
-            "pending_reference_items",
             "pending_review_items",
             "queued_items",
             "running_items",

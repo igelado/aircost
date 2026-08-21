@@ -903,6 +903,12 @@ mod tests {
                     equipment_tokens: vec![],
                     valuation_facts: vec![],
                     technical_field_count: 5,
+                    factory_reference: Some(crate::valuation::FactoryReferenceFeature {
+                        configuration_id: 1,
+                        version_id: 1,
+                        full_standard_configuration_price_usd: log_price.exp(),
+                        nominal_dollar_year: 2026,
+                    }),
                 }
             })
             .collect()

@@ -18,6 +18,20 @@ INSERT INTO curation_evidence_claims (
   'validated', '2026-07-21'
 );
 
+INSERT INTO curation_evidence_claims (
+  evidence_source_id, claim_kind, subject_text, predicate_text, object_text,
+  quoted_evidence, validation_status, validated_at
+) VALUES
+  (1, 'applicability', 'aircraft', 'applies in', 'GLOBAL',
+    'Authoritative factory source defines global applicability.',
+    'validated', '2026-07-21'),
+  (1, 'price', 'aircraft', 'equipped MSRP', '779900 USD',
+    'Authoritative factory source states the equipped MSRP.',
+    'validated', '2026-07-21'),
+  (1, 'standard_equipment', 'aircraft', 'includes', 'factory equipment',
+    'Authoritative factory source defines the complete standard equipment.',
+    'validated', '2026-07-21');
+
 INSERT INTO aircraft_identity_observations (
   observed_make, observed_family, observed_designation, observed_generation,
   observed_package, model_year, exact_source_evidence, observation_sha256
@@ -120,24 +134,31 @@ INSERT INTO aircraft_reference_configuration_versions (
 INSERT INTO aircraft_reference_applicability_scopes (
   aircraft_reference_configuration_version_id, aircraft_market_id,
   applies_to_all_serials, evidence_claim_id
-) VALUES (1, 1, 1, 1);
+) VALUES (1, 1, 1, 2);
 
 INSERT INTO aircraft_reference_prices (
   aircraft_reference_configuration_version_id, price_kind, amount, currency,
-  price_reference_year, evidence_kind, evidence_claim_id
-) VALUES (1, 'equipped_msrp', 779900, 'USD', 2020, 'direct_model_year', 1);
+  price_reference_year, configuration_basis, evidence_kind, evidence_claim_id
+) VALUES (1, 'equipped_msrp', 779900, 'USD', 2019,
+  'full_standard_configuration', 'direct_model_year', 3);
 
 INSERT INTO aircraft_reference_engines (
   aircraft_reference_configuration_version_id,
   aircraft_engine_catalog_model_id, quantity, equipment_role,
   evidence_claim_id
-) VALUES (1, 1, 1, 'standard', 1);
+) VALUES (1, 1, 1, 'standard', 4);
 
 INSERT INTO aircraft_reference_propellers (
   aircraft_reference_configuration_version_id,
   aircraft_propeller_catalog_model_id, quantity, equipment_role,
   evidence_claim_id
-) VALUES (1, 1, 1, 'standard', 1);
+) VALUES (1, 1, 1, 'standard', 4);
+
+INSERT INTO aircraft_reference_fact_set_attestations (
+  aircraft_reference_configuration_version_id, fact_set_kind, evidence_claim_id
+) VALUES
+  (1, 'avionics', 4), (1, 'engines', 4),
+  (1, 'propellers', 4), (1, 'features', 4);
 
 UPDATE aircraft_reference_configuration_versions
 SET publication_state = 'published', published_at = '2026-07-21'

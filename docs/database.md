@@ -49,6 +49,15 @@ version; it does not rewrite a published version. Legacy model specs, price
 points, and default-avionics rows are not promoted into this catalog by the
 migration.
 
+`aircraft_reference_fact_set_attestations` proves that the avionics, engines,
+propellers, and material-feature sets were each reviewed for completeness. An
+empty set is therefore distinguishable from an unresearched set. Publication
+requires all four attestations, exactly one direct exact-model-year USD price
+for the full standard configuration, validated primary evidence for every fact,
+valuation-ready factory avionics, and non-overlapping applicability. A fact's
+nominal dollar year is retained as published and is not forced to equal the
+aircraft model year.
+
 `faa_registry_snapshots`, `faa_registry_aircraft`,
 `faa_registry_aircraft_references`, `faa_registry_engine_references`,
 `faa_registry_coverage`
@@ -93,23 +102,15 @@ text, and confidence; a missing time is not converted to zero or copied from
 the airframe. High-confidence installed engine and propeller identities are
 linked separately from the factory configuration.
 
-`incomplete` also represents a successful listing-specific verification whose
-shared factory-reference data is not yet valuation-ready. In that case the
-finalizer returns a typed, derived `PendingReference` outcome: FAA/listing
-identity and installed-component checks are complete, but an applicable
-aircraft specification, model-year price, or factory-configuration reference
-still needs independent curation. The row remains unverified because the
-schema requires `is_verified` only for `ready` rows, and it remains excluded
-from serving, snapshots, and training. This is retryable reference work, not a
-listing failure, so it does not set `ingestion_error` or move the listing to
-`quarantined`.
-
-`PendingReference` is not another persistent status and has no companion
-table. It is derived by finalization from the current listing and shared
-reference catalog on every attempt. The database stores only the ordinary
-`incomplete` state and any independently useful approved reference facts; it
-does not store a Gemini prompt, response, URL-context dossier, or duplicate
-pending-reference record.
+Factory-reference readiness is deliberately independent of listing readiness.
+Once the FAA-backed identity and every listing-specific review and persistence
+check pass, the listing is `ready` and verified even when no applicable
+published factory configuration exists yet. Valuation resolves the shared
+reference separately and returns typed reference gaps instead of an estimate;
+snapshot and training construction likewise omit that unusable valuation row.
+Reference curation therefore never rewrites a valid listing back to
+`incomplete`, and there is no persistent or derived `PendingReference`
+listing outcome.
 
 `aircraft_sale_listing_facts`
 
@@ -174,24 +175,6 @@ The `benchmark-gemini` command is read-only when `--execute` is omitted. It
 samples only retained source submissions linked to canonical listings. With
 `--execute`, its only database writes are these usage-accounting rows; it never
 updates a listing, plugin submission, catalog, or other domain row.
-
-`aircraft_model_spec_versions`
-
-Stores variant-level operating and component metadata. This includes fuel burn,
-oil assumptions, linked engine and propeller models, component counts, TBOs,
-overhaul costs, component baseline-life fractions, annual inspection, variable
-maintenance, source URL, and the depreciation profile assigned to the variant.
-Only authoritative, high-confidence `factory_default` rows can be marked
-valuation-eligible. A component configuration seen on one sale listing remains
-listing-specific and cannot seed this shared metadata.
-
-`aircraft_model_variant_price_points`
-
-Stores nominal new-price points for a variant/model year. These are used as the
-airframe basis for valuations after subtracting default avionics.
-Evidence kind and eligibility are stored separately from confidence. Serving
-uses only high-confidence direct exact-model-year points; inferred and
-interpolated rows remain available for curation.
 
 `engine_manufacturers`, `engine_models`
 
@@ -286,8 +269,8 @@ response or URL-context dossier is retained.
 Links concrete avionics units to a specific sale listing. The link stores
 quantity, provenance, evidence confidence, and an explicit `installed`,
 `replaces`, or `removes` configuration action with an optional replacement
-target. Valuation starts from factory defaults and applies these links as
-deltas. New primary and replacement links require approved catalog identities;
+target. Valuation starts from the applicable published reference profile and
+applies these links as deltas. New primary and replacement links require approved catalog identities;
 the installation-evidence confidence on the link is independent from catalog
 identity confidence. A listing cannot contain the same canonical product twice
 or install and replace the same product. Ready or verified listing associations
@@ -319,24 +302,6 @@ transaction, and leaves the pending review byte-for-byte unchanged rather than
 reconstructing or guessing review state. Reviews containing non-avionics state
 are also refused before review mutation because this reset has an avionics-only
 public contract.
-
-`aircraft_model_variant_default_avionics`
-
-Stores factory/default avionics for a variant/model year. This is used when a
-listing panel is valued; high-confidence listing actions are then applied as
-additions, replacements, or removals from this baseline.
-
-`depreciation_profiles`, `depreciation_profile_fit_metadata`
-
-Store fitted airframe depreciation coefficients and fit-quality metadata. The
-current production path uses `generic:all` plus per-model fitted profiles when
-enough samples exist.
-
-`component_depreciation_profiles`
-
-Stores generic component model parameters. Engine and propeller use
-`baseline_life_fraction`; avionics use an age decay rate and long-run residual
-fraction.
 
 `valuation_snapshots`, `valuation_snapshot_rows`
 
@@ -416,13 +381,13 @@ Listings are created through either the web API or plugin submission path:
 12. If any avionics aspects remain unresolved, atomically upsert the complete
    one-row review bundle and set the listing to `pending_review`. Enrichment is
    skipped while that row exists.
-13. Otherwise, enrich and validate missing authoritative factory specs,
-   exact-model-year price evidence, factory avionics, and listing avionics
-   metadata.
-14. Mark the listing `ready` only after every readiness query passes. When all
-   listing-specific checks pass but shared factory-reference data is not yet
-   valuation-ready, return `PendingReference` and leave the row `incomplete`
-   for an independent retry. A failed listing/FAA admission, listing-specific
+13. Otherwise, complete and validate the remaining listing-specific evidence
+   and canonical associations. Resolve factory-reference readiness separately
+   for valuation; a missing model-year reference is reported as typed gaps and
+   does not block listing verification.
+14. Mark the listing `ready` after every listing-specific readiness query
+   passes, regardless of shared factory-reference availability. A failed
+   listing/FAA admission, listing-specific
    persistence, or listing-specific enrichment completion remains stored as
    `quarantined` with the error for inspection or reprocessing; expected
    identity uncertainty remains `pending_review` instead.
@@ -509,12 +474,12 @@ The server checks mandatory FAA admission before entering this catalog-writing
 transaction. The transaction rejects stale payload or catalog hashes, applies
 all catalog decisions and only the exact covered listing-link ID/role pairs,
 removes the bundle, and returns the listing to `incomplete`. After commit, the
-server rechecks FAA admission before ordinary grounded enrichment and final
-publication. Successful source-backed completion becomes `ready` and verified
-only after all readiness checks pass. Missing or not-yet-approved shared
-factory-reference data returns the derived `PendingReference` outcome and
-leaves the listing `incomplete`, so reference curation can be retried without
-repeating completed listing identity/component review. Actual FAA admission,
+server rechecks FAA admission before final publication. Successful
+source-backed completion becomes `ready` and verified after the
+listing-specific checks pass. Missing or not-yet-approved shared
+factory-reference data does not change that listing state: valuation reports
+the current typed reference gaps until independent reference publication makes
+an exact configuration available. Actual FAA admission,
 listing evidence, listing-specific persistence, and listing-specific
 enrichment failures become `quarantined`. If a new pending bundle appears
 while post-review enrichment is running, that bundle wins: the listing remains
@@ -596,9 +561,6 @@ cargo run --bin aircost-admin -- curate-avionics --dry-run
 cargo run --bin aircost-admin -- verify-listings --limit 10 --preview
 cargo run --bin aircost-admin -- stage-listing-reviews --limit 100 --dry-run
 cargo run --bin aircost-admin -- enrich-avionics --dry-run
-cargo run --bin aircost-admin -- enrich-model-year-avionics --dry-run
-cargo run --bin aircost-admin -- enrich-aircraft-specs --dry-run
-cargo run --bin aircost-admin -- fit-depreciation --dry-run
 ```
 
 Use `--apply` only after reviewing the report.
@@ -1284,11 +1246,10 @@ links and pending review intact. If residual aspects remain, the listing stays
 `pending_review`; an all-pass result returns it to `incomplete`. The enclosing
 automatic verifier then finalizes only when the FAA-backed aircraft identity
 is assigned and no review aspects remain. A successful finalizer makes the
-listing `ready` and verified. A `PendingReference` finalization leaves it
-`incomplete` and reports which shared reference prerequisite is missing; a
-later automatic run retries that reference work independently. The outcome is
-derived rather than persisted, so retry does not replay or retrieve a stored
-Gemini dossier. Residual listing review remains `pending_review`, while actual
+listing `ready` and verified. Factory-reference resolution remains a separate
+valuation concern: missing prerequisites are returned as typed gaps without
+changing listing state or replaying a stored Gemini dossier. Residual listing
+review remains `pending_review`, while actual
 listing, FAA, or listing-specific finalization failures follow the quarantine
 path.
 
@@ -1724,6 +1685,114 @@ The contract query must return both migrations at version 2. The placeholder
 query must return exactly `1/-1/-1/-1`; both count queries must return zero;
 the duplicate query must return no rows. SQLite must additionally return no
 rows from `PRAGMA foreign_key_check` and `ok` from `PRAGMA integrity_check`.
+
+## Reference Catalog Publication Cutover
+
+Fresh databases include the strict reference publication contract. Upgrade an
+existing database with the backend-specific migration:
+
+```text
+migrations/20260819_reference_catalog_cutover.sqlite.sql
+migrations/20260819_reference_catalog_cutover.postgres.sql
+```
+
+The one-time migration runs inside one `BEGIN IMMEDIATE` SQLite transaction or
+one PostgreSQL transaction. It adds the price configuration-basis discriminator
+and the four fact-set completeness attestations, then replaces the publication
+gates. It permanently drops the old specification, variant-price, default-avionics,
+airframe-depreciation, fit-metadata, and component-depreciation tables; none of
+their rows are copied into the immutable catalog. Any error, including a late
+contract-write failure, restores all seven legacy tables and their old triggers.
+Bounded applicability created outside the final universal serial-key contract
+fails the preflight before destructive work. Rehearse the SQLite migration on a
+consistent disposable backup:
+
+```sh
+rehearsal_db="$(mktemp /tmp/aircost-reference-cutover.XXXXXX.sqlite3)"
+sqlite3 data/aircost.sqlite3 ".backup '$rehearsal_db'"
+sqlite3 -bail "$rehearsal_db" \
+  ".read migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+rm -f "$rehearsal_db"
+```
+
+For PostgreSQL, restore a backup into a rehearsal database and run:
+
+```sh
+psql -v ON_ERROR_STOP=1 "$REHEARSAL_DATABASE_URL" \
+  -f migrations/20260819_reference_catalog_cutover.postgres.sql
+```
+
+After the migration, grounded research and adjudication hand off a normalized
+JSON draft containing only approved decision IDs, validated evidence-claim
+IDs, catalog IDs, applicability, and normalized facts. Preview the exact
+database assembly/publication transaction (it always rolls back) with:
+
+```sh
+cargo run --bin aircost-admin -- \
+  publish-aircraft-reference --draft normalized-reference.json
+```
+
+Add `--apply` to atomically create or reuse the reference configuration, insert
+the building version and facts, and publish it. Provider prompts, responses,
+Search transcripts, and complete URL-context dossiers are not accepted by this
+boundary and are not stored.
+
+The draft price fields are `direct_cited_amount_usd` and
+`direct_cited_nominal_dollar_year`; they represent the primary source's nominal
+MSRP, not an inflation-adjusted value. `official_dollar_normalization_facts`
+stores only an immutable source year, target year, official index series,
+source/target index values, their checked factor, and a validated
+regulator-primary evidence-claim ID. The normalized draft can publish that
+fact transactionally; no prompt, response, search transcript, or URL dossier
+is retained. Serving and snapshots consume the exact factor. A missing pair
+produces `reference_price_dollar_normalization_missing` and no estimate.
+
+Verify the installed contract with:
+
+```sql
+SELECT contract_version, contract_fingerprint
+FROM schema_migration_contracts
+WHERE migration_name = '20260819_reference_catalog_cutover';
+
+SELECT publication_state, count(*)
+FROM aircraft_reference_configuration_versions
+GROUP BY publication_state;
+
+SELECT name
+FROM sqlite_schema
+WHERE type = 'table'
+  AND name IN (
+    'aircraft_model_spec_versions',
+    'aircraft_model_variant_price_points',
+    'aircraft_model_variant_default_avionics',
+    'aircraft_model_variant_default_avionics_candidates',
+    'depreciation_profiles',
+    'depreciation_profile_fit_metadata',
+    'component_depreciation_profiles'
+  );
+```
+
+The contract must be version `1` with fingerprint
+`fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5`.
+The fingerprint is the SHA-256 of this newline-terminated manifest:
+
+```text
+20260819_reference_catalog_cutover:v1
+sqlite-old:238:a2e2d5d3fdbc38847b9bddcebbf587c50447b3415ba3c7f1c3ed8a0b94605b45
+sqlite-post:213:82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1
+postgres-old:925:379464a027df1c61f99c754b28ff4738
+postgres-post:793:5bea7b82d356e161fe8a160f68845c68
+```
+
+Its `installed_at` value records the first successful installation and remains
+unchanged across schema reruns and application startups. A marker mismatch or
+marker-present damaged cutover contract fails before canonical DDL can heal it.
+Listing reference resolution uses only one complete published version matching
+the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
+scope. Missing and ambiguous matches remain ineligible for snapshots, training,
+and serving. The final query must return no rows.
 
 ## Gemini Usage Accounting Migration
 

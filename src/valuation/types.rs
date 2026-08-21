@@ -57,6 +57,30 @@ pub struct SourceBackedValuationFact {
     pub confidence: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct FactoryReferenceFeature {
+    pub configuration_id: i64,
+    pub version_id: i64,
+    pub full_standard_configuration_price_usd: f64,
+    pub nominal_dollar_year: i64,
+}
+
+impl FactoryReferenceFeature {
+    fn validate(&self) -> Result<(), ValuationError> {
+        if self.configuration_id <= 0
+            || self.version_id <= 0
+            || !self.full_standard_configuration_price_usd.is_finite()
+            || self.full_standard_configuration_price_usd <= 0.0
+            || !(1900..=2200).contains(&self.nominal_dollar_year)
+        {
+            return Err(ValuationError::InvalidQuery(
+                "factory reference feature is incomplete or invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn one_component() -> i64 {
     1
 }
@@ -139,10 +163,19 @@ pub struct ValuationQuery {
     pub equipment_tokens: Vec<String>,
     #[serde(default)]
     pub technical_field_count: u32,
+    pub factory_reference: Option<FactoryReferenceFeature>,
 }
 
 impl ValuationQuery {
     pub fn validate(&self) -> Result<(), ValuationError> {
+        self.factory_reference
+            .as_ref()
+            .ok_or_else(|| {
+                ValuationError::InvalidQuery(
+                    "published factory reference is required for valuation".to_string(),
+                )
+            })?
+            .validate()?;
         if !(1850..=self.valuation_year).contains(&self.model_year) {
             return Err(ValuationError::InvalidQuery(format!(
                 "model year {} is outside 1850..={}",
@@ -176,6 +209,19 @@ impl ValuationQuery {
         (self.valuation_year - self.model_year).max(0) as f64
     }
 
+    /// The model-defined factory anchor keeps identity fixed while removing
+    /// age, utilization, and optional-equipment effects.
+    pub(crate) fn factory_configuration_query(&self) -> Self {
+        let mut query = self.clone();
+        query.valuation_year = query.model_year;
+        query.airframe_hours = Some(0.0);
+        query.engine_times.clear();
+        query.propeller_times.clear();
+        query.equipment_tokens.clear();
+        query.technical_field_count = 0;
+        query
+    }
+
     pub fn age_years(&self) -> Result<f64, ValuationError> {
         self.validate()?;
         Ok(self.age())
@@ -192,6 +238,7 @@ pub enum SupportGrade {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ValuationEstimate {
+    pub modeled_factory_configuration_anchor_usd: f64,
     pub estimated_value_usd: f64,
     pub low_value_usd: f64,
     pub high_value_usd: f64,
@@ -256,6 +303,7 @@ pub struct TrainingListing {
     pub valuation_facts: Vec<SourceBackedValuationFact>,
     #[serde(default)]
     pub technical_field_count: u32,
+    pub factory_reference: Option<FactoryReferenceFeature>,
 }
 
 impl TrainingListing {
@@ -276,6 +324,7 @@ impl TrainingListing {
             propeller_times: self.propeller_times.clone(),
             equipment_tokens: self.equipment_tokens.clone(),
             technical_field_count: self.technical_field_count,
+            factory_reference: self.factory_reference.clone(),
         }
     }
 

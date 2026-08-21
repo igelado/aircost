@@ -105,4 +105,16 @@ do
   rg -q '20260806_listing_avionics_collision_closure' "$definition"
 done
 
+
+for definition in \
+  "$repository_root/schema/sqlite.sql" \
+  "$repository_root/schema/postgres.sql"
+do
+  if rg -q 'aircraft_sale_listing_avionics_corroboration_scopes|listing_avionics_collision_closure_v1' \
+      "$definition"; then
+    echo "Current schema unexpectedly retains legacy collision-closure evidence" >&2
+    exit 1
+  fi
+done
+
 echo "Listing-avionics collision-closure schema contract passed"

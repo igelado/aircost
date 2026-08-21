@@ -22,11 +22,14 @@ load_pre_projection_schema() {
   local database="$1"
   sed '/^-- FAA-backed aircraft valuation compatibility projection\.$/,$d' \
     "$repository_root/schema/sqlite.sql" | sqlite3 -bail "$database"
+  sqlite3 -bail "$database" \
+    ".read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql"
 }
 
 # A fresh install is complete and a repeated install is idempotent.
 sqlite3 -bail "$fresh_database" \
   ".read $repository_root/schema/sqlite.sql" \
+  ".read $repository_root/tests/schema/reference_catalog_pre_cutover.sqlite.sql" \
   ".read $migration" \
   ".read $migration"
 
