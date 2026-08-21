@@ -6,6 +6,7 @@
 //! This module does not promote FAA rows into the curated aircraft catalog.
 
 mod admission;
+pub(crate) mod bridge;
 pub mod drs;
 mod import;
 mod lookup;
