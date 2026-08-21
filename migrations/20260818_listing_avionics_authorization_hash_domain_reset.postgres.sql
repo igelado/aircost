@@ -4,6 +4,11 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 -- Exclude old-binary authorization writers until both invalidation and the
 -- reset contract commit. SHARE ROW EXCLUSIVE conflicts with INSERT's ROW
 -- EXCLUSIVE lock while still allowing ordinary reads.
@@ -24,8 +29,8 @@ BEGIN
     WHERE migration_name =
             '20260818_listing_avionics_authorization_hash_domain_reset'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033'
       )
   ) THEN
@@ -58,9 +63,6 @@ INSERT INTO schema_migration_contracts (
   'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

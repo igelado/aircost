@@ -1,5 +1,7 @@
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
@@ -8,6 +10,9 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(BTRIM(migration_name)) > 0)
 );
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
 
 -- The historical and installed contracts share the same five projection
 -- relations. Refuse any relation, column, constraint, or index drift before
@@ -666,9 +671,9 @@ BEGIN
     SELECT 1
     FROM public.schema_migration_contracts
     WHERE migration_name = '20260819_faa_reference_reachability'
-      AND NOT (
-        contract_version = 1
-        AND contract_fingerprint =
+      AND (
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'fc6451ffe8e1ee2034e76480767d16d6c37463461d9e684687448b4d43f96bef'
       )
   ) THEN

@@ -1,5 +1,7 @@
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
@@ -8,6 +10,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(trim(migration_name)) > 0)
 );
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260726_listing_aircraft_compatibility_projection'
+      AND (
+        contract_version IS DISTINCT FROM 2
+        OR contract_fingerprint IS DISTINCT FROM
+          '0a182d5972d62be3d906395df8d08b741bc3e23d713badf7596b360048aa45ba'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed listing aircraft compatibility projection migration has a different contract';
+  END IF;
+END
+$migration_guard$;
 
 -- Every unresolved new listing points at one schema-owned placeholder. Literal
 -- extracted labels live only in the non-authoritative input observation table.
@@ -1440,9 +1462,6 @@ INSERT INTO schema_migration_contracts (
   '0a182d5972d62be3d906395df8d08b741bc3e23d713badf7596b360048aa45ba',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

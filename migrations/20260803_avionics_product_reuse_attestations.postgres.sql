@@ -7,6 +7,8 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version BIGINT NOT NULL CHECK (contract_version > 0),
@@ -16,6 +18,9 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 DO $migration_guard$
 BEGIN
   IF EXISTS (
@@ -24,13 +29,13 @@ BEGIN
     WHERE migration_name = '20260803_avionics_product_reuse_attestations'
       AND NOT (
         (
-          contract_version = 1
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 1
+          AND contract_fingerprint IS NOT DISTINCT FROM
             'edfe54b792fa91890bd1708ad23b58f4fd9f9c717b42147f5edb948d67ccd837'
         )
         OR (
-          contract_version = 2
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 2
+          AND contract_fingerprint IS NOT DISTINCT FROM
             '8ad6e935e1222a03e2da4848a9e3c6f4b7f50ee027a6e50ede3b692d034cae55'
         )
       )
@@ -205,6 +210,9 @@ INSERT INTO schema_migration_contracts (
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = EXCLUDED.contract_version,
   contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+  installed_at = EXCLUDED.installed_at
+WHERE schema_migration_contracts.contract_version = 1
+  AND schema_migration_contracts.contract_fingerprint =
+      'edfe54b792fa91890bd1708ad23b58f4fd9f9c717b42147f5edb948d67ccd837';
 
 COMMIT;

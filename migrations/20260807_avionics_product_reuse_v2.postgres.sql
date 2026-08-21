@@ -6,6 +6,8 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version BIGINT NOT NULL CHECK (contract_version > 0),
@@ -14,6 +16,9 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(BTRIM(migration_name)) > 0)
 );
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
@@ -44,8 +49,8 @@ BEGIN
     FROM schema_migration_contracts
     WHERE migration_name = '20260807_avionics_product_reuse_v2'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc'
       )
   ) THEN
@@ -240,12 +245,6 @@ INSERT INTO schema_migration_contracts (
   'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at
-WHERE schema_migration_contracts.contract_version = EXCLUDED.contract_version
-  AND schema_migration_contracts.contract_fingerprint =
-      EXCLUDED.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

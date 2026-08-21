@@ -109,6 +109,22 @@ expect_migration_failure() {
   fi
 }
 
+expect_migration_failure_with_error() {
+  local reason="$1"
+  local expected_error="$2"
+  local output
+  if output="$(psql "$database_url" -v ON_ERROR_STOP=1 -q \
+    -f migrations/20260819_faa_reference_reachability.postgres.sql 2>&1)"; then
+    echo "FAA reference migration unexpectedly accepted invalid pre-state: $reason" >&2
+    exit 1
+  fi
+  if [[ "$output" != *"$expected_error"* ]]; then
+    echo "FAA reference migration rejected $reason with an unexpected error" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
 assert_pre_v1_survived_rollback() {
   psql "$database_url" -v ON_ERROR_STOP=1 -qAt <<'SQL' | grep -qx '1:0:0'
 SELECT
@@ -167,6 +183,36 @@ psql "$database_url" -v ON_ERROR_STOP=1 -q \
 psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
   -c "SELECT installed_at FROM public.schema_migration_contracts WHERE migration_name = '20260819_faa_reference_reachability'" \
   | grep -qx '2000-01-01'
+
+# A weakened nullable receipt table cannot turn a NULL version or fingerprint
+# into an exact installed contract. Rejection precedes trigger replacement and
+# leaves the malformed marker untouched for operator investigation.
+for null_case in version fingerprint both; do
+  case "$null_case" in
+    version)
+      null_assignment='contract_version=NULL'
+      null_predicate="receipt.contract_version IS NULL AND receipt.contract_fingerprint='fc6451ffe8e1ee2034e76480767d16d6c37463461d9e684687448b4d43f96bef'"
+      ;;
+    fingerprint)
+      null_assignment='contract_fingerprint=NULL'
+      null_predicate='receipt.contract_version=1 AND receipt.contract_fingerprint IS NULL'
+      ;;
+    both)
+      null_assignment='contract_version=NULL,contract_fingerprint=NULL'
+      null_predicate='receipt.contract_version IS NULL AND receipt.contract_fingerprint IS NULL'
+      ;;
+  esac
+  reset_current_schema
+  psql "$database_url" -v ON_ERROR_STOP=1 -q \
+    -c "ALTER TABLE public.schema_migration_contracts ALTER COLUMN contract_version DROP NOT NULL, ALTER COLUMN contract_fingerprint DROP NOT NULL; UPDATE public.schema_migration_contracts SET $null_assignment,installed_at='2000-01-01' WHERE migration_name='20260819_faa_reference_reachability'"
+  trigger_oid_before="$(psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
+    -c "SELECT oid FROM pg_catalog.pg_trigger WHERE tgrelid=pg_catalog.to_regclass('public.faa_registry_aircraft_references') AND tgname='faa_registry_aircraft_references_reachable'")"
+  expect_migration_failure_with_error "NULL receipt $null_case" \
+    'installed FAA reference reachability migration has a different contract'
+  test "$(psql "$database_url" -v ON_ERROR_STOP=1 -qAt \
+    -c "SELECT ($null_predicate)::int || ':' || receipt.installed_at || ':' || trigger_row.oid FROM public.schema_migration_contracts receipt CROSS JOIN pg_catalog.pg_trigger trigger_row WHERE receipt.migration_name='20260819_faa_reference_reachability' AND trigger_row.tgrelid=pg_catalog.to_regclass('public.faa_registry_aircraft_references') AND trigger_row.tgname='faa_registry_aircraft_references_reachable'")" = \
+    "1:2000-01-01:$trigger_oid_before"
+done
 
 # A hostile caller search_path cannot make a same-named attacker parent satisfy
 # the marker-present FK contract, and the failed migration changes nothing.

@@ -4,6 +4,8 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
@@ -12,6 +14,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(trim(migration_name)) > 0)
 );
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_identity_deduplication_postconditions'
+      AND (
+        contract_version IS DISTINCT FROM 6
+        OR contract_fingerprint IS DISTINCT FROM
+          'cd001240b48a1480fd8bbee39b9ddedbba01d00fad45cbac315cec7a243cf133'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed identity deduplication postconditions migration has a different contract';
+  END IF;
+END
+$migration_guard$;
 
 -- Identifier namespaces are independent: a manufacturer's model number and
 -- SKU may legitimately have the same normalized value.
@@ -2227,9 +2249,6 @@ INSERT INTO schema_migration_contracts (
   'cd001240b48a1480fd8bbee39b9ddedbba01d00fad45cbac315cec7a243cf133',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

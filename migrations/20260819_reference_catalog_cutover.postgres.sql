@@ -1,5 +1,10 @@
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 -- A marker-present rerun is an attestation before it is a migration. Reject
 -- mismatched provenance or any changed/missing/extra canonical object before
 -- CREATE OR REPLACE and other transition DDL can heal it.

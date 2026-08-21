@@ -1,5 +1,7 @@
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
@@ -8,6 +10,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(trim(migration_name)) > 0)
 );
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_listing_aircraft_identity'
+      AND (
+        contract_version IS DISTINCT FROM 2
+        OR contract_fingerprint IS DISTINCT FROM
+          '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed listing aircraft identity migration has a different contract';
+  END IF;
+END
+$migration_guard$;
 
 -- Immutable assignment versions retain every approved correction. The small
 -- current-pointer table is the only mutable state.
@@ -926,9 +948,6 @@ INSERT INTO schema_migration_contracts (
   '63fb5b5213fc9eb2b7b4dcb2b0be3a9f22a80d4acae49f64e68ec1302c1437be',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

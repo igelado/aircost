@@ -12,6 +12,26 @@ PRAGMA foreign_keys = OFF;
 PRAGMA legacy_alter_table = ON;
 BEGIN IMMEDIATE;
 
+CREATE TEMP TABLE aircraft_identity_no_selection_migration_contract_guard (
+  accepted INTEGER NOT NULL CHECK (accepted = 1)
+);
+INSERT INTO aircraft_identity_no_selection_migration_contract_guard (accepted)
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260728_aircraft_identity_no_supported_selection'
+  ) THEN 1
+  WHEN EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260728_aircraft_identity_no_supported_selection'
+      AND contract_version = 2
+      AND contract_fingerprint =
+        '2c61547aae5158dd0a5393ca49218f0f3aada7d9b87caf950fa27fe2953d7dee'
+  ) THEN 1
+  ELSE 0
+END;
+DROP TABLE aircraft_identity_no_selection_migration_contract_guard;
+
 DROP TABLE IF EXISTS temp.aircraft_identity_decision_action_guard;
 CREATE TEMP TABLE aircraft_identity_decision_action_guard (
   valid INTEGER NOT NULL CHECK (valid = 1)
@@ -209,10 +229,7 @@ INSERT INTO schema_migration_contracts (
   '2c61547aae5158dd0a5393ca49218f0f3aada7d9b87caf950fa27fe2953d7dee',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
 PRAGMA legacy_alter_table = OFF;

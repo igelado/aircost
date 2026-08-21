@@ -2,6 +2,11 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 DO $migration_guard$
 DECLARE
   marker_is_present BOOLEAN;

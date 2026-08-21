@@ -4,6 +4,8 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
@@ -12,6 +14,9 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CHECK (length(BTRIM(migration_name)) > 0)
 );
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
 
 LOCK TABLE
   avionics_models,
@@ -37,8 +42,8 @@ BEGIN
     WHERE migration_name =
           '20260810_avionics_grounded_exact_model_consolidation'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           '36f9ff06bf42fc769508ecfe578f4b4a11f2e0072b81efebed1dee8958654f2a'
       )
   ) THEN
@@ -460,12 +465,6 @@ INSERT INTO schema_migration_contracts (
   '36f9ff06bf42fc769508ecfe578f4b4a11f2e0072b81efebed1dee8958654f2a',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at
-WHERE schema_migration_contracts.contract_version = EXCLUDED.contract_version
-  AND schema_migration_contracts.contract_fingerprint =
-      EXCLUDED.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

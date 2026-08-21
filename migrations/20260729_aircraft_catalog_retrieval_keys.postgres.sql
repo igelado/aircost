@@ -8,14 +8,36 @@
 -- Empty derived keys, scoped key collisions, and cross-make alias collisions
 -- abort the transaction before an immutable row is touched.
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+BEGIN;
+
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL,
   contract_fingerprint TEXT NOT NULL,
   installed_at TEXT NOT NULL
 );
 
-BEGIN;
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260729_aircraft_catalog_retrieval_keys'
+      AND (
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
+          'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed aircraft catalog retrieval keys migration has a different contract';
+  END IF;
+END
+$migration_guard$;
 
 CREATE OR REPLACE FUNCTION aircraft_retrieval_key(value TEXT)
 RETURNS TEXT
@@ -305,9 +327,6 @@ INSERT INTO schema_migration_contracts (
   'b40b266fc450810cf89acc78c9405f4cd7d816ea38d389114e93a20cfea6901d',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;

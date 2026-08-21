@@ -18,6 +18,26 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
 
+CREATE TEMP TABLE identity_deduplication_migration_contract_guard (
+  accepted INTEGER NOT NULL CHECK (accepted = 1)
+);
+INSERT INTO identity_deduplication_migration_contract_guard (accepted)
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_identity_deduplication_postconditions'
+  ) THEN 1
+  WHEN EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260725_identity_deduplication_postconditions'
+      AND contract_version = 6
+      AND contract_fingerprint =
+        'cd001240b48a1480fd8bbee39b9ddedbba01d00fad45cbac315cec7a243cf133'
+  ) THEN 1
+  ELSE 0
+END;
+DROP TABLE identity_deduplication_migration_contract_guard;
+
 -- Identifier namespaces are independent: a manufacturer's model number and
 -- SKU may legitimately have the same normalized value.
 DROP INDEX IF EXISTS idx_avionics_models_manufacturer_identifier;
@@ -2124,10 +2144,7 @@ INSERT INTO schema_migration_contracts (
   'cd001240b48a1480fd8bbee39b9ddedbba01d00fad45cbac315cec7a243cf133',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint,
-  installed_at = excluded.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
 PRAGMA foreign_key_check;

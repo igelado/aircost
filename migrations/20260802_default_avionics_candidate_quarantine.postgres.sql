@@ -6,6 +6,8 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
@@ -15,6 +17,9 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(trim(migration_name)) > 0)
 );
 
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
 DO $migration_guard$
 BEGIN
   IF EXISTS (
@@ -23,13 +28,13 @@ BEGIN
     WHERE migration_name = '20260802_default_avionics_candidate_quarantine'
       AND NOT (
         (
-          contract_version = 1
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 1
+          AND contract_fingerprint IS NOT DISTINCT FROM
             'b50683c27b244cadf3cf88b226665f79051f678df9b30e0d01d0ca261464581f'
         )
         OR (
-          contract_version = 2
-          AND contract_fingerprint =
+          contract_version IS NOT DISTINCT FROM 2
+          AND contract_fingerprint IS NOT DISTINCT FROM
             'b8a6ecd15acc0ce14f67bf37ff4387c0ded4d1c6669d2fc4698b6c0a6c209ba4'
         )
       )
@@ -331,6 +336,9 @@ INSERT INTO schema_migration_contracts (
 ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = EXCLUDED.contract_version,
   contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+  installed_at = EXCLUDED.installed_at
+WHERE schema_migration_contracts.contract_version = 1
+  AND schema_migration_contracts.contract_fingerprint =
+      'b50683c27b244cadf3cf88b226665f79051f678df9b30e0d01d0ca261464581f';
 
 COMMIT;

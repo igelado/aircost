@@ -11,6 +11,28 @@
 
 BEGIN;
 
+SET LOCAL search_path = public, pg_catalog, pg_temp;
+
+LOCK TABLE public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
+DO $migration_contract_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260728_aircraft_identity_no_supported_selection'
+      AND (
+        contract_version IS DISTINCT FROM 2
+        OR contract_fingerprint IS DISTINCT FROM
+          '2c61547aae5158dd0a5393ca49218f0f3aada7d9b87caf950fa27fe2953d7dee'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed aircraft no-supported-selection migration has a different contract';
+  END IF;
+END
+$migration_contract_guard$;
+
 DO $migration$
 BEGIN
   IF EXISTS (
@@ -167,9 +189,6 @@ INSERT INTO schema_migration_contracts (
   '2c61547aae5158dd0a5393ca49218f0f3aada7d9b87caf950fa27fe2953d7dee',
   CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint,
-  installed_at = EXCLUDED.installed_at;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
