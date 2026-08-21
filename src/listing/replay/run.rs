@@ -46,8 +46,9 @@ impl ReplayPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PhaseState {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayItemState {
     Queued,
     Running,
     Succeeded,
@@ -56,7 +57,7 @@ enum PhaseState {
     Blocked,
 }
 
-impl PhaseState {
+impl ReplayItemState {
     fn parse(value: &str) -> ReplayRunResult<Self> {
         match value {
             "queued" => Ok(Self::Queued),
@@ -105,6 +106,39 @@ pub struct ReplayCapturesReport {
     pub phase: ReplayPhase,
     pub gemini_usage: ReplayGeminiUsage,
     pub counts: ReplayCapturesCounts,
+    /// Present for an applied `--submission-id` invocation. Batch and dry-run
+    /// reports intentionally omit per-item diagnostics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_item: Option<ReplaySelectedItemReport>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplaySelectedItemReport {
+    pub submission_id: i64,
+    pub phase: ReplayPhase,
+    pub state: ReplayItemState,
+    pub reason_code: Option<String>,
+    /// This invocation's sanitized operation diagnostic. It is assembled in
+    /// memory after a failed operation and is never written to the replay
+    /// ledger or any provider evidence store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_error: Option<ReplayTransientOperationError>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayTransientErrorCategory {
+    Schema,
+    Evidence,
+    Provider,
+    Database,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplayTransientOperationError {
+    pub category: ReplayTransientErrorCategory,
+    pub code: &'static str,
+    pub message: &'static str,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -207,8 +241,15 @@ struct ItemRow {
     plugin_submission_id: i64,
     position: i64,
     expected_rendered_html_sha256: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ReportItemRow {
+    plugin_submission_id: i64,
     extraction_state: String,
     materialization_state: String,
+    terminal_rejection_reason_code: Option<String>,
+    last_failure_reason_code: Option<String>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -240,7 +281,7 @@ pub async fn replay_captures(
     let usage_correlation_id = replay_usage_correlation(request.manifest, request.phase);
     if run.status == "completed" {
         let gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
-        return report_from_ledger(db, run.id, request, &selected, gemini_usage).await;
+        return report_from_ledger(db, run.id, request, &selected, gemini_usage, None).await;
     }
     let owner_token = new_owner_token(request.manifest, request.phase)?;
     acquire_run(
@@ -252,6 +293,7 @@ pub async fn replay_captures(
     )
     .await?;
 
+    let mut selected_transient_error = None;
     let processing: ReplayRunResult<()> = async {
         for submission_id in selected.iter().copied() {
             let expected_capture = request
@@ -349,6 +391,12 @@ pub async fn replay_captures(
             let owner = match plugin_submission_owner(db, submission_id).await {
                 Ok(owner) => owner,
                 Err(error) => {
+                    record_selected_transient_error(
+                        request,
+                        submission_id,
+                        &error,
+                        &mut selected_transient_error,
+                    );
                     finish_capture_admission_error(
                         db,
                         run.id,
@@ -367,6 +415,12 @@ pub async fn replay_captures(
             {
                 Ok(state) => state,
                 Err(error) => {
+                    record_selected_transient_error(
+                        request,
+                        submission_id,
+                        &error,
+                        &mut selected_transient_error,
+                    );
                     finish_capture_admission_error(
                         db,
                         run.id,
@@ -440,6 +494,12 @@ pub async fn replay_captures(
                                 .await
                             }
                             Err(error) => {
+                                record_selected_transient_error(
+                                    request,
+                                    submission_id,
+                                    &error,
+                                    &mut selected_transient_error,
+                                );
                                 finish_operation_error(
                                     db,
                                     run.id,
@@ -470,6 +530,9 @@ pub async fn replay_captures(
                         )
                         .await
                     } else if state.checkpoint.is_none() {
+                        if request.submission_id == Some(submission_id) {
+                            selected_transient_error = Some(schema_transient_error());
+                        }
                         finish_failed(
                             db,
                             run.id,
@@ -539,6 +602,12 @@ pub async fn replay_captures(
                                 .await
                             }
                             Err(error) => {
+                                record_selected_transient_error(
+                                    request,
+                                    submission_id,
+                                    &error,
+                                    &mut selected_transient_error,
+                                );
                                 finish_operation_error(
                                     db,
                                     run.id,
@@ -564,7 +633,15 @@ pub async fn replay_captures(
     validate_target_captures(db, request.manifest).await?;
     release_run(db, run.id, &owner_token).await?;
     let gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
-    report_from_ledger(db, run.id, request, &selected, gemini_usage).await
+    report_from_ledger(
+        db,
+        run.id,
+        request,
+        &selected,
+        gemini_usage,
+        selected_transient_error,
+    )
+    .await
 }
 
 /// A malformed capture without a resolvable owner cannot satisfy extraction,
@@ -1170,8 +1247,7 @@ async fn validate_run_membership(
         ));
     }
     let sql = db.sql(
-        r#"SELECT plugin_submission_id, position, expected_rendered_html_sha256,
-                  extraction_state, materialization_state
+        r#"SELECT plugin_submission_id, position, expected_rendered_html_sha256
            FROM listing_replay_run_items WHERE run_id = ? ORDER BY position"#,
     );
     let rows: Vec<ItemRow> = match db.backend() {
@@ -1770,6 +1846,87 @@ async fn finish_capture_admission_error(
     }
 }
 
+fn record_selected_transient_error(
+    request: &ReplayCapturesRequest<'_>,
+    submission_id: i64,
+    error: &PluginStoreError,
+    selected_transient_error: &mut Option<ReplayTransientOperationError>,
+) {
+    if request.submission_id == Some(submission_id) {
+        *selected_transient_error = Some(sanitized_transient_operation_error(error));
+    }
+}
+
+fn sanitized_transient_operation_error(error: &PluginStoreError) -> ReplayTransientOperationError {
+    match error {
+        PluginStoreError::Database(_) => database_transient_error(),
+        PluginStoreError::AdmissionBlocked(_)
+        | PluginStoreError::AircraftAdmission(_)
+        | PluginStoreError::Permission(_)
+        | PluginStoreError::NotFound(_) => evidence_transient_error(),
+        PluginStoreError::Validation(message) => {
+            let message = message.to_ascii_lowercase();
+            if message.contains("usage accounting")
+                || message.contains("error returned from database")
+                || message.contains("database operation")
+                || message.contains("sqlite error")
+                || message.contains("postgres error")
+            {
+                database_transient_error()
+            } else if message.contains("request failed")
+                || message.contains("failed with status")
+                || message.contains("non-json response with status")
+                || message.contains("interactions client is unavailable")
+                || message.contains("could not download bounded listing identity images")
+                || message.contains("selected listing identity images could be downloaded")
+            {
+                provider_transient_error()
+            } else if message.contains("evidence")
+                || message.contains("source_evidence_text")
+                || message.contains("structurally visible")
+                || message.contains("bounded source excerpt")
+                || message.contains("retained capture")
+            {
+                evidence_transient_error()
+            } else {
+                schema_transient_error()
+            }
+        }
+    }
+}
+
+fn schema_transient_error() -> ReplayTransientOperationError {
+    ReplayTransientOperationError {
+        category: ReplayTransientErrorCategory::Schema,
+        code: "schema_validation_failed",
+        message: "provider output did not satisfy the current replay schema",
+    }
+}
+
+fn evidence_transient_error() -> ReplayTransientOperationError {
+    ReplayTransientOperationError {
+        category: ReplayTransientErrorCategory::Evidence,
+        code: "evidence_validation_failed",
+        message: "provider output failed retained-source evidence validation",
+    }
+}
+
+fn provider_transient_error() -> ReplayTransientOperationError {
+    ReplayTransientOperationError {
+        category: ReplayTransientErrorCategory::Provider,
+        code: "provider_operation_failed",
+        message: "provider request or response transport failed during replay",
+    }
+}
+
+fn database_transient_error() -> ReplayTransientOperationError {
+    ReplayTransientOperationError {
+        category: ReplayTransientErrorCategory::Database,
+        code: "database_operation_failed",
+        message: "database or usage-accounting operation failed during replay",
+    }
+}
+
 async fn finish_operation_error(
     db: &AppDb,
     run_id: i64,
@@ -1933,6 +2090,7 @@ async fn dry_run_report(
         phase: request.phase,
         gemini_usage,
         counts,
+        selected_item: None,
     })
 }
 
@@ -1942,13 +2100,14 @@ async fn report_from_ledger(
     request: &ReplayCapturesRequest<'_>,
     selected: &BTreeSet<i64>,
     gemini_usage: ReplayGeminiUsage,
+    transient_error: Option<ReplayTransientOperationError>,
 ) -> ReplayRunResult<ReplayCapturesReport> {
     let sql = db.sql(
-        r#"SELECT plugin_submission_id, position, expected_rendered_html_sha256,
-                  extraction_state, materialization_state
+        r#"SELECT plugin_submission_id, extraction_state, materialization_state,
+                  terminal_rejection_reason_code, last_failure_reason_code
            FROM listing_replay_run_items WHERE run_id = ? ORDER BY position"#,
     );
-    let rows: Vec<ItemRow> = match db.backend() {
+    let rows: Vec<ReportItemRow> = match db.backend() {
         DatabaseBackend::Sqlite(pool) => sqlx::query_as(&sql).bind(run_id).fetch_all(pool).await?,
         DatabaseBackend::Postgres(pool) => {
             sqlx::query_as(&sql).bind(run_id).fetch_all(pool).await?
@@ -1958,21 +2117,43 @@ async fn report_from_ledger(
         selected: selected.len(),
         ..Default::default()
     };
+    let mut selected_item = None;
     for row in rows
         .into_iter()
         .filter(|row| selected.contains(&row.plugin_submission_id))
     {
-        let state = PhaseState::parse(match request.phase {
+        let state = ReplayItemState::parse(match request.phase {
             ReplayPhase::Extraction => &row.extraction_state,
             ReplayPhase::Materialization => &row.materialization_state,
         })?;
         match state {
-            PhaseState::Succeeded => counts.succeeded += 1,
-            PhaseState::Rejected => counts.rejected += 1,
-            PhaseState::Failed => counts.failed += 1,
-            PhaseState::Blocked => counts.blocked += 1,
-            PhaseState::Queued | PhaseState::Running => counts.ready += 1,
+            ReplayItemState::Succeeded => counts.succeeded += 1,
+            ReplayItemState::Rejected => counts.rejected += 1,
+            ReplayItemState::Failed => counts.failed += 1,
+            ReplayItemState::Blocked => counts.blocked += 1,
+            ReplayItemState::Queued | ReplayItemState::Running => counts.ready += 1,
         }
+        if request.submission_id == Some(row.plugin_submission_id) {
+            let reason_code = selected_item_reason_code(
+                state,
+                row.terminal_rejection_reason_code,
+                row.last_failure_reason_code,
+            )?;
+            selected_item = Some(ReplaySelectedItemReport {
+                submission_id: row.plugin_submission_id,
+                phase: request.phase,
+                state,
+                reason_code,
+                transient_error: (state == ReplayItemState::Failed)
+                    .then_some(transient_error.clone())
+                    .flatten(),
+            });
+        }
+    }
+    if request.submission_id.is_some() && selected_item.is_none() {
+        return Err(ReplayRunError::Conflict(
+            "selected replay item disappeared from the durable ledger".to_string(),
+        ));
     }
     Ok(ReplayCapturesReport {
         dry_run: false,
@@ -1981,7 +2162,33 @@ async fn report_from_ledger(
         phase: request.phase,
         gemini_usage,
         counts,
+        selected_item,
     })
+}
+
+fn selected_item_reason_code(
+    state: ReplayItemState,
+    terminal_rejection_reason_code: Option<String>,
+    last_failure_reason_code: Option<String>,
+) -> ReplayRunResult<Option<String>> {
+    match state {
+        ReplayItemState::Rejected => terminal_rejection_reason_code.map(Some).ok_or_else(|| {
+            ReplayRunError::Database(
+                "rejected replay item is missing its stable reason code".to_string(),
+            )
+        }),
+        ReplayItemState::Failed => last_failure_reason_code.map(Some).ok_or_else(|| {
+            ReplayRunError::Database(
+                "failed replay item is missing its stable reason code".to_string(),
+            )
+        }),
+        ReplayItemState::Blocked => Ok(Some(
+            terminal_rejection_reason_code
+                .or(last_failure_reason_code)
+                .unwrap_or_else(|| "upstream_extraction_incomplete".to_string()),
+        )),
+        ReplayItemState::Queued | ReplayItemState::Running | ReplayItemState::Succeeded => Ok(None),
+    }
 }
 
 fn replay_usage_correlation(manifest: &TrustedCaptureManifest, phase: ReplayPhase) -> String {
@@ -2147,11 +2354,15 @@ async fn execute(db: &AppDb, sql: &str, binds: &[Bind<'_>]) -> ReplayRunResult<u
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
     use serde_json::json;
+    use tokio::net::TcpListener;
 
     use super::*;
     use crate::listing::replay::build_trusted_capture_manifest;
@@ -2226,6 +2437,31 @@ mod tests {
         (manifest, submission_id, user)
     }
 
+    async fn extraction_endpoint(extraction: serde_json::Value) -> String {
+        async fn handler(State(extraction): State<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(json!({
+                "candidates": [{"content": {"parts": [{"text": extraction.to_string()}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 10,
+                    "thoughtsTokenCount": 0,
+                    "cachedContentTokenCount": 0,
+                    "toolUsePromptTokenCount": 0
+                }
+            }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(extraction);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}/")
+    }
+
     #[test]
     fn rejection_vocabulary_is_closed() {
         assert!(
@@ -2242,10 +2478,209 @@ mod tests {
 
     #[test]
     fn phase_states_distinguish_retryable_and_terminal_results() {
-        assert!(PhaseState::parse("failed").unwrap().is_terminal() == false);
-        assert!(PhaseState::parse("rejected").unwrap().is_terminal());
-        assert!(PhaseState::parse("succeeded").unwrap().is_terminal());
-        assert!(PhaseState::parse("pending").is_err());
+        assert!(!ReplayItemState::parse("failed").unwrap().is_terminal());
+        assert!(ReplayItemState::parse("rejected").unwrap().is_terminal());
+        assert!(ReplayItemState::parse("succeeded").unwrap().is_terminal());
+        assert!(ReplayItemState::parse("pending").is_err());
+    }
+
+    #[test]
+    fn selected_item_reason_codes_cover_every_machine_stop_state() {
+        assert_eq!(
+            selected_item_reason_code(
+                ReplayItemState::Failed,
+                None,
+                Some("operation_failed".into())
+            )
+            .unwrap()
+            .as_deref(),
+            Some("operation_failed")
+        );
+        assert_eq!(
+            selected_item_reason_code(
+                ReplayItemState::Rejected,
+                Some("capture_validation_failed".into()),
+                None
+            )
+            .unwrap()
+            .as_deref(),
+            Some("capture_validation_failed")
+        );
+        assert_eq!(
+            selected_item_reason_code(ReplayItemState::Blocked, None, None)
+                .unwrap()
+                .as_deref(),
+            Some("upstream_extraction_incomplete")
+        );
+        assert!(selected_item_reason_code(ReplayItemState::Failed, None, None).is_err());
+        assert!(selected_item_reason_code(ReplayItemState::Rejected, None, None).is_err());
+    }
+
+    #[test]
+    fn transient_operation_errors_are_closed_and_never_echo_raw_provider_text() {
+        let cases = [
+            (
+                PluginStoreError::Validation(
+                    "Gemini extraction failed with status 500: SECRET_RAW_PROVIDER_BODY".into(),
+                ),
+                ReplayTransientErrorCategory::Provider,
+                "provider_operation_failed",
+            ),
+            (
+                PluginStoreError::Validation(
+                    "Gemini returned invalid JSON after repair: SECRET_RAW_PROVIDER_BODY".into(),
+                ),
+                ReplayTransientErrorCategory::Schema,
+                "schema_validation_failed",
+            ),
+            (
+                PluginStoreError::Validation(
+                    "source_evidence_text exposed SECRET_RAW_PROVIDER_BODY".into(),
+                ),
+                ReplayTransientErrorCategory::Evidence,
+                "evidence_validation_failed",
+            ),
+            (
+                PluginStoreError::Database("SECRET_RAW_DATABASE_DETAIL".into()),
+                ReplayTransientErrorCategory::Database,
+                "database_operation_failed",
+            ),
+            (
+                PluginStoreError::Validation(
+                    "error returned from database: SECRET_RAW_USAGE_START".into(),
+                ),
+                ReplayTransientErrorCategory::Database,
+                "database_operation_failed",
+            ),
+        ];
+        for (error, category, code) in cases {
+            let diagnostic = sanitized_transient_operation_error(&error);
+            assert_eq!(diagnostic.category, category);
+            assert_eq!(diagnostic.code, code);
+            let serialized = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!serialized.contains("SECRET_RAW"));
+            assert!(diagnostic.message.len() <= 100);
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_extraction_validation_failure_reports_only_sanitized_transient_diagnostic() {
+        const SENSITIVE_PROVIDER_TEXT: &str =
+            "SENSITIVE_PROVIDER_ONLY Garmin G1000 fabricated evidence";
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = NULL WHERE id = ?")
+            .bind(submission_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let extraction = json!({
+            "manufacturer": "Cessna", "model": "182", "variant": "182T",
+            "model_year": 2020, "asking_price_usd": 200000.0, "currency": "USD",
+            "airframe_hours": 500.0, "engine_hours": null,
+            "engine_time_basis": "unknown", "engine_time_evidence": null,
+            "engine_time_confidence": null, "propeller_hours": null,
+            "propeller_time_basis": "unknown", "propeller_time_evidence": null,
+            "propeller_time_confidence": null, "installed_engine": null,
+            "installed_propeller": null, "registration_number": "N182PF",
+            "serial_number": "182TEST", "status": "active",
+            "avionics": [{
+                "manufacturer": "Garmin", "model": "G1000", "types": ["Flight Display"],
+                "quantity": 1, "configuration_action": "installed", "replaces": null,
+                "source_evidence_text": SENSITIVE_PROVIDER_TEXT, "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        });
+        let endpoint = extraction_endpoint(extraction).await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint)
+            .with_usage_store(GeminiUsageStore::new(&db));
+        let report = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: Some(submission_id),
+                apply: true,
+                recover_stale: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.counts.failed, 1);
+        assert_eq!(report.counts.selected, 1);
+        let selected = report.selected_item.as_ref().unwrap();
+        assert_eq!(selected.submission_id, submission_id);
+        assert_eq!(selected.state, ReplayItemState::Failed);
+        assert_eq!(selected.reason_code.as_deref(), Some("operation_failed"));
+        assert_eq!(
+            selected.transient_error.as_ref().unwrap().category,
+            ReplayTransientErrorCategory::Evidence
+        );
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains(SENSITIVE_PROVIDER_TEXT));
+
+        let persisted: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"SELECT submission.extracted_listing_json, item.extracted_listing_json,
+                          item.last_failure_reason_code, usage.error_text
+                   FROM plugin_submissions submission
+                   JOIN listing_replay_run_items item
+                     ON item.plugin_submission_id = submission.id
+                   LEFT JOIN gemini_api_usage usage
+                     ON usage.source_kind = 'plugin_submission'
+                    AND usage.source_id = CAST(submission.id AS TEXT)
+                   WHERE submission.id = ?"#,
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted.0, None);
+        assert_eq!(persisted.1, None);
+        assert_eq!(persisted.2.as_deref(), Some("operation_failed"));
+        assert_eq!(persisted.3, None);
+    }
+
+    #[tokio::test]
+    async fn selected_success_reports_exact_state_without_a_transient_error() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let report = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: Some(submission_id),
+                apply: true,
+                recover_stale: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.counts.succeeded, 1);
+        assert_eq!(
+            report.selected_item,
+            Some(ReplaySelectedItemReport {
+                submission_id,
+                phase: ReplayPhase::Extraction,
+                state: ReplayItemState::Succeeded,
+                reason_code: None,
+                transient_error: None,
+            })
+        );
+        assert_eq!(report.gemini_usage.logical_requests, 0);
     }
 
     #[tokio::test]
