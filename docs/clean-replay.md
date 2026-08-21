@@ -115,7 +115,44 @@ All operational commands are dry-run unless `--apply` is supplied.
    submission timestamps, and resets extraction, error, and canonical-listing
    fields.
 
-3. Create and inspect the extraction checkpoint:
+3. Seed the exact reviewed catalog closure from the prepared current-schema
+   source:
+
+   ```text
+   aircost-admin seed-verified-catalog --source-database PREPARED_SOURCE \
+     --catalog-fingerprint-sha256 REVIEWED_SHA256 --database SHADOW
+   aircost-admin seed-verified-catalog --source-database PREPARED_SOURCE \
+     --catalog-fingerprint-sha256 REVIEWED_SHA256 --database SHADOW --apply
+   ```
+
+   The source is opened diagnostically. Apply takes the target writer lock
+   before its final exhaustive base-table scan, admits only exact schema
+   bootstrap rows plus immutable imported users, installs, and captures, and
+   installs only the approved aircraft/FAA/reference and avionics closure. The
+   locked validation requires the exact startup migration-receipt inventory and
+   reauthenticates every retained capture's owner, HTML digest, P-256 signature,
+   and install/submission/revocation chronology.
+   Avionics models pass through the schema's normal unreviewed-to-approved
+   transition; generated manufacturer keys, product identities, and curated
+   origins must match the projection instead of being replaced. The operation
+   has no provider client, is transactional, resets identity sequences, then
+   reloads the target through the same versioned catalog projection both before
+   commit and after reopening the database, requiring exact fingerprint, row,
+   and count parity. A second invocation is rejected because the target is no
+   longer clean.
+
+   SQLite takes `BEGIN IMMEDIATE` before the final scan. PostgreSQL first takes
+   a transaction-scoped advisory lock for competing seed commands, discovers
+   every public base table, and then locks that exact inventory in `SHARE ROW
+   EXCLUSIVE` mode before repeating discovery and checking any rows. This mode
+   conflicts with the `ROW EXCLUSIVE` lock acquired by ordinary
+   `INSERT`/`UPDATE`/`DELETE` statements, so an application writer cannot race
+   the clean check or any materialization write; unlike `ACCESS EXCLUSIVE`, it
+   does not unnecessarily block plain diagnostic reads. Sequence resets use
+   transactional `ALTER SEQUENCE ... RESTART`, including both identity and
+   legacy serial-owned `id` sequences—never non-transactional `setval`.
+
+4. Create and inspect the extraction checkpoint:
 
    ```text
    aircost-admin replay-extraction --database SHADOW --submission-id ID
@@ -128,7 +165,7 @@ All operational commands are dry-run unless `--apply` is supplied.
    finalization. The checkpoint retains the pinned visual-identity report when
    visual recovery was used.
 
-4. Materialize the exact checkpoint:
+5. Materialize the exact checkpoint:
 
    ```text
    aircost-admin replay-listing --database SHADOW --submission-id ID

@@ -299,6 +299,129 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL: &str =
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL: &str =
     include_str!("../migrations/20260819_reference_catalog_cutover.postgres.sql");
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MigrationContractReceipt {
+    pub migration_name: &'static str,
+    pub contract_version: i64,
+    pub contract_fingerprint: &'static str,
+}
+
+const COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] = &[
+    MigrationContractReceipt {
+        migration_name: IDENTITY_DEDUPLICATION_POSTCONDITIONS_MIGRATION,
+        contract_version: IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_VERSION,
+        contract_fingerprint: IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: LISTING_AIRCRAFT_IDENTITY_MIGRATION,
+        contract_version: LISTING_AIRCRAFT_IDENTITY_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_AIRCRAFT_IDENTITY_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_MIGRATION,
+        contract_version: LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_AIRCRAFT_COMPATIBILITY_PROJECTION_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_MIGRATION,
+        contract_version: AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_CONTRACT_VERSION,
+        contract_fingerprint: AIRCRAFT_IDENTITY_NO_SUPPORTED_SELECTION_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
+        contract_version: AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
+        contract_fingerprint: AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AIRCRAFT_TCDS_MAKE_LINEAGE_MIGRATION,
+        contract_version: AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_VERSION,
+        contract_fingerprint: AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_MIGRATION,
+        contract_version: AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_HUMAN_REVIEWED_CONSOLIDATION_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION,
+        contract_version: AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_PRODUCT_REUSE_ATTESTATIONS_MIGRATION,
+        contract_version: AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_PRODUCT_REUSE_ATTESTATIONS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_GROUNDED_EVIDENCE_REFRESH_MIGRATION,
+        contract_version: AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_PRODUCT_REUSE_V2_MIGRATION,
+        contract_version: AVIONICS_PRODUCT_REUSE_V2_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_PRODUCT_REUSE_V2_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
+        contract_version: AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
+        contract_version: AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
+        contract_version: LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
+        contract_version: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
+        contract_version: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION,
+        contract_fingerprint: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: LISTING_REPLAY_RUNS_MIGRATION,
+        contract_version: LISTING_REPLAY_RUNS_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: REFERENCE_CATALOG_CUTOVER_MIGRATION,
+        contract_version: REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION,
+        contract_fingerprint: REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: FAA_RECORD_HASH_DOMAIN_MIGRATION,
+        contract_version: FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION,
+        contract_fingerprint: FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT,
+    },
+];
+
+const POSTGRES_ONLY_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] =
+    &[MigrationContractReceipt {
+        migration_name: FAA_REFERENCE_REACHABILITY_MIGRATION,
+        contract_version: FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION,
+        contract_fingerprint: FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
+    }];
+
+pub(crate) fn canonical_startup_migration_contract_receipts(
+    kind: DatabaseKind,
+) -> Vec<MigrationContractReceipt> {
+    let mut receipts = COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS.to_vec();
+    if kind == DatabaseKind::Postgres {
+        receipts.extend_from_slice(POSTGRES_ONLY_STARTUP_MIGRATION_CONTRACT_RECEIPTS);
+    }
+    receipts.sort();
+    receipts
+}
+
 const REFERENCE_CATALOG_CUTOVER_ROUTINES: &[&str] = &[
     "aircraft_serial_natural_sort_key",
     "validate_aircraft_serial_scheme_ordering",

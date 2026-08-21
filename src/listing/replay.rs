@@ -15,6 +15,7 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::validate_source_url;
 use crate::plugin::{sha256_hex, verify_submission_signature};
 
+pub mod catalog;
 pub mod run;
 pub mod source;
 
@@ -139,6 +140,46 @@ struct SourceCaptureRow {
     rendered_html: String,
     rendered_html_sha256: String,
     signature_base64: String,
+}
+
+pub(crate) struct RetainedCaptureAuthentication<'capture> {
+    pub submission_id: i64,
+    pub submission_user_id: i64,
+    pub plugin_install_id: i64,
+    pub plugin_install_user_id: i64,
+    pub plugin_public_key_base64: &'capture str,
+    pub source_url: &'capture str,
+    pub rendered_html: &'capture str,
+    pub rendered_html_sha256: &'capture str,
+    pub signature_base64: &'capture str,
+    pub timestamp_chronology_valid: bool,
+}
+
+pub(crate) fn authenticate_retained_capture(
+    capture: RetainedCaptureAuthentication<'_>,
+) -> Result<(), String> {
+    if capture.submission_user_id != capture.plugin_install_user_id {
+        return Err(format!(
+            "capture {} owner differs from plugin install {} owner",
+            capture.submission_id, capture.plugin_install_id
+        ));
+    }
+    if !capture.timestamp_chronology_valid {
+        return Err(format!(
+            "capture {} has invalid install/submission/revocation timestamp chronology",
+            capture.submission_id
+        ));
+    }
+    validate_capture_authenticity(
+        capture.submission_id,
+        capture.submission_user_id,
+        capture.plugin_install_id,
+        capture.plugin_public_key_base64,
+        capture.source_url,
+        capture.rendered_html,
+        capture.rendered_html_sha256,
+        capture.signature_base64,
+    )
 }
 
 pub async fn build_trusted_capture_manifest(
@@ -402,31 +443,54 @@ fn entry_from_row(row: &SourceCaptureRow) -> TrustedCaptureEntry {
 }
 
 fn validate_source_capture(row: &SourceCaptureRow) -> Result<(), String> {
-    if row.submission_id <= 0 || row.user_id <= 0 || row.plugin_install_id <= 0 {
+    validate_capture_authenticity(
+        row.submission_id,
+        row.user_id,
+        row.plugin_install_id,
+        &row.plugin_public_key_base64,
+        &row.source_url,
+        &row.rendered_html,
+        &row.rendered_html_sha256,
+        &row.signature_base64,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_capture_authenticity(
+    submission_id: i64,
+    user_id: i64,
+    plugin_install_id: i64,
+    plugin_public_key_base64: &str,
+    source_url: &str,
+    rendered_html: &str,
+    rendered_html_sha256: &str,
+    signature_base64: &str,
+) -> Result<(), String> {
+    if submission_id <= 0 || user_id <= 0 || plugin_install_id <= 0 {
         return Err("capture, owner, and plugin install IDs must be positive".to_string());
     }
-    validate_source_url(&row.source_url).map_err(|error| error.to_string())?;
-    if row.rendered_html.trim().is_empty() || row.rendered_html.len() > MAX_CAPTURE_BYTES {
+    validate_source_url(source_url).map_err(|error| error.to_string())?;
+    if rendered_html.trim().is_empty() || rendered_html.len() > MAX_CAPTURE_BYTES {
         return Err(format!(
             "capture {} HTML is empty or exceeds the admission limit",
-            row.submission_id
+            submission_id
         ));
     }
-    let recomputed = sha256_hex(row.rendered_html.as_bytes());
-    if recomputed != row.rendered_html_sha256 {
+    let recomputed = sha256_hex(rendered_html.as_bytes());
+    if recomputed != rendered_html_sha256 {
         return Err(format!(
             "capture {} rendered HTML hash is corrupt",
-            row.submission_id
+            submission_id
         ));
     }
     verify_submission_signature(
-        &row.plugin_public_key_base64,
-        row.plugin_install_id,
-        &row.source_url,
+        plugin_public_key_base64,
+        plugin_install_id,
+        source_url,
         &recomputed,
-        &row.signature_base64,
+        signature_base64,
     )
-    .map_err(|error| format!("capture {}: {error}", row.submission_id))
+    .map_err(|error| format!("capture {submission_id}: {error}"))
 }
 
 fn manifest_fingerprint(entries: &[TrustedCaptureEntry]) -> Result<String, String> {
