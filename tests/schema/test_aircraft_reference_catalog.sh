@@ -26,7 +26,10 @@ upgrade_finalization_scalar_database="$(mktemp /tmp/aircost-reference-upgrade-fi
 upgrade_finalization_string_database="$(mktemp /tmp/aircost-reference-upgrade-finalization-string.XXXXXX.sqlite3)"
 upgrade_finalization_null_database="$(mktemp /tmp/aircost-reference-upgrade-finalization-null.XXXXXX.sqlite3)"
 upgrade_finalization_missing_database="$(mktemp /tmp/aircost-reference-upgrade-finalization-missing.XXXXXX.sqlite3)"
-trap 'rm -f "$test_database" "$approval_database" "$component_database" "$duplicate_price_database" "$overlap_database" "$serial_overlap_database" "$incomplete_database" "$cleanup_database" "$marker_rerun_database" "$marker_mismatch_database" "$marker_damage_database" "$marker_unexpected_database" "$marker_run_check_database" "$upgrade_database" "$upgrade_unexpected_index_database" "$upgrade_unexpected_trigger_database" "$upgrade_unexpected_price_index_database" "$upgrade_unexpected_version_trigger_database" "$upgrade_unexpected_scope_index_database" "$upgrade_altered_check_database" "$upgrade_finalization_scalar_database" "$upgrade_finalization_string_database" "$upgrade_finalization_null_database" "$upgrade_finalization_missing_database"' EXIT
+marker_null_post_database="$(mktemp /tmp/aircost-reference-marker-null-post.XXXXXX.sqlite3)"
+marker_null_predecessor_database="$(mktemp /tmp/aircost-reference-marker-null-predecessor.XXXXXX.sqlite3)"
+marker_null_work_database="$(mktemp /tmp/aircost-reference-marker-null-work.XXXXXX.sqlite3)"
+trap 'rm -f "$test_database" "$approval_database" "$component_database" "$duplicate_price_database" "$overlap_database" "$serial_overlap_database" "$incomplete_database" "$cleanup_database" "$marker_rerun_database" "$marker_mismatch_database" "$marker_damage_database" "$marker_unexpected_database" "$marker_run_check_database" "$upgrade_database" "$upgrade_unexpected_index_database" "$upgrade_unexpected_trigger_database" "$upgrade_unexpected_price_index_database" "$upgrade_unexpected_version_trigger_database" "$upgrade_unexpected_scope_index_database" "$upgrade_altered_check_database" "$upgrade_finalization_scalar_database" "$upgrade_finalization_string_database" "$upgrade_finalization_null_database" "$upgrade_finalization_missing_database" "$marker_null_post_database" "$marker_null_predecessor_database" "$marker_null_work_database"' EXIT
 
 sqlite3 -bail "$test_database" \
   ".read $repository_root/schema/sqlite.sql" \
@@ -69,6 +72,107 @@ expect_failure() {
     exit 1
   fi
 }
+
+sqlite_schema_digest() {
+  sqlite3 "$1" "SELECT lower(hex(sha3(group_concat(
+    type || ':' || name || ':' || tbl_name || ':' || coalesce(sql, ''), '|'
+  ), 256))) FROM (
+    SELECT type, name, tbl_name, sql FROM sqlite_schema
+    ORDER BY type, name, tbl_name
+  )"
+}
+
+make_reference_cutover_marker_nullable() {
+  sqlite3 -bail "$1" "
+    PRAGMA foreign_keys = OFF;
+    ALTER TABLE schema_migration_contracts
+      RENAME TO reference_cutover_original_contracts;
+    CREATE TABLE schema_migration_contracts (
+      migration_name TEXT PRIMARY KEY,
+      contract_version INTEGER,
+      contract_fingerprint TEXT,
+      installed_at TEXT
+    );
+    INSERT INTO schema_migration_contracts
+    SELECT migration_name, contract_version, contract_fingerprint, installed_at
+    FROM reference_cutover_original_contracts;
+    DROP TABLE reference_cutover_original_contracts;
+    PRAGMA foreign_keys = ON;
+  "
+}
+
+assert_null_reference_cutover_marker_rejected() {
+  local source_database="$1"
+  local null_assignment="$2"
+  local runner="$3"
+  local label="$4"
+  cp "$source_database" "$marker_null_work_database"
+  make_reference_cutover_marker_nullable "$marker_null_work_database"
+  sqlite3 -bail "$marker_null_work_database" "
+    UPDATE schema_migration_contracts
+    SET $null_assignment
+    WHERE migration_name = '20260819_reference_catalog_cutover';
+  "
+  local marker_before
+  local schema_before
+  marker_before="$(sqlite3 "$marker_null_work_database" "
+    SELECT quote(contract_version) || ':' || quote(contract_fingerprint) || ':' ||
+           quote(installed_at)
+    FROM schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+  ")"
+  schema_before="$(sqlite_schema_digest "$marker_null_work_database")"
+  expect_failure "$marker_null_work_database" \
+    ".read $repository_root/$runner" \
+    "CHECK constraint failed"
+  test "$(sqlite_schema_digest "$marker_null_work_database")" = "$schema_before" || {
+    echo "$label: rejected marker must not heal or mutate the schema" >&2
+    exit 1
+  }
+  test "$(sqlite3 "$marker_null_work_database" "
+    SELECT quote(contract_version) || ':' || quote(contract_fingerprint) || ':' ||
+           quote(installed_at)
+    FROM schema_migration_contracts
+    WHERE migration_name = '20260819_reference_catalog_cutover'
+  ")" = "$marker_before" || {
+    echo "$label: rejected marker must remain byte-for-byte unchanged" >&2
+    exit 1
+  }
+}
+
+cp "$test_database" "$marker_null_post_database"
+sqlite3 -bail "$marker_null_predecessor_database" \
+  ".read $repository_root/schema/sqlite.sql" \
+  ".read $repository_root/tests/schema/reference_catalog_cutover_predecessor.sqlite.sql" \
+  "INSERT INTO schema_migration_contracts (
+     migration_name, contract_version, contract_fingerprint, installed_at
+   ) VALUES (
+     '20260819_reference_catalog_cutover', 1,
+     'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5',
+     '2000-01-01 00:00:00'
+   );"
+for null_case in version fingerprint both
+do
+  case "$null_case" in
+    version) null_assignment="contract_version = NULL" ;;
+    fingerprint) null_assignment="contract_fingerprint = NULL" ;;
+    both) null_assignment="contract_version = NULL, contract_fingerprint = NULL" ;;
+  esac
+  assert_null_reference_cutover_marker_rejected \
+    "$marker_null_post_database" "$null_assignment" "schema/sqlite.sql" \
+    "canonical-post-$null_case"
+  assert_null_reference_cutover_marker_rejected \
+    "$marker_null_post_database" "$null_assignment" \
+    "migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+    "migration-post-$null_case"
+  assert_null_reference_cutover_marker_rejected \
+    "$marker_null_predecessor_database" "$null_assignment" "schema/sqlite.sql" \
+    "canonical-predecessor-$null_case"
+  assert_null_reference_cutover_marker_rejected \
+    "$marker_null_predecessor_database" "$null_assignment" \
+    "migrations/20260819_reference_catalog_cutover.sqlite.sql" \
+    "migration-predecessor-$null_case"
+done
 
 sqlite3 -bail "$upgrade_database" \
   ".read $repository_root/schema/sqlite.sql" \

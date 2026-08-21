@@ -7586,8 +7586,9 @@ mod tests {
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
         listing_pending_reviews_migration_required_message, migration_required_message,
-        split_sql_statements, sqlite_migration_definition, sqlite_table_definition, AppDb,
-        DatabaseBackend, DatabaseKind, AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
+        postgres_reference_owned_objects_query, split_sql_statements, sqlite_migration_definition,
+        sqlite_table_definition, AppDb, DatabaseBackend, DatabaseKind,
+        AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
         AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
@@ -9204,6 +9205,120 @@ mod tests {
         migration_error
     }
 
+    async fn postgres_reference_owned_object_snapshot(
+        pool: &sqlx::PgPool,
+    ) -> (i64, Option<String>) {
+        let owned_objects_query = postgres_reference_owned_objects_query().unwrap();
+        let snapshot_query = format!(
+            "SELECT count(*), pg_catalog.md5(pg_catalog.string_agg(\
+             object_key || '=' || definition, E'\\n' ORDER BY object_key)) \
+             FROM ({owned_objects_query}) owned_object(object_key, definition)"
+        );
+        sqlx::query_as(&snapshot_query)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_postgres_reference_null_marker_rejected(
+        database_url: &str,
+        null_assignment: &str,
+        runner_name: &str,
+        runner_sql: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        pool.execute(
+            "ALTER TABLE public.schema_migration_contracts \
+             ALTER COLUMN contract_version DROP NOT NULL, \
+             ALTER COLUMN contract_fingerprint DROP NOT NULL",
+        )
+        .await
+        .unwrap();
+        let update_marker = format!(
+            "UPDATE public.schema_migration_contracts SET {null_assignment} \
+             WHERE migration_name = '{REFERENCE_CATALOG_CUTOVER_MIGRATION}'"
+        );
+        pool.execute(update_marker.as_str()).await.unwrap();
+        let marker_before = sqlx::query_as::<_, (Option<i32>, Option<String>, String)>(
+            "SELECT contract_version, contract_fingerprint, installed_at \
+             FROM public.schema_migration_contracts WHERE migration_name = $1",
+        )
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let objects_before = postgres_reference_owned_object_snapshot(pool).await;
+
+        let mut connection = pool.acquire().await.unwrap();
+        let mut rejection = None;
+        for statement in split_sql_statements(runner_sql) {
+            if let Err(error) = connection.execute(statement).await {
+                rejection = Some(error.to_string());
+                break;
+            }
+        }
+        let rejection = rejection.unwrap_or_else(|| {
+            panic!("{runner_name}: NULL cutover marker must reject before transition DDL")
+        });
+        let _ = connection.execute("ROLLBACK").await;
+        drop(connection);
+        assert!(
+            rejection.contains("reference catalog cutover contract marker mismatch"),
+            "{runner_name}: {rejection}"
+        );
+        let marker_after = sqlx::query_as::<_, (Option<i32>, Option<String>, String)>(
+            "SELECT contract_version, contract_fingerprint, installed_at \
+             FROM public.schema_migration_contracts WHERE migration_name = $1",
+        )
+        .bind(REFERENCE_CATALOG_CUTOVER_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(marker_after, marker_before, "{runner_name}: marker changed");
+        assert_eq!(
+            postgres_reference_owned_object_snapshot(pool).await,
+            objects_before,
+            "{runner_name}: rejected rerun changed the protected object closure"
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_reference_cutover_rejects_null_marker_fields_without_healing() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        for (case_name, null_assignment) in [
+            ("null-version", "contract_version = NULL"),
+            ("null-fingerprint", "contract_fingerprint = NULL"),
+            (
+                "null-version-and-fingerprint",
+                "contract_version = NULL, contract_fingerprint = NULL",
+            ),
+        ] {
+            for (runner_name, runner_sql) in [
+                ("canonical-schema", POSTGRES_SCHEMA_SQL),
+                (
+                    "explicit-migration",
+                    REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL,
+                ),
+            ] {
+                assert_postgres_reference_null_marker_rejected(
+                    &database_url,
+                    null_assignment,
+                    &format!("{case_name}-{runner_name}"),
+                    runner_sql,
+                )
+                .await;
+            }
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
     async fn postgres_reference_cutover_validation_rejects_adversarial_mutations() {
@@ -10584,9 +10699,12 @@ mod tests {
     async fn assert_postgres_replay_startup_rejected(database_url: &str) {
         let error = match AppDb::connect(database_url).await {
             Ok(_) => panic!("startup must reject a weakened PostgreSQL replay contract"),
-            Err(error) => error.to_string(),
+            Err(error) => format!("{error:#}"),
         };
-        assert!(error.contains("20260819_listing_replay_runs.postgres.sql"));
+        assert!(
+            error.contains("20260819_listing_replay_runs.postgres.sql"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -30,8 +30,8 @@ BEGIN
     FROM public.schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND (
-        contract_version <> 1
-        OR contract_fingerprint <>
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
           'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
       )
   ) THEN
