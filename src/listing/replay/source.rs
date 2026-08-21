@@ -122,6 +122,19 @@ struct FrozenSourceContract {
     receipt_sha3_256: &'static str,
 }
 
+type StoredCaptureBoundary = (
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
 const FROZEN_SOURCE_CONTRACT: FrozenSourceContract = FrozenSourceContract {
     schema_object_count: LEGACY_SQLITE_SCHEMA_OBJECT_COUNT,
     schema_sha3_256: LEGACY_SQLITE_SCHEMA_SHA3_256,
@@ -670,18 +683,7 @@ async fn import_legacy_captures(
         .bind(&row.signature_base64)
         .execute(&mut *transaction)
         .await?;
-        let stored: (
-            i64,
-            i64,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        ) = sqlx::query_as(
+        let stored: StoredCaptureBoundary = sqlx::query_as(
             r#"SELECT user_id, plugin_install_id, source_url, submitted_at,
                       rendered_html, rendered_html_sha256, signature_base64,
                       extracted_listing_json, extraction_error,
@@ -756,7 +758,7 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
                 bail!("prepared replay source contains {count} excluded artifact rows in {table}");
             }
         }
-        let columns = sqlx::query(&format!("PRAGMA table_xinfo({})", quote_identifier(&table)))
+        let columns = sqlx::query(&format!("PRAGMA table_xinfo({})", quote_identifier(table)))
             .fetch_all(pool)
             .await?;
         for column in columns {
@@ -776,7 +778,7 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
             }
             let sql = format!(
                 "SELECT COUNT(*) FROM {} WHERE instr(CAST({} AS BLOB), ?) > 0",
-                quote_identifier(&table),
+                quote_identifier(table),
                 quote_identifier(&name)
             );
             for obsolete in obsolete_hashes {

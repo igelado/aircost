@@ -110,7 +110,7 @@ impl ProjectionBundle {
         }
         rows.extend(self.generated_keys.clone());
         rows.extend(self.generated_products.clone());
-        rows.sort_by(|left, right| canonical_row(left).cmp(&canonical_row(right)));
+        rows.sort_by_key(canonical_row);
         Ok(rows)
     }
 }
@@ -683,7 +683,7 @@ fn project_observations(rows: &mut [ProjectionRow]) -> Result<()> {
 
 fn projected_catalog_revision(roots: &BTreeMap<String, Vec<ProjectionRow>>) -> Result<String> {
     let mut material = roots.values().flatten().cloned().collect::<Vec<_>>();
-    material.sort_by(|left, right| canonical_row(left).cmp(&canonical_row(right)));
+    material.sort_by_key(canonical_row);
     Ok(format!(
         "sha256:{}",
         sha256_json(&serde_json::json!({
@@ -1059,10 +1059,9 @@ async fn rebuild_server_faa_hierarchy_claim(
         parse_server_faa_hierarchy_claim(fact_kind, claim.string("quoted_evidence")?, claim_id)?;
     if parsed.snapshot_date != faa.report.snapshot_date
         || parsed.archive_sha256 != faa.report.archive_sha256
-        || faa
+        || !faa
             .obsolete_hash_replacements
-            .get(&parsed.source_manifest_sha256)
-            .is_none()
+            .contains_key(&parsed.source_manifest_sha256)
     {
         bail!("legacy FAA hierarchy claim {claim_id} references a different release");
     }
@@ -1879,7 +1878,7 @@ async fn validate_projected_target(target: &AppDb, bundle: &ProjectionBundle) ->
         }
         actual.push(rows.into_iter().next().unwrap());
     }
-    actual.sort_by(|left, right| canonical_row(left).cmp(&canonical_row(right)));
+    actual.sort_by_key(canonical_row);
     let actual_fingerprint = fingerprint(&actual)?;
     if actual_fingerprint != bundle.fingerprint_sha256 {
         bail!(
