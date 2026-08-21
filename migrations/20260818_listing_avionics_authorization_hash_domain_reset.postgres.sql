@@ -6,7 +6,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 -- Exclude old-binary authorization writers until both invalidation and the
@@ -18,14 +18,14 @@ IN SHARE ROW EXCLUSIVE MODE;
 DO $migration_guard$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name =
             '20260818_listing_avionics_association_authorizations'
       AND contract_version = 1
       AND contract_fingerprint =
         'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9'
   ) OR EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name =
             '20260818_listing_avionics_authorization_hash_domain_reset'
       AND (
@@ -47,7 +47,7 @@ $migration_guard$;
 DELETE FROM aircraft_sale_listing_avionics_authorizations
 WHERE authorization_kind = 'manufacturer_reuse'
   AND NOT EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name =
             '20260818_listing_avionics_authorization_hash_domain_reset'
       AND contract_version = 1
@@ -55,7 +55,7 @@ WHERE authorization_kind = 'manufacturer_reuse'
         'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033'
   );
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260818_listing_avionics_authorization_hash_domain_reset',

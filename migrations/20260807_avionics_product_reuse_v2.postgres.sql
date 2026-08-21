@@ -8,7 +8,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version BIGINT NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL
@@ -17,21 +17,21 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260803_avionics_product_reuse_attestations'
       AND contract_version = 2
       AND contract_fingerprint =
         '8ad6e935e1222a03e2da4848a9e3c6f4b7f50ee027a6e50ede3b692d034cae55'
   ) OR NOT EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name =
           '20260805_listing_avionics_association_corroborations'
       AND contract_version = 1
@@ -39,14 +39,14 @@ BEGIN
         '2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9'
   ) OR NOT EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260806_listing_avionics_collision_closure'
       AND contract_version = 1
       AND contract_fingerprint =
         '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3'
   ) OR EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260807_avionics_product_reuse_v2'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -237,7 +237,7 @@ CREATE TRIGGER avionics_product_reuse_invalidate_origin_revocation
 AFTER INSERT ON avionics_authoritative_source_origin_revocations
 FOR EACH ROW EXECUTE FUNCTION invalidate_avionics_product_reuse_for_revocation();
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260807_avionics_product_reuse_v2',

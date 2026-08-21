@@ -75,7 +75,7 @@ extract_postgres_guard() {
 
 extract_postgres_ledger_lock() {
   awk '
-    /^LOCK TABLE public[.]schema_migration_contracts$/ { capture = 1 }
+    /^LOCK TABLE ONLY public[.]schema_migration_contracts$/ { capture = 1 }
     capture { print }
     capture && /;$/ { exit }
   ' "$1"
@@ -125,21 +125,21 @@ assert_postgres_ledger_lock_placement() {
   local transaction_line search_path_line create_line lock_line first_guard_line marker_line
   local lock_statement
   test "$(grep -c '^SET LOCAL search_path = public, pg_catalog, pg_temp;$' "$file")" = 1
-  test "$(grep -c '^LOCK TABLE public[.]schema_migration_contracts$' "$file")" = 1
+  test "$(grep -c '^LOCK TABLE ONLY public[.]schema_migration_contracts$' "$file")" = 1
   transaction_line="$(grep -n -m1 '^BEGIN;$' "$file" | cut -d: -f1)"
   search_path_line="$(grep -n -m1 \
     '^SET LOCAL search_path = public, pg_catalog, pg_temp;$' "$file" | cut -d: -f1)"
   create_line="$(grep -n -m1 \
     '^CREATE TABLE IF NOT EXISTS \(public[.]\)\?schema_migration_contracts' \
     "$file" | cut -d: -f1 || true)"
-  lock_line="$(grep -n -m1 '^LOCK TABLE public[.]schema_migration_contracts$' \
+  lock_line="$(grep -n -m1 '^LOCK TABLE ONLY public[.]schema_migration_contracts$' \
     "$file" | cut -d: -f1)"
   first_guard_line="$(grep -n -m1 '^DO [$]' "$file" | cut -d: -f1)"
   marker_line="$(grep -n -m1 \
-    '^INSERT INTO \(public[.]\)\?schema_migration_contracts' "$file" | \
+    '^INSERT INTO public[.]schema_migration_contracts' "$file" | \
     cut -d: -f1)"
   lock_statement="$(sed -n "${lock_line},$((lock_line + 1))p" "$file")"
-  [[ "$lock_statement" == $'LOCK TABLE public.schema_migration_contracts\nIN SHARE ROW EXCLUSIVE MODE;' ]]
+  [[ "$lock_statement" == $'LOCK TABLE ONLY public.schema_migration_contracts\nIN SHARE ROW EXCLUSIVE MODE;' ]]
   (( transaction_line < search_path_line ))
   if [[ -n "$create_line" ]]; then
     (( search_path_line < create_line ))
@@ -149,6 +149,25 @@ assert_postgres_ledger_lock_placement() {
   fi
   (( lock_line < first_guard_line ))
   (( first_guard_line < marker_line ))
+}
+
+assert_postgres_parent_only_ledger_references() {
+  local file="$1"
+  local unexpected_references
+
+  # INSERT has no ONLY syntax and already targets exactly the named table.
+  # Reads and locks require ONLY so inherited descendants cannot participate.
+  test "$(grep -c '^INSERT INTO public[.]schema_migration_contracts' "$file")" = 1
+  unexpected_references="$(
+    grep -n 'schema_migration_contracts' "$file" |
+      grep -Ev \
+        'CREATE TABLE IF NOT EXISTS public[.]schema_migration_contracts|LOCK TABLE ONLY public[.]schema_migration_contracts|FROM ONLY public[.]schema_migration_contracts|INSERT INTO public[.]schema_migration_contracts' || true
+  )"
+  if [[ -n "$unexpected_references" ]]; then
+    printf 'non-parent-only ledger reference in %s:\n%s\n' \
+      "$file" "$unexpected_references" >&2
+    return 1
+  fi
 }
 
 execute_sql() {
@@ -249,7 +268,7 @@ expect_guard_failure() {
 # namespace and ledger-serialization envelope. The four specialized migrations
 # keep their dedicated state-shape tests outside this general behavior matrix.
 mapfile -t receipt_postgres_migrations < <(
-  grep -El '^INSERT INTO (public[.])?schema_migration_contracts' \
+  grep -El '^INSERT INTO public[.]schema_migration_contracts' \
     "$repository_root"/migrations/*.postgres.sql |
     sed -E 's|.*/([^/]+)[.]postgres[.]sql|\1|' | sort
 )
@@ -259,8 +278,9 @@ diff -u \
   <(printf '%s\n' "${all_postgres_migrations[@]}" | sort) \
   <(printf '%s\n' "${receipt_postgres_migrations[@]}")
 for migration in "${all_postgres_migrations[@]}"; do
-  assert_postgres_ledger_lock_placement \
-    "$repository_root/migrations/$migration.postgres.sql"
+  file="$repository_root/migrations/$migration.postgres.sql"
+  assert_postgres_ledger_lock_placement "$file"
+  assert_postgres_parent_only_ledger_references "$file"
 done
 
 # Strict receipts are literal conflict no-ops. Only the two explicit v1-to-v2
@@ -679,6 +699,50 @@ test_postgres_temporary_shadows_are_searched_last() {
   [[ "$session_output" == *'accept_temp_probe|0'* ]]
 }
 
+test_postgres_inherited_receipts_cannot_spoof_parent_ledger() {
+  local migration file tuple version fingerprint
+  migration=20260804_avionics_grounded_evidence_refresh
+  file="$repository_root/migrations/$migration.postgres.sql"
+  tuple="$(contract_tuple "$migration" postgres)"
+  version="${tuple%%:*}"
+  fingerprint="${tuple#*:}"
+
+  execute_sql postgres \
+    'DROP TABLE IF EXISTS public.schema_migration_contracts_inheritance_probe; CREATE TABLE public.schema_migration_contracts_inheritance_probe () INHERITS (public.schema_migration_contracts)'
+
+  # A hostile descendant receipt must not turn an exact canonical receipt into
+  # a rejection, and the canonical no-op must preserve its installation time.
+  execute_sql postgres \
+    "UPDATE ONLY public.schema_migration_contracts SET contract_version=$version,contract_fingerprint='$fingerprint',installed_at='$sentinel_installed_at' WHERE migration_name='$migration'; DELETE FROM public.schema_migration_contracts_inheritance_probe; INSERT INTO public.schema_migration_contracts_inheritance_probe VALUES ('$migration',99,'$hostile_fingerprint','$sentinel_installed_at'); UPDATE public.historical_migration_domain_probe SET mutation_count=0 WHERE id=1"
+  execute_postgres_transaction_contract "$file"
+  test "$(query_sql postgres \
+    'SELECT mutation_count FROM public.historical_migration_domain_probe WHERE id=1')" = 1
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM ONLY public.schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "$version:$fingerprint:$sentinel_installed_at"
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM public.schema_migration_contracts_inheritance_probe WHERE migration_name='$migration'")" = \
+    "99:$hostile_fingerprint:$sentinel_installed_at"
+
+  # Conversely, an exact descendant receipt must not hide or heal a hostile
+  # canonical receipt. The guard rejects before the domain probe or either row
+  # can change.
+  execute_sql postgres \
+    "UPDATE ONLY public.schema_migration_contracts SET contract_version=99,contract_fingerprint='$hostile_fingerprint',installed_at='$sentinel_installed_at' WHERE migration_name='$migration'; UPDATE public.schema_migration_contracts_inheritance_probe SET contract_version=$version,contract_fingerprint='$fingerprint' WHERE migration_name='$migration'; UPDATE public.historical_migration_domain_probe SET mutation_count=0 WHERE id=1"
+  expect_guard_failure postgres "$file"
+  test "$(query_sql postgres \
+    'SELECT mutation_count FROM public.historical_migration_domain_probe WHERE id=1')" = 0
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM ONLY public.schema_migration_contracts WHERE migration_name='$migration'")" = \
+    "99:$hostile_fingerprint:$sentinel_installed_at"
+  test "$(query_sql postgres \
+    "SELECT contract_version||':'||contract_fingerprint||':'||installed_at FROM public.schema_migration_contracts_inheritance_probe WHERE migration_name='$migration'")" = \
+    "$version:$fingerprint:$sentinel_installed_at"
+
+  execute_sql postgres \
+    'DROP TABLE public.schema_migration_contracts_inheritance_probe'
+}
+
 for backend in sqlite postgres; do
   initialize_backend "$backend"
   test_strict_contracts "$backend"
@@ -688,5 +752,6 @@ done
 test_postgres_concurrent_receipt_writers
 test_postgres_hostile_search_path_is_transaction_local
 test_postgres_temporary_shadows_are_searched_last
+test_postgres_inherited_receipts_cannot_spoof_parent_ledger
 
 echo 'Historical migration provenance contracts passed'

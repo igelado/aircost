@@ -9,7 +9,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version BIGINT NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL
@@ -18,14 +18,14 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260803_avionics_product_reuse_attestations'
       AND NOT (
         (
@@ -199,7 +199,7 @@ CREATE TRIGGER avionics_product_reuse_invalidate_origin_revocation
 AFTER INSERT ON avionics_authoritative_source_origin_revocations
 FOR EACH ROW EXECUTE FUNCTION invalidate_avionics_product_reuse_for_revocation();
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts AS installed_contract (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260803_avionics_product_reuse_attestations',
@@ -211,8 +211,8 @@ ON CONFLICT (migration_name) DO UPDATE SET
   contract_version = EXCLUDED.contract_version,
   contract_fingerprint = EXCLUDED.contract_fingerprint,
   installed_at = EXCLUDED.installed_at
-WHERE schema_migration_contracts.contract_version = 1
-  AND schema_migration_contracts.contract_fingerprint =
+WHERE installed_contract.contract_version = 1
+  AND installed_contract.contract_fingerprint =
       'edfe54b792fa91890bd1708ad23b58f4fd9f9c717b42147f5edb948d67ccd837';
 
 COMMIT;

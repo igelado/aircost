@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 -- A legacy projection does not say which field set/domain produced its record
@@ -28,7 +28,7 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_faa_reference_reachability'
       AND contract_version = 1
       AND contract_fingerprint =
@@ -39,7 +39,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260820_faa_record_hash_domain'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -52,7 +52,7 @@ BEGIN
 
   SELECT EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260820_faa_record_hash_domain'
   ) INTO marker_installed;
 
@@ -685,7 +685,7 @@ DO $install_domain$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260820_faa_record_hash_domain'
   ) THEN
     ALTER TABLE public.faa_registry_snapshots

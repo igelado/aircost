@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 -- The historical and installed contracts share the same five projection
@@ -398,7 +398,7 @@ DECLARE
   function_matches BIGINT;
 BEGIN
   SELECT EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_faa_reference_reachability'
   ) INTO marker_installed;
 
@@ -669,7 +669,7 @@ DO $migration_guard$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_faa_reference_reachability'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -683,7 +683,7 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_faa_reference_reachability'
   ) THEN
     IF (

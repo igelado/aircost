@@ -5,7 +5,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL
@@ -14,14 +14,14 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260809_listing_verification_runs'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -132,7 +132,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS
 CREATE INDEX IF NOT EXISTS idx_listing_verification_run_items_claim
   ON listing_verification_run_items (run_id, status, position, id);
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name,
   contract_version,
   contract_fingerprint,

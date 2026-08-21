@@ -11,7 +11,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL
@@ -20,14 +20,14 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name =
           '20260731_avionics_human_reviewed_consolidation'
       AND contract_version = 1
@@ -35,14 +35,14 @@ BEGIN
         '93a641a0f653eacf0c8413bdb697a35c588fe34efc1419d30bf65146c8b2d55a'
   ) OR NOT EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260807_avionics_product_reuse_v2'
       AND contract_version = 1
       AND contract_fingerprint =
         'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc'
   ) OR EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name =
           '20260808_avionics_descriptive_consolidation'
       AND (
@@ -284,7 +284,7 @@ WHERE (
       )
   );
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260808_avionics_descriptive_consolidation',

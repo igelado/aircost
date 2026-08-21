@@ -2,7 +2,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 -- A marker-present rerun is an attestation before it is a migration. Reject
@@ -16,7 +16,7 @@ DECLARE
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -29,7 +29,7 @@ BEGIN
 
   SELECT EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
@@ -437,7 +437,7 @@ DECLARE
   actual_definition_digest TEXT;
 BEGIN
   SELECT EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
   ) INTO exact_marker;
 
@@ -511,7 +511,7 @@ DECLARE
   actual_definition_digest TEXT;
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_reference_catalog_cutover'
   ) THEN
     WITH objects(object_key, definition) AS (
