@@ -821,9 +821,6 @@ impl AppDb {
                 backend: DatabaseBackend::Postgres(pool),
             };
             db.initialize_transactionally().await?;
-            db.ensure_required_migrations()
-                .await
-                .context("PostgreSQL post-initialize migration gate failed")?;
             Ok(db)
         } else {
             ensure_sqlite_parent_directory(&database_url)?;
@@ -840,7 +837,6 @@ impl AppDb {
                 backend: DatabaseBackend::Sqlite(pool),
             };
             db.initialize_transactionally().await?;
-            db.ensure_required_migrations().await?;
             Ok(db)
         }
     }
