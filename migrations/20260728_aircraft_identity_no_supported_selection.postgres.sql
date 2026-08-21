@@ -13,13 +13,13 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_contract_guard$
 BEGIN
   IF EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260728_aircraft_identity_no_supported_selection'
       AND (
         contract_version IS DISTINCT FROM 2
@@ -181,7 +181,7 @@ BEFORE UPDATE OF decision_action ON aircraft_identity_decisions
 FOR EACH ROW
 EXECUTE FUNCTION reject_claimed_no_supported_selection_decision();
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260728_aircraft_identity_no_supported_selection',

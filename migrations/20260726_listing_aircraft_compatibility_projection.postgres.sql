@@ -2,7 +2,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL
@@ -11,13 +11,13 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(trim(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260726_listing_aircraft_compatibility_projection'
       AND (
         contract_version IS DISTINCT FROM 2
@@ -1454,7 +1454,7 @@ ON aircraft_model_variant_default_avionics
 FOR EACH ROW
 EXECUTE FUNCTION prevent_projected_aircraft_evidence_variant_move();
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260726_listing_aircraft_compatibility_projection',

@@ -6,7 +6,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-CREATE TABLE IF NOT EXISTS schema_migration_contracts (
+CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version BIGINT NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL
@@ -15,14 +15,14 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260804_avionics_grounded_evidence_refresh'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -64,7 +64,7 @@ CREATE TRIGGER avionics_models_approved_identity_immutable
 BEFORE UPDATE ON avionics_models
 FOR EACH ROW EXECUTE FUNCTION preserve_approved_avionics_identity();
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260804_avionics_grounded_evidence_refresh',

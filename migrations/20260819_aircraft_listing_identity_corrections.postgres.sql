@@ -11,14 +11,14 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   CHECK (length(BTRIM(migration_name)) > 0)
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM public.schema_migration_contracts
+    FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_aircraft_listing_identity_corrections'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -33,7 +33,7 @@ BEGIN
        'public.aircraft_listing_identity_correction_decisions'
      ) IS NOT NULL
      AND NOT EXISTS (
-       SELECT 1 FROM public.schema_migration_contracts
+       SELECT 1 FROM ONLY public.schema_migration_contracts
        WHERE migration_name = '20260819_aircraft_listing_identity_corrections'
      ) THEN
     RAISE EXCEPTION

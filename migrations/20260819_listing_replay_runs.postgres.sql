@@ -4,7 +4,7 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
@@ -15,12 +15,12 @@ DECLARE
   function_signature TEXT;
 BEGIN
   SELECT EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_listing_replay_runs'
   ) INTO marker_is_present;
 
   IF marker_is_present AND NOT EXISTS (
-    SELECT 1 FROM public.schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260819_listing_replay_runs'
       AND contract_version = 1
       AND contract_fingerprint =

@@ -5,31 +5,31 @@ BEGIN;
 
 SET LOCAL search_path = public, pg_catalog, pg_temp;
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260805_listing_avionics_association_corroborations'
       AND contract_version = 1
       AND contract_fingerprint =
         '2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9'
   ) OR NOT EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260806_listing_avionics_collision_closure'
       AND contract_version = 1
       AND contract_fingerprint =
         '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3'
   ) OR NOT EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260807_avionics_product_reuse_v2'
       AND contract_version = 1
       AND contract_fingerprint =
         'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc'
   ) OR EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260818_listing_avionics_association_authorizations'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -509,7 +509,7 @@ FOR EACH ROW
 EXECUTE FUNCTION invalidate_listing_avionics_authorization_for_capture();
 
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260818_listing_avionics_association_authorizations',

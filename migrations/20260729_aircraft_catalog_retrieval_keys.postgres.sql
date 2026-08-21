@@ -19,13 +19,13 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   installed_at TEXT NOT NULL
 );
 
-LOCK TABLE public.schema_migration_contracts
+LOCK TABLE ONLY public.schema_migration_contracts
 IN SHARE ROW EXCLUSIVE MODE;
 
 DO $migration_guard$
 BEGIN
   IF EXISTS (
-    SELECT 1 FROM schema_migration_contracts
+    SELECT 1 FROM ONLY public.schema_migration_contracts
     WHERE migration_name = '20260729_aircraft_catalog_retrieval_keys'
       AND (
         contract_version IS DISTINCT FROM 1
@@ -319,7 +319,7 @@ EXECUTE FUNCTION preserve_compatibility_projected_aircraft_entity(
   'aircraft_factory_package_id'
 );
 
-INSERT INTO schema_migration_contracts (
+INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260729_aircraft_catalog_retrieval_keys',
