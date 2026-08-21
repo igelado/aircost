@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use sha3::{Digest, Sha3_256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Acquire, FromRow, Row, SqliteConnection, SqlitePool};
+use sqlx::{Acquire, FromRow, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use tempfile::NamedTempFile;
 
 use super::{
@@ -763,6 +763,17 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
     if provider_calls != 0 {
         bail!("prepared replay source contains {provider_calls} provider-accounting rows");
     }
+    let obsolete_needles = obsolete_hashes
+        .iter()
+        .map(|digest| {
+            Ok((
+                digest.as_bytes().to_vec(),
+                decode_sha256(digest).with_context(|| {
+                    format!("could not decode legacy FAA taint digest {digest}")
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let tables = sqlx::query_scalar::<_, String>(
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )
@@ -796,21 +807,8 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
             if !text_bearing {
                 continue;
             }
-            let sql = format!(
-                "SELECT COUNT(*) FROM {} WHERE instr(CAST({} AS BLOB), ?) > 0",
-                quote_identifier(table),
-                quote_identifier(&name)
-            );
-            for obsolete in obsolete_hashes {
-                let ascii_count: i64 = sqlx::query_scalar(&sql)
-                    .bind(obsolete.as_bytes())
-                    .fetch_one(pool)
-                    .await?;
-                let binary_count: i64 = sqlx::query_scalar(&sql)
-                    .bind(decode_sha256(obsolete)?)
-                    .fetch_one(pool)
-                    .await?;
-                if ascii_count != 0 || binary_count != 0 {
+            for needles in obsolete_needles.chunks(200) {
+                if column_contains_any_taint(pool, table, &name, needles).await? {
                     bail!(
                         "prepared replay source retained obsolete FAA hash material in {table}.{name}"
                     );
@@ -819,6 +817,40 @@ async fn audit_prepared_target(target: &AppDb, obsolete_hashes: &BTreeSet<String
         }
     }
     Ok(())
+}
+
+async fn column_contains_any_taint(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    needles: &[(Vec<u8>, Vec<u8>)],
+) -> Result<bool> {
+    if needles.is_empty() {
+        return Ok(false);
+    }
+    let mut query =
+        QueryBuilder::<Sqlite>::new("WITH obsolete(ascii_digest, binary_digest) AS (VALUES ");
+    for (index, (ascii, binary)) in needles.iter().enumerate() {
+        if index != 0 {
+            query.push(", ");
+        }
+        query
+            .push("(")
+            .push_bind(ascii.clone())
+            .push(", ")
+            .push_bind(binary.clone())
+            .push(")");
+    }
+    query
+        .push(") SELECT EXISTS (SELECT 1 FROM ")
+        .push(quote_identifier(table))
+        .push(" CROSS JOIN obsolete WHERE instr(CAST(")
+        .push(quote_identifier(column))
+        .push(" AS BLOB), obsolete.ascii_digest) > 0 OR instr(CAST(")
+        .push(quote_identifier(column))
+        .push(" AS BLOB), obsolete.binary_digest) > 0)");
+    let present: i64 = query.build_query_scalar().fetch_one(pool).await?;
+    Ok(present != 0)
 }
 
 async fn checkpoint_prepared_target(target: &AppDb) -> Result<()> {
@@ -926,5 +958,47 @@ mod tests {
             Path::new("artifacts")
         );
         assert!(output_parent(Path::new("/")).is_err());
+    }
+
+    #[tokio::test]
+    async fn batched_taint_scan_finds_ascii_and_binary_digests() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE retained (text_value TEXT, blob_value BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let digest = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let needles = vec![(digest.as_bytes().to_vec(), decode_sha256(digest).unwrap())];
+        assert!(
+            !column_contains_any_taint(&pool, "retained", "text_value", &needles)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query("INSERT INTO retained (text_value) VALUES (?)")
+            .bind(format!("typed receipt {digest}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            column_contains_any_taint(&pool, "retained", "text_value", &needles)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query("DELETE FROM retained")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO retained (blob_value) VALUES (?)")
+            .bind([b"prefix".as_slice(), needles[0].1.as_slice()].concat())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            column_contains_any_taint(&pool, "retained", "blob_value", &needles)
+                .await
+                .unwrap()
+        );
     }
 }
