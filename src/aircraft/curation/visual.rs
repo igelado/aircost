@@ -348,9 +348,8 @@ async fn resolve_visible_aircraft_identifiers_with_options(
             GeminiTask::AircraftVisualIdentity,
             "visible_aircraft_identifier_resolution",
         )
-        .with_correlation_id(photo_set_id.clone())
-        .with_source("listing_photo_set", photo_set_id)
     });
+    let accounting = complete_visual_accounting(accounting, &photo_set_id);
     let request = CreateInteractionRequest::new(
         config.model.trim(),
         InteractionInput::multimodal(input)?,
@@ -405,6 +404,19 @@ async fn resolve_visible_aircraft_identifiers_with_options(
         total_input_tokens: usage.map(|usage| usage.total_input_tokens),
         total_output_tokens: usage.map(|usage| usage.total_output_tokens),
     })
+}
+
+fn complete_visual_accounting(
+    mut accounting: InteractionAccountingContext,
+    photo_set_id: &str,
+) -> InteractionAccountingContext {
+    if accounting.correlation_id.is_none() {
+        accounting.correlation_id = Some(photo_set_id.to_string());
+    }
+    if accounting.source.is_none() {
+        accounting = accounting.with_source("listing_photo_set", photo_set_id.to_string());
+    }
+    accounting
 }
 
 pub fn visual_identifier_response_schema(image_ids: &[String]) -> Value {
@@ -1210,5 +1222,45 @@ mod tests {
         assert_eq!(config.service_tier.as_deref(), Some("flex"));
         assert_eq!(config.thinking_level, ConfigThinkingLevel::Minimal);
         assert_eq!(config.max_output_tokens, 2048);
+    }
+
+    #[test]
+    fn visual_accounting_preserves_capture_or_phase_correlation_and_adds_photo_fallback() {
+        let capture = InteractionAccountingContext::new(
+            GeminiTask::AircraftVisualIdentity,
+            "faa_unmatched_registration_visual_recovery",
+        )
+        .with_correlation_id("plugin-submission:41:capture:abc123");
+        let completed = complete_visual_accounting(capture, "sha256:photo-set");
+        assert_eq!(
+            completed.correlation_id.as_deref(),
+            Some("plugin-submission:41:capture:abc123")
+        );
+        assert_eq!(
+            completed
+                .source
+                .as_ref()
+                .map(|source| (source.kind.as_str(), source.id.as_str())),
+            Some(("listing_photo_set", "sha256:photo-set"))
+        );
+
+        let replay = InteractionAccountingContext::new(
+            GeminiTask::AircraftVisualIdentity,
+            "faa_unmatched_registration_visual_recovery",
+        )
+        .with_correlation_id("replay-run:7:phase:materialization")
+        .with_source("replay_capture", "submission:41");
+        let completed = complete_visual_accounting(replay, "sha256:photo-set");
+        assert_eq!(
+            completed.correlation_id.as_deref(),
+            Some("replay-run:7:phase:materialization")
+        );
+        assert_eq!(
+            completed
+                .source
+                .as_ref()
+                .map(|source| (source.kind.as_str(), source.id.as_str())),
+            Some(("replay_capture", "submission:41"))
+        );
     }
 }

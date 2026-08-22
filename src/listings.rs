@@ -1,14 +1,19 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
+use crate::aircraft::curation::visual::{
+    VisibleIdentifierKind, VisualConsensusStatus, VisualEvidenceConfidence,
+    VisualIdentifierResolution,
+};
 use crate::aircraft::faa::{
-    admit_aircraft_source_identity, normalize_serial_key, require_aircraft_admission,
-    require_listing_admission, require_listing_faa_admission, AircraftAdmissionError,
-    AircraftGrounding, FaaSerialCorrection,
+    admit_aircraft_source_identity, normalize_n_number, normalize_serial_key,
+    require_aircraft_admission, require_listing_admission, require_listing_faa_admission,
+    AircraftAdmissionError, AircraftGrounding, BlockReason, FaaSerialCorrection,
 };
 use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
@@ -171,6 +176,34 @@ pub(crate) struct ListingCreationResult {
     pub(crate) listing: SaleListing,
     pub(crate) occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
     pub(crate) source_serial_correction: Option<FaaSerialCorrection>,
+    pub(crate) source_visual_correction: Option<SourceVisualRegistrationCorrection>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SourceVisualRegistrationCorrection {
+    pub(crate) observed_registration_number: String,
+    pub(crate) corrected_registration_number: String,
+    pub(crate) corrected_serial_number: Option<String>,
+    pub(crate) grounding: AircraftGrounding,
+    pub(crate) resolution: VisualIdentifierResolution,
+    pub(crate) media_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, FromRow, Serialize)]
+pub(crate) struct PinnedSourceVisualCorrectionArtifact {
+    pub(crate) plugin_submission_id: i64,
+    pub(crate) rendered_html_sha256: String,
+    pub(crate) observed_registration_number: String,
+    pub(crate) corrected_registration_number: String,
+    pub(crate) corrected_serial_number: Option<String>,
+    pub(crate) faa_registry_snapshot_id: i64,
+    pub(crate) faa_snapshot_archive_sha256: String,
+    pub(crate) faa_source_record_sha256: String,
+    pub(crate) primary_photo_asset_id: String,
+    pub(crate) primary_photo_url: String,
+    pub(crate) primary_photo_sha256: String,
+    pub(crate) visual_resolution_sha256: String,
+    pub(crate) visual_resolution_json: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +240,265 @@ impl ListingCreationMode {
     fn permits_source_serial_correction(self) -> bool {
         matches!(self, Self::SignedSource | Self::CreateOnly)
     }
+}
+
+async fn recover_source_visual_registration(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    binding: &SignedSourceListingBinding,
+    observed_registration: Option<&str>,
+    observed_snapshot_id: i64,
+) -> StoreResult<Option<SourceVisualRegistrationCorrection>> {
+    recover_source_visual_registration_from_retained_source(
+        db,
+        extractor,
+        &binding.source_url,
+        &binding.rendered_html,
+        observed_registration,
+        observed_snapshot_id,
+        binding.submission_id,
+        &binding.rendered_html_sha256,
+    )
+    .await
+}
+
+async fn recover_source_visual_registration_from_retained_source(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    source_url: &str,
+    rendered_html: &str,
+    observed_registration: Option<&str>,
+    observed_snapshot_id: i64,
+    submission_id: i64,
+    rendered_html_sha256: &str,
+) -> StoreResult<Option<SourceVisualRegistrationCorrection>> {
+    let Some(observed_registration) = observed_registration
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !crate::html::clean::listing_body_contains_exact_structurally_visible_text_span(
+        rendered_html,
+        observed_registration,
+    ) {
+        return Ok(None);
+    }
+    let Some((resolution, media_url)) = extractor
+        .recover_visible_aircraft_identity_from_primary_photo(
+            source_url,
+            rendered_html,
+            submission_id,
+            rendered_html_sha256,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    admit_source_visual_registration(
+        db,
+        observed_registration,
+        observed_snapshot_id,
+        resolution,
+        media_url,
+    )
+    .await
+}
+
+async fn admit_source_visual_registration(
+    db: &AppDb,
+    observed_registration: &str,
+    observed_snapshot_id: i64,
+    resolution: VisualIdentifierResolution,
+    media_url: String,
+) -> StoreResult<Option<SourceVisualRegistrationCorrection>> {
+    let Some(observed_n_number) = normalize_n_number(observed_registration) else {
+        return Ok(None);
+    };
+    if resolution.photos.len() != 1
+        || resolution.registration_consensus.status != VisualConsensusStatus::AutoAccept
+    {
+        return Ok(None);
+    }
+    let Some(candidate_n_number) = resolution
+        .registration_consensus
+        .normalized_n_number
+        .as_deref()
+        .and_then(normalize_n_number)
+    else {
+        return Ok(None);
+    };
+    if candidate_n_number == observed_n_number {
+        return Ok(None);
+    }
+    let visible_serials = resolution
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == VisibleIdentifierKind::ManufacturerSerial)
+        .filter(|candidate| {
+            !candidate.evidence.is_empty()
+                && candidate.evidence.iter().all(|evidence| {
+                    matches!(
+                        evidence.confidence,
+                        VisualEvidenceConfidence::High | VisualEvidenceConfidence::VeryHigh
+                    )
+                })
+        })
+        .map(|candidate| candidate.visible_text.trim())
+        .collect::<Vec<_>>();
+    if visible_serials.len() > 1 || visible_serials.iter().any(|serial| serial.is_empty()) {
+        return Ok(None);
+    }
+    let visible_serial_keys = visible_serials
+        .iter()
+        .map(|serial| normalize_serial_key(serial))
+        .collect::<Option<HashSet<_>>>();
+    let Some(visible_serial_keys) = visible_serial_keys else {
+        return Ok(None);
+    };
+    if visible_serial_keys.len() > 1 {
+        return Ok(None);
+    }
+    let visible_serial = visible_serials.first().copied();
+    let grounding = match require_aircraft_admission(db, Some(&candidate_n_number), None).await {
+        Ok(grounding) => grounding,
+        Err(AircraftAdmissionError::Rejected { .. }) => return Ok(None),
+        Err(error) => return Err(listing_admission_error(error)),
+    };
+    let corrected_serial_number = grounding.manufacturer_serial_raw.clone();
+    if let Some(visible_serial) = visible_serial {
+        let Some(faa_serial) = corrected_serial_number.as_deref() else {
+            return Ok(None);
+        };
+        if normalize_serial_key(visible_serial) != normalize_serial_key(faa_serial) {
+            return Ok(None);
+        }
+    }
+    let admission_serial = visible_serial.or(corrected_serial_number.as_deref());
+    let grounding =
+        match require_aircraft_admission(db, Some(&candidate_n_number), admission_serial).await {
+            Ok(grounding) => grounding,
+            Err(AircraftAdmissionError::Rejected { .. }) => return Ok(None),
+            Err(error) => return Err(listing_admission_error(error)),
+        };
+    if grounding.snapshot.id != observed_snapshot_id {
+        return Ok(None);
+    }
+    let correction = SourceVisualRegistrationCorrection {
+        observed_registration_number: observed_registration.to_string(),
+        corrected_registration_number: candidate_n_number,
+        corrected_serial_number,
+        grounding,
+        resolution,
+        media_url,
+    };
+    validate_visual_faa_pair(db, &correction).await?;
+    Ok(Some(correction))
+}
+
+async fn validate_visual_faa_pair(
+    db: &AppDb,
+    correction: &SourceVisualRegistrationCorrection,
+) -> StoreResult<()> {
+    let observed =
+        normalize_n_number(&correction.observed_registration_number).ok_or_else(|| {
+            ListingStoreError::State(
+                "visual correction observed registration is invalid".to_string(),
+            )
+        })?;
+    let count = query_scalar_one!(
+        db,
+        i64,
+        r#"
+        SELECT COUNT(*)
+        FROM faa_registry_snapshots snapshot
+        JOIN faa_registry_coverage observed
+          ON observed.snapshot_id = snapshot.id
+         AND observed.n_number = ?
+         AND observed.lookup_status = 'absent'
+        JOIN faa_registry_coverage corrected
+          ON corrected.snapshot_id = snapshot.id
+         AND corrected.n_number = ?
+         AND corrected.lookup_status = 'matched'
+        JOIN faa_registry_aircraft aircraft
+          ON aircraft.snapshot_id = snapshot.id
+         AND aircraft.n_number = corrected.n_number
+        WHERE snapshot.id = ?
+          AND snapshot.id = (
+            SELECT id FROM faa_registry_snapshots
+            ORDER BY snapshot_date DESC, id DESC LIMIT 1
+          )
+          AND snapshot.archive_sha256 = ?
+          AND aircraft.source_record_sha256 = ?
+          AND (
+            aircraft.manufacturer_serial_raw = ?
+            OR (aircraft.manufacturer_serial_raw IS NULL AND ? IS NULL)
+          )
+        "#,
+        observed,
+        correction.corrected_registration_number.as_str(),
+        correction.grounding.snapshot.id,
+        correction.grounding.snapshot.archive_sha256.as_str(),
+        correction.grounding.source_record_sha256.as_str(),
+        correction.corrected_serial_number.as_deref(),
+        correction.corrected_serial_number.as_deref()
+    )?;
+    if count != 1 {
+        return Err(ListingStoreError::State(
+            "visual correction FAA absence/match pair changed before binding".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn pinned_visual_resolution(resolution: &VisualIdentifierResolution) -> VisualIdentifierResolution {
+    let mut normalized = resolution.clone();
+    normalized.interaction_id = None;
+    normalized.model.clear();
+    normalized.prompt_version.clear();
+    normalized.schema_version.clear();
+    normalized.total_input_tokens = None;
+    normalized.total_output_tokens = None;
+    normalized
+}
+
+fn pinned_source_visual_artifact(
+    binding: &SignedSourceListingBinding,
+    correction: &SourceVisualRegistrationCorrection,
+) -> StoreResult<PinnedSourceVisualCorrectionArtifact> {
+    let photo = correction.resolution.photos.first().ok_or_else(|| {
+        ListingStoreError::State("visual correction has no audited primary photo".to_string())
+    })?;
+    let primary_photo_asset_id = photo
+        .image_id
+        .strip_prefix("asset-")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ListingStoreError::State(
+                "visual correction primary photo has no retained asset id".to_string(),
+            )
+        })?
+        .to_string();
+    let visual_resolution_json =
+        serde_json::to_string(&pinned_visual_resolution(&correction.resolution))
+            .map_err(|error| ListingStoreError::Database(error.to_string()))?;
+    let visual_resolution_sha256 =
+        format!("{:x}", Sha256::digest(visual_resolution_json.as_bytes()));
+    Ok(PinnedSourceVisualCorrectionArtifact {
+        plugin_submission_id: binding.submission_id,
+        rendered_html_sha256: binding.rendered_html_sha256.clone(),
+        observed_registration_number: correction.observed_registration_number.clone(),
+        corrected_registration_number: correction.corrected_registration_number.clone(),
+        corrected_serial_number: correction.corrected_serial_number.clone(),
+        faa_registry_snapshot_id: correction.grounding.snapshot.id,
+        faa_snapshot_archive_sha256: correction.grounding.snapshot.archive_sha256.clone(),
+        faa_source_record_sha256: correction.grounding.source_record_sha256.clone(),
+        primary_photo_asset_id,
+        primary_photo_url: correction.media_url.clone(),
+        primary_photo_sha256: photo.sha256.clone(),
+        visual_resolution_sha256,
+        visual_resolution_json,
+    })
 }
 
 #[derive(Debug)]
@@ -464,17 +756,50 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         values.serial_number.as_deref(),
         retained_serial_evidence,
     )?;
+    let mut source_visual_correction = None;
     let (grounding, source_serial_correction) = if creation_mode.permits_source_serial_correction()
     {
-        let admission = admit_aircraft_source_identity(
+        match admit_aircraft_source_identity(
             db,
             values.registration_number.as_deref(),
             admission_serial.as_deref(),
             preview.context_text.as_deref(),
         )
         .await
-        .map_err(listing_admission_error)?;
-        (admission.grounding, admission.serial_correction)
+        {
+            Ok(admission) => (admission.grounding, admission.serial_correction),
+            Err(
+                rejected @ AircraftAdmissionError::Rejected {
+                    reason: BlockReason::RegistrationNotFound,
+                    snapshot_id: Some(observed_snapshot_id),
+                    ..
+                },
+            ) => {
+                let Some(binding) = signed_source_binding else {
+                    return Err(listing_admission_error(rejected));
+                };
+                let Some(extractor) = extractor else {
+                    return Err(listing_admission_error(rejected));
+                };
+                let Some(correction) = Box::pin(recover_source_visual_registration(
+                    db,
+                    extractor,
+                    binding,
+                    values.registration_number.as_deref(),
+                    observed_snapshot_id,
+                ))
+                .await?
+                else {
+                    return Err(listing_admission_error(rejected));
+                };
+                values.registration_number = Some(correction.corrected_registration_number.clone());
+                values.serial_number = correction.corrected_serial_number.clone();
+                let grounding = correction.grounding.clone();
+                source_visual_correction = Some(correction);
+                (grounding, None)
+            }
+            Err(error) => return Err(listing_admission_error(error)),
+        }
     } else {
         (
             require_aircraft_admission(
@@ -487,7 +812,9 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
             None,
         )
     };
-    let may_reuse_listing = creation_mode.may_reuse_listing() && source_serial_correction.is_none();
+    let source_identity_correction =
+        source_serial_correction.is_some() || source_visual_correction.is_some();
+    let may_reuse_listing = creation_mode.may_reuse_listing() && !source_identity_correction;
     if !may_reuse_listing {
         // A source serial correction is materialized as an isolated observation.
         // No existing row may change before the signed capture and immutable
@@ -559,6 +886,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                 source_serial_correction,
+                source_visual_correction,
             });
         }
     }
@@ -596,6 +924,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                     source_serial_correction,
+                    source_visual_correction,
                 });
             }
         }
@@ -634,6 +963,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                     listing: get_listing(db, user_id, listing_id).await?,
                     occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                     source_serial_correction,
+                    source_visual_correction,
                 });
             }
         }
@@ -654,6 +984,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
                 source_serial_correction,
+                source_visual_correction,
             });
         }
     }
@@ -664,22 +995,24 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         user_id,
         &values,
         &literal_identity_values,
-        source_serial_correction.is_some(),
+        source_identity_correction,
         signed_source_binding,
+        source_visual_correction.as_ref(),
     )
     .await?;
     replace_listing_pending_review(
         db,
         listing_id,
         &resolved_avionics.pending_review_aspects,
-        source_serial_correction.is_some(),
+        source_identity_correction,
     )
     .await?;
-    if source_serial_correction.is_some() {
+    if source_identity_correction {
         return Ok(ListingCreationResult {
             listing: get_listing(db, user_id, listing_id).await?,
             occurrence_dispositions: resolved_avionics.occurrence_dispositions,
             source_serial_correction,
+            source_visual_correction,
         });
     }
     emit_listing_progress(
@@ -692,6 +1025,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
         source_serial_correction,
+        source_visual_correction,
     })
 }
 
@@ -765,6 +1099,188 @@ pub(crate) async fn resume_signed_source_correction_listing(
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
         source_serial_correction: Some(source_serial_correction),
+        source_visual_correction: None,
+    })
+}
+
+/// Revalidate the single retained primary photo for a receipt-gated visual
+/// registration correction after a process interruption. The corrected row
+/// must still match the newly FAA-admitted visual result exactly before any
+/// child projection can be rebuilt or the immutable receipt can be written.
+pub(crate) async fn resume_signed_source_visual_correction_listing(
+    db: &AppDb,
+    user_id: i64,
+    listing_id: i64,
+    submission_id: i64,
+    preview: &ListingPreview,
+    extractor: Option<&GeminiListingExtractor>,
+    rendered_html: &str,
+    rebuild_children: bool,
+) -> StoreResult<ListingCreationResult> {
+    let values = values_from_preview(preview, None)?;
+    let source_url = values.source_url.as_deref().ok_or_else(|| {
+        ListingStoreError::State(
+            "receipt-gated visual correction lost its retained source URL".to_string(),
+        )
+    })?;
+    let artifact = query_as_optional!(
+        db,
+        PinnedSourceVisualCorrectionArtifact,
+        r#"
+        SELECT plugin_submission_id, rendered_html_sha256,
+               observed_registration_number, corrected_registration_number,
+               corrected_serial_number, faa_registry_snapshot_id,
+               faa_snapshot_archive_sha256, faa_source_record_sha256,
+               primary_photo_asset_id, primary_photo_url, primary_photo_sha256,
+               visual_resolution_sha256, visual_resolution_json
+        FROM aircraft_source_visual_correction_artifacts
+        WHERE plugin_submission_id = ?
+        "#,
+        submission_id
+    )?
+    .ok_or_else(|| {
+        ListingStoreError::State(
+            "receipt-gated visual correction lost its pinned artifact".to_string(),
+        )
+    })?;
+    let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+    if artifact.rendered_html_sha256 != rendered_html_sha256
+        || values.registration_number.as_deref()
+            != Some(artifact.observed_registration_number.as_str())
+    {
+        return Err(ListingStoreError::State(
+            "receipt-gated visual artifact no longer matches its signed capture".to_string(),
+        ));
+    }
+    let discovery = crate::html::listing::media::discover(source_url, rendered_html)
+        .map_err(|error| ListingStoreError::State(error.to_string()))?;
+    let primary = discovery.aircraft_photos.first().ok_or_else(|| {
+        ListingStoreError::State("retained capture lost its primary aircraft photo".to_string())
+    })?;
+    if primary.asset_id != artifact.primary_photo_asset_id
+        || primary.media_url != artifact.primary_photo_url
+    {
+        return Err(ListingStoreError::State(
+            "retained primary aircraft photo changed after visual pinning".to_string(),
+        ));
+    }
+    if format!(
+        "{:x}",
+        Sha256::digest(artifact.visual_resolution_json.as_bytes())
+    ) != artifact.visual_resolution_sha256
+    {
+        return Err(ListingStoreError::State(
+            "pinned visual resolution hash is invalid".to_string(),
+        ));
+    }
+    let resolution: VisualIdentifierResolution =
+        serde_json::from_str(&artifact.visual_resolution_json)
+            .map_err(|error| ListingStoreError::State(error.to_string()))?;
+    if resolution.photos.len() != 1
+        || resolution.photos[0].image_id != format!("asset-{}", primary.asset_id)
+        || resolution.photos[0].sha256 != artifact.primary_photo_sha256
+    {
+        return Err(ListingStoreError::State(
+            "pinned primary photo audit is inconsistent".to_string(),
+        ));
+    }
+    let grounding = require_aircraft_admission(
+        db,
+        Some(&artifact.corrected_registration_number),
+        artifact.corrected_serial_number.as_deref(),
+    )
+    .await
+    .map_err(listing_admission_error)?;
+    if grounding.snapshot.id != artifact.faa_registry_snapshot_id
+        || grounding.snapshot.archive_sha256 != artifact.faa_snapshot_archive_sha256
+        || grounding.source_record_sha256 != artifact.faa_source_record_sha256
+    {
+        return Err(ListingStoreError::State(
+            "pinned visual correction FAA record is no longer current".to_string(),
+        ));
+    }
+    let correction = SourceVisualRegistrationCorrection {
+        observed_registration_number: artifact.observed_registration_number,
+        corrected_registration_number: artifact.corrected_registration_number,
+        corrected_serial_number: artifact.corrected_serial_number,
+        grounding,
+        resolution,
+        media_url: artifact.primary_photo_url,
+    };
+    validate_visual_faa_pair(db, &correction).await?;
+    resume_signed_source_visual_correction_listing_with_correction(
+        db,
+        user_id,
+        listing_id,
+        preview,
+        extractor,
+        correction,
+        rebuild_children,
+    )
+    .await
+}
+
+async fn resume_signed_source_visual_correction_listing_with_correction(
+    db: &AppDb,
+    user_id: i64,
+    listing_id: i64,
+    preview: &ListingPreview,
+    extractor: Option<&GeminiListingExtractor>,
+    correction: SourceVisualRegistrationCorrection,
+    rebuild_children: bool,
+) -> StoreResult<ListingCreationResult> {
+    let mut values = values_from_preview(preview, None)?;
+    let literal_identity_values = values.clone();
+    values.registration_number = Some(correction.corrected_registration_number.clone());
+    values.serial_number = correction.corrected_serial_number.clone();
+    apply_faa_grounding_identity(&mut values, &correction.grounding);
+    let current = get_listing(db, user_id, listing_id).await?;
+    if current.created_by_user_id != user_id
+        || current.source_url != values.source_url
+        || current.ingestion_state != "quarantined"
+        || current.ingestion_error.as_deref() != Some(SOURCE_IDENTITY_RECEIPT_PENDING)
+        || current.registration_number != values.registration_number
+        || current.serial_number != values.serial_number
+    {
+        return Err(ListingStoreError::State(format!(
+            "receipt-gated visual listing {listing_id} changed before deterministic recovery"
+        )));
+    }
+    let occurrence_dispositions = if rebuild_children {
+        let resolved_avionics = resolve_listing_avionics_values(
+            db,
+            &mut values,
+            extractor,
+            preview.source_url.as_deref(),
+            preview.context_text.as_deref(),
+        )
+        .await?;
+        update_listing_values(
+            db,
+            listing_id,
+            &values,
+            &literal_identity_values,
+            false,
+            true,
+            true,
+        )
+        .await?;
+        replace_listing_pending_review(
+            db,
+            listing_id,
+            &resolved_avionics.pending_review_aspects,
+            true,
+        )
+        .await?;
+        resolved_avionics.occurrence_dispositions
+    } else {
+        Vec::new()
+    };
+    Ok(ListingCreationResult {
+        listing: get_listing(db, user_id, listing_id).await?,
+        occurrence_dispositions,
+        source_serial_correction: None,
+        source_visual_correction: Some(correction),
     })
 }
 
@@ -838,6 +1354,7 @@ pub(crate) async fn resume_bound_replay_listing(
         listing: get_listing(db, user_id, listing_id).await?,
         occurrence_dispositions: resolved_avionics.occurrence_dispositions,
         source_serial_correction: None,
+        source_visual_correction: None,
     })
 }
 
@@ -859,14 +1376,20 @@ pub(crate) async fn finalize_signed_source_listing_after_receipt(
           ON listing.id = decision.aircraft_sale_listing_id
         WHERE decision.aircraft_sale_listing_id = ?
           AND decision.plugin_submission_id = ?
-          AND decision.correction_kind = 'faa_serial'
+          AND decision.correction_kind IN ('faa_serial', 'visual_identifier')
           AND decision.rendered_html_sha256 = submission.rendered_html_sha256
           AND submission.user_id = ?
           AND submission.canonical_listing_id = decision.aircraft_sale_listing_id
           AND submission.extraction_error IS NULL
           AND listing.created_by_user_id = submission.user_id
-          AND listing.registration_number = decision.corrected_registration_number
-          AND listing.serial_number = decision.corrected_serial_number
+          AND (
+            listing.registration_number = decision.corrected_registration_number
+            OR (listing.registration_number IS NULL AND decision.corrected_registration_number IS NULL)
+          )
+          AND (
+            listing.serial_number = decision.corrected_serial_number
+            OR (listing.serial_number IS NULL AND decision.corrected_serial_number IS NULL)
+          )
         "#,
         listing_id,
         submission_id,
@@ -1129,10 +1652,22 @@ async fn insert_listing(
     literal_identity_values: &ListingValues,
     source_identity_receipt_pending: bool,
     signed_source_binding: Option<&SignedSourceListingBinding>,
+    source_visual_correction: Option<&SourceVisualRegistrationCorrection>,
 ) -> StoreResult<i64> {
     let aircraft_model_variant_id = pending_aircraft_compatibility_variant_id(db).await?;
     let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
     let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;
+    let pinned_visual_artifact = match (signed_source_binding, source_visual_correction) {
+        (Some(binding), Some(correction)) => {
+            Some(pinned_source_visual_artifact(binding, correction)?)
+        }
+        (None, Some(_)) => {
+            return Err(ListingStoreError::State(
+                "visual source correction cannot be pinned without its signed capture".to_string(),
+            ))
+        }
+        _ => None,
+    };
     let insert_sql = db.sql(
         r#"
         INSERT INTO aircraft_sale_listings (
@@ -1278,6 +1813,16 @@ async fn insert_listing(
     macro_rules! insert_and_bind {
         ($pool:expr) => {{
             let mut transaction = $pool.begin().await?;
+            if pinned_visual_artifact.is_some()
+                && matches!(db.backend(), DatabaseBackend::Postgres(_))
+            {
+                sqlx::query(
+                    "LOCK TABLE faa_registry_snapshots, faa_registry_coverage, \
+                     faa_registry_aircraft IN SHARE MODE",
+                )
+                .execute(&mut *transaction)
+                .await?;
+            }
             if let Some(binding) = signed_source_binding {
                 let install_id = sqlx::query_scalar::<_, i64>(&lock_exact_install_sql)
                     .bind(binding.plugin_install_id)
@@ -1294,6 +1839,78 @@ async fn insert_listing(
                             .to_string(),
                     ));
                 }
+            }
+            if let Some(artifact) = pinned_visual_artifact.as_ref() {
+                let pair_count = sqlx::query_scalar::<_, i64>(&db.sql(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM faa_registry_snapshots snapshot
+                    JOIN faa_registry_coverage observed
+                      ON observed.snapshot_id = snapshot.id
+                     AND observed.n_number = ?
+                     AND observed.lookup_status = 'absent'
+                    JOIN faa_registry_coverage corrected
+                      ON corrected.snapshot_id = snapshot.id
+                     AND corrected.n_number = ?
+                     AND corrected.lookup_status = 'matched'
+                    JOIN faa_registry_aircraft aircraft
+                      ON aircraft.snapshot_id = snapshot.id
+                     AND aircraft.n_number = corrected.n_number
+                    WHERE snapshot.id = ?
+                      AND snapshot.id = (
+                        SELECT id FROM faa_registry_snapshots
+                        ORDER BY snapshot_date DESC, id DESC LIMIT 1
+                      )
+                      AND snapshot.archive_sha256 = ?
+                      AND aircraft.source_record_sha256 = ?
+                      AND (
+                        aircraft.manufacturer_serial_raw = ?
+                        OR (aircraft.manufacturer_serial_raw IS NULL AND ? IS NULL)
+                      )
+                    "#,
+                ))
+                .bind(artifact.observed_registration_number.as_str())
+                .bind(artifact.corrected_registration_number.as_str())
+                .bind(artifact.faa_registry_snapshot_id)
+                .bind(artifact.faa_snapshot_archive_sha256.as_str())
+                .bind(artifact.faa_source_record_sha256.as_str())
+                .bind(artifact.corrected_serial_number.as_deref())
+                .bind(artifact.corrected_serial_number.as_deref())
+                .fetch_one(&mut *transaction)
+                .await?;
+                if pair_count != 1 {
+                    return Err(ListingStoreError::State(
+                        "visual correction FAA absence/match pair changed before atomic binding"
+                            .to_string(),
+                    ));
+                }
+                sqlx::query(&db.sql(
+                    r#"
+                    INSERT INTO aircraft_source_visual_correction_artifacts (
+                      plugin_submission_id, rendered_html_sha256,
+                      observed_registration_number, corrected_registration_number,
+                      corrected_serial_number, faa_registry_snapshot_id,
+                      faa_snapshot_archive_sha256, faa_source_record_sha256,
+                      primary_photo_asset_id, primary_photo_url, primary_photo_sha256,
+                      visual_resolution_sha256, visual_resolution_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "#,
+                ))
+                .bind(artifact.plugin_submission_id)
+                .bind(artifact.rendered_html_sha256.as_str())
+                .bind(artifact.observed_registration_number.as_str())
+                .bind(artifact.corrected_registration_number.as_str())
+                .bind(artifact.corrected_serial_number.as_deref())
+                .bind(artifact.faa_registry_snapshot_id)
+                .bind(artifact.faa_snapshot_archive_sha256.as_str())
+                .bind(artifact.faa_source_record_sha256.as_str())
+                .bind(artifact.primary_photo_asset_id.as_str())
+                .bind(artifact.primary_photo_url.as_str())
+                .bind(artifact.primary_photo_sha256.as_str())
+                .bind(artifact.visual_resolution_sha256.as_str())
+                .bind(artifact.visual_resolution_json.as_str())
+                .execute(&mut *transaction)
+                .await?;
             }
             let listing_id = sqlx::query_scalar::<_, i64>(&insert_sql)
                 .bind(aircraft_model_variant_id)
@@ -4673,6 +5290,12 @@ mod tests {
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
+    use crate::aircraft::curation::visual::{
+        VisibilityBasis, VisibleAircraftIdentifier, VisibleIdentifierKind, VisualConsensusBasis,
+        VisualConsensusStatus, VisualEvidenceConfidence, VisualIdentifierImageEvidence,
+        VisualIdentifierResolution, VisualIdentifierStatus, VisualPhotoAudit,
+        VisualRegistrationConsensus,
+    };
     use crate::aircraft::faa::{
         require_listing_faa_admission, store_release, AircraftAdmissionError, BlockReason,
         ReleaseFixtureBuilder, ReleaseMetadata,
@@ -4682,6 +5305,7 @@ mod tests {
         ReferenceApplicabilityDraft, ReferenceComponentDraft, ReferenceConfigurationIdentityDraft,
         ReferencePriceDraft,
     };
+    use crate::aircraft::repair::{record_bound_source_visual_correction, AircraftRepairOutcome};
     use crate::avionics::catalog::{
         ApprovedAvionicsIdentity, AvionicsIdentityOutcome, CatalogError,
     };
@@ -4692,7 +5316,7 @@ mod tests {
         refresh_reuse_attestation_sqlite, reuse_attestation_is_current_sqlite,
     };
     use crate::db::{AppDb, DatabaseBackend};
-    use crate::extract::preview_manual_listing;
+    use crate::extract::{preview_manual_listing, GeminiListingExtractor};
     use crate::listing::review::{
         stage_pending_review, ListingAssociationRole, PendingReviewAspect, ReviewProduct,
     };
@@ -4731,6 +5355,762 @@ mod tests {
         store_release(db, &release)
             .await
             .expect("test FAA release should store");
+    }
+
+    async fn seed_faa_aircraft_with_absent_claim(
+        db: &AppDb,
+        matched_n_number: &str,
+        serial: &str,
+        absent_n_number: &str,
+    ) {
+        let suffix = matched_n_number
+            .strip_prefix('N')
+            .expect("test FAA N-number must include N prefix");
+        let master = format!(
+            "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n{suffix},{serial},2072738,41528,2023\n"
+        );
+        let release = ReleaseFixtureBuilder::from_csv(
+            ReleaseMetadata::official("2026-07-20", "a".repeat(64)),
+            Cursor::new(master),
+            Cursor::new(FAA_AIRCRAFT_REFERENCE),
+            Cursor::new(FAA_ENGINE_REFERENCE),
+            [matched_n_number, absent_n_number],
+        )
+        .expect("test FAA release should parse");
+        store_release(db, &release)
+            .await
+            .expect("test FAA release should store");
+    }
+
+    fn visual_resolution(registration: &str) -> VisualIdentifierResolution {
+        let image_id = "asset-primary".to_string();
+        VisualIdentifierResolution {
+            status: VisualIdentifierStatus::CandidatesVisible,
+            candidates: vec![VisibleAircraftIdentifier {
+                kind: VisibleIdentifierKind::Registration,
+                visible_text: registration.to_string(),
+                evidence_count: 1,
+                evidence: vec![VisualIdentifierImageEvidence {
+                    image_id: image_id.clone(),
+                    visible_text: registration.to_string(),
+                    confidence: VisualEvidenceConfidence::VeryHigh,
+                    box_2d: [100, 100, 200, 300],
+                    visibility_basis: VisibilityBasis::ExteriorRegistrationMarking,
+                    location_description: "aft fuselage".to_string(),
+                }],
+            }],
+            registration_consensus: VisualRegistrationConsensus {
+                status: VisualConsensusStatus::AutoAccept,
+                basis: VisualConsensusBasis::SingleRegistrationImage,
+                normalized_n_number: Some(registration.to_string()),
+                literal_registrations: vec![registration.to_string()],
+                literal_serials: Vec::new(),
+                registration_evidence_count: 1,
+                serial_evidence_count: 0,
+                supporting_image_ids: vec![image_id.clone()],
+                reason: "one complete visible N-number".to_string(),
+            },
+            refusal_reason: None,
+            photos: vec![VisualPhotoAudit {
+                image_id,
+                mime_type: "image/jpeg".to_string(),
+                byte_count: 3,
+                sha256: "b".repeat(64),
+            }],
+            interaction_id: Some("interaction-test".to_string()),
+            model: "gemini-3.1-flash-lite".to_string(),
+            prompt_version: "aircraft-visible-identifier-v1".to_string(),
+            schema_version: "aircraft-visible-identifier-schema-v1".to_string(),
+            total_input_tokens: Some(10),
+            total_output_tokens: Some(2),
+        }
+    }
+
+    fn visual_resolution_for_asset(
+        registration: &str,
+        asset_id: &str,
+    ) -> VisualIdentifierResolution {
+        let mut resolution = visual_resolution(registration);
+        let image_id = format!("asset-{asset_id}");
+        resolution.photos[0].image_id = image_id.clone();
+        resolution.registration_consensus.supporting_image_ids = vec![image_id.clone()];
+        for candidate in &mut resolution.candidates {
+            for evidence in &mut candidate.evidence {
+                evidence.image_id = image_id.clone();
+            }
+        }
+        resolution.registration_consensus =
+            crate::aircraft::curation::visual::evaluate_visual_registration_consensus(
+                &resolution.candidates,
+            );
+        resolution
+    }
+
+    fn visual_resolution_with_serial(
+        registration: &str,
+        serial: &str,
+    ) -> VisualIdentifierResolution {
+        let mut resolution = visual_resolution(registration);
+        let image_id = resolution.photos[0].image_id.clone();
+        resolution.candidates.push(VisibleAircraftIdentifier {
+            kind: VisibleIdentifierKind::ManufacturerSerial,
+            visible_text: serial.to_string(),
+            evidence_count: 1,
+            evidence: vec![VisualIdentifierImageEvidence {
+                image_id,
+                visible_text: serial.to_string(),
+                confidence: VisualEvidenceConfidence::VeryHigh,
+                box_2d: [250, 250, 350, 600],
+                visibility_basis: VisibilityBasis::ManufacturerSerialLabel,
+                location_description: "manufacturer data plate".to_string(),
+            }],
+        });
+        resolution.registration_consensus =
+            crate::aircraft::curation::visual::evaluate_visual_registration_consensus(
+                &resolution.candidates,
+            );
+        resolution
+    }
+
+    struct PreparedBoundVisualCorrection {
+        preview: super::ListingPreview,
+        correction: super::SourceVisualRegistrationCorrection,
+        rendered_html: String,
+        binding: super::SignedSourceListingBinding,
+        literal_values: ListingValues,
+        corrected_values: ListingValues,
+    }
+
+    async fn prepare_bound_visual_correction(
+        db: &AppDb,
+        user_id: i64,
+        serial: &str,
+    ) -> PreparedBoundVisualCorrection {
+        seed_faa_aircraft_with_absent_claim(db, "N123T", serial, "N182PF").await;
+        if matches!(db.backend(), DatabaseBackend::Sqlite(_)) {
+            seed_curated_test_aircraft_catalog(db, user_id).await;
+        }
+        let source_url = "https://www.controller.com/listing/for-sale/256858675/2010-cessna-turbo-182t-skylane-piston-single-aircraft";
+        let media_url = "https://media.sandhills.com/img.axd?id=1&wid=4326165471&w=0&h=0&sz=Max&checksum=SIGNED1";
+        let rendered_html = format!(
+            r#"<html><body><p>Registration N182PF</p><div class="mc-items"><div class="mc-item mc-img mc-selected"><img data-fullscreen="{media_url}" alt="Cessna exterior"></div></div></body></html>"#
+        );
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N182PF",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+        preview.context_text = Some("Registration N182PF".to_string());
+        let correction = super::admit_source_visual_registration(
+            db,
+            "N182PF",
+            1,
+            visual_resolution_for_asset("N123T", "1"),
+            media_url.to_string(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let bound_json = serde_json::to_string(&preview.parsed_listing).unwrap();
+        let bound_sha256 = format!("{:x}", Sha256::digest(bound_json.as_bytes()));
+        let install_id = query_scalar_one!(
+            db,
+            i64,
+            "INSERT INTO plugin_installs (user_id, public_key_base64) \
+             VALUES (?, 'test-public-key') RETURNING id",
+            user_id
+        )
+        .unwrap();
+        let submission_id = query_scalar_one!(
+            db,
+            i64,
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES (?, ?, ?, '2026-07-20 12:34:56', ?, ?, 'test-signature')
+               RETURNING id"#,
+            user_id,
+            install_id,
+            source_url,
+            &rendered_html,
+            &rendered_html_sha256
+        )
+        .unwrap();
+        let binding = super::SignedSourceListingBinding {
+            submission_id,
+            user_id,
+            plugin_install_id: install_id,
+            install_public_key_base64: "test-public-key".to_string(),
+            install_revoked_at: None,
+            source_url: source_url.to_string(),
+            submitted_at: "2026-07-20 12:34:56".to_string(),
+            rendered_html: rendered_html.clone(),
+            rendered_html_sha256,
+            signature_base64: "test-signature".to_string(),
+            expected_extracted_listing_json: None,
+            expected_extracted_listing_sha256: None,
+            expected_extraction_error: None,
+            bound_extracted_listing_json: bound_json,
+            bound_extracted_listing_sha256: bound_sha256,
+        };
+        let literal_values = super::values_from_preview(&preview, None).unwrap();
+        let mut corrected_values = literal_values.clone();
+        corrected_values.registration_number =
+            Some(correction.corrected_registration_number.clone());
+        corrected_values.serial_number = correction.corrected_serial_number.clone();
+        super::apply_faa_grounding_identity(&mut corrected_values, &correction.grounding);
+        PreparedBoundVisualCorrection {
+            preview,
+            correction,
+            rendered_html,
+            binding,
+            literal_values,
+            corrected_values,
+        }
+    }
+
+    async fn seed_bound_visual_correction(
+        db: &AppDb,
+        user_id: i64,
+        serial: &str,
+    ) -> (
+        i64,
+        i64,
+        super::ListingPreview,
+        super::SourceVisualRegistrationCorrection,
+        String,
+    ) {
+        let prepared = prepare_bound_visual_correction(db, user_id, serial).await;
+        let listing_id = super::insert_listing(
+            db,
+            user_id,
+            &prepared.corrected_values,
+            &prepared.literal_values,
+            true,
+            Some(&prepared.binding),
+            Some(&prepared.correction),
+        )
+        .await
+        .unwrap();
+        (
+            listing_id,
+            prepared.binding.submission_id,
+            prepared.preview,
+            prepared.correction,
+            prepared.rendered_html,
+        )
+    }
+
+    #[tokio::test]
+    async fn source_visual_recovery_accepts_a_different_current_faa_registration() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_faa_aircraft_with_absent_claim(&db, "N123AB", "SERIAL123", "N182PF").await;
+
+        let correction = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution("N123AB"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .expect("current FAA lookup should complete")
+        .expect("a different exact current FAA registration should be accepted");
+
+        assert_eq!(correction.observed_registration_number, "N182PF");
+        assert_eq!(correction.corrected_registration_number, "N123AB");
+        assert_eq!(
+            correction.corrected_serial_number.as_deref(),
+            Some("SERIAL123")
+        );
+        assert_eq!(correction.resolution.photos.len(), 1);
+        assert_eq!(correction.grounding.n_number, "N123AB");
+    }
+
+    #[tokio::test]
+    async fn source_visual_recovery_rejects_the_same_absent_registration() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_faa_aircraft_with_absent_claim(&db, "N123AB", "SERIAL123", "N182PF").await;
+
+        let correction = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution("N182PF"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .expect("visual recovery should fail closed without an FAA error");
+
+        assert!(correction.is_none());
+        let error = super::require_aircraft_admission(&db, Some("N182PF"), None)
+            .await
+            .expect_err("the absent source claim must remain inadmissible");
+        assert!(matches!(
+            error,
+            AircraftAdmissionError::Rejected {
+                reason: BlockReason::RegistrationNotFound,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_visual_recovery_rejects_malformed_and_non_n_identifiers() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_faa_aircraft_with_absent_claim(&db, "N123AB", "SERIAL123", "N182PF").await;
+
+        for invalid in ["ABC123", "N-@@@"] {
+            let correction = super::admit_source_visual_registration(
+                &db,
+                "N182PF",
+                1,
+                visual_resolution(invalid),
+                "https://images.example.test/primary.jpg".to_string(),
+            )
+            .await
+            .expect("malformed visual identifiers should be discarded safely");
+            assert!(correction.is_none(), "{invalid} must not be admitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_visual_recovery_requires_an_asserted_serial_to_match_current_faa() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_faa_aircraft_with_absent_claim(&db, "N123AB", "SERIAL-123", "N182PF").await;
+
+        let accepted = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution_with_serial("N123AB", "serial 123"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("normalized-equal visual and FAA serials must be admitted");
+        assert_eq!(
+            accepted.corrected_serial_number.as_deref(),
+            Some("SERIAL-123")
+        );
+
+        let conflict = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution_with_serial("N123AB", "SERIAL-999"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(conflict.is_none());
+    }
+
+    #[tokio::test]
+    async fn source_visual_recovery_rejects_an_asserted_serial_when_faa_has_none() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_faa_aircraft_with_absent_claim(&db, "N123AB", "", "N182PF").await;
+
+        let asserted = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution_with_serial("N123AB", "SERIAL-123"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(asserted.is_none());
+
+        let registration_only = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution("N123AB"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .unwrap()
+        .expect("registration-only evidence may use the current FAA NULL serial");
+        assert_eq!(registration_only.corrected_serial_number, None);
+    }
+
+    #[tokio::test]
+    async fn exact_current_faa_registration_does_not_invoke_visual_recovery() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft(&db, "N123T", "TESTSERIAL").await;
+        seed_curated_test_aircraft_catalog(&db, user.id).await;
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N123T",
+            "serial_number": "TESTSERIAL",
+            "avionics": []
+        }));
+        preview.source_url = Some("https://example.test/exact-faa".to_string());
+        preview.context_text = Some("Registration N123T; serial TESTSERIAL".to_string());
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        super::create_listing_with_progress_and_occurrence_dispositions(
+            &db,
+            user.id,
+            &preview,
+            None,
+            Some(&extractor),
+            None,
+            super::ListingCreationMode::SignedSource,
+            None,
+        )
+        .await
+        .expect("an exact current FAA identity should materialize without visual recovery");
+
+        assert_eq!(extractor.primary_visual_recovery_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn interrupted_visual_correction_revalidates_the_exact_receipt_gated_row() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        seed_faa_aircraft_with_absent_claim(&db, "N123T", "TESTSERIAL", "N182PF").await;
+        let variant_id = seed_curated_test_aircraft_catalog(&db, user.id).await;
+        let source_url = "https://example.test/interrupted-visual-correction";
+        let listing_id = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, is_verified,
+              source_url, model_year, asking_price_usd, currency, status,
+              ingestion_state, ingestion_error, registration_number, serial_number,
+              airframe_hours
+            )
+            VALUES (?, ?, FALSE, ?, 2023, 525000, 'USD', 'active',
+                    'quarantined', ?, 'N123T', 'TESTSERIAL', 400)
+            RETURNING id
+            "#,
+            variant_id,
+            user.id,
+            source_url,
+            super::SOURCE_IDENTITY_RECEIPT_PENDING
+        )
+        .expect("receipt-gated corrected listing should seed");
+        let mut preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2023,
+            "asking_price_usd": 525000,
+            "currency": "USD",
+            "airframe_hours": 400,
+            "status": "active",
+            "registration_number": "N182PF",
+            "serial_number": null,
+            "avionics": []
+        }));
+        preview.source_url = Some(source_url.to_string());
+        preview.context_text = Some("Registration N182PF".to_string());
+        let correction = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution("N123T"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .expect("FAA revalidation should complete")
+        .expect("the different current FAA registration should be recoverable");
+
+        let resumed = super::resume_signed_source_visual_correction_listing_with_correction(
+            &db, user.id, listing_id, &preview, None, correction, false,
+        )
+        .await
+        .expect("the exact unchanged receipt-gated row should resume");
+
+        assert_eq!(
+            resumed.listing.registration_number.as_deref(),
+            Some("N123T")
+        );
+        assert_eq!(resumed.listing.serial_number.as_deref(), Some("TESTSERIAL"));
+        assert!(resumed.source_serial_correction.is_none());
+        assert_eq!(
+            resumed
+                .source_visual_correction
+                .as_ref()
+                .map(|correction| correction.observed_registration_number.as_str()),
+            Some("N182PF")
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_visual_correction_resumes_without_provider_or_media_and_commits_receipt_gate() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let (listing_id, submission_id, preview, correction, rendered_html) =
+            seed_bound_visual_correction(&db, user.id, "TESTSERIAL").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        let resumed = super::resume_signed_source_visual_correction_listing(
+            &db,
+            user.id,
+            listing_id,
+            submission_id,
+            &preview,
+            Some(&extractor),
+            &rendered_html,
+            false,
+        )
+        .await
+        .expect("restart must use only the pinned signed artifact");
+        assert_eq!(extractor.primary_visual_recovery_call_count(), 0);
+        assert_eq!(
+            resumed.listing.ingestion_error.as_deref(),
+            Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
+        );
+
+        let outcome = record_bound_source_visual_correction(
+            &db,
+            user.id,
+            listing_id,
+            submission_id,
+            resumed.source_visual_correction.as_ref().unwrap(),
+        )
+        .await
+        .expect("the visual receipt and receipt-gate release must commit together");
+        assert!(matches!(outcome, AircraftRepairOutcome::Applied { .. }));
+        let finalized = super::finalize_signed_source_listing_after_receipt(
+            &db,
+            user.id,
+            listing_id,
+            submission_id,
+        )
+        .await
+        .expect("a crash after receipt but before finalization must be resumable");
+        assert_eq!(finalized.registration_number.as_deref(), Some("N123T"));
+        assert_eq!(finalized.serial_number.as_deref(), Some("TESTSERIAL"));
+        assert_ne!(
+            finalized.ingestion_error.as_deref(),
+            Some(super::SOURCE_IDENTITY_RECEIPT_PENDING)
+        );
+        assert_eq!(correction.grounding.snapshot.id, 1);
+    }
+
+    #[tokio::test]
+    async fn visual_correction_receipt_and_finalization_support_a_null_faa_serial() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let (listing_id, submission_id, preview, _, rendered_html) =
+            seed_bound_visual_correction(&db, user.id, "").await;
+
+        let resumed = super::resume_signed_source_visual_correction_listing(
+            &db,
+            user.id,
+            listing_id,
+            submission_id,
+            &preview,
+            None,
+            &rendered_html,
+            false,
+        )
+        .await
+        .expect("NULL FAA serial must compare null-safely");
+        assert_eq!(resumed.listing.serial_number, None);
+        record_bound_source_visual_correction(
+            &db,
+            user.id,
+            listing_id,
+            submission_id,
+            resumed.source_visual_correction.as_ref().unwrap(),
+        )
+        .await
+        .expect("NULL-serial visual receipt must commit");
+        let finalized = super::finalize_signed_source_listing_after_receipt(
+            &db,
+            user.id,
+            listing_id,
+            submission_id,
+        )
+        .await
+        .expect("NULL-serial visual receipt must be found during finalization");
+        assert_eq!(finalized.serial_number, None);
+    }
+
+    #[tokio::test]
+    async fn source_visual_recovery_rejects_a_newer_snapshot_after_the_initial_absence() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        seed_faa_aircraft_with_absent_claim(&db, "N123T", "OLD-SERIAL", "N182PF").await;
+        let master = "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR\n123T,NEW-SERIAL,2072738,41528,2023\n";
+        let release = ReleaseFixtureBuilder::from_csv(
+            ReleaseMetadata::official("2026-07-21", "c".repeat(64)),
+            Cursor::new(master),
+            Cursor::new(FAA_AIRCRAFT_REFERENCE),
+            Cursor::new(FAA_ENGINE_REFERENCE),
+            ["N123T", "N182PF"],
+        )
+        .unwrap();
+        store_release(&db, &release).await.unwrap();
+
+        let correction = super::admit_source_visual_registration(
+            &db,
+            "N182PF",
+            1,
+            visual_resolution("N123T"),
+            "https://images.example.test/primary.jpg".to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            correction.is_none(),
+            "visual evidence gathered for snapshot 1 cannot bind against snapshot 2"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_visual_artifact_bind_waits_for_newer_faa_snapshot_and_refuses_stale_pair() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::query("DROP SCHEMA public CASCADE")
+            .execute(&reset)
+            .await
+            .unwrap();
+        sqlx::query("CREATE SCHEMA public")
+            .execute(&reset)
+            .await
+            .unwrap();
+        reset.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let prepared = prepare_bound_visual_correction(&db, user.id, "TESTSERIAL").await;
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let mut newer_release = pool.begin().await.unwrap();
+        let newer_evidence_source_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO public.curation_evidence_sources (
+                 source_url, resolved_url, source_title, publisher, source_domain,
+                 source_tier, content_sha256, retrieved_at
+               )
+               SELECT source_url, resolved_url,
+                      'FAA Releasable Aircraft Registry 2026-07-21', publisher,
+                      source_domain, source_tier, repeat('c', 64), CURRENT_TIMESTAMP
+               FROM public.curation_evidence_sources
+               WHERE id = $1
+               RETURNING id"#,
+        )
+        .bind(prepared.correction.grounding.snapshot.evidence_source_id)
+        .fetch_one(&mut *newer_release)
+        .await
+        .unwrap();
+        let newer_snapshot_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO public.faa_registry_snapshots (
+                 evidence_source_id, snapshot_date, source_url,
+                 archive_sha256, source_manifest_sha256, target_set_sha256,
+                 master_member_name, master_member_sha256,
+                 aircraft_member_name, aircraft_member_sha256,
+                 engine_member_name, engine_member_sha256, record_hash_domain
+               )
+               SELECT $2, '2026-07-21', source_url,
+                      repeat('c', 64), repeat('d', 64), repeat('e', 64),
+                      master_member_name, master_member_sha256,
+                      aircraft_member_name, aircraft_member_sha256,
+                      engine_member_name, engine_member_sha256, record_hash_domain
+               FROM public.faa_registry_snapshots
+               WHERE id = $1
+               RETURNING id"#,
+        )
+        .bind(prepared.correction.grounding.snapshot.id)
+        .bind(newer_evidence_source_id)
+        .fetch_one(&mut *newer_release)
+        .await
+        .unwrap();
+
+        let mut bind = Box::pin(super::insert_listing(
+            &db,
+            user.id,
+            &prepared.corrected_values,
+            &prepared.literal_values,
+            true,
+            Some(&prepared.binding),
+            Some(&prepared.correction),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut bind)
+                .await
+                .is_err(),
+            "the initial artifact bind must wait for an in-flight FAA snapshot writer"
+        );
+        newer_release.commit().await.unwrap();
+
+        let error = bind.await.unwrap_err().to_string();
+        assert!(
+            error
+                .contains("visual correction FAA absence/match pair changed before atomic binding"),
+            "unexpected stale-pair refusal: {error}"
+        );
+        let latest_snapshot_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM public.faa_registry_snapshots \
+                                ORDER BY snapshot_date DESC, id DESC LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(latest_snapshot_id, newer_snapshot_id);
+        let artifact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM public.aircraft_source_visual_correction_artifacts \
+             WHERE plugin_submission_id = $1",
+        )
+        .bind(prepared.binding.submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let canonical_listing_id: Option<i64> = sqlx::query_scalar(
+            "SELECT canonical_listing_id FROM public.plugin_submissions WHERE id = $1",
+        )
+        .bind(prepared.binding.submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(artifact_count, 0);
+        assert_eq!(canonical_listing_id, None);
     }
 
     async fn seed_blank_identity_listing(db: &AppDb, user_id: i64, source_url: &str) -> i64 {
@@ -5925,6 +7305,7 @@ mod tests {
             &literal_values,
             false,
             Some(&binding),
+            None,
         )
         .await
         .expect_err("capture drift must reject the atomic bind");
