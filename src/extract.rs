@@ -166,6 +166,10 @@ pub struct AvionicsApprovedCatalogCandidate {
     /// selected. Other manufacturer-family members are supplied as blockers
     /// so an absent or legacy sibling cannot be hidden from the comparison.
     pub selectable: bool,
+    /// The server found this exact catalog model by removing only an attached
+    /// trailing s/S from a quantity-qualified raw listing token. This is an
+    /// ambiguity marker for Gemini, never a server-side identity decision.
+    pub possible_attached_plural_base: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2057,6 +2061,7 @@ Rules:\n\
 - valuation_facts contains only source-backed facts material to value. Allowed kinds are restoration, damage_history, log_completeness, paint_condition, interior_condition, engine_conversion, airframe_conversion, and major_modification.\n\
 - For each valuation fact, value is a concise normalized description, evidence_text is a short exact span copied from the listing, and confidence is high, medium, or low. Omit facts that are not explicitly supported; do not infer that an unmentioned damage history means no damage.\n\
 - For avionics model labels, preserve the full identifiable unit or suite code from the listing. Do not return bare numbers or generic labels such as 50, 60, 300, 440, 540, GPS, NAV/COM, Autopilot, or Transponder unless that exact bare label is the only supported identifier in the source text.\n\
+- Preserve an ambiguous attached trailing letter exactly as written in the listing. In particular, when quantity wording attaches s or S to a product token (for example, 3 Garmin GI275s), return the source token GI275s rather than singularizing it to GI275 or deciding it is model GI275S. Later catalog curation, not listing extraction, resolves that ambiguity.\n\
 - Keep certification, approval, and feature words outside the model label unless they are part of the official marketed designator. For example, extract KMA 20 rather than KMA 20 TSO and KT 75 rather than KT 75 TSO; do not remove a real alphanumeric suffix such as W, WAAS, Xi, NXi, R, or ES from the product code.\n\
 - When a listing gives enough surrounding context to identify a common avionics unit, return that unit label, for example IFD 540 instead of 540, IFD 440 instead of 440, S-TEC 55X instead of System 55X, and Century 2000 instead of Autopilot.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
@@ -2251,7 +2256,23 @@ fn validate_avionics_approved_candidate_adjudication_context(
     {
         bail!("approved-candidate adjudication requires at least one selectable product");
     }
+    let observed_key = context
+        .observed_candidate
+        .model
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    let possible_plural_base_key = (context.observed_candidate.quantity > 1)
+        .then(|| observed_key.strip_suffix('s'))
+        .flatten()
+        .filter(|base| !base.is_empty());
+    let has_possible_plural_base = context
+        .catalog_candidates
+        .iter()
+        .any(|candidate| candidate.possible_attached_plural_base);
     let mut ids = HashSet::with_capacity(context.catalog_candidates.len());
+    let mut possible_plural_base_count = 0usize;
     for candidate in &context.catalog_candidates {
         if candidate.id < 1 {
             bail!("approved-candidate catalog ids must be positive");
@@ -2262,6 +2283,26 @@ fn validate_avionics_approved_candidate_adjudication_context(
                 candidate.id
             );
         }
+        let candidate_key = candidate
+            .model
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>();
+        if candidate.possible_attached_plural_base {
+            possible_plural_base_count += 1;
+            if possible_plural_base_key != Some(candidate_key.as_str()) {
+                bail!(
+                    "possible attached-plural base must equal the observed model minus one trailing s/S"
+                );
+            }
+        }
+        if has_possible_plural_base && candidate_key == observed_key && candidate.selectable {
+            bail!("an exact raw-S catalog candidate must remain a collision blocker");
+        }
+    }
+    if possible_plural_base_count > 1 {
+        bail!("approved-candidate adjudication permits at most one possible attached-plural base");
     }
     Ok(())
 }
@@ -2279,6 +2320,7 @@ Rules:\n\
 - same means the listing evidence identifies exactly one selectable=true catalog candidate as the same physical product, exact integrated-suite generation, or exact named package. selected_catalog_id must copy that candidate's id unchanged.\n\
 - selectable=false candidates are mandatory collision blockers. They cannot be selected, but a possible match to one makes the decision uncertain; do not hide or ignore them because they are legacy, unattested, or capability-incompatible.\n\
 - Harmless case, spacing, punctuation, hyphenation, and a redundant manufacturer prefix may be ignored. Do not ignore different digits, suffixes, generations, remote/panel form factors, certification variants, packages, or manufacturer identifiers.\n\
+- possible_attached_plural_base=true means the server found an exact quantity phrase whose raw product token is this catalog model plus one attached trailing s/S. It is only an ambiguity marker: select that candidate only when the supplied listing grammar makes the trailing letter a plural marker. A same decision through this exception must use confidence=very_high and evidence_text must copy the complete decimal quantity + manufacturer + raw plural-shaped model phrase, for example 3 Garmin GI275s; quoting only GI275s is invalid. If that complete phrase does not make the plural use unambiguous, return uncertain. Never apply this exception to any other suffix or spelling difference.\n\
 - A component is not the same identity as its containing suite. Related products, family members, successors, predecessors, and products with overlapping capabilities are not the same product.\n\
 - avionics_types are supporting context only. Capability overlap or aircraft co-installation never establishes product identity.\n\
 - Use none with selected_catalog_id=0 only when the supplied listing evidence positively distinguishes the observed product from every catalog candidate. Absence of proof is not proof that none match.\n\
@@ -4191,6 +4233,8 @@ mod tests {
             "decision must be same, none, or uncertain",
             "selected_catalog_id=0",
             "exact substring copied from listing_evidence_text",
+            "possible_attached_plural_base=true",
+            "only an ambiguity marker",
             "\"id\": 42",
             "\"id\": 43",
         ] {
@@ -4414,6 +4458,8 @@ mod tests {
         assert!(prompt.contains("word weather by itself never establishes Weather Radar"));
         assert!(prompt.contains("KMA 20 rather than KMA 20 TSO"));
         assert!(prompt.contains("do not remove a real alphanumeric suffix"));
+        assert!(prompt.contains("return the source token GI275s rather than singularizing it"));
+        assert!(prompt.contains("Later catalog curation, not listing extraction"));
     }
 
     #[test]
@@ -5425,6 +5471,7 @@ mod tests {
                     manufacturer_identifier_kind: "manufacturer_part_number".to_string(),
                     manufacturer_identifier: "011-03378-40".to_string(),
                     selectable: true,
+                    possible_attached_plural_base: false,
                 },
                 AvionicsApprovedCatalogCandidate {
                     id: 43,
@@ -5434,6 +5481,7 @@ mod tests {
                     manufacturer_identifier_kind: "manufacturer_part_number".to_string(),
                     manufacturer_identifier: "011-03378-10".to_string(),
                     selectable: false,
+                    possible_attached_plural_base: false,
                 },
             ],
         }
