@@ -1454,6 +1454,9 @@ pub async fn resolve_verified_local_avionics_identity(
     {
         return Ok(None);
     }
+    if attached_quantity_plural_ambiguity(request).is_some() {
+        return Ok(None);
+    }
     let catalog = load_catalog_candidates(db).await?;
     let approved_candidates = load_known_approved_candidates(db).await?;
     if let Some(manufacturer_identity_id) =
@@ -3562,11 +3565,13 @@ fn approved_candidate_adjudication_plan(
         return None;
     }
 
+    let attached_quantity_plural_ambiguity = attached_quantity_plural_ambiguity(request);
     let collision_family = complete_manufacturer_collision_family(
         &request.manufacturer,
         &request.model,
         &observed_types,
         manufacturer_catalog,
+        attached_quantity_plural_ambiguity.as_deref(),
     )?;
     if collision_family.is_empty()
         || collision_family.len() > AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT
@@ -3588,21 +3593,28 @@ fn approved_candidate_adjudication_plan(
                 .all(|capability| approved.avionics_types.contains(capability));
             let collision_free =
                 !approved_candidate_has_identity_collision(approved, manufacturer_catalog);
-            let model_compatible = matches!(
-                avionics_model_identity_relation(
-                    &request.manufacturer,
-                    &request.model,
-                    &observed_types,
-                    &approved.manufacturer,
-                    &approved.model,
-                    &approved.avionics_types,
-                ),
-                Some(
-                    AvionicsModelIdentityRelation::TypographyExact
-                        | AvionicsModelIdentityRelation::DescriptiveExpansion
-                )
-            );
-            (model_compatible && capability_compatible && collision_free).then_some(candidate.id)
+            let model_compatible = attached_quantity_plural_ambiguity.is_none()
+                && matches!(
+                    avionics_model_identity_relation(
+                        &request.manufacturer,
+                        &request.model,
+                        &observed_types,
+                        &approved.manufacturer,
+                        &approved.model,
+                        &approved.avionics_types,
+                    ),
+                    Some(
+                        AvionicsModelIdentityRelation::TypographyExact
+                            | AvionicsModelIdentityRelation::DescriptiveExpansion
+                    )
+                );
+            let possible_attached_plural_base = attached_quantity_plural_ambiguity
+                .as_deref()
+                .is_some_and(|base_key| approved.canonical_product_key == base_key);
+            ((model_compatible || possible_attached_plural_base)
+                && capability_compatible
+                && collision_free)
+                .then_some(candidate.id)
         })
         .collect::<HashSet<_>>();
     if selectable_catalog_ids.is_empty() {
@@ -3621,9 +3633,15 @@ fn approved_candidate_adjudication_plan(
         catalog_candidates: collision_family
             .iter()
             .map(|candidate| {
+                let possible_attached_plural_base = attached_quantity_plural_ambiguity
+                    .as_deref()
+                    .is_some_and(|base_key| {
+                        normalize_avionics_identifier(&candidate.model) == base_key
+                    });
                 catalog_adjudication_prompt_candidate(
                     candidate,
                     selectable_catalog_ids.contains(&candidate.id),
+                    possible_attached_plural_base,
                 )
             })
             .collect(),
@@ -3640,19 +3658,22 @@ fn complete_manufacturer_collision_family<'a>(
     observed_model: &str,
     observed_types: &[String],
     manufacturer_catalog: &'a [AvionicsCatalogCandidate],
+    possible_attached_plural_base_key: Option<&str>,
 ) -> Option<Vec<&'a AvionicsCatalogCandidate>> {
     let mut included = manufacturer_catalog
         .iter()
         .map(|candidate| {
-            avionics_model_identity_relation(
-                observed_manufacturer,
-                observed_model,
-                observed_types,
-                &candidate.manufacturer,
-                &candidate.model,
-                &candidate.avionics_types,
-            )
-            .is_some()
+            possible_attached_plural_base_key
+                .is_some_and(|base_key| normalize_avionics_identifier(&candidate.model) == base_key)
+                || avionics_model_identity_relation(
+                    observed_manufacturer,
+                    observed_model,
+                    observed_types,
+                    &candidate.manufacturer,
+                    &candidate.model,
+                    &candidate.avionics_types,
+                )
+                .is_some()
         })
         .collect::<Vec<_>>();
     if !included.iter().any(|included| *included) {
@@ -3721,6 +3742,7 @@ fn catalog_candidates_share_collision_family(
 fn catalog_adjudication_prompt_candidate(
     candidate: &AvionicsCatalogCandidate,
     selectable: bool,
+    possible_attached_plural_base: bool,
 ) -> AvionicsApprovedCatalogCandidate {
     AvionicsApprovedCatalogCandidate {
         id: candidate.id,
@@ -3730,7 +3752,145 @@ fn catalog_adjudication_prompt_candidate(
         manufacturer_identifier_kind: candidate.manufacturer_identifier_kind.clone(),
         manufacturer_identifier: candidate.manufacturer_identifier.clone(),
         selectable,
+        possible_attached_plural_base,
     }
+}
+
+/// Return one possible catalog key only for the narrow listing shape where a
+/// numeric quantity is immediately followed by the observed manufacturer and
+/// raw model token, and that raw model ends in one attached s/S after an
+/// alphanumeric model character.
+///
+/// The raw request remains unchanged. This helper only makes the base catalog
+/// product visible to the closed-context Gemini adjudicator; it never grants a
+/// local match or changes the ordinary meaningful-suffix relation.
+fn attached_quantity_plural_ambiguity(request: &AvionicsIdentityRequest) -> Option<String> {
+    if !request.requires_listing_evidence || request.quantity <= 1 {
+        return None;
+    }
+    let raw_model = request.model.trim();
+    let final_character = raw_model.chars().next_back()?;
+    if !matches!(final_character, 's' | 'S') {
+        return None;
+    }
+    let base_model = raw_model[..raw_model.len() - final_character.len_utf8()].trim_end();
+    if !base_model
+        .chars()
+        .next_back()
+        .is_some_and(|character| character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let raw_model_key = normalize_avionics_identifier(raw_model);
+    let base_model_key = normalize_avionics_identifier(base_model);
+    if !is_usable_avionics_label(&request.manufacturer, base_model)
+        || raw_model_key != format!("{base_model_key}s")
+    {
+        return None;
+    }
+
+    let quantity = request.quantity.to_string();
+    let manufacturer_tokens = exact_identity_tokens(&request.manufacturer);
+    let quantity_and_manufacturer = std::iter::once(quantity.as_str())
+        .chain(manufacturer_tokens.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let mut qualified_occurrence_count = 0usize;
+    for line in request.listing_context.lines() {
+        let tokens = exact_identity_token_spans(line);
+        for (start, end) in compact_identity_token_ranges(&tokens, &raw_model_key) {
+            let final_token = &tokens[end - 1];
+            let attached_suffix = line[final_token.start..final_token.end]
+                .chars()
+                .rev()
+                .take(2)
+                .collect::<Vec<_>>();
+            if attached_suffix.len() != 2
+                || !matches!(attached_suffix[0], 's' | 'S')
+                || !attached_suffix[1].is_ascii_alphanumeric()
+            {
+                return None;
+            }
+            let exact_quantity_prefix = start >= quantity_and_manufacturer.len()
+                && tokens[start - quantity_and_manufacturer.len()..start]
+                    .iter()
+                    .map(|token| token.value.as_str())
+                    .eq(quantity_and_manufacturer.iter().copied());
+            if exact_quantity_prefix {
+                qualified_occurrence_count += 1;
+                continue;
+            }
+            let manufacturer_length = manufacturer_tokens.len();
+            let has_explicit_count_and_manufacturer = start > manufacturer_length
+                && tokens[start - manufacturer_length..start]
+                    .iter()
+                    .map(|token| token.value.as_str())
+                    .eq(manufacturer_tokens.iter().map(String::as_str))
+                && tokens[start - manufacturer_length - 1]
+                    .value
+                    .parse::<i64>()
+                    .is_ok();
+            if has_explicit_count_and_manufacturer {
+                return None;
+            }
+        }
+    }
+    (qualified_occurrence_count > 0).then_some(base_model_key)
+}
+
+#[derive(Debug)]
+struct ExactIdentityTokenSpan {
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+fn exact_identity_token_spans(value: &str) -> Vec<ExactIdentityTokenSpan> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut start = None;
+    for (offset, character) in value.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            start.get_or_insert(offset);
+            token.push(character.to_ascii_lowercase());
+        } else if let Some(token_start) = start.take() {
+            tokens.push(ExactIdentityTokenSpan {
+                value: std::mem::take(&mut token),
+                start: token_start,
+                end: offset,
+            });
+        }
+    }
+    if let Some(token_start) = start {
+        tokens.push(ExactIdentityTokenSpan {
+            value: token,
+            start: token_start,
+            end: value.len(),
+        });
+    }
+    tokens
+}
+
+fn compact_identity_token_ranges(
+    tokens: &[ExactIdentityTokenSpan],
+    identity_key: &str,
+) -> Vec<(usize, usize)> {
+    tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(start, _)| {
+            let mut joined = String::new();
+            for (offset, token) in tokens[start..].iter().enumerate() {
+                joined.push_str(&token.value);
+                if joined == identity_key {
+                    return Some((start, start + offset + 1));
+                }
+                if joined.len() >= identity_key.len() {
+                    return None;
+                }
+            }
+            None
+        })
+        .collect()
 }
 
 fn approved_candidate_has_identity_collision(
@@ -3765,13 +3925,12 @@ fn approved_candidate_adjudication_selection(
         return None;
     }
     let selected_id = object.get("selected_catalog_id")?.as_i64()?;
-    if !plan.selectable_catalog_ids.contains(&selected_id)
-        || !plan
-            .context
-            .catalog_candidates
-            .iter()
-            .any(|candidate| candidate.id == selected_id && candidate.selectable)
-    {
+    let selected = plan
+        .context
+        .catalog_candidates
+        .iter()
+        .find(|candidate| candidate.id == selected_id && candidate.selectable)?;
+    if !plan.selectable_catalog_ids.contains(&selected_id) {
         return None;
     }
     let evidence = string_field(response, "evidence_text");
@@ -3782,6 +3941,27 @@ fn approved_candidate_adjudication_selection(
         || !exact_compact_identity_is_present(evidence, &observed_product_key)
     {
         return None;
+    }
+    if selected.possible_attached_plural_base {
+        let evidence_request = AvionicsIdentityRequest {
+            listing_context: evidence.to_string(),
+            ..request.clone()
+        };
+        let selected_model_key = normalize_avionics_identifier(&selected.model);
+        if attached_quantity_plural_ambiguity(&evidence_request).as_deref()
+            != Some(selected_model_key.as_str())
+        {
+            return None;
+        }
+        let raw_model_key = normalize_avionics_identifier(&request.model);
+        if plan
+            .context
+            .catalog_candidates
+            .iter()
+            .any(|candidate| normalize_avionics_identifier(&candidate.model) == raw_model_key)
+        {
+            return None;
+        }
     }
     Some(selected_id)
 }
@@ -3814,6 +3994,7 @@ fn approved_candidate_adjudication_plan_is_unchanged(
                     && left.manufacturer_identifier_kind == right.manufacturer_identifier_kind
                     && left.manufacturer_identifier == right.manufacturer_identifier
                     && left.selectable == right.selectable
+                    && left.possible_attached_plural_base == right.possible_attached_plural_base
             })
 }
 
@@ -9793,6 +9974,177 @@ mod tests {
     }
 
     #[test]
+    fn bounded_adjudication_surfaces_only_an_exact_quantity_plural_base() {
+        let request = AvionicsIdentityRequest {
+            model: "GI275s".to_string(),
+            quantity: 3,
+            listing_context: "3 Garmin GI275s".to_string(),
+            ..local_request("")
+        };
+        let known = vec![known_candidate(275, "GI 275")];
+        let catalog = vec![candidate(275, "GI 275", "approved")];
+
+        assert!(
+            known_approved_local_match(&request, 1, &known, &catalog).is_none(),
+            "the raw plural-shaped token must never be mechanically singularized by local reuse"
+        );
+        let plan = approved_candidate_adjudication_plan(
+            &request,
+            &request.avionics_types,
+            1,
+            &known,
+            &catalog,
+        )
+        .expect("an exact numeric quantity phrase may surface the approved base for adjudication");
+        assert_eq!(plan.selectable_catalog_ids, HashSet::from([275]));
+        assert!(plan.context.catalog_candidates[0].selectable);
+        assert!(plan.context.catalog_candidates[0].possible_attached_plural_base);
+
+        let response = json!({
+            "decision": "same",
+            "selected_catalog_id": 275,
+            "confidence": "very_high",
+            "evidence_text": "3 Garmin GI275s",
+            "reason": "The attached lowercase letter is used as the plural marker for three units."
+        });
+        assert_eq!(
+            approved_candidate_adjudication_selection(&request, &plan, &response),
+            Some(275),
+            "only the model adjudicator, not the server helper, may resolve the ambiguity"
+        );
+
+        for ineligible in [
+            AvionicsIdentityRequest {
+                quantity: 1,
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "Garmin GI275s".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "3 Garmin\nGI275s".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "2 Garmin GI275s".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "three Garmin GI275s".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "3 Garmin GI275 s".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "3 Garmin GI275's".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                listing_context: "3 Garmin GI275s\n2 Garmin GI275s".to_string(),
+                ..request.clone()
+            },
+            AvionicsIdentityRequest {
+                model: "GI275W".to_string(),
+                listing_context: "3 Garmin GI275W".to_string(),
+                ..request.clone()
+            },
+        ] {
+            assert!(
+                approved_candidate_adjudication_plan(
+                    &ineligible,
+                    &ineligible.avionics_types,
+                    1,
+                    &known,
+                    &catalog,
+                )
+                .is_none(),
+                "quantity, same-line grammar, and the sole trailing s/S shape are mandatory"
+            );
+        }
+
+        let repeated_unqualified = AvionicsIdentityRequest {
+            listing_context: "3 Garmin GI275s\nGarmin GI275s\nGI275s".to_string(),
+            ..request.clone()
+        };
+        assert!(
+            approved_candidate_adjudication_plan(
+                &repeated_unqualified,
+                &repeated_unqualified.avionics_types,
+                1,
+                &known,
+                &catalog,
+            )
+            .is_some(),
+            "unqualified repeated mentions do not contradict the one exact quantity phrase"
+        );
+
+        let exact_suffix = known_candidate(276, "GI 275S");
+        let exact_suffix_catalog = candidate(276, "GI 275S", "approved");
+        let guarded_plan = approved_candidate_adjudication_plan(
+            &request,
+            &request.avionics_types,
+            1,
+            &[known[0].clone(), exact_suffix],
+            &[catalog[0].clone(), exact_suffix_catalog],
+        )
+        .expect("the possible base remains visible beside a known exact-S blocker");
+        assert_eq!(guarded_plan.selectable_catalog_ids, HashSet::from([275]));
+        assert_eq!(
+            guarded_plan
+                .context
+                .catalog_candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.id,
+                        candidate.selectable,
+                        candidate.possible_attached_plural_base,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(275, true, true), (276, false, false)]
+        );
+        assert_eq!(
+            approved_candidate_adjudication_selection(&request, &guarded_plan, &response),
+            None,
+            "a known exact raw-S catalog product must block collapsing the token into the base"
+        );
+    }
+
+    #[test]
+    fn quantity_plural_routing_includes_short_and_letter_suffixed_base_models() {
+        for (manufacturer, raw_model, base_model, evidence) in [
+            ("Garmin", "G5s", "G5", "2 Garmin G5s"),
+            ("BendixKing", "KX170Bs", "KX 170B", "2 BendixKing KX170Bs"),
+        ] {
+            let request = AvionicsIdentityRequest {
+                manufacturer: manufacturer.to_string(),
+                model: raw_model.to_string(),
+                quantity: 2,
+                listing_context: evidence.to_string(),
+                ..local_request("")
+            };
+            let mut approved = known_candidate(501, base_model);
+            approved.manufacturer = manufacturer.to_string();
+            let mut catalog = candidate(501, base_model, "approved");
+            catalog.manufacturer = manufacturer.to_string();
+            let plan = approved_candidate_adjudication_plan(
+                &request,
+                &request.avionics_types,
+                1,
+                &[approved],
+                &[catalog],
+            )
+            .expect("a concrete alphanumeric base must reach ambiguity adjudication");
+            assert_eq!(plan.selectable_catalog_ids, HashSet::from([501]));
+            assert!(plan.context.catalog_candidates[0].possible_attached_plural_base);
+        }
+    }
+
+    #[test]
     fn bounded_adjudication_skips_when_only_meaningful_variants_exist() {
         for (observed, catalog_model) in [
             ("G1000", "G1000 NXi"),
@@ -9816,6 +10168,7 @@ mod tests {
                 &request.model,
                 &request.avionics_types,
                 &catalog,
+                None,
             )
             .expect("meaningful variants must remain in the collision family");
             assert_eq!(family.len(), 1);
@@ -11857,6 +12210,51 @@ mod tests {
             plan.existing_catalog_scope.unbounded,
             "adjudication can fall through to cross-manufacturer candidate triage"
         );
+    }
+
+    #[tokio::test]
+    async fn short_quantity_plural_ambiguity_forces_candidate_adjudication() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_garmin_static_source_authority(&db).await;
+        let mut g5 = verified_identity();
+        g5.canonical_model = "G5".to_string();
+        g5.canonical_types = vec!["Flight Display".to_string()];
+        g5.manufacturer_identifier_kind = "manufacturer_model_number".to_string();
+        g5.manufacturer_identifier = "G5".to_string();
+        g5.identity_source_url = "https://static.garmin.com/manuals/g5.pdf".to_string();
+        g5.identity_source_title = "Garmin G5 pilot guide".to_string();
+        g5.identity_evidence =
+            "The Garmin pilot guide identifies the G5 flight display model.".to_string();
+        g5.grounded_claim_source_urls = vec![g5.identity_source_url.clone()];
+        let stored = persist_approved_identity(&db, None, &[], &g5, &catalog_fingerprint(&[]))
+            .await
+            .expect("approved G5 should seed");
+        let request = AvionicsIdentityRequest {
+            model: "G5s".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            quantity: 2,
+            listing_context: "2 Garmin G5s".to_string(),
+            ..local_request("")
+        };
+
+        assert!(
+            resolve_verified_local_avionics_identity(&db, &request)
+                .await
+                .expect("the local lookup should fail closed")
+                .is_none(),
+            "the ambiguous raw token must not resolve through exact local reuse"
+        );
+        let plan = plan_avionics_identity_verification_route(&db, &request)
+            .await
+            .expect("the current catalog should produce a bounded route");
+        assert_eq!(
+            plan.route,
+            AvionicsIdentityVerificationRoute::CandidateAdjudication
+        );
+        assert_eq!(plan.existing_catalog_scope.catalog_ids.len(), 1);
+        assert!(plan.existing_catalog_scope.catalog_ids.contains(&stored.id));
     }
 
     #[tokio::test]
