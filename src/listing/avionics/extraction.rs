@@ -39,22 +39,11 @@ pub(crate) fn validate_current_avionics_extraction(
     let observations = parse_current_avionics_extraction_json(extraction.extracted_listing_json)?;
     let listing_context =
         ListingEvidenceContext::from_rendered_html(Some(extraction.rendered_html));
-    validate_current_avionics_identity_evidence(&observations, &listing_context)?;
-    for (index, observation) in observations.iter().enumerate() {
-        let path = format!("avionics[{index}]");
-        let evidence = observation
-            .source_evidence_text
-            .as_deref()
-            .expect("the canonical parser requires occurrence evidence");
-        if !listing_body_contains_exact_structurally_visible_text_span(
-            extraction.rendered_html,
-            evidence,
-        ) {
-            return Err(format!(
-                "{path}.source_evidence_text is not one exact structurally visible span in the retained capture"
-            ));
-        }
-    }
+    validate_current_avionics_identity_evidence(
+        &observations,
+        &listing_context,
+        extraction.rendered_html,
+    )?;
     Ok(observations)
 }
 
@@ -68,18 +57,7 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
 ) -> Result<Vec<ParsedAvionics>, String> {
     let observations = parse_current_avionics_extraction_json(extracted_listing_json)?;
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
-    validate_current_avionics_identity_evidence(&observations, &listing_context)?;
-    for (index, observation) in observations.iter().enumerate() {
-        let evidence = observation
-            .source_evidence_text
-            .as_deref()
-            .expect("the canonical parser requires occurrence evidence");
-        if !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence) {
-            return Err(format!(
-                "avionics[{index}].source_evidence_text is not one exact structurally visible span in the retained capture"
-            ));
-        }
-    }
+    validate_current_avionics_identity_evidence(&observations, &listing_context, rendered_html)?;
     Ok(observations)
 }
 
@@ -330,6 +308,7 @@ pub(crate) fn parse_current_avionics_extraction_value(
 pub(crate) fn validate_current_avionics_identity_evidence(
     observations: &[ParsedAvionics],
     listing_context: &ListingEvidenceContext,
+    rendered_html: &str,
 ) -> Result<(), String> {
     for (index, observation) in observations.iter().enumerate() {
         let evidence = observation
@@ -337,30 +316,58 @@ pub(crate) fn validate_current_avionics_identity_evidence(
             .as_deref()
             .expect("the canonical parser requires occurrence evidence")
             .trim();
-        let bounded_source =
-            listing_context.for_candidate(&observation.manufacturer, &observation.model, None);
-        let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
-        if !bounded_source.contains(evidence)
-            || !context_has_exact_identity(
-                &evidence_context,
-                &observation.manufacturer,
-                &observation.model,
-            )
-        {
+        if !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence) {
             return Err(format!(
-                "avionics[{index}].source_evidence_text is not one exact bounded source excerpt containing the candidate identity"
+                "avionics[{index}].source_evidence_text is not one exact structurally visible span in the retained capture"
             ));
         }
-        if let Some(replacement) = observation.replaces.as_ref() {
-            if !context_has_exact_identity(
-                &evidence_context,
-                &replacement.manufacturer,
-                &replacement.model,
-            ) {
-                return Err(format!(
-                    "avionics[{index}].source_evidence_text does not contain the exact replacement identity from avionics[{index}].replaces"
-                ));
-            }
+        validate_current_avionics_identity_evidence_occurrence(
+            observation,
+            index,
+            listing_context,
+            evidence,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_current_avionics_identity_evidence_occurrence(
+    observation: &ParsedAvionics,
+    index: usize,
+    listing_context: &ListingEvidenceContext,
+    exact_visible_evidence_locator: &str,
+) -> Result<(), String> {
+    let evidence = observation
+        .source_evidence_text
+        .as_deref()
+        .expect("the canonical parser requires occurrence evidence")
+        .trim();
+    let bounded_source = listing_context.for_candidate(
+        &observation.manufacturer,
+        &observation.model,
+        Some(exact_visible_evidence_locator),
+    );
+    let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
+    if !bounded_source.contains(evidence)
+        || !context_has_exact_identity(
+            &evidence_context,
+            &observation.manufacturer,
+            &observation.model,
+        )
+    {
+        return Err(format!(
+            "avionics[{index}].source_evidence_text is not one exact bounded source excerpt containing the candidate identity"
+        ));
+    }
+    if let Some(replacement) = observation.replaces.as_ref() {
+        if !context_has_exact_identity(
+            &evidence_context,
+            &replacement.manufacturer,
+            &replacement.model,
+        ) {
+            return Err(format!(
+                "avionics[{index}].source_evidence_text does not contain the exact replacement identity from avionics[{index}].replaces"
+            ));
         }
     }
     Ok(())
@@ -554,6 +561,61 @@ mod tests {
 
         let parsed = validate_current_avionics_extraction(bound(html, &hash, json)).unwrap();
         assert_eq!(parsed[0].model, "G5");
+    }
+
+    #[test]
+    fn exact_evidence_selects_its_repeated_identity_mention() {
+        let html = format!(
+            "<html><body><p>Garmin G1000 summary.</p><p>{}</p><p>Garmin G1000 avionics system</p></body></html>",
+            "unrelated listing detail ".repeat(300),
+        );
+        let json = r#"{"avionics":[{"manufacturer":"Garmin","model":"G1000","types":["Flight Display"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin G1000 avionics system","source_confidence":"high"}]}"#;
+
+        let parsed = validate_unbound_current_avionics_extraction(json, &html).unwrap();
+
+        assert_eq!(parsed[0].model, "G1000");
+    }
+
+    #[test]
+    fn shared_identity_validation_rejects_hidden_and_metadata_only_evidence() {
+        let html = "<html><head><meta content=\"Garmin G1000 metadata\"></head><body><p hidden>Garmin G1000 avionics system</p></body></html>";
+        let payload = installed("Garmin", "G1000", "Garmin G1000 avionics system");
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        let context = ListingEvidenceContext::from_rendered_html(Some(&html));
+
+        assert!(
+            validate_current_avionics_identity_evidence(&observations, &context, html)
+                .unwrap_err()
+                .contains("structurally visible")
+        );
+
+        let metadata_payload = installed("Garmin", "G1000", "Garmin G1000 metadata");
+        let metadata_observations =
+            parse_current_avionics_extraction_value(&metadata_payload).unwrap();
+        assert!(validate_current_avionics_identity_evidence(
+            &metadata_observations,
+            &context,
+            html
+        )
+        .unwrap_err()
+        .contains("structurally visible"));
+    }
+
+    #[test]
+    fn visible_evidence_locator_does_not_erase_meaningful_model_suffixes() {
+        for (model, evidence) in [
+            ("G1000", "Garmin G1000 NXi avionics system"),
+            ("G5", "Garmin G5X flight display"),
+        ] {
+            let html = format!("<html><body><p>{evidence}</p></body></html>");
+            let payload = installed("Garmin", model, evidence);
+
+            assert!(
+                validate_unbound_current_avionics_extraction(&payload.to_string(), &html)
+                    .unwrap_err()
+                    .contains("candidate identity")
+            );
+        }
     }
 
     #[test]

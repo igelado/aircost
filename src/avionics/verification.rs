@@ -1296,6 +1296,7 @@ async fn process_listing(
                 &scoped_extractor,
                 &listing_text,
                 &listing_context,
+                rendered_html,
                 row.extracted_listing_json.as_deref(),
             )
             .await
@@ -3794,7 +3795,11 @@ async fn retained_observation_source(
         }
     };
     Ok(
-        match retained_avionics_source(row.extracted_listing_json.as_deref(), listing_context) {
+        match retained_avionics_source(
+            row.extracted_listing_json.as_deref(),
+            listing_context,
+            row.rendered_html.as_deref(),
+        ) {
             RetainedAvionicsSource::Current(avionics) => RetainedObservationSource::Extraction {
                 avionics,
                 preserved_aspects,
@@ -3871,7 +3876,12 @@ async fn retained_review_observations(
         });
     }
     if (!avionics.is_empty()
-        && validate_current_avionics_identity_evidence(&avionics, listing_context).is_err())
+        && validate_current_avionics_identity_evidence(
+            &avionics,
+            listing_context,
+            row.rendered_html.as_deref().unwrap_or_default(),
+        )
+        .is_err())
         || (avionics.is_empty() && preserved_aspects.is_empty())
     {
         return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
@@ -4028,6 +4038,7 @@ async fn replay_current_verified_suggestion(
 fn retained_avionics_source(
     raw_json: Option<&str>,
     listing_context: &ListingEvidenceContext,
+    rendered_html: Option<&str>,
 ) -> RetainedAvionicsSource {
     let Some(raw_json) = raw_json.filter(|raw_json| !raw_json.trim().is_empty()) else {
         return RetainedAvionicsSource::RequiresReextraction {
@@ -4041,7 +4052,11 @@ fn retained_avionics_source(
                     .to_string(),
             }
         }
-        Ok(avionics) => match validate_current_avionics_identity_evidence(&avionics, listing_context) {
+        Ok(avionics) => match validate_current_avionics_identity_evidence(
+            &avionics,
+            listing_context,
+            rendered_html.unwrap_or_default(),
+        ) {
             Ok(()) => RetainedAvionicsSource::Current(avionics),
             Err(error) => RetainedAvionicsSource::RequiresReextraction {
                 reason: format!(
@@ -4341,6 +4356,7 @@ async fn reextract_avionics(
     extractor: &GeminiListingExtractor,
     listing_text: &str,
     listing_context: &ListingEvidenceContext,
+    rendered_html: &str,
     prior_extracted_listing_json: Option<&str>,
 ) -> Result<ValidatedListingReextraction, String> {
     let extracted = extractor
@@ -4359,9 +4375,10 @@ async fn reextract_avionics(
             ));
         }
     }
-    validate_current_avionics_identity_evidence(&avionics, listing_context).map_err(|error| {
-        format!("Gemini returned listing evidence not present in the retained source: {error}")
-    })?;
+    validate_current_avionics_identity_evidence(&avionics, listing_context, rendered_html)
+        .map_err(|error| {
+            format!("Gemini returned listing evidence not present in the retained source: {error}")
+        })?;
     let extracted_listing_json = if avionics.is_empty() {
         String::new()
     } else {
@@ -6134,6 +6151,7 @@ mod tests {
         let source = retained_avionics_source(
             Some(legacy),
             &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+            Some("Garmin GNX 375"),
         );
 
         let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
@@ -6247,6 +6265,7 @@ mod tests {
             &extractor,
             evidence,
             &ListingEvidenceContext::from_cleaned_text(evidence),
+            evidence,
             Some(&prior),
         )
         .await
@@ -6277,6 +6296,7 @@ mod tests {
         let source = retained_avionics_source(
             Some(current),
             &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+            Some("Garmin GNX 375"),
         );
 
         let RetainedAvionicsSource::Current(avionics) = source else {
@@ -6302,6 +6322,7 @@ mod tests {
         let source = retained_avionics_source(
             Some(missing_evidence),
             &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+            Some("Garmin GNX 375"),
         );
 
         let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
@@ -6313,20 +6334,22 @@ mod tests {
     #[test]
     fn missing_or_invalid_capability_arrays_fail_closed_to_reextraction() {
         assert!(matches!(
-            retained_avionics_source(None, &ListingEvidenceContext::default()),
+            retained_avionics_source(None, &ListingEvidenceContext::default(), None),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
             retained_avionics_source(
                 Some(r#"{"avionics":[]}"#),
-                &ListingEvidenceContext::default()
+                &ListingEvidenceContext::default(),
+                None,
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
             retained_avionics_source(
                 Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"GTN 750Xi","types":[]}]}"#),
-                &ListingEvidenceContext::default()
+                &ListingEvidenceContext::default(),
+                None,
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
@@ -6341,7 +6364,8 @@ mod tests {
                   }]
                 }"#
                 ),
-                &ListingEvidenceContext::default()
+                &ListingEvidenceContext::default(),
+                None,
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
@@ -6365,12 +6389,46 @@ mod tests {
         let source = retained_avionics_source(
             Some(fabricated),
             &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375 installed"),
+            Some("Garmin GNX 375 installed"),
         );
 
         let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
             panic!("model-produced evidence absent from the source must never be replayed")
         };
-        assert!(reason.contains("not one exact bounded source excerpt"));
+        assert!(reason.contains("not one exact structurally visible span"));
+    }
+
+    #[test]
+    fn retained_extraction_rejects_hidden_and_metadata_only_evidence() {
+        for (html, evidence) in [
+            (
+                "<html><body><p hidden>Garmin G1000 avionics system</p></body></html>",
+                "Garmin G1000 avionics system",
+            ),
+            (
+                "<html><head><meta content=\"Garmin G1000 metadata\"></head><body><p>Aircraft listing</p></body></html>",
+                "Garmin G1000 metadata",
+            ),
+        ] {
+            let payload = json!({"avionics": [{
+                "manufacturer": "Garmin",
+                "model": "G1000",
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]});
+            let context = ListingEvidenceContext::from_rendered_html(Some(html));
+
+            let RetainedAvionicsSource::RequiresReextraction { reason } =
+                retained_avionics_source(Some(&payload.to_string()), &context, Some(html))
+            else {
+                panic!("non-visible evidence must never be reused from a retained extraction")
+            };
+            assert!(reason.contains("structurally visible"));
+        }
     }
 
     #[test]
@@ -6921,7 +6979,8 @@ mod tests {
         assert!(matches!(
             retained_avionics_source(
                 rows[0].extracted_listing_json.as_deref(),
-                &ListingEvidenceContext::from_rendered_html(rows[0].rendered_html.as_deref())
+                &ListingEvidenceContext::from_rendered_html(rows[0].rendered_html.as_deref()),
+                rows[0].rendered_html.as_deref(),
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
@@ -6958,7 +7017,11 @@ mod tests {
         let listing_context =
             ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
         assert!(matches!(
-            retained_avionics_source(row.extracted_listing_json.as_deref(), &listing_context),
+            retained_avionics_source(
+                row.extracted_listing_json.as_deref(),
+                &listing_context,
+                row.rendered_html.as_deref(),
+            ),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
 
