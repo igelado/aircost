@@ -2062,7 +2062,7 @@ Rules:\n\
 - For each valuation fact, value is a concise normalized description, evidence_text is a short exact span copied from the listing, and confidence is high, medium, or low. Omit facts that are not explicitly supported; do not infer that an unmentioned damage history means no damage.\n\
 - For avionics model labels, preserve the full identifiable unit or suite code from the listing. Do not return bare numbers or generic labels such as 50, 60, 300, 440, 540, GPS, NAV/COM, Autopilot, or Transponder unless that exact bare label is the only supported identifier in the source text.\n\
 - Preserve an ambiguous attached trailing letter exactly as written in the listing. In particular, when quantity wording attaches s or S to a product token (for example, 3 Garmin GI275s), return the source token GI275s rather than singularizing it to GI275 or deciding it is model GI275S. Later catalog curation, not listing extraction, resolves that ambiguity.\n\
-- Keep certification, approval, and feature words outside the model label unless they are part of the official marketed designator. For example, extract KMA 20 rather than KMA 20 TSO and KT 75 rather than KT 75 TSO; do not remove a real alphanumeric suffix such as W, WAAS, Xi, NXi, R, or ES from the product code.\n\
+- Keep generic certification, approval, and feature annotations outside the model label. Extract KMA 20 rather than KMA 20 TSO and KT 75 rather than KT 75 TSO. A standalone WAAS immediately before a slash-delimited capability list is an annotation, not automatically part of the model: from Garmin GTN 750 WAAS GPS/NAV/COM return manufacturer Garmin, model GTN 750, types [GPS, NAV, COM], and source_evidence_text Garmin GTN 750 WAAS GPS/NAV/COM. Preserve actual attached or marketed designators such as W, Xi, NXi, R, and ES exactly.\n\
 - When a listing gives enough surrounding context to identify a common avionics unit, return that unit label, for example IFD 540 instead of 540, IFD 440 instead of 440, S-TEC 55X instead of System 55X, and Century 2000 instead of Autopilot.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
 Listing text:\n{listing_text}",
@@ -4457,7 +4457,9 @@ mod tests {
         assert!(prompt.contains("receiver/datalink is a Datalink capability, not Weather Radar"));
         assert!(prompt.contains("word weather by itself never establishes Weather Radar"));
         assert!(prompt.contains("KMA 20 rather than KMA 20 TSO"));
-        assert!(prompt.contains("do not remove a real alphanumeric suffix"));
+        assert!(prompt.contains("standalone WAAS immediately before a slash-delimited"));
+        assert!(prompt.contains("model GTN 750, types [GPS, NAV, COM]"));
+        assert!(prompt.contains("Preserve actual attached or marketed designators"));
         assert!(prompt.contains("return the source token GI275s rather than singularizing it"));
         assert!(prompt.contains("Later catalog curation, not listing extraction"));
     }

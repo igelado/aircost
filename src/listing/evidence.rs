@@ -848,9 +848,12 @@ mod tests {
             "ADS-B compliant GTX 33 transponder",
             "modified GTX 33 transponder",
             "WAAS-upgraded GNS 430 navigator",
+            "Garmin GTN 750 WAAS GPS/NAV/COM",
         ] {
             let model = if source.contains("GNS") {
                 "GNS 430"
+            } else if source.contains("GTN") {
+                "GTN 750"
             } else {
                 "GTX 33"
             };
@@ -870,6 +873,15 @@ mod tests {
             .as_deref(),
             Some("GTX 33"),
             "a qualifier from a prior punctuated clause must not poison the model"
+        );
+
+        let annotated =
+            ListingEvidenceContext::from_cleaned_text("Garmin GTN 750 WAAS GPS/NAV/COM");
+        assert_eq!(annotated.unique_exact_model_slice("GTN 750"), None);
+        assert_eq!(
+            annotated.unique_exact_product_slice("Garmin", "GTN 750"),
+            None,
+            "extraction-only annotation admission must not weaken local catalog reuse"
         );
     }
 
