@@ -131,6 +131,7 @@ struct AutomationGuardRow {
 struct PreparedOccurrenceDisposition<'a> {
     decision: &'a AutomaticOccurrenceDisposition,
     occurrence_fingerprint: String,
+    listing_evidence_text: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -460,6 +461,10 @@ fn prepare_occurrence_dispositions<'a>(
                 decision.occurrence_role,
             )
             .map_err(ReviewError::Validation)?,
+            listing_evidence_text: occurrences[decision.occurrence_index]
+                .source_evidence_text
+                .clone()
+                .expect("the canonical retained-extraction parser requires occurrence evidence"),
         });
     }
     Ok((extraction_hash, prepared))
@@ -1477,6 +1482,29 @@ pub(crate) async fn apply_automated_avionics_review(
                         )?;
                     }
                 }
+            }
+            for linked_guard in &request.linked_occurrence_guards {
+                if linked_guard.authorization
+                    != AutomatedAssociationAuthorization::GlobalExactModelReuse
+                {
+                    continue;
+                }
+                let identity = identity_cache
+                    .get(&linked_guard.avionics_model_id)
+                    .expect("linked occurrence identity was loaded");
+                let evidence = terminal_dispositions
+                    .iter()
+                    .find(|prepared| {
+                        prepared.decision.occurrence_index == linked_guard.occurrence_index
+                            && prepared.decision.occurrence_role == linked_guard.occurrence_role
+                    })
+                    .expect("a validated linked occurrence guard has a terminal disposition");
+                require_current_global_exact_model_reuse(
+                    &active_collision_catalog_rows,
+                    linked_guard.avionics_model_id,
+                    &identity.model,
+                    Some(&evidence.listing_evidence_text),
+                )?;
             }
             for (model_id, expected) in &expected_collision_closure_by_model {
                 if collision_closures.get(model_id) != Some(expected) {
@@ -2595,6 +2623,92 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, (0, 1, "pending_review".to_string()));
+    }
+
+    #[tokio::test]
+    async fn linked_only_global_exact_model_reuse_rechecks_uniqueness_atomically() {
+        let mut fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let mut apply_request = linked_only_request(&mut fixture, model_id).await;
+        apply_request.linked_occurrence_guards[0].authorization =
+            AutomatedAssociationAuthorization::GlobalExactModelReuse;
+
+        let pool = pool(&fixture.db);
+        let collision_manufacturer_key =
+            normalize_avionics_manufacturer_name("Other Avionics Maker");
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Other Avionics Maker', ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(&collision_manufacturer_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        let collision_manufacturer_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?")
+                .bind(&collision_manufacturer_key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier
+            ) VALUES (?, 'Test Unit', ?, 'manufacturer_model_number',
+                      'OTHER-TEST-UNIT', 'othertestunit')
+            "#,
+        )
+        .bind(collision_manufacturer_id)
+        .bind(normalize_avionics_model_name("Test Unit"))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = apply_automated_avionics_review(&fixture.db, &apply_request)
+            .await
+            .expect_err(
+                "linked-only global model reuse must rerun uniqueness under the write lock",
+            );
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("global exact-model reuse")
+        ));
+
+        let receipt_counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions
+               WHERE aircraft_sale_listing_id = ?),
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations)
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_counts, (0, 0));
+
+        let review_state: (i64, String, String) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*), MAX(review_payload_sha256), MAX(ingestion_state)
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN aircraft_sale_listings listing ON listing.id = review.listing_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            review_state,
+            (
+                1,
+                fixture.review_payload_sha256.clone(),
+                "pending_review".to_string(),
+            )
+        );
     }
 
     #[tokio::test]
