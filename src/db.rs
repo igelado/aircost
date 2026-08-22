@@ -9358,8 +9358,8 @@ mod tests {
             .difference(&postgres_receipts)
             .next()
             .is_none());
-        assert_eq!(sqlite_receipts.len(), 20);
-        assert_eq!(postgres_receipts.len(), 21);
+        assert_eq!(sqlite_receipts.len(), 21);
+        assert_eq!(postgres_receipts.len(), 22);
         assert!(!sqlite_receipts.contains("20260802_default_avionics_candidate_quarantine"));
     }
 
@@ -9722,7 +9722,7 @@ mod tests {
         .await
         .unwrap();
         let expected = sqlite_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 21);
+        assert_eq!(expected.len(), 22);
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -9819,7 +9819,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 20);
+        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 21);
         inspection.close().await;
         std::fs::remove_file(database_path).unwrap();
 
@@ -13180,7 +13180,7 @@ mod tests {
         .await
         .unwrap();
         let expected = postgres_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 21);
+        assert_eq!(expected.len(), 23);
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -13465,7 +13465,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 21);
+        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 22);
         inspection.close().await;
     }
 
