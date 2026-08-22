@@ -15,8 +15,9 @@ use sqlx::{FromRow, Postgres, Sqlite};
 use url::Url;
 
 use crate::aircraft::curation::visual::{
-    resolve_visible_aircraft_identifiers_with_accounting, ListingPhotoInput, VisibleIdentifierKind,
-    VisualConsensusStatus, VisualIdentifierConfig, VisualIdentifierResolution,
+    evaluate_visual_registration_consensus, resolve_visible_aircraft_identifiers_with_accounting,
+    ListingPhotoInput, VisibleIdentifierKind, VisualConsensusStatus, VisualIdentifierConfig,
+    VisualIdentifierResolution,
 };
 use crate::aircraft::faa::{
     admit_aircraft_source_identity, block_reason_code, normalize_n_number,
@@ -33,7 +34,10 @@ use crate::gemini::config::{GeminiRuntimeConfig, GeminiTask};
 use crate::gemini::interactions::{GeminiInteractionsClient, InteractionAccountingContext};
 use crate::html::listing::download::download_identity_image;
 use crate::html::listing::media::{discover, MediaDiscoveryError};
-use crate::listings::SOURCE_IDENTITY_RECEIPT_PENDING;
+use crate::listings::{
+    PinnedSourceVisualCorrectionArtifact, SourceVisualRegistrationCorrection,
+    SOURCE_IDENTITY_RECEIPT_PENDING,
+};
 use crate::models::ParsedListing;
 
 const MAX_PUBLISHER_EVIDENCE_CHARACTERS: usize = 2_000;
@@ -413,6 +417,223 @@ pub async fn record_bound_source_serial_correction(
         serial_number: Some(correction.corrected_serial_number.clone()),
         faa_snapshot_id: Some(admission.grounding.snapshot.id),
     })
+}
+
+/// Record a one-photo registration correction used while materializing an
+/// exact signed source checkpoint. The checkpoint retains the publisher's raw
+/// registration; the listing and this immutable decision retain the separately
+/// FAA-admitted visual correction.
+pub(crate) async fn record_bound_source_visual_correction(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: i64,
+    submission_id: i64,
+    correction: &SourceVisualRegistrationCorrection,
+) -> Result<AircraftRepairOutcome, AircraftRepairError> {
+    if submission_id <= 0 {
+        return Err(AircraftRepairError::Validation(
+            "source correction submission is invalid",
+        ));
+    }
+    let state = load_state(db, listing_id).await?;
+    require_owner(&state, owner_user_id)?;
+    if state.submission_id != Some(submission_id) {
+        return Err(AircraftRepairError::Stale);
+    }
+    let extracted_json =
+        load_bound_extraction(db, owner_user_id, listing_id, submission_id).await?;
+    let artifact = load_pinned_source_visual_artifact(db, submission_id).await?;
+    let parsed: ParsedListing = serde_json::from_str(&extracted_json).map_err(|_| {
+        AircraftRepairError::Validation("bound source extraction is not a current listing object")
+    })?;
+    let observed_registration = parsed
+        .registration_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(AircraftRepairError::Validation(
+            "bound source extraction has no registration",
+        ))?;
+    if observed_registration != correction.observed_registration_number.trim()
+        || normalize_n_number(observed_registration)
+            == normalize_n_number(&correction.corrected_registration_number)
+        || state.registration_number.as_deref()
+            != Some(correction.corrected_registration_number.as_str())
+        || state.serial_number.as_deref() != correction.corrected_serial_number.as_deref()
+    {
+        return Err(AircraftRepairError::Stale);
+    }
+    let rendered_html = state
+        .rendered_html
+        .as_deref()
+        .ok_or(AircraftRepairError::Stale)?;
+    if !crate::html::clean::listing_body_contains_exact_structurally_visible_text_span(
+        rendered_html,
+        observed_registration,
+    ) {
+        return Err(AircraftRepairError::Validation(
+            "observed source registration is not an exact visible retained-source span",
+        ));
+    }
+    validate_source_visual_correction(&state, correction)?;
+    validate_pinned_source_visual_artifact(&state, correction, &artifact)?;
+    let exact_grounding = require_aircraft_admission(
+        db,
+        Some(&correction.corrected_registration_number),
+        correction.corrected_serial_number.as_deref(),
+    )
+    .await
+    .map_err(admission_error)?;
+    if exact_grounding != correction.grounding {
+        return Err(AircraftRepairError::Stale);
+    }
+    let expected_state_sha256 = state.fingerprint();
+    let decision_id = persist_correction(
+        db,
+        &state,
+        owner_user_id,
+        &expected_state_sha256,
+        PersistCorrection::SourceVisual {
+            parsed: &parsed,
+            correction,
+            artifact: &artifact,
+        },
+    )
+    .await?;
+    Ok(AircraftRepairOutcome::Applied {
+        listing_id,
+        correction_decision_id: decision_id,
+        registration_number: Some(correction.corrected_registration_number.clone()),
+        serial_number: correction.corrected_serial_number.clone(),
+        faa_snapshot_id: Some(exact_grounding.snapshot.id),
+    })
+}
+
+async fn load_pinned_source_visual_artifact(
+    db: &AppDb,
+    submission_id: i64,
+) -> Result<PinnedSourceVisualCorrectionArtifact, AircraftRepairError> {
+    let sql = db.sql(
+        r#"
+        SELECT plugin_submission_id, rendered_html_sha256,
+               observed_registration_number, corrected_registration_number,
+               corrected_serial_number, faa_registry_snapshot_id,
+               faa_snapshot_archive_sha256, faa_source_record_sha256,
+               primary_photo_asset_id, primary_photo_url, primary_photo_sha256,
+               visual_resolution_sha256, visual_resolution_json
+        FROM aircraft_source_visual_correction_artifacts
+        WHERE plugin_submission_id = ?
+        "#,
+    );
+    let artifact = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, PinnedSourceVisualCorrectionArtifact>(&sql)
+                .bind(submission_id)
+                .fetch_optional(pool)
+                .await
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, PinnedSourceVisualCorrectionArtifact>(&sql)
+                .bind(submission_id)
+                .fetch_optional(pool)
+                .await
+        }
+    }
+    .map_err(db_error)?;
+    artifact.ok_or(AircraftRepairError::Stale)
+}
+
+fn validate_pinned_source_visual_artifact(
+    state: &RepairState,
+    correction: &SourceVisualRegistrationCorrection,
+    artifact: &PinnedSourceVisualCorrectionArtifact,
+) -> Result<(), AircraftRepairError> {
+    if artifact.plugin_submission_id != state.submission_id.ok_or(AircraftRepairError::Stale)?
+        || Some(artifact.rendered_html_sha256.as_str()) != state.rendered_html_sha256.as_deref()
+        || artifact.observed_registration_number != correction.observed_registration_number
+        || artifact.corrected_registration_number != correction.corrected_registration_number
+        || artifact.corrected_serial_number != correction.corrected_serial_number
+        || artifact.faa_registry_snapshot_id != correction.grounding.snapshot.id
+        || artifact.faa_snapshot_archive_sha256 != correction.grounding.snapshot.archive_sha256
+        || artifact.faa_source_record_sha256 != correction.grounding.source_record_sha256
+        || artifact.primary_photo_url != correction.media_url
+        || format!(
+            "{:x}",
+            Sha256::digest(artifact.visual_resolution_json.as_bytes())
+        ) != artifact.visual_resolution_sha256
+    {
+        return Err(AircraftRepairError::Stale);
+    }
+    let pinned: VisualIdentifierResolution = serde_json::from_str(&artifact.visual_resolution_json)
+        .map_err(|_| AircraftRepairError::Stale)?;
+    if pinned.status != correction.resolution.status
+        || pinned.candidates != correction.resolution.candidates
+        || pinned.registration_consensus != correction.resolution.registration_consensus
+        || pinned.refusal_reason != correction.resolution.refusal_reason
+        || pinned.photos != correction.resolution.photos
+        || pinned.photos.len() != 1
+        || pinned.photos[0].image_id != format!("asset-{}", artifact.primary_photo_asset_id)
+        || pinned.photos[0].sha256 != artifact.primary_photo_sha256
+    {
+        return Err(AircraftRepairError::Stale);
+    }
+    Ok(())
+}
+
+fn validate_source_visual_correction(
+    state: &RepairState,
+    correction: &SourceVisualRegistrationCorrection,
+) -> Result<(), AircraftRepairError> {
+    let resolution = &correction.resolution;
+    if resolution.photos.len() != 1
+        || resolution.registration_consensus.status != VisualConsensusStatus::AutoAccept
+        || evaluate_visual_registration_consensus(&resolution.candidates)
+            != resolution.registration_consensus
+        || resolution
+            .registration_consensus
+            .normalized_n_number
+            .as_deref()
+            .and_then(normalize_n_number)
+            .as_deref()
+            != Some(correction.corrected_registration_number.as_str())
+    {
+        return Err(AircraftRepairError::Validation(
+            "source visual correction is not one complete registration observation",
+        ));
+    }
+    let photo_id = resolution.photos[0].image_id.as_str();
+    if resolution.candidates.iter().any(|candidate| {
+        candidate.evidence_count != candidate.evidence.len()
+            || candidate.evidence.is_empty()
+            || candidate
+                .evidence
+                .iter()
+                .any(|evidence| evidence.image_id != photo_id)
+    }) {
+        return Err(AircraftRepairError::Validation(
+            "source visual correction has invalid photo evidence bindings",
+        ));
+    }
+    let source_url = state.source_url().ok_or(AircraftRepairError::Stale)?;
+    let rendered_html = state
+        .rendered_html
+        .as_deref()
+        .ok_or(AircraftRepairError::Stale)?;
+    let discovery = discover(source_url, rendered_html).map_err(|_| {
+        AircraftRepairError::Validation("retained source has no supported visual assets")
+    })?;
+    let primary = discovery
+        .aircraft_photos
+        .first()
+        .ok_or(AircraftRepairError::Validation(
+            "retained source has no primary aircraft photo",
+        ))?;
+    if primary.media_url != correction.media_url
+        || photo_id != format!("asset-{}", primary.asset_id)
+    {
+        return Err(AircraftRepairError::Stale);
+    }
+    Ok(())
 }
 
 pub async fn recover_aircraft_from_visual_asset(
@@ -890,6 +1111,11 @@ enum PersistCorrection<'a> {
         parsed: &'a ParsedListing,
         grounding: &'a AircraftGrounding,
     },
+    SourceVisual {
+        parsed: &'a ParsedListing,
+        correction: &'a SourceVisualRegistrationCorrection,
+        artifact: &'a PinnedSourceVisualCorrectionArtifact,
+    },
 }
 
 async fn persist_correction(
@@ -1127,6 +1353,14 @@ async fn persist_locked_sqlite(
     {
         ensure_current_faa_sqlite(tx, grounding).await?;
     }
+    if let PersistCorrection::SourceVisual {
+        correction,
+        artifact,
+        ..
+    } = &correction
+    {
+        ensure_source_visual_faa_pair_sqlite(tx, correction, artifact).await?;
+    }
     let source_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO curation_evidence_sources (source_url, resolved_url, source_title, publisher, source_domain, source_tier, content_sha256, retrieved_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT (source_url, content_sha256) DO NOTHING RETURNING id",
     )
@@ -1161,7 +1395,10 @@ async fn persist_locked_sqlite(
         &material,
     )
     .await?;
-    if matches!(correction, PersistCorrection::SourceFaaSerial { .. }) {
+    if matches!(
+        correction,
+        PersistCorrection::SourceFaaSerial { .. } | PersistCorrection::SourceVisual { .. }
+    ) {
         release_source_receipt_gate_sqlite(tx, state).await?;
     }
     Ok(decision_id)
@@ -1184,6 +1421,14 @@ async fn persist_locked_postgres(
     | PersistCorrection::SourceFaaSerial { grounding, .. } = &correction
     {
         ensure_current_faa_postgres(tx, grounding).await?;
+    }
+    if let PersistCorrection::SourceVisual {
+        correction,
+        artifact,
+        ..
+    } = &correction
+    {
+        ensure_source_visual_faa_pair_postgres(tx, correction, artifact).await?;
     }
     let source_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO curation_evidence_sources (source_url, resolved_url, source_title, publisher, source_domain, source_tier, content_sha256, retrieved_at) VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP) ON CONFLICT (source_url, content_sha256) DO NOTHING RETURNING id",
@@ -1213,7 +1458,10 @@ async fn persist_locked_postgres(
         &material,
     )
     .await?;
-    if matches!(correction, PersistCorrection::SourceFaaSerial { .. }) {
+    if matches!(
+        correction,
+        PersistCorrection::SourceFaaSerial { .. } | PersistCorrection::SourceVisual { .. }
+    ) {
         release_source_receipt_gate_postgres(tx, state).await?;
     }
     Ok(decision_id)
@@ -1416,6 +1664,36 @@ fn correction_material(
             "regulator_primary",
             grounding.snapshot.archive_sha256.clone(),
         ),
+        PersistCorrection::SourceVisual {
+            correction,
+            artifact,
+            ..
+        } => {
+            let resolution = &correction.resolution;
+            let evidence = resolution
+                .candidates
+                .iter()
+                .flat_map(|candidate| {
+                    candidate
+                        .evidence
+                        .iter()
+                        .map(|item| item.visible_text.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            (
+                "visual_identifier",
+                correction.media_url.clone(),
+                evidence,
+                Some(correction.corrected_registration_number.clone()),
+                correction.corrected_serial_number.clone(),
+                Some(correction.grounding.snapshot.id),
+                Some(correction.grounding.source_record_sha256.clone()),
+                Some(artifact.visual_resolution_json.clone()),
+                "marketplace_observation",
+                artifact.primary_photo_sha256.clone(),
+            )
+        }
     };
     let (prior_registration, prior_serial, decision_origin) = match correction {
         PersistCorrection::SourceFaaSerial {
@@ -1425,6 +1703,11 @@ fn correction_material(
         } => (
             parsed.registration_number.clone(),
             Some((*observed_serial).to_string()),
+            "source_materialization",
+        ),
+        PersistCorrection::SourceVisual { parsed, .. } => (
+            parsed.registration_number.clone(),
+            parsed.serial_number.clone(),
             "source_materialization",
         ),
         _ => (
@@ -1590,6 +1873,102 @@ insert_helpers!(
     "$17",
     "$18"
 );
+
+async fn ensure_source_visual_faa_pair_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    correction: &SourceVisualRegistrationCorrection,
+    artifact: &PinnedSourceVisualCorrectionArtifact,
+) -> Result<(), AircraftRepairError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM aircraft_source_visual_correction_artifacts pinned
+        JOIN plugin_submissions submission ON submission.id = pinned.plugin_submission_id
+        JOIN faa_registry_snapshots snapshot ON snapshot.id = pinned.faa_registry_snapshot_id
+        JOIN faa_registry_coverage observed
+          ON observed.snapshot_id = snapshot.id
+         AND observed.n_number = pinned.observed_registration_number
+         AND observed.lookup_status = 'absent'
+        JOIN faa_registry_coverage corrected
+          ON corrected.snapshot_id = snapshot.id
+         AND corrected.n_number = pinned.corrected_registration_number
+         AND corrected.lookup_status = 'matched'
+        JOIN faa_registry_aircraft aircraft
+          ON aircraft.snapshot_id = snapshot.id
+         AND aircraft.n_number = corrected.n_number
+        WHERE pinned.plugin_submission_id = ?
+          AND pinned.rendered_html_sha256 = submission.rendered_html_sha256
+          AND pinned.observed_registration_number = ?
+          AND pinned.corrected_registration_number = ?
+          AND pinned.corrected_serial_number IS ?
+          AND snapshot.id = (SELECT id FROM faa_registry_snapshots ORDER BY snapshot_date DESC, id DESC LIMIT 1)
+          AND snapshot.archive_sha256 = ?
+          AND aircraft.source_record_sha256 = ?
+          AND aircraft.manufacturer_serial_raw IS pinned.corrected_serial_number
+        "#,
+    )
+    .bind(artifact.plugin_submission_id)
+    .bind(correction.observed_registration_number.as_str())
+    .bind(correction.corrected_registration_number.as_str())
+    .bind(correction.corrected_serial_number.as_deref())
+    .bind(correction.grounding.snapshot.archive_sha256.as_str())
+    .bind(correction.grounding.source_record_sha256.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if count != 1 {
+        return Err(AircraftRepairError::Stale);
+    }
+    Ok(())
+}
+
+async fn ensure_source_visual_faa_pair_postgres(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    correction: &SourceVisualRegistrationCorrection,
+    artifact: &PinnedSourceVisualCorrectionArtifact,
+) -> Result<(), AircraftRepairError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM public.aircraft_source_visual_correction_artifacts pinned
+        JOIN public.plugin_submissions submission ON submission.id = pinned.plugin_submission_id
+        JOIN public.faa_registry_snapshots snapshot ON snapshot.id = pinned.faa_registry_snapshot_id
+        JOIN public.faa_registry_coverage observed
+          ON observed.snapshot_id = snapshot.id
+         AND observed.n_number = pinned.observed_registration_number
+         AND observed.lookup_status = 'absent'
+        JOIN public.faa_registry_coverage corrected
+          ON corrected.snapshot_id = snapshot.id
+         AND corrected.n_number = pinned.corrected_registration_number
+         AND corrected.lookup_status = 'matched'
+        JOIN public.faa_registry_aircraft aircraft
+          ON aircraft.snapshot_id = snapshot.id
+         AND aircraft.n_number = corrected.n_number
+        WHERE pinned.plugin_submission_id = $1
+          AND pinned.rendered_html_sha256 = submission.rendered_html_sha256
+          AND pinned.observed_registration_number = $2
+          AND pinned.corrected_registration_number = $3
+          AND pinned.corrected_serial_number IS NOT DISTINCT FROM $4
+          AND snapshot.id = (SELECT id FROM public.faa_registry_snapshots ORDER BY snapshot_date DESC, id DESC LIMIT 1)
+          AND snapshot.archive_sha256 = $5
+          AND aircraft.source_record_sha256 = $6
+          AND aircraft.manufacturer_serial_raw IS NOT DISTINCT FROM pinned.corrected_serial_number
+        "#,
+    )
+    .bind(artifact.plugin_submission_id)
+    .bind(correction.observed_registration_number.as_str())
+    .bind(correction.corrected_registration_number.as_str())
+    .bind(correction.corrected_serial_number.as_deref())
+    .bind(correction.grounding.snapshot.archive_sha256.as_str())
+    .bind(correction.grounding.source_record_sha256.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    if count != 1 {
+        return Err(AircraftRepairError::Stale);
+    }
+    Ok(())
+}
 
 async fn ensure_current_faa_sqlite(
     tx: &mut sqlx::Transaction<'_, Sqlite>,

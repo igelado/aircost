@@ -220,6 +220,11 @@ const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION: &str =
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
 const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
     "589a0716726d2ffd34bf84c08583198383c003228b769c88f094ac6bd9f677b8";
+const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION: &str =
+    "20260821_aircraft_visual_source_corrections";
+const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_VERSION: i64 = 1;
+const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
+    "ccc63aa23f2579ec5cec682bf1493a13eb73829718936b5890bd84de51bb828a";
 const LISTING_REPLAY_RUNS_MIGRATION: &str = "20260819_listing_replay_runs";
 const LISTING_REPLAY_RUNS_CONTRACT_VERSION: i64 = 1;
 const LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT: &str =
@@ -271,7 +276,7 @@ WHEN OLD.ingestion_error = 'source_identity_correction_receipt_pending'
    JOIN plugin_submissions submission
      ON submission.id = decision.plugin_submission_id
    WHERE decision.aircraft_sale_listing_id = OLD.id
-     AND decision.correction_kind = 'faa_serial'
+     AND decision.correction_kind IN ('faa_serial', 'visual_identifier')
      AND decision.rendered_html_sha256 = submission.rendered_html_sha256
      AND submission.user_id = OLD.created_by_user_id
      AND submission.canonical_listing_id = OLD.id
@@ -280,6 +285,34 @@ WHEN OLD.ingestion_error = 'source_identity_correction_receipt_pending'
      AND NEW.serial_number IS decision.corrected_serial_number
  )
 BEGIN SELECT RAISE(ABORT, 'source identity correction receipt is required before leaving the receipt gate'); END
+"#;
+const SQLITE_SOURCE_VISUAL_ARTIFACT_UPDATE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_source_visual_artifacts_immutable_update
+BEFORE UPDATE ON aircraft_source_visual_correction_artifacts
+BEGIN SELECT RAISE(ABORT, 'aircraft source visual correction artifacts are immutable'); END
+"#;
+const SQLITE_SOURCE_VISUAL_ARTIFACT_DELETE_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_source_visual_artifacts_immutable_delete
+BEFORE DELETE ON aircraft_source_visual_correction_artifacts
+BEGIN SELECT RAISE(ABORT, 'aircraft source visual correction artifacts are immutable'); END
+"#;
+const SQLITE_SOURCE_VISUAL_ARTIFACT_INSERT_TRIGGER: &str = r#"
+CREATE TRIGGER aircraft_source_visual_artifacts_validate_insert
+BEFORE INSERT ON aircraft_source_visual_correction_artifacts
+WHEN NOT EXISTS (
+  SELECT 1 FROM plugin_submissions submission
+  JOIN faa_registry_snapshots snapshot ON snapshot.id = NEW.faa_registry_snapshot_id
+  JOIN faa_registry_coverage observed ON observed.snapshot_id = snapshot.id AND observed.n_number = NEW.observed_registration_number AND observed.lookup_status = 'absent'
+  JOIN faa_registry_coverage corrected ON corrected.snapshot_id = snapshot.id AND corrected.n_number = NEW.corrected_registration_number AND corrected.lookup_status = 'matched'
+  JOIN faa_registry_aircraft aircraft ON aircraft.snapshot_id = snapshot.id AND aircraft.n_number = corrected.n_number
+  WHERE submission.id = NEW.plugin_submission_id
+    AND submission.rendered_html_sha256 = NEW.rendered_html_sha256
+    AND snapshot.id = (SELECT id FROM faa_registry_snapshots ORDER BY snapshot_date DESC, id DESC LIMIT 1)
+    AND snapshot.archive_sha256 = NEW.faa_snapshot_archive_sha256
+    AND aircraft.source_record_sha256 = NEW.faa_source_record_sha256
+    AND aircraft.manufacturer_serial_raw IS NEW.corrected_serial_number
+)
+BEGIN SELECT RAISE(ABORT, 'source visual correction artifact requires one exact current FAA absence/match pair'); END
 "#;
 const POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE: &str = r#"
 BEGIN
@@ -314,7 +347,7 @@ BEGIN
        JOIN public.plugin_submissions submission
          ON submission.id = decision.plugin_submission_id
        WHERE decision.aircraft_sale_listing_id = OLD.id
-         AND decision.correction_kind = 'faa_serial'
+         AND decision.correction_kind IN ('faa_serial', 'visual_identifier')
          AND decision.rendered_html_sha256 = submission.rendered_html_sha256
          AND submission.user_id = OLD.created_by_user_id
          AND submission.canonical_listing_id = OLD.id
@@ -323,6 +356,31 @@ BEGIN
          AND NEW.serial_number IS NOT DISTINCT FROM decision.corrected_serial_number
      ) THEN
     RAISE EXCEPTION 'source identity correction receipt is required before leaving the receipt gate';
+  END IF;
+  RETURN NEW;
+END;
+"#;
+const POSTGRES_SOURCE_VISUAL_ARTIFACT_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  RAISE EXCEPTION 'aircraft source visual correction artifacts are immutable';
+END;
+"#;
+const POSTGRES_SOURCE_VISUAL_ARTIFACT_VALIDATION_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.plugin_submissions submission
+    JOIN public.faa_registry_snapshots snapshot ON snapshot.id = NEW.faa_registry_snapshot_id
+    JOIN public.faa_registry_coverage observed ON observed.snapshot_id = snapshot.id AND observed.n_number = NEW.observed_registration_number AND observed.lookup_status = 'absent'
+    JOIN public.faa_registry_coverage corrected ON corrected.snapshot_id = snapshot.id AND corrected.n_number = NEW.corrected_registration_number AND corrected.lookup_status = 'matched'
+    JOIN public.faa_registry_aircraft aircraft ON aircraft.snapshot_id = snapshot.id AND aircraft.n_number = corrected.n_number
+    WHERE submission.id = NEW.plugin_submission_id
+      AND submission.rendered_html_sha256 = NEW.rendered_html_sha256
+      AND snapshot.id = (SELECT id FROM public.faa_registry_snapshots ORDER BY snapshot_date DESC, id DESC LIMIT 1)
+      AND snapshot.archive_sha256 = NEW.faa_snapshot_archive_sha256
+      AND aircraft.source_record_sha256 = NEW.faa_source_record_sha256
+      AND aircraft.manufacturer_serial_raw IS NOT DISTINCT FROM NEW.corrected_serial_number
+  ) THEN
+    RAISE EXCEPTION 'source visual correction artifact requires one exact current FAA absence/match pair';
   END IF;
   RETURN NEW;
 END;
@@ -423,6 +481,11 @@ const COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] = 
         migration_name: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
         contract_version: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_VERSION,
         contract_fingerprint: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION,
+        contract_version: AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_VERSION,
+        contract_fingerprint: AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT,
     },
     MigrationContractReceipt {
         migration_name: LISTING_REPLAY_RUNS_MIGRATION,
@@ -3860,6 +3923,31 @@ impl AppDb {
         if missing_aircraft_listing_identity_corrections {
             bail!(aircraft_listing_identity_corrections_migration_required_message(self.kind()));
         }
+        let aircraft_visual_source_correction_state = self
+            .migration_contract_state_on(
+                connection,
+                match self.kind() {
+                    DatabaseKind::Sqlite => "aircraft_source_visual_correction_artifacts",
+                    DatabaseKind::Postgres => "public.aircraft_source_visual_correction_artifacts",
+                },
+                AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION,
+                AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_VERSION,
+                AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT,
+            )
+            .await?;
+        let missing_aircraft_visual_source_corrections =
+            match aircraft_visual_source_correction_state {
+                MigrationContractState::Fresh => false,
+                MigrationContractState::Installed => {
+                    !self
+                        .aircraft_visual_source_correction_definitions_valid_on(connection)
+                        .await?
+                }
+                MigrationContractState::Invalid => true,
+            };
+        if missing_aircraft_visual_source_corrections {
+            bail!(aircraft_visual_source_corrections_migration_required_message(self.kind()));
+        }
         let missing_listing_replay_objects = match &mut *connection {
             GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
@@ -4288,6 +4376,411 @@ impl AppDb {
             ));
         }
         Ok(())
+    }
+
+    async fn aircraft_visual_source_correction_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                let table_definition = sqlx::query_scalar::<_, Option<String>>(
+                    r#"
+                    SELECT sql FROM sqlite_schema
+                    WHERE type = 'table'
+                      AND name = 'aircraft_source_visual_correction_artifacts'
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                let table_is_exact = table_definition.as_deref().is_some_and(|actual| {
+                    canonical_sql_definition(actual).replacen(
+                        "createtableifnotexists",
+                        "createtable",
+                        1,
+                    ) == canonical_sqlite_table_definition(
+                        SQLITE_SCHEMA_SQL,
+                        "aircraft_source_visual_correction_artifacts",
+                    )
+                    .expect("canonical visual source correction artifact table must exist")
+                });
+                let definitions = sqlx::query_as::<_, (String, Option<String>)>(
+                    r#"
+                    SELECT name, sql FROM sqlite_schema
+                    WHERE type = 'trigger' AND (
+                      tbl_name = 'aircraft_source_visual_correction_artifacts'
+                      OR name = 'aircraft_source_identity_receipt_gate'
+                    )
+                    ORDER BY name
+                    "#,
+                )
+                .fetch_all(&mut **pool)
+                .await?;
+                let expected = [
+                    (
+                        "aircraft_source_identity_receipt_gate",
+                        SQLITE_SOURCE_IDENTITY_RECEIPT_GATE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_source_visual_artifacts_immutable_delete",
+                        SQLITE_SOURCE_VISUAL_ARTIFACT_DELETE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_source_visual_artifacts_immutable_update",
+                        SQLITE_SOURCE_VISUAL_ARTIFACT_UPDATE_TRIGGER,
+                    ),
+                    (
+                        "aircraft_source_visual_artifacts_validate_insert",
+                        SQLITE_SOURCE_VISUAL_ARTIFACT_INSERT_TRIGGER,
+                    ),
+                ];
+                let valid = table_is_exact
+                    && definitions.len() == expected.len()
+                    && definitions.iter().zip(expected).all(
+                        |((actual_name, actual_sql), (expected_name, expected_sql))| {
+                            actual_name == expected_name
+                                && actual_sql.as_deref().is_some_and(|actual| {
+                                    canonical_sql_definition(actual)
+                                        == canonical_sql_definition(expected_sql)
+                                })
+                        },
+                    );
+                Ok(valid)
+            }
+            GateConnection::Postgres(pool) => {
+                let table_is_exact = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    WITH expected_columns (
+                      ordinal_position, column_name, column_type, is_not_null,
+                      identity_kind, default_expression
+                    ) AS (
+                      VALUES
+                        (1, 'plugin_submission_id', 'bigint', TRUE, '', ''),
+                        (2, 'rendered_html_sha256', 'text', TRUE, '', ''),
+                        (3, 'observed_registration_number', 'text', TRUE, '', ''),
+                        (4, 'corrected_registration_number', 'text', TRUE, '', ''),
+                        (5, 'corrected_serial_number', 'text', FALSE, '', ''),
+                        (6, 'faa_registry_snapshot_id', 'bigint', TRUE, '', ''),
+                        (7, 'faa_snapshot_archive_sha256', 'text', TRUE, '', ''),
+                        (8, 'faa_source_record_sha256', 'text', TRUE, '', ''),
+                        (9, 'primary_photo_asset_id', 'text', TRUE, '', ''),
+                        (10, 'primary_photo_url', 'text', TRUE, '', ''),
+                        (11, 'primary_photo_sha256', 'text', TRUE, '', ''),
+                        (12, 'visual_resolution_sha256', 'text', TRUE, '', ''),
+                        (13, 'visual_resolution_json', 'text', TRUE, '', ''),
+                        (14, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP')
+                    ), actual_columns AS (
+                      SELECT attribute.attnum::integer,
+                             attribute.attname::text,
+                             pg_catalog.format_type(
+                               attribute.atttypid, attribute.atttypmod
+                             ),
+                             attribute.attnotnull,
+                             attribute.attidentity::text,
+                             COALESCE(pg_catalog.pg_get_expr(
+                               attribute_default.adbin,
+                               attribute_default.adrelid
+                             ), '')
+                      FROM pg_catalog.pg_class relation
+                      JOIN pg_catalog.pg_namespace namespace
+                        ON namespace.oid = relation.relnamespace
+                      JOIN pg_catalog.pg_attribute attribute
+                        ON attribute.attrelid = relation.oid
+                       AND attribute.attnum > 0
+                       AND NOT attribute.attisdropped
+                      LEFT JOIN pg_catalog.pg_attrdef attribute_default
+                        ON attribute_default.adrelid = relation.oid
+                       AND attribute_default.adnum = attribute.attnum
+                      WHERE namespace.nspname = 'public'
+                        AND relation.relname =
+                          'aircraft_source_visual_correction_artifacts'
+                        AND relation.relkind = 'r'
+                        AND relation.relpersistence = 'p'
+                        AND NOT relation.relrowsecurity
+                        AND NOT relation.relforcerowsecurity
+                        AND NOT relation.relispartition
+                    ), expected_constraints (constraint_name, constraint_type) AS (
+                      VALUES
+                        ('aircraft_source_visual_correction_artifacts_pkey', 'p'),
+                        ('visual_source_artifact_submission_fk', 'f'),
+                        ('visual_source_artifact_snapshot_fk', 'f'),
+                        ('visual_source_artifact_observed_coverage_fk', 'f'),
+                        ('visual_source_artifact_corrected_aircraft_fk', 'f'),
+                        ('visual_source_artifact_record_aircraft_fk', 'f'),
+                        ('visual_source_artifact_rendered_sha256_check', 'c'),
+                        ('visual_source_artifact_archive_sha256_check', 'c'),
+                        ('visual_source_artifact_record_sha256_check', 'c'),
+                        ('visual_source_artifact_photo_sha256_check', 'c'),
+                        ('visual_source_artifact_resolution_sha256_check', 'c'),
+                        ('visual_source_artifact_registration_distinct_check', 'c'),
+                        ('visual_source_artifact_observed_registration_length_check', 'c'),
+                        ('visual_source_artifact_corrected_registration_length_check', 'c'),
+                        ('visual_source_artifact_corrected_serial_length_check', 'c'),
+                        ('visual_source_artifact_asset_id_length_check', 'c'),
+                        ('visual_source_artifact_url_length_check', 'c'),
+                        ('visual_source_artifact_resolution_json_check', 'c')
+                    ), actual_constraints AS (
+                      SELECT constraint_row.conname::text,
+                             constraint_row.contype::text
+                      FROM pg_catalog.pg_constraint constraint_row
+                      WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                        'public.aircraft_source_visual_correction_artifacts'
+                      )
+                    ), expected_foreign_keys (
+                      constraint_name, child_columns, parent_relation, parent_columns
+                    ) AS (
+                      VALUES
+                        ('visual_source_artifact_submission_fk',
+                         'plugin_submission_id', 'plugin_submissions', 'id'),
+                        ('visual_source_artifact_snapshot_fk',
+                         'faa_registry_snapshot_id', 'faa_registry_snapshots', 'id'),
+                        ('visual_source_artifact_observed_coverage_fk',
+                         'faa_registry_snapshot_id,observed_registration_number',
+                         'faa_registry_coverage', 'snapshot_id,n_number'),
+                        ('visual_source_artifact_corrected_aircraft_fk',
+                         'faa_registry_snapshot_id,corrected_registration_number',
+                         'faa_registry_aircraft', 'snapshot_id,n_number'),
+                        ('visual_source_artifact_record_aircraft_fk',
+                         'faa_registry_snapshot_id,faa_source_record_sha256',
+                         'faa_registry_aircraft', 'snapshot_id,source_record_sha256')
+                    ), actual_foreign_keys AS (
+                      SELECT constraint_row.conname::text,
+                             (
+                               SELECT pg_catalog.string_agg(
+                                 child_attribute.attname, ',' ORDER BY key.ordinality
+                               )
+                               FROM pg_catalog.unnest(constraint_row.conkey)
+                                 WITH ORDINALITY AS key(attnum, ordinality)
+                               JOIN pg_catalog.pg_attribute child_attribute
+                                 ON child_attribute.attrelid = constraint_row.conrelid
+                                AND child_attribute.attnum = key.attnum
+                             ),
+                             parent_relation.relname::text,
+                             (
+                               SELECT pg_catalog.string_agg(
+                                 parent_attribute.attname, ',' ORDER BY key.ordinality
+                               )
+                               FROM pg_catalog.unnest(constraint_row.confkey)
+                                 WITH ORDINALITY AS key(attnum, ordinality)
+                               JOIN pg_catalog.pg_attribute parent_attribute
+                                 ON parent_attribute.attrelid = constraint_row.confrelid
+                                AND parent_attribute.attnum = key.attnum
+                             )
+                      FROM pg_catalog.pg_constraint constraint_row
+                      JOIN pg_catalog.pg_class parent_relation
+                        ON parent_relation.oid = constraint_row.confrelid
+                      JOIN pg_catalog.pg_namespace parent_namespace
+                        ON parent_namespace.oid = parent_relation.relnamespace
+                      WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                              'public.aircraft_source_visual_correction_artifacts'
+                            )
+                        AND constraint_row.contype = 'f'
+                        AND constraint_row.convalidated
+                        AND NOT constraint_row.condeferrable
+                        AND NOT constraint_row.condeferred
+                        AND constraint_row.confmatchtype = 's'
+                        AND constraint_row.confupdtype = 'a'
+                        AND constraint_row.confdeltype = 'r'
+                        AND parent_namespace.nspname = 'public'
+                    ), actual_checks AS (
+                      SELECT constraint_row.conname::text AS constraint_name,
+                             pg_catalog.regexp_replace(
+                               pg_catalog.lower(pg_catalog.pg_get_constraintdef(
+                                 constraint_row.oid, FALSE
+                               )), '[[:space:]()]', '', 'g'
+                             ) AS definition
+                      FROM pg_catalog.pg_constraint constraint_row
+                      WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                              'public.aircraft_source_visual_correction_artifacts'
+                            )
+                        AND constraint_row.contype = 'c'
+                        AND constraint_row.convalidated
+                        AND NOT constraint_row.connoinherit
+                    ), expected_checks (constraint_name, definition) AS (
+                      VALUES
+                        ('visual_source_artifact_rendered_sha256_check',
+                         'checkrendered_html_sha256~''^[0-9a-f]{64}$''::text'),
+                        ('visual_source_artifact_archive_sha256_check',
+                         'checkfaa_snapshot_archive_sha256~''^[0-9a-f]{64}$''::text'),
+                        ('visual_source_artifact_record_sha256_check',
+                         'checkfaa_source_record_sha256~''^[0-9a-f]{64}$''::text'),
+                        ('visual_source_artifact_photo_sha256_check',
+                         'checkprimary_photo_sha256~''^[0-9a-f]{64}$''::text'),
+                        ('visual_source_artifact_resolution_sha256_check',
+                         'checkvisual_resolution_sha256~''^[0-9a-f]{64}$''::text'),
+                        ('visual_source_artifact_registration_distinct_check',
+                         'checkobserved_registration_number<>corrected_registration_number'),
+                        ('visual_source_artifact_observed_registration_length_check',
+                         'checklengthobserved_registration_number>=2andlengthobserved_registration_number<=6'),
+                        ('visual_source_artifact_corrected_registration_length_check',
+                         'checklengthcorrected_registration_number>=2andlengthcorrected_registration_number<=6'),
+                        ('visual_source_artifact_corrected_serial_length_check',
+                         'checkcorrected_serial_numberisnullorlengthcorrected_serial_number>=1andlengthcorrected_serial_number<=128'),
+                        ('visual_source_artifact_asset_id_length_check',
+                         'checklengthprimary_photo_asset_id>=1andlengthprimary_photo_asset_id<=256'),
+                        ('visual_source_artifact_url_length_check',
+                         'checklengthprimary_photo_url>=1andlengthprimary_photo_url<=4096'),
+                        ('visual_source_artifact_resolution_json_check',
+                         'checklengthvisual_resolution_json>=2andlengthvisual_resolution_json<=65536andjsonb_typeofvisual_resolution_json::jsonb=''object''::text')
+                    )
+                    SELECT
+                      NOT EXISTS (
+                        (SELECT * FROM expected_columns
+                         EXCEPT SELECT * FROM actual_columns)
+                        UNION ALL
+                        (SELECT * FROM actual_columns
+                         EXCEPT SELECT * FROM expected_columns)
+                      )
+                      AND NOT EXISTS (
+                        (SELECT * FROM expected_constraints
+                         EXCEPT SELECT * FROM actual_constraints)
+                        UNION ALL
+                        (SELECT * FROM actual_constraints
+                         EXCEPT SELECT * FROM expected_constraints)
+                      )
+                      AND NOT EXISTS (
+                        (SELECT * FROM expected_foreign_keys
+                         EXCEPT SELECT * FROM actual_foreign_keys)
+                        UNION ALL
+                        (SELECT * FROM actual_foreign_keys
+                         EXCEPT SELECT * FROM expected_foreign_keys)
+                      )
+                      AND NOT EXISTS (
+                        (SELECT * FROM expected_checks
+                         EXCEPT SELECT * FROM actual_checks)
+                        UNION ALL
+                        (SELECT * FROM actual_checks
+                         EXCEPT SELECT * FROM expected_checks)
+                      )
+                      AND EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_constraint primary_key
+                        JOIN pg_catalog.pg_index backing_index
+                          ON backing_index.indexrelid = primary_key.conindid
+                        WHERE primary_key.conrelid = pg_catalog.to_regclass(
+                                'public.aircraft_source_visual_correction_artifacts'
+                              )
+                          AND primary_key.conname =
+                            'aircraft_source_visual_correction_artifacts_pkey'
+                          AND primary_key.contype = 'p'
+                          AND primary_key.convalidated
+                          AND NOT primary_key.condeferrable
+                          AND NOT primary_key.condeferred
+                          AND primary_key.conkey = ARRAY[(
+                            SELECT attribute.attnum
+                            FROM pg_catalog.pg_attribute attribute
+                            WHERE attribute.attrelid = primary_key.conrelid
+                              AND attribute.attname = 'plugin_submission_id'
+                          )]::smallint[]
+                          AND backing_index.indisprimary
+                          AND backing_index.indisunique
+                          AND backing_index.indisvalid
+                          AND backing_index.indisready
+                          AND backing_index.indnkeyatts = 1
+                          AND backing_index.indnatts = 1
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                        WHERE inheritance.inhrelid = pg_catalog.to_regclass(
+                          'public.aircraft_source_visual_correction_artifacts'
+                        )
+                           OR inheritance.inhparent = pg_catalog.to_regclass(
+                          'public.aircraft_source_visual_correction_artifacts'
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                if !table_is_exact {
+                    return Ok(false);
+                }
+                let rows =
+                    sqlx::query_as::<_, (String, i16, String, String, String, String, String)>(
+                        r#"
+                    SELECT trigger_row.tgname,
+                           trigger_row.tgtype::smallint,
+                           COALESCE((
+                             SELECT string_agg(attribute.attname, ',' ORDER BY attribute.attname)
+                             FROM unnest(trigger_row.tgattr) AS update_column(attnum)
+                             JOIN pg_catalog.pg_attribute attribute
+                               ON attribute.attrelid = trigger_row.tgrelid
+                              AND attribute.attnum = update_column.attnum
+                           ), ''),
+                           relation.relname,
+                           routine.proname,
+                           routine.prosrc,
+                           COALESCE(pg_catalog.array_to_string(routine.proconfig, E'\n'), '')
+                    FROM pg_catalog.pg_trigger trigger_row
+                    JOIN pg_catalog.pg_class relation ON relation.oid = trigger_row.tgrelid
+                    JOIN pg_catalog.pg_namespace relation_namespace
+                      ON relation_namespace.oid = relation.relnamespace
+                    JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
+                    JOIN pg_catalog.pg_namespace routine_namespace
+                      ON routine_namespace.oid = routine.pronamespace
+                    WHERE NOT trigger_row.tgisinternal
+                      AND relation_namespace.nspname = 'public'
+                      AND routine_namespace.nspname = 'public'
+                      AND (
+                        relation.relname = 'aircraft_source_visual_correction_artifacts'
+                        OR trigger_row.tgname = 'aircraft_source_identity_receipt_gate'
+                      )
+                    ORDER BY trigger_row.tgname
+                    "#,
+                    )
+                    .fetch_all(&mut **pool)
+                    .await?;
+                let expected = [
+                    (
+                        "aircraft_source_identity_receipt_gate",
+                        19_i16,
+                        "ingestion_error,ingestion_state,is_verified",
+                        "aircraft_sale_listings",
+                        "require_source_identity_correction_receipt",
+                        POSTGRES_SOURCE_IDENTITY_RECEIPT_GATE_FUNCTION_SOURCE,
+                    ),
+                    (
+                        "aircraft_source_visual_artifacts_immutable",
+                        27_i16,
+                        "",
+                        "aircraft_source_visual_correction_artifacts",
+                        "preserve_aircraft_source_visual_correction_artifact",
+                        POSTGRES_SOURCE_VISUAL_ARTIFACT_FUNCTION_SOURCE,
+                    ),
+                    (
+                        "aircraft_source_visual_artifacts_validate_insert",
+                        7_i16,
+                        "",
+                        "aircraft_source_visual_correction_artifacts",
+                        "validate_aircraft_source_visual_correction_artifact",
+                        POSTGRES_SOURCE_VISUAL_ARTIFACT_VALIDATION_FUNCTION_SOURCE,
+                    ),
+                ];
+                Ok(rows.len() == expected.len()
+                    && rows.iter().zip(expected).all(
+                        |(
+                            (name, kind, columns, relation, function, source, config),
+                            (
+                                expected_name,
+                                expected_kind,
+                                expected_columns,
+                                expected_relation,
+                                expected_function,
+                                expected_source,
+                            ),
+                        )| {
+                            name == expected_name
+                                && *kind == expected_kind
+                                && columns == expected_columns
+                                && relation == expected_relation
+                                && function == expected_function
+                                && canonical_sql_definition(source)
+                                    == canonical_sql_definition(expected_source)
+                                && config == "search_path=pg_catalog"
+                        },
+                    ))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -6473,8 +6966,7 @@ impl AppDb {
                         'aircraft_listing_identity_corrections_immutable_update',
                         'aircraft_listing_identity_corrections_immutable_delete',
                         'aircraft_identity_correction_observation_immutable_update',
-                        'aircraft_identity_correction_observation_immutable_delete',
-                        'aircraft_source_identity_receipt_gate'
+                        'aircraft_identity_correction_observation_immutable_delete'
                       )
                     ORDER BY name
                     "#,
@@ -6497,10 +6989,6 @@ impl AppDb {
                     (
                         "aircraft_listing_identity_corrections_immutable_update",
                         SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER,
-                    ),
-                    (
-                        "aircraft_source_identity_receipt_gate",
-                        SQLITE_SOURCE_IDENTITY_RECEIPT_GATE_TRIGGER,
                     ),
                 ];
                 Ok(definitions.len() == expected.len()
@@ -6594,10 +7082,6 @@ impl AppDb {
                             'aircraft_identity_correction_observation_immutable'
                           AND relation_namespace.nspname = 'public'
                           AND relation.relname = 'aircraft_identity_observations'
-                        ) OR (
-                          actual_trigger.tgname = 'aircraft_source_identity_receipt_gate'
-                          AND relation_namespace.nspname = 'public'
-                          AND relation.relname = 'aircraft_sale_listings'
                         )
                       )
                     ORDER BY actual_trigger.tgname
@@ -6621,14 +7105,6 @@ impl AppDb {
                         "aircraft_listing_identity_correction_decisions",
                         "preserve_aircraft_listing_identity_correction",
                         POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
-                    ),
-                    (
-                        "aircraft_source_identity_receipt_gate",
-                        19_i16,
-                        "ingestion_error,ingestion_state,is_verified",
-                        "aircraft_sale_listings",
-                        "require_source_identity_correction_receipt",
-                        POSTGRES_SOURCE_IDENTITY_RECEIPT_GATE_FUNCTION_SOURCE,
                     ),
                 ];
                 Ok(definitions.len() == expected.len()
@@ -8567,6 +9043,19 @@ fn aircraft_listing_identity_corrections_migration_required_message(kind: Databa
     )
 }
 
+fn aircraft_visual_source_corrections_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: signed visual aircraft corrections need an \
+         immutable pinned artifact and receipt gate; back up the database, apply \
+         `migrations/{AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION}.{backend}.sql`, then restart \
+         aircost"
+    )
+}
+
 fn faa_registry_contract_required_message(kind: DatabaseKind, problem: &str) -> String {
     match kind {
         DatabaseKind::Sqlite => format!(
@@ -8652,6 +9141,9 @@ mod tests {
         AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
         AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_FINGERPRINT,
         AIRCRAFT_TCDS_MAKE_LINEAGE_CONTRACT_VERSION, AIRCRAFT_TCDS_MAKE_LINEAGE_MIGRATION,
+        AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT,
+        AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_VERSION,
+        AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_FINGERPRINT,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_CONTRACT_VERSION,
         AVIONICS_AUTHORITATIVE_SOURCE_ORIGINS_MIGRATION, AVIONICS_CATALOG_CURATION_MIGRATION,
@@ -8759,6 +9251,10 @@ mod tests {
         include_str!("../migrations/20260819_aircraft_listing_identity_corrections.sqlite.sql");
     const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260819_aircraft_listing_identity_corrections.postgres.sql");
+    const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260821_aircraft_visual_source_corrections.sqlite.sql");
+    const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260821_aircraft_visual_source_corrections.postgres.sql");
     const LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260819_listing_replay_runs.sqlite.sql");
     const LISTING_REPLAY_RUNS_POSTGRES_MIGRATION_SQL: &str =
@@ -8862,8 +9358,8 @@ mod tests {
             .difference(&postgres_receipts)
             .next()
             .is_none());
-        assert_eq!(sqlite_receipts.len(), 20);
-        assert_eq!(postgres_receipts.len(), 21);
+        assert_eq!(sqlite_receipts.len(), 21);
+        assert_eq!(postgres_receipts.len(), 22);
         assert!(!sqlite_receipts.contains("20260802_default_avionics_candidate_quarantine"));
     }
 
@@ -9226,7 +9722,7 @@ mod tests {
         .await
         .unwrap();
         let expected = sqlite_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 21);
+        assert_eq!(expected.len(), 22);
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -9323,7 +9819,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 20);
+        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 21);
         inspection.close().await;
         std::fs::remove_file(database_path).unwrap();
 
@@ -10386,6 +10882,34 @@ mod tests {
         std::fs::remove_file(database_path).unwrap();
     }
 
+    async fn assert_corrupt_visual_source_correction_schema_rejected(
+        label: &str,
+        statements: &[&str],
+    ) {
+        let (database_path, database_url) = unique_sqlite_test_database(label);
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let mut connection = pool.acquire().await.unwrap();
+        for statement in statements {
+            connection.execute(*statement).await.unwrap();
+        }
+        drop(connection);
+        drop(db);
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("startup must reject corrupt visual source correction schema"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("immutable pinned artifact and receipt gate"),
+            "{error}"
+        );
+        assert!(error.contains("20260821_aircraft_visual_source_corrections.sqlite.sql"));
+        std::fs::remove_file(database_path).unwrap();
+    }
+
     async fn assert_corrupt_reference_cutover_schema_rejected(label: &str, statements: &[&str]) {
         let (database_path, database_url) = unique_sqlite_test_database(label);
         let db = AppDb::connect(&database_url).await.unwrap();
@@ -10661,6 +11185,189 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn visual_source_correction_migrations_and_fresh_schemas_share_the_exact_contract() {
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL,
+            AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION));
+            assert!(definition.contains(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT));
+            assert!(definition.contains("aircraft_source_visual_correction_artifacts"));
+            assert!(definition.contains("aircraft_source_visual_artifacts_validate_insert"));
+            assert!(definition.contains("correction_kind IN ('faa_serial', 'visual_identifier')"));
+        }
+        for definition in [
+            POSTGRES_SCHEMA_SQL,
+            AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_POSTGRES_MIGRATION_SQL,
+        ] {
+            for constraint in [
+                "aircraft_source_visual_correction_artifacts_pkey",
+                "visual_source_artifact_submission_fk",
+                "visual_source_artifact_snapshot_fk",
+                "visual_source_artifact_observed_coverage_fk",
+                "visual_source_artifact_corrected_aircraft_fk",
+                "visual_source_artifact_record_aircraft_fk",
+                "visual_source_artifact_rendered_sha256_check",
+                "visual_source_artifact_archive_sha256_check",
+                "visual_source_artifact_record_sha256_check",
+                "visual_source_artifact_photo_sha256_check",
+                "visual_source_artifact_resolution_sha256_check",
+                "visual_source_artifact_resolution_json_check",
+            ] {
+                assert!(definition.contains(constraint), "missing {constraint}");
+            }
+            assert!(definition.contains("length(visual_resolution_json) BETWEEN 2 AND 65536"));
+            assert!(definition.contains("'^[0-9a-f]{64}$'"));
+        }
+        assert_eq!(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_VERSION, 1);
+        assert!(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL
+            .starts_with("PRAGMA foreign_keys = ON;\nBEGIN IMMEDIATE;"));
+        assert!(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL.ends_with("COMMIT;\n"));
+        assert!(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_POSTGRES_MIGRATION_SQL.starts_with("BEGIN;\n"));
+        assert!(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_POSTGRES_MIGRATION_SQL.ends_with("COMMIT;\n"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_visual_source_correction_migration_upgrades_and_reruns_atomically() {
+        let (database_path, database_url) =
+            unique_sqlite_test_database("visual-source-correction-migration");
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(
+            "DROP TRIGGER aircraft_source_visual_artifacts_validate_insert; \
+             DROP TRIGGER aircraft_source_visual_artifacts_immutable_update; \
+             DROP TRIGGER aircraft_source_visual_artifacts_immutable_delete; \
+             DROP TABLE aircraft_source_visual_correction_artifacts; \
+             DELETE FROM schema_migration_contracts \
+             WHERE migration_name = '20260821_aircraft_visual_source_corrections';",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .unwrap();
+        let installed_at: String = sqlx::query_scalar(
+            "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .unwrap();
+        let installed_at_after: String = sqlx::query_scalar(
+            "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(installed_at_after, installed_at);
+        drop(db);
+        AppDb::connect(&database_url)
+            .await
+            .expect("the upgraded exact contract must pass startup")
+            .close()
+            .await;
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_visual_source_correction_contract_tampering() {
+        assert_corrupt_visual_source_correction_schema_rejected(
+            "visual-source-correction-noop-validation",
+            &[
+                "DROP TRIGGER aircraft_source_visual_artifacts_validate_insert",
+                "CREATE TRIGGER aircraft_source_visual_artifacts_validate_insert BEFORE INSERT ON aircraft_source_visual_correction_artifacts BEGIN SELECT 1; END",
+            ],
+        )
+        .await;
+        assert_corrupt_visual_source_correction_schema_rejected(
+            "visual-source-correction-noop-receipt-gate",
+            &[
+                "DROP TRIGGER aircraft_source_identity_receipt_gate",
+                "CREATE TRIGGER aircraft_source_identity_receipt_gate BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified ON aircraft_sale_listings BEGIN SELECT 1; END",
+            ],
+        )
+        .await;
+        assert_corrupt_visual_source_correction_schema_rejected(
+            "visual-source-correction-weakened-receipt-gate",
+            &[
+                "DROP TRIGGER aircraft_source_identity_receipt_gate",
+                "CREATE TRIGGER aircraft_source_identity_receipt_gate BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified ON aircraft_sale_listings WHEN OLD.ingestion_error = 'source_identity_correction_receipt_pending' AND (NEW.ingestion_error IS NOT OLD.ingestion_error OR NEW.ingestion_state IS NOT OLD.ingestion_state OR NEW.is_verified IS NOT OLD.is_verified) AND 1 = 0 AND NOT EXISTS (SELECT 1 FROM aircraft_listing_identity_correction_decisions decision JOIN plugin_submissions submission ON submission.id = decision.plugin_submission_id WHERE decision.aircraft_sale_listing_id = OLD.id AND decision.correction_kind IN ('faa_serial', 'visual_identifier') AND decision.rendered_html_sha256 = submission.rendered_html_sha256 AND submission.user_id = OLD.created_by_user_id AND submission.canonical_listing_id = OLD.id AND submission.extraction_error IS NULL AND NEW.registration_number IS decision.corrected_registration_number AND NEW.serial_number IS decision.corrected_serial_number) BEGIN SELECT RAISE(ABORT, 'source identity correction receipt is required before leaving the receipt gate'); END",
+            ],
+        )
+        .await;
+        assert_corrupt_visual_source_correction_schema_rejected(
+            "visual-source-correction-weakened-table",
+            &[
+                "DROP TRIGGER aircraft_source_visual_artifacts_validate_insert",
+                "DROP TRIGGER aircraft_source_visual_artifacts_immutable_update",
+                "DROP TRIGGER aircraft_source_visual_artifacts_immutable_delete",
+                "DROP TABLE aircraft_source_visual_correction_artifacts",
+                "CREATE TABLE aircraft_source_visual_correction_artifacts (plugin_submission_id INTEGER PRIMARY KEY)",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_startup_rejects_visual_artifact_constraint_tampering() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let initialized = reset_isolated_postgres(&database_url).await;
+        initialized.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM public.schema_migration_contracts \
+             WHERE migration_name = $1 AND contract_fingerprint = $2",
+        )
+        .bind(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_MIGRATION)
+        .bind(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let trigger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_catalog.pg_trigger trigger_row \
+             WHERE trigger_row.tgrelid = pg_catalog.to_regclass(\
+               'public.aircraft_source_visual_correction_artifacts'\
+             ) AND NOT trigger_row.tgisinternal",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 1);
+        assert_eq!(trigger_count, 2);
+        pool.execute(
+            "ALTER TABLE public.aircraft_source_visual_correction_artifacts \
+             DROP CONSTRAINT visual_source_artifact_resolution_json_check",
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let error = match AppDb::connect(&database_url).await {
+            Ok(_) => panic!("tampered PostgreSQL artifact table must fail startup"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("20260821_aircraft_visual_source_corrections.postgres.sql"));
+        assert!(error.contains("signed visual aircraft corrections"));
+    }
+
     #[tokio::test]
     async fn correction_preflight_does_not_treat_a_partial_anchor_set_as_fresh() {
         let db = sqlite_db_with_statements(&[
@@ -10707,13 +11414,6 @@ mod tests {
                     "CREATE TRIGGER aircraft_identity_correction_observation_immutable_delete BEFORE DELETE ON aircraft_identity_observations BEGIN SELECT 1; END",
                 ],
             ),
-            (
-                "aircraft-correction-noop-receipt-gate",
-                [
-                    "DROP TRIGGER aircraft_source_identity_receipt_gate",
-                    "CREATE TRIGGER aircraft_source_identity_receipt_gate BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified ON aircraft_sale_listings BEGIN SELECT 1; END",
-                ],
-            ),
         ] {
             assert_corrupt_identity_correction_schema_rejected(label, &statements).await;
         }
@@ -10734,13 +11434,6 @@ mod tests {
                 [
                     "DROP TRIGGER aircraft_identity_correction_observation_immutable_update",
                     "CREATE TRIGGER aircraft_identity_correction_observation_immutable_update BEFORE UPDATE ON aircraft_identity_observations WHEN NOT EXISTS (SELECT 1 FROM aircraft_listing_identity_correction_decisions decision WHERE decision.observation_id = OLD.id) BEGIN SELECT RAISE(ABORT, 'aircraft identity observations referenced by correction decisions are immutable'); END",
-                ],
-            ),
-            (
-                "aircraft-correction-receipt-extra-bypass",
-                [
-                    "DROP TRIGGER aircraft_source_identity_receipt_gate",
-                    "CREATE TRIGGER aircraft_source_identity_receipt_gate BEFORE UPDATE OF ingestion_state, ingestion_error, is_verified ON aircraft_sale_listings WHEN OLD.ingestion_error = 'source_identity_correction_receipt_pending' AND (NEW.ingestion_error IS NOT OLD.ingestion_error OR NEW.ingestion_state IS NOT OLD.ingestion_state OR NEW.is_verified IS NOT OLD.is_verified) AND 1 = 0 AND NOT EXISTS (SELECT 1 FROM aircraft_listing_identity_correction_decisions decision JOIN plugin_submissions submission ON submission.id = decision.plugin_submission_id WHERE decision.aircraft_sale_listing_id = OLD.id AND decision.correction_kind = 'faa_serial' AND decision.rendered_html_sha256 = submission.rendered_html_sha256 AND submission.user_id = OLD.created_by_user_id AND submission.canonical_listing_id = OLD.id AND submission.extraction_error IS NULL AND NEW.registration_number IS decision.corrected_registration_number AND NEW.serial_number IS decision.corrected_serial_number) BEGIN SELECT RAISE(ABORT, 'source identity correction receipt is required before leaving the receipt gate'); END",
                 ],
             ),
             (
@@ -12487,7 +13180,7 @@ mod tests {
         .await
         .unwrap();
         let expected = postgres_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 21);
+        assert_eq!(expected.len(), 23);
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -12772,7 +13465,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 21);
+        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 22);
         inspection.close().await;
     }
 
@@ -13774,6 +14467,14 @@ mod tests {
             let mut connection = pool.acquire().await.unwrap();
             for statement in
                 split_sql_statements(AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL)
+            {
+                connection.execute(statement).await.unwrap();
+            }
+        }
+        {
+            let mut connection = pool.acquire().await.unwrap();
+            for statement in
+                split_sql_statements(AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_SQLITE_MIGRATION_SQL)
             {
                 connection.execute(statement).await.unwrap();
             }

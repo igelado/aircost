@@ -11,8 +11,11 @@ use sqlx::FromRow;
 
 use crate::aircraft::faa::{
     admit_aircraft_source_identity, AircraftAdmissionError, BlockReason, FaaSerialCorrection,
+    SourceAircraftAdmission,
 };
-use crate::aircraft::repair::record_bound_source_serial_correction;
+use crate::aircraft::repair::{
+    record_bound_source_serial_correction, record_bound_source_visual_correction,
+};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{parse_listing_html, validate_source_url, GeminiListingExtractor};
 use crate::html::clean::clean_listing_html;
@@ -26,8 +29,9 @@ use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{
     create_listing_with_progress_and_occurrence_dispositions,
     finalize_signed_source_listing_after_receipt, get_listing, resume_bound_replay_listing,
-    resume_signed_source_correction_listing, ListingCreationMode, ListingStoreError,
-    SignedSourceListingBinding, SOURCE_IDENTITY_RECEIPT_PENDING,
+    resume_signed_source_correction_listing, resume_signed_source_visual_correction_listing,
+    ListingCreationMode, ListingStoreError, SignedSourceListingBinding,
+    SourceVisualRegistrationCorrection, SOURCE_IDENTITY_RECEIPT_PENDING,
 };
 use crate::models::{
     ListingPreview, ParsedListing, PluginInstall, PluginSubmission, PluginSubmissionRequest,
@@ -450,7 +454,7 @@ pub async fn submit_plugin_html_with_progress(
             .await;
         }
         if listing.ingestion_state != "ready"
-            && bound_source_serial_receipt_exists(db, user.id, existing.id, listing_id).await?
+            && bound_source_correction_receipt_exists(db, user.id, existing.id, listing_id).await?
         {
             listing =
                 finalize_signed_source_listing_after_receipt(db, user.id, listing_id, existing.id)
@@ -470,6 +474,7 @@ pub async fn submit_plugin_html_with_progress(
     let mut canonical_listing_id = None;
     let mut occurrence_dispositions: Vec<AutomaticOccurrenceDisposition> = Vec::new();
     let mut source_serial_correction = None;
+    let mut source_visual_correction = None;
     let mut prepared_submission: Option<PluginSubmission> = None;
     let mut durable_corrected_capture = false;
     let mut durable_materialization_error = None;
@@ -495,51 +500,47 @@ pub async fn submit_plugin_html_with_progress(
                     parsed_preview.parsed_listing.serial_number.as_deref(),
                     parsed_preview.context_text.as_deref(),
                 )
-                .await
-                .ok();
-                let binding = if source_admission
-                    .as_ref()
-                    .and_then(|admission| admission.serial_correction.as_ref())
-                    .is_some()
-                {
-                    let submission = insert_plugin_submission(
-                        db,
-                        user.id,
-                        request.plugin_install_id,
-                        &request.source_url,
-                        &request.rendered_html,
-                        &rendered_html_sha256,
-                        &request.signature,
-                        extracted_listing_json.as_ref(),
-                        None,
-                        None,
-                    )
-                    .await?;
-                    let bound_extracted_listing_json = extracted_listing_json
-                        .as_ref()
-                        .expect("the extracted checkpoint was assigned before admission")
-                        .to_string();
-                    let binding = signed_source_listing_binding(
-                        submission.id,
-                        submission.user_id,
-                        submission.plugin_install_id,
-                        &install.public_key_base64,
-                        install.revoked_at.as_deref(),
-                        &submission.source_url,
-                        &submission.submitted_at,
-                        &request.rendered_html,
-                        &submission.rendered_html_sha256,
-                        &submission.signature_base64,
-                        Some(bound_extracted_listing_json.clone()),
-                        None,
-                        bound_extracted_listing_json,
-                    );
-                    prepared_submission = Some(submission);
-                    durable_corrected_capture = true;
-                    Some(binding)
-                } else {
-                    None
-                };
+                .await;
+                let binding =
+                    if source_admission_requires_durable_correction_capture(&source_admission) {
+                        let submission = insert_plugin_submission(
+                            db,
+                            user.id,
+                            request.plugin_install_id,
+                            &request.source_url,
+                            &request.rendered_html,
+                            &rendered_html_sha256,
+                            &request.signature,
+                            extracted_listing_json.as_ref(),
+                            None,
+                            None,
+                        )
+                        .await?;
+                        let bound_extracted_listing_json = extracted_listing_json
+                            .as_ref()
+                            .expect("the extracted checkpoint was assigned before admission")
+                            .to_string();
+                        let binding = signed_source_listing_binding(
+                            submission.id,
+                            submission.user_id,
+                            submission.plugin_install_id,
+                            &install.public_key_base64,
+                            install.revoked_at.as_deref(),
+                            &submission.source_url,
+                            &submission.submitted_at,
+                            &request.rendered_html,
+                            &submission.rendered_html_sha256,
+                            &submission.signature_base64,
+                            Some(bound_extracted_listing_json.clone()),
+                            None,
+                            bound_extracted_listing_json,
+                        );
+                        prepared_submission = Some(submission);
+                        durable_corrected_capture = true;
+                        Some(binding)
+                    } else {
+                        None
+                    };
                 match create_listing_with_progress_and_occurrence_dispositions(
                     db,
                     user.id,
@@ -556,6 +557,7 @@ pub async fn submit_plugin_html_with_progress(
                         canonical_listing_id = Some(created.listing.id);
                         occurrence_dispositions = created.occurrence_dispositions;
                         source_serial_correction = created.source_serial_correction;
+                        source_visual_correction = created.source_visual_correction;
                         listing = Some(created.listing);
                     }
                     Err(ListingStoreError::Ingestion {
@@ -593,6 +595,7 @@ pub async fn submit_plugin_html_with_progress(
                                 canonical_listing_id = Some(listing_id);
                                 source_serial_correction = source_admission
                                     .as_ref()
+                                    .ok()
                                     .and_then(|admission| admission.serial_correction.clone());
                                 durable_materialization_error = Some(error.to_string());
                             } else {
@@ -675,11 +678,19 @@ pub async fn submit_plugin_html_with_progress(
             source_serial_correction.as_ref(),
         )
         .await?;
+        record_source_visual_correction_if_present(
+            db,
+            user.id,
+            canonical_listing_id,
+            &submission,
+            source_visual_correction.as_ref(),
+        )
+        .await?;
         Ok::<PluginSubmission, PluginStoreError>(submission)
     }
     .await;
     let submission = materialized?;
-    if source_serial_correction.is_some() {
+    if source_serial_correction.is_some() || source_visual_correction.is_some() {
         let listing_id = canonical_listing_id.ok_or_else(|| {
             PluginStoreError::Database(
                 "corrected source listing lost its canonical identifier after receipt".to_string(),
@@ -772,6 +783,7 @@ pub async fn reprocess_plugin_submission(
     let mut canonical_listing_id = stored.canonical_listing_id;
     let mut occurrence_dispositions: Vec<AutomaticOccurrenceDisposition> = Vec::new();
     let mut source_serial_correction = None;
+    let mut source_visual_correction = None;
     let mut durable_materialization_error = None;
 
     if let Some(extractor) = extractor {
@@ -783,15 +795,17 @@ pub async fn reprocess_plugin_submission(
         .await
         {
             Ok((parsed_preview, checkpoint_payload)) => {
-                let preflight_source_correction = admit_aircraft_source_identity(
+                let preflight_source_admission = admit_aircraft_source_identity(
                     db,
                     parsed_preview.parsed_listing.registration_number.as_deref(),
                     parsed_preview.parsed_listing.serial_number.as_deref(),
                     parsed_preview.context_text.as_deref(),
                 )
-                .await
-                .ok()
-                .and_then(|admission| admission.serial_correction);
+                .await;
+                let preflight_source_correction = preflight_source_admission
+                    .as_ref()
+                    .ok()
+                    .and_then(|admission| admission.serial_correction.as_ref());
                 if let (Some(existing_listing_id), Some(correction)) = (
                     stored.canonical_listing_id,
                     preflight_source_correction.as_ref(),
@@ -836,7 +850,10 @@ pub async fn reprocess_plugin_submission(
                 }
                 let checkpoint_payload_json = checkpoint_payload.to_string();
                 extracted_listing_json = Some(checkpoint_payload);
-                let signed_source_binding = preflight_source_correction.as_ref().and_then(|_| {
+                let signed_source_binding = source_admission_requires_durable_correction_capture(
+                    &preflight_source_admission,
+                )
+                .then(|| {
                     stored.canonical_listing_id.is_none().then(|| {
                         signed_source_listing_binding(
                             stored.id,
@@ -854,7 +871,8 @@ pub async fn reprocess_plugin_submission(
                             checkpoint_payload_json.clone(),
                         )
                     })
-                });
+                })
+                .flatten();
                 match create_listing_with_progress_and_occurrence_dispositions(
                     db,
                     user.id,
@@ -871,6 +889,7 @@ pub async fn reprocess_plugin_submission(
                         canonical_listing_id = Some(created.listing.id);
                         occurrence_dispositions = created.occurrence_dispositions;
                         source_serial_correction = created.source_serial_correction;
+                        source_visual_correction = created.source_visual_correction;
                         listing = Some(created.listing);
                     }
                     Err(ListingStoreError::Ingestion {
@@ -887,8 +906,9 @@ pub async fn reprocess_plugin_submission(
                         .await
                         .ok()
                         .and_then(|admission| admission.serial_correction);
-                        if preflight_source_correction.is_none()
-                            || stored.canonical_listing_id.is_some()
+                        if !source_admission_requires_durable_correction_capture(
+                            &preflight_source_admission,
+                        ) || stored.canonical_listing_id.is_some()
                         {
                             extraction_error =
                                 Some(format!("listing {listing_id} was quarantined: {message}"));
@@ -902,7 +922,7 @@ pub async fn reprocess_plugin_submission(
                                 plugin_submission_for_user(db, user.id, stored.id).await?;
                             if let Some(listing_id) = retained.canonical_listing_id {
                                 canonical_listing_id = Some(listing_id);
-                                source_serial_correction = preflight_source_correction.clone();
+                                source_serial_correction = preflight_source_correction.cloned();
                                 durable_materialization_error = Some(error.to_string());
                             } else {
                                 extraction_error = Some(error.to_string());
@@ -960,11 +980,19 @@ pub async fn reprocess_plugin_submission(
             source_serial_correction.as_ref(),
         )
         .await?;
+        record_source_visual_correction_if_present(
+            db,
+            user.id,
+            canonical_listing_id,
+            &submission,
+            source_visual_correction.as_ref(),
+        )
+        .await?;
         Ok::<PluginSubmission, PluginStoreError>(submission)
     }
     .await;
     let submission = materialized?;
-    if source_serial_correction.is_some() {
+    if source_serial_correction.is_some() || source_visual_correction.is_some() {
         let listing_id = canonical_listing_id.ok_or_else(|| {
             PluginStoreError::Database(
                 "corrected reprocessed listing lost its canonical identifier after receipt"
@@ -1032,6 +1060,46 @@ async fn record_source_serial_correction_if_present(
         .map_err(|error| {
             PluginStoreError::Database(format!(
                 "FAA source serial correction could not be recorded: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+fn source_admission_requires_durable_correction_capture(
+    admission: &Result<SourceAircraftAdmission, AircraftAdmissionError>,
+) -> bool {
+    matches!(
+        admission,
+        Ok(SourceAircraftAdmission {
+            serial_correction: Some(_),
+            ..
+        }) | Err(AircraftAdmissionError::Rejected {
+            reason: BlockReason::RegistrationNotFound,
+            ..
+        })
+    )
+}
+
+async fn record_source_visual_correction_if_present(
+    db: &AppDb,
+    owner_user_id: i64,
+    listing_id: Option<i64>,
+    submission: &PluginSubmission,
+    correction: Option<&SourceVisualRegistrationCorrection>,
+) -> StoreResult<()> {
+    let Some(correction) = correction else {
+        return Ok(());
+    };
+    let listing_id = listing_id.ok_or_else(|| {
+        PluginStoreError::Database(
+            "visual source registration correction lost its materialized listing".to_string(),
+        )
+    })?;
+    record_bound_source_visual_correction(db, owner_user_id, listing_id, submission.id, correction)
+        .await
+        .map_err(|error| {
+            PluginStoreError::Database(format!(
+                "visual source registration correction could not be recorded: {error}"
             ))
         })?;
     Ok(())
@@ -1106,7 +1174,7 @@ async fn plugin_submission_for_user(
     plugin_submission_from_row(row)
 }
 
-async fn bound_source_serial_receipt_exists(
+async fn bound_source_correction_receipt_exists(
     db: &AppDb,
     owner_user_id: i64,
     submission_id: i64,
@@ -1122,7 +1190,7 @@ async fn bound_source_serial_receipt_exists(
           ON submission.id = decision.plugin_submission_id
         JOIN aircraft_sale_listings listing
           ON listing.id = decision.aircraft_sale_listing_id
-        WHERE decision.correction_kind = 'faa_serial'
+        WHERE decision.correction_kind IN ('faa_serial', 'visual_identifier')
           AND decision.plugin_submission_id = ?
           AND decision.aircraft_sale_listing_id = ?
           AND decision.rendered_html_sha256 = submission.rendered_html_sha256
@@ -1130,8 +1198,14 @@ async fn bound_source_serial_receipt_exists(
           AND submission.canonical_listing_id = listing.id
           AND submission.extraction_error IS NULL
           AND listing.created_by_user_id = ?
-          AND listing.registration_number = decision.corrected_registration_number
-          AND listing.serial_number = decision.corrected_serial_number
+          AND (
+            listing.registration_number = decision.corrected_registration_number
+            OR (listing.registration_number IS NULL AND decision.corrected_registration_number IS NULL)
+          )
+          AND (
+            listing.serial_number = decision.corrected_serial_number
+            OR (listing.serial_number IS NULL AND decision.corrected_serial_number IS NULL)
+          )
         "#,
         submission_id,
         listing_id,
@@ -1177,32 +1251,81 @@ async fn recover_bound_source_correction(
         context_text: Some(clean_listing_html(rendered_html)),
     };
     let existing_dispositions = automatic_occurrence_disposition_count(db, submission.id).await?;
-    let source_serial_correction = if existing_dispositions == 0 {
-        let resumed =
-            resume_signed_source_correction_listing(db, user.id, listing_id, &preview, extractor)
+    let source_admission = admit_aircraft_source_identity(
+        db,
+        preview.parsed_listing.registration_number.as_deref(),
+        preview.parsed_listing.serial_number.as_deref(),
+        preview.context_text.as_deref(),
+    )
+    .await;
+    let (source_serial_correction, source_visual_correction) = match source_admission {
+        Ok(admission) => {
+            let correction = admission.serial_correction.ok_or_else(|| {
+                PluginStoreError::Validation(
+                    "receipt-gated signed capture no longer requires its FAA serial correction"
+                        .to_string(),
+                )
+            })?;
+            if existing_dispositions == 0 {
+                let resumed = resume_signed_source_correction_listing(
+                    db, user.id, listing_id, &preview, extractor,
+                )
                 .await?;
-        attach_submission_to_pending_review_if_needed(db, user, Some(&resumed.listing), submission)
+                attach_submission_to_pending_review_if_needed(
+                    db,
+                    user,
+                    Some(&resumed.listing),
+                    submission,
+                )
+                .await?;
+                record_automatic_occurrence_dispositions(
+                    db,
+                    listing_id,
+                    submission.id,
+                    user.id,
+                    &resumed.occurrence_dispositions,
+                )
+                .await
+                .map_err(PluginStoreError::Database)?;
+            }
+            (Some(correction), None)
+        }
+        Err(AircraftAdmissionError::Rejected {
+            reason: BlockReason::RegistrationNotFound,
+            ..
+        }) => {
+            let resumed = resume_signed_source_visual_correction_listing(
+                db,
+                user.id,
+                listing_id,
+                submission.id,
+                &preview,
+                extractor,
+                rendered_html,
+                existing_dispositions == 0,
+            )
             .await?;
-        record_automatic_occurrence_dispositions(
-            db,
-            listing_id,
-            submission.id,
-            user.id,
-            &resumed.occurrence_dispositions,
-        )
-        .await
-        .map_err(PluginStoreError::Database)?;
-        resumed.source_serial_correction
-    } else {
-        admit_aircraft_source_identity(
-            db,
-            preview.parsed_listing.registration_number.as_deref(),
-            preview.parsed_listing.serial_number.as_deref(),
-            preview.context_text.as_deref(),
-        )
-        .await
-        .map_err(|error| PluginStoreError::Validation(error.to_string()))?
-        .serial_correction
+            if existing_dispositions == 0 {
+                attach_submission_to_pending_review_if_needed(
+                    db,
+                    user,
+                    Some(&resumed.listing),
+                    submission,
+                )
+                .await?;
+                record_automatic_occurrence_dispositions(
+                    db,
+                    listing_id,
+                    submission.id,
+                    user.id,
+                    &resumed.occurrence_dispositions,
+                )
+                .await
+                .map_err(PluginStoreError::Database)?;
+            }
+            (None, resumed.source_visual_correction)
+        }
+        Err(error) => return Err(PluginStoreError::Validation(error.to_string())),
     };
     record_source_serial_correction_if_present(
         db,
@@ -1210,6 +1333,14 @@ async fn recover_bound_source_correction(
         Some(listing_id),
         submission,
         source_serial_correction.as_ref(),
+    )
+    .await?;
+    record_source_visual_correction_if_present(
+        db,
+        user.id,
+        Some(listing_id),
+        submission,
+        source_visual_correction.as_ref(),
     )
     .await?;
     let listing =
@@ -1964,14 +2095,14 @@ async fn complete_bound_replay_materialization(
     let submission = plugin_submission_for_user(db, user.id, stored.id).await?;
     let current = get_listing(db, user.id, listing_id).await?;
     let listing = if current.ingestion_error.as_deref() == Some(SOURCE_IDENTITY_RECEIPT_PENDING) {
-        recover_bound_source_correction(
+        Box::pin(recover_bound_source_correction(
             db,
             user,
             &submission,
             listing_id,
             Some(extractor),
             &stored.rendered_html,
-        )
+        ))
         .await?
         .listing
         .ok_or_else(|| {
@@ -2088,7 +2219,7 @@ pub async fn materialize_plugin_submission_checkpoint(
         stored.extraction_error.clone(),
         extracted_listing_json.to_string(),
     );
-    let creation = create_listing_with_progress_and_occurrence_dispositions(
+    let creation = Box::pin(create_listing_with_progress_and_occurrence_dispositions(
         db,
         user.id,
         &preview,
@@ -2097,7 +2228,7 @@ pub async fn materialize_plugin_submission_checkpoint(
         None,
         ListingCreationMode::CreateOnly,
         Some(&signed_source_binding),
-    )
+    ))
     .await;
     if let Err(error) = &creation {
         let retained = load_checkpoint_capture(db, user.id, stored.id).await?;
@@ -2139,6 +2270,7 @@ pub async fn materialize_plugin_submission_checkpoint(
     };
     let listing_id = created.listing.id;
     let source_serial_correction = created.source_serial_correction.clone();
+    let source_visual_correction = created.source_visual_correction.clone();
     let materialized = async {
         let bound_submission = PluginSubmission {
             id: stored.id,
@@ -2178,11 +2310,19 @@ pub async fn materialize_plugin_submission_checkpoint(
             source_serial_correction.as_ref(),
         )
         .await?;
+        record_source_visual_correction_if_present(
+            db,
+            user.id,
+            Some(listing_id),
+            &bound_submission,
+            source_visual_correction.as_ref(),
+        )
+        .await?;
         Ok::<(), PluginStoreError>(())
     }
     .await;
     materialized?;
-    let listing = if source_serial_correction.is_some() {
+    let listing = if source_serial_correction.is_some() || source_visual_correction.is_some() {
         finalize_signed_source_listing_after_receipt(db, user.id, listing_id, stored.id).await?
     } else {
         get_listing(db, user.id, listing_id).await?

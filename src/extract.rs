@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::env;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +34,7 @@ use crate::gemini::usage::{
     SourceCorrelation, Start as UsageStart, Store as UsageStore, ToolUseBilling,
 };
 use crate::html::clean::clean_listing_html;
-use crate::html::listing::download::download_identity_images;
+use crate::html::listing::download::{download_identity_image, download_identity_images};
 use crate::html::listing::media::{discover as discover_listing_media, MediaDiscoveryError};
 use crate::models::{
     ListingPreview, ListingValuationFact, ParsedAvionics, ParsedInstalledComponent, ParsedListing,
@@ -287,6 +289,8 @@ pub struct GeminiListingExtractor {
     usage_listing_id: Option<i64>,
     usage_source: Option<SourceCorrelation>,
     browser: Arc<OnceCell<eoka::Browser>>,
+    #[cfg(test)]
+    primary_visual_recovery_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -697,7 +701,13 @@ impl GeminiListingExtractor {
             usage_listing_id: None,
             usage_source: None,
             browser: Arc::new(OnceCell::new()),
+            primary_visual_recovery_calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_visual_recovery_call_count(&self) -> usize {
+        self.primary_visual_recovery_calls.load(Ordering::SeqCst)
     }
 
     pub fn from_environment() -> Result<Self> {
@@ -741,6 +751,8 @@ impl GeminiListingExtractor {
             usage_listing_id: None,
             usage_source: None,
             browser: Arc::new(OnceCell::new()),
+            #[cfg(test)]
+            primary_visual_recovery_calls: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -803,6 +815,23 @@ impl GeminiListingExtractor {
         }
         if let Some(source) = self.usage_source.as_ref() {
             accounting = accounting.with_source(&source.kind, &source.id);
+        }
+        accounting
+    }
+
+    fn source_visual_accounting_context(
+        &self,
+        submission_id: i64,
+        rendered_html_sha256: &str,
+    ) -> InteractionAccountingContext {
+        let mut accounting = self.interaction_accounting_context(
+            GeminiTask::AircraftVisualIdentity,
+            "faa_unmatched_registration_visual_recovery",
+        );
+        if accounting.correlation_id.is_none() {
+            accounting.correlation_id = Some(format!(
+                "plugin-submission:{submission_id}:capture:{rendered_html_sha256}"
+            ));
         }
         accounting
     }
@@ -872,6 +901,54 @@ impl GeminiListingExtractor {
         )
         .await?;
         Ok(Some((resolution, downloads.failures.len())))
+    }
+
+    /// Transcribe at most one primary retained listing photo for an FAA
+    /// registration correction. The caller remains responsible for requiring
+    /// an exact, different current FAA assignment before using the candidate.
+    pub(crate) async fn recover_visible_aircraft_identity_from_primary_photo(
+        &self,
+        source_url: &str,
+        retained_html: &str,
+        submission_id: i64,
+        rendered_html_sha256: &str,
+    ) -> Result<Option<(VisualIdentifierResolution, String)>> {
+        #[cfg(test)]
+        self.primary_visual_recovery_calls
+            .fetch_add(1, Ordering::SeqCst);
+        let Some(client) = self.interactions_client.as_ref() else {
+            return Ok(None);
+        };
+        let discovery = match discover_listing_media(source_url, retained_html) {
+            Ok(discovery) => discovery,
+            Err(
+                MediaDiscoveryError::UnsupportedSourceHost
+                | MediaDiscoveryError::UnsupportedSourcePath,
+            ) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(primary) = discovery.aircraft_photos.first() else {
+            return Ok(None);
+        };
+        let image = download_identity_image(&discovery, &primary.asset_id)
+            .await
+            .context("could not download primary listing identity image")?;
+        let media_url = image.reference.media_url.clone();
+        let photo = ListingPhotoInput::new(
+            format!("asset-{}", image.reference.asset_id),
+            image.mime_type,
+            image.bytes,
+        );
+        let visual_config = VisualIdentifierConfig::from_runtime_config(&self.runtime_config)?;
+        let accounting = self.source_visual_accounting_context(submission_id, rendered_html_sha256);
+        let resolution = resolve_visible_aircraft_identifiers_with_accounting(
+            client,
+            &[photo],
+            &visual_config,
+            accounting,
+        )
+        .await?;
+        Ok(Some((resolution, media_url)))
     }
 
     pub async fn extract(&self, listing_text: &str) -> Result<Value> {
@@ -3851,10 +3928,31 @@ mod tests {
         AvionicsCatalogCandidate, AvionicsCatalogCollisionReviewContext, AvionicsMetadataContext,
         AvionicsProposedIdentity, AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext,
         AvionicsUnitResolutionCorrectionContext, DirectSourceProductIdentityRequirement,
-        AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT, AVIONICS_CANDIDATE_TRIAGE_LIMIT,
-        AVIONICS_DIRECT_SOURCE_RELEVANCE_HINT_LIMIT, AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES,
-        AVIONICS_REJECTION_BASIS_VALUES, CURATED_AVIONICS_TYPES,
+        GeminiListingExtractor, AVIONICS_APPROVED_CANDIDATE_ADJUDICATION_LIMIT,
+        AVIONICS_CANDIDATE_TRIAGE_LIMIT, AVIONICS_DIRECT_SOURCE_RELEVANCE_HINT_LIMIT,
+        AVIONICS_MANUFACTURER_IDENTIFIER_SCOPES, AVIONICS_REJECTION_BASIS_VALUES,
+        CURATED_AVIONICS_TYPES,
     };
+
+    #[test]
+    fn source_visual_accounting_uses_signed_capture_and_preserves_replay_phase() {
+        let global = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let context = global.source_visual_accounting_context(41, "abc123");
+        assert_eq!(
+            context.correlation_id.as_deref(),
+            Some("plugin-submission:41:capture:abc123")
+        );
+        assert!(context.source.is_none());
+
+        let replay = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9")
+            .with_usage_scope("replay-run:7:phase:materialization", Some(23), None);
+        let context = replay.source_visual_accounting_context(41, "abc123");
+        assert_eq!(
+            context.correlation_id.as_deref(),
+            Some("replay-run:7:phase:materialization")
+        );
+        assert_eq!(context.listing_id, Some(23));
+    }
 
     #[test]
     fn normalizes_model_output() {
