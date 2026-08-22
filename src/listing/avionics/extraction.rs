@@ -393,7 +393,9 @@ fn context_has_exact_identity(
 /// The strict `context_has_exact_identity` path remains the catalog-reuse
 /// contract. A standalone `WAAS` followed by an exact slash-delimited list of
 /// the observation's declared atomic capabilities is occurrence evidence, but
-/// never proof that the unqualified model is safe for local catalog reuse.
+/// never proof that the unqualified model is safe for local catalog reuse. An
+/// attached-`W` identity may additionally carry the exact `WAAS IFR` wording
+/// and a bounded rebuilt-date note used by Controller listings.
 fn extraction_occurrence_has_exact_identity(
     context: &ListingEvidenceContext,
     manufacturer: &str,
@@ -479,11 +481,32 @@ fn exact_standalone_waas_capability_annotation(
         return false;
     }
 
-    let capabilities = &tokens[identity.len() + 1..];
-    if capabilities.len() < 2 {
+    let mut capability_start = identity.len() + 1;
+    if tokens
+        .get(capability_start)
+        .is_some_and(|token| token.value == "ifr")
+    {
+        if !model_has_attached_w_designator(model) {
+            return false;
+        }
+        let ifr = &tokens[capability_start];
+        let separator = &evidence[waas.end..ifr.start];
+        if separator.is_empty() || !separator.chars().all(char::is_whitespace) {
+            return false;
+        }
+        capability_start += 1;
+    }
+
+    if avionics_types.len() < 2 || tokens.len() < capability_start + avionics_types.len() {
         return false;
     }
-    let first_separator = &evidence[waas.end..capabilities[0].start];
+    let capabilities = &tokens[capability_start..capability_start + avionics_types.len()];
+    let annotation_end = if capability_start == identity.len() + 1 {
+        waas.end
+    } else {
+        tokens[capability_start - 1].end
+    };
+    let first_separator = &evidence[annotation_end..capabilities[0].start];
     if first_separator.is_empty() || !first_separator.chars().all(char::is_whitespace) {
         return false;
     }
@@ -502,10 +525,52 @@ fn exact_standalone_waas_capability_annotation(
         .iter()
         .map(|token| token.value.clone())
         .collect::<BTreeSet<_>>();
-    !declared.contains("")
-        && annotated.len() == capabilities.len()
-        && declared.len() == avionics_types.len()
-        && declared == annotated
+    if declared.contains("")
+        || annotated.len() != capabilities.len()
+        || declared.len() != avionics_types.len()
+        || declared != annotated
+    {
+        return false;
+    }
+
+    let trailing_annotation =
+        evidence[capabilities.last().expect("capabilities exist").end..].trim();
+    trailing_annotation.is_empty()
+        || (model_has_attached_w_designator(model)
+            && exact_rebuilt_date_annotation(trailing_annotation))
+}
+
+fn model_has_attached_w_designator(model: &str) -> bool {
+    evidence_identity_tokens(model)
+        .last()
+        .and_then(|token| token.value.strip_suffix('w'))
+        .and_then(|prefix| prefix.chars().last())
+        .is_some_and(|character| character.is_ascii_digit())
+}
+
+fn exact_rebuilt_date_annotation(value: &str) -> bool {
+    let Some(value) = value.strip_prefix('-').map(str::trim) else {
+        return false;
+    };
+    let mut parts = value.split_ascii_whitespace();
+    if !parts
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("rebuilt"))
+    {
+        return false;
+    }
+    let Some(date) = parts.next().filter(|_| parts.next().is_none()) else {
+        return false;
+    };
+    let Some((month, year)) = date.split_once('/') else {
+        return false;
+    };
+    month.len() <= 2
+        && month
+            .parse::<u8>()
+            .is_ok_and(|month| (1..=12).contains(&month))
+        && matches!(year.len(), 2 | 4)
+        && year.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn validate_capture_binding(extraction: CurrentAvionicsExtraction<'_>) -> Result<(), String> {
@@ -760,6 +825,27 @@ mod tests {
     }
 
     #[test]
+    fn visible_evidence_accepts_attached_w_waas_ifr_and_rebuilt_date() {
+        let evidence = "GARMIN GNS 530W WAAS IFR GPS/NAV/COM-REBUILT 1/23";
+        let html = format!("<html><body><p>{evidence}</p></body></html>");
+        let mut payload = installed("Garmin", "GNS 530W", evidence);
+        payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
+
+        let parsed =
+            validate_unbound_current_avionics_extraction(&payload.to_string(), &html).unwrap();
+
+        assert_eq!(parsed[0].model, "GNS 530W");
+        assert_eq!(parsed[0].avionics_types, ["GPS", "NAV", "COM"]);
+        let context = ListingEvidenceContext::from_cleaned_text(evidence);
+        assert_eq!(
+            context.unique_exact_product_slice("Garmin", "GNS 530W"),
+            None,
+            "extraction-only annotation admission must not weaken local catalog reuse"
+        );
+        assert_eq!(context.unique_exact_model_slice("GNS 530W"), None);
+    }
+
+    #[test]
     fn standalone_waas_annotation_requires_exact_slash_delimited_declared_capabilities() {
         for (model, evidence, avionics_types) in [
             ("GNS 430", "Garmin GNS 430 WAAS upgraded", vec!["GPS"]),
@@ -775,6 +861,36 @@ mod tests {
                 "GTN 750",
                 "Garmin GTN 750 WAAS GPS NAV COM",
                 vec!["GPS", "NAV", "COM"],
+            ),
+            (
+                "GNS 530W",
+                "Garmin GNS 530W WAAS VFR GPS/NAV/COM-REBUILT 1/23",
+                vec!["GPS", "NAV", "COM"],
+            ),
+            (
+                "GNS 530W",
+                "Garmin GNS 530W WAAS IFR GPS NAV COM-REBUILT 1/23",
+                vec!["GPS", "NAV", "COM"],
+            ),
+            (
+                "GNS 530W",
+                "Garmin GNS 530W WAAS IFR GPS/NAV/COM-NXi",
+                vec!["GPS", "NAV", "COM"],
+            ),
+            (
+                "GNS 530W",
+                "Garmin GNS 530W WAAS IFR GPS/NAV/COM-REPLACED BY GTN 750",
+                vec!["GPS", "NAV", "COM"],
+            ),
+            (
+                "GNS 530W",
+                "Garmin GNS 530W WAAS IFR GPS/NAV/COM-REBUILT JAN 2023",
+                vec!["GPS", "NAV", "COM"],
+            ),
+            (
+                "GNS 530W",
+                "Garmin GNS 530W WAAS IFR GPS/NAV/COM-REBUILT 1/23",
+                vec!["GPS", "NAV"],
             ),
         ] {
             let html = format!("<html><body><p>{evidence}</p></body></html>");
