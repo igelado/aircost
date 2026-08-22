@@ -337,6 +337,10 @@ WHERE (
 ) OR (
   schema_row.type = 'trigger'
   AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
+  AND schema_row.name NOT IN (
+    'avionics_models_approved_concrete_model_insert',
+    'avionics_models_approved_concrete_model_update'
+  )
 )
 UNION ALL
 SELECT
@@ -9870,6 +9874,10 @@ WHERE (
 ) OR (
   schema_row.type = 'trigger'
   AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
+  AND schema_row.name NOT IN (
+    'avionics_models_approved_concrete_model_insert',
+    'avionics_models_approved_concrete_model_update'
+  )
 )
 UNION ALL
 SELECT
@@ -9945,6 +9953,67 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
   'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;
+
+CREATE TRIGGER IF NOT EXISTS avionics_models_approved_concrete_model_insert
+BEFORE INSERT ON avionics_models
+WHEN NEW.catalog_status = 'approved'
+ AND (
+  NEW.normalized_name <> lower(trim(NEW.normalized_name))
+  OR NEW.normalized_name GLOB '*[^a-z0-9 ]*'
+  OR instr(NEW.normalized_name, '  ') > 0
+  OR NEW.normalized_name IN (
+  '', 'unknown', 'generic', 'standard', 'factory', 'oem', 'various', 'multiple',
+  'avionics', 'avionics suite', 'integrated avionics', 'integrated avionics suite',
+  'glass panel', 'flight instruments', 'standard flight instruments',
+  'standard vfr avionics', 'standard ifr avionics', 'radio', 'radios', 'nav',
+  'com', 'nav com', 'gps nav com', 'navigation system', 'gps', 'autopilot',
+  'flight director', 'transponder', 'ads b', 'weather radar', 'audio panel',
+  'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
+  'traffic', 'active traffic', 'traffic advisory system', 'datalink', 'xm',
+  'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
+  'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
+  'taws', 'engine monitor', 'standby instrument', 'elt', 'adf', 'dme', 'ahrs',
+  'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'equipment'
+  )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'approved avionics normalized_name must be canonical and concrete; canonicalize, correct, or demote it before retrying migration');
+END;
+
+CREATE TRIGGER IF NOT EXISTS avionics_models_approved_concrete_model_update
+BEFORE UPDATE OF catalog_status, normalized_name ON avionics_models
+WHEN NEW.catalog_status = 'approved'
+ AND (
+  NEW.normalized_name <> lower(trim(NEW.normalized_name))
+  OR NEW.normalized_name GLOB '*[^a-z0-9 ]*'
+  OR instr(NEW.normalized_name, '  ') > 0
+  OR NEW.normalized_name IN (
+  '', 'unknown', 'generic', 'standard', 'factory', 'oem', 'various', 'multiple',
+  'avionics', 'avionics suite', 'integrated avionics', 'integrated avionics suite',
+  'glass panel', 'flight instruments', 'standard flight instruments',
+  'standard vfr avionics', 'standard ifr avionics', 'radio', 'radios', 'nav',
+  'com', 'nav com', 'gps nav com', 'navigation system', 'gps', 'autopilot',
+  'flight director', 'transponder', 'ads b', 'weather radar', 'audio panel',
+  'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
+  'traffic', 'active traffic', 'traffic advisory system', 'datalink', 'xm',
+  'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
+  'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
+  'taws', 'engine monitor', 'standby instrument', 'elt', 'adf', 'dme', 'ahrs',
+  'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'equipment'
+  )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'approved avionics normalized_name must be canonical and concrete; canonicalize, correct, or demote it before retrying migration');
+END;
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260821_avionics_approved_concrete_model', 1,
+  '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

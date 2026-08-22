@@ -602,7 +602,14 @@ Avionics parsing is intentionally strict. A durable avionics row should be a
 concrete unit, integrated suite, or named package. Generic labels are not useful
 for valuation and are not inserted into the catalog.
 
-Every extracted candidate first goes through a local catalog pass:
+After request validation and before any local, catalog, or provider identity
+work, an observation whose complete typography-normalized model equals one
+label in the server-owned generic equipment-category vocabulary is rejected
+deterministically. This is whole-label equality only: manufacturer names,
+capability types, substrings, fuzzy similarity, and product labels containing a
+generic term do not authorize discard.
+
+Every remaining candidate first goes through a local catalog pass:
 
 1. A distinct exact OEM part number or SKU in the listing takes precedence.
 2. Otherwise, an exact manufacturer-scoped canonical model label or
@@ -619,25 +626,23 @@ Every extracted candidate first goes through a local catalog pass:
 
 Candidates unresolved by that local pass enter the grounded workflow:
 
-Before grounded research, a tools-disabled concreteness classifier provides one
-narrow discard fast path. The server accepts its exact response shape and
-automatically rejects only `generic` at `very_high` confidence when
+For other observations that reach grounded research, a tools-disabled
+concreteness classifier provides a separate narrow discard path. The server
+accepts its exact response shape and automatically rejects only `generic` at
+`very_high` confidence when
 `model_identifies_single_unit=false` and the response contains concrete,
 non-empty generic indicators. Classifier errors, unknown or malformed fields,
 blank indicators, `ambiguous`, and every weaker-confidence answer continue into
 ordinary grounding. All supplied context is explicitly labeled untrusted; the
 classifier cannot approve or create a catalog identity.
 
-Automatic review applies the same classifier policy to a narrower terminal
-validation case. A retained current-schema observation whose capability array,
-quantity, source confidence, installation action, and replacement graph are
-structurally valid, but whose model is deterministically a generic label, gets
-exactly the one tools-disabled classifier request before it is retained as
-invalid. Only the same exact-shape `generic` + `very_high` +
-`model_identifies_single_unit=false` decision with non-empty indicators may
-discard it. Every other response or provider failure remains pending review and
-does not enter grounded catalog resolution. Structurally malformed observations
-remain pending without a classifier request.
+Automatic review applies that deterministic closed-vocabulary policy only
+after validating the complete retained observation. A current-schema
+observation with valid capabilities, quantity, source confidence, installation
+action, and replacement graph is discarded without a provider request when its
+complete normalized model is a generic category. Structurally malformed
+observations remain pending; similarity or partial label overlap never reaches
+this discard path.
 
 1. Gemini returns `existing_match`, `propose_new`, `reject`, or `unresolved`
    with authoritative identity evidence. Existing IDs are schema-constrained

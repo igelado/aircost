@@ -19,8 +19,9 @@ use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
 };
 use crate::avionics::catalog::{
-    resolve_avionics_identity, resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity,
-    AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
+    deterministic_generic_avionics_rejection_reason, resolve_avionics_identity,
+    resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
+    AvionicsIdentityRequest, CatalogError,
 };
 use crate::avionics::reuse::{
     reuse_attestation_is_current_postgres, reuse_attestation_is_current_sqlite,
@@ -2296,11 +2297,34 @@ async fn resolve_listing_avionics_values(
                     index,
                     OccurrenceRole::Primary,
                 ));
-                if item.replaces.is_some() {
-                    dispositions.push(AutomaticOccurrenceDisposition::discarded(
-                        index,
-                        OccurrenceRole::Replacement,
-                    ));
+                match resolve_listing_avionics_replacement(
+                    db,
+                    values,
+                    extractor,
+                    source_url,
+                    &listing_context,
+                    index,
+                    &item,
+                )
+                .await?
+                {
+                    ListingAvionicsReplacementResolution::None => {}
+                    ListingAvionicsReplacementResolution::Rejected => {
+                        dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                            index,
+                            OccurrenceRole::Replacement,
+                        ));
+                    }
+                    ListingAvionicsReplacementResolution::Approved(identity) => {
+                        dispositions.push(AutomaticOccurrenceDisposition::linked(
+                            index,
+                            OccurrenceRole::Replacement,
+                            identity.id,
+                        ));
+                    }
+                    ListingAvionicsReplacementResolution::Pending(aspect) => {
+                        pending.push(*aspect);
+                    }
                 }
             }
             ListingAvionicsIdentityResolution::Pending {
@@ -2319,6 +2343,13 @@ async fn resolve_listing_avionics_values(
                 .await?;
                 let (replaces_product_id, replacement_aspect_id) = match &replacement {
                     ListingAvionicsReplacementResolution::None => (None, None),
+                    ListingAvionicsReplacementResolution::Rejected => {
+                        dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                            index,
+                            OccurrenceRole::Replacement,
+                        ));
+                        (None, None)
+                    }
                     ListingAvionicsReplacementResolution::Approved(identity) => {
                         dispositions.push(AutomaticOccurrenceDisposition::linked(
                             index,
@@ -2331,14 +2362,45 @@ async fn resolve_listing_avionics_values(
                         (None, Some(aspect.id.clone()))
                     }
                 };
+                let pending_item =
+                    if matches!(&replacement, ListingAvionicsReplacementResolution::Rejected) {
+                        if item.configuration_action == "removes" {
+                            item.clone()
+                        } else {
+                            listing_avionics_without_replacement(&item)
+                        }
+                    } else {
+                        item.clone()
+                    };
+                let self_removal_target =
+                    matches!(&replacement, ListingAvionicsReplacementResolution::Rejected)
+                        .then_some(())
+                        .filter(|_| item.configuration_action == "removes")
+                        .and_then(|_| suggested_product.as_ref().and_then(|product| product.id));
+                let self_removal_aspect_id =
+                    (matches!(&replacement, ListingAvionicsReplacementResolution::Rejected)
+                        && item.configuration_action == "removes"
+                        && self_removal_target.is_none())
+                    .then(|| ReviewAspectId::String(format!("avionics:{index}:removal-product")));
                 pending.push(pending_avionics_aspect(
                     ReviewAspectId::String(format!("avionics:{index}:primary")),
-                    &item,
-                    reason,
-                    suggested_product,
-                    replaces_product_id,
-                    replacement_aspect_id,
+                    &pending_item,
+                    reason.clone(),
+                    suggested_product.clone(),
+                    self_removal_target.or(replaces_product_id),
+                    self_removal_aspect_id.clone().or(replacement_aspect_id),
                 ));
+                if let Some(self_removal_aspect_id) = self_removal_aspect_id {
+                    let self_removal_target_item = listing_avionics_without_replacement(&item);
+                    pending.push(pending_avionics_aspect(
+                        self_removal_aspect_id,
+                        &self_removal_target_item,
+                        reason,
+                        suggested_product,
+                        None,
+                        None,
+                    ));
+                }
                 if let ListingAvionicsReplacementResolution::Pending(aspect) = replacement {
                     pending.push(*aspect);
                 }
@@ -2362,6 +2424,20 @@ async fn resolve_listing_avionics_values(
                             identity.id,
                         ));
                         resolved.push(listing_avionics_value_from_catalog(&item, &identity));
+                    }
+                    ListingAvionicsReplacementResolution::Rejected => {
+                        dispositions.push(AutomaticOccurrenceDisposition::linked(
+                            index,
+                            OccurrenceRole::Primary,
+                            identity.id,
+                        ));
+                        dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                            index,
+                            OccurrenceRole::Replacement,
+                        ));
+                        resolved.push(listing_avionics_after_generic_target_rejection(
+                            &item, &identity,
+                        ));
                     }
                     ListingAvionicsReplacementResolution::Approved(replaced) => {
                         dispositions.push(AutomaticOccurrenceDisposition::linked(
@@ -2427,6 +2503,29 @@ async fn resolve_listing_avionics_identity(
     request: &AvionicsIdentityRequest,
     source_confidence: Option<&str>,
 ) -> ListingAvionicsIdentityResolution {
+    let structure_issue =
+        if request.manufacturer.trim().is_empty() || request.model.trim().is_empty() {
+            Some("candidate is missing a manufacturer or model label")
+        } else if !request
+            .avionics_types
+            .iter()
+            .any(|value| !value.trim().is_empty())
+        {
+            Some("candidate is missing an avionics capability observation")
+        } else if request.quantity < 1 {
+            Some("candidate quantity must be at least one")
+        } else {
+            None
+        };
+    if let Some(reason) = structure_issue {
+        return ListingAvionicsIdentityResolution::Pending {
+            reason: reason.to_string(),
+            suggested_product: None,
+        };
+    }
+    if let Some(reason) = deterministic_generic_avionics_rejection_reason(request) {
+        return ListingAvionicsIdentityResolution::Rejected { reason };
+    }
     if let Some(extractor) = extractor {
         return listing_avionics_identity_resolution(
             resolve_avionics_identity(db, extractor, request).await,
@@ -2502,12 +2601,13 @@ fn listing_avionics_identity_request(
         manufacturer: manufacturer.to_string(),
         model: model.to_string(),
         avionics_types: avionics_types.to_vec(),
-        quantity: quantity.max(1),
+        quantity,
     }
 }
 
 enum ListingAvionicsReplacementResolution {
     None,
+    Rejected,
     Approved(Box<ApprovedAvionicsIdentity>),
     Pending(Box<PendingReviewAspect>),
 }
@@ -2545,6 +2645,9 @@ async fn resolve_listing_avionics_replacement(
         &replaced.avionics_types,
         1,
     );
+    if deterministic_generic_avionics_rejection_reason(&request).is_some() {
+        return Ok(ListingAvionicsReplacementResolution::Rejected);
+    }
     match resolve_listing_avionics_identity(
         db,
         extractor,
@@ -2736,6 +2839,33 @@ fn listing_avionics_value_from_catalog(
         replaces: original.replaces.clone(),
         replaces_avionics_model_id: original.replaces_avionics_model_id,
     }
+}
+
+fn listing_avionics_without_replacement(original: &ListingAvionicsValue) -> ListingAvionicsValue {
+    let mut independent = original.clone();
+    independent.configuration_action = "installed".to_string();
+    independent.replaces = None;
+    independent.replaces_avionics_model_id = None;
+    independent
+}
+
+fn listing_avionics_after_generic_target_rejection(
+    original: &ListingAvionicsValue,
+    identity: &ApprovedAvionicsIdentity,
+) -> ListingAvionicsValue {
+    if original.configuration_action != "removes" {
+        let independent = listing_avionics_without_replacement(original);
+        return listing_avionics_value_from_catalog(&independent, identity);
+    }
+
+    let mut removal = listing_avionics_value_from_catalog(original, identity);
+    removal.replaces = Some(ParsedAvionicsReference {
+        manufacturer: identity.manufacturer.clone(),
+        model: identity.model.clone(),
+        avionics_types: identity.avionics_types.clone(),
+    });
+    removal.replaces_avionics_model_id = Some(identity.id);
+    removal
 }
 
 fn merged_avionics_types(left: &[String], right: &[String]) -> Vec<String> {
@@ -3257,6 +3387,12 @@ fn validate_listing_values(values: &ListingValues) -> StoreResult<()> {
         if canonical_avionics_types(&item.avionics_types).is_empty() {
             return Err(ListingStoreError::Validation(format!(
                 "avionics capability types are required for {} {}",
+                item.manufacturer, item.model
+            )));
+        }
+        if item.quantity < 1 {
+            return Err(ListingStoreError::Validation(format!(
+                "avionics quantity must be at least 1 for {} {}",
                 item.manufacturer, item.model
             )));
         }
@@ -5317,10 +5453,11 @@ mod tests {
     };
     use crate::db::{AppDb, DatabaseBackend};
     use crate::extract::{preview_manual_listing, GeminiListingExtractor};
+    use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
     use crate::listing::review::{
         stage_pending_review, ListingAssociationRole, PendingReviewAspect, ReviewProduct,
     };
-    use crate::models::ParsedAvionics;
+    use crate::models::{ParsedAvionics, ParsedAvionicsReference};
 
     use super::{
         coalesce_resolved_listing_avionics, listing_avionics_identity_resolution,
@@ -6407,6 +6544,20 @@ mod tests {
         assert!(error.to_string().contains("requires source URL"));
     }
 
+    #[test]
+    fn listing_validation_rejects_nonpositive_avionics_quantity_before_identity_work() {
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        let mut generic = ListingAvionicsValue::from_parsed(parsed_avionics("TAWS"));
+        generic.quantity = 0;
+        values.avionics = vec![generic];
+
+        let error = super::validate_listing_values(&values)
+            .expect_err("malformed quantity must fail before deterministic discard");
+        assert!(error
+            .to_string()
+            .contains("avionics quantity must be at least 1"));
+    }
+
     #[tokio::test]
     async fn unavailable_classifier_cannot_assign_even_exact_looking_avionics() {
         let db = AppDb::connect("sqlite::memory:")
@@ -6610,6 +6761,162 @@ mod tests {
         );
         assert!(pending[0].suggested_product.is_none());
         assert!(values.avionics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_generic_listing_observation_emits_an_explicit_discard_disposition() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let extractor =
+            crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        for configured_extractor in [None, Some(&extractor)] {
+            let mut values = listing_values_with_variant("182T SKYLANE");
+            let mut generic = parsed_avionics("XM Weather & Radio");
+            generic.avionics_types = vec!["Datalink".to_string()];
+            values.avionics = vec![ListingAvionicsValue::from_parsed(generic)];
+
+            let resolved = resolve_listing_avionics_values(
+                &db,
+                &mut values,
+                configured_extractor,
+                Some("https://example.com/listing"),
+                Some("XM Weather & Radio"),
+            )
+            .await
+            .expect("exact generic discard must not depend on provider availability");
+
+            assert!(resolved.pending_review_aspects.is_empty());
+            assert!(values.avionics.is_empty());
+            assert_eq!(resolved.occurrence_dispositions.len(), 1);
+            let disposition = &resolved.occurrence_dispositions[0];
+            assert_eq!(disposition.outcome, "discarded");
+            assert_eq!(disposition.avionics_model_id, None);
+            assert_eq!(disposition.reason_code, "automatic_identity_rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_primary_does_not_discard_a_concrete_replacement_without_a_key() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let replacement_id = ensure_approved_test_avionics_model(&db, "Garmin", "GNS 430W", "GPS")
+            .await
+            .expect("concrete replacement should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, replacement_id).await;
+        let unreachable =
+            crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        for configured_extractor in [None, Some(&unreachable)] {
+            let mut values = listing_values_with_variant("182T SKYLANE");
+            let mut generic = parsed_avionics("GPS");
+            generic.configuration_action = "replaces".to_string();
+            generic.replaces = Some(ParsedAvionicsReference {
+                manufacturer: "Garmin".to_string(),
+                model: "GNS 430W".to_string(),
+                avionics_types: vec!["GPS".to_string()],
+            });
+            values.avionics = vec![ListingAvionicsValue::from_parsed(generic)];
+
+            let resolved = resolve_listing_avionics_values(
+                &db,
+                &mut values,
+                configured_extractor,
+                Some("https://example.com/listing"),
+                Some("Garmin GPS replaces Garmin GNS 430W"),
+            )
+            .await
+            .expect("each occurrence role should resolve independently");
+
+            assert!(resolved.pending_review_aspects.is_empty());
+            assert!(values.avionics.is_empty());
+            assert_eq!(resolved.occurrence_dispositions.len(), 2);
+            assert_eq!(
+                resolved.occurrence_dispositions[0],
+                AutomaticOccurrenceDisposition::discarded(0, OccurrenceRole::Primary)
+            );
+            assert_eq!(
+                resolved.occurrence_dispositions[1],
+                AutomaticOccurrenceDisposition::linked(
+                    0,
+                    OccurrenceRole::Replacement,
+                    replacement_id,
+                )
+            );
+        }
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn concrete_primary_keeps_its_local_link_when_replacement_is_generic() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let primary_id = ensure_approved_test_avionics_model(&db, "Garmin", "GNS 430W", "GPS")
+            .await
+            .expect("concrete primary should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, primary_id).await;
+        let unreachable =
+            crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        for configured_extractor in [None, Some(&unreachable)] {
+            for action in ["replaces", "removes"] {
+                let mut values = listing_values_with_variant("182T SKYLANE");
+                let mut concrete = parsed_avionics("GNS 430W");
+                concrete.configuration_action = action.to_string();
+                concrete.replaces = Some(ParsedAvionicsReference {
+                    manufacturer: "Garmin".to_string(),
+                    model: "GPS".to_string(),
+                    avionics_types: vec!["GPS".to_string()],
+                });
+                values.avionics = vec![ListingAvionicsValue::from_parsed(concrete)];
+
+                let resolved = resolve_listing_avionics_values(
+                    &db,
+                    &mut values,
+                    configured_extractor,
+                    Some("https://example.com/listing"),
+                    Some("Garmin GNS 430W changes Garmin GPS"),
+                )
+                .await
+                .expect("each occurrence role should resolve independently");
+
+                assert!(resolved.pending_review_aspects.is_empty());
+                assert_eq!(values.avionics.len(), 1);
+                assert_eq!(values.avionics[0].avionics_model_id, Some(primary_id));
+                assert_eq!(
+                    values.avionics[0].configuration_action,
+                    if action == "removes" {
+                        "removes"
+                    } else {
+                        "installed"
+                    }
+                );
+                assert_eq!(
+                    values.avionics[0].replaces_avionics_model_id,
+                    (action == "removes").then_some(primary_id)
+                );
+                assert_eq!(resolved.occurrence_dispositions.len(), 2);
+                assert_eq!(
+                    resolved.occurrence_dispositions[0],
+                    AutomaticOccurrenceDisposition::linked(0, OccurrenceRole::Primary, primary_id)
+                );
+                assert_eq!(
+                    resolved.occurrence_dispositions[1],
+                    AutomaticOccurrenceDisposition::discarded(0, OccurrenceRole::Replacement)
+                );
+            }
+        }
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
     }
 
     #[tokio::test]

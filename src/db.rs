@@ -104,6 +104,43 @@ const FAA_RECORD_HASH_DOMAIN_MIGRATION: &str = "20260820_faa_record_hash_domain"
 const FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION: i64 = 1;
 const FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT: &str =
     "f124f573bf705da6c1e4b0a5c7a8df45ea5a4a5dc009a28eee012be42c691502";
+const AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION: &str =
+    "20260821_avionics_approved_concrete_model";
+const AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_VERSION: i64 = 1;
+const AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT: &str =
+    "1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6";
+const AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION: i64 = 1;
+const SQLITE_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
+    "5f63974c8eb8b39298ee4862904f418f223c41f7c3d46c80f2c069e09fe7372e";
+const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
+    "740076e3a5ce9c73bbfaaaf83be2863180e7ab62295217edc0549813b2942d59";
+const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE: &str = r#"
+BEGIN
+  IF NEW.catalog_status = 'approved' AND (
+    NEW.normalized_name <> LOWER(BTRIM(NEW.normalized_name))
+    OR NEW.normalized_name !~ '^[a-z0-9]+( [a-z0-9]+)*$'
+  ) THEN
+    RAISE EXCEPTION 'approved avionics normalized_name is not canonical; canonicalize, correct, or demote it before retrying migration';
+  END IF;
+  IF NEW.catalog_status = 'approved' AND NEW.normalized_name IN (
+    '', 'unknown', 'generic', 'standard', 'factory', 'oem', 'various', 'multiple',
+    'avionics', 'avionics suite', 'integrated avionics', 'integrated avionics suite',
+    'glass panel', 'flight instruments', 'standard flight instruments',
+    'standard vfr avionics', 'standard ifr avionics', 'radio', 'radios', 'nav',
+    'com', 'nav com', 'gps nav com', 'navigation system', 'gps', 'autopilot',
+    'flight director', 'transponder', 'ads b', 'weather radar', 'audio panel',
+    'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
+    'traffic', 'active traffic', 'traffic advisory system', 'datalink', 'xm',
+    'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
+    'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
+    'taws', 'engine monitor', 'standby instrument', 'elt', 'adf', 'dme', 'ahrs',
+    'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'equipment'
+  ) THEN
+    RAISE EXCEPTION 'approved avionics model is a generic category; canonicalize, correct, or demote it before retrying migration';
+  END IF;
+  RETURN NEW;
+END;
+"#;
 // SHA-256 fingerprints of newline-terminated, ordered PostgreSQL catalog
 // signatures. Keeping each object class separate lets startup identify the
 // broken class without exposing row data. Trigger and function definitions are
@@ -465,6 +502,11 @@ const COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] = 
         contract_version: FAA_RECORD_HASH_DOMAIN_CONTRACT_VERSION,
         contract_fingerprint: FAA_RECORD_HASH_DOMAIN_CONTRACT_FINGERPRINT,
     },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION,
+        contract_version: AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT,
+    },
 ];
 
 const POSTGRES_ONLY_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] =
@@ -707,6 +749,32 @@ struct PostgresFaaReferenceTriggerDefinition {
 }
 
 #[derive(sqlx::FromRow)]
+struct PostgresApprovedConcreteModelTriggerDefinition {
+    trigger_name: String,
+    trigger_type: i16,
+    has_no_when_clause: bool,
+    update_columns: String,
+    trigger_enabled: String,
+    trigger_argument_count: i16,
+    relation_schema: String,
+    relation_name: String,
+    relation_oid_matches: bool,
+    function_name: String,
+    function_schema: String,
+    function_oid_matches: bool,
+    function_source: String,
+    function_configuration: String,
+    function_language: String,
+    returns_trigger: bool,
+    function_argument_count: i16,
+    ordinary_function: bool,
+    security_definer: bool,
+    strict: bool,
+    volatility: String,
+    parallel_safety: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct PostgresReferenceRoutineDefinition {
     function_name: String,
     function_oid_matches: bool,
@@ -827,6 +895,46 @@ fn canonical_sqlite_schema_definition(value: &str) -> String {
         }
     }
     canonical
+}
+
+fn postgres_approved_concrete_model_object_payload(
+    actual: &PostgresApprovedConcreteModelTriggerDefinition,
+) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        actual.trigger_name,
+        actual.trigger_type,
+        actual.has_no_when_clause,
+        actual.update_columns,
+        actual.trigger_enabled,
+        actual.trigger_argument_count,
+        actual.relation_schema,
+        actual.relation_name,
+        actual.relation_oid_matches,
+        actual.function_name,
+        actual.function_schema,
+        actual.function_oid_matches,
+        canonical_sql_definition(&actual.function_source),
+        actual.function_configuration,
+        actual.function_language,
+        actual.returns_trigger,
+        actual.function_argument_count,
+        actual.ordinary_function,
+        actual.security_definer,
+        actual.strict,
+        actual.volatility,
+        actual.parallel_safety,
+    )
+}
+
+fn versioned_avionics_approved_concrete_model_object_fingerprint(payload: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "v{}\n{}",
+            AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION, payload
+        ))
+    )
 }
 
 fn expected_sqlite_faa_registry_definitions() -> Vec<SqliteSchemaDefinition> {
@@ -1148,6 +1256,161 @@ impl AppDb {
                 self.ensure_required_migrations_on(&mut connection).await
             }
         }
+    }
+
+    async fn avionics_approved_concrete_model_object_contract_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        let (valid_shape, payload, expected_fingerprint) = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                let definitions = sqlx::query_as::<_, (String, Option<String>)>(
+                    r#"
+                    SELECT name, sql
+                    FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND tbl_name = 'avionics_models'
+                      AND name IN (
+                        'avionics_models_approved_concrete_model_insert',
+                        'avionics_models_approved_concrete_model_update'
+                      )
+                    ORDER BY name
+                    "#,
+                )
+                .fetch_all(&mut **pool)
+                .await?;
+                let valid_shape = definitions.len() == 2
+                    && definitions
+                        .iter()
+                        .all(|(_, definition)| definition.is_some());
+                let payload = definitions
+                    .iter()
+                    .map(|(name, definition)| {
+                        format!(
+                            "{name}={}",
+                            definition
+                                .as_deref()
+                                .map(canonical_sqlite_schema_definition)
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (
+                    valid_shape,
+                    payload,
+                    SQLITE_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT,
+                )
+            }
+            GateConnection::Postgres(pool) => {
+                let definitions =
+                    sqlx::query_as::<_, PostgresApprovedConcreteModelTriggerDefinition>(
+                        r#"
+                    SELECT
+                      actual_trigger.tgname AS trigger_name,
+                      actual_trigger.tgtype::smallint AS trigger_type,
+                      actual_trigger.tgqual IS NULL AS has_no_when_clause,
+                      COALESCE((
+                        SELECT pg_catalog.string_agg(
+                          attribute.attname, ',' ORDER BY attribute.attname
+                        )
+                        FROM pg_catalog.unnest(actual_trigger.tgattr)
+                          AS update_column(attnum)
+                        JOIN pg_catalog.pg_attribute attribute
+                          ON attribute.attrelid = actual_trigger.tgrelid
+                         AND attribute.attnum = update_column.attnum
+                      ), '') AS update_columns,
+                      actual_trigger.tgenabled::text AS trigger_enabled,
+                      actual_trigger.tgnargs::smallint AS trigger_argument_count,
+                      relation_namespace.nspname AS relation_schema,
+                      relation.relname AS relation_name,
+                      actual_trigger.tgrelid = pg_catalog.to_regclass(
+                        'public.avionics_models'
+                      ) AS relation_oid_matches,
+                      routine.proname AS function_name,
+                      routine_namespace.nspname AS function_schema,
+                      routine.oid = pg_catalog.to_regprocedure(
+                        'public.enforce_avionics_approved_concrete_model()'
+                      ) AS function_oid_matches,
+                      routine.prosrc AS function_source,
+                      COALESCE(
+                        pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+                      ) AS function_configuration,
+                      language.lanname AS function_language,
+                      routine.prorettype = 'trigger'::regtype AS returns_trigger,
+                      routine.pronargs::smallint AS function_argument_count,
+                      routine.prokind = 'f' AS ordinary_function,
+                      routine.prosecdef AS security_definer,
+                      routine.proisstrict AS strict,
+                      routine.provolatile::text AS volatility,
+                      routine.proparallel::text AS parallel_safety
+                    FROM pg_catalog.pg_trigger actual_trigger
+                    JOIN pg_catalog.pg_class relation
+                      ON relation.oid = actual_trigger.tgrelid
+                    JOIN pg_catalog.pg_namespace relation_namespace
+                      ON relation_namespace.oid = relation.relnamespace
+                    JOIN pg_catalog.pg_proc routine
+                      ON routine.oid = actual_trigger.tgfoid
+                    JOIN pg_catalog.pg_namespace routine_namespace
+                      ON routine_namespace.oid = routine.pronamespace
+                    JOIN pg_catalog.pg_language language
+                      ON language.oid = routine.prolang
+                    WHERE NOT actual_trigger.tgisinternal
+                      AND actual_trigger.tgname =
+                        'avionics_models_approved_concrete_model'
+                      AND relation_namespace.nspname = 'public'
+                      AND relation.relname = 'avionics_models'
+                    "#,
+                    )
+                    .fetch_all(&mut **pool)
+                    .await?;
+                let valid_shape = definitions.as_slice().first().is_some_and(|actual| {
+                    definitions.len() == 1
+                        && actual.trigger_name == "avionics_models_approved_concrete_model"
+                        && actual.trigger_type == 23
+                        && actual.has_no_when_clause
+                        && actual.update_columns == "catalog_status,normalized_name"
+                        && actual.trigger_enabled == "O"
+                        && actual.trigger_argument_count == 0
+                        && actual.relation_schema == "public"
+                        && actual.relation_name == "avionics_models"
+                        && actual.relation_oid_matches
+                        && actual.function_name == "enforce_avionics_approved_concrete_model"
+                        && actual.function_schema == "public"
+                        && actual.function_oid_matches
+                        && canonical_sql_definition(&actual.function_source)
+                            == canonical_sql_definition(
+                                POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE,
+                            )
+                        && actual.function_configuration.is_empty()
+                        && actual.function_language == "plpgsql"
+                        && actual.returns_trigger
+                        && actual.function_argument_count == 0
+                        && actual.ordinary_function
+                        && !actual.security_definer
+                        && !actual.strict
+                        && actual.volatility == "v"
+                        && actual.parallel_safety == "u"
+                });
+                let payload = definitions
+                    .first()
+                    .map(postgres_approved_concrete_model_object_payload)
+                    .unwrap_or_default();
+                (
+                    valid_shape,
+                    payload,
+                    POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT,
+                )
+            }
+        };
+        let fingerprint = versioned_avionics_approved_concrete_model_object_fingerprint(&payload);
+        #[cfg(test)]
+        if !valid_shape || fingerprint != expected_fingerprint {
+            eprintln!(
+                "approved concrete-model object contract mismatch shape={valid_shape} fingerprint={fingerprint} expected={expected_fingerprint}"
+            );
+        }
+        Ok(valid_shape && fingerprint == expected_fingerprint)
     }
 
     async fn ensure_required_migrations_on(
@@ -3382,6 +3645,47 @@ impl AppDb {
                 "aircraft_sale_listing_avionics_dispositions",
                 "occurrence_fingerprint",
                 LISTING_AVIONICS_DISPOSITIONS_MIGRATION,
+            ));
+        }
+        let missing_approved_concrete_model_contract = self
+            .migration_contract_invalid_on(
+                connection,
+                match self.kind() {
+                    DatabaseKind::Sqlite => "avionics_models",
+                    DatabaseKind::Postgres => "public.avionics_models",
+                },
+                AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION,
+                AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_VERSION,
+                AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT,
+            )
+            .await?;
+        let approved_concrete_model_anchor_exists = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'avionics_models')",
+                )
+                .fetch_one(&mut **pool)
+                .await?
+                    != 0
+            }
+            GateConnection::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_catalog.to_regclass('public.avionics_models') IS NOT NULL",
+                )
+                .fetch_one(&mut **pool)
+                .await?
+            }
+        };
+        let missing_approved_concrete_model_enforcement = approved_concrete_model_anchor_exists
+            && !self
+                .avionics_approved_concrete_model_object_contract_valid_on(connection)
+                .await?;
+        if missing_approved_concrete_model_contract || missing_approved_concrete_model_enforcement {
+            bail!(migration_required_message(
+                self.kind(),
+                "avionics_models",
+                "approved concrete-model invariant",
+                AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION,
             ));
         }
         let faa_registry_schema_started = self.faa_registry_schema_started_on(connection).await?;
@@ -6155,6 +6459,10 @@ impl AppDb {
                   ) OR (
                     schema_row.type = 'trigger'
                     AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
+                    AND schema_row.name NOT IN (
+                      'avionics_models_approved_concrete_model_insert',
+                      'avionics_models_approved_concrete_model_update'
+                    )
                   )
                   UNION ALL
                   SELECT
@@ -6249,7 +6557,9 @@ impl AppDb {
         let contract_query = format!(
             "SELECT count(*), pg_catalog.md5(pg_catalog.string_agg(\
              object_key || '=' || definition, E'\\n' ORDER BY object_key)) \
-             FROM ({owned_objects_query}) owned_object(object_key, definition)"
+             FROM ({owned_objects_query}) owned_object(object_key, definition) \
+             WHERE object_key <> \
+               'trigger:avionics_models:avionics_models_approved_concrete_model'"
         );
         let (object_count, definition_digest) =
             sqlx::query_as::<_, (i64, Option<String>)>(&contract_query)
@@ -8819,8 +9129,10 @@ mod tests {
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
         listing_pending_reviews_migration_required_message, migration_required_message,
-        postgres_reference_owned_objects_query, split_sql_statements, sqlite_migration_definition,
-        sqlite_table_definition, AppDb, DatabaseBackend, DatabaseKind,
+        postgres_approved_concrete_model_object_payload, postgres_reference_owned_objects_query,
+        split_sql_statements, sqlite_migration_definition, sqlite_table_definition,
+        versioned_avionics_approved_concrete_model_object_fingerprint, AppDb, DatabaseBackend,
+        DatabaseKind, PostgresApprovedConcreteModelTriggerDefinition,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
@@ -8859,7 +9171,9 @@ mod tests {
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
         LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT, LISTING_REPLAY_RUNS_CONTRACT_VERSION,
-        LISTING_REPLAY_RUNS_MIGRATION, POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
+        LISTING_REPLAY_RUNS_MIGRATION, POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE,
+        POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT,
+        POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
         POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
         POSTGRES_FAA_COVERAGE_FUNCTION_SOURCE,
         POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
@@ -8891,6 +9205,10 @@ mod tests {
         include_str!("../migrations/20260820_faa_record_hash_domain.sqlite.sql");
     const FAA_RECORD_HASH_DOMAIN_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260820_faa_record_hash_domain.postgres.sql");
+    const AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260821_avionics_approved_concrete_model.sqlite.sql");
+    const AVIONICS_APPROVED_CONCRETE_MODEL_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260821_avionics_approved_concrete_model.postgres.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260731_avionics_human_reviewed_consolidation.sqlite.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
@@ -13147,7 +13465,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 20);
+        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 21);
         inspection.close().await;
     }
 
@@ -14336,6 +14654,357 @@ mod tests {
         assert_eq!(statements.len(), 2);
         assert!(statements[0].contains("RETURN NEW;"));
         assert!(statements[1].starts_with("CREATE TRIGGER"));
+    }
+
+    #[tokio::test]
+    async fn approved_concrete_model_sqlite_migration_is_idempotent_and_audits_legacy_rows() {
+        async fn minimal_connection() -> SqliteConnection {
+            let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE avionics_models (\
+                       id INTEGER PRIMARY KEY, normalized_name TEXT NOT NULL, \
+                       catalog_status TEXT NOT NULL\
+                     )",
+                )
+                .await
+                .unwrap();
+            connection
+        }
+        async fn apply(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+            for statement in
+                split_sql_statements(AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL)
+            {
+                connection.execute(statement).await?;
+            }
+            Ok(())
+        }
+
+        let mut clean = minimal_connection().await;
+        apply(&mut clean).await.unwrap();
+        apply(&mut clean)
+            .await
+            .expect("the exact installed migration must be idempotent");
+        let (receipt_count, trigger_count): (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT count(*) FROM schema_migration_contracts
+               WHERE migration_name = '20260821_avionics_approved_concrete_model'
+                 AND contract_version = 1
+                 AND contract_fingerprint =
+                   '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6'),
+              (SELECT count(*) FROM sqlite_schema
+               WHERE type = 'trigger'
+                 AND name LIKE 'avionics_models_approved_concrete_model_%')
+            "#,
+        )
+        .fetch_one(&mut clean)
+        .await
+        .unwrap();
+        assert_eq!((receipt_count, trigger_count), (1, 2));
+
+        let mut legacy = minimal_connection().await;
+        legacy
+            .execute(
+                "INSERT INTO avionics_models (id, normalized_name, catalog_status) \
+                 VALUES (7, 'autopilot', 'approved')",
+            )
+            .await
+            .unwrap();
+        let error = apply(&mut legacy)
+            .await
+            .expect_err("a pre-existing approved generic row must stop migration")
+            .to_string();
+        assert!(error.contains("canonicalize, correct, or demote it before retrying migration"));
+        let retained: (String, String) = sqlx::query_as(
+            "SELECT normalized_name, catalog_status FROM avionics_models WHERE id = 7",
+        )
+        .fetch_one(&mut legacy)
+        .await
+        .unwrap();
+        assert_eq!(retained, ("autopilot".to_string(), "approved".to_string()));
+
+        for (index, invalid_key) in ["pfd/mfd", "ads-b", "xm weather &amp; radio"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut upgrade = minimal_connection().await;
+            sqlx::query(
+                "INSERT INTO avionics_models (id, normalized_name, catalog_status) \
+                 VALUES (?, ?, 'approved')",
+            )
+            .bind(index as i64 + 20)
+            .bind(invalid_key)
+            .execute(&mut upgrade)
+            .await
+            .unwrap();
+            let error = apply(&mut upgrade)
+                .await
+                .expect_err("noncanonical approved keys must stop upgrade")
+                .to_string();
+            assert!(
+                error.contains("canonicalize, correct, or demote it before retrying migration"),
+                "{invalid_key}: {error}"
+            );
+            let retained: String =
+                sqlx::query_scalar("SELECT normalized_name FROM avionics_models")
+                    .fetch_one(&mut upgrade)
+                    .await
+                    .unwrap();
+            assert_eq!(retained, invalid_key);
+        }
+
+        for invalid_key in [
+            "pfd/mfd",
+            "ads-b",
+            "xm weather &amp; radio",
+            "pfd mfd",
+            "ads b",
+            "xm weather radio",
+        ] {
+            let error = sqlx::query(
+                "INSERT INTO avionics_models (normalized_name, catalog_status) \
+                 VALUES (?, 'approved')",
+            )
+            .bind(invalid_key)
+            .execute(&mut clean)
+            .await
+            .expect_err("fresh invariant must reject generic or noncanonical approved keys")
+            .to_string();
+            assert!(
+                error.contains("canonicalize, correct, or demote it before retrying migration"),
+                "{invalid_key}: {error}"
+            );
+        }
+        clean
+            .execute(
+                "INSERT INTO avionics_models (normalized_name, catalog_status) \
+                 VALUES ('gns430w', 'approved')",
+            )
+            .await
+            .expect("a canonical concrete product key must remain admissible");
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_noop_approved_concrete_model_trigger_bodies() {
+        for (label, trigger_name, event) in [
+            (
+                "approved-concrete-noop-insert",
+                "avionics_models_approved_concrete_model_insert",
+                "INSERT",
+            ),
+            (
+                "approved-concrete-noop-update",
+                "avionics_models_approved_concrete_model_update",
+                "UPDATE OF catalog_status, normalized_name",
+            ),
+        ] {
+            let (database_path, database_url) = unique_sqlite_test_database(label);
+            AppDb::connect(&database_url).await.unwrap().close().await;
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            pool.execute(format!("DROP TRIGGER {trigger_name}").as_str())
+                .await
+                .unwrap();
+            pool.execute(
+                format!(
+                    "CREATE TRIGGER {trigger_name} BEFORE {event} ON avionics_models BEGIN SELECT 1; END"
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+            pool.close().await;
+
+            let error = connect_error(AppDb::connect(&database_url).await);
+            assert!(
+                error.contains("approved concrete-model invariant"),
+                "{error}"
+            );
+            std::fs::remove_file(database_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn postgres_approved_concrete_model_object_contract_is_versioned_and_exact() {
+        let mut expected = PostgresApprovedConcreteModelTriggerDefinition {
+            trigger_name: "avionics_models_approved_concrete_model".to_string(),
+            trigger_type: 23,
+            has_no_when_clause: true,
+            update_columns: "catalog_status,normalized_name".to_string(),
+            trigger_enabled: "O".to_string(),
+            trigger_argument_count: 0,
+            relation_schema: "public".to_string(),
+            relation_name: "avionics_models".to_string(),
+            relation_oid_matches: true,
+            function_name: "enforce_avionics_approved_concrete_model".to_string(),
+            function_schema: "public".to_string(),
+            function_oid_matches: true,
+            function_source: POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE.to_string(),
+            function_configuration: String::new(),
+            function_language: "plpgsql".to_string(),
+            returns_trigger: true,
+            function_argument_count: 0,
+            ordinary_function: true,
+            security_definer: false,
+            strict: false,
+            volatility: "v".to_string(),
+            parallel_safety: "u".to_string(),
+        };
+        let fingerprint = versioned_avionics_approved_concrete_model_object_fingerprint(
+            &postgres_approved_concrete_model_object_payload(&expected),
+        );
+        assert_eq!(
+            fingerprint,
+            POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT
+        );
+        expected.function_source = "BEGIN RETURN NEW; END;".to_string();
+        assert_ne!(
+            versioned_avionics_approved_concrete_model_object_fingerprint(
+                &postgres_approved_concrete_model_object_payload(&expected),
+            ),
+            POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT,
+            "a same-named no-op PostgreSQL function must not satisfy the object contract"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_startup_rejects_same_named_noop_approved_concrete_model_function() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        AppDb::connect(&database_url).await.unwrap().close().await;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        pool.execute(
+            r#"
+            CREATE OR REPLACE FUNCTION public.enforce_avionics_approved_concrete_model()
+            RETURNS TRIGGER
+            LANGUAGE plpgsql
+            AS $function$
+            BEGIN
+              RETURN NEW;
+            END;
+            $function$
+            "#,
+        )
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let error = connect_error(AppDb::connect(&database_url).await);
+        assert!(
+            error.contains("approved concrete-model invariant"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn approved_concrete_model_sql_uses_the_complete_rust_generic_vocabulary() {
+        let vocabulary = [
+            "",
+            "unknown",
+            "generic",
+            "standard",
+            "factory",
+            "oem",
+            "various",
+            "multiple",
+            "avionics",
+            "avionics suite",
+            "integrated avionics",
+            "integrated avionics suite",
+            "glass panel",
+            "flight instruments",
+            "standard flight instruments",
+            "standard vfr avionics",
+            "standard ifr avionics",
+            "radio",
+            "radios",
+            "nav",
+            "com",
+            "nav com",
+            "gps nav com",
+            "navigation system",
+            "gps",
+            "autopilot",
+            "flight director",
+            "transponder",
+            "ads b",
+            "weather radar",
+            "audio panel",
+            "display",
+            "flight display",
+            "pfd",
+            "mfd",
+            "pfd mfd",
+            "navigation indicator",
+            "traffic",
+            "active traffic",
+            "traffic advisory system",
+            "datalink",
+            "xm",
+            "xm weather",
+            "xm radio",
+            "xm weather radio",
+            "lightning detection",
+            "terrain awareness",
+            "terrain awareness system",
+            "terrain avoidance system",
+            "taws",
+            "engine monitor",
+            "standby instrument",
+            "elt",
+            "adf",
+            "dme",
+            "ahrs",
+            "air data computer",
+            "radar altimeter",
+            "magnetometer",
+            "clock timer",
+            "equipment",
+        ];
+        for label in vocabulary {
+            assert!(crate::normalize::is_generic_avionics_model_name(label));
+            let quoted = format!("'{label}'");
+            for definition in [
+                SQLITE_SCHEMA_SQL,
+                POSTGRES_SCHEMA_SQL,
+                AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL,
+                AVIONICS_APPROVED_CONCRETE_MODEL_POSTGRES_MIGRATION_SQL,
+            ] {
+                assert!(
+                    definition.contains(&quoted),
+                    "database policy is missing Rust generic label {label:?}"
+                );
+            }
+        }
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains("GLOB '*[^a-z0-9 ]*'"));
+            assert!(definition.contains("instr(NEW.normalized_name, '  ') > 0"));
+            assert!(definition.contains("canonicalize, correct, or demote"));
+        }
+        for definition in [
+            POSTGRES_SCHEMA_SQL,
+            AVIONICS_APPROVED_CONCRETE_MODEL_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains("!~ '^[a-z0-9]+( [a-z0-9]+)*$'"));
+            assert!(definition.contains("canonicalize, correct, or demote"));
+        }
+        for spelling in ["pfd/mfd", "ads-b", "xm weather &amp; radio"] {
+            assert!(crate::normalize::is_generic_avionics_model_name(spelling));
+        }
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! outside this module. This boundary revalidates every mutable dependency and
 //! either applies the complete accepted/residual result or commits nothing.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -15,6 +15,14 @@ use crate::avionics::reuse::{
     reuse_attestation_is_current_sqlite,
 };
 use crate::db::{AppDb, DatabaseBackend};
+use crate::listing::avionics::disposition::{
+    coordinates_from_aspect_id, extraction_sha256, occurrence_fingerprint,
+    AutomaticOccurrenceDisposition, OccurrenceRole, DISPOSITION_POLICY_VERSION,
+    INSERT_DISPOSITION_SQL,
+};
+use crate::listing::avionics::extraction::{
+    validate_current_avionics_extraction, CurrentAvionicsExtraction,
+};
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
@@ -63,6 +71,15 @@ pub(crate) struct AutomatedAvionicsLink {
     pub preserved_association_guard: Option<AutomatedPreservedAssociationGuard>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AutomatedLinkedOccurrenceGuard {
+    pub occurrence_index: usize,
+    pub occurrence_role: OccurrenceRole,
+    pub avionics_model_id: i64,
+    pub authorization: AutomatedAssociationAuthorization,
+    pub expected_collision_closure_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AutomatedReviewApplyRequest {
     pub listing_id: i64,
@@ -72,6 +89,8 @@ pub(crate) struct AutomatedReviewApplyRequest {
     pub expected_faa_snapshot_id: i64,
     pub expected_faa_source_record_sha256: String,
     pub accepted_links: Vec<AutomatedAvionicsLink>,
+    pub occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
+    pub linked_occurrence_guards: Vec<AutomatedLinkedOccurrenceGuard>,
     pub residual_aspects: Vec<PendingReviewAspect>,
 }
 
@@ -105,6 +124,14 @@ struct AutomationGuardRow {
     submission_canonical_listing_id: Option<i64>,
     rendered_html: String,
     rendered_html_sha256: String,
+    extracted_listing_json: Option<String>,
+    extraction_error: Option<String>,
+}
+
+struct PreparedOccurrenceDisposition<'a> {
+    decision: &'a AutomaticOccurrenceDisposition,
+    occurrence_fingerprint: String,
+    listing_evidence_text: String,
 }
 
 #[derive(Debug, FromRow)]
@@ -212,16 +239,7 @@ pub(crate) fn validate_automated_avionics_link(
                 .zip(link.replacement_authorization.as_ref()),
         )
     {
-        if let AutomatedAssociationAuthorization::SameCaseGrounded(receipt) = authorization {
-            if receipt.listing_id() != listing_id
-                || receipt.avionics_model_id() != target_id
-                || !valid_sha256(receipt.resolution_sha256())
-            {
-                return Err(ReviewError::Validation(format!(
-                    "same-case grounded authorization for catalog id {target_id} is not bound to this listing and product"
-                )));
-            }
-        }
+        validate_automated_authorization(listing_id, target_id, authorization)?;
     }
     match link.configuration_action.as_str() {
         "installed"
@@ -237,6 +255,24 @@ pub(crate) fn validate_automated_avionics_link(
                 "accepted avionics catalog id {} has invalid action/target semantics",
                 link.avionics_model_id
             )))
+        }
+    }
+    Ok(())
+}
+
+fn validate_automated_authorization(
+    listing_id: i64,
+    target_id: i64,
+    authorization: &AutomatedAssociationAuthorization,
+) -> ReviewResult<()> {
+    if let AutomatedAssociationAuthorization::SameCaseGrounded(receipt) = authorization {
+        if receipt.listing_id() != listing_id
+            || receipt.avionics_model_id() != target_id
+            || !valid_sha256(receipt.resolution_sha256())
+        {
+            return Err(ReviewError::Validation(format!(
+                "same-case grounded authorization for catalog id {target_id} is not bound to this listing and product"
+            )));
         }
     }
     Ok(())
@@ -297,11 +333,141 @@ fn validate_request(
     for link in &request.accepted_links {
         validate_automated_avionics_link(request.listing_id, link)?;
     }
+    let mut classified = HashSet::new();
+    let mut linked = HashMap::new();
+    for decision in &request.occurrence_dispositions {
+        let valid_outcome = match decision.outcome {
+            "discarded" => {
+                decision.avionics_model_id.is_none()
+                    && decision.reason_code == "automatic_identity_rejected"
+            }
+            "linked" => {
+                decision.avionics_model_id.is_some_and(|id| id > 0)
+                    && decision.reason_code == "automatic_verified_product"
+            }
+            _ => false,
+        };
+        if !valid_outcome
+            || decision.decision_reason.trim().is_empty()
+            || decision.decision_reason.len() > 500
+            || !classified.insert((decision.occurrence_index, decision.occurrence_role))
+        {
+            return Err(ReviewError::Validation(
+                "automatic review contains an invalid or duplicate occurrence disposition"
+                    .to_string(),
+            ));
+        }
+        if decision.outcome == "linked" {
+            linked.insert(
+                (decision.occurrence_index, decision.occurrence_role),
+                decision
+                    .avionics_model_id
+                    .expect("a validated linked disposition has a product id"),
+            );
+        }
+    }
+    let mut guarded = HashSet::new();
+    for guard in &request.linked_occurrence_guards {
+        let coordinate = (guard.occurrence_index, guard.occurrence_role);
+        if guard.avionics_model_id <= 0
+            || !valid_sha256(&guard.expected_collision_closure_sha256)
+            || !guarded.insert(coordinate)
+            || linked.get(&coordinate) != Some(&guard.avionics_model_id)
+        {
+            return Err(ReviewError::Validation(
+                "automatic review contains an invalid or duplicate linked-occurrence guard"
+                    .to_string(),
+            ));
+        }
+        validate_automated_authorization(
+            request.listing_id,
+            guard.avionics_model_id,
+            &guard.authorization,
+        )?;
+    }
+    if guarded.len() != linked.len() {
+        return Err(ReviewError::Validation(
+            "every linked occurrence disposition requires an exact authorization guard".to_string(),
+        ));
+    }
     if request.residual_aspects.is_empty() {
         Ok(None)
     } else {
         serialize_review_payload(&request.residual_aspects).map(Some)
     }
+}
+
+fn prepare_occurrence_dispositions<'a>(
+    request: &'a AutomatedReviewApplyRequest,
+    guard: &AutomationGuardRow,
+) -> ReviewResult<(String, Vec<PreparedOccurrenceDisposition<'a>>)> {
+    let extracted_listing_json = guard.extracted_listing_json.as_deref().ok_or_else(|| {
+        ReviewError::Stale("retained capture has no extraction checkpoint".to_string())
+    })?;
+    if guard.extraction_error.is_some() {
+        return Err(ReviewError::Stale(
+            "retained capture has an extraction error".to_string(),
+        ));
+    }
+    let occurrences = validate_current_avionics_extraction(CurrentAvionicsExtraction {
+        listing_id: request.listing_id,
+        listing_owner_user_id: guard.owner_user_id,
+        listing_source_url: guard.listing_source_url.as_deref(),
+        submission_id: request.plugin_submission_id,
+        submission_owner_user_id: guard.submission_user_id,
+        submission_canonical_listing_id: guard.submission_canonical_listing_id,
+        submission_source_url: &guard.submission_source_url,
+        rendered_html: &guard.rendered_html,
+        rendered_html_sha256: &guard.rendered_html_sha256,
+        extracted_listing_json,
+    })
+    .map_err(ReviewError::Stale)?;
+    let expected = occurrences
+        .iter()
+        .enumerate()
+        .flat_map(|(index, occurrence)| {
+            let mut components = vec![(index, OccurrenceRole::Primary)];
+            if occurrence.replaces.is_some() {
+                components.push((index, OccurrenceRole::Replacement));
+            }
+            components
+        })
+        .collect::<HashSet<_>>();
+    let pending = request
+        .residual_aspects
+        .iter()
+        .filter_map(|aspect| coordinates_from_aspect_id(&aspect.id))
+        .collect::<HashSet<_>>();
+    let extraction_hash = extraction_sha256(extracted_listing_json);
+    let mut prepared = Vec::with_capacity(request.occurrence_dispositions.len());
+    for decision in &request.occurrence_dispositions {
+        let component = (decision.occurrence_index, decision.occurrence_role);
+        if !expected.contains(&component) {
+            return Err(ReviewError::Validation(
+                "automatic disposition names a nonexistent retained occurrence component"
+                    .to_string(),
+            ));
+        }
+        if pending.contains(&component) {
+            return Err(ReviewError::Validation(
+                "one retained occurrence component cannot be both pending and terminal".to_string(),
+            ));
+        }
+        prepared.push(PreparedOccurrenceDisposition {
+            decision,
+            occurrence_fingerprint: occurrence_fingerprint(
+                &extraction_hash,
+                decision.occurrence_index,
+                decision.occurrence_role,
+            )
+            .map_err(ReviewError::Validation)?,
+            listing_evidence_text: occurrences[decision.occurrence_index]
+                .source_evidence_text
+                .clone()
+                .expect("the canonical retained-extraction parser requires occurrence evidence"),
+        });
+    }
+    Ok((extraction_hash, prepared))
 }
 
 fn graph_key(
@@ -732,7 +898,9 @@ pub(crate) async fn apply_automated_avionics_review(
           submission.source_url AS submission_source_url,
           submission.canonical_listing_id AS submission_canonical_listing_id,
           submission.rendered_html,
-          submission.rendered_html_sha256
+          submission.rendered_html_sha256,
+          submission.extracted_listing_json,
+          submission.extraction_error
         FROM aircraft_sale_listings listing
         JOIN aircraft_sale_listing_pending_reviews review
           ON review.listing_id = listing.id
@@ -885,6 +1053,7 @@ pub(crate) async fn apply_automated_avionics_review(
         ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?)
         "#,
     );
+    let insert_disposition = db.sql(INSERT_DISPOSITION_SQL);
     let update_review = db.sql(
         r#"
         UPDATE aircraft_sale_listing_pending_reviews
@@ -1010,14 +1179,21 @@ pub(crate) async fn apply_automated_avionics_review(
                     "retained listing HTML changed or failed its content hash".to_string(),
                 ));
             }
-            if !request.accepted_links.is_empty()
+            if (!request.accepted_links.is_empty()
+                || !request.linked_occurrence_guards.is_empty())
                 && guard.submission_canonical_listing_id != Some(request.listing_id)
             {
                 return Err(ReviewError::Stale(
-                    "accepted listing associations require the retained submission to be bound to the exact canonical listing"
+                    "accepted listing identities require the retained submission to be bound to the exact canonical listing"
                         .to_string(),
                 ));
             }
+            let (disposition_extraction_sha256, terminal_dispositions) =
+                if request.occurrence_dispositions.is_empty() {
+                    (String::new(), Vec::new())
+                } else {
+                    prepare_occurrence_dispositions(request, &guard)?
+                };
             for link in &request.accepted_links {
                 let evidence_text = link.source_notes.as_deref().ok_or_else(|| {
                     ReviewError::Validation(format!(
@@ -1116,6 +1292,7 @@ pub(crate) async fn apply_automated_avionics_review(
             let mut identity_cache = BTreeMap::<i64, CatalogGraphIdentity>::new();
             let mut required_model_ids = BTreeSet::new();
             let mut authorization_by_model = BTreeMap::new();
+            let mut expected_collision_closure_by_model = BTreeMap::new();
             for link in &request.accepted_links {
                 required_model_ids.insert(link.avionics_model_id);
                 if authorization_by_model
@@ -1124,6 +1301,18 @@ pub(crate) async fn apply_automated_avionics_review(
                 {
                     return Err(ReviewError::Conflict(format!(
                         "catalog id {} has conflicting automatic authorization proofs",
+                        link.avionics_model_id
+                    )));
+                }
+                if expected_collision_closure_by_model
+                    .insert(
+                        link.avionics_model_id,
+                        link.expected_collision_closure_sha256.clone(),
+                    )
+                    .is_some_and(|existing| existing != link.expected_collision_closure_sha256)
+                {
+                    return Err(ReviewError::Conflict(format!(
+                        "catalog id {} has conflicting automatic collision revisions",
                         link.avionics_model_id
                     )));
                 }
@@ -1142,6 +1331,45 @@ pub(crate) async fn apply_automated_avionics_review(
                             "replacement catalog id {target} has conflicting automatic authorization proofs"
                         )));
                     }
+                    let expected = link
+                        .expected_replacement_collision_closure_sha256
+                        .as_ref()
+                        .expect("validated replacement has a collision revision")
+                        .clone();
+                    if expected_collision_closure_by_model
+                        .insert(target, expected.clone())
+                        .is_some_and(|existing| existing != expected)
+                    {
+                        return Err(ReviewError::Conflict(format!(
+                            "replacement catalog id {target} has conflicting automatic collision revisions"
+                        )));
+                    }
+                }
+            }
+            for guard in &request.linked_occurrence_guards {
+                required_model_ids.insert(guard.avionics_model_id);
+                if authorization_by_model
+                    .insert(guard.avionics_model_id, guard.authorization.clone())
+                    .is_some_and(|existing| existing != guard.authorization)
+                {
+                    return Err(ReviewError::Conflict(format!(
+                        "linked occurrence catalog id {} has conflicting automatic authorization proofs",
+                        guard.avionics_model_id
+                    )));
+                }
+                if expected_collision_closure_by_model
+                    .insert(
+                        guard.avionics_model_id,
+                        guard.expected_collision_closure_sha256.clone(),
+                    )
+                    .is_some_and(|existing| {
+                        existing != guard.expected_collision_closure_sha256
+                    })
+                {
+                    return Err(ReviewError::Conflict(format!(
+                        "linked occurrence catalog id {} has conflicting automatic collision revisions",
+                        guard.avionics_model_id
+                    )));
                 }
             }
             let active_collision_catalog_rows =
@@ -1255,25 +1483,34 @@ pub(crate) async fn apply_automated_avionics_review(
                     }
                 }
             }
-            for link in &request.accepted_links {
-                if collision_closures.get(&link.avionics_model_id)
-                    != Some(&link.expected_collision_closure_sha256)
+            for linked_guard in &request.linked_occurrence_guards {
+                if linked_guard.authorization
+                    != AutomatedAssociationAuthorization::GlobalExactModelReuse
                 {
-                    return Err(ReviewError::Stale(format!(
-                        "active avionics collision catalog changed after automatic identity resolution for catalog id {}",
-                        link.avionics_model_id
-                    )));
+                    continue;
                 }
-                if let Some(target_id) = link.replaces_avionics_model_id {
-                    let expected = link
-                        .expected_replacement_collision_closure_sha256
-                        .as_ref()
-                        .expect("replacement validation requires its collision revision");
-                    if collision_closures.get(&target_id) != Some(expected) {
-                        return Err(ReviewError::Stale(format!(
-                            "active avionics collision catalog changed after automatic identity resolution for replacement catalog id {target_id}"
-                        )));
-                    }
+                let identity = identity_cache
+                    .get(&linked_guard.avionics_model_id)
+                    .expect("linked occurrence identity was loaded");
+                let evidence = terminal_dispositions
+                    .iter()
+                    .find(|prepared| {
+                        prepared.decision.occurrence_index == linked_guard.occurrence_index
+                            && prepared.decision.occurrence_role == linked_guard.occurrence_role
+                    })
+                    .expect("a validated linked occurrence guard has a terminal disposition");
+                require_current_global_exact_model_reuse(
+                    &active_collision_catalog_rows,
+                    linked_guard.avionics_model_id,
+                    &identity.model,
+                    Some(&evidence.listing_evidence_text),
+                )?;
+            }
+            for (model_id, expected) in &expected_collision_closure_by_model {
+                if collision_closures.get(model_id) != Some(expected) {
+                    return Err(ReviewError::Stale(format!(
+                        "active avionics collision catalog changed after automatic identity resolution for catalog id {model_id}"
+                    )));
                 }
             }
 
@@ -1622,6 +1859,36 @@ pub(crate) async fn apply_automated_avionics_review(
                 }
             }
 
+            // Terminal garbage classifications belong to the exact retained
+            // extraction. Commit their immutable receipts before replacing or
+            // deleting the pending-review bundle so no successful apply can
+            // erase the only durable explanation for a discarded occurrence.
+            for prepared_disposition in &terminal_dispositions {
+                let decision = prepared_disposition.decision;
+                let inserted = sqlx::query(&insert_disposition)
+                    .bind(request.listing_id)
+                    .bind(request.plugin_submission_id)
+                    .bind(disposition_extraction_sha256.as_str())
+                    .bind(decision.occurrence_index as i64)
+                    .bind(decision.occurrence_role.as_str())
+                    .bind(prepared_disposition.occurrence_fingerprint.as_str())
+                    .bind(decision.outcome)
+                    .bind(decision.avionics_model_id)
+                    .bind(decision.reason_code)
+                    .bind(decision.decision_reason)
+                    .bind("automatic")
+                    .bind(guard.owner_user_id)
+                    .bind(DISPOSITION_POLICY_VERSION)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if inserted != 1 {
+                    return Err(ReviewError::Conflict(
+                        "retained occurrence already has a terminal disposition".to_string(),
+                    ));
+                }
+            }
+
             let (review_payload_sha256, stored_catalog_revision, ingestion_state) =
                 if let Some(serialized) = &serialized_residual {
                     let changed = sqlx::query(&update_review)
@@ -1877,15 +2144,18 @@ mod tests {
             Garmin GMA 340, Garmin GTN 650Xi, Garmin GNS 530W, and Garmin Unverified Unit.
             GIA-63W NAV/COM/GPS with Glideslope.
             Garmin GTN 750Xi replaces Garmin GNS 530W.
+            Garmin Autopilot.
+            <p>Garmin Test Unit installed</p>
         </body></html>"#;
         let rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
         let submission_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
+              rendered_html_sha256, signature_base64, canonical_listing_id,
+              extracted_listing_json
             ) VALUES (?, ?, 'https://broker.example/listing', ?, ?,
-                      'test-signature', ?)
+                      'test-signature', ?, ?)
             RETURNING id
             "#,
         )
@@ -1894,6 +2164,7 @@ mod tests {
         .bind(rendered_html)
         .bind(&rendered_html_sha256)
         .bind(listing_id)
+        .bind(r#"{"avionics":[{"manufacturer":"Garmin","model":"Test Unit","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin Test Unit installed","source_confidence":"high"}]}"#)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -2028,6 +2299,8 @@ mod tests {
             expected_faa_snapshot_id: fixture.faa_snapshot_id,
             expected_faa_source_record_sha256: fixture.faa_source_record_sha256.clone(),
             accepted_links,
+            occurrence_dispositions: Vec::new(),
+            linked_occurrence_guards: Vec::new(),
             residual_aspects,
         }
     }
@@ -2100,6 +2373,48 @@ mod tests {
         link
     }
 
+    async fn linked_only_request(
+        fixture: &mut Fixture,
+        model_id: i64,
+    ) -> AutomatedReviewApplyRequest {
+        let rendered_html = "<p>Garmin GPS replaces Garmin Test Unit</p>";
+        fixture.rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
+        let extracted_listing_json = r#"{"avionics":[{"manufacturer":"Garmin","model":"GPS","types":["GPS"],"quantity":1,"configuration_action":"replaces","replaces":{"manufacturer":"Garmin","model":"Test Unit","types":["GPS"]},"source_evidence_text":"Garmin GPS replaces Garmin Test Unit","source_confidence":"high"}]}"#;
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET rendered_html = ?, rendered_html_sha256 = ?,
+                extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ?
+            "#,
+        )
+        .bind(rendered_html)
+        .bind(&fixture.rendered_html_sha256)
+        .bind(extracted_listing_json)
+        .bind(fixture.submission_id)
+        .execute(pool(&fixture.db))
+        .await
+        .unwrap();
+
+        let expected_collision_closure_sha256 =
+            super::super::active_collision_closure_revision_sha256(&fixture.db, model_id)
+                .await
+                .unwrap();
+        let mut apply_request = request(fixture, Vec::new(), Vec::new());
+        apply_request.occurrence_dispositions = vec![
+            AutomaticOccurrenceDisposition::discarded(0, OccurrenceRole::Primary),
+            AutomaticOccurrenceDisposition::linked(0, OccurrenceRole::Replacement, model_id),
+        ];
+        apply_request.linked_occurrence_guards = vec![AutomatedLinkedOccurrenceGuard {
+            occurrence_index: 0,
+            occurrence_role: OccurrenceRole::Replacement,
+            avionics_model_id: model_id,
+            authorization: AutomatedAssociationAuthorization::ManufacturerReuse,
+            expected_collision_closure_sha256,
+        }];
+        apply_request
+    }
+
     #[tokio::test]
     async fn same_case_grounded_authorization_accepts_without_global_reuse() {
         let fixture = fixture().await;
@@ -2165,6 +2480,235 @@ mod tests {
             );
         assert_eq!(replayed.preserved_link_count, 1);
         assert_eq!(replayed.stored_link_count, 1);
+    }
+
+    #[tokio::test]
+    async fn automatic_apply_persists_hash_bound_discard_before_clearing_review() {
+        let fixture = fixture().await;
+        let mut apply_request = request(&fixture, Vec::new(), Vec::new());
+        apply_request.occurrence_dispositions = vec![AutomaticOccurrenceDisposition::discarded(
+            0,
+            OccurrenceRole::Primary,
+        )];
+
+        let result = apply_automated_avionics_review(&fixture.db, &apply_request)
+            .await
+            .expect("a valid exact generic discard should commit atomically");
+        assert_eq!(result.ingestion_state, "incomplete");
+        assert_eq!(result.residual_aspect_count, 0);
+
+        let stored: (String, String, String, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT extraction_sha256, occurrence_fingerprint, outcome, avionics_model_id
+            FROM aircraft_sale_listing_avionics_dispositions
+            WHERE aircraft_sale_listing_id = ?
+              AND plugin_submission_id = ?
+              AND occurrence_index = 0
+              AND occurrence_role = 'primary'
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(fixture.submission_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(stored.0.len(), 64);
+        assert_eq!(stored.1.len(), 64);
+        assert_eq!(stored.2, "discarded");
+        assert_eq!(stored.3, None);
+
+        let owner_user_id: i64 = sqlx::query_scalar(
+            "SELECT created_by_user_id FROM aircraft_sale_listings WHERE id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        let reconciled =
+            crate::listing::avionics::disposition::reconcile_current_occurrence_dispositions(
+                &fixture.db,
+                fixture.listing_id,
+                fixture.submission_id,
+                owner_user_id,
+                false,
+            )
+            .await
+            .expect("the reconciler should recognize the committed terminal receipt");
+        assert_eq!(reconciled.already_recorded_count, 1);
+        assert_eq!(reconciled.unknown_count, 0);
+    }
+
+    #[tokio::test]
+    async fn linked_only_occurrence_rejects_revoked_reuse_atomically() {
+        let mut fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let apply_request = linked_only_request(&mut fixture, model_id).await;
+
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(model_id)
+            .execute(pool(&fixture.db))
+            .await
+            .unwrap();
+
+        let error = apply_automated_avionics_review(&fixture.db, &apply_request)
+            .await
+            .expect_err("linked-only products must retain their prepared reuse authorization");
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message)
+                if message.contains("lost its manufacturer-primary reuse authorization")
+        ));
+        let state: (i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions
+               WHERE aircraft_sale_listing_id = ?),
+              (SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews
+               WHERE listing_id = ?),
+              ingestion_state
+            FROM aircraft_sale_listings
+            WHERE id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(fixture.listing_id)
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(state, (0, 1, "pending_review".to_string()));
+    }
+
+    #[tokio::test]
+    async fn linked_only_occurrence_rejects_stale_catalog_revision_atomically() {
+        let mut fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let apply_request = linked_only_request(&mut fixture, model_id).await;
+
+        let vor_type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('VOR', 'vor') RETURNING id",
+        )
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(vor_type_id)
+        .execute(pool(&fixture.db))
+        .await
+        .unwrap();
+
+        let error = apply_automated_avionics_review(&fixture.db, &apply_request)
+            .await
+            .expect_err("linked-only products must retain their prepared catalog revision");
+        assert!(matches!(error, ReviewError::Stale(_)));
+        let state: (i64, i64, String) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions
+               WHERE aircraft_sale_listing_id = ?),
+              (SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews
+               WHERE listing_id = ?),
+              ingestion_state
+            FROM aircraft_sale_listings
+            WHERE id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .bind(fixture.listing_id)
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(state, (0, 1, "pending_review".to_string()));
+    }
+
+    #[tokio::test]
+    async fn linked_only_global_exact_model_reuse_rechecks_uniqueness_atomically() {
+        let mut fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let mut apply_request = linked_only_request(&mut fixture, model_id).await;
+        apply_request.linked_occurrence_guards[0].authorization =
+            AutomatedAssociationAuthorization::GlobalExactModelReuse;
+
+        let pool = pool(&fixture.db);
+        let collision_manufacturer_key =
+            normalize_avionics_manufacturer_name("Other Avionics Maker");
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Other Avionics Maker', ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(&collision_manufacturer_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        let collision_manufacturer_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?")
+                .bind(&collision_manufacturer_key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier
+            ) VALUES (?, 'Test Unit', ?, 'manufacturer_model_number',
+                      'OTHER-TEST-UNIT', 'othertestunit')
+            "#,
+        )
+        .bind(collision_manufacturer_id)
+        .bind(normalize_avionics_model_name("Test Unit"))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = apply_automated_avionics_review(&fixture.db, &apply_request)
+            .await
+            .expect_err(
+                "linked-only global model reuse must rerun uniqueness under the write lock",
+            );
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("global exact-model reuse")
+        ));
+
+        let receipt_counts: (i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions
+               WHERE aircraft_sale_listing_id = ?),
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations)
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_counts, (0, 0));
+
+        let review_state: (i64, String, String) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*), MAX(review_payload_sha256), MAX(ingestion_state)
+            FROM aircraft_sale_listing_pending_reviews review
+            JOIN aircraft_sale_listings listing ON listing.id = review.listing_id
+            WHERE review.listing_id = ?
+            "#,
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            review_state,
+            (
+                1,
+                fixture.review_payload_sha256.clone(),
+                "pending_review".to_string(),
+            )
+        );
     }
 
     #[tokio::test]
