@@ -42,8 +42,9 @@ use crate::gemini::curation::workflow::{
 use crate::gemini::interactions::FetchedSourceDocument;
 use crate::listing::evidence::ListingEvidenceContext;
 use crate::normalize::{
-    is_generic_avionics_manufacturer_name, is_usable_avionics_label, normalize_avionics_identifier,
-    normalize_avionics_manufacturer_name, normalize_avionics_model_name, normalize_name,
+    is_generic_avionics_manufacturer_name, is_generic_avionics_model_name,
+    is_usable_avionics_label, normalize_avionics_identifier, normalize_avionics_manufacturer_name,
+    normalize_avionics_model_name, normalize_name,
 };
 
 const CANDIDATE_LIMIT: usize = 16;
@@ -933,49 +934,22 @@ pub(crate) async fn resolve_avionics_identity_for_review_preflight(
     )
 }
 
-/// Run only the single tools-disabled generic-label discard gate for a raw
-/// current-schema observation that failed deterministic product-label
-/// validation.
+/// Reject an observed model only when its complete typography-normalized label
+/// is one of the server-owned generic equipment categories.
 ///
-/// This boundary deliberately has no database, local-match, Search, or catalog
-/// write path. The caller retains every result except the same exact-shape,
-/// very-high-confidence generic rejection accepted by ordinary identity
-/// resolution.
-pub(crate) async fn classify_invalid_generic_avionics_observation(
-    extractor: &GeminiListingExtractor,
+/// This policy deliberately does not inspect manufacturer names, capability
+/// types, substrings, or similar catalog products. Callers must validate the
+/// surrounding observation before treating the result as terminal.
+pub(crate) fn deterministic_generic_avionics_rejection_reason(
     request: &AvionicsIdentityRequest,
 ) -> Option<String> {
-    if request.manufacturer.trim().is_empty()
-        || request.model.trim().is_empty()
-        || request.avionics_types.is_empty()
-        || request
-            .avionics_types
-            .iter()
-            .any(|avionics_type| avionics_type.trim().is_empty())
-        || request.quantity < 1
-    {
+    if !is_generic_avionics_model_name(&request.model) {
         return None;
     }
-    let context = AvionicsUnitResolutionContext {
-        aircraft_manufacturer: request.aircraft_manufacturer.clone(),
-        aircraft_model: request.aircraft_model.clone(),
-        aircraft_variant: request.aircraft_variant.clone(),
-        model_year: request.model_year,
-        source_url: request.source_url.clone(),
-        listing_context: request.listing_context.clone(),
-        requires_listing_evidence: request.requires_listing_evidence,
-        authoritative_direct_source_urls: Vec::new(),
-        authoritative_identity_anchors: Vec::new(),
-        candidate_triage_hint: None,
-        candidate: AvionicsUnitResolutionCandidate {
-            manufacturer: request.manufacturer.clone(),
-            model: request.model.clone(),
-            avionics_types: request.avionics_types.clone(),
-            quantity: request.quantity,
-        },
-        catalog_candidates: Vec::new(),
-    };
-    classify_generic_concreteness_rejection(extractor, &context).await
+    let observed_identity = format!("{} {}", request.manufacturer.trim(), request.model.trim());
+    Some(format!(
+        "observed avionics {observed_identity:?} has an exact normalized model label from the curated generic equipment-category vocabulary and does not identify one concrete product"
+    ))
 }
 
 /// Persist a current-policy reuse attestation for an already-approved product
@@ -2041,6 +2015,14 @@ async fn resolve_avionics_identity_with_write_mode(
         return Ok(AvionicsIdentityOutcome::Unresolved {
             reason: "candidate is missing an avionics capability observation".to_string(),
         });
+    }
+    if request.quantity < 1 {
+        return Ok(AvionicsIdentityOutcome::Unresolved {
+            reason: "candidate quantity must be at least one".to_string(),
+        });
+    }
+    if let Some(reason) = deterministic_generic_avionics_rejection_reason(request) {
+        return Ok(AvionicsIdentityOutcome::Rejected { reason });
     }
     let explicit_direct_source_plan =
         explicit_authoritative_direct_source_plan(db, request).await?;
@@ -6182,6 +6164,11 @@ async fn persist_approved_identity(
     identity: &VerifiedIdentity,
     reviewed_catalog_fingerprint: &str,
 ) -> CatalogResult<ApprovedAvionicsIdentity> {
+    if !is_usable_avionics_label(&identity.canonical_manufacturer, &identity.canonical_model) {
+        return Err(CatalogError::Validation(
+            "cannot approve a generic avionics manufacturer or model label".to_string(),
+        ));
+    }
     if identity.canonical_types.is_empty() {
         return Err(CatalogError::Validation(
             "cannot persist an avionics product without a canonical capability".to_string(),
@@ -6628,6 +6615,7 @@ mod tests {
         canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
         collision_correction_plan, collision_response_issues,
         collision_reviews_with_direct_source_proofs, complete_manufacturer_collision_family,
+        deterministic_generic_avionics_rejection_reason,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
@@ -6912,6 +6900,137 @@ mod tests {
             ],
             "notes": "No single model designation is present."
         })
+    }
+
+    #[test]
+    fn deterministic_generic_rejection_uses_only_the_complete_normalized_model_label() {
+        let mut request = local_request("XM Weather & Radio");
+        request.manufacturer = "Garmin".to_string();
+        request.model = "XM Weather &amp; Radio".to_string();
+        request.avionics_types = vec!["Datalink".to_string()];
+
+        let reason = deterministic_generic_avionics_rejection_reason(&request)
+            .expect("an exact curated generic category should be rejected");
+        assert!(reason.contains("Garmin XM Weather &amp; Radio"));
+        assert!(reason.contains("exact normalized model label"));
+
+        for concrete_model in [
+            "GPS150",
+            "WX500",
+            "GDL69A XM Receiver",
+            "AHRS-200",
+            "TAWS-B",
+        ] {
+            request.model = concrete_model.to_string();
+            assert!(
+                deterministic_generic_avionics_rejection_reason(&request).is_none(),
+                "{concrete_model} is a concrete model-shaped label, not an exact generic category"
+            );
+        }
+
+        request.manufacturer = "Avionics".to_string();
+        request.model = "GPS150".to_string();
+        assert!(
+            deterministic_generic_avionics_rejection_reason(&request).is_none(),
+            "a generic manufacturer label must not discard a concrete model"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_generic_identity_rejects_before_provider_or_catalog_writes() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let before: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM avionics_manufacturers),
+              (SELECT COUNT(*) FROM avionics_models),
+              (SELECT COUNT(*) FROM avionics_approved_product_identities),
+              (SELECT COUNT(*) FROM avionics_product_reuse_attestations)
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("catalog counts should load");
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Garmin".to_string(),
+            model: "XM Weather & Radio".to_string(),
+            avionics_types: vec!["Datalink".to_string()],
+            listing_context: "XM Weather & Radio".to_string(),
+            ..local_request("")
+        };
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        let outcome = resolve_avionics_identity(&db, &extractor, &request)
+            .await
+            .expect("exact generic rejection must not contact the unreachable provider");
+        assert!(matches!(outcome, AvionicsIdentityOutcome::Rejected { .. }));
+
+        let mut invalid_approved_identity = verified_identity();
+        invalid_approved_identity.canonical_model = "XM Weather & Radio".to_string();
+        invalid_approved_identity.manufacturer_identifier = "XM Weather & Radio".to_string();
+        let approval_error = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &invalid_approved_identity,
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .expect_err("the approval write boundary must enforce the concrete-product invariant");
+        assert!(approval_error
+            .to_string()
+            .contains("cannot approve a generic avionics"));
+
+        let after: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              (SELECT COUNT(*) FROM avionics_manufacturers),
+              (SELECT COUNT(*) FROM avionics_models),
+              (SELECT COUNT(*) FROM avionics_approved_product_identities),
+              (SELECT COUNT(*) FROM avionics_product_reuse_attestations)
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("catalog counts should load");
+        assert_eq!(
+            after, before,
+            "deterministic discard must not mutate the catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_generic_quantity_remains_unresolved_without_provider_or_writes() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let mut request = local_request("TAWS");
+        request.model = "TAWS".to_string();
+        request.avionics_types = vec!["Terrain Awareness".to_string()];
+        request.quantity = 0;
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        let outcome = resolve_avionics_identity(&db, &extractor, &request)
+            .await
+            .expect("malformed quantity must not contact the unreachable provider");
+        assert!(matches!(
+            outcome,
+            AvionicsIdentityOutcome::Unresolved { ref reason }
+                if reason.contains("quantity must be at least one")
+        ));
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let model_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
+            .fetch_one(pool)
+            .await
+            .expect("catalog count should load");
+        assert_eq!(model_count, 0);
     }
 
     #[test]
@@ -10143,6 +10262,28 @@ mod tests {
             identity.canonical_types,
             vec!["GPS".to_string(), "Transponder".to_string()]
         );
+    }
+
+    #[test]
+    fn approved_identity_invariant_rejects_a_curated_generic_model_label() {
+        let response = json!({
+            "canonical_manufacturer": "Garmin",
+            "canonical_model": "XM Weather & Radio",
+            "canonical_types": ["Datalink"],
+            "manufacturer_identifier_kind": "manufacturer_model_number",
+            "manufacturer_identifier": "XM Weather & Radio",
+            "manufacturer_identifier_scope": "exact_catalog_product",
+            "identity_source_url": "https://www.garmin.com/aviation/",
+            "identity_source_title": "Garmin aviation",
+            "identity_evidence": "Garmin documents satellite weather and radio services.",
+            "reason": "The source describes a service category."
+        });
+
+        let error = verified_identity_from_response(&response)
+            .expect_err("a generic category must never become an approved catalog identity");
+        assert!(error
+            .to_string()
+            .contains("must name one concrete manufacturer and model"));
     }
 
     #[test]

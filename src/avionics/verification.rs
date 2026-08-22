@@ -7,7 +7,7 @@ use sqlx::FromRow;
 
 use crate::aircraft::faa::require_listing_faa_admission;
 use crate::avionics::catalog::{
-    classify_invalid_generic_avionics_observation, plan_avionics_identity_verification_route,
+    deterministic_generic_avionics_rejection_reason, plan_avionics_identity_verification_route,
     preview_avionics_identity, resolve_avionics_identity_for_automated_review,
     resolve_verified_local_avionics_identity, unique_exact_avionics_review_candidate,
     ApprovedAvionicsIdentity, AvionicsExistingCatalogScope, AvionicsIdentityOutcome,
@@ -21,6 +21,7 @@ use crate::extract::GeminiListingExtractor;
 use crate::gemini::interactions::RetryPolicy;
 use crate::gemini::usage::SourceCorrelation;
 use crate::html::clean::clean_listing_html;
+use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::extraction::{
     parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
     validate_current_avionics_identity_evidence,
@@ -33,7 +34,8 @@ use crate::listing::evidence::{identity_span_has_boundaries, ListingEvidenceCont
 use crate::listing::review::automation::{
     apply_automated_avionics_review, unrelated_preserved_avionics_blocker,
     validate_automated_avionics_link, AutomatedAssociationAuthorization, AutomatedAvionicsLink,
-    AutomatedPreservedAssociationGuard, AutomatedReviewApplyRequest,
+    AutomatedLinkedOccurrenceGuard, AutomatedPreservedAssociationGuard,
+    AutomatedReviewApplyRequest,
 };
 use crate::listing::review::{
     active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
@@ -199,7 +201,6 @@ pub struct AvionicsProviderRequestPlan {
     pub grounded_initial_identity_components: usize,
     pub grounded_conditional_relationship_components: usize,
     pub generic_invalid_identity_components: usize,
-    pub generic_invalid_classifier_provider_requests: usize,
     pub initial_grounded_provider_requests_baseline: usize,
     pub initial_grounded_provider_requests_nonpositive_validation_envelope: usize,
     pub positive_identity_provider_requests_baseline: usize,
@@ -796,57 +797,79 @@ async fn preflight_listing(
             report.invalid_retained_observations += 1;
             continue;
         }
-        if generic_model_issue(raw).is_some() {
-            report.invalid_retained_observations += 1;
-            report.generic_invalid_identity_components += 1;
-            continue;
-        }
-        let primary_plan = match preflight_identity_component(
-            db,
+        let primary_identity = IdentityInput {
+            manufacturer: &raw.manufacturer,
+            model: &raw.model,
+            avionics_types: &raw.avionics_types,
+            quantity: raw.quantity,
+        };
+        let primary_request = identity_request(
             row,
             row.submission_source_url.as_deref(),
             &listing_context,
-            IdentityInput {
-                manufacturer: &raw.manufacturer,
-                model: &raw.model,
-                avionics_types: &raw.avionics_types,
-                quantity: raw.quantity,
-            },
+            &primary_identity,
             raw.source_evidence_text.as_deref(),
-        )
-        .await
-        {
-            Ok(plan) => plan,
-            Err(error) => {
-                report.note = format!("verified-local identity preflight failed: {error}");
-                return report;
+        );
+        let primary_is_generic =
+            deterministic_generic_avionics_rejection_reason(&primary_request).is_some();
+        let replacement_is_generic = raw.replaces.as_ref().is_some_and(|replacement| {
+            let replacement_identity = IdentityInput {
+                manufacturer: &replacement.manufacturer,
+                model: &replacement.model,
+                avionics_types: &replacement.avionics_types,
+                quantity: 1,
+            };
+            let replacement_request = identity_request(
+                row,
+                row.submission_source_url.as_deref(),
+                &listing_context,
+                &replacement_identity,
+                raw.source_evidence_text.as_deref(),
+            );
+            deterministic_generic_avionics_rejection_reason(&replacement_request).is_some()
+        });
+        if primary_is_generic || replacement_is_generic {
+            report.invalid_retained_observations += 1;
+            report.generic_invalid_identity_components +=
+                usize::from(primary_is_generic) + usize::from(replacement_is_generic);
+        }
+        let primary_plan = if primary_is_generic {
+            None
+        } else {
+            match preflight_identity_component(
+                db,
+                row,
+                row.submission_source_url.as_deref(),
+                &listing_context,
+                primary_identity,
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(plan) => {
+                    report.retained_identity_components += 1;
+                    add_preflight_identity_route(&mut report, plan.route, false);
+                    if plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal {
+                        extend_existing_catalog_scope(
+                            &mut paid_candidate_scope,
+                            &plan.existing_catalog_scope,
+                        );
+                    }
+                    Some(plan)
+                }
+                Err(error) => {
+                    report.note = format!("verified-local identity preflight failed: {error}");
+                    return report;
+                }
             }
         };
-        report.retained_identity_components += 1;
-        match primary_plan.route {
-            AvionicsIdentityVerificationRoute::VerifiedLocal => {
-                report.verified_local_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::CandidateAdjudication => {
-                report.candidate_adjudication_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::CandidateTriage => {
-                report.candidate_triage_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::GroundedCuration => {
-                report.grounded_initial_identity_components += 1;
-            }
-        }
 
         let Some(replacement) = raw.replaces.as_ref() else {
-            if primary_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal {
-                extend_existing_catalog_scope(
-                    &mut paid_candidate_scope,
-                    &primary_plan.existing_catalog_scope,
-                );
-            }
             continue;
         };
+        if replacement_is_generic {
+            continue;
+        }
         let replacement_plan = match preflight_identity_component(
             db,
             row,
@@ -868,51 +891,21 @@ async fn preflight_listing(
                 return report;
             }
         };
-        if primary_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal
-            || replacement_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal
-        {
-            extend_existing_catalog_scope(
-                &mut paid_candidate_scope,
-                &primary_plan.existing_catalog_scope,
-            );
+        if replacement_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal {
             extend_existing_catalog_scope(
                 &mut paid_candidate_scope,
                 &replacement_plan.existing_catalog_scope,
             );
         }
         report.retained_identity_components += 1;
-        match replacement_plan.route {
-            AvionicsIdentityVerificationRoute::VerifiedLocal => {
-                report.verified_local_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::CandidateAdjudication
-                if primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
-            {
-                report.candidate_adjudication_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::CandidateAdjudication => {
-                report.candidate_adjudication_conditional_relationship_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::CandidateTriage
-                if primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
-            {
-                report.candidate_triage_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::CandidateTriage => {
-                report.candidate_triage_conditional_relationship_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::GroundedCuration
-                if primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal =>
-            {
-                // A locally approved primary cannot be rejected, so the
-                // execution path necessarily evaluates its relationship.
-                report.grounded_initial_identity_components += 1;
-            }
-            AvionicsIdentityVerificationRoute::GroundedCuration => {
-                // A rejected nonlocal primary stops before its target.
-                report.grounded_conditional_relationship_components += 1;
-            }
-        }
+        let replacement_is_conditional = primary_plan
+            .as_ref()
+            .is_some_and(|plan| plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal);
+        add_preflight_identity_route(
+            &mut report,
+            replacement_plan.route,
+            replacement_is_conditional,
+        );
     }
     if require_commit_readiness
         && (report.candidate_adjudication_identity_components > 0
@@ -920,8 +913,7 @@ async fn preflight_listing(
             || report.candidate_triage_identity_components > 0
             || report.candidate_triage_conditional_relationship_components > 0
             || report.grounded_initial_identity_components > 0
-            || report.grounded_conditional_relationship_components > 0
-            || report.generic_invalid_identity_components > 0)
+            || report.grounded_conditional_relationship_components > 0)
     {
         let candidate_graph_keys = match candidate_graph_key_envelope(db, &paid_candidate_scope)
             .await
@@ -962,7 +954,7 @@ async fn preflight_listing(
         "retained current-schema observations are ready".to_string()
     } else if report.generic_invalid_identity_components > 0 {
         format!(
-            "{} retained observation(s) are invalid; {} structurally valid generic-label observation(s) will receive one tools-disabled discard-classifier request, while every non-rejected or otherwise invalid observation remains for review",
+            "{} retained observation(s) are invalid; {} structurally valid exact generic-label observation(s) will be discarded deterministically without a provider request, while every otherwise invalid observation remains for review",
             report.invalid_retained_observations, report.generic_invalid_identity_components
         )
     } else {
@@ -972,6 +964,36 @@ async fn preflight_listing(
         )
     };
     report
+}
+
+fn add_preflight_identity_route(
+    report: &mut AvionicsVerificationPreflightListingReport,
+    route: AvionicsIdentityVerificationRoute,
+    conditional_relationship: bool,
+) {
+    match (route, conditional_relationship) {
+        (AvionicsIdentityVerificationRoute::VerifiedLocal, _) => {
+            report.verified_local_identity_components += 1;
+        }
+        (AvionicsIdentityVerificationRoute::CandidateAdjudication, false) => {
+            report.candidate_adjudication_identity_components += 1;
+        }
+        (AvionicsIdentityVerificationRoute::CandidateAdjudication, true) => {
+            report.candidate_adjudication_conditional_relationship_components += 1;
+        }
+        (AvionicsIdentityVerificationRoute::CandidateTriage, false) => {
+            report.candidate_triage_identity_components += 1;
+        }
+        (AvionicsIdentityVerificationRoute::CandidateTriage, true) => {
+            report.candidate_triage_conditional_relationship_components += 1;
+        }
+        (AvionicsIdentityVerificationRoute::GroundedCuration, false) => {
+            report.grounded_initial_identity_components += 1;
+        }
+        (AvionicsIdentityVerificationRoute::GroundedCuration, true) => {
+            report.grounded_conditional_relationship_components += 1;
+        }
+    }
 }
 
 async fn preflight_identity_component(
@@ -1064,7 +1086,6 @@ fn clear_paid_preflight_counts(report: &mut AvionicsVerificationPreflightListing
     report.candidate_triage_conditional_relationship_components = 0;
     report.grounded_initial_identity_components = 0;
     report.grounded_conditional_relationship_components = 0;
-    report.generic_invalid_identity_components = 0;
 }
 
 fn provider_request_plan(
@@ -1100,7 +1121,6 @@ fn provider_request_plan(
         grounded_initial_identity_components: grounded,
         grounded_conditional_relationship_components: conditional_grounded,
         generic_invalid_identity_components: generic_invalid,
-        generic_invalid_classifier_provider_requests: generic_invalid,
         initial_grounded_provider_requests_baseline: grounded.saturating_mul(4),
         initial_grounded_provider_requests_nonpositive_validation_envelope: grounded
             .saturating_mul(9),
@@ -1110,20 +1130,17 @@ fn provider_request_plan(
         known_total_provider_requests_minimum_baseline: reextractions
             .saturating_add(candidate)
             .saturating_add(triage)
-            .saturating_add(generic_invalid)
             .saturating_add(grounded.saturating_mul(4))
             .saturating_add(triage.saturating_mul(4)),
         known_total_provider_requests_all_positive_baseline: reextractions
             .saturating_add(all_candidate_components)
             .saturating_add(all_triage_components)
-            .saturating_add(generic_invalid)
             .saturating_add(all_grounded_components.saturating_mul(7))
             .saturating_add(all_triage_components.saturating_mul(7)),
         known_total_provider_requests_validation_envelope_maximum: reextractions
             .saturating_mul(2)
             .saturating_add(all_candidate_components)
             .saturating_add(all_triage_components)
-            .saturating_add(generic_invalid)
             .saturating_add(
                 all_grounded_components
                     .saturating_add(all_candidate_components)
@@ -1135,11 +1152,11 @@ fn provider_request_plan(
         default_max_transport_attempts_per_logical_request: usize::from(
             RetryPolicy::default().max_attempts(),
         ),
-        grounded_pass_note: "Every identity that reaches the grounded route first uses exactly one tools-disabled concreteness-classifier request. A structurally valid current-schema observation rejected locally only because its model is a generic label uses that same one-call classifier without entering the grounded route. A strict very-high-confidence generic result stops there; malformed, ambiguous, weaker, or concrete results on the invalid-observation path remain for review. The fresh grounded identity pass has three logical provider requests at baseline (Search, URL Context, structure) and at most six after per-stage validation fallbacks. One reused-evidence identity correction can raise the grounded portion to eight. Including the classifier, a positive identity and its independent collision pass use seven requests at baseline and up to fifteen in the complete validation envelope. A nonpositive grounded identity does not run collision review."
+        grounded_pass_note: "Every identity that reaches the grounded route first uses exactly one tools-disabled concreteness-classifier request. A structurally valid observation whose complete normalized model label is in the closed generic-category vocabulary is discarded deterministically without entering the provider phase. Malformed observations remain for review. The fresh grounded identity pass has three logical provider requests at baseline (Search, URL Context, structure) and at most six after per-stage validation fallbacks. One reused-evidence identity correction can raise the grounded portion to eight. Including the classifier, a positive identity and its independent collision pass use seven requests at baseline and up to fifteen in the complete validation envelope. A nonpositive grounded identity does not run collision review."
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. Each comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid generic-label observations contribute exactly one tools-disabled classifier request to every plan total and never continue to grounding from the invalid-observation path. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. When legacy_reextraction_identity_outputs_unknown is true, every known-total field is only the calls-before-extraction floor: downstream identity calls are unknown until the validated extraction is durably persisted and preflighted again, so those fields must not be presented as an end-to-end total. Correction and fallback outcomes remain unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. Each comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid exact generic-label observations use no provider request and never continue to grounding. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. When legacy_reextraction_identity_outputs_unknown is true, every known-total field is only the calls-before-extraction floor: downstream identity calls are unknown until the validated extraction is durably persisted and preflighted again, so those fields must not be presented as an end-to-end total. Correction and fallback outcomes remain unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -1363,12 +1380,63 @@ async fn process_listing(
         );
         return listing_report;
     }
+    // Keep source-array coordinates before the presentation-level numbered
+    // instance coalescer changes cardinality. Durable discard receipts are
+    // bound to the retained extraction, never to that derived work list.
+    let mut occurrence_dispositions = Vec::new();
+    let mut linked_occurrence_guards = Vec::new();
+    for (occurrence_index, raw) in raw_avionics.iter().enumerate() {
+        if raw_candidate_structure_issue(raw).is_some() {
+            continue;
+        }
+        let identity = IdentityInput {
+            manufacturer: &raw.manufacturer,
+            model: &raw.model,
+            avionics_types: &raw.avionics_types,
+            quantity: raw.quantity,
+        };
+        let primary_request = identity_request(
+            row,
+            source_url.as_deref(),
+            &listing_context,
+            &identity,
+            raw.source_evidence_text.as_deref(),
+        );
+        if deterministic_generic_avionics_rejection_reason(&primary_request).is_some() {
+            occurrence_dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                occurrence_index,
+                OccurrenceRole::Primary,
+            ));
+        }
+        if let Some(replacement) = raw.replaces.as_ref() {
+            let replacement_identity = IdentityInput {
+                manufacturer: &replacement.manufacturer,
+                model: &replacement.model,
+                avionics_types: &replacement.avionics_types,
+                quantity: 1,
+            };
+            let replacement_request = identity_request(
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                &replacement_identity,
+                raw.source_evidence_text.as_deref(),
+            );
+            if deterministic_generic_avionics_rejection_reason(&replacement_request).is_some() {
+                occurrence_dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                    occurrence_index,
+                    OccurrenceRole::Replacement,
+                ));
+            }
+        }
+    }
     let raw_avionics = coalesce_explicit_numbered_instances(raw_avionics, &listing_context);
 
-    // Route every concrete retained observation without invoking Gemini before
-    // executing any identity resolution. This lets exact local identities and
-    // their prepared-link semantics fail closed before a later candidate can
-    // spend provider requests or curate catalog state for a listing whose
+    // Route every retained observation before executing identity resolution.
+    // Structurally invalid and exact generic-category observations remain
+    // provider-free; concrete observations still let exact local identities
+    // and their prepared-link semantics fail closed before a later candidate
+    // can spend provider requests or curate catalog state for a listing whose
     // transaction cannot commit.
     let mut provider_free_candidate_indices = Vec::new();
     let mut provider_candidate_indices = Vec::new();
@@ -1379,7 +1447,54 @@ async fn process_listing(
             continue;
         }
         if generic_model_issue(raw).is_some() {
-            provider_candidate_indices.push(candidate_index);
+            let Some(replacement) = raw.replaces.as_ref() else {
+                provider_free_candidate_indices.push(candidate_index);
+                continue;
+            };
+            let replacement_identity = IdentityInput {
+                manufacturer: &replacement.manufacturer,
+                model: &replacement.model,
+                avionics_types: &replacement.avionics_types,
+                quantity: 1,
+            };
+            let replacement_request = identity_request(
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                &replacement_identity,
+                raw.source_evidence_text.as_deref(),
+            );
+            if deterministic_generic_avionics_rejection_reason(&replacement_request).is_some() {
+                provider_free_candidate_indices.push(candidate_index);
+                continue;
+            }
+            let replacement_plan = match preflight_identity_component(
+                db,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                replacement_identity,
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: provider-free replacement identity preflight failed: {error}"
+                    ));
+                    continue;
+                }
+            };
+            extend_existing_catalog_scope(
+                &mut candidate_scope,
+                &replacement_plan.existing_catalog_scope,
+            );
+            if replacement_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal {
+                provider_free_candidate_indices.push(candidate_index);
+            } else {
+                provider_candidate_indices.push(candidate_index);
+            }
             continue;
         }
         let primary_plan = match preflight_identity_component(
@@ -1407,27 +1522,39 @@ async fn process_listing(
         };
         extend_existing_catalog_scope(&mut candidate_scope, &primary_plan.existing_catalog_scope);
         let replacement_plan = if let Some(replacement) = raw.replaces.as_ref() {
-            match preflight_identity_component(
-                db,
+            let replacement_identity = IdentityInput {
+                manufacturer: &replacement.manufacturer,
+                model: &replacement.model,
+                avionics_types: &replacement.avionics_types,
+                quantity: 1,
+            };
+            let replacement_request = identity_request(
                 row,
                 source_url.as_deref(),
                 &listing_context,
-                IdentityInput {
-                    manufacturer: &replacement.manufacturer,
-                    model: &replacement.model,
-                    avionics_types: &replacement.avionics_types,
-                    quantity: 1,
-                },
+                &replacement_identity,
                 raw.source_evidence_text.as_deref(),
-            )
-            .await
-            {
-                Ok(plan) => Some(plan),
-                Err(error) => {
-                    blocking_reasons.push(format!(
+            );
+            if deterministic_generic_avionics_rejection_reason(&replacement_request).is_some() {
+                None
+            } else {
+                match preflight_identity_component(
+                    db,
+                    row,
+                    source_url.as_deref(),
+                    &listing_context,
+                    replacement_identity,
+                    raw.source_evidence_text.as_deref(),
+                )
+                .await
+                {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        blocking_reasons.push(format!(
                         "candidate {candidate_index}: provider-free replacement identity preflight failed: {error}"
                     ));
-                    continue;
+                        continue;
+                    }
                 }
             }
         } else {
@@ -1561,9 +1688,7 @@ async fn process_listing(
                 &identity,
                 raw.source_evidence_text.as_deref(),
             );
-            if let Some(reason) =
-                classify_invalid_generic_avionics_observation(&scoped_extractor, &request).await
-            {
+            if let Some(reason) = deterministic_generic_avionics_rejection_reason(&request) {
                 listing_report.candidates.push(outcome_report(
                     candidate_index,
                     "primary",
@@ -1579,6 +1704,141 @@ async fn process_listing(
                     reason,
                 ));
                 listing_report.safely_discarded += 1;
+                let Some(replacement) = raw.replaces.as_ref() else {
+                    continue;
+                };
+                let replacement_identity = IdentityInput {
+                    manufacturer: &replacement.manufacturer,
+                    model: &replacement.model,
+                    avionics_types: &replacement.avionics_types,
+                    quantity: 1,
+                };
+                let replacement_request = identity_request(
+                    row,
+                    source_url.as_deref(),
+                    &listing_context,
+                    &replacement_identity,
+                    raw.source_evidence_text.as_deref(),
+                );
+                if let Some(replacement_reason) =
+                    deterministic_generic_avionics_rejection_reason(&replacement_request)
+                {
+                    listing_report.candidates.push(outcome_report(
+                        candidate_index,
+                        "replacement",
+                        &replacement_identity,
+                        &raw.configuration_action,
+                        raw.source_evidence_text.as_deref(),
+                        raw.source_confidence.as_deref(),
+                        "rejected",
+                        None,
+                        None,
+                        None,
+                        Vec::new(),
+                        replacement_reason,
+                    ));
+                    listing_report.safely_discarded += 1;
+                    continue;
+                }
+                let mut replacement_attempt = if requires_provider {
+                    resolve_identity_attempt(
+                        db,
+                        &scoped_extractor,
+                        apply,
+                        row,
+                        source_url.as_deref(),
+                        &listing_context,
+                        candidate_index,
+                        "replacement",
+                        replacement_identity,
+                        &raw.configuration_action,
+                        raw.source_evidence_text.as_deref(),
+                        raw.source_confidence.as_deref(),
+                        catalog_statuses,
+                        &mut review_revision,
+                    )
+                    .await
+                } else {
+                    match resolve_local_only_identity_attempt(
+                        db,
+                        apply,
+                        row,
+                        source_url.as_deref(),
+                        &listing_context,
+                        candidate_index,
+                        "replacement",
+                        replacement_identity,
+                        &raw.configuration_action,
+                        raw.source_evidence_text.as_deref(),
+                        raw.source_confidence.as_deref(),
+                        catalog_statuses,
+                    )
+                    .await
+                    {
+                        Ok(Some(attempt)) => attempt,
+                        Ok(None) => {
+                            execution_order.push((candidate_index, true));
+                            continue;
+                        }
+                        Err(error) => {
+                            blocking_reasons.push(format!(
+                                "candidate {candidate_index}: provider-free replacement identity resolution failed: {error}"
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                if can_automatically_accept(&replacement_attempt, raw.source_confidence.as_deref())
+                {
+                    let avionics_model_id = replacement_attempt
+                        .approved_id
+                        .expect("approved replacement has a catalog id");
+                    occurrence_dispositions.push(AutomaticOccurrenceDisposition::linked(
+                        candidate_index,
+                        OccurrenceRole::Replacement,
+                        avionics_model_id,
+                    ));
+                    linked_occurrence_guards.push(AutomatedLinkedOccurrenceGuard {
+                        occurrence_index: candidate_index,
+                        occurrence_role: OccurrenceRole::Replacement,
+                        avionics_model_id,
+                        authorization: replacement_attempt
+                            .authorization
+                            .clone()
+                            .expect("approved replacement has an authorization"),
+                        expected_collision_closure_sha256: replacement_attempt
+                            .collision_closure_sha256
+                            .clone()
+                            .expect("approved replacement has a collision revision"),
+                    });
+                } else {
+                    if identity_is_approved(&replacement_attempt)
+                        && raw.source_confidence.as_deref() != Some("high")
+                    {
+                        mark_weak_listing_evidence(&mut replacement_attempt.report);
+                    }
+                    let aspect = replacement_residual_aspect(
+                        candidate_index,
+                        raw,
+                        replacement_attempt.report.reason.clone(),
+                        replacement_attempt.suggested_product.clone(),
+                    );
+                    match attach_unique_exact_review_candidate(
+                        db,
+                        aspect,
+                        &replacement.manufacturer,
+                        &replacement.model,
+                        &replacement.avionics_types,
+                    )
+                    .await
+                    {
+                        Ok(aspect) => residual_aspects.push(aspect),
+                        Err(error) => blocking_reasons.push(format!(
+                            "candidate {candidate_index}: exact replacement catalog review retrieval failed: {error}"
+                        )),
+                    }
+                }
+                listing_report.candidates.push(replacement_attempt.report);
                 continue;
             }
             listing_report.candidates.push(input_error_report(
@@ -1729,6 +1989,127 @@ async fn process_listing(
             avionics_types: &replacement.avionics_types,
             quantity: 1,
         };
+        let replacement_request = identity_request(
+            row,
+            source_url.as_deref(),
+            &listing_context,
+            &replacement_identity,
+            raw.source_evidence_text.as_deref(),
+        );
+        if let Some(reason) = deterministic_generic_avionics_rejection_reason(&replacement_request)
+        {
+            let mut independent_raw = raw.clone();
+            independent_raw.configuration_action = "installed".to_string();
+            independent_raw.replaces = None;
+            if can_automatically_accept(&primary, raw.source_confidence.as_deref()) {
+                let primary_id = primary
+                    .approved_id
+                    .expect("approved primary has a catalog id");
+                let primary_identity_key = primary
+                    .identity_key
+                    .clone()
+                    .expect("approved primary has a product key");
+                let is_removal = raw.configuration_action == "removes";
+                let incoming_link = PreparedLink {
+                    identity_key: primary_identity_key.clone(),
+                    avionics_model_id: primary_id,
+                    authorization: primary.authorization.clone(),
+                    expected_collision_closure_sha256: primary.collision_closure_sha256.clone(),
+                    quantity: raw.quantity,
+                    source_notes: raw.source_evidence_text.clone(),
+                    source_confidence: Some("high".to_string()),
+                    configuration_action: if is_removal {
+                        "removes".to_string()
+                    } else {
+                        "installed".to_string()
+                    },
+                    replaces_avionics_model_id: is_removal.then_some(primary_id),
+                    replacement_authorization: is_removal
+                        .then(|| primary.authorization.clone())
+                        .flatten(),
+                    replacement_identity_key: is_removal.then_some(primary_identity_key),
+                    expected_replacement_collision_closure_sha256: is_removal
+                        .then(|| primary.collision_closure_sha256.clone())
+                        .flatten(),
+                    preserved_association_guard: None,
+                };
+                if let Err(error) =
+                    merge_prepared_link_for_candidate(&mut prepared, incoming_link, &mut primary)
+                {
+                    blocking_reasons.push(format!("candidate {candidate_index}: {error}"));
+                }
+            } else {
+                let suggested_id = primary
+                    .suggested_product
+                    .as_ref()
+                    .and_then(|product| product.id);
+                let self_removal_aspect_id = (raw.configuration_action == "removes"
+                    && suggested_id.is_none())
+                .then(|| {
+                    ReviewAspectId::String(format!("avionics:{candidate_index}:removal-product"))
+                });
+                let mut aspect = primary_residual_aspect(
+                    candidate_index,
+                    if raw.configuration_action == "removes" {
+                        raw
+                    } else {
+                        &independent_raw
+                    },
+                    primary.report.reason.clone(),
+                    primary.suggested_product.clone(),
+                    self_removal_aspect_id.clone(),
+                );
+                if raw.configuration_action == "removes" {
+                    aspect.replaces_product_id = suggested_id;
+                }
+                match attach_unique_exact_review_candidate(
+                    db,
+                    aspect,
+                    &raw.manufacturer,
+                    &raw.model,
+                    &raw.avionics_types,
+                )
+                .await
+                {
+                    Ok(aspect) => {
+                        let target_suggestion = aspect.suggested_product.clone();
+                        residual_aspects.push(aspect);
+                        if let Some(self_removal_aspect_id) = self_removal_aspect_id {
+                            let mut target = primary_residual_aspect(
+                                candidate_index,
+                                &independent_raw,
+                                primary.report.reason.clone(),
+                                target_suggestion,
+                                None,
+                            );
+                            target.id = self_removal_aspect_id;
+                            target.quantity = 1;
+                            residual_aspects.push(target);
+                        }
+                    }
+                    Err(error) => blocking_reasons.push(format!(
+                        "candidate {candidate_index}: exact primary catalog review retrieval failed: {error}"
+                    )),
+                }
+            }
+            listing_report.candidates.push(primary.report);
+            listing_report.candidates.push(outcome_report(
+                candidate_index,
+                "replacement",
+                &replacement_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                "rejected",
+                None,
+                None,
+                None,
+                Vec::new(),
+                reason,
+            ));
+            listing_report.safely_discarded += 1;
+            continue;
+        }
         let mut replacement_attempt = if requires_provider {
             resolve_identity_attempt(
                 db,
@@ -1977,6 +2358,8 @@ async fn process_listing(
         expected_faa_snapshot_id: faa_grounding.snapshot.id,
         expected_faa_source_record_sha256: faa_grounding.source_record_sha256,
         accepted_links,
+        occurrence_dispositions,
+        linked_occurrence_guards,
         residual_aspects,
     };
     match apply_automated_avionics_review(db, &request).await {
@@ -4739,12 +5122,11 @@ mod tests {
             60
         );
         assert_eq!(plan.generic_invalid_identity_components, 2);
-        assert_eq!(plan.generic_invalid_classifier_provider_requests, 2);
-        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 23);
-        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 51);
+        assert_eq!(plan.known_total_provider_requests_minimum_baseline, 21);
+        assert_eq!(plan.known_total_provider_requests_all_positive_baseline, 49);
         assert_eq!(
             plan.known_total_provider_requests_validation_envelope_maximum,
-            146
+            144
         );
         assert!(plan.legacy_reextraction_identity_outputs_unknown);
         assert!(!plan.logical_provider_request_counts_include_transport_retries);
@@ -5210,7 +5592,7 @@ mod tests {
     }
 
     #[test]
-    fn structurally_valid_generic_labels_are_eligible_for_the_discard_classifier() {
+    fn only_exact_structurally_valid_generic_labels_are_deterministic_discards() {
         for model in ["TAWS", "XM Weather & Radio", "Active Traffic", "AHRS"] {
             let raw = ParsedAvionics {
                 manufacturer: "Garmin".to_string(),
@@ -5225,13 +5607,38 @@ mod tests {
 
             assert!(raw_candidate_structure_issue(&raw).is_none());
             let issue = generic_model_issue(&raw)
-                .expect("a generic label must be eligible for classifier review");
+                .expect("an exact generic label must be eligible for deterministic discard");
             assert!(issue.contains("rather than a specific avionics product"));
+        }
+
+        for model in [
+            "GPS 150",
+            "WX 500",
+            "GDL 69A XM Receiver",
+            "AHRS-200",
+            "TAWS-B",
+        ] {
+            let raw = ParsedAvionics {
+                manufacturer: "Garmin".to_string(),
+                model: model.to_string(),
+                avionics_types: vec!["Navigation".to_string()],
+                quantity: 1,
+                configuration_action: "installed".to_string(),
+                replaces: None,
+                source_evidence_text: Some(model.to_string()),
+                source_confidence: Some("high".to_string()),
+            };
+
+            assert!(raw_candidate_structure_issue(&raw).is_none());
+            assert!(
+                generic_model_issue(&raw).is_none(),
+                "concrete product {model} must continue through normal identity resolution"
+            );
         }
     }
 
     #[test]
-    fn malformed_generic_labels_bypass_the_classifier_and_remain_for_review() {
+    fn malformed_generic_labels_bypass_deterministic_discard_and_remain_for_review() {
         let raw = ParsedAvionics {
             manufacturer: "Garmin".to_string(),
             model: "GPS".to_string(),
@@ -5265,7 +5672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn very_high_generic_current_observation_is_discarded_by_one_classifier_request() {
+    async fn exact_generic_current_observation_is_discarded_without_provider_requests() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let listing_id = seed_generic_listing(&db, "very-high-generic").await;
         let preflight = preflight_listing_avionics_page(
@@ -5279,84 +5686,10 @@ mod tests {
         assert_eq!(
             preflight
                 .provider_request_plan
-                .generic_invalid_classifier_provider_requests,
-            1
-        );
-        assert_eq!(
-            preflight
-                .provider_request_plan
                 .known_total_provider_requests_minimum_baseline,
-            1
+            0
         );
 
-        let (endpoint, request_count, requests, server) =
-            spawn_classifier_endpoint("very_high").await;
-        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
-        let report = verify_listing_avionics_page(
-            &db,
-            &extractor,
-            AvionicsVerificationExecutionMode::Preview,
-            &AvionicsVerificationScope::new(1, Some(listing_id), None),
-        )
-        .await
-        .unwrap();
-        server.abort();
-
-        let listing = &report.listings[0];
-        assert_eq!(listing.status, "previewed");
-        assert_eq!(listing.safely_discarded, 1);
-        assert_eq!(listing.remaining_review_aspects, 0);
-        assert_eq!(listing.candidates.len(), 1);
-        assert_eq!(listing.candidates[0].status, "rejected");
-        assert!(listing.candidates[0].resolution_attempted);
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].get("tools").is_none());
-        let prompt = requests[0]["contents"][0]["parts"][0]["text"]
-            .as_str()
-            .unwrap();
-        assert!(prompt.contains("GARMIN"));
-        assert!(prompt.contains("GPS"));
-    }
-
-    #[tokio::test]
-    async fn weaker_generic_classification_stays_in_review_without_grounding() {
-        let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        let listing_id = seed_generic_listing(&db, "high-generic").await;
-        let (endpoint, request_count, _requests, server) = spawn_classifier_endpoint("high").await;
-        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
-        let report = verify_listing_avionics_page(
-            &db,
-            &extractor,
-            AvionicsVerificationExecutionMode::Preview,
-            &AvionicsVerificationScope::new(1, Some(listing_id), None),
-        )
-        .await
-        .unwrap();
-        server.abort();
-
-        let listing = &report.listings[0];
-        assert_eq!(listing.status, "previewed");
-        assert_eq!(listing.safely_discarded, 0);
-        assert_eq!(listing.remaining_review_aspects, 1);
-        assert_eq!(listing.candidates.len(), 1);
-        assert_eq!(listing.candidates[0].status, "error");
-        assert!(!listing.candidates[0].resolution_attempted);
-        assert!(listing.candidates[0]
-            .reason
-            .contains("rather than a specific avionics product"));
-        assert_eq!(
-            request_count.load(Ordering::SeqCst),
-            1,
-            "a non-terminal classifier answer must remain pending without opening grounded calls"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_generic_classifier_request_stays_in_review() {
-        let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        let listing_id = seed_generic_listing(&db, "failed-generic-classifier").await;
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let report = verify_listing_avionics_page(
             &db,
@@ -5369,11 +5702,425 @@ mod tests {
 
         let listing = &report.listings[0];
         assert_eq!(listing.status, "previewed");
-        assert_eq!(listing.safely_discarded, 0);
-        assert_eq!(listing.remaining_review_aspects, 1);
+        assert_eq!(listing.safely_discarded, 1);
+        assert_eq!(listing.remaining_review_aspects, 0);
         assert_eq!(listing.candidates.len(), 1);
-        assert_eq!(listing.candidates[0].status, "error");
-        assert!(!listing.candidates[0].resolution_attempted);
+        assert_eq!(listing.candidates[0].status, "rejected");
+        assert!(listing.candidates[0].resolution_attempted);
+
+        let applied = verify_listing_avionics_page(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.listings[0].status, "applied");
+        let disposition: (String, Option<i64>) = sqlx::query_as(
+            r#"
+            SELECT outcome, avionics_model_id
+            FROM aircraft_sale_listing_avionics_dispositions
+            WHERE aircraft_sale_listing_id = ?
+              AND occurrence_index = 0
+              AND occurrence_role = 'primary'
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(disposition, ("discarded".to_string(), None));
+        let usage: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(usage, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_primary_keeps_concrete_replacement_on_its_independent_local_path() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let replacement_id = seed_approved_named_product_for_manufacturer(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "GNS 430W",
+            "GNS-430W",
+            "GPS",
+        )
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        for action in ["replaces", "removes"] {
+            let listing_id = seed_generic_primary_with_concrete_replacement_listing(
+                &db,
+                &format!("generic-primary-concrete-replacement-{action}"),
+                action,
+                "GNS 430W",
+            )
+            .await;
+            let preflight = preflight_listing_avionics_page(
+                &db,
+                &AvionicsVerificationScope::new(1, Some(listing_id), None),
+            )
+            .await
+            .unwrap();
+            let preflight_listing = &preflight.listings[0];
+            assert_eq!(preflight_listing.generic_invalid_identity_components, 1);
+            assert_eq!(preflight_listing.retained_identity_components, 1);
+            assert_eq!(preflight_listing.verified_local_identity_components, 1);
+            assert_eq!(
+                preflight
+                    .provider_request_plan
+                    .known_total_provider_requests_validation_envelope_maximum,
+                0
+            );
+
+            let applied = verify_listing_avionics_page(
+                &db,
+                &extractor,
+                AvionicsVerificationExecutionMode::Apply,
+                &AvionicsVerificationScope::new(1, Some(listing_id), None),
+            )
+            .await
+            .unwrap();
+
+            let listing = &applied.listings[0];
+            assert_eq!(listing.status, "applied");
+            assert_eq!(listing.safely_discarded, 1);
+            assert_eq!(listing.remaining_review_aspects, 0);
+            assert_eq!(listing.candidates.len(), 2);
+            assert_eq!(listing.candidates[0].role, "primary");
+            assert_eq!(listing.candidates[0].status, "rejected");
+            assert_eq!(listing.candidates[1].role, "replacement");
+            assert_eq!(listing.candidates[1].status, "existing");
+            let dispositions: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+                r#"
+            SELECT occurrence_role, outcome, avionics_model_id
+            FROM aircraft_sale_listing_avionics_dispositions
+            WHERE aircraft_sale_listing_id = ?
+            ORDER BY occurrence_role
+            "#,
+            )
+            .bind(listing_id)
+            .fetch_all(sqlite_pool(&db))
+            .await
+            .unwrap();
+            assert_eq!(
+                dispositions,
+                vec![
+                    ("primary".to_string(), "discarded".to_string(), None),
+                    (
+                        "replacement".to_string(),
+                        "linked".to_string(),
+                        Some(replacement_id),
+                    ),
+                ]
+            );
+            let usage: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            assert_eq!(usage, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn concrete_primary_keeps_local_link_when_replacement_is_generic() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let primary_id = seed_approved_named_product_for_manufacturer(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "GNS 430W",
+            "GNS-430W",
+            "GPS",
+        )
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        for action in ["replaces", "removes"] {
+            let listing_id = seed_concrete_primary_with_generic_replacement_listing(
+                &db,
+                &format!("concrete-primary-generic-replacement-{action}"),
+                action,
+            )
+            .await;
+            let preflight = preflight_listing_avionics_page(
+                &db,
+                &AvionicsVerificationScope::new(1, Some(listing_id), None),
+            )
+            .await
+            .unwrap();
+            let preflight_listing = &preflight.listings[0];
+            assert_eq!(preflight_listing.generic_invalid_identity_components, 1);
+            assert_eq!(preflight_listing.retained_identity_components, 1);
+            assert_eq!(preflight_listing.verified_local_identity_components, 1);
+            assert_eq!(
+                preflight
+                    .provider_request_plan
+                    .known_total_provider_requests_validation_envelope_maximum,
+                0
+            );
+            let applied = verify_listing_avionics_page(
+                &db,
+                &extractor,
+                AvionicsVerificationExecutionMode::Apply,
+                &AvionicsVerificationScope::new(1, Some(listing_id), None),
+            )
+            .await
+            .unwrap();
+
+            let listing = &applied.listings[0];
+            assert_eq!(listing.status, "applied");
+            assert_eq!(listing.accepted, 1);
+            assert_eq!(listing.safely_discarded, 1);
+            assert_eq!(listing.remaining_review_aspects, 0);
+            assert_eq!(listing.candidates.len(), 2);
+            assert_eq!(listing.candidates[0].role, "primary");
+            assert_eq!(listing.candidates[0].status, "existing");
+            assert_eq!(listing.candidates[1].role, "replacement");
+            assert_eq!(listing.candidates[1].status, "rejected");
+            let link: (i64, String, Option<i64>) = sqlx::query_as(
+                r#"
+            SELECT avionics_model_id, configuration_action,
+                   replaces_avionics_model_id
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            assert_eq!(
+                link,
+                (
+                    primary_id,
+                    if action == "removes" {
+                        "removes".to_string()
+                    } else {
+                        "installed".to_string()
+                    },
+                    (action == "removes").then_some(primary_id),
+                )
+            );
+            let replacement_disposition: (String, Option<i64>) = sqlx::query_as(
+                r#"
+            SELECT outcome, avionics_model_id
+            FROM aircraft_sale_listing_avionics_dispositions
+            WHERE aircraft_sale_listing_id = ?
+              AND occurrence_index = 0
+              AND occurrence_role = 'replacement'
+            "#,
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            assert_eq!(replacement_disposition, ("discarded".to_string(), None));
+            let usage: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            assert_eq!(usage, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_relationship_routes_only_the_concrete_nonlocal_role_unconditionally() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (endpoint, request_count, requests, server) =
+            spawn_classifier_endpoint("very_high").await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let mut expected_requests = 0;
+
+        for action in ["replaces", "removes"] {
+            for generic_role in [OccurrenceRole::Primary, OccurrenceRole::Replacement] {
+                let suffix = format!("nonlocal-{}-generic-{}", generic_role.as_str(), action);
+                let listing_id = match generic_role {
+                    OccurrenceRole::Primary => {
+                        seed_generic_primary_with_concrete_replacement_listing(
+                            &db, &suffix, action, "GNS 530W",
+                        )
+                        .await
+                    }
+                    OccurrenceRole::Replacement => {
+                        seed_concrete_primary_with_generic_replacement_listing(&db, &suffix, action)
+                            .await
+                    }
+                };
+
+                let preflight = preflight_listing_avionics_page(
+                    &db,
+                    &AvionicsVerificationScope::new(1, Some(listing_id), None),
+                )
+                .await
+                .unwrap();
+                let listing = &preflight.listings[0];
+                assert_eq!(listing.status, "ready_retained_observations");
+                assert_eq!(listing.generic_invalid_identity_components, 1);
+                assert_eq!(listing.invalid_retained_observations, 1);
+                assert_eq!(listing.retained_identity_components, 1);
+                assert_eq!(listing.verified_local_identity_components, 0);
+                assert_eq!(listing.grounded_initial_identity_components, 1);
+                assert_eq!(listing.grounded_conditional_relationship_components, 0);
+                assert_eq!(
+                    preflight
+                        .provider_request_plan
+                        .initial_grounded_provider_requests_baseline,
+                    4
+                );
+                assert_eq!(
+                    preflight
+                        .provider_request_plan
+                        .known_total_provider_requests_minimum_baseline,
+                    4
+                );
+                assert_eq!(
+                    preflight
+                        .provider_request_plan
+                        .known_total_provider_requests_all_positive_baseline,
+                    7
+                );
+
+                let preview = verify_listing_avionics_page(
+                    &db,
+                    &extractor,
+                    AvionicsVerificationExecutionMode::Preview,
+                    &AvionicsVerificationScope::new(1, Some(listing_id), None),
+                )
+                .await
+                .unwrap();
+                expected_requests += 1;
+                assert_eq!(request_count.load(Ordering::SeqCst), expected_requests);
+                let expected_reported_attempts =
+                    usize::from(generic_role == OccurrenceRole::Primary) + 1;
+                assert_eq!(
+                    preview.summary.identity_resolution_attempts,
+                    expected_reported_attempts
+                );
+                assert_eq!(preview.summary.rejected, expected_reported_attempts);
+            }
+        }
+        server.abort();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), expected_requests);
+        assert!(requests
+            .iter()
+            .all(|request| request.get("tools").is_none()));
+    }
+
+    #[tokio::test]
+    async fn generic_relationship_paid_readiness_scope_contains_only_the_nonlocal_concrete_role() {
+        for action in ["replaces", "removes"] {
+            for generic_role in [OccurrenceRole::Primary, OccurrenceRole::Replacement] {
+                let db = AppDb::connect("sqlite::memory:").await.unwrap();
+                let (listing_id, blocker_id) = match generic_role {
+                    OccurrenceRole::Primary => {
+                        seed_manufacturer_identity_only(
+                            &db,
+                            "BendixKing",
+                            "https://www.bendixking.com",
+                        )
+                        .await;
+                        let blocker_id = seed_approved_named_product_for_manufacturer(
+                            &db,
+                            false,
+                            "Garmin",
+                            "https://www.garmin.com",
+                            "GNS 430W",
+                            "GNS-430W",
+                            "GPS",
+                        )
+                        .await;
+                        let listing_id = seed_relationship_listing(
+                            &db,
+                            &format!("scope-generic-primary-{action}"),
+                            action,
+                            "Garmin",
+                            "GPS",
+                            "BendixKing",
+                            "KX 999",
+                        )
+                        .await;
+                        (listing_id, blocker_id)
+                    }
+                    OccurrenceRole::Replacement => {
+                        seed_manufacturer_identity_only(&db, "Garmin", "https://www.garmin.com")
+                            .await;
+                        let blocker_id = seed_approved_named_product_for_manufacturer(
+                            &db,
+                            false,
+                            "BendixKing",
+                            "https://www.bendixking.com",
+                            "KX 155",
+                            "KX-155",
+                            "GPS",
+                        )
+                        .await;
+                        let listing_id = seed_relationship_listing(
+                            &db,
+                            &format!("scope-generic-replacement-{action}"),
+                            action,
+                            "Garmin",
+                            "GNS 999",
+                            "BendixKing",
+                            "GPS",
+                        )
+                        .await;
+                        (listing_id, blocker_id)
+                    }
+                };
+                sqlx::query(
+                    r#"
+                    INSERT INTO aircraft_sale_listing_avionics (
+                      aircraft_sale_listing_id, avionics_model_id, quantity,
+                      source, source_notes, source_confidence,
+                      configuration_action
+                    ) VALUES (?, ?, 1, 'listing', 'unrelated preserved blocker',
+                              'high', 'installed')
+                    "#,
+                )
+                .bind(listing_id)
+                .bind(blocker_id)
+                .execute(sqlite_pool(&db))
+                .await
+                .unwrap();
+
+                let preflight = preflight_listing_avionics(
+                    &db,
+                    listing_id,
+                    AvionicsVerificationExecutionMode::Apply,
+                )
+                .await
+                .unwrap();
+                let ListingAvionicsVerificationPreflight::PendingReview { report } = preflight
+                else {
+                    panic!("the listing should remain in review")
+                };
+                assert_eq!(report.status, "blocked");
+                assert_eq!(report.generic_invalid_identity_components, 1);
+                assert_eq!(report.grounded_initial_identity_components, 0);
+                assert_eq!(report.grounded_conditional_relationship_components, 0);
+                assert!(report.note.contains(&format!(
+                    "preserved avionics catalog id {blocker_id} has neither current manufacturer-reuse nor same-case grounded authorization"
+                )));
+            }
+        }
     }
 
     #[test]
@@ -6868,11 +7615,19 @@ mod tests {
         assert_eq!(report.status, "blocked");
         assert!(report.error.as_deref().is_some_and(|error| error
             .contains("conflicting action, replacement, or collision-closure semantics")));
-        assert_eq!(report.candidates.len(), 2);
+        assert_eq!(report.candidates.len(), 3);
         assert!(report
             .candidates
             .iter()
-            .all(|candidate| candidate.candidate_index == 1));
+            .any(|candidate| { candidate.candidate_index == 0 && candidate.status == "rejected" }));
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.candidate_index == 1)
+                .count(),
+            2
+        );
         let stored_link_id: i64 = sqlx::query_scalar(
             "SELECT id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
         )
@@ -6892,7 +7647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_preserved_link_blocks_paid_candidate_and_preflight() {
+    async fn provider_free_generic_skips_paid_preflight_before_preserved_link_apply_guard() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let product_id = seed_approved_suggestion_product(&db, true).await;
         let (listing_id, link_id, preserved_aspect_id) = seed_preserved_association_listing(
@@ -7000,13 +7755,9 @@ mod tests {
         let ListingAvionicsVerificationPreflight::PendingReview { report } = apply_preflight else {
             panic!("the listing should remain in review")
         };
-        assert_eq!(report.status, "blocked");
-        assert!(report
-            .note
-            .contains("automatic verification is unavailable"));
-        assert!(report.note.contains(&format!(
-            "preserved avionics catalog id {product_id} has neither current manufacturer-reuse nor same-case grounded authorization"
-        )));
+        assert_eq!(report.status, "ready_retained_observations");
+        assert_eq!(report.generic_invalid_identity_components, 1);
+        assert!(report.note.contains("discarded deterministically"));
         let page_preflight = preflight_listing_avionics_page(
             &db,
             &AvionicsVerificationScope::new(1, Some(listing_id), None),
@@ -8375,6 +9126,79 @@ mod tests {
         listing_id
     }
 
+    async fn seed_generic_primary_with_concrete_replacement_listing(
+        db: &AppDb,
+        suffix: &str,
+        action: &str,
+        replacement_model: &str,
+    ) -> i64 {
+        seed_relationship_listing(
+            db,
+            suffix,
+            action,
+            "GARMIN",
+            "GPS",
+            "GARMIN",
+            replacement_model,
+        )
+        .await
+    }
+
+    async fn seed_concrete_primary_with_generic_replacement_listing(
+        db: &AppDb,
+        suffix: &str,
+        action: &str,
+    ) -> i64 {
+        seed_relationship_listing(db, suffix, action, "GARMIN", "GNS 430W", "GARMIN", "GPS").await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_relationship_listing(
+        db: &AppDb,
+        suffix: &str,
+        action: &str,
+        primary_manufacturer: &str,
+        primary_model: &str,
+        replacement_manufacturer: &str,
+        replacement_model: &str,
+    ) -> i64 {
+        let source_url = format!("https://example.test/listing/{suffix}");
+        let listing_id = seed_listing(db, &source_url).await;
+        seed_faa_admission(db, listing_id).await;
+        let evidence = format!(
+            "{primary_manufacturer} {primary_model} {action} {replacement_manufacturer} {replacement_model}"
+        );
+        let rendered_html = format!("<p>{evidence}</p>");
+        let extracted = serde_json::json!({
+            "avionics": [{
+                "manufacturer": primary_manufacturer,
+                "model": primary_model,
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": action,
+                "replaces": {
+                    "manufacturer": replacement_manufacturer,
+                    "model": replacement_model,
+                    "types": ["GPS"]
+                },
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]
+        })
+        .to_string();
+        seed_submission_and_review(
+            db,
+            listing_id,
+            &source_url,
+            &rendered_html,
+            Some(&extracted),
+            Some(listing_id),
+            None,
+        )
+        .await;
+        listing_id
+    }
+
     async fn seed_faa_admission(db: &AppDb, listing_id: i64) {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
@@ -8474,6 +9298,75 @@ mod tests {
         manufacturer: &str,
         source_origin: &str,
     ) -> i64 {
+        let sequence: i64 = sqlx::query_scalar("SELECT COUNT(*) + 1 FROM avionics_models")
+            .fetch_one(sqlite_pool(db))
+            .await
+            .unwrap();
+        let model = if manufacturer == "Garmin" {
+            format!("GI 275 TEST {sequence}")
+        } else {
+            format!("{manufacturer} DISPLAY TEST {sequence}")
+        };
+        let identifier = if manufacturer == "Garmin" {
+            format!("GI-275-TEST-{sequence}")
+        } else {
+            format!(
+                "{}-DISPLAY-TEST-{sequence}",
+                normalize_avionics_manufacturer_name(manufacturer).to_uppercase()
+            )
+        };
+        seed_approved_named_product_for_manufacturer(
+            db,
+            attest,
+            manufacturer,
+            source_origin,
+            &model,
+            &identifier,
+            "Flight Display",
+        )
+        .await
+    }
+
+    async fn seed_manufacturer_identity_only(db: &AppDb, manufacturer: &str, source_origin: &str) {
+        let pool = sqlite_pool(db);
+        let manufacturer_key = normalize_avionics_manufacturer_name(manufacturer);
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(manufacturer)
+        .bind(&manufacturer_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        let manufacturer_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?")
+                .bind(&manufacturer_key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        ensure_manufacturer_identity(
+            db,
+            manufacturer_id,
+            &ManufacturerIdentityEvidence {
+                source_url: format!("{source_origin}/aviation/"),
+                source_title: format!("{manufacturer} Aviation"),
+                evidence_text: format!("{manufacturer} identifies its aviation products."),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_approved_named_product_for_manufacturer(
+        db: &AppDb,
+        attest: bool,
+        manufacturer: &str,
+        source_origin: &str,
+        model: &str,
+        identifier: &str,
+        avionics_type: &str,
+    ) -> i64 {
         let pool = sqlite_pool(db);
         let manufacturer_key = normalize_avionics_manufacturer_name(manufacturer);
         sqlx::query(
@@ -8502,23 +9395,6 @@ mod tests {
         .await
         .unwrap();
 
-        let sequence: i64 = sqlx::query_scalar("SELECT COUNT(*) + 1 FROM avionics_models")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        let model = if manufacturer == "Garmin" {
-            format!("GI 275 TEST {sequence}")
-        } else {
-            format!("{manufacturer} DISPLAY TEST {sequence}")
-        };
-        let identifier = if manufacturer == "Garmin" {
-            format!("GI-275-TEST-{sequence}")
-        } else {
-            format!(
-                "{}-DISPLAY-TEST-{sequence}",
-                manufacturer_key.to_uppercase()
-            )
-        };
         let product_source_url = format!("{source_origin}/aviation/product");
         let product_id: i64 = sqlx::query_scalar(
             r#"
@@ -8535,22 +9411,21 @@ mod tests {
             "#,
         )
         .bind(manufacturer_id)
-        .bind(&model)
-        .bind(normalize_avionics_model_name(&model))
-        .bind(&identifier)
-        .bind(normalize_avionics_identifier(&identifier))
+        .bind(model)
+        .bind(normalize_avionics_model_name(model))
+        .bind(identifier)
+        .bind(normalize_avionics_identifier(identifier))
         .bind(&product_source_url)
         .bind(format!("{manufacturer} product manual"))
-        .bind(format!(
-            "{manufacturer} identifies the exact test flight display."
-        ))
+        .bind(format!("{manufacturer} identifies the exact test product."))
         .fetch_one(pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Flight Display', ?) ON CONFLICT (normalized_name) DO NOTHING",
+            "INSERT INTO avionics_types (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
         )
-        .bind(normalize_name("Flight Display"))
+        .bind(avionics_type)
+        .bind(normalize_name(avionics_type))
         .execute(pool)
         .await
         .unwrap();
@@ -8561,7 +9436,7 @@ mod tests {
             "#,
         )
         .bind(product_id)
-        .bind(normalize_name("Flight Display"))
+        .bind(normalize_name(avionics_type))
         .execute(pool)
         .await
         .unwrap();
