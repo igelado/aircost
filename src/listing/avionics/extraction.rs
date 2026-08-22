@@ -868,6 +868,11 @@ mod tests {
                 vec!["GPS", "NAV", "COM"],
             ),
             (
+                "GTN 750",
+                "Garmin GTN 750 WAAS IFR GPS/NAV/COM",
+                vec!["GPS", "NAV", "COM"],
+            ),
+            (
                 "GNS 530W",
                 "Garmin GNS 530W WAAS IFR GPS NAV COM-REBUILT 1/23",
                 vec!["GPS", "NAV", "COM"],
