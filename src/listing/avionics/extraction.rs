@@ -349,10 +349,12 @@ fn validate_current_avionics_identity_evidence_occurrence(
     );
     let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
     if !bounded_source.contains(evidence)
-        || !context_has_exact_identity(
+        || !extraction_occurrence_has_exact_identity(
             &evidence_context,
             &observation.manufacturer,
             &observation.model,
+            &observation.avionics_types,
+            evidence,
         )
     {
         return Err(format!(
@@ -360,10 +362,12 @@ fn validate_current_avionics_identity_evidence_occurrence(
         ));
     }
     if let Some(replacement) = observation.replaces.as_ref() {
-        if !context_has_exact_identity(
+        if !extraction_occurrence_has_exact_identity(
             &evidence_context,
             &replacement.manufacturer,
             &replacement.model,
+            &replacement.avionics_types,
+            evidence,
         ) {
             return Err(format!(
                 "avionics[{index}].source_evidence_text does not contain the exact replacement identity from avionics[{index}].replaces"
@@ -382,6 +386,126 @@ fn context_has_exact_identity(
         .unique_exact_product_slice(manufacturer, model)
         .is_some()
         || context.unique_exact_model_slice(model).is_some()
+}
+
+/// Admit one source annotation grammar only at the extraction boundary.
+///
+/// The strict `context_has_exact_identity` path remains the catalog-reuse
+/// contract. A standalone `WAAS` followed by an exact slash-delimited list of
+/// the observation's declared atomic capabilities is occurrence evidence, but
+/// never proof that the unqualified model is safe for local catalog reuse.
+fn extraction_occurrence_has_exact_identity(
+    context: &ListingEvidenceContext,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+    evidence: &str,
+) -> bool {
+    context_has_exact_identity(context, manufacturer, model)
+        || exact_standalone_waas_capability_annotation(
+            evidence,
+            manufacturer,
+            model,
+            avionics_types,
+        )
+}
+
+#[derive(Debug)]
+struct EvidenceIdentityToken {
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+fn evidence_identity_tokens(value: &str) -> Vec<EvidenceIdentityToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut start = None;
+    for (offset, character) in value.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            start.get_or_insert(offset);
+            current.push(character.to_ascii_lowercase());
+        } else if let Some(token_start) = start.take() {
+            tokens.push(EvidenceIdentityToken {
+                value: std::mem::take(&mut current),
+                start: token_start,
+                end: offset,
+            });
+        }
+    }
+    if let Some(token_start) = start {
+        tokens.push(EvidenceIdentityToken {
+            value: current,
+            start: token_start,
+            end: value.len(),
+        });
+    }
+    tokens
+}
+
+fn normalized_atomic_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn exact_standalone_waas_capability_annotation(
+    evidence: &str,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+) -> bool {
+    let evidence = evidence.trim();
+    let tokens = evidence_identity_tokens(evidence);
+    let identity = evidence_identity_tokens(&format!("{manufacturer} {model}"));
+    if identity.is_empty() || tokens.len() <= identity.len() + 1 {
+        return false;
+    }
+    if !tokens
+        .iter()
+        .zip(&identity)
+        .all(|(observed, expected)| observed.value == expected.value)
+        || tokens[identity.len()].value != "waas"
+    {
+        return false;
+    }
+
+    let waas = &tokens[identity.len()];
+    let prior = &tokens[identity.len() - 1];
+    let waas_separator = &evidence[prior.end..waas.start];
+    if waas_separator.is_empty() || !waas_separator.chars().all(char::is_whitespace) {
+        return false;
+    }
+
+    let capabilities = &tokens[identity.len() + 1..];
+    if capabilities.len() < 2 {
+        return false;
+    }
+    let first_separator = &evidence[waas.end..capabilities[0].start];
+    if first_separator.is_empty() || !first_separator.chars().all(char::is_whitespace) {
+        return false;
+    }
+    if capabilities
+        .windows(2)
+        .any(|pair| evidence[pair[0].end..pair[1].start].trim() != "/")
+    {
+        return false;
+    }
+
+    let declared = avionics_types
+        .iter()
+        .map(|value| normalized_atomic_label(value))
+        .collect::<BTreeSet<_>>();
+    let annotated = capabilities
+        .iter()
+        .map(|token| token.value.clone())
+        .collect::<BTreeSet<_>>();
+    !declared.contains("")
+        && annotated.len() == capabilities.len()
+        && declared.len() == avionics_types.len()
+        && declared == annotated
 }
 
 fn validate_capture_binding(extraction: CurrentAvionicsExtraction<'_>) -> Result<(), String> {
@@ -606,6 +730,9 @@ mod tests {
         for (model, evidence) in [
             ("G1000", "Garmin G1000 NXi avionics system"),
             ("G5", "Garmin G5X flight display"),
+            ("GTN 750", "Garmin GTN 750Xi GPS/NAV/COM"),
+            ("GNS 430", "Garmin GNS 430W GPS/NAV/COM"),
+            ("GTX 33", "Garmin GTX 33 ES transponder"),
         ] {
             let html = format!("<html><body><p>{evidence}</p></body></html>");
             let payload = installed("Garmin", model, evidence);
@@ -614,6 +741,51 @@ mod tests {
                 validate_unbound_current_avionics_extraction(&payload.to_string(), &html)
                     .unwrap_err()
                     .contains("candidate identity")
+            );
+        }
+    }
+
+    #[test]
+    fn visible_evidence_accepts_standalone_waas_before_declared_capabilities() {
+        let evidence = "Garmin GTN 750 WAAS GPS/NAV/COM";
+        let html = format!("<html><body><p>{evidence}</p></body></html>");
+        let mut payload = installed("Garmin", "GTN 750", evidence);
+        payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
+
+        let parsed =
+            validate_unbound_current_avionics_extraction(&payload.to_string(), &html).unwrap();
+
+        assert_eq!(parsed[0].model, "GTN 750");
+        assert_eq!(parsed[0].avionics_types, ["GPS", "NAV", "COM"]);
+    }
+
+    #[test]
+    fn standalone_waas_annotation_requires_exact_slash_delimited_declared_capabilities() {
+        for (model, evidence, avionics_types) in [
+            ("GNS 430", "Garmin GNS 430 WAAS upgraded", vec!["GPS"]),
+            ("GNS 430", "Garmin GNS 430 WAAS", vec!["GPS"]),
+            ("GNS 430", "Garmin GNS 430 WAAS GPS", vec!["GPS"]),
+            ("GTN 750", "Garmin GTN 750 WAAS random", vec!["GPS"]),
+            (
+                "GTN 750",
+                "Garmin GTN 750 WAAS GPS/NAV/COM",
+                vec!["GPS", "NAV"],
+            ),
+            (
+                "GTN 750",
+                "Garmin GTN 750 WAAS GPS NAV COM",
+                vec!["GPS", "NAV", "COM"],
+            ),
+        ] {
+            let html = format!("<html><body><p>{evidence}</p></body></html>");
+            let mut payload = installed("Garmin", model, evidence);
+            payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
+
+            assert!(
+                validate_unbound_current_avionics_extraction(&payload.to_string(), &html)
+                    .unwrap_err()
+                    .contains("candidate identity"),
+                "{evidence:?} must not cross the narrow annotation grammar"
             );
         }
     }
