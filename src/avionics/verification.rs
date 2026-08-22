@@ -12,7 +12,7 @@ use crate::avionics::catalog::{
     resolve_verified_local_avionics_identity, unique_exact_avionics_review_candidate,
     ApprovedAvionicsIdentity, AvionicsExistingCatalogScope, AvionicsIdentityOutcome,
     AvionicsIdentityRequest, AvionicsIdentityVerificationPlan, AvionicsIdentityVerificationRoute,
-    GroundedAvionicsResolutionReceipt,
+    GroundedAvionicsResolutionReceipt, VerifiedLocalReuseProof,
 };
 use crate::avionics::consolidation::PendingReviewRevisionReceipt;
 use crate::avionics::reuse::product_reuse_attestation_is_current;
@@ -3059,6 +3059,19 @@ fn identity_request(
     }
 }
 
+fn verified_local_reuse_authorization(
+    approved: &ApprovedAvionicsIdentity,
+) -> AutomatedAssociationAuthorization {
+    match approved.verified_local_reuse_proof {
+        Some(VerifiedLocalReuseProof::GlobalExactModel) => {
+            AutomatedAssociationAuthorization::GlobalExactModelReuse
+        }
+        Some(VerifiedLocalReuseProof::ManufacturerScoped) | None => {
+            AutomatedAssociationAuthorization::ManufacturerReuse
+        }
+    }
+}
+
 /// Resolve one preflight-local identity without any provider or catalog write.
 ///
 /// `None` means the exact local reuse proof changed after route planning. The
@@ -3109,6 +3122,7 @@ async fn resolve_local_only_identity_attempt(
         .await
         .map_err(|error| error.to_string())?;
     let approved_id = approved.id;
+    let reuse_authorization = verified_local_reuse_authorization(&approved);
     let mut attempt = approved_attempt(
         apply,
         candidate_index,
@@ -3122,7 +3136,7 @@ async fn resolve_local_only_identity_attempt(
         catalog_statuses,
     );
     if apply {
-        attempt.authorization = Some(AutomatedAssociationAuthorization::ManufacturerReuse);
+        attempt.authorization = Some(reuse_authorization);
         attempt.collision_closure_sha256 = Some(
             active_collision_closure_revision_sha256(db, approved_id)
                 .await
@@ -3203,6 +3217,7 @@ async fn resolve_identity_attempt(
     match outcome {
         Ok(AvionicsIdentityOutcome::Approved(approved)) => {
             let suggested_product = Some(review_product_from_approved(&approved));
+            let reuse_authorization = verified_local_reuse_authorization(&approved);
             let mut authorization = None;
             if apply && approved.id > 0 {
                 let reuse_is_current = match product_reuse_attestation_is_current(db, approved.id)
@@ -3236,7 +3251,7 @@ async fn resolve_identity_attempt(
                     }
                 };
                 if reuse_is_current {
-                    authorization = Some(AutomatedAssociationAuthorization::ManufacturerReuse);
+                    authorization = Some(reuse_authorization);
                 } else if let Some(receipt) = grounded_receipt.take().filter(|receipt| {
                     receipt.listing_id() == row.listing_id
                         && receipt.avionics_model_id() == approved.id
@@ -3328,9 +3343,10 @@ async fn resolve_identity_attempt(
             if apply {
                 if let Some(model_id) = attempt.approved_id {
                     let collision_revision = match attempt.authorization.as_ref() {
-                        Some(AutomatedAssociationAuthorization::ManufacturerReuse) => {
-                            active_collision_closure_revision_sha256(db, model_id).await
-                        }
+                        Some(
+                            AutomatedAssociationAuthorization::ManufacturerReuse
+                            | AutomatedAssociationAuthorization::GlobalExactModelReuse,
+                        ) => active_collision_closure_revision_sha256(db, model_id).await,
                         Some(AutomatedAssociationAuthorization::SameCaseGrounded(_)) => {
                             grounded_collision_closure_revision_sha256(db, model_id).await
                         }
@@ -5466,6 +5482,7 @@ mod tests {
             evidence: "Manufacturer evidence identifies the product.".to_string(),
             reason: "verified exact product".to_string(),
             grounded_claim_source_urls: Vec::new(),
+            verified_local_reuse_proof: None,
         };
         let attempt = approved_attempt(
             false,
@@ -6629,6 +6646,7 @@ mod tests {
             evidence: "Manufacturer product evidence".to_string(),
             reason: "Verified GPS capability".to_string(),
             grounded_claim_source_urls: Vec::new(),
+            verified_local_reuse_proof: None,
         };
         let transponder = ApprovedAvionicsIdentity {
             avionics_types: vec!["Transponder".to_string()],

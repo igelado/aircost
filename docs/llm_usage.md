@@ -111,11 +111,20 @@ job correlations, request fingerprint, provider counters, attempts, latency,
 validation outcome, error text, and an optional dated paid-list cost estimate.
 
 Provider counters are nullable. An explicitly reported zero is stored as zero,
-while an omitted counter remains null. Cost can be estimated only when the
-provider reports every counter required by the pricing calculation and the
+while an omitted counter remains null unless the exact request configuration
+proves that counter must be zero. Cost can be estimated only when every counter
+required by the pricing calculation is reported or exactly deduced and the
 model/tier has a dated pricing snapshot. Otherwise cost remains unknown: both
 `estimated_cost_microusd` and `pricing_snapshot_json` stay null rather than
 silently treating missing counters as zero.
+
+The request adapter records zero tool-use tokens only for a first-turn text or
+multimodal request that declared no tools, because tool input is then
+impossible. A client-managed stateless-history continuation may carry earlier
+tool calls and results even when its current tool declaration is empty, so an
+omitted counter remains unknown there. It likewise remains unknown when
+Search, URL Context, or a custom function was declared; task names and observed
+output do not substitute for the exact sent request.
 
 GenerateContent may omit `thoughtsTokenCount` when it is zero. When
 `totalTokenCount`, `promptTokenCount`, and `candidatesTokenCount` are present,
@@ -153,6 +162,19 @@ later blocked identity run resume without paying for extraction again; it does
 not persist prompts, provider envelopes, Search results, URL Context dossiers,
 or grounding evidence. Preview mode never performs this domain write, and an
 empty equipment extraction is not persisted.
+
+Before a fresh listing extraction checkpoint is stored, a narrower
+publisher-specific repair may correct typography in avionics occurrence
+evidence. It runs only for one structurally valid Controller capture with one
+exact `Avionics/Radios` field, copies one unique bounded visible span from that
+field, and changes only `source_evidence_text`. The copied span must be exactly
+equal to the model's evidence locator after case and non-alphanumeric
+typography are removed, must contain every primary and replacement identity,
+and must pass the existing full-source suffix and ambiguity gates. Exact
+visible evidence is never rewritten; distinct spellings, line joins, hidden
+text, variant suffixes, malformed fields, and non-Controller sources fail
+closed. The complete current extraction validator runs again before the
+checkpoint can be stored.
 
 ## Evidence Retention And Reuse
 

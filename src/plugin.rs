@@ -19,7 +19,9 @@ use crate::html::clean::clean_listing_html;
 use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
 };
-use crate::listing::avionics::extraction::validate_unbound_current_avionics_extraction;
+use crate::listing::avionics::extraction::{
+    recover_controller_avionics_evidence_typography, validate_unbound_current_avionics_extraction,
+};
 use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{
     create_listing_with_progress_and_occurrence_dispositions,
@@ -1404,10 +1406,33 @@ async fn extract_capture_to_current_checkpoint(
     rendered_html: &str,
     extractor: &GeminiListingExtractor,
 ) -> StoreResult<(ListingPreview, Value)> {
-    let preview = parse_listing_html(source_url, rendered_html, extractor).await?;
-    let payload = extracted_listing_payload(&preview);
-    validate_unbound_current_avionics_extraction(&payload.to_string(), rendered_html)
+    let mut preview = parse_listing_html(source_url, rendered_html, extractor).await?;
+    let mut payload = extracted_listing_payload(&preview);
+    recover_controller_avionics_evidence_typography(&mut payload, source_url, rendered_html)
         .map_err(PluginStoreError::Validation)?;
+    let validated_occurrences =
+        validate_unbound_current_avionics_extraction(&payload.to_string(), rendered_html)
+            .map_err(PluginStoreError::Validation)?;
+    if validated_occurrences.len() != preview.parsed_listing.avionics.len() {
+        return Err(PluginStoreError::Validation(
+            "avionics evidence recovery changed the occurrence structure".to_string(),
+        ));
+    }
+    for (preview_occurrence, mut validated_occurrence) in preview
+        .parsed_listing
+        .avionics
+        .iter_mut()
+        .zip(validated_occurrences)
+    {
+        let recovered_evidence = validated_occurrence.source_evidence_text.take();
+        validated_occurrence.source_evidence_text = preview_occurrence.source_evidence_text.clone();
+        if *preview_occurrence != validated_occurrence {
+            return Err(PluginStoreError::Validation(
+                "avionics evidence recovery changed a non-evidence value".to_string(),
+            ));
+        }
+        preview_occurrence.source_evidence_text = recovered_evidence;
+    }
     Ok((preview, payload))
 }
 

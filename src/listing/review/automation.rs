@@ -38,7 +38,9 @@ use super::{
     ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
     ASSOCIATION_AUTHORIZATION_POLICY_VERSION, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
-use crate::avionics::catalog::GroundedAvionicsResolutionReceipt;
+use crate::avionics::catalog::{
+    globally_unique_active_exact_model_id, GroundedAvionicsResolutionReceipt,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct AutomatedPreservedAssociationGuard {
@@ -50,6 +52,7 @@ pub(crate) struct AutomatedPreservedAssociationGuard {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AutomatedAssociationAuthorization {
     ManufacturerReuse,
+    GlobalExactModelReuse,
     SameCaseGrounded(GroundedAvionicsResolutionReceipt),
 }
 
@@ -272,6 +275,27 @@ fn validate_automated_authorization(
         }
     }
     Ok(())
+}
+
+fn require_current_global_exact_model_reuse(
+    active_catalog: &[ActiveCollisionCatalogFingerprintRow],
+    target_id: i64,
+    target_model: &str,
+    listing_evidence_text: Option<&str>,
+) -> ReviewResult<()> {
+    let remains_unique = listing_evidence_text
+        .filter(|evidence| !evidence.trim().is_empty())
+        .and_then(|evidence| {
+            globally_unique_active_exact_model_id(target_model, evidence, active_catalog)
+        })
+        == Some(target_id);
+    if remains_unique {
+        Ok(())
+    } else {
+        Err(ReviewError::Stale(format!(
+            "global exact-model reuse for avionics catalog id {target_id} is no longer unique in the active catalog"
+        )))
+    }
 }
 
 fn validate_request(
@@ -1374,7 +1398,8 @@ pub(crate) async fn apply_automated_avionics_review(
                     .get(model_id)
                     .expect("required model authorization was collected");
                 let collision_closure = match authorization {
-                    AutomatedAssociationAuthorization::ManufacturerReuse => {
+                    AutomatedAssociationAuthorization::ManufacturerReuse
+                    | AutomatedAssociationAuthorization::GlobalExactModelReuse => {
                         if !current_reuse_attested_ids.contains(model_id) {
                             return Err(ReviewError::Stale(format!(
                                 "accepted avionics catalog id {model_id} lost its manufacturer-primary reuse authorization"
@@ -1422,6 +1447,36 @@ pub(crate) async fn apply_automated_avionics_review(
                         model,
                     },
                 );
+            }
+            for link in &request.accepted_links {
+                if link.authorization
+                    == AutomatedAssociationAuthorization::GlobalExactModelReuse
+                {
+                    let identity = identity_cache
+                        .get(&link.avionics_model_id)
+                        .expect("accepted subject identity was loaded");
+                    require_current_global_exact_model_reuse(
+                        &active_collision_catalog_rows,
+                        link.avionics_model_id,
+                        &identity.model,
+                        link.source_notes.as_deref(),
+                    )?;
+                }
+                if let Some(target_id) = link.replaces_avionics_model_id {
+                    if link.replacement_authorization.as_ref()
+                        == Some(&AutomatedAssociationAuthorization::GlobalExactModelReuse)
+                    {
+                        let identity = identity_cache
+                            .get(&target_id)
+                            .expect("accepted replacement identity was loaded");
+                        require_current_global_exact_model_reuse(
+                            &active_collision_catalog_rows,
+                            target_id,
+                            &identity.model,
+                            link.source_notes.as_deref(),
+                        )?;
+                    }
+                }
             }
             for (model_id, expected) in &expected_collision_closure_by_model {
                 if collision_closures.get(model_id) != Some(expected) {
@@ -1730,7 +1785,8 @@ pub(crate) async fn apply_automated_avionics_review(
                         .get(&target_id)
                         .expect("accepted target collision closure was loaded");
                     let inserted = match authorization {
-                        AutomatedAssociationAuthorization::ManufacturerReuse => {
+                        AutomatedAssociationAuthorization::ManufacturerReuse
+                        | AutomatedAssociationAuthorization::GlobalExactModelReuse => {
                             sqlx::query(&insert_reuse_authorization)
                                 .bind(persisted.id)
                                 .bind(role_label)
@@ -3706,6 +3762,75 @@ mod tests {
                 if message.contains("collision catalog changed")
         ));
         let pool = pool(&fixture.db);
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let review_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!((link_count, review_count), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn global_exact_model_reuse_rechecks_uniqueness_after_revision_capture() {
+        let fixture = fixture().await;
+        let accepted_id = insert_product(&fixture.db, "GTX 345", "GTX345", true).await;
+        let pool = pool(&fixture.db);
+        let collision_manufacturer_key =
+            normalize_avionics_manufacturer_name("Other Avionics Maker");
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Other Avionics Maker', ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(&collision_manufacturer_key)
+        .execute(pool)
+        .await
+        .unwrap();
+        let collision_manufacturer_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?")
+                .bind(&collision_manufacturer_key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier
+            ) VALUES (?, 'GTX 345', ?, 'manufacturer_model_number',
+                      'OTHER-GTX345', 'othergtx345')
+            "#,
+        )
+        .bind(collision_manufacturer_id)
+        .bind(normalize_avionics_model_name("GTX 345"))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // This deliberately captures the ordinary collision revision after
+        // the collision exists. Before the transaction-time global predicate,
+        // that timing could incorrectly legitimize a stale model-only decision.
+        let mut accepted = accepted(&fixture.db, accepted_id).await;
+        accepted.authorization = AutomatedAssociationAuthorization::GlobalExactModelReuse;
+        let error = apply_automated_avionics_review(
+            &fixture.db,
+            &request(&fixture, vec![accepted], vec![]),
+        )
+        .await
+        .expect_err("global model-only reuse must rerun uniqueness under the write lock");
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("global exact-model reuse")
+        ));
+
         let link_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
         )

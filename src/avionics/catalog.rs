@@ -40,6 +40,7 @@ use crate::gemini::curation::workflow::{
     direct_source_product_identity_signal_is_present, SourceEvidenceProof,
 };
 use crate::gemini::interactions::FetchedSourceDocument;
+use crate::listing::evidence::ListingEvidenceContext;
 use crate::normalize::{
     is_generic_avionics_manufacturer_name, is_generic_avionics_model_name,
     is_usable_avionics_label, normalize_avionics_identifier, normalize_avionics_manufacturer_name,
@@ -302,6 +303,16 @@ pub(crate) enum ApprovedProductSourceVerificationOutcome {
     Unresolved { reason: String },
 }
 
+/// Internal proof carried from local identity resolution into the atomic
+/// listing-review boundary. Global model-only reuse must be revalidated under
+/// that transaction's catalog snapshot; manufacturer-scoped reuse follows the
+/// existing collision-closure authorization path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VerifiedLocalReuseProof {
+    ManufacturerScoped,
+    GlobalExactModel,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ApprovedAvionicsIdentity {
     pub id: i64,
@@ -319,6 +330,8 @@ pub struct ApprovedAvionicsIdentity {
     /// review input.
     #[serde(skip)]
     pub(crate) grounded_claim_source_urls: Vec<String>,
+    #[serde(skip)]
+    pub(crate) verified_local_reuse_proof: Option<VerifiedLocalReuseProof>,
 }
 
 /// One unique exact-model catalog candidate exposed to a human review.
@@ -571,6 +584,7 @@ pub(crate) fn grounded_resolution_receipt_for_test(
         evidence: "Test-only grounded identity proof".to_string(),
         reason: "test-only catalog receipt fixture".to_string(),
         grounded_claim_source_urls: Vec::new(),
+        verified_local_reuse_proof: None,
     };
     grounded_resolution_receipt(listing_id, &request, &approved)
 }
@@ -669,6 +683,48 @@ struct CatalogRow {
     catalog_status: String,
     avionics_manufacturer_identity_id: Option<i64>,
 }
+
+/// Every active catalog identity component that can block source-free reuse.
+///
+/// This projection is intentionally independent of product selectability: a
+/// generic manufacturer, missing manufacturer identity, or missing capability
+/// membership still participates in collision detection.
+#[derive(Clone, Debug, FromRow)]
+pub(crate) struct ActiveCollisionCatalogFingerprintRow {
+    pub(crate) id: i64,
+    pub(crate) catalog_status: String,
+    pub(crate) effective_manufacturer_identity_id: Option<i64>,
+    pub(crate) model: String,
+    pub(crate) manufacturer_identifier_kind: Option<String>,
+    pub(crate) manufacturer_identifier: Option<String>,
+}
+
+pub(crate) const ACTIVE_COLLISION_CATALOG_ROWS_SQL: &str = r#"
+    SELECT
+      model.id,
+      model.catalog_status,
+      effective_manufacturer.avionics_manufacturer_identity_id
+        AS effective_manufacturer_identity_id,
+      model.name AS model,
+      model.manufacturer_identifier_kind,
+      model.manufacturer_identifier
+    FROM avionics_models model
+    LEFT JOIN avionics_manufacturer_effective_memberships effective_manufacturer
+      ON effective_manufacturer.avionics_manufacturer_id =
+         model.avionics_manufacturer_id
+    LEFT JOIN avionics_model_types capability_membership
+      ON capability_membership.avionics_model_id = model.id
+    WHERE model.catalog_status IN ('approved', 'unreviewed')
+    GROUP BY
+      model.id,
+      model.catalog_status,
+      effective_manufacturer.avionics_manufacturer_identity_id,
+      model.name,
+      model.manufacturer_identifier_kind,
+      model.manufacturer_identifier
+    ORDER BY model.id,
+             effective_manufacturer.avionics_manufacturer_identity_id
+"#;
 
 #[derive(Clone, Debug)]
 struct ReviewCatalogCandidate {
@@ -1365,6 +1421,7 @@ fn deterministic_graph_approved_identity_from_source(
         evidence,
         reason: "A fresh guarded fetch from the currently admitted OEM origin carries the complete graph-approved model and stable identifier in one bounded visible structural row; the manufacturer-scoped catalog has no exact identity duplicate.".to_string(),
         grounded_claim_source_urls: vec![fetched.final_url.to_string()],
+        verified_local_reuse_proof: None,
     })
 }
 
@@ -1397,19 +1454,35 @@ pub async fn resolve_verified_local_avionics_identity(
     {
         return Ok(None);
     }
-    let Some(manufacturer_identity_id) =
-        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
-    else {
-        return Ok(None);
-    };
     let catalog = load_catalog_candidates(db).await?;
     let approved_candidates = load_known_approved_candidates(db).await?;
-    Ok(known_approved_local_match_core(
+    if let Some(manufacturer_identity_id) =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
+    {
+        if let Some(approved) = known_approved_local_match_core(
+            &request.model,
+            &request.listing_context,
+            manufacturer_identity_id,
+            &approved_candidates,
+            &catalog,
+        ) {
+            return Ok(Some(approved));
+        }
+    }
+
+    if !request.authoritative_direct_source_urls.is_empty()
+        || !request.authoritative_identity_anchors.is_empty()
+    {
+        return Ok(None);
+    }
+    let active_collision_catalog = load_active_collision_catalog_rows(db).await?;
+    Ok(globally_unique_exact_model_local_match_core(
         &request.model,
+        &request.avionics_types,
         &request.listing_context,
-        manufacturer_identity_id,
         &approved_candidates,
         &catalog,
+        &active_collision_catalog,
     ))
 }
 
@@ -1477,6 +1550,7 @@ pub(crate) async fn resolve_verified_catalog_avionics_identity(
         evidence: selected.identity_evidence.clone(),
         reason: "Reused one exact, unique graph-approved catalog product with a current reuse attestation for non-listing metadata enrichment without Gemini".to_string(),
         grounded_claim_source_urls: Vec::new(),
+        verified_local_reuse_proof: None,
     }))
 }
 
@@ -2608,6 +2682,7 @@ async fn resolve_verified_identity(
                 evidence: review.candidate_evidence.clone(),
                 reason: review.reason.clone(),
                 grounded_claim_source_urls: proposed.grounded_claim_source_urls.clone(),
+                verified_local_reuse_proof: None,
             },
         ));
     }
@@ -2751,6 +2826,16 @@ fn grounded_exact_model_consolidation_request(
 async fn load_catalog_candidates(db: &AppDb) -> CatalogResult<Vec<AvionicsCatalogCandidate>> {
     let rows = query_as_all!(db, CatalogRow, CATALOG_SELECT_SQL)?;
     Ok(catalog_candidates_from_rows(rows))
+}
+
+async fn load_active_collision_catalog_rows(
+    db: &AppDb,
+) -> CatalogResult<Vec<ActiveCollisionCatalogFingerprintRow>> {
+    Ok(query_as_all!(
+        db,
+        ActiveCollisionCatalogFingerprintRow,
+        ACTIVE_COLLISION_CATALOG_ROWS_SQL
+    )?)
 }
 
 async fn load_review_catalog_candidates(db: &AppDb) -> CatalogResult<Vec<ReviewCatalogCandidate>> {
@@ -3158,6 +3243,7 @@ async fn resolve_approved_catalog_candidate_with_gemini(
             "Matched one unchanged graph-approved catalog product through bounded Gemini listing-evidence adjudication without Search, URL Context, collision review, or catalog mutation"
                 .to_string(),
         grounded_claim_source_urls: Vec::new(),
+        verified_local_reuse_proof: None,
     }))
 }
 
@@ -3821,18 +3907,7 @@ fn known_approved_local_match_core(
         return None;
     }
 
-    let selected_manufacturer = normalize_avionics_manufacturer_name(&selected.manufacturer);
-    let selected_model = normalize_avionics_model_name(&selected.model);
-    let selected_identifier = normalize_avionics_identifier(&selected.manufacturer_identifier);
-    if candidates.iter().any(|candidate| {
-        candidate.id != selected.id
-            && ((normalize_avionics_manufacturer_name(&candidate.manufacturer)
-                == selected_manufacturer
-                && normalize_avionics_model_name(&candidate.model) == selected_model)
-                || (!selected_identifier.is_empty()
-                    && normalize_avionics_identifier(&candidate.manufacturer_identifier)
-                        == selected_identifier))
-    }) {
+    if known_approved_identity_is_duplicated(selected, candidates) {
         return None;
     }
 
@@ -3848,6 +3923,165 @@ fn known_approved_local_match_core(
         evidence: selected.identity_evidence.clone(),
         reason: match_reason.to_string(),
         grounded_claim_source_urls: Vec::new(),
+        verified_local_reuse_proof: Some(VerifiedLocalReuseProof::ManufacturerScoped),
+    })
+}
+
+/// Resolve one listing occurrence by model alone only when the active catalog
+/// proves that the exact label has a single possible product identity.
+///
+/// This fallback runs only after manufacturer-scoped reuse fails. The observed
+/// manufacturer is therefore treated solely as an unsupported extraction hint:
+/// it never scopes candidates or breaks a tie. Catalog uniqueness is resolved
+/// globally before capabilities are considered, and the selected row must also
+/// be the one graph-approved product carrying a current reuse attestation.
+fn globally_unique_exact_model_local_match_core(
+    observed_model: &str,
+    observed_types: &[String],
+    listing_evidence_text: &str,
+    candidates: &[KnownApprovedAvionicsCandidate],
+    catalog: &[AvionicsCatalogCandidate],
+    active_collision_catalog: &[ActiveCollisionCatalogFingerprintRow],
+) -> Option<ApprovedAvionicsIdentity> {
+    let observed_product_key = normalize_avionics_identifier(observed_model);
+    let selected_id = globally_unique_active_exact_model_id(
+        observed_model,
+        listing_evidence_text,
+        active_collision_catalog,
+    )?;
+
+    let exact_attested_matches = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.id == selected_id && candidate.canonical_product_key == observed_product_key
+        })
+        .collect::<Vec<_>>();
+    let [selected] = exact_attested_matches.as_slice() else {
+        return None;
+    };
+
+    let observed_type_count = observed_types.len();
+    let observed_types = canonicalize_avionics_types(observed_types);
+    if observed_types.is_empty()
+        || observed_types.len() != observed_type_count
+        || !observed_types
+            .iter()
+            .all(|capability| selected.avionics_types.contains(capability))
+    {
+        return None;
+    }
+    if catalog_identity_is_duplicated(selected, catalog)
+        || known_approved_identity_is_duplicated(selected, candidates)
+    {
+        return None;
+    }
+
+    Some(ApprovedAvionicsIdentity {
+        id: selected.id,
+        manufacturer: selected.manufacturer.clone(),
+        model: selected.model.clone(),
+        avionics_types: selected.avionics_types.clone(),
+        manufacturer_identifier_kind: selected.manufacturer_identifier_kind.clone(),
+        manufacturer_identifier: selected.manufacturer_identifier.clone(),
+        evidence_url: selected.identity_source_url.clone(),
+        evidence_title: selected.identity_source_title.clone(),
+        evidence: selected.identity_evidence.clone(),
+        reason: "Matched one globally unique exact listing model to the sole current graph-approved, reuse-attested catalog product without Gemini; the observed manufacturer hint was unsupported"
+            .to_string(),
+        grounded_claim_source_urls: Vec::new(),
+        verified_local_reuse_proof: Some(VerifiedLocalReuseProof::GlobalExactModel),
+    })
+}
+
+/// Return the sole active catalog product named by one exact, unqualified
+/// listing model occurrence.
+///
+/// This is the common decision/commit predicate for global model-only reuse.
+/// It deliberately sees every approved or unreviewed row, including generic
+/// manufacturers and products without capability memberships. Capabilities
+/// are a separate selectability condition and can never remove a collision.
+pub(crate) fn globally_unique_active_exact_model_id(
+    observed_model: &str,
+    listing_evidence_text: &str,
+    rows: &[ActiveCollisionCatalogFingerprintRow],
+) -> Option<i64> {
+    let observed_product_key = normalize_avionics_identifier(observed_model);
+    if observed_product_key.is_empty()
+        || ListingEvidenceContext::from_cleaned_text(listing_evidence_text)
+            .unique_exact_model_slice(observed_model)
+            .is_none()
+    {
+        return None;
+    }
+
+    let exact_ids = rows
+        .iter()
+        .filter(|row| normalize_avionics_identifier(&row.model) == observed_product_key)
+        .map(|row| row.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let [selected_id] = exact_ids.as_slice() else {
+        return None;
+    };
+    let selected_rows = rows
+        .iter()
+        .filter(|row| row.id == *selected_id)
+        .collect::<Vec<_>>();
+    let [selected] = selected_rows.as_slice() else {
+        return None;
+    };
+    if selected.catalog_status != "approved" {
+        return None;
+    }
+
+    let selected_identifier = normalize_avionics_identifier(
+        selected
+            .manufacturer_identifier
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    if rows.iter().any(|row| {
+        if row.id == *selected_id {
+            return false;
+        }
+        let model_key = normalize_avionics_identifier(&row.model);
+        let identifier_key = normalize_avionics_identifier(
+            row.manufacturer_identifier.as_deref().unwrap_or_default(),
+        );
+        let duplicates_selected_identity = [model_key.as_str(), identifier_key.as_str()]
+            .into_iter()
+            .filter(|key| !key.is_empty())
+            .any(|key| {
+                key == observed_product_key
+                    || (!selected_identifier.is_empty() && key == selected_identifier)
+            });
+        let explicit_longer_variant = model_key.len() > observed_product_key.len()
+            && model_key.starts_with(&observed_product_key)
+            && model_numeric_runs(&model_key) == model_numeric_runs(&observed_product_key)
+            && exact_compact_identity_is_present(listing_evidence_text, &model_key);
+        duplicates_selected_identity || explicit_longer_variant
+    }) {
+        return None;
+    }
+    Some(*selected_id)
+}
+
+fn known_approved_identity_is_duplicated(
+    selected: &KnownApprovedAvionicsCandidate,
+    candidates: &[KnownApprovedAvionicsCandidate],
+) -> bool {
+    let selected_manufacturer = normalize_avionics_manufacturer_name(&selected.manufacturer);
+    let selected_model = normalize_avionics_model_name(&selected.model);
+    let selected_identifier = normalize_avionics_identifier(&selected.manufacturer_identifier);
+    candidates.iter().any(|candidate| {
+        candidate.id != selected.id
+            && ((normalize_avionics_manufacturer_name(&candidate.manufacturer)
+                == selected_manufacturer
+                && normalize_avionics_model_name(&candidate.model) == selected_model)
+                || (!selected_identifier.is_empty()
+                    && normalize_avionics_identifier(&candidate.manufacturer_identifier)
+                        == selected_identifier))
     })
 }
 
@@ -5653,6 +5887,7 @@ fn approved_identity_from_verified(
         evidence: identity.identity_evidence.clone(),
         reason: identity.reason.clone(),
         grounded_claim_source_urls: identity.grounded_claim_source_urls.clone(),
+        verified_local_reuse_proof: None,
     }
 }
 
@@ -6385,14 +6620,15 @@ mod tests {
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
         expanded_complete_triage_collision_context, explicit_authoritative_direct_source_plan,
-        generic_concreteness_rejection_reason, grounded_consolidation_preview_block,
-        known_approved_local_match, load_catalog_candidates, load_known_approved_candidates,
-        load_review_catalog_candidates, manufacturer_collision_snapshot_sha256,
-        manufacturer_scoped_catalog_candidates, model_identity_relation_score,
-        nonpositive_identity_outcome, opportunistic_authoritative_direct_source_plan,
-        persist_approved_capability_enrichment, persist_approved_identity,
-        persist_existing_reuse_attestation, plan_avionics_identity_verification_route,
-        proposal_attestation_with_direct_source_proofs,
+        generic_concreteness_rejection_reason, globally_unique_exact_model_local_match_core,
+        grounded_consolidation_preview_block, known_approved_local_match,
+        load_active_collision_catalog_rows, load_catalog_candidates,
+        load_known_approved_candidates, load_review_catalog_candidates,
+        manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
+        model_identity_relation_score, nonpositive_identity_outcome,
+        opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
+        persist_approved_identity, persist_existing_reuse_attestation,
+        plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_avionics_identity,
         resolve_verified_catalog_avionics_identity, resolve_verified_local_avionics_identity,
@@ -6401,17 +6637,18 @@ mod tests {
         shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
         stable_oem_identifier_has_placeholder, validate_authorized_direct_source_response,
         validate_collision_decision_relation, validate_evidence_values,
-        verified_identity_from_response, ApprovedAvionicsIdentity,
-        ApprovedAvionicsProductSourceRequest, ApprovedProductSourceVerification,
-        AuthoritativeDirectSourcePlan, AuthoritativeSourceHintRow, AvionicsCatalogCandidate,
-        AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationRoute,
-        AvionicsModelIdentityRelation, AvionicsUnitResolutionCandidate,
-        AvionicsUnitResolutionContext, CollisionCorrectionPlan, DirectSourceRequirement,
-        GeminiGroundingSource, GeminiGroundingSupport, GroundedJsonResponse, IdentityGroundingPlan,
-        IdentityPersistenceMode, IdentityResolutionExecution, KnownApprovedAvionicsCandidate,
+        verified_identity_from_response, ActiveCollisionCatalogFingerprintRow,
+        ApprovedAvionicsIdentity, ApprovedAvionicsProductSourceRequest,
+        ApprovedProductSourceVerification, AuthoritativeDirectSourcePlan,
+        AuthoritativeSourceHintRow, AvionicsCatalogCandidate, AvionicsIdentityOutcome,
+        AvionicsIdentityRequest, AvionicsIdentityVerificationRoute, AvionicsModelIdentityRelation,
+        AvionicsUnitResolutionCandidate, AvionicsUnitResolutionContext, CollisionCorrectionPlan,
+        DirectSourceRequirement, GeminiGroundingSource, GeminiGroundingSupport,
+        GroundedJsonResponse, IdentityGroundingPlan, IdentityPersistenceMode,
+        IdentityResolutionExecution, KnownApprovedAvionicsCandidate,
         PendingProductAttestationCommitGuard, ReviewCatalogCandidate,
-        ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, COLLISION_CANDIDATE_LIMIT,
-        COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
+        ReviewPreflightAvionicsIdentityOutcome, VerifiedIdentity, VerifiedLocalReuseProof,
+        COLLISION_CANDIDATE_LIMIT, COLLISION_STRUCTURE_CALL_BUDGET, KNOWN_APPROVED_SELECT_SQL,
     };
     use crate::avionics::manufacturer::{
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
@@ -8196,6 +8433,161 @@ mod tests {
         .expect("Garmin source authority should load")
     }
 
+    async fn seed_bendixking_source_authority_and_stec_identity(db: &AppDb) -> i64 {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        for (name, source_url, source_title, evidence_text) in [
+            (
+                "BendixKing",
+                "https://aerospace.honeywell.com/us/en/about-us",
+                "Honeywell Aerospace",
+                "Honeywell identifies BendixKing as its avionics product brand.",
+            ),
+            (
+                "S-TEC",
+                "https://genesys-aerosystems.com/about-us/",
+                "Genesys Aerosystems",
+                "Genesys identifies S-TEC as an avionics product brand.",
+            ),
+        ] {
+            let normalized_name = normalize_avionics_manufacturer_name(name);
+            sqlx::query(
+                "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+            )
+            .bind(name)
+            .bind(&normalized_name)
+            .execute(pool)
+            .await
+            .expect("test manufacturer should seed");
+            let manufacturer_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM avionics_manufacturers WHERE normalized_name = ?",
+            )
+            .bind(&normalized_name)
+            .fetch_one(pool)
+            .await
+            .expect("test manufacturer should load");
+            ensure_manufacturer_identity(
+                db,
+                manufacturer_id,
+                &ManufacturerIdentityEvidence {
+                    source_url: source_url.to_string(),
+                    source_title: source_title.to_string(),
+                    evidence_text: evidence_text.to_string(),
+                },
+            )
+            .await
+            .expect("test manufacturer identity should seed");
+        }
+
+        let bendixking_identity_id: i64 = sqlx::query_scalar(
+            r#"SELECT effective.avionics_manufacturer_identity_id
+               FROM avionics_manufacturer_effective_memberships effective
+               JOIN avionics_manufacturers manufacturer
+                 ON manufacturer.id = effective.avionics_manufacturer_id
+               WHERE manufacturer.normalized_name = 'bendixking'"#,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("BendixKing manufacturer identity should load");
+        sqlx::query(
+            r#"INSERT INTO avionics_authoritative_source_origins (
+                 authority_kind, avionics_manufacturer_identity_id, https_origin,
+                 evidence_source_url, evidence_source_title, evidence_text,
+                 approval_basis, approval_reason
+               ) VALUES (
+                 'manufacturer_primary', ?, 'https://aerospace.honeywell.com',
+                 'https://aerospace.honeywell.com/us/en/products-and-services/product/hardware-and-systems/cockpit-systems-and-displays/kap-140-autopilot',
+                 'BendixKing KAP 140 Autopilot',
+                 'BendixKing identifies the KAP 140 autopilot product.',
+                 'curated_bootstrap',
+                 'Test fixture for exact BendixKing source authority'
+               )
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(bendixking_identity_id)
+        .execute(pool)
+        .await
+        .expect("BendixKing source authority should seed");
+        bendixking_identity_id
+    }
+
+    fn bendixking_kap_140_verified_identity() -> VerifiedIdentity {
+        VerifiedIdentity {
+            canonical_manufacturer: "BendixKing".to_string(),
+            canonical_model: "KAP 140".to_string(),
+            canonical_types: vec!["Autopilot".to_string()],
+            manufacturer_identifier_kind: "manufacturer_part_number".to_string(),
+            manufacturer_identifier: "065-00176-7701".to_string(),
+            manufacturer_identifier_scope: "exact_catalog_product".to_string(),
+            identity_source_url: "https://aerospace.honeywell.com/us/en/products-and-services/product/hardware-and-systems/cockpit-systems-and-displays/kap-140-autopilot".to_string(),
+            identity_source_title: "BendixKing KAP 140 Autopilot".to_string(),
+            identity_evidence: "BendixKing identifies the KAP 140 autopilot product and manufacturer part number 065-00176-7701.".to_string(),
+            reason: "Authoritative manufacturer documentation.".to_string(),
+            grounded_claim_source_urls: vec!["https://aerospace.honeywell.com/us/en/products-and-services/product/hardware-and-systems/cockpit-systems-and-displays/kap-140-autopilot".to_string()],
+        }
+    }
+
+    async fn insert_unreviewed_exact_model_collision(
+        db: &AppDb,
+        manufacturer: &str,
+        model: &str,
+        with_capability: bool,
+    ) -> i64 {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let normalized_manufacturer = normalize_avionics_manufacturer_name(manufacturer);
+        sqlx::query(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES (?, ?) ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .bind(manufacturer)
+        .bind(&normalized_manufacturer)
+        .execute(pool)
+        .await
+        .expect("collision manufacturer should seed");
+        let manufacturer_id: i64 =
+            sqlx::query_scalar("SELECT id FROM avionics_manufacturers WHERE normalized_name = ?")
+                .bind(&normalized_manufacturer)
+                .fetch_one(pool)
+                .await
+                .expect("collision manufacturer should load");
+        let identifier = format!("{model}-COLLISION");
+        let model_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO avionics_models (
+                 avionics_manufacturer_id, name, normalized_name,
+                 manufacturer_identifier_kind, manufacturer_identifier,
+                 normalized_manufacturer_identifier
+               ) VALUES (?, ?, ?, 'manufacturer_model_number', ?, ?)
+               RETURNING id"#,
+        )
+        .bind(manufacturer_id)
+        .bind(model)
+        .bind(normalize_avionics_model_name(model))
+        .bind(&identifier)
+        .bind(normalize_avionics_identifier(&identifier))
+        .fetch_one(pool)
+        .await
+        .expect("unreviewed exact-model collision should seed");
+        if with_capability {
+            let capability_id: i64 = sqlx::query_scalar(
+                "SELECT id FROM avionics_types WHERE normalized_name = 'autopilot'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("approved KAP 140 should have seeded the Autopilot capability");
+            sqlx::query(
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+            )
+            .bind(model_id)
+            .bind(capability_id)
+            .execute(pool)
+            .await
+            .expect("collision capability should seed");
+        }
+        model_id
+    }
+
     async fn revoke_source_authority(db: &AppDb, source_origin_id: i64) {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!("test uses SQLite")
@@ -8599,6 +8991,218 @@ mod tests {
             listing_context: "GMA-1347 Digital Audio Panel w/ Intercom".to_string(),
             ..local_request("")
         }
+    }
+
+    fn bendixking_kap_140_candidates() -> (KnownApprovedAvionicsCandidate, AvionicsCatalogCandidate)
+    {
+        let mut approved = known_candidate(140, "KAP 140");
+        approved.manufacturer = "BendixKing".to_string();
+        approved.avionics_types = vec!["Autopilot".to_string()];
+        approved.manufacturer_identifier = "065-00176-7701".to_string();
+        approved.canonical_identifier_key =
+            normalize_avionics_identifier(&approved.manufacturer_identifier);
+        approved.identity_source_url =
+            "https://aerospace.honeywell.com/manuals/kap140.pdf".to_string();
+        approved.identity_source_title = "BendixKing KAP 140 manual".to_string();
+        approved.identity_evidence =
+            "The manufacturer manual identifies the BendixKing KAP 140 autopilot.".to_string();
+
+        let catalog = AvionicsCatalogCandidate {
+            id: approved.id,
+            manufacturer: approved.manufacturer.clone(),
+            model: approved.model.clone(),
+            avionics_types: approved.avionics_types.clone(),
+            manufacturer_identifier_kind: approved.manufacturer_identifier_kind.clone(),
+            manufacturer_identifier: approved.manufacturer_identifier.clone(),
+            catalog_status: "approved".to_string(),
+        };
+        (approved, catalog)
+    }
+
+    fn active_collision_row(
+        candidate: &AvionicsCatalogCandidate,
+        effective_manufacturer_identity_id: Option<i64>,
+    ) -> ActiveCollisionCatalogFingerprintRow {
+        ActiveCollisionCatalogFingerprintRow {
+            id: candidate.id,
+            catalog_status: candidate.catalog_status.clone(),
+            effective_manufacturer_identity_id,
+            model: candidate.model.clone(),
+            manufacturer_identifier_kind: Some(candidate.manufacturer_identifier_kind.clone()),
+            manufacturer_identifier: Some(candidate.manufacturer_identifier.clone()),
+        }
+    }
+
+    #[test]
+    fn globally_unique_exact_model_corrects_an_unsupported_manufacturer_hint() {
+        let (approved, catalog) = bendixking_kap_140_candidates();
+        let active_catalog = [active_collision_row(&catalog, Some(1))];
+
+        let resolved = globally_unique_exact_model_local_match_core(
+            "KAP-140",
+            &["Autopilot".to_string()],
+            "S-TEC autopilot equipment; KAP-140 installed",
+            &[approved],
+            &[catalog],
+            &active_catalog,
+        )
+        .expect("one exact globally unique attested model should ignore the wrong maker hint");
+
+        assert_eq!(resolved.id, 140);
+        assert_eq!(resolved.manufacturer, "BendixKing");
+        assert_eq!(resolved.model, "KAP 140");
+        assert_eq!(resolved.avionics_types, vec!["Autopilot"]);
+    }
+
+    #[test]
+    fn global_exact_model_reuse_rejects_suffix_family_evidence() {
+        for (model, variant, listing_context) in [
+            (
+                "GDC 74",
+                "GDC 74A",
+                "GDC 74 installed; GDC 74A air data computer",
+            ),
+            (
+                "G1000",
+                "G1000 NXi",
+                "G1000 flight deck upgraded to G1000 NXi",
+            ),
+            (
+                "GNS 430",
+                "GNS 430W",
+                "GNS 430 navigator replaced by GNS 430W",
+            ),
+        ] {
+            let approved = known_candidate(7, model);
+            let catalog = candidate(7, model, "approved");
+            let variant = candidate(8, variant, "unreviewed");
+            let active_catalog = [
+                active_collision_row(&catalog, Some(1)),
+                active_collision_row(&variant, Some(1)),
+            ];
+            assert!(
+                globally_unique_exact_model_local_match_core(
+                    model,
+                    &["Transponder".to_string()],
+                    listing_context,
+                    &[approved],
+                    &[catalog, variant],
+                    &active_catalog,
+                )
+                .is_none(),
+                "{listing_context:?} must not authorize the unqualified base model"
+            );
+        }
+    }
+
+    #[test]
+    fn global_exact_model_reuse_resolves_collisions_before_capabilities() {
+        let (approved, catalog) = bendixking_kap_140_candidates();
+        let mut unreviewed_duplicate = catalog.clone();
+        unreviewed_duplicate.id = 141;
+        unreviewed_duplicate.manufacturer = "Other Autopilot Maker".to_string();
+        unreviewed_duplicate.catalog_status = "unreviewed".to_string();
+        unreviewed_duplicate.avionics_types = vec!["Flight Director".to_string()];
+        let active_catalog = [
+            active_collision_row(&catalog, Some(1)),
+            active_collision_row(&unreviewed_duplicate, None),
+        ];
+
+        assert!(
+            globally_unique_exact_model_local_match_core(
+                "KAP 140",
+                &["Autopilot".to_string()],
+                "KAP 140 autopilot installed",
+                &[approved],
+                &[catalog, unreviewed_duplicate],
+                &active_catalog,
+            )
+            .is_none(),
+            "an unreviewed exact-model collision must block reuse even when its capabilities differ"
+        );
+    }
+
+    #[test]
+    fn global_exact_model_reuse_rejects_identifier_collisions_and_capability_mismatches() {
+        let (approved, catalog) = bendixking_kap_140_candidates();
+        let mut identifier_collision = candidate(240, "Different Product", "unreviewed");
+        identifier_collision.manufacturer_identifier = approved.manufacturer_identifier.clone();
+        let identifier_collision_catalog = [
+            active_collision_row(&catalog, Some(1)),
+            active_collision_row(&identifier_collision, Some(2)),
+        ];
+        assert!(
+            globally_unique_exact_model_local_match_core(
+                "KAP 140",
+                &["Autopilot".to_string()],
+                "KAP 140 autopilot installed",
+                &[approved.clone()],
+                &[catalog.clone(), identifier_collision],
+                &identifier_collision_catalog,
+            )
+            .is_none(),
+            "a stable-identifier collision must block exact-model reuse"
+        );
+
+        let active_catalog = [active_collision_row(&catalog, Some(1))];
+        assert!(
+            globally_unique_exact_model_local_match_core(
+                "KAP 140",
+                &["Autopilot".to_string(), "Flight Director".to_string()],
+                "KAP 140 autopilot installed",
+                &[approved],
+                &[catalog],
+                &active_catalog,
+            )
+            .is_none(),
+            "observed capabilities outside the curated product set must block reuse"
+        );
+    }
+
+    #[test]
+    fn global_exact_model_reuse_requires_approved_attested_identity_and_exact_evidence() {
+        let (approved, mut catalog) = bendixking_kap_140_candidates();
+        catalog.catalog_status = "unreviewed".to_string();
+        let unreviewed_active_catalog = [active_collision_row(&catalog, Some(1))];
+        assert!(
+            globally_unique_exact_model_local_match_core(
+                "KAP 140",
+                &["Autopilot".to_string()],
+                "KAP 140 autopilot installed",
+                &[approved.clone()],
+                &[catalog.clone()],
+                &unreviewed_active_catalog,
+            )
+            .is_none(),
+            "an unreviewed row must never be authorized by an inconsistent approved fixture"
+        );
+
+        catalog.catalog_status = "approved".to_string();
+        let approved_active_catalog = [active_collision_row(&catalog, Some(1))];
+        assert!(
+            globally_unique_exact_model_local_match_core(
+                "KAP 140",
+                &["Autopilot".to_string()],
+                "KAP 140 autopilot installed",
+                &[],
+                &[catalog.clone()],
+                &approved_active_catalog,
+            )
+            .is_none(),
+            "an approved catalog row without a current reuse-attested graph candidate must fail"
+        );
+        assert!(
+            globally_unique_exact_model_local_match_core(
+                "KAP 140",
+                &["Autopilot".to_string()],
+                "S-TEC autopilot installed",
+                &[approved],
+                &[catalog],
+                &approved_active_catalog,
+            )
+            .is_none(),
+            "catalog presence cannot replace exact listing occurrence evidence"
+        );
     }
 
     #[test]
@@ -10999,6 +11603,214 @@ mod tests {
                 .expect("local lookup should remain available")
                 .is_none(),
             "the local path requires exact server taxonomy values"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_known_manufacturer_uses_globally_unique_attested_exact_model_without_gemini() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_bendixking_source_authority_and_stec_identity(&db).await;
+        let stored = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &bendixking_kap_140_verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .expect("approved KAP 140 should seed with a current reuse attestation");
+        let request = AvionicsIdentityRequest {
+            manufacturer: "S-TEC".to_string(),
+            model: "KAP-140".to_string(),
+            avionics_types: vec!["Autopilot".to_string()],
+            listing_context: "S-TEC autopilot equipment; KAP-140 installed".to_string(),
+            ..local_request("")
+        };
+
+        let local = resolve_verified_local_avionics_identity(&db, &request)
+            .await
+            .expect("provider-free local resolution should complete")
+            .expect("the globally unique exact model should correct the unsupported maker hint");
+        assert_eq!(local.id, stored.id);
+        assert_eq!(local.manufacturer, "BendixKing");
+        assert_eq!(local.model, "KAP 140");
+        assert_eq!(local.avionics_types, vec!["Autopilot"]);
+        assert_eq!(
+            local.verified_local_reuse_proof,
+            Some(VerifiedLocalReuseProof::GlobalExactModel)
+        );
+        let missing_maker_request = AvionicsIdentityRequest {
+            manufacturer: "Unknown".to_string(),
+            listing_context: "KAP 140 autopilot installed".to_string(),
+            ..request.clone()
+        };
+        let missing_maker = resolve_verified_local_avionics_identity(&db, &missing_maker_request)
+            .await
+            .expect("a generic maker hint should remain provider-free")
+            .expect("global exact-model proof should supply the missing canonical maker");
+        assert_eq!(missing_maker.id, stored.id);
+        assert_eq!(missing_maker.manufacturer, "BendixKing");
+        assert_eq!(
+            plan_avionics_identity_verification_route(&db, &request)
+                .await
+                .expect("the route planner should reuse the same local proof")
+                .route,
+            AvionicsIdentityVerificationRoute::VerifiedLocal
+        );
+
+        let unreachable_provider = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let resolved = resolve_avionics_identity(&db, &unreachable_provider, &request)
+            .await
+            .expect("verified-local resolution must bypass the unreachable provider");
+        let AvionicsIdentityOutcome::Approved(resolved) = resolved else {
+            panic!("the verified-local exact model should be approved")
+        };
+        assert_eq!(resolved.id, stored.id);
+        assert_eq!(resolved.manufacturer, "BendixKing");
+    }
+
+    #[tokio::test]
+    async fn generic_manufacturer_exact_model_collision_blocks_global_local_reuse() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_bendixking_source_authority_and_stec_identity(&db).await;
+        persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &bendixking_kap_140_verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .expect("approved KAP 140 should seed");
+        let collision_id =
+            insert_unreviewed_exact_model_collision(&db, "Unknown", "KAP 140", true).await;
+
+        assert!(
+            !load_catalog_candidates(&db)
+                .await
+                .expect("legacy candidate projection should load")
+                .iter()
+                .any(|candidate| candidate.id == collision_id),
+            "generic manufacturer rows are intentionally unavailable for selection"
+        );
+        assert!(
+            load_active_collision_catalog_rows(&db)
+                .await
+                .expect("collision projection should load")
+                .iter()
+                .any(|candidate| candidate.id == collision_id),
+            "generic manufacturer rows must remain visible as collisions"
+        );
+
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Unknown".to_string(),
+            model: "KAP 140".to_string(),
+            avionics_types: vec!["Autopilot".to_string()],
+            listing_context: "KAP 140 autopilot installed".to_string(),
+            ..local_request("")
+        };
+        assert!(
+            resolve_verified_local_avionics_identity(&db, &request)
+                .await
+                .expect("local resolution should fail closed")
+                .is_none(),
+            "a generic unreviewed exact-model collision must defeat global reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_less_exact_model_collision_blocks_global_local_reuse() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_bendixking_source_authority_and_stec_identity(&db).await;
+        persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &bendixking_kap_140_verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .expect("approved KAP 140 should seed");
+        let collision_id =
+            insert_unreviewed_exact_model_collision(&db, "Legacy Autopilot Labs", "KAP 140", false)
+                .await;
+
+        assert!(
+            !load_catalog_candidates(&db)
+                .await
+                .expect("legacy candidate projection should load")
+                .iter()
+                .any(|candidate| candidate.id == collision_id),
+            "the selectable projection requires a capability membership"
+        );
+        assert!(
+            load_active_collision_catalog_rows(&db)
+                .await
+                .expect("collision projection should load")
+                .iter()
+                .any(|candidate| candidate.id == collision_id),
+            "capability-less rows must remain visible as identity collisions"
+        );
+
+        let request = AvionicsIdentityRequest {
+            manufacturer: "S-TEC".to_string(),
+            model: "KAP 140".to_string(),
+            avionics_types: vec!["Autopilot".to_string()],
+            listing_context: "KAP 140 autopilot installed".to_string(),
+            ..local_request("")
+        };
+        assert!(
+            resolve_verified_local_avionics_identity(&db, &request)
+                .await
+                .expect("local resolution should fail closed")
+                .is_none(),
+            "a capability-less unreviewed exact-model collision must defeat global reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn globally_unique_exact_model_still_requires_a_current_reuse_attestation() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        seed_bendixking_source_authority_and_stec_identity(&db).await;
+        let stored = persist_approved_identity(
+            &db,
+            None,
+            &[],
+            &bendixking_kap_140_verified_identity(),
+            &catalog_fingerprint(&[]),
+        )
+        .await
+        .expect("approved KAP 140 should seed");
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        sqlx::query("DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?")
+            .bind(stored.id)
+            .execute(pool)
+            .await
+            .expect("the in-memory reuse attestation should be removed");
+        let request = AvionicsIdentityRequest {
+            manufacturer: "S-TEC".to_string(),
+            model: "KAP 140".to_string(),
+            avionics_types: vec!["Autopilot".to_string()],
+            listing_context: "KAP 140 autopilot installed".to_string(),
+            ..local_request("")
+        };
+
+        assert!(
+            resolve_verified_local_avionics_identity(&db, &request)
+                .await
+                .expect("provider-free lookup should fail closed")
+                .is_none(),
+            "global catalog uniqueness cannot substitute for a current reuse attestation"
         );
     }
 
