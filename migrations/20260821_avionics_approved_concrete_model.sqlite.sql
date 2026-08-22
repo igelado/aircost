@@ -5,8 +5,34 @@ CREATE TABLE IF NOT EXISTS schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL,
   contract_fingerprint TEXT NOT NULL,
-  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (length(trim(migration_name)) > 0),
+  CHECK (typeof(contract_version) = 'integer' AND contract_version > 0),
+  CHECK (length(contract_fingerprint) = 64),
+  CHECK (contract_fingerprint = lower(contract_fingerprint)),
+  CHECK (contract_fingerprint NOT GLOB '*[^0-9a-f]*')
 );
+
+DROP TABLE IF EXISTS temp.avionics_approved_concrete_model_migration_guard;
+CREATE TEMP TABLE avionics_approved_concrete_model_migration_guard (
+  accepted INTEGER NOT NULL CHECK (accepted = 1)
+);
+INSERT INTO avionics_approved_concrete_model_migration_guard (accepted)
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260821_avionics_approved_concrete_model'
+  )
+  OR EXISTS (
+    SELECT 1 FROM schema_migration_contracts
+    WHERE migration_name = '20260821_avionics_approved_concrete_model'
+      AND contract_version = 1
+      AND contract_fingerprint =
+        '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6'
+  ) THEN 1
+  ELSE 0
+END;
+DROP TABLE avionics_approved_concrete_model_migration_guard;
 
 DROP TRIGGER IF EXISTS avionics_models_approved_concrete_model_insert;
 CREATE TRIGGER avionics_models_approved_concrete_model_insert
@@ -88,16 +114,17 @@ WHERE catalog_status = 'approved'
   );
 
 INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint
+  migration_name,
+  contract_version,
+  contract_fingerprint,
+  installed_at
 ) VALUES (
-  '20260821_avionics_approved_concrete_model', 1,
-  '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6'
+  '20260821_avionics_approved_concrete_model',
+  1,
+  '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6',
+  CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = excluded.contract_version,
-  contract_fingerprint = excluded.contract_fingerprint
-WHERE schema_migration_contracts.contract_version = excluded.contract_version
-  AND schema_migration_contracts.contract_fingerprint = excluded.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
 PRAGMA foreign_keys = ON;

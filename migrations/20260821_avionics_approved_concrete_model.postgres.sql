@@ -6,8 +6,30 @@ CREATE TABLE IF NOT EXISTS public.schema_migration_contracts (
   migration_name TEXT PRIMARY KEY,
   contract_version INTEGER NOT NULL CHECK (contract_version > 0),
   contract_fingerprint TEXT NOT NULL CHECK (contract_fingerprint ~ '^[0-9a-f]{64}$'),
-  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CHECK (length(BTRIM(migration_name)) > 0)
 );
+
+LOCK TABLE ONLY public.schema_migration_contracts
+IN SHARE ROW EXCLUSIVE MODE;
+
+DO $migration_guard$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM ONLY public.schema_migration_contracts
+    WHERE migration_name = '20260821_avionics_approved_concrete_model'
+      AND (
+        contract_version IS DISTINCT FROM 1
+        OR contract_fingerprint IS DISTINCT FROM
+          '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6'
+      )
+  ) THEN
+    RAISE EXCEPTION
+      'installed avionics approved concrete model migration has a different contract';
+  END IF;
+END
+$migration_guard$;
 
 CREATE OR REPLACE FUNCTION public.enforce_avionics_approved_concrete_model()
 RETURNS TRIGGER
@@ -72,15 +94,16 @@ WHERE catalog_status = 'approved'
   );
 
 INSERT INTO public.schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint
+  migration_name,
+  contract_version,
+  contract_fingerprint,
+  installed_at
 ) VALUES (
-  '20260821_avionics_approved_concrete_model', 1,
-  '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6'
+  '20260821_avionics_approved_concrete_model',
+  1,
+  '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6',
+  CURRENT_TIMESTAMP
 )
-ON CONFLICT (migration_name) DO UPDATE SET
-  contract_version = EXCLUDED.contract_version,
-  contract_fingerprint = EXCLUDED.contract_fingerprint
-WHERE schema_migration_contracts.contract_version = EXCLUDED.contract_version
-  AND schema_migration_contracts.contract_fingerprint = EXCLUDED.contract_fingerprint;
+ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
