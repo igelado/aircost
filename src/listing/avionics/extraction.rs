@@ -1060,8 +1060,11 @@ fn extraction_occurrence_has_exact_identity(
         )
 }
 
-/// Admit one Controller-specific publisher run-on grammar at the extraction
-/// boundary without weakening the ordinary identity or catalog-reuse matchers.
+/// Recognize one Controller-specific publisher run-on grammar.
+///
+/// This function proves only the grammar inside one occurrence. Callers must
+/// separately prove that `evidence` is one exact line from the structurally
+/// admitted Controller `Avionics/Radios` value before using the result.
 ///
 /// Some Controller `Avionics/Radios` values omit whitespace between a model
 /// and its capability list (for example `GIA63WNAV/COM/GPS(Dual)`). The model
@@ -1070,7 +1073,7 @@ fn extraction_occurrence_has_exact_identity(
 /// capabilities declared for that occurrence. The suffix must end there,
 /// apart from Controller's exact `(Dual)` annotation on a quantity-two
 /// occurrence.
-fn exact_controller_run_on_capability_annotation(
+pub(crate) fn exact_controller_run_on_capability_annotation(
     evidence: &str,
     model: &str,
     avionics_types: &[String],

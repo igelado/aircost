@@ -5559,6 +5559,22 @@ mod tests {
     }
 
     #[test]
+    fn paid_avionics_prompt_keeps_structured_maker_when_occurrence_omits_it() {
+        let mut context = avionics_identity_context();
+        context.listing_context = "GDC74 Air Data Computer".to_string();
+        context.candidate.manufacturer = "Garmin".to_string();
+        context.candidate.model = "GDC 74".to_string();
+        context.candidate.avionics_types = vec!["Air Data Computer".to_string()];
+
+        let prompt = build_avionics_unit_resolution_prompt(&context);
+
+        assert!(prompt.contains("\"listing_context\":\"GDC74 Air Data Computer\""));
+        assert!(prompt.contains("\"manufacturer\":\"Garmin\""));
+        assert!(prompt.contains("\"model\":\"GDC 74\""));
+        assert!(!prompt.contains("UNRELATED LISTING FIELD"));
+    }
+
+    #[test]
     fn avionics_concreteness_gate_is_very_high_and_untrusted_context_bounded() {
         let mut context = avionics_identity_context();
         context.listing_context =

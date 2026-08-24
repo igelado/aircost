@@ -24,8 +24,10 @@ use crate::avionics::catalog::{
     approved_avionics_identity_for_grounded_replay, authoritative_source_revocation_count,
     deterministic_generic_avionics_rejection_reason, grounded_resolution_receipt_basis_for_replay,
     grounded_resolution_request_sha256, resolve_avionics_identity_for_listing_materialization,
-    resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
-    AvionicsIdentityRequest, CatalogError, GroundedAvionicsResolutionReceiptSeed,
+    resolve_verified_local_avionics_identity,
+    resolve_verified_local_controller_run_on_avionics_identity, ApprovedAvionicsIdentity,
+    AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
+    GroundedAvionicsResolutionReceiptSeed,
 };
 use crate::avionics::fingerprint::{
     catalog_product_fingerprint_for_id, catalog_product_fingerprint_from_rows,
@@ -39,10 +41,15 @@ use crate::avionics::reuse::{
 use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{optional_f64, optional_i64, optional_string, GeminiListingExtractor};
+use crate::html::listing::source::{
+    controller_extraction_source_has_exact_avionics_line,
+    listing_extraction_source_contains_exact_avionics_occurrence,
+};
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
+use crate::listing::evidence::MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES;
 use crate::listing::review::{
     association_observation_sha256_from_values, clear_pending_review, replace_pending_review,
     ListingAssociationRole, PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct,
@@ -3307,18 +3314,28 @@ async fn resolve_listing_avionics_values(
     listing_context: Option<&str>,
     replay_scope: Option<&GroundedCapabilityReplayScope>,
 ) -> StoreResult<ResolvedListingAvionics> {
-    let listing_context = listing_context
-        .map(listing_context_excerpt)
-        .unwrap_or_default();
+    let retained_listing_context = listing_context.unwrap_or_default();
     let mut resolved: Vec<ListingAvionicsValue> = Vec::new();
     let mut pending = Vec::new();
     let mut dispositions = Vec::new();
 
     for (index, item) in values.avionics.clone().into_iter().enumerate() {
+        let occurrence_evidence = exact_occurrence_evidence_from_retained_listing_context(
+            source_url,
+            retained_listing_context,
+            item.source_notes.as_deref(),
+        );
+        let controller_run_on_line = source_url.is_some_and(|source_url| {
+            controller_extraction_source_has_exact_avionics_line(
+                source_url,
+                retained_listing_context,
+                occurrence_evidence,
+            )
+        });
         let identity_request = listing_avionics_identity_request(
             values,
             source_url,
-            &listing_context,
+            occurrence_evidence,
             &item.manufacturer,
             &item.model,
             &item.avionics_types,
@@ -3334,6 +3351,7 @@ async fn resolve_listing_avionics_values(
             index,
             OccurrenceRole::Primary,
             item.configuration_action.as_str(),
+            controller_run_on_line,
         )
         .await;
 
@@ -3350,7 +3368,8 @@ async fn resolve_listing_avionics_values(
                     values,
                     extractor,
                     source_url,
-                    &listing_context,
+                    occurrence_evidence,
+                    controller_run_on_line,
                     index,
                     &item,
                     replay_scope,
@@ -3385,7 +3404,8 @@ async fn resolve_listing_avionics_values(
                     values,
                     extractor,
                     source_url,
-                    &listing_context,
+                    occurrence_evidence,
+                    controller_run_on_line,
                     index,
                     &item,
                     replay_scope,
@@ -3464,7 +3484,8 @@ async fn resolve_listing_avionics_values(
                     values,
                     extractor,
                     source_url,
-                    &listing_context,
+                    occurrence_evidence,
+                    controller_run_on_line,
                     index,
                     &item,
                     replay_scope,
@@ -3814,6 +3835,7 @@ async fn resolve_listing_avionics_identity(
     occurrence_index: usize,
     occurrence_role: OccurrenceRole,
     configuration_action: &str,
+    controller_run_on_line: bool,
 ) -> ListingAvionicsIdentityResolution {
     let structure_issue =
         if request.manufacturer.trim().is_empty() || request.model.trim().is_empty() {
@@ -3873,6 +3895,40 @@ async fn resolve_listing_avionics_identity(
             }
         }
     }
+    if request.listing_context.trim().is_empty() {
+        return ListingAvionicsIdentityResolution::Pending {
+            reason: AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON.to_string(),
+            suggested_product: None,
+        };
+    }
+    match resolve_verified_local_avionics_identity(db, request).await {
+        Ok(Some(identity)) => {
+            return listing_avionics_identity_resolution::<CatalogError>(
+                Ok(AvionicsIdentityOutcome::Approved(identity)),
+                source_confidence,
+                None,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return listing_avionics_identity_resolution(Err(error), source_confidence, None);
+        }
+    }
+    if controller_run_on_line {
+        match resolve_verified_local_controller_run_on_avionics_identity(db, request).await {
+            Ok(Some(identity)) => {
+                return listing_avionics_identity_resolution::<CatalogError>(
+                    Ok(AvionicsIdentityOutcome::Approved(identity)),
+                    source_confidence,
+                    None,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return listing_avionics_identity_resolution(Err(error), source_confidence, None);
+            }
+        }
+    }
     if let Some(extractor) = extractor {
         return match resolve_avionics_identity_for_listing_materialization(db, extractor, request)
             .await
@@ -3886,17 +3942,9 @@ async fn resolve_listing_avionics_identity(
         };
     }
 
-    match resolve_verified_local_avionics_identity(db, request).await {
-        Ok(Some(identity)) => listing_avionics_identity_resolution::<CatalogError>(
-            Ok(AvionicsIdentityOutcome::Approved(identity)),
-            source_confidence,
-            None,
-        ),
-        Ok(None) => ListingAvionicsIdentityResolution::Pending {
-            reason: AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON.to_string(),
-            suggested_product: None,
-        },
-        Err(error) => listing_avionics_identity_resolution(Err(error), source_confidence, None),
+    ListingAvionicsIdentityResolution::Pending {
+        reason: AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON.to_string(),
+        suggested_product: None,
     }
 }
 
@@ -3979,6 +4027,7 @@ async fn resolve_listing_avionics_replacement(
     extractor: Option<&GeminiListingExtractor>,
     source_url: Option<&str>,
     listing_context: &str,
+    controller_run_on_line: bool,
     index: usize,
     item: &ListingAvionicsValue,
     replay_scope: Option<&GroundedCapabilityReplayScope>,
@@ -4020,6 +4069,7 @@ async fn resolve_listing_avionics_replacement(
         index,
         OccurrenceRole::Replacement,
         item.configuration_action.as_str(),
+        controller_run_on_line,
     )
     .await
     {
@@ -4410,12 +4460,29 @@ fn coalesce_resolved_listing_avionics(
     Ok(coalesced)
 }
 
-fn listing_context_excerpt(value: &str) -> String {
-    value
-        .split_whitespace()
-        .take(900)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Select only one extraction-validated occurrence from the bounded source
+/// adapter context. Provider and local identity work must never receive page
+/// fields unrelated to the occurrence being resolved.
+fn exact_occurrence_evidence_from_retained_listing_context<'a>(
+    source_url: Option<&str>,
+    retained_listing_context: &'a str,
+    source_evidence_text: Option<&'a str>,
+) -> &'a str {
+    let evidence = source_evidence_text.map(str::trim).unwrap_or_default();
+    if evidence.is_empty()
+        || evidence.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
+        || source_url.is_none_or(|source_url| {
+            !listing_extraction_source_contains_exact_avionics_occurrence(
+                source_url,
+                retained_listing_context,
+                evidence,
+            )
+        })
+    {
+        ""
+    } else {
+        evidence
+    }
 }
 
 fn values_from_listing(listing: &SaleListing) -> ListingValues {
@@ -7185,10 +7252,12 @@ mod tests {
     use crate::models::{ParsedAvionics, ParsedAvionicsReference};
 
     use super::{
-        coalesce_resolved_listing_avionics, listing_avionics_identity_resolution,
-        listing_avionics_value_from_catalog, replace_listing_avionics,
-        resolve_listing_avionics_values, ListingAvionicsIdentityResolution, ListingAvionicsValue,
-        ListingValues, AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
+        coalesce_resolved_listing_avionics,
+        exact_occurrence_evidence_from_retained_listing_context, listing_avionics_identity_request,
+        listing_avionics_identity_resolution, listing_avionics_value_from_catalog,
+        replace_listing_avionics, resolve_listing_avionics_values,
+        ListingAvionicsIdentityResolution, ListingAvionicsValue, ListingValues,
+        AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
         AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON,
     };
 
@@ -8390,6 +8459,240 @@ mod tests {
     }
 
     #[test]
+    fn identity_work_receives_only_the_checkpoint_occurrence_not_adjacent_fields() {
+        let retained = "UNRELATED AIRCRAFT DESCRIPTION\nGDC74 Air Data Computer\nUNRELATED PRICE";
+        let occurrence = exact_occurrence_evidence_from_retained_listing_context(
+            Some("https://example.com/listing"),
+            retained,
+            Some("GDC74 Air Data Computer"),
+        );
+        let values = listing_values_with_variant("182T SKYLANE");
+        let request = listing_avionics_identity_request(
+            &values,
+            Some("https://example.com/listing"),
+            occurrence,
+            "Garmin",
+            "GDC 74",
+            &["Air Data Computer".to_string()],
+            1,
+        );
+
+        assert_eq!(occurrence, "GDC74 Air Data Computer");
+        assert_eq!(request.listing_context, "GDC74 Air Data Computer");
+        assert_eq!(request.manufacturer, "Garmin");
+        assert!(!request.listing_context.contains("UNRELATED"));
+    }
+
+    #[tokio::test]
+    async fn exact_controller_run_on_reuses_only_the_attested_canonical_product() {
+        const CONTROLLER_URL: &str =
+            "https://www.controller.com/listing/for-sale/257959105/example";
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id = ensure_approved_test_avionics_model(&db, "Garmin", "GIA 63W", "GPS")
+            .await
+            .expect("approved graph identity should seed");
+        for capability in ["NAV", "COM"] {
+            let type_id = super::ensure_named_row(&db, "avionics_types", capability)
+                .await
+                .expect("capability should seed");
+            execute_query!(
+                &db,
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+                approved_id,
+                type_id,
+            )
+            .expect("capability membership should seed");
+        }
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+
+        let html = include_str!("../tests/fixtures/controller/id25_like_listing.html").replace(
+            "GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140",
+            "GIA63WNAV/COM/GPS(Dual)",
+        );
+        let source = crate::html::listing::source::listing_extraction_source(CONTROLLER_URL, &html)
+            .expect("Controller fixture should produce a bounded source envelope");
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: "Garmin".to_string(),
+            model: "GIA63W".to_string(),
+            avionics_types: vec!["NAV".to_string(), "COM".to_string(), "GPS".to_string()],
+            quantity: 2,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some("GIA63WNAV/COM/GPS(Dual)".to_string()),
+            source_confidence: Some("high".to_string()),
+        })];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            None,
+            Some(CONTROLLER_URL),
+            Some(&source),
+        )
+        .await
+        .expect("the exact Controller run-on should resolve without Gemini");
+
+        assert!(resolved.pending_review_aspects.is_empty());
+        assert_eq!(values.avionics.len(), 1);
+        assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
+        assert_eq!(values.avionics[0].quantity, 2);
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_run_on_variants_and_non_controller_sources_fail_closed() {
+        const CONTROLLER_URL: &str =
+            "https://www.controller.com/listing/for-sale/257959105/example";
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id = ensure_approved_test_avionics_model(&db, "Garmin", "GIA 63W", "GPS")
+            .await
+            .expect("approved graph identity should seed");
+        for capability in ["NAV", "COM"] {
+            let type_id = super::ensure_named_row(&db, "avionics_types", capability)
+                .await
+                .expect("capability should seed");
+            execute_query!(
+                &db,
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+                approved_id,
+                type_id,
+            )
+            .expect("capability membership should seed");
+        }
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+
+        for (source_url, evidence, model, capabilities, quantity) in [
+            (
+                CONTROLLER_URL,
+                "GIA63WNXiNAV/COM/GPS(Dual)",
+                "GIA 63W NXi",
+                vec!["NAV", "COM", "GPS"],
+                2,
+            ),
+            (
+                CONTROLLER_URL,
+                "GIA63WNAV/COM/GPS/Traffic(Dual)",
+                "GIA 63W",
+                vec!["NAV", "COM", "GPS", "Traffic"],
+                2,
+            ),
+            (
+                CONTROLLER_URL,
+                "GIA63WNAV/COM/GPS(Dual)",
+                "GIA 63W",
+                vec!["NAV", "COM", "GPS"],
+                1,
+            ),
+            (
+                "https://example.com/listing",
+                "GIA63WNAV/COM/GPS(Dual)",
+                "GIA 63W",
+                vec!["NAV", "COM", "GPS"],
+                2,
+            ),
+        ] {
+            let source = if source_url == CONTROLLER_URL {
+                let html = include_str!("../tests/fixtures/controller/id25_like_listing.html")
+                    .replace(
+                        "GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140",
+                        evidence,
+                    );
+                crate::html::listing::source::listing_extraction_source(source_url, &html)
+                    .expect("Controller fixture should produce a bounded source envelope")
+            } else {
+                evidence.to_string()
+            };
+            let mut values = listing_values_with_variant("182T SKYLANE");
+            values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+                manufacturer: "Garmin".to_string(),
+                model: model.to_string(),
+                avionics_types: capabilities.into_iter().map(str::to_string).collect(),
+                quantity,
+                configuration_action: "installed".to_string(),
+                replaces: None,
+                source_evidence_text: Some(evidence.to_string()),
+                source_confidence: Some("high".to_string()),
+            })];
+
+            let resolved = resolve_listing_avionics_values(
+                &db,
+                &mut values,
+                None,
+                Some(source_url),
+                Some(&source),
+            )
+            .await
+            .expect("unsafe run-on shape should stage review rather than assign");
+
+            assert_eq!(resolved.pending_review_aspects.len(), 1, "{evidence}");
+            assert!(values.avionics.is_empty(), "{evidence}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_exact_occurrences_reuse_and_coalesce_without_gemini() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "GDU 1044B", "Flight Display")
+                .await
+                .expect("approved graph identity should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let parsed = ParsedAvionics {
+            manufacturer: "Garmin".to_string(),
+            model: "GDU 1044B".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            quantity: 1,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some("Garmin GDU 1044B Flight Display".to_string()),
+            source_confidence: Some("high".to_string()),
+        };
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![
+            ListingAvionicsValue::from_parsed(parsed.clone()),
+            ListingAvionicsValue::from_parsed(parsed),
+        ];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            None,
+            Some("https://example.com/listing"),
+            Some(
+                "Garmin GDU 1044B Flight Display\nGarmin GDU 1044B Flight Display\nUNRELATED FIELD",
+            ),
+        )
+        .await
+        .expect("each exact occurrence should use the same attested local identity");
+
+        assert!(resolved.pending_review_aspects.is_empty());
+        assert_eq!(resolved.occurrence_dispositions.len(), 2);
+        assert!(resolved
+            .occurrence_dispositions
+            .iter()
+            .all(|disposition| disposition.avionics_model_id == Some(approved_id)));
+        assert_eq!(values.avionics.len(), 1);
+        assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
+        assert_eq!(values.avionics[0].quantity, 1);
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[test]
     fn approved_product_requires_exactly_high_listing_installation_evidence() {
         for source_confidence in [None, Some("medium"), Some("low")] {
             let resolution = listing_avionics_identity_resolution::<CatalogError>(
@@ -8552,6 +8855,7 @@ mod tests {
             let mut values = listing_values_with_variant("182T SKYLANE");
             let mut generic = parsed_avionics("GPS");
             generic.configuration_action = "replaces".to_string();
+            generic.source_evidence_text = Some("Garmin GPS replaces Garmin GNS 430W".to_string());
             generic.replaces = Some(ParsedAvionicsReference {
                 manufacturer: "Garmin".to_string(),
                 model: "GNS 430W".to_string(),
@@ -8610,6 +8914,8 @@ mod tests {
                 let mut values = listing_values_with_variant("182T SKYLANE");
                 let mut concrete = parsed_avionics("GNS 430W");
                 concrete.configuration_action = action.to_string();
+                concrete.source_evidence_text =
+                    Some("Garmin GNS 430W changes Garmin GPS".to_string());
                 concrete.replaces = Some(ParsedAvionicsReference {
                     manufacturer: "Garmin".to_string(),
                     model: "GPS".to_string(),
