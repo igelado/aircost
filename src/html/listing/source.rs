@@ -11,7 +11,7 @@ use scraper::{ElementRef, Html, Selector};
 use serde_json::Value;
 use url::Url;
 
-use crate::html::clean::{clean_listing_html, PublisherTextExtractor};
+use crate::html::clean::{clean_listing_html, ListingBodyEvidenceUnits, PublisherTextExtractor};
 use crate::html::listing::media::{
     is_controller_source_host, validate_controller_listing_source_url, MAX_RETAINED_HTML_BYTES,
 };
@@ -116,6 +116,35 @@ struct ControllerField {
     value: String,
 }
 
+#[derive(Debug)]
+struct ControllerListingSource {
+    extraction_text: String,
+    evidence_units: Vec<String>,
+}
+
+/// Publisher-aware evidence units admitted by the same source adapter used to
+/// construct extraction-model input.
+///
+/// Controller evidence is restricted to one exact specification value. Labels,
+/// adjacent values, price/page chrome, and JSON-LD cannot become avionics
+/// evidence. Other publishers retain the generic visible-body unit contract.
+#[derive(Debug)]
+pub(crate) enum ListingEvidenceUnits {
+    Controller(Vec<String>),
+    Generic(ListingBodyEvidenceUnits),
+}
+
+impl ListingEvidenceUnits {
+    pub(crate) fn contains_exact_span(&self, evidence: &str) -> bool {
+        match self {
+            Self::Controller(units) => units.iter().any(|unit| {
+                crate::html::clean::exact_normalized_source_span_occurs(unit, evidence)
+            }),
+            Self::Generic(units) => units.contains_exact_span(evidence),
+        }
+    }
+}
+
 /// Build the bounded source text used for listing extraction.
 ///
 /// A URL on a Controller host is never sent through the broad scraper. Once
@@ -127,16 +156,31 @@ pub fn listing_extraction_source(
     retained_html: &str,
 ) -> Result<String, ListingSourceError> {
     if is_controller_source_host(source_url) {
-        controller_listing_source(source_url, retained_html)
+        controller_listing_source(source_url, retained_html).map(|source| source.extraction_text)
     } else {
         Ok(clean_listing_html(retained_html))
+    }
+}
+
+/// Build the exact source-unit index used to validate model evidence.
+pub(crate) fn listing_evidence_units(
+    source_url: &str,
+    retained_html: &str,
+) -> Result<ListingEvidenceUnits, ListingSourceError> {
+    if is_controller_source_host(source_url) {
+        controller_listing_source(source_url, retained_html)
+            .map(|source| ListingEvidenceUnits::Controller(source.evidence_units))
+    } else {
+        Ok(ListingEvidenceUnits::Generic(
+            ListingBodyEvidenceUnits::from_html(retained_html),
+        ))
     }
 }
 
 fn controller_listing_source(
     source_url: &str,
     retained_html: &str,
-) -> Result<String, ListingSourceError> {
+) -> Result<ControllerListingSource, ListingSourceError> {
     let source_url = validate_controller_listing_source_url(source_url)
         .map_err(|error| ListingSourceError::InvalidControllerSourceUrl(error.to_string()))?;
     if retained_html.len() > MAX_RETAINED_HTML_BYTES {
@@ -189,6 +233,12 @@ fn controller_listing_source(
     )?;
     let fields = parse_controller_fields(&text, specs)?;
 
+    // Each specification value is one authoritative semantic evidence unit.
+    // Preserve this index before consuming fields into the model-source
+    // envelope so evidence validation and extraction cannot disagree about
+    // publisher boundaries.
+    let evidence_units = fields.iter().map(|field| field.value.clone()).collect();
+
     let mut source = String::new();
     push_envelope(&mut source, TITLE_OPEN, &title, TITLE_CLOSE);
     push_envelope(&mut source, PRICE_OPEN, &price, PRICE_CLOSE);
@@ -219,7 +269,10 @@ fn controller_listing_source(
             maximum_bytes: MAX_CONTROLLER_SOURCE_BYTES,
         });
     }
-    Ok(source)
+    Ok(ControllerListingSource {
+        extraction_text: source,
+        evidence_units,
+    })
 }
 
 fn parse_controller_fields<'document>(
@@ -601,7 +654,7 @@ fn invalid_structure(error: impl Into<String>) -> ListingSourceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{listing_extraction_source, MAX_CONTROLLER_VALUE_BYTES};
+    use super::{listing_evidence_units, listing_extraction_source, MAX_CONTROLLER_VALUE_BYTES};
 
     const URL: &str = "https://www.controller.com/listing/for-sale/257959105/example";
     const FROZEN_CORPUS_ID_HTML_FINGERPRINT: &str =
@@ -638,6 +691,17 @@ mod tests {
         assert!(!source.contains("$6,206.35"));
         assert!(!source.contains("RELATED AIRCRAFT $99,999"));
         assert!(!source.contains("Browse Aircraft"));
+    }
+
+    #[test]
+    fn controller_evidence_uses_exact_values_from_the_structured_source_adapter() {
+        let units = listing_evidence_units(URL, REALISTIC).unwrap();
+
+        assert!(units.contains_exact_span("GARMIN G1000 NXI"));
+        assert!(units.contains_exact_span("GFC 700 autopilot"));
+        assert!(!units.contains_exact_span("Flight Deck Manufacturer/Model GARMIN G1000 NXI"));
+        assert!(!units.contains_exact_span("GARMIN G1000 NXI SVT"));
+        assert!(!units.contains_exact_span("SVT Yes"));
     }
 
     #[test]

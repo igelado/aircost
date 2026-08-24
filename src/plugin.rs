@@ -157,7 +157,7 @@ impl From<ListingStoreError> for PluginStoreError {
     }
 }
 
-type StoreResult<T> = Result<T, PluginStoreError>;
+pub(crate) type StoreResult<T> = Result<T, PluginStoreError>;
 pub type PluginProgressSender = tokio::sync::mpsc::UnboundedSender<Value>;
 
 #[derive(Debug)]
@@ -1421,10 +1421,18 @@ fn emit_plugin_progress(progress: Option<&PluginProgressSender>, stage: &str, me
 }
 
 fn extracted_listing_payload(preview: &ListingPreview) -> Value {
-    let mut payload = json!(preview.parsed_listing);
-    if let (Some(object), Some(identity_recovery)) =
-        (payload.as_object_mut(), preview.identity_recovery.as_ref())
-    {
+    canonical_current_checkpoint_payload(
+        &preview.parsed_listing,
+        preview.identity_recovery.as_ref(),
+    )
+}
+
+pub(crate) fn canonical_current_checkpoint_payload(
+    parsed_listing: &ParsedListing,
+    identity_recovery: Option<&crate::aircraft::curation::visual::VisualIdentifierResolution>,
+) -> Value {
+    let mut payload = json!(parsed_listing);
+    if let (Some(object), Some(identity_recovery)) = (payload.as_object_mut(), identity_recovery) {
         object.insert(
             "visual_identity_recovery".to_string(),
             json!(identity_recovery),
@@ -1433,7 +1441,7 @@ fn extracted_listing_payload(preview: &ListingPreview) -> Value {
     payload
 }
 
-fn parse_current_checkpoint_payload(
+pub(crate) fn parse_current_checkpoint_payload(
     extracted_listing_json: &str,
 ) -> StoreResult<(
     ParsedListing,
@@ -3149,7 +3157,7 @@ mod tests {
         let avionics = json!([installed_avionics(
             "Garmin",
             "G1000 NXi",
-            &["Integrated Flight Deck", "Flight Display"],
+            &["Integrated Flight Deck"],
             1,
             "GARMIN G1000 NXI",
         )]);
@@ -3203,7 +3211,7 @@ mod tests {
             installed_avionics(
                 "Garmin",
                 "G1000 NXi",
-                &["Integrated Flight Deck", "Flight Display"],
+                &["Integrated Flight Deck"],
                 1,
                 "GARMIN G1000 NXI",
             ),
@@ -3256,7 +3264,8 @@ mod tests {
             .unwrap();
         assert!(correction_prompt.contains("Previous transient avionics JSON"));
         assert!(correction_prompt.contains("GARMIN G1000 NXI SVT Yes"));
-        assert!(correction_prompt.contains("bounded source excerpt"));
+        assert!(correction_prompt.contains("structurally visible source unit"));
+        assert!(correction_prompt.contains("Every additional type on that suite row"));
         assert!(!correction_prompt.contains("\"asking_price_usd\": 400000"));
         assert!(!correction_prompt.contains("\"serial_number\""));
         drop(requests);
@@ -3303,15 +3312,14 @@ mod tests {
             1,
             "GARMIN G1000 NXI SVT Yes",
         )]));
-        let corrected = json!({
-            "avionics": [installed_avionics(
-                "Garmin",
-                "G1000 NXi",
-                &["Integrated Flight Deck", "Flight Display"],
-                1,
-                "GARMIN G1000 NXI",
-            )]
-        });
+        let corrected_avionics = json!([installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck"],
+            1,
+            "GARMIN G1000 NXI",
+        )]);
+        let corrected = json!({"avionics": corrected_avionics});
         let (endpoint, request_count, _) =
             extraction_sequence_endpoint(vec![primary.to_string(), corrected.to_string()]).await;
         let db = AppDb::connect("sqlite::memory:").await.unwrap();

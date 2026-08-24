@@ -26,10 +26,10 @@ use crate::html::listing::source::listing_extraction_source;
 use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 #[cfg(test)]
-use crate::listing::avionics::extraction::parse_current_avionics_extraction_value;
+use crate::listing::avionics::extraction::parse_current_avionics_extraction_json;
 use crate::listing::avionics::extraction::{
-    parse_current_avionics_extraction_json, validate_current_avionics_identity_evidence,
-    validate_current_avionics_quantity_completeness,
+    parse_current_avionics_extraction_value, validate_current_avionics_observations,
+    validate_unbound_current_avionics_extraction,
 };
 use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
@@ -49,9 +49,11 @@ use crate::listing::review::{
     ExistingProductAssociationEvaluation, ListingAssociationRole, PendingReviewAspect,
     ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
-use crate::models::{ParsedAvionics, ParsedListing};
+use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
-use crate::plugin::sha256_hex;
+use crate::plugin::{
+    canonical_current_checkpoint_payload, parse_current_checkpoint_payload, sha256_hex,
+};
 
 #[derive(Debug)]
 pub enum AvionicsVerificationError {
@@ -3789,35 +3791,41 @@ async fn retained_observation_source(
     row: &ListingSourceRow,
     listing_context: &ListingEvidenceContext,
 ) -> Result<RetainedObservationSource, String> {
-    let preserved_aspects = match retained_review_observations(db, row, listing_context).await? {
-        RetainedReviewObservationSource::Current(replay) => {
-            return Ok(RetainedObservationSource::Review {
+    let review_source = retained_review_observations(db, row, listing_context).await?;
+    let extraction_source = retained_avionics_source(
+        row.extracted_listing_json.as_deref(),
+        row.submission_source_url.as_deref(),
+        row.rendered_html.as_deref(),
+    );
+    Ok(match (review_source, extraction_source) {
+        (RetainedReviewObservationSource::Current(replay), RetainedAvionicsSource::Current(_)) => {
+            RetainedObservationSource::Review {
                 avionics: replay.avionics,
                 preserved_aspects: replay.preserved_aspects,
-            });
-        }
-        RetainedReviewObservationSource::RequiresFallback { preserved_aspects } => {
-            preserved_aspects
-        }
-    };
-    Ok(
-        match retained_avionics_source(
-            row.extracted_listing_json.as_deref(),
-            listing_context,
-            row.rendered_html.as_deref(),
-        ) {
-            RetainedAvionicsSource::Current(avionics) => RetainedObservationSource::Extraction {
-                avionics,
-                preserved_aspects,
-            },
-            RetainedAvionicsSource::RequiresReextraction { reason } => {
-                RetainedObservationSource::RequiresReextraction {
-                    reason,
-                    preserved_aspects,
-                }
             }
+        }
+        (
+            RetainedReviewObservationSource::Current(replay),
+            RetainedAvionicsSource::RequiresReextraction { reason },
+        ) => RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects: replay.preserved_aspects,
         },
-    )
+        (
+            RetainedReviewObservationSource::RequiresFallback { preserved_aspects },
+            RetainedAvionicsSource::Current(avionics),
+        ) => RetainedObservationSource::Extraction {
+            avionics,
+            preserved_aspects,
+        },
+        (
+            RetainedReviewObservationSource::RequiresFallback { preserved_aspects },
+            RetainedAvionicsSource::RequiresReextraction { reason },
+        ) => RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects,
+        },
+    })
 }
 
 async fn retained_review_observations(
@@ -3881,10 +3889,14 @@ async fn retained_review_observations(
             source_confidence: aspect.source_confidence.clone(),
         });
     }
+    let Some(source_url) = row.submission_source_url.as_deref() else {
+        return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
+    };
     if (!avionics.is_empty()
-        && validate_current_avionics_identity_evidence(
+        && validate_current_avionics_observations(
             &avionics,
             listing_context,
+            source_url,
             row.rendered_html.as_deref().unwrap_or_default(),
         )
         .is_err())
@@ -4043,7 +4055,7 @@ async fn replay_current_verified_suggestion(
 
 fn retained_avionics_source(
     raw_json: Option<&str>,
-    listing_context: &ListingEvidenceContext,
+    source_url: Option<&str>,
     rendered_html: Option<&str>,
 ) -> RetainedAvionicsSource {
     let Some(raw_json) = raw_json.filter(|raw_json| !raw_json.trim().is_empty()) else {
@@ -4051,28 +4063,33 @@ fn retained_avionics_source(
             reason: "the retained plugin submission has no extracted listing JSON".to_string(),
         };
     };
-    match parse_raw_avionics(raw_json) {
+    let Some(source_url) = source_url.filter(|source_url| !source_url.trim().is_empty()) else {
+        return RetainedAvionicsSource::RequiresReextraction {
+            reason: "the retained plugin submission has no source URL".to_string(),
+        };
+    };
+    if let Err(error) = parse_current_checkpoint_payload(raw_json) {
+        return RetainedAvionicsSource::RequiresReextraction {
+            reason: format!(
+                "the retained plugin extraction is not an exact current checkpoint: {error}"
+            ),
+        };
+    }
+    match validate_unbound_current_avionics_extraction(
+        raw_json,
+        source_url,
+        rendered_html.unwrap_or_default(),
+    ) {
         Ok(avionics) if avionics.is_empty() => {
             RetainedAvionicsSource::RequiresReextraction {
                 reason: "the retained plugin extraction contains no avionics capability arrays"
                     .to_string(),
             }
         }
-        Ok(avionics) => match validate_current_avionics_identity_evidence(
-            &avionics,
-            listing_context,
-            rendered_html.unwrap_or_default(),
-        ) {
-            Ok(()) => RetainedAvionicsSource::Current(avionics),
-            Err(error) => RetainedAvionicsSource::RequiresReextraction {
-                reason: format!(
-                    "the retained plugin extraction has invalid listing evidence: {error}"
-                ),
-            },
-        },
+        Ok(avionics) => RetainedAvionicsSource::Current(avionics),
         Err(error) => RetainedAvionicsSource::RequiresReextraction {
             reason: format!(
-                "the retained plugin extraction is not compatible with the current capability-array schema: {error}"
+                "the retained plugin extraction does not satisfy the complete current avionics contract: {error}"
             ),
         },
     }
@@ -4389,17 +4406,31 @@ async fn reextract_avionics(
             ));
         }
     }
-    validate_current_avionics_identity_evidence(&avionics, listing_context, rendered_html)
-        .map_err(|error| {
-            format!("Gemini returned listing evidence not present in the retained source: {error}")
-        })?;
-    validate_current_avionics_quantity_completeness(&avionics, source_url, rendered_html).map_err(
-        |error| format!("Gemini returned incomplete listing quantity evidence: {error}"),
-    )?;
+    validate_current_avionics_observations(&avionics, listing_context, source_url, rendered_html)
+        .map_err(|error| format!("Gemini returned invalid current avionics: {error}"))?;
     let extracted_listing_json = if avionics.is_empty() {
         String::new()
     } else {
-        merge_validated_avionics_into_prior_extraction(prior_extracted_listing_json, &avionics)?
+        let extracted_listing_json = merge_validated_avionics_into_listing_extraction(
+            prior_extracted_listing_json,
+            extracted,
+            &avionics,
+        )?;
+        let persisted_avionics = validate_unbound_current_avionics_extraction(
+            &extracted_listing_json,
+            source_url,
+            rendered_html,
+        )
+        .map_err(|error| {
+            format!("repaired listing extraction failed final current validation: {error}")
+        })?;
+        if persisted_avionics != avionics {
+            return Err(
+                "repaired listing extraction changed validated avionics during persistence"
+                    .to_string(),
+            );
+        }
+        extracted_listing_json
     };
     Ok(ValidatedListingReextraction {
         extracted_listing_json,
@@ -4407,44 +4438,71 @@ async fn reextract_avionics(
     })
 }
 
-/// Replace only the derived avionics portion of a retained extraction.
+/// Build the complete current extraction that can durably replace the retained
+/// checkpoint.
 ///
-/// This workflow validates avionics evidence, not aircraft identity, hours,
-/// price, or valuation facts. Those unrelated values therefore remain exactly
-/// the prior JSON values and are never refreshed from this Gemini response.
-fn merge_validated_avionics_into_prior_extraction(
+/// A structurally current retained listing keeps its non-avionics values. An
+/// absent or structurally unusable checkpoint cannot supply values to
+/// preserve, so the newly extracted complete listing becomes the repair base.
+/// In both cases the validated avionics are injected and the final object must
+/// satisfy both the complete listing and strict current avionics schemas.
+fn merge_validated_avionics_into_listing_extraction(
     prior_extracted_listing_json: Option<&str>,
+    mut newly_extracted_listing: Value,
     avionics: &[ParsedAvionics],
 ) -> Result<String, String> {
-    let prior = prior_extracted_listing_json
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            "cannot durably persist avionics re-extraction without a retained top-level listing extraction whose non-avionics fields can be preserved"
-                .to_string()
-        })?;
-    let mut extraction: Value = serde_json::from_str(prior).map_err(|error| {
-        format!(
-            "cannot durably persist avionics re-extraction because the retained listing extraction is invalid JSON: {error}"
-        )
-    })?;
-    let object = extraction.as_object_mut().ok_or_else(|| {
-        "cannot durably persist avionics re-extraction because the retained listing extraction is not a top-level object"
-            .to_string()
-    })?;
-    let avionics = serde_json::to_value(avionics)
+    let avionics_value = serde_json::to_value(avionics)
         .map_err(|error| format!("could not serialize validated avionics extraction: {error}"))?;
-    object.insert("avionics".to_string(), avionics);
-    serde_json::from_value::<ParsedListing>(extraction.clone()).map_err(|error| {
-        format!(
-            "cannot durably persist avionics re-extraction because the merged listing extraction does not match the current schema: {error}"
-        )
-    })?;
-    serde_json::to_string(&extraction)
+
+    newly_extracted_listing
+        .as_object_mut()
+        .ok_or_else(|| {
+            "cannot durably persist avionics re-extraction because the newly extracted listing is not a top-level object"
+                .to_string()
+        })?
+        .insert("avionics".to_string(), avionics_value.clone());
+    let newly_extracted_listing =
+        canonical_complete_current_listing_value(&newly_extracted_listing, "newly extracted")?;
+
+    let mut repaired_listing = prior_extracted_listing_json
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| canonical_complete_current_listing_value(&value, "retained").ok())
+        .unwrap_or(newly_extracted_listing);
+    repaired_listing
+        .as_object_mut()
+        .expect("a validated current listing extraction is a top-level object")
+        .insert("avionics".to_string(), avionics_value);
+    let repaired_listing = canonical_complete_current_listing_value(&repaired_listing, "repaired")?;
+
+    serde_json::to_string(&repaired_listing)
         .map_err(|error| format!("could not serialize validated listing extraction: {error}"))
 }
 
-fn parse_raw_avionics(raw_json: &str) -> Result<Vec<ParsedAvionics>, String> {
-    parse_current_avionics_extraction_json(raw_json)
+fn canonical_complete_current_listing_value(value: &Value, label: &str) -> Result<Value, String> {
+    if !value.is_object() {
+        return Err(format!(
+            "cannot durably persist avionics re-extraction because the {label} listing extraction is not a top-level object"
+        ));
+    }
+    let serialized = serde_json::to_string(value).map_err(|error| {
+        format!("could not serialize the {label} listing extraction for validation: {error}")
+    })?;
+    let (parsed_listing, identity_recovery) = parse_current_checkpoint_payload(&serialized)
+        .map_err(|error| {
+            format!(
+                "cannot durably persist avionics re-extraction because the {label} listing extraction is not an exact current checkpoint: {error}"
+            )
+        })?;
+    parse_current_avionics_extraction_value(value).map_err(|error| {
+        format!(
+            "cannot durably persist avionics re-extraction because the {label} listing extraction does not use the current avionics schema: {error}"
+        )
+    })?;
+    Ok(canonical_current_checkpoint_payload(
+        &parsed_listing,
+        identity_recovery.as_ref(),
+    ))
 }
 
 async fn load_listing_sources(
@@ -4758,6 +4816,7 @@ mod tests {
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
     };
     use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
+    use crate::models::ParsedListing;
     use crate::normalize::{
         normalize_avionics_identifier, normalize_avionics_manufacturer_name,
         normalize_avionics_model_name, normalize_name,
@@ -5072,12 +5131,19 @@ mod tests {
         format!(
             r#"<html><body>
               <p>Currently hangared at KSAR</p>
-              <div class="detail__specs-wrapper">
-                <div class="detail__specs-label">ADS-B Equipped</div>
-                <div class="detail__specs-value">Yes</div>
-                <div class="detail__specs-label">Avionics/Radios</div>
-                <div class="detail__specs-value">{field}</div>
-              </div>
+              <main id="main-content" class="detail__main-content">
+                <h1 class="detail__title">Test Aircraft</h1>
+                <div class="listing-prices__retail-price">$100,000</div>
+                <div class="detail__specs">
+                  <h3 class="detail__specs-heading">Avionics</h3>
+                  <div class="detail__specs-wrapper">
+                    <div class="detail__specs-label">ADS-B Equipped</div>
+                    <div class="detail__specs-value">Yes</div>
+                    <div class="detail__specs-label">Avionics/Radios</div>
+                    <div class="detail__specs-value">{field}</div>
+                  </div>
+                </div>
+              </main>
             </body></html>"#
         )
     }
@@ -5119,13 +5185,26 @@ mod tests {
         })
     }
 
+    fn current_listing_extraction_with_avionics(avionics: Value) -> String {
+        let mut payload = retained_legacy_listing_extraction();
+        payload["avionics"] = avionics;
+        payload.to_string()
+    }
+
     async fn store_retained_legacy_listing_extraction(db: &AppDb, submission_id: i64) {
-        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = ? WHERE id = ?")
-            .bind(retained_legacy_listing_extraction().to_string())
-            .bind(submission_id)
-            .execute(sqlite_pool(db))
-            .await
-            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET extracted_listing_json = ?,
+                extraction_error = 'legacy extraction unavailable'
+            WHERE id = ?
+            "#,
+        )
+        .bind(retained_legacy_listing_extraction().to_string())
+        .bind(submission_id)
+        .execute(sqlite_pool(db))
+        .await
+        .unwrap();
     }
 
     fn locked_reextraction_state(
@@ -5345,7 +5424,7 @@ mod tests {
 
     #[test]
     fn raw_parser_preserves_capability_arrays_and_explicit_actions() {
-        let parsed = parse_raw_avionics(
+        let parsed = parse_current_avionics_extraction_json(
             r#"{
               "avionics": [
                 {
@@ -6208,15 +6287,13 @@ mod tests {
 
     #[test]
     fn legacy_scalar_type_requires_reextraction_without_mechanical_conversion() {
-        let legacy = r#"{
-          "avionics": [
+        let legacy = current_listing_extraction_with_avionics(json!([
             {"manufacturer":"Garmin","model":"GNX 375","type":"GPS","quantity":1}
-          ]
-        }"#;
+        ]));
 
         let source = retained_avionics_source(
-            Some(legacy),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+            Some(&legacy),
+            Some("https://example.test/listing/legacy"),
             Some("Garmin GNX 375"),
         );
 
@@ -6227,8 +6304,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_avionics_merge_preserves_every_non_avionics_value() {
-        let prior = retained_legacy_listing_extraction();
+    fn durable_avionics_repair_preserves_every_current_prior_non_avionics_value() {
         let avionics = vec![ParsedAvionics {
             manufacturer: "Garmin".to_string(),
             model: "G5".to_string(),
@@ -6239,12 +6315,22 @@ mod tests {
             source_evidence_text: Some("Dual Garmin G5 displays".to_string()),
             source_confidence: Some("high".to_string()),
         }];
+        let mut prior = retained_legacy_listing_extraction();
+        prior["avionics"] = serde_json::to_value(&avionics).unwrap();
+        let mut fresh = prior.clone();
+        fresh["manufacturer"] = json!("Fresh extraction maker");
+        fresh["airframe_hours"] = json!(111.0);
 
-        let merged =
-            merge_validated_avionics_into_prior_extraction(Some(&prior.to_string()), &avionics)
-                .unwrap();
+        let merged = merge_validated_avionics_into_listing_extraction(
+            Some(&prior.to_string()),
+            fresh.clone(),
+            &avionics,
+        )
+        .unwrap();
         let merged: Value = serde_json::from_str(&merged).unwrap();
-        for (field, value) in prior.as_object().unwrap() {
+        let canonical_prior =
+            canonical_complete_current_listing_value(&prior, "test prior extraction").unwrap();
+        for (field, value) in canonical_prior.as_object().unwrap() {
             if field != "avionics" {
                 assert_eq!(&merged[field], value, "field {field} changed");
             }
@@ -6253,17 +6339,44 @@ mod tests {
             serde_json::from_value::<Vec<ParsedAvionics>>(merged["avionics"].clone()).unwrap(),
             avionics
         );
-        assert!(
-            merge_validated_avionics_into_prior_extraction(None, &avionics)
-                .unwrap_err()
-                .contains("without a retained top-level listing extraction")
-        );
-        assert!(merge_validated_avionics_into_prior_extraction(
-            Some(r#"{"status":"active"}"#),
+
+        let repaired_from_missing =
+            merge_validated_avionics_into_listing_extraction(None, fresh.clone(), &avionics)
+                .unwrap();
+        let repaired_from_missing: Value = serde_json::from_str(&repaired_from_missing).unwrap();
+        let canonical_fresh =
+            canonical_complete_current_listing_value(&fresh, "test fresh extraction").unwrap();
+        assert_eq!(repaired_from_missing, canonical_fresh);
+
+        let repaired_from_malformed = merge_validated_avionics_into_listing_extraction(
+            Some("not json"),
+            fresh.clone(),
             &avionics,
         )
-        .unwrap_err()
-        .contains("does not match the current schema"));
+        .unwrap();
+        let repaired_from_malformed: Value =
+            serde_json::from_str(&repaired_from_malformed).unwrap();
+        assert_eq!(repaired_from_malformed, canonical_fresh);
+
+        let mut unsupported_prior = prior;
+        unsupported_prior["candidates"] = json!([{"content": "provider envelope"}]);
+        let repaired_from_unsupported_prior = merge_validated_avionics_into_listing_extraction(
+            Some(&unsupported_prior.to_string()),
+            fresh.clone(),
+            &avionics,
+        )
+        .unwrap();
+        let repaired_from_unsupported_prior: Value =
+            serde_json::from_str(&repaired_from_unsupported_prior).unwrap();
+        assert_eq!(repaired_from_unsupported_prior, canonical_fresh);
+        assert!(repaired_from_unsupported_prior.get("candidates").is_none());
+
+        let mut unsupported_fresh = fresh;
+        unsupported_fresh["grounding"] = json!({"dossier": "must not persist"});
+        let error =
+            merge_validated_avionics_into_listing_extraction(None, unsupported_fresh, &avionics)
+                .unwrap_err();
+        assert!(error.contains("unsupported field"), "{error}");
     }
 
     #[test]
@@ -6404,7 +6517,7 @@ mod tests {
         let corrected = json!([{
             "manufacturer": "Garmin",
             "model": "G1000 NXi",
-            "types": ["Integrated Flight Deck", "Flight Display"],
+            "types": ["Integrated Flight Deck"],
             "quantity": 1,
             "configuration_action": "installed",
             "replaces": null,
@@ -6412,9 +6525,11 @@ mod tests {
             "source_confidence": "high"
         }]);
         let (endpoint, request_count, server) =
-            spawn_listing_extraction_sequence_endpoint(vec![primary, corrected]).await;
+            spawn_listing_extraction_sequence_endpoint(vec![primary, corrected.clone()]).await;
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
-        let prior = retained_legacy_listing_extraction().to_string();
+        let mut prior = retained_legacy_listing_extraction();
+        prior["avionics"] = corrected;
+        let prior = prior.to_string();
 
         let reextracted = reextract_avionics(
             &extractor,
@@ -6436,10 +6551,12 @@ mod tests {
         assert_eq!(reextracted.avionics[0].model, "G1000 NXi");
         assert_eq!(
             reextracted.avionics[0].avionics_types,
-            vec!["Integrated Flight Deck", "Flight Display"]
+            vec!["Integrated Flight Deck"]
         );
         let merged: Value = serde_json::from_str(&reextracted.extracted_listing_json).unwrap();
         let prior: Value = serde_json::from_str(&prior).unwrap();
+        let prior =
+            canonical_complete_current_listing_value(&prior, "test prior extraction").unwrap();
         for field in [
             "manufacturer",
             "model",
@@ -6493,8 +6610,7 @@ mod tests {
 
     #[test]
     fn current_multi_capability_payload_is_replayed_without_reextraction() {
-        let current = r#"{
-          "avionics": [
+        let current = current_listing_extraction_with_avionics(json!([
             {
               "manufacturer":"Garmin",
               "model":"GNX 375",
@@ -6505,13 +6621,12 @@ mod tests {
               "source_evidence_text":"Garmin GNX 375",
               "source_confidence":"high"
             }
-          ]
-        }"#;
+        ]));
 
         let source = retained_avionics_source(
-            Some(current),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
-            Some("Garmin GNX 375"),
+            Some(&current),
+            Some("https://example.test/listing/current"),
+            Some("<p>Garmin GNX 375</p>"),
         );
 
         let RetainedAvionicsSource::Current(avionics) = source else {
@@ -6522,21 +6637,44 @@ mod tests {
     }
 
     #[test]
-    fn capability_array_without_exact_evidence_requires_reextraction() {
-        let missing_evidence = r#"{
-          "avionics": [{
-            "manufacturer":"Garmin",
-            "model":"GNX 375",
-            "types":["GPS","Transponder"],
-            "quantity":1,
-            "configuration_action":"installed",
-            "replaces":null
-          }]
-        }"#;
+    fn retained_extraction_rejects_exact_evidence_with_inflated_suite_types() {
+        let current = current_listing_extraction_with_avionics(json!([{
+          "manufacturer":"Garmin",
+          "model":"G1000 NXi",
+          "types":["Integrated Flight Deck","Autopilot"],
+          "quantity":1,
+          "configuration_action":"installed",
+          "replaces":null,
+          "source_evidence_text":"Garmin G1000 NXi",
+          "source_confidence":"high"
+        }]));
 
         let source = retained_avionics_source(
-            Some(missing_evidence),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
+            Some(&current),
+            Some("https://example.test/listing/inflated-suite"),
+            Some("<p>Garmin G1000 NXi</p>"),
+        );
+
+        let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
+            panic!("inflated retained suite capabilities must require re-extraction")
+        };
+        assert!(reason.contains("integrated suite"), "{reason}");
+    }
+
+    #[test]
+    fn capability_array_without_exact_evidence_requires_reextraction() {
+        let missing_evidence = current_listing_extraction_with_avionics(json!([{
+          "manufacturer":"Garmin",
+          "model":"GNX 375",
+          "types":["GPS","Transponder"],
+          "quantity":1,
+          "configuration_action":"installed",
+          "replaces":null
+        }]));
+
+        let source = retained_avionics_source(
+            Some(&missing_evidence),
+            Some("https://example.test/listing/missing-evidence"),
             Some("Garmin GNX 375"),
         );
 
@@ -6549,21 +6687,17 @@ mod tests {
     #[test]
     fn missing_or_invalid_capability_arrays_fail_closed_to_reextraction() {
         assert!(matches!(
-            retained_avionics_source(None, &ListingEvidenceContext::default(), None),
+            retained_avionics_source(None, None, None),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
-            retained_avionics_source(
-                Some(r#"{"avionics":[]}"#),
-                &ListingEvidenceContext::default(),
-                None,
-            ),
+            retained_avionics_source(Some(r#"{"avionics":[]}"#), None, None,),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
             retained_avionics_source(
                 Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"GTN 750Xi","types":[]}]}"#),
-                &ListingEvidenceContext::default(),
+                None,
                 None,
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
@@ -6579,7 +6713,7 @@ mod tests {
                   }]
                 }"#
                 ),
-                &ListingEvidenceContext::default(),
+                None,
                 None,
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
@@ -6588,29 +6722,27 @@ mod tests {
 
     #[test]
     fn fabricated_evidence_requires_reextraction() {
-        let fabricated = r#"{
-          "avionics": [{
-            "manufacturer":"Garmin",
-            "model":"GNX 375",
-            "types":["GPS","Transponder"],
-            "quantity":1,
-            "configuration_action":"installed",
-            "replaces":null,
-            "source_evidence_text":"Garmin GNX 375 with invented qualifier",
-            "source_confidence":"high"
-          }]
-        }"#;
+        let fabricated = current_listing_extraction_with_avionics(json!([{
+          "manufacturer":"Garmin",
+          "model":"GNX 375",
+          "types":["GPS","Transponder"],
+          "quantity":1,
+          "configuration_action":"installed",
+          "replaces":null,
+          "source_evidence_text":"Garmin GNX 375 with invented qualifier",
+          "source_confidence":"high"
+        }]));
 
         let source = retained_avionics_source(
-            Some(fabricated),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375 installed"),
+            Some(&fabricated),
+            Some("https://example.test/listing/fabricated"),
             Some("Garmin GNX 375 installed"),
         );
 
         let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
             panic!("model-produced evidence absent from the source must never be replayed")
         };
-        assert!(reason.contains("not one exact structurally visible span"));
+        assert!(reason.contains("not one exact structurally visible source unit"));
     }
 
     #[test]
@@ -6625,7 +6757,7 @@ mod tests {
                 "Garmin G1000 metadata",
             ),
         ] {
-            let payload = json!({"avionics": [{
+            let payload = current_listing_extraction_with_avionics(json!([{
                 "manufacturer": "Garmin",
                 "model": "G1000",
                 "types": ["Flight Display"],
@@ -6634,11 +6766,13 @@ mod tests {
                 "replaces": null,
                 "source_evidence_text": evidence,
                 "source_confidence": "high"
-            }]});
-            let context = ListingEvidenceContext::from_rendered_html(Some(html));
-
+            }]));
             let RetainedAvionicsSource::RequiresReextraction { reason } =
-                retained_avionics_source(Some(&payload.to_string()), &context, Some(html))
+                retained_avionics_source(
+                    Some(&payload.to_string()),
+                    Some("https://example.test/listing/hidden"),
+                    Some(html),
+                )
             else {
                 panic!("non-visible evidence must never be reused from a retained extraction")
             };
@@ -7138,7 +7272,6 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-
         let page = load_listing_sources(
             &db,
             &AvionicsVerificationScope::new(1, Some(listing_id), None),
@@ -7153,7 +7286,10 @@ mod tests {
             rows[0].submission_extraction_error.as_deref(),
             Some("prior extraction warning")
         );
-        let raw = parse_raw_avionics(rows[0].extracted_listing_json.as_deref().unwrap()).unwrap();
+        let raw = parse_current_avionics_extraction_json(
+            rows[0].extracted_listing_json.as_deref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(raw[0].model, "Attached");
         assert_eq!(
             validate_pending_source_binding(&rows[0]).unwrap().1,
@@ -7194,7 +7330,7 @@ mod tests {
         assert!(matches!(
             retained_avionics_source(
                 rows[0].extracted_listing_json.as_deref(),
-                &ListingEvidenceContext::from_rendered_html(rows[0].rendered_html.as_deref()),
+                rows[0].submission_source_url.as_deref(),
                 rows[0].rendered_html.as_deref(),
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
@@ -7206,15 +7342,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_exact_review_observations_bypass_stale_plugin_extraction() {
+    async fn current_review_observations_require_and_can_replace_a_stale_plugin_extraction() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_named_product_for_manufacturer(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "Fixture",
+            "FIXTURE-TEST",
+            "GPS",
+        )
+        .await;
         let listing_id = seed_listing(&db, "https://example.test/listing/53").await;
+        seed_faa_admission(&db, listing_id).await;
+        let stale_extraction = retained_legacy_listing_extraction().to_string();
         seed_submission_and_review(
             &db,
             listing_id,
             "https://example.test/listing/53",
             "<p>Garmin fixture installed</p>",
-            Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"Fixture","types":["GPS"]}]}"#),
+            Some(&stale_extraction),
             Some(listing_id),
             None,
         )
@@ -7234,7 +7382,7 @@ mod tests {
         assert!(matches!(
             retained_avionics_source(
                 row.extracted_listing_json.as_deref(),
-                &listing_context,
+                row.submission_source_url.as_deref(),
                 row.rendered_html.as_deref(),
             ),
             RetainedAvionicsSource::RequiresReextraction { .. }
@@ -7250,6 +7398,239 @@ mod tests {
         assert_eq!(replay.avionics.len(), 1);
         assert_eq!(replay.avionics[0].model, "Fixture");
         assert!(replay.preserved_aspects.is_empty());
+
+        let RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects,
+        } = retained_observation_source(&db, &row, &listing_context)
+            .await
+            .unwrap()
+        else {
+            panic!("a stale attached extraction must not select review observations")
+        };
+        assert!(reason.contains("complete current avionics contract"));
+        assert!(preserved_aspects.is_empty());
+
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": "Garmin",
+            "model": "Fixture",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "Garmin fixture installed",
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let result = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("a validated re-extraction should replace the stale checkpoint and advance");
+        server.abort();
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the listing should be processed")
+        };
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(report.status, "applied", "{report:#?}");
+        assert_eq!(report.raw_avionics_source, "gemini_reextraction");
+        assert!(report.reextraction_required);
+        assert!(report.reextraction_attempted);
+        assert!(report.reextraction_succeeded);
+        assert_eq!(report.accepted, 1);
+
+        let stored_product_id: i64 = sqlx::query_scalar(
+            "SELECT avionics_model_id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(stored_product_id, product_id);
+    }
+
+    #[tokio::test]
+    async fn missing_malformed_and_non_object_checkpoints_reextract_once_and_apply() {
+        for case in ["missing", "malformed", "non-object", "unsupported-prior"] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let product_id = seed_approved_named_product_for_manufacturer(
+                &db,
+                true,
+                "Garmin",
+                "https://www.garmin.com",
+                "Fixture",
+                "FIXTURE-TEST",
+                "GPS",
+            )
+            .await;
+            let source_url = format!("https://example.test/listing/repair-{case}");
+            let listing_id = seed_listing(&db, &source_url).await;
+            seed_faa_admission(&db, listing_id).await;
+            let retained_extraction = match case {
+                "missing" => None,
+                "malformed" => Some("{not-json".to_string()),
+                "non-object" => Some("[]".to_string()),
+                "unsupported-prior" => {
+                    let mut checkpoint = retained_legacy_listing_extraction();
+                    checkpoint["avionics"] = json!([{
+                        "manufacturer": "Garmin",
+                        "model": "Fixture",
+                        "types": ["GPS"],
+                        "quantity": 1,
+                        "configuration_action": "installed",
+                        "replaces": null,
+                        "source_evidence_text": "Garmin fixture installed",
+                        "source_confidence": "high"
+                    }]);
+                    checkpoint["candidates"] =
+                        json!([{"content": "provider envelope must not persist"}]);
+                    Some(checkpoint.to_string())
+                }
+                _ => unreachable!(),
+            };
+            let submission_id = seed_submission_and_review(
+                &db,
+                listing_id,
+                &source_url,
+                "<p>Garmin fixture installed</p>",
+                retained_extraction.as_deref(),
+                Some(listing_id),
+                None,
+            )
+            .await;
+
+            let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+                "manufacturer": "Garmin",
+                "model": "Fixture",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin fixture installed",
+                "source_confidence": "high"
+            }]))
+            .await;
+            let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+            let result = verify_listing_avionics(
+                &db,
+                &extractor,
+                AvionicsVerificationExecutionMode::Apply,
+                listing_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{case} checkpoint repair failed: {error}"));
+            server.abort();
+            let ListingAvionicsVerification::Processed { report } = result else {
+                panic!("{case} checkpoint listing was not processed")
+            };
+
+            assert_eq!(
+                request_count.load(Ordering::SeqCst),
+                1,
+                "{case} checkpoint should use one extraction request"
+            );
+            assert_eq!(report.status, "applied", "{case}: {report:#?}");
+            assert_eq!(report.raw_avionics_source, "gemini_reextraction");
+            assert!(report.reextraction_succeeded);
+            assert_eq!(report.accepted, 1);
+
+            let (stored_json, stored_error): (String, Option<String>) = sqlx::query_as(
+                "SELECT extracted_listing_json, extraction_error FROM plugin_submissions WHERE id = ?",
+            )
+            .bind(submission_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            let stored_value: Value = serde_json::from_str(&stored_json).unwrap();
+            serde_json::from_value::<ParsedListing>(stored_value.clone()).unwrap();
+            let stored_avionics = validate_unbound_current_avionics_extraction(
+                &stored_json,
+                &source_url,
+                "<p>Garmin fixture installed</p>",
+            )
+            .unwrap();
+            assert_eq!(stored_avionics.len(), 1);
+            assert_eq!(stored_avionics[0].model, "Fixture");
+            assert_eq!(stored_error, None);
+            assert!(stored_value.get("candidates").is_none());
+            assert!(stored_value.get("content").is_none());
+
+            let stored_product_id: i64 = sqlx::query_scalar(
+                "SELECT avionics_model_id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            assert_eq!(stored_product_id, product_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_review_observations_reject_inflated_suite_types() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let source_url = "https://example.test/listing/review-inflated-suite";
+        let listing_id = seed_listing(&db, source_url).await;
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            source_url,
+            "<p>Garmin G1000 NXi</p>",
+            None,
+            Some(listing_id),
+            Some("legacy extraction unavailable"),
+        )
+        .await;
+        let aspect = PendingReviewAspect::avionics(
+            "fixture:review-inflated-suite:0",
+            "avionics",
+            "Garmin G1000 NXi",
+            "Garmin G1000 NXi",
+            "exact retained observation",
+            1,
+            "installed",
+            Some("Garmin G1000 NXi".to_string()),
+            Some("high".to_string()),
+        )
+        .with_proposed_product(ReviewProduct::proposed(
+            "Garmin",
+            "G1000 NXi",
+            vec![
+                "Integrated Flight Deck".to_string(),
+                "Autopilot".to_string(),
+            ],
+        ));
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[aspect],
+        )
+        .await
+        .unwrap();
+
+        let row = load_listing_sources(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let listing_context =
+            ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+
+        assert!(matches!(
+            retained_review_observations(&db, &row, &listing_context)
+                .await
+                .unwrap(),
+            RetainedReviewObservationSource::RequiresFallback { .. }
+        ));
     }
 
     #[tokio::test]
@@ -7820,35 +8201,32 @@ mod tests {
         );
         let rendered_html =
             format!("{rendered_html}<p>{generic_evidence}</p><p>{relationship_evidence}</p>");
-        let extracted_listing_json = json!({
-            "avionics": [
-                {
-                    "manufacturer": "Garmin",
-                    "model": "GPS",
-                    "types": ["GPS"],
-                    "quantity": 1,
-                    "configuration_action": "installed",
-                    "replaces": null,
-                    "source_evidence_text": generic_evidence,
-                    "source_confidence": "high"
+        let extracted_listing_json = current_listing_extraction_with_avionics(json!([
+            {
+                "manufacturer": "Garmin",
+                "model": "GPS",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": generic_evidence,
+                "source_confidence": "high"
+            },
+            {
+                "manufacturer": product.1,
+                "model": product_model,
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "replaces",
+                "replaces": {
+                    "manufacturer": replacement.1,
+                    "model": replacement_model,
+                    "types": ["Flight Display"]
                 },
-                {
-                    "manufacturer": product.1,
-                    "model": product_model,
-                    "types": ["Flight Display"],
-                    "quantity": 1,
-                    "configuration_action": "replaces",
-                    "replaces": {
-                        "manufacturer": replacement.1,
-                        "model": replacement_model,
-                        "types": ["Flight Display"]
-                    },
-                    "source_evidence_text": relationship_evidence,
-                    "source_confidence": "high"
-                }
-            ]
-        })
-        .to_string();
+                "source_evidence_text": relationship_evidence,
+                "source_confidence": "high"
+            }
+        ]));
         sqlx::query(
             r#"
             UPDATE plugin_submissions
@@ -7989,19 +8367,16 @@ mod tests {
         );
         let paid_evidence = "Garmin GPS capability";
         let rendered_html = format!("{rendered_html}<p>{paid_evidence}</p>");
-        let extracted_listing_json = json!({
-            "avionics": [{
-                "manufacturer": "Garmin",
-                "model": "GPS",
-                "types": ["GPS"],
-                "quantity": 1,
-                "configuration_action": "installed",
-                "replaces": null,
-                "source_evidence_text": paid_evidence,
-                "source_confidence": "high"
-            }]
-        })
-        .to_string();
+        let extracted_listing_json = current_listing_extraction_with_avionics(json!([{
+            "manufacturer": "Garmin",
+            "model": "GPS",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": paid_evidence,
+            "source_confidence": "high"
+        }]));
         sqlx::query(
             r#"
             UPDATE plugin_submissions
@@ -8497,9 +8872,16 @@ mod tests {
         );
         let rendered_html =
             format!("{rendered_html}<p>{ineligible_evidence}</p><p>{ordinary_evidence}</p>");
-        let extracted_listing_json = format!(
-            r#"{{"avionics":[{{"manufacturer":"Unknown","model":"Replacement Package","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"{ordinary_evidence}","source_confidence":"high"}}]}}"#
-        );
+        let extracted_listing_json = current_listing_extraction_with_avionics(json!([{
+            "manufacturer": "Unknown",
+            "model": "Replacement Package",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": ordinary_evidence,
+            "source_confidence": "high"
+        }]));
         sqlx::query(
             r#"
             UPDATE plugin_submissions
@@ -8797,7 +9179,6 @@ mod tests {
         )
         .await;
         let submission_id = append_nonreplayable_review_aspect(&db, listing_id).await;
-        store_retained_legacy_listing_extraction(&db, submission_id).await;
         let pool = sqlite_pool(&db);
         let (manufacturer, model, evidence): (String, String, String) = sqlx::query_as(
             r#"
@@ -8813,6 +9194,27 @@ mod tests {
         .bind(product_id)
         .bind(link_id)
         .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut prior = retained_legacy_listing_extraction();
+        prior["avionics"] = json!([{
+            "manufacturer": manufacturer,
+            "model": model,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": format!("{evidence} fabricated"),
+            "source_confidence": "high"
+        }]);
+        let canonical_prior =
+            canonical_complete_current_listing_value(&prior, "test prior extraction").unwrap();
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(prior.to_string())
+        .bind(submission_id)
+        .execute(pool)
         .await
         .unwrap();
         let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
@@ -8860,7 +9262,6 @@ mod tests {
         .unwrap();
         assert!(extraction_error.is_none());
         let persisted: Value = serde_json::from_str(&persisted_json).unwrap();
-        let prior = retained_legacy_listing_extraction();
         for field in [
             "manufacturer",
             "model",
@@ -8874,7 +9275,10 @@ mod tests {
             "status",
             "valuation_facts",
         ] {
-            assert_eq!(persisted[field], prior[field], "field {field} changed");
+            assert_eq!(
+                persisted[field], canonical_prior[field],
+                "field {field} changed"
+            );
         }
         assert_eq!(persisted["avionics"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -9186,7 +9590,7 @@ mod tests {
             let ListingAvionicsVerification::Processed { report } = result else {
                 panic!("the listing should retain its pending review")
             };
-            assert_eq!(report.status, "blocked");
+            assert_eq!(report.status, "blocked", "fixture {index}: {report:#?}");
             assert_eq!(report.raw_avionics_source, "pending_review");
             assert!(!report.reextraction_attempted);
             assert_eq!(report.accepted, 0);
@@ -9247,6 +9651,15 @@ mod tests {
             unattested_listing_id,
             mismatched_listing_id,
         ] {
+            let submission_id: i64 = sqlx::query_scalar(
+                "SELECT plugin_submission_id FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            store_retained_legacy_listing_extraction(&db, submission_id).await;
+
             let preflight = preflight_listing_avionics(
                 &db,
                 listing_id,
@@ -9786,6 +10199,17 @@ mod tests {
         let source_url = format!("https://example.test/listing/{suffix}");
         let evidence = format!("{} {} standby instrument", product.0, product.1);
         let rendered_html = format!("<p>{evidence}</p>");
+        let extracted_listing_json = json!({"avionics": [{
+            "manufacturer": product.0,
+            "model": product.1,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        }]})
+        .to_string();
         let listing_id = seed_listing(db, &source_url).await;
         seed_faa_admission(db, listing_id).await;
         let submission_id = seed_submission_and_review(
@@ -9793,9 +10217,9 @@ mod tests {
             listing_id,
             &source_url,
             &rendered_html,
-            None,
+            Some(&extracted_listing_json),
             Some(listing_id),
-            Some("legacy extraction unavailable"),
+            None,
         )
         .await;
         let aspect = PendingReviewAspect::avionics(
@@ -9855,14 +10279,29 @@ mod tests {
         .await
         .unwrap();
         let exact_evidence = format!("{manufacturer} {model} standby instrument");
-        let evidence = match fixture {
+        let review_evidence = match fixture {
             PreservedAssociationFixture::AmbiguousQualifier => {
                 format!("{manufacturer} {model} WAAS upgraded")
             }
-            _ => exact_evidence,
+            _ => exact_evidence.clone(),
         };
         let source_url = format!("https://example.test/listing/{suffix}");
-        let rendered_html = format!("<p>{evidence}</p>");
+        let rendered_html = if review_evidence == exact_evidence {
+            format!("<p>{exact_evidence}</p>")
+        } else {
+            format!("<p>{exact_evidence}</p><p>{review_evidence}</p>")
+        };
+        let extracted_listing_json = json!({"avionics": [{
+            "manufacturer": manufacturer,
+            "model": model,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": exact_evidence,
+            "source_confidence": "high"
+        }]})
+        .to_string();
         let listing_id = seed_listing(db, &source_url).await;
         seed_faa_admission(db, listing_id).await;
         let submission_id = seed_submission_and_review(
@@ -9870,9 +10309,9 @@ mod tests {
             listing_id,
             &source_url,
             &rendered_html,
-            None,
+            Some(&extracted_listing_json),
             Some(listing_id),
-            Some("legacy extraction unavailable"),
+            None,
         )
         .await;
         let replacement_id = if matches!(fixture, PreservedAssociationFixture::Replacement) {
@@ -9897,7 +10336,7 @@ mod tests {
         )
         .bind(listing_id)
         .bind(product_id)
-        .bind(&evidence)
+        .bind(&review_evidence)
         .bind(configuration_action)
         .bind(replacement_id)
         .fetch_one(pool)
@@ -9914,7 +10353,7 @@ mod tests {
             configuration_action,
             match fixture {
                 PreservedAssociationFixture::MissingEvidence => None,
-                _ => Some(evidence),
+                _ => Some(review_evidence),
             },
             Some("high".to_string()),
         )
@@ -10026,6 +10465,18 @@ mod tests {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
+        let extracted_listing_json = extracted_listing_json.map(|raw| {
+            let Ok(value) = serde_json::from_str::<Value>(raw) else {
+                return raw.to_string();
+            };
+            if value
+                .as_object()
+                .is_some_and(|object| object.len() == 1 && object.contains_key("avionics"))
+            {
+                return current_listing_extraction_with_avionics(value["avionics"].clone());
+            }
+            raw.to_string()
+        });
         let install_id: i64 = sqlx::query_scalar(
             "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (1, 'fixture') RETURNING id",
         )
@@ -10046,7 +10497,7 @@ mod tests {
         .bind(source_url)
         .bind(rendered_html)
         .bind(sha256_hex(rendered_html.as_bytes()))
-        .bind(extracted_listing_json)
+        .bind(extracted_listing_json.as_deref())
         .bind(extraction_error)
         .bind(canonical_listing_id)
         .fetch_one(pool)

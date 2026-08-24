@@ -117,6 +117,20 @@ domain and evidence rules but does not repeat a prose rendering of that same
 JSON shape. Tests at both the prompt builder and request boundary require the
 schema to remain attached.
 
+Occurrence evidence must be contained within one unit admitted by the same
+publisher source adapter that constructs extraction-model input. For Controller
+that means one exact specification value; labels, sibling values, price/page
+chrome, and JSON-LD are ineligible. Inline markup and line wraps within a value
+remain one unit. Generic publishers use structurally visible body units, where
+sibling blocks, table cells, and definition terms/values remain separate.
+Whole-body flattening cannot manufacture an evidence phrase across any of
+these boundaries. The same gate runs for the initial extraction checkpoint and
+durable avionics re-extraction.
+An `Integrated Flight Deck` identity may establish that core category without
+repeating it in prose; every additional category assigned to the suite must be
+explicit in the same occurrence evidence, and a separately extracted
+component's category cannot also be absorbed into the suite.
+
 The listing-extraction envelope is at most two logical requests. A malformed
 primary JSON response may consume the second request for the existing JSON
 repair, or a directly parseable primary may consume it for the semantic
@@ -180,12 +194,15 @@ Apply-mode recovery of an obsolete listing extraction has a distinct durable
 boundary. The returned raw avionics array must contain explicit quantity,
 action, and replacement semantics, pass the current capability schema, and
 bind every excerpt exactly to the retained source capture. The application
-then replaces only `avionics` in the retained top-level extraction object and
-stores the compact merged JSON; it never accepts aircraft identity, hours,
-price, valuation facts, or other non-avionics values from this scoped pass. A
-missing or invalid prior object fails closed. The write is bound to the exact
-submission, owner, listing, source URL, capture bytes and hash, pending-review
-revision, canonical listing binding, and prior extraction/error state.
+then creates one canonical current checkpoint. When the prior checkpoint is an
+exact current `ParsedListing`, its non-avionics fields are preserved and only
+`avionics` is replaced. When the prior is missing or unusable, the complete
+newly extracted listing supplies those fields instead. Both inputs and the
+final persisted object are checked against the shared exact checkpoint-field
+contract, so unsupported provider-envelope, grounding, dossier, or arbitrary
+keys cannot be retained. The write is bound to the exact submission, owner,
+listing, source URL, capture bytes and hash, pending-review revision, canonical
+listing binding, and prior extraction/error state.
 PostgreSQL takes the project listing-child lock order and locks/revalidates the
 listing, review, and submission rows before updating. The write is idempotent
 for the same extraction and fails closed on any concurrent change. This lets a
@@ -193,6 +210,25 @@ later blocked identity run resume without paying for extraction again; it does
 not persist prompts, provider envelopes, Search results, URL Context dossiers,
 or grounding evidence. Preview mode never performs this domain write, and an
 empty equipment extraction is not persisted.
+
+Every automated avionics-review apply revalidates the complete current
+extraction against the retained bound capture before it writes links,
+authorizations, dispositions, or review state. This is unconditional for
+accepted-links-only and local-reuse results even when they carry no occurrence
+dispositions. When dispositions are present, their fingerprints reuse the
+same parsed and validated observations instead of opening a weaker second
+parse path. An empty avionics array cannot authorize an automated avionics
+write. Pending-review observations are selected only when the attached raw
+checkpoint also passes this complete contract; otherwise the workflow retains
+the review and re-extracts the bound source before it can apply.
+
+Successful re-extraction always produces one complete current listing
+checkpoint. If the retained checkpoint is a structurally current
+`ParsedListing`, its non-avionics values are preserved and only avionics are
+replaced. If it is missing, malformed, non-object, or not current, the complete
+newly extracted listing becomes the repair checkpoint after full listing and
+avionics validation. Only that parsed listing object is stored; provider
+response envelopes and research dossiers are not retained.
 
 Before a fresh listing extraction checkpoint is stored, a narrower
 publisher-specific repair may correct typography in avionics occurrence
