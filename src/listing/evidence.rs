@@ -376,37 +376,43 @@ pub(crate) fn controller_avionics_evidence(
             continue;
         }
         let children = wrapper.child_elements().collect::<Vec<_>>();
-        let labels = children
-            .iter()
-            .copied()
-            .filter(|element| element_has_exact_class_token(*element, CONTROLLER_SPECS_LABEL_CLASS))
-            .collect::<Vec<_>>();
-        let values = children
-            .iter()
-            .copied()
-            .filter(|element| element_has_exact_class_token(*element, CONTROLLER_SPECS_VALUE_CLASS))
-            .collect::<Vec<_>>();
-        let raw_claims_avionics_field = labels.iter().any(|label| {
-            normalized_controller_field_label(label.text().collect::<String>())
-                == CONTROLLER_AVIONICS_LABEL
+        let claims_avionics_field = children.iter().copied().any(|label| {
+            element_has_exact_class_token(label, CONTROLLER_SPECS_LABEL_CLASS)
+                && (normalized_controller_field_label(label.text().collect::<String>())
+                    == CONTROLLER_AVIONICS_LABEL
+                    || normalized_controller_field_label(clean_publisher_multiline_element_text(
+                        &document, label,
+                    )) == CONTROLLER_AVIONICS_LABEL)
         });
-        let visible_claims_avionics_field = labels.iter().any(|label| {
-            normalized_controller_field_label(clean_publisher_multiline_element_text(
-                &document, *label,
-            )) == CONTROLLER_AVIONICS_LABEL
-        });
-        if !raw_claims_avionics_field && !visible_claims_avionics_field {
+        if !claims_avionics_field {
             continue;
         }
-        if labels.len() != 1 || values.len() != 1 {
+        if children.len() % 2 != 0 {
             return None;
         }
-        if !visible_claims_avionics_field {
-            return None;
-        }
-        let value = clean_publisher_multiline_element_text(&document, values[0]);
-        if value.is_empty() || accepted.replace(value).is_some() {
-            return None;
+        for pair in children.chunks_exact(2) {
+            let label = pair[0];
+            let value = pair[1];
+            if !element_has_exact_class_token(label, CONTROLLER_SPECS_LABEL_CLASS)
+                || !element_has_exact_class_token(value, CONTROLLER_SPECS_VALUE_CLASS)
+            {
+                return None;
+            }
+            let raw_claims_avionics_field =
+                normalized_controller_field_label(label.text().collect::<String>())
+                    == CONTROLLER_AVIONICS_LABEL;
+            let visible_claims_avionics_field = normalized_controller_field_label(
+                clean_publisher_multiline_element_text(&document, label),
+            ) == CONTROLLER_AVIONICS_LABEL;
+            if raw_claims_avionics_field != visible_claims_avionics_field {
+                return None;
+            }
+            if visible_claims_avionics_field {
+                let value = clean_publisher_multiline_element_text(&document, value);
+                if value.is_empty() || accepted.replace(value).is_some() {
+                    return None;
+                }
+            }
         }
     }
     accepted
@@ -996,6 +1002,30 @@ Garmin GTX 33 ADS-B compliant</div>
                 None,
                 "a wrong label or class token must not authorize multiline semantics"
             );
+        }
+
+        let multi_field_wrapper = r#"<div class="detail__specs-wrapper">
+          <div class="detail__specs-label">ADS-B Equipped</div>
+          <div class="detail__specs-value">Yes</div>
+          <div class="detail__specs-label">Avionics/Radios</div>
+          <div class="detail__specs-value">KSAR Garmin G5 attitude, Garmin G5 HSI</div>
+        </div>"#;
+        assert_eq!(
+            controller_avionics_evidence(URL, multi_field_wrapper).as_deref(),
+            Some("KSAR Garmin G5 attitude, Garmin G5 HSI")
+        );
+
+        for malformed in [
+            multi_field_wrapper.replace(
+                r#"<div class="detail__specs-value">Yes</div>"#,
+                r#"<div class="detail__specs-label">Yes</div>"#,
+            ),
+            multi_field_wrapper.replace(
+                r#"<div class="detail__specs-label">ADS-B Equipped</div>"#,
+                "",
+            ),
+        ] {
+            assert_eq!(controller_avionics_evidence(URL, &malformed), None);
         }
     }
 

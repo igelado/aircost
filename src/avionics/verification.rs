@@ -24,7 +24,8 @@ use crate::html::clean::clean_listing_html;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::extraction::{
     parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
-    validate_current_avionics_identity_evidence,
+    recover_exact_role_separated_avionics_quantity, validate_current_avionics_identity_evidence,
+    validate_current_avionics_quantity_completeness,
 };
 use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
@@ -1296,6 +1297,7 @@ async fn process_listing(
                 &scoped_extractor,
                 &listing_text,
                 &listing_context,
+                source_url,
                 rendered_html,
                 row.extracted_listing_json.as_deref(),
             )
@@ -4356,13 +4358,18 @@ async fn reextract_avionics(
     extractor: &GeminiListingExtractor,
     listing_text: &str,
     listing_context: &ListingEvidenceContext,
+    source_url: &str,
     rendered_html: &str,
     prior_extracted_listing_json: Option<&str>,
 ) -> Result<ValidatedListingReextraction, String> {
-    let extracted = extractor
+    let mut extracted = extractor
         .extract(listing_text)
         .await
         .map_err(|error| format!("Gemini listing extraction request failed: {error}"))?;
+    recover_exact_role_separated_avionics_quantity(&mut extracted, source_url, rendered_html)
+        .map_err(|error| {
+            format!("Gemini returned listing quantity evidence that could not be repaired: {error}")
+        })?;
     let avionics = parse_current_avionics_extraction_value(&extracted).map_err(|error| {
         format!(
             "Gemini returned output incompatible with the current explicit occurrence schema: {error}"
@@ -4379,6 +4386,9 @@ async fn reextract_avionics(
         .map_err(|error| {
             format!("Gemini returned listing evidence not present in the retained source: {error}")
         })?;
+    validate_current_avionics_quantity_completeness(&avionics, source_url, rendered_html).map_err(
+        |error| format!("Gemini returned incomplete listing quantity evidence: {error}"),
+    )?;
     let extracted_listing_json = if avionics.is_empty() {
         String::new()
     } else {
@@ -5023,6 +5033,23 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/"), request_count, server)
+    }
+
+    const CONTROLLER_ROLE_LISTING_URL: &str =
+        "https://www.controller.com/listing/for-sale/252742967/example";
+
+    fn trusted_controller_role_html(field: &str) -> String {
+        format!(
+            r#"<html><body>
+              <p>Currently hangared at KSAR</p>
+              <div class="detail__specs-wrapper">
+                <div class="detail__specs-label">ADS-B Equipped</div>
+                <div class="detail__specs-value">Yes</div>
+                <div class="detail__specs-label">Avionics/Radios</div>
+                <div class="detail__specs-value">{field}</div>
+              </div>
+            </body></html>"#
+        )
     }
 
     fn retained_legacy_listing_extraction() -> Value {
@@ -6265,6 +6292,7 @@ mod tests {
             &extractor,
             evidence,
             &ListingEvidenceContext::from_cleaned_text(evidence),
+            "https://example.test/listing/1",
             evidence,
             Some(&prior),
         )
@@ -6274,6 +6302,89 @@ mod tests {
 
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(error.contains("quantity must be at least 1"));
+    }
+
+    #[tokio::test]
+    async fn durable_reextraction_repairs_one_trusted_role_pair_without_another_provider_call() {
+        let html = trusted_controller_role_html(
+            "KSAR Garmin G5 attitude, Garmin G5 HSI, Garmin GFC500 auto pilot",
+        );
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": "Garmin",
+            "model": "G5",
+            "types": ["Flight Display", "AHRS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "Garmin G5 attitude",
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let prior = retained_legacy_listing_extraction().to_string();
+
+        let reextracted = reextract_avionics(
+            &extractor,
+            &clean_listing_html(&html),
+            &ListingEvidenceContext::from_listing_capture(
+                Some(CONTROLLER_ROLE_LISTING_URL),
+                Some(&html),
+            ),
+            CONTROLLER_ROLE_LISTING_URL,
+            &html,
+            Some(&prior),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(reextracted.avionics.len(), 1);
+        assert_eq!(reextracted.avionics[0].quantity, 2);
+        assert_eq!(
+            reextracted.avionics[0].source_evidence_text.as_deref(),
+            Some("Garmin G5 attitude, Garmin G5 HSI")
+        );
+        let merged: Value = serde_json::from_str(&reextracted.extracted_listing_json).unwrap();
+        assert_eq!(merged["avionics"][0]["quantity"], 2);
+    }
+
+    #[tokio::test]
+    async fn durable_reextraction_rejects_an_extra_same_product_role_occurrence() {
+        let html = trusted_controller_role_html(
+            "Garmin G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5 standby display",
+        );
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": "Garmin",
+            "model": "G5",
+            "types": ["Flight Display", "AHRS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "Garmin G5 attitude",
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let prior = retained_legacy_listing_extraction().to_string();
+
+        let error = reextract_avionics(
+            &extractor,
+            &clean_listing_html(&html),
+            &ListingEvidenceContext::from_listing_capture(
+                Some(CONTROLLER_ROLE_LISTING_URL),
+                Some(&html),
+            ),
+            CONTROLLER_ROLE_LISTING_URL,
+            &html,
+            Some(&prior),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(error.contains("multiple distinct role-separated quantity proofs"));
     }
 
     #[test]

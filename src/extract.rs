@@ -2053,7 +2053,7 @@ Rules:\n\
 - Do not convert model names to ICAO type designators.\n\
 - avionics must come from the listing text and should include fixed installed avionics only.\n\
 - Each physical avionics product must appear once. Its types array may contain multiple independently supported atomic capabilities; do not emit duplicate product rows merely to represent GPS, transponder, navigation, communications, or other functions separately. Represent a combined NAV/COM unit with both NAV and COM, never a composite NAV/COM type. Use [Unknown] only when the listing gives no usable capability.\n\
-- When the listing explicitly enumerates multiple installed units of the exact same product (for example unit #1 and unit #2, or dual identical radios), emit one avionics row with quantity equal to the supported installed count. Do not emit one row per serial position. Do not increase quantity merely because the same unit is mentioned repeatedly in narrative text when separate physical units are not explicit.\n\
+- When the listing explicitly enumerates multiple installed units of the exact same product (for example unit #1 and unit #2, dual identical radios, or Garmin G5 attitude plus Garmin G5 HSI), emit one avionics row with quantity equal to the supported installed count. Copy one exact source_evidence_text span that covers every counted list item. Do not emit one row per serial position. Distinct complementary attitude and HSI installation roles in adjacent comma- or semicolon-delimited equipment items prove separate physical units; repeated mentions in narrative text, repeated copies of the same role, or different model suffixes do not.\n\
 - Assign only capabilities intrinsic to the identified physical product. Do not copy capabilities of a compatible external display, sensor, antenna, servo, or indicator into the product. In particular, VOR/localizer/glideslope support on a NAV/COM radio establishes NAV, not a separate Navigation Indicator capability; use Navigation Indicator only when the listing identifies an installed CDI, HSI, or indicator product.\n\
 - Weather delivered by satellite, ADS-B/FIS-B, SiriusXM, or another receiver/datalink is a Datalink capability, not Weather Radar. Assign Weather Radar only to an installed airborne radar sensor/system; the word weather by itself never establishes Weather Radar.\n\
 - Each avionics item must include configuration_action installed, replaces, or removes; a short exact source_evidence_text; and high/medium/low source_confidence. Use replaces/removes only when the listing explicitly states the delta from prior/factory equipment.\n\
@@ -4452,7 +4452,10 @@ mod tests {
         let prompt = build_extraction_prompt("Dual KX-170B NAV/COM radios installed.");
         assert!(prompt.contains("unit #1 and unit #2"));
         assert!(prompt.contains("one avionics row with quantity"));
-        assert!(prompt.contains("separate physical units are not explicit"));
+        assert!(prompt.contains("Garmin G5 attitude plus Garmin G5 HSI"));
+        assert!(prompt.contains("covers every counted list item"));
+        assert!(prompt.contains("complementary attitude and HSI installation roles"));
+        assert!(prompt.contains("repeated mentions in narrative text"));
         assert!(prompt.contains("not a separate Navigation Indicator capability"));
         assert!(prompt.contains("receiver/datalink is a Datalink capability, not Weather Radar"));
         assert!(prompt.contains("word weather by itself never establishes Weather Radar"));
