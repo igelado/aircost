@@ -43,15 +43,9 @@ pub(crate) fn validate_current_avionics_extraction(
     let observations = parse_current_avionics_extraction_json(extraction.extracted_listing_json)?;
     let listing_context =
         ListingEvidenceContext::from_rendered_html(Some(extraction.rendered_html));
-    validate_current_avionics_identity_evidence(
+    validate_current_avionics_observations(
         &observations,
         &listing_context,
-        extraction.submission_source_url,
-        extraction.rendered_html,
-    )?;
-    validate_current_avionics_type_scope(&observations)?;
-    validate_current_avionics_quantity_completeness(
-        &observations,
         extraction.submission_source_url,
         extraction.rendered_html,
     )?;
@@ -69,15 +63,34 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
 ) -> Result<Vec<ParsedAvionics>, String> {
     let observations = parse_current_avionics_extraction_json(extracted_listing_json)?;
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
-    validate_current_avionics_identity_evidence(
+    validate_current_avionics_observations(
         &observations,
         &listing_context,
         source_url,
         rendered_html,
     )?;
-    validate_current_avionics_type_scope(&observations)?;
-    validate_current_avionics_quantity_completeness(&observations, source_url, rendered_html)?;
     Ok(observations)
+}
+
+/// Apply the complete semantic contract to already parsed current-schema
+/// observations. Callers that construct observations from another current
+/// representation, such as a pending-review payload, use this boundary so
+/// identity evidence, capability scope, and quantity completeness cannot
+/// drift apart across replay paths.
+pub(crate) fn validate_current_avionics_observations(
+    observations: &[ParsedAvionics],
+    listing_context: &ListingEvidenceContext,
+    source_url: &str,
+    rendered_html: &str,
+) -> Result<(), String> {
+    validate_current_avionics_identity_evidence(
+        observations,
+        listing_context,
+        source_url,
+        rendered_html,
+    )?;
+    validate_current_avionics_type_scope(observations)?;
+    validate_current_avionics_quantity_completeness(observations, source_url, rendered_html)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

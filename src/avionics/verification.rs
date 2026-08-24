@@ -26,10 +26,11 @@ use crate::html::listing::source::listing_extraction_source;
 use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 #[cfg(test)]
-use crate::listing::avionics::extraction::parse_current_avionics_extraction_value;
 use crate::listing::avionics::extraction::{
-    parse_current_avionics_extraction_json, validate_current_avionics_identity_evidence,
-    validate_current_avionics_quantity_completeness,
+    parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
+};
+use crate::listing::avionics::extraction::{
+    validate_current_avionics_observations, validate_unbound_current_avionics_extraction,
 };
 use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
@@ -3803,7 +3804,6 @@ async fn retained_observation_source(
     Ok(
         match retained_avionics_source(
             row.extracted_listing_json.as_deref(),
-            listing_context,
             row.submission_source_url.as_deref(),
             row.rendered_html.as_deref(),
         ) {
@@ -3886,7 +3886,7 @@ async fn retained_review_observations(
         return Ok(RetainedReviewObservationSource::RequiresFallback { preserved_aspects });
     };
     if (!avionics.is_empty()
-        && validate_current_avionics_identity_evidence(
+        && validate_current_avionics_observations(
             &avionics,
             listing_context,
             source_url,
@@ -4048,7 +4048,6 @@ async fn replay_current_verified_suggestion(
 
 fn retained_avionics_source(
     raw_json: Option<&str>,
-    listing_context: &ListingEvidenceContext,
     source_url: Option<&str>,
     rendered_html: Option<&str>,
 ) -> RetainedAvionicsSource {
@@ -4062,29 +4061,21 @@ fn retained_avionics_source(
             reason: "the retained plugin submission has no source URL".to_string(),
         };
     };
-    match parse_raw_avionics(raw_json) {
+    match validate_unbound_current_avionics_extraction(
+        raw_json,
+        source_url,
+        rendered_html.unwrap_or_default(),
+    ) {
         Ok(avionics) if avionics.is_empty() => {
             RetainedAvionicsSource::RequiresReextraction {
                 reason: "the retained plugin extraction contains no avionics capability arrays"
                     .to_string(),
             }
         }
-        Ok(avionics) => match validate_current_avionics_identity_evidence(
-            &avionics,
-            listing_context,
-            source_url,
-            rendered_html.unwrap_or_default(),
-        ) {
-            Ok(()) => RetainedAvionicsSource::Current(avionics),
-            Err(error) => RetainedAvionicsSource::RequiresReextraction {
-                reason: format!(
-                    "the retained plugin extraction has invalid listing evidence: {error}"
-                ),
-            },
-        },
+        Ok(avionics) => RetainedAvionicsSource::Current(avionics),
         Err(error) => RetainedAvionicsSource::RequiresReextraction {
             reason: format!(
-                "the retained plugin extraction is not compatible with the current capability-array schema: {error}"
+                "the retained plugin extraction does not satisfy the complete current avionics contract: {error}"
             ),
         },
     }
@@ -4401,18 +4392,8 @@ async fn reextract_avionics(
             ));
         }
     }
-    validate_current_avionics_identity_evidence(
-        &avionics,
-        listing_context,
-        source_url,
-        rendered_html,
-    )
-    .map_err(|error| {
-        format!("Gemini returned listing evidence not present in the retained source: {error}")
-    })?;
-    validate_current_avionics_quantity_completeness(&avionics, source_url, rendered_html).map_err(
-        |error| format!("Gemini returned incomplete listing quantity evidence: {error}"),
-    )?;
+    validate_current_avionics_observations(&avionics, listing_context, source_url, rendered_html)
+        .map_err(|error| format!("Gemini returned invalid current avionics: {error}"))?;
     let extracted_listing_json = if avionics.is_empty() {
         String::new()
     } else {
@@ -4458,10 +4439,6 @@ fn merge_validated_avionics_into_prior_extraction(
     })?;
     serde_json::to_string(&extraction)
         .map_err(|error| format!("could not serialize validated listing extraction: {error}"))
-}
-
-fn parse_raw_avionics(raw_json: &str) -> Result<Vec<ParsedAvionics>, String> {
-    parse_current_avionics_extraction_json(raw_json)
 }
 
 async fn load_listing_sources(
@@ -5144,12 +5121,19 @@ mod tests {
     }
 
     async fn store_retained_legacy_listing_extraction(db: &AppDb, submission_id: i64) {
-        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = ? WHERE id = ?")
-            .bind(retained_legacy_listing_extraction().to_string())
-            .bind(submission_id)
-            .execute(sqlite_pool(db))
-            .await
-            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE plugin_submissions
+            SET extracted_listing_json = ?,
+                extraction_error = 'legacy extraction unavailable'
+            WHERE id = ?
+            "#,
+        )
+        .bind(retained_legacy_listing_extraction().to_string())
+        .bind(submission_id)
+        .execute(sqlite_pool(db))
+        .await
+        .unwrap();
     }
 
     fn locked_reextraction_state(
@@ -5369,7 +5353,7 @@ mod tests {
 
     #[test]
     fn raw_parser_preserves_capability_arrays_and_explicit_actions() {
-        let parsed = parse_raw_avionics(
+        let parsed = parse_current_avionics_extraction_json(
             r#"{
               "avionics": [
                 {
@@ -6240,7 +6224,6 @@ mod tests {
 
         let source = retained_avionics_source(
             Some(legacy),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
             Some("https://example.test/listing/legacy"),
             Some("Garmin GNX 375"),
         );
@@ -6535,9 +6518,8 @@ mod tests {
 
         let source = retained_avionics_source(
             Some(current),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
             Some("https://example.test/listing/current"),
-            Some("Garmin GNX 375"),
+            Some("<p>Garmin GNX 375</p>"),
         );
 
         let RetainedAvionicsSource::Current(avionics) = source else {
@@ -6545,6 +6527,33 @@ mod tests {
         };
         assert_eq!(avionics.len(), 1);
         assert_eq!(avionics[0].avionics_types, vec!["GPS", "Transponder"]);
+    }
+
+    #[test]
+    fn retained_extraction_rejects_exact_evidence_with_inflated_suite_types() {
+        let current = r#"{
+          "avionics": [{
+            "manufacturer":"Garmin",
+            "model":"G1000 NXi",
+            "types":["Integrated Flight Deck","Autopilot"],
+            "quantity":1,
+            "configuration_action":"installed",
+            "replaces":null,
+            "source_evidence_text":"Garmin G1000 NXi",
+            "source_confidence":"high"
+          }]
+        }"#;
+
+        let source = retained_avionics_source(
+            Some(current),
+            Some("https://example.test/listing/inflated-suite"),
+            Some("<p>Garmin G1000 NXi</p>"),
+        );
+
+        let RetainedAvionicsSource::RequiresReextraction { reason } = source else {
+            panic!("inflated retained suite capabilities must require re-extraction")
+        };
+        assert!(reason.contains("integrated suite"), "{reason}");
     }
 
     #[test]
@@ -6562,7 +6571,6 @@ mod tests {
 
         let source = retained_avionics_source(
             Some(missing_evidence),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375"),
             Some("https://example.test/listing/missing-evidence"),
             Some("Garmin GNX 375"),
         );
@@ -6576,22 +6584,16 @@ mod tests {
     #[test]
     fn missing_or_invalid_capability_arrays_fail_closed_to_reextraction() {
         assert!(matches!(
-            retained_avionics_source(None, &ListingEvidenceContext::default(), None, None),
+            retained_avionics_source(None, None, None),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
-            retained_avionics_source(
-                Some(r#"{"avionics":[]}"#),
-                &ListingEvidenceContext::default(),
-                None,
-                None,
-            ),
+            retained_avionics_source(Some(r#"{"avionics":[]}"#), None, None,),
             RetainedAvionicsSource::RequiresReextraction { .. }
         ));
         assert!(matches!(
             retained_avionics_source(
                 Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"GTN 750Xi","types":[]}]}"#),
-                &ListingEvidenceContext::default(),
                 None,
                 None,
             ),
@@ -6608,7 +6610,6 @@ mod tests {
                   }]
                 }"#
                 ),
-                &ListingEvidenceContext::default(),
                 None,
                 None,
             ),
@@ -6633,7 +6634,6 @@ mod tests {
 
         let source = retained_avionics_source(
             Some(fabricated),
-            &ListingEvidenceContext::from_cleaned_text("Garmin GNX 375 installed"),
             Some("https://example.test/listing/fabricated"),
             Some("Garmin GNX 375 installed"),
         );
@@ -6666,12 +6666,9 @@ mod tests {
                 "source_evidence_text": evidence,
                 "source_confidence": "high"
             }]});
-            let context = ListingEvidenceContext::from_rendered_html(Some(html));
-
             let RetainedAvionicsSource::RequiresReextraction { reason } =
                 retained_avionics_source(
                     Some(&payload.to_string()),
-                    &context,
                     Some("https://example.test/listing/hidden"),
                     Some(html),
                 )
@@ -7189,7 +7186,10 @@ mod tests {
             rows[0].submission_extraction_error.as_deref(),
             Some("prior extraction warning")
         );
-        let raw = parse_raw_avionics(rows[0].extracted_listing_json.as_deref().unwrap()).unwrap();
+        let raw = parse_current_avionics_extraction_json(
+            rows[0].extracted_listing_json.as_deref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(raw[0].model, "Attached");
         assert_eq!(
             validate_pending_source_binding(&rows[0]).unwrap().1,
@@ -7230,7 +7230,6 @@ mod tests {
         assert!(matches!(
             retained_avionics_source(
                 rows[0].extracted_listing_json.as_deref(),
-                &ListingEvidenceContext::from_rendered_html(rows[0].rendered_html.as_deref()),
                 rows[0].submission_source_url.as_deref(),
                 rows[0].rendered_html.as_deref(),
             ),
@@ -7271,7 +7270,6 @@ mod tests {
         assert!(matches!(
             retained_avionics_source(
                 row.extracted_listing_json.as_deref(),
-                &listing_context,
                 row.submission_source_url.as_deref(),
                 row.rendered_html.as_deref(),
             ),
@@ -7288,6 +7286,69 @@ mod tests {
         assert_eq!(replay.avionics.len(), 1);
         assert_eq!(replay.avionics[0].model, "Fixture");
         assert!(replay.preserved_aspects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_review_observations_reject_inflated_suite_types() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let source_url = "https://example.test/listing/review-inflated-suite";
+        let listing_id = seed_listing(&db, source_url).await;
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            source_url,
+            "<p>Garmin G1000 NXi</p>",
+            None,
+            Some(listing_id),
+            Some("legacy extraction unavailable"),
+        )
+        .await;
+        let aspect = PendingReviewAspect::avionics(
+            "fixture:review-inflated-suite:0",
+            "avionics",
+            "Garmin G1000 NXi",
+            "Garmin G1000 NXi",
+            "exact retained observation",
+            1,
+            "installed",
+            Some("Garmin G1000 NXi".to_string()),
+            Some("high".to_string()),
+        )
+        .with_proposed_product(ReviewProduct::proposed(
+            "Garmin",
+            "G1000 NXi",
+            vec![
+                "Integrated Flight Deck".to_string(),
+                "Autopilot".to_string(),
+            ],
+        ));
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[aspect],
+        )
+        .await
+        .unwrap();
+
+        let row = load_listing_sources(
+            &db,
+            &AvionicsVerificationScope::new(1, Some(listing_id), None),
+        )
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .unwrap();
+        let listing_context =
+            ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+
+        assert!(matches!(
+            retained_review_observations(&db, &row, &listing_context)
+                .await
+                .unwrap(),
+            RetainedReviewObservationSource::RequiresFallback { .. }
+        ));
     }
 
     #[tokio::test]
@@ -9285,6 +9346,15 @@ mod tests {
             unattested_listing_id,
             mismatched_listing_id,
         ] {
+            let submission_id: i64 = sqlx::query_scalar(
+                "SELECT plugin_submission_id FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(sqlite_pool(&db))
+            .await
+            .unwrap();
+            store_retained_legacy_listing_extraction(&db, submission_id).await;
+
             let preflight = preflight_listing_avionics(
                 &db,
                 listing_id,
@@ -9824,6 +9894,17 @@ mod tests {
         let source_url = format!("https://example.test/listing/{suffix}");
         let evidence = format!("{} {} standby instrument", product.0, product.1);
         let rendered_html = format!("<p>{evidence}</p>");
+        let extracted_listing_json = json!({"avionics": [{
+            "manufacturer": product.0,
+            "model": product.1,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        }]})
+        .to_string();
         let listing_id = seed_listing(db, &source_url).await;
         seed_faa_admission(db, listing_id).await;
         let submission_id = seed_submission_and_review(
@@ -9831,9 +9912,9 @@ mod tests {
             listing_id,
             &source_url,
             &rendered_html,
-            None,
+            Some(&extracted_listing_json),
             Some(listing_id),
-            Some("legacy extraction unavailable"),
+            None,
         )
         .await;
         let aspect = PendingReviewAspect::avionics(
@@ -9901,6 +9982,17 @@ mod tests {
         };
         let source_url = format!("https://example.test/listing/{suffix}");
         let rendered_html = format!("<p>{evidence}</p>");
+        let extracted_listing_json = json!({"avionics": [{
+            "manufacturer": manufacturer,
+            "model": model,
+            "types": ["Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        }]})
+        .to_string();
         let listing_id = seed_listing(db, &source_url).await;
         seed_faa_admission(db, listing_id).await;
         let submission_id = seed_submission_and_review(
@@ -9908,9 +10000,9 @@ mod tests {
             listing_id,
             &source_url,
             &rendered_html,
-            None,
+            Some(&extracted_listing_json),
             Some(listing_id),
-            Some("legacy extraction unavailable"),
+            None,
         )
         .await;
         let replacement_id = if matches!(fixture, PreservedAssociationFixture::Replacement) {

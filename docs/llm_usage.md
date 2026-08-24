@@ -208,6 +208,14 @@ not persist prompts, provider envelopes, Search results, URL Context dossiers,
 or grounding evidence. Preview mode never performs this domain write, and an
 empty equipment extraction is not persisted.
 
+Every automated avionics-review apply revalidates the complete current
+extraction against the retained bound capture before it writes links,
+authorizations, dispositions, or review state. This is unconditional for
+accepted-links-only and local-reuse results even when they carry no occurrence
+dispositions. When dispositions are present, their fingerprints reuse the
+same parsed and validated observations instead of opening a weaker second
+parse path.
+
 Before a fresh listing extraction checkpoint is stored, a narrower
 publisher-specific repair may correct typography in avionics occurrence
 evidence. It runs only for one structurally valid Controller capture with one

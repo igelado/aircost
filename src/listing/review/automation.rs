@@ -26,6 +26,7 @@ use crate::listing::avionics::extraction::{
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
+use crate::models::ParsedAvionics;
 
 use super::{
     active_collision_closure_member_ids, association_observation_sha256_from_values,
@@ -397,10 +398,10 @@ fn validate_request(
     }
 }
 
-fn prepare_occurrence_dispositions<'a>(
-    request: &'a AutomatedReviewApplyRequest,
+fn validate_retained_current_extraction(
+    request: &AutomatedReviewApplyRequest,
     guard: &AutomationGuardRow,
-) -> ReviewResult<(String, Vec<PreparedOccurrenceDisposition<'a>>)> {
+) -> ReviewResult<(String, Vec<ParsedAvionics>)> {
     let extracted_listing_json = guard.extracted_listing_json.as_deref().ok_or_else(|| {
         ReviewError::Stale("retained capture has no extraction checkpoint".to_string())
     })?;
@@ -422,6 +423,14 @@ fn prepare_occurrence_dispositions<'a>(
         extracted_listing_json,
     })
     .map_err(ReviewError::Stale)?;
+    Ok((extraction_sha256(extracted_listing_json), occurrences))
+}
+
+fn prepare_occurrence_dispositions<'a>(
+    request: &'a AutomatedReviewApplyRequest,
+    extraction_hash: &str,
+    occurrences: &[ParsedAvionics],
+) -> ReviewResult<Vec<PreparedOccurrenceDisposition<'a>>> {
     let expected = occurrences
         .iter()
         .enumerate()
@@ -438,7 +447,6 @@ fn prepare_occurrence_dispositions<'a>(
         .iter()
         .filter_map(|aspect| coordinates_from_aspect_id(&aspect.id))
         .collect::<HashSet<_>>();
-    let extraction_hash = extraction_sha256(extracted_listing_json);
     let mut prepared = Vec::with_capacity(request.occurrence_dispositions.len());
     for decision in &request.occurrence_dispositions {
         let component = (decision.occurrence_index, decision.occurrence_role);
@@ -456,7 +464,7 @@ fn prepare_occurrence_dispositions<'a>(
         prepared.push(PreparedOccurrenceDisposition {
             decision,
             occurrence_fingerprint: occurrence_fingerprint(
-                &extraction_hash,
+                extraction_hash,
                 decision.occurrence_index,
                 decision.occurrence_role,
             )
@@ -467,7 +475,7 @@ fn prepare_occurrence_dispositions<'a>(
                 .expect("the canonical retained-extraction parser requires occurrence evidence"),
         });
     }
-    Ok((extraction_hash, prepared))
+    Ok(prepared)
 }
 
 fn graph_key(
@@ -1188,12 +1196,13 @@ pub(crate) async fn apply_automated_avionics_review(
                         .to_string(),
                 ));
             }
-            let (disposition_extraction_sha256, terminal_dispositions) =
-                if request.occurrence_dispositions.is_empty() {
-                    (String::new(), Vec::new())
-                } else {
-                    prepare_occurrence_dispositions(request, &guard)?
-                };
+            let (disposition_extraction_sha256, current_occurrences) =
+                validate_retained_current_extraction(request, &guard)?;
+            let terminal_dispositions = prepare_occurrence_dispositions(
+                request,
+                &disposition_extraction_sha256,
+                &current_occurrences,
+            )?;
             for link in &request.accepted_links {
                 let evidence_text = link.source_notes.as_deref().ok_or_else(|| {
                     ReviewError::Validation(format!(
@@ -2413,6 +2422,73 @@ mod tests {
             expected_collision_closure_sha256,
         }];
         apply_request
+    }
+
+    #[tokio::test]
+    async fn accepted_links_only_apply_accepts_a_complete_current_extraction() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let residual = pending_aspect("residual:current-extraction", "Unknown audio panel");
+
+        let result = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![accepted(&fixture.db, model_id).await],
+                vec![residual],
+            ),
+        )
+        .await
+        .expect("a complete current retained extraction should pass the write boundary");
+
+        assert_eq!(result.accepted_link_count, 1);
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(stored, 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_links_only_apply_rejects_inflated_retained_suite_types() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let inflated = r#"{"avionics":[{"manufacturer":"Garmin","model":"Test Unit","types":["Integrated Flight Deck","GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin Test Unit installed","source_confidence":"high"}]}"#;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(inflated)
+        .bind(fixture.submission_id)
+        .execute(pool(&fixture.db))
+        .await
+        .unwrap();
+
+        let error = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![accepted(&fixture.db, model_id).await],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect_err("exact identity evidence must not admit inflated suite capabilities");
+
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("integrated suite")
+        ));
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "rejected validation must remain atomic");
     }
 
     #[tokio::test]
