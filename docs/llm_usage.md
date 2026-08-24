@@ -219,6 +219,14 @@ write. Pending-review observations are selected only when the attached raw
 checkpoint also passes this complete contract; otherwise the workflow retains
 the review and re-extracts the bound source before it can apply.
 
+Successful re-extraction always produces one complete current listing
+checkpoint. If the retained checkpoint is a structurally current
+`ParsedListing`, its non-avionics values are preserved and only avionics are
+replaced. If it is missing, malformed, non-object, or not current, the complete
+newly extracted listing becomes the repair checkpoint after full listing and
+avionics validation. Only that parsed listing object is stored; provider
+response envelopes and research dossiers are not retained.
+
 Before a fresh listing extraction checkpoint is stored, a narrower
 publisher-specific repair may correct typography in avionics occurrence
 evidence. It runs only for one structurally valid Controller capture with one
