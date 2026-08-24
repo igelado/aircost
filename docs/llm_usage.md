@@ -441,7 +441,26 @@ when the listing does not provide it.
 
 ## Listing Extraction
 
-The extraction prompt receives cleaned listing text and returns:
+The extraction prompt receives bounded listing text and returns:
+
+Controller captures use the publisher's unique listing main, primary asking
+price, and direct specification heading/label/value structure. Each label and
+value is retained in an explicit separate envelope, including author-entered
+line breaks in Description and Avionics/Radios values. Raw JSON-LD is excluded;
+the adapter may extract only availability from an exact Schema.org `Offer`
+owned by the Schema.org `Product` whose numeric `@id` exactly matches the
+validated listing route. `InStock`
+establishes an active sale listing. Other or missing availability remains
+unknown unless the listing explicitly states sold or pending, and aircraft
+Condition values such as New or Used never substitute for sale lifecycle.
+Financing amounts, navigation, advertising, service-log link chrome, and
+related listings are not part of this extraction source. A recognized
+Controller URL never falls back to broad page cleaning: missing or ambiguous
+structure and any critical-section or total-source overflow fail closed before
+a Gemini request.
+Other publishers continue to use generic visible-page cleaning.
+
+The extractor returns:
 
 - manufacturer
 - model family

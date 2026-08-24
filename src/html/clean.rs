@@ -2,6 +2,7 @@ use ego_tree::{NodeId, NodeRef};
 use html_escape::decode_html_entities;
 use scraper::{node::Element, ElementRef, Html, Node, Selector};
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
 const DEFAULT_MAX_LISTING_TEXT_CHARACTERS: usize = 24_000;
 
@@ -62,16 +63,38 @@ pub fn clean_publisher_source_html(html: &str) -> String {
 
 /// Extract visible text from one already-validated publisher element while
 /// preserving its author-entered line boundaries.
-pub(crate) fn clean_publisher_multiline_element_text(
-    document: &Html,
-    element: ElementRef<'_>,
+pub(crate) fn clean_publisher_multiline_element_text<'document>(
+    document: &'document Html,
+    element: ElementRef<'document>,
 ) -> String {
-    clean_publisher_nodes(
-        document,
-        element.descendants(),
-        |_| true,
-        structurally_hidden_element,
-    )
+    PublisherTextExtractor::new(document).multiline_element_text(element)
+}
+
+/// Reusable visible-text extractor for several elements in one parsed page.
+///
+/// Publisher-specific structure readers should create this once so embedded
+/// stylesheet visibility rules are indexed once for the complete document.
+pub(crate) struct PublisherTextExtractor<'document> {
+    stylesheet_hidden_nodes: HashSet<NodeId>,
+    document: PhantomData<&'document Html>,
+}
+
+impl<'document> PublisherTextExtractor<'document> {
+    pub(crate) fn new(document: &'document Html) -> Self {
+        Self {
+            stylesheet_hidden_nodes: stylesheet_hidden_node_ids(document),
+            document: PhantomData,
+        }
+    }
+
+    pub(crate) fn multiline_element_text(&self, element: ElementRef<'document>) -> String {
+        clean_publisher_nodes_with_hidden(
+            element.descendants(),
+            |_| true,
+            structurally_hidden_element,
+            &self.stylesheet_hidden_nodes,
+        )
+    }
 }
 
 fn clean_publisher_nodes<'a>(
@@ -81,11 +104,25 @@ fn clean_publisher_nodes<'a>(
     element_is_hidden: fn(&Element) -> bool,
 ) -> String {
     let stylesheet_hidden_nodes = stylesheet_hidden_node_ids(document);
+    clean_publisher_nodes_with_hidden(
+        nodes,
+        preserves_line_breaks,
+        element_is_hidden,
+        &stylesheet_hidden_nodes,
+    )
+}
+
+fn clean_publisher_nodes_with_hidden<'a>(
+    nodes: impl Iterator<Item = NodeRef<'a, Node>>,
+    preserves_line_breaks: impl Fn(NodeRef<'a, Node>) -> bool,
+    element_is_hidden: fn(&Element) -> bool,
+    stylesheet_hidden_nodes: &HashSet<NodeId>,
+) -> String {
     let mut text = String::new();
     let mut previous_line_container = None;
     let mut pending_line_break = false;
     for node in nodes {
-        if publisher_node_is_hidden(node, &stylesheet_hidden_nodes, element_is_hidden) {
+        if publisher_node_is_hidden(node, stylesheet_hidden_nodes, element_is_hidden) {
             continue;
         }
         if node

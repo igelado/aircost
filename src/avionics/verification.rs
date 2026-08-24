@@ -20,7 +20,9 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
 use crate::gemini::interactions::RetryPolicy;
 use crate::gemini::usage::SourceCorrelation;
+#[cfg(test)]
 use crate::html::clean::clean_listing_html;
+use crate::html::listing::source::listing_extraction_source;
 use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 #[cfg(test)]
@@ -4079,7 +4081,8 @@ fn retained_avionics_source(
 fn prepare_stored_listing_text(source_url: &str, rendered_html: &str) -> Result<String, String> {
     crate::extract::validate_source_url(source_url)
         .map_err(|error| format!("retained source URL is invalid: {error}"))?;
-    let listing_text = clean_listing_html(rendered_html);
+    let listing_text = listing_extraction_source(source_url, rendered_html)
+        .map_err(|error| format!("retained listing source is invalid: {error}"))?;
     if listing_text.trim().is_empty() {
         return Err("retained rendered_html contains no usable listing text".to_string());
     }

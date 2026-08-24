@@ -33,9 +33,9 @@ use crate::gemini::usage::{
     estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, Outcome as UsageOutcome,
     SourceCorrelation, Start as UsageStart, Store as UsageStore, ToolUseBilling,
 };
-use crate::html::clean::clean_listing_html;
 use crate::html::listing::download::{download_identity_image, download_identity_images};
 use crate::html::listing::media::{discover as discover_listing_media, MediaDiscoveryError};
+use crate::html::listing::source::listing_extraction_source;
 use crate::models::{
     ListingPreview, ListingValuationFact, ParsedAvionics, ParsedInstalledComponent, ParsedListing,
 };
@@ -2141,7 +2141,8 @@ pub async fn parse_listing_html(
     html: &str,
     extractor: &GeminiListingExtractor,
 ) -> Result<ListingPreview> {
-    let listing_text = clean_listing_html(html);
+    let listing_text = listing_extraction_source(source_url, html)
+        .context("could not build bounded listing extraction source")?;
     let structured = extractor.extract(&listing_text).await?;
     listing_preview_from_structured(source_url, html, extractor, listing_text, &structured).await
 }
@@ -2151,7 +2152,8 @@ pub(crate) async fn parse_listing_html_for_avionics_validation(
     html: &str,
     extractor: &GeminiListingExtractor,
 ) -> Result<ListingPreviewForAvionicsValidation> {
-    let listing_text = clean_listing_html(html);
+    let listing_text = listing_extraction_source(source_url, html)
+        .context("could not build bounded listing extraction source")?;
     let extraction = extractor
         .extract_for_avionics_validation(&listing_text)
         .await?;
@@ -2272,6 +2274,7 @@ Rules:\n\
 - Use null for absent registration_number, serial_number, engine_hours, propeller_hours, and their evidence/confidence fields.\n\
 - asking_price_usd must be the aircraft asking price, not a loan payment.\n\
 - model_year must be the aircraft model year, not an inspection or warranty date.\n\
+- status is the sale lifecycle: active, sold, pending, or unknown. Aircraft Condition values such as New or Used never establish sale lifecycle. A Controller listing offer availability of InStock establishes active; any other or missing offer availability remains unknown unless the listing explicitly states sold or pending.\n\
 - airframe_hours is total time, TTAF, TT, TTSN, or flight hours since new.\n\
 - engine_hours is engine TTSN/SNEW/SMOH/SFRM time, not horsepower, TBO, or engine model.\n\
 - propeller_hours is propeller TTSN/SNEW/SMOH/SPOH time, not blade count or model.\n\
@@ -4744,6 +4747,8 @@ mod tests {
         assert!(prompt.contains("Preserve actual attached or marketed designators"));
         assert!(prompt.contains("return the source token GI275s rather than singularizing it"));
         assert!(prompt.contains("Later catalog curation, not listing extraction"));
+        assert!(prompt.contains("Aircraft Condition values such as New or Used never establish"));
+        assert!(prompt.contains("offer availability of InStock establishes active"));
     }
 
     #[test]

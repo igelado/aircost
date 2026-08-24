@@ -270,6 +270,13 @@ pub(crate) fn validate_controller_listing_source_url(
     Ok(source_url.to_string())
 }
 
+pub(crate) fn is_controller_source_host(source_url: &str) -> bool {
+    Url::parse(source_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| CONTROLLER_HOSTS.contains(&host.as_str()))
+}
+
 fn discover_controller_photos(
     document: &Html,
     source_url: &str,
