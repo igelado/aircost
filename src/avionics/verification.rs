@@ -24,7 +24,7 @@ use crate::html::clean::clean_listing_html;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::extraction::{
     parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
-    validate_current_avionics_identity_evidence,
+    validate_current_avionics_identity_evidence, validate_current_avionics_quantity_completeness,
 };
 use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
@@ -1296,6 +1296,7 @@ async fn process_listing(
                 &scoped_extractor,
                 &listing_text,
                 &listing_context,
+                source_url,
                 rendered_html,
                 row.extracted_listing_json.as_deref(),
             )
@@ -4356,6 +4357,7 @@ async fn reextract_avionics(
     extractor: &GeminiListingExtractor,
     listing_text: &str,
     listing_context: &ListingEvidenceContext,
+    source_url: &str,
     rendered_html: &str,
     prior_extracted_listing_json: Option<&str>,
 ) -> Result<ValidatedListingReextraction, String> {
@@ -4379,6 +4381,9 @@ async fn reextract_avionics(
         .map_err(|error| {
             format!("Gemini returned listing evidence not present in the retained source: {error}")
         })?;
+    validate_current_avionics_quantity_completeness(&avionics, source_url, rendered_html).map_err(
+        |error| format!("Gemini returned incomplete listing quantity evidence: {error}"),
+    )?;
     let extracted_listing_json = if avionics.is_empty() {
         String::new()
     } else {
@@ -6265,6 +6270,7 @@ mod tests {
             &extractor,
             evidence,
             &ListingEvidenceContext::from_cleaned_text(evidence),
+            "https://example.test/listing/1",
             evidence,
             Some(&prior),
         )

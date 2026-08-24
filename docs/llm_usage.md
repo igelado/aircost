@@ -176,17 +176,23 @@ text, variant suffixes, malformed fields, and non-Controller sources fail
 closed. The complete current extraction validator runs again before the
 checkpoint can be stored.
 
-The extraction boundary may also repair one narrowly proved quantity omission.
-Two adjacent comma- or semicolon-delimited equipment items must repeat the same
-complete manufacturer/model identity and assign complementary display roles:
-attitude versus HSI. The model must already have returned one ordinary installed
-occurrence with quantity one and exact evidence equal to one of those items. The
-server then changes only quantity to two and replaces the evidence locator with
-the complete exact two-item source span. A completeness gate independently
-requires that shape even for retained or provider-produced payloads. Narrative
-repetition, repeated copies of one role, non-adjacent mentions, ambiguous proof
-spans, replacement actions, duplicate output rows, and distinct product suffixes
-fail closed.
+The extraction boundary may also repair one narrowly proved quantity omission
+from a structurally valid Controller `Avionics/Radios` field. Two adjacent
+comma- or semicolon-delimited equipment items must repeat the same complete
+manufacturer/model identity and assign complementary attitude and HSI roles.
+The first item must start with the identity or one four-letter US ICAO airport
+token (`K` plus three uppercase letters); arbitrary qualifiers such as `NEW` or
+`Optional configurations:` are not installed-equipment proof. The model must
+already have returned one ordinary installed occurrence with quantity one and
+exact evidence equal to one of those items. The server then changes only
+quantity to two and replaces the evidence locator with the complete exact
+two-item source span. A completeness
+gate independently requires that shape for current Controller payloads.
+Narrative repetition, whole-page prose outside the trusted field, repeated
+copies of one role, non-adjacent mentions, ambiguous proof spans, replacement
+actions, punctuation-equivalent duplicate output rows, and distinct product
+suffixes fail closed. Other publishers receive only the prompt contract until
+they have an equally explicit installed-equipment provenance adapter.
 
 ## Evidence Retention And Reuse
 

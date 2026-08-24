@@ -1541,13 +1541,16 @@ async fn extract_capture_to_current_checkpoint(
     let mut preview = parse_listing_html(source_url, rendered_html, extractor).await?;
     let mut payload = extracted_listing_payload(&preview);
     let quantity_recovered =
-        recover_exact_role_separated_avionics_quantity(&mut payload, rendered_html)
+        recover_exact_role_separated_avionics_quantity(&mut payload, source_url, rendered_html)
             .map_err(PluginStoreError::Validation)?;
     recover_controller_avionics_evidence_typography(&mut payload, source_url, rendered_html)
         .map_err(PluginStoreError::Validation)?;
-    let validated_occurrences =
-        validate_unbound_current_avionics_extraction(&payload.to_string(), rendered_html)
-            .map_err(PluginStoreError::Validation)?;
+    let validated_occurrences = validate_unbound_current_avionics_extraction(
+        &payload.to_string(),
+        source_url,
+        rendered_html,
+    )
+    .map_err(PluginStoreError::Validation)?;
     if validated_occurrences.len() != preview.parsed_listing.avionics.len() {
         return Err(PluginStoreError::Validation(
             "avionics evidence recovery changed the occurrence structure".to_string(),
@@ -1598,9 +1601,12 @@ pub async fn checkpoint_plugin_submission_extraction(
         extract_capture_to_current_checkpoint(&stored.source_url, &stored.rendered_html, extractor)
             .await?;
     let payload_json = payload.to_string();
-    let occurrences =
-        validate_unbound_current_avionics_extraction(&payload_json, &stored.rendered_html)
-            .map_err(PluginStoreError::Validation)?;
+    let occurrences = validate_unbound_current_avionics_extraction(
+        &payload_json,
+        &stored.source_url,
+        &stored.rendered_html,
+    )
+    .map_err(PluginStoreError::Validation)?;
     let payload_sha256 = sha256_hex(payload_json.as_bytes());
     store_plugin_extraction_checkpoint(db, &stored, &payload_json).await?;
     Ok(PluginExtractionCheckpoint {
@@ -1785,9 +1791,12 @@ pub async fn inspect_plugin_submission_extraction(
         )
     })?;
     parse_current_checkpoint_payload(extracted)?;
-    let occurrences =
-        validate_unbound_current_avionics_extraction(extracted, &stored.rendered_html)
-            .map_err(PluginStoreError::Validation)?;
+    let occurrences = validate_unbound_current_avionics_extraction(
+        extracted,
+        &stored.source_url,
+        &stored.rendered_html,
+    )
+    .map_err(PluginStoreError::Validation)?;
     Ok(PluginExtractionCheckpoint {
         submission_id,
         rendered_html_sha256: stored.rendered_html_sha256.clone(),
@@ -1820,9 +1829,12 @@ pub async fn preflight_plugin_submission_extraction(
     }
     let current_checkpoint = match stored.extracted_listing_json.as_deref() {
         Some(extracted) => {
-            let occurrences =
-                validate_unbound_current_avionics_extraction(extracted, &stored.rendered_html)
-                    .map_err(PluginStoreError::Validation)?;
+            let occurrences = validate_unbound_current_avionics_extraction(
+                extracted,
+                &stored.source_url,
+                &stored.rendered_html,
+            )
+            .map_err(PluginStoreError::Validation)?;
             parse_current_checkpoint_payload(extracted)?;
             Some(PluginExtractionCheckpoint {
                 submission_id,
@@ -2051,9 +2063,12 @@ pub async fn inspect_plugin_replay_capture_state(
         .as_deref()
         .map(|extracted| {
             parse_current_checkpoint_payload(extracted)?;
-            let occurrences =
-                validate_unbound_current_avionics_extraction(extracted, &stored.rendered_html)
-                    .map_err(PluginStoreError::Validation)?;
+            let occurrences = validate_unbound_current_avionics_extraction(
+                extracted,
+                &stored.source_url,
+                &stored.rendered_html,
+            )
+            .map_err(PluginStoreError::Validation)?;
             Ok::<_, PluginStoreError>(PluginExtractionCheckpoint {
                 submission_id,
                 rendered_html_sha256: stored.rendered_html_sha256.clone(),
@@ -2204,8 +2219,12 @@ pub async fn materialize_plugin_submission_checkpoint(
         ));
     }
     preflight_replay_source_claim(db, stored.user_id, &stored.source_url).await?;
-    validate_unbound_current_avionics_extraction(extracted_listing_json, &stored.rendered_html)
-        .map_err(PluginStoreError::Validation)?;
+    validate_unbound_current_avionics_extraction(
+        extracted_listing_json,
+        &stored.source_url,
+        &stored.rendered_html,
+    )
+    .map_err(PluginStoreError::Validation)?;
     let (parsed_listing, identity_recovery) =
         parse_current_checkpoint_payload(extracted_listing_json)?;
     let preview = ListingPreview {
