@@ -3119,7 +3119,7 @@ mod tests {
             "GARMIN G1000 NXI",
         )]);
         let primary = listing_extraction_with_avionics(avionics.clone());
-        let (endpoint, request_count, _) =
+        let (endpoint, request_count, requests) =
             extraction_sequence_endpoint(vec![primary.to_string()]).await;
         let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
         let html = controller_avionics_html("GARMIN G1000 NXI", "GFC700");
@@ -3134,6 +3134,24 @@ mod tests {
         assert_eq!(payload["avionics"], avionics);
         assert_eq!(preview.parsed_listing.avionics.len(), 1);
         assert_eq!(preview.parsed_listing.avionics[0].model, "G1000 NXi");
+
+        let requests = requests.lock().unwrap();
+        let request = &requests[0];
+        let prompt = request["contents"][0]["parts"][0]["text"].as_str().unwrap();
+        assert!(prompt.contains("satisfies the enforced response schema"));
+        assert!(!prompt.contains("Return JSON with exactly this shape"));
+        let response_schema = &request["generationConfig"]["responseSchema"];
+        assert_eq!(response_schema["type"], "object");
+        assert_eq!(
+            response_schema["properties"]["asking_price_usd"]["type"],
+            "number"
+        );
+        assert_eq!(response_schema["properties"]["avionics"]["type"], "array");
+        assert!(response_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "valuation_facts"));
     }
 
     #[tokio::test]
