@@ -194,12 +194,15 @@ Apply-mode recovery of an obsolete listing extraction has a distinct durable
 boundary. The returned raw avionics array must contain explicit quantity,
 action, and replacement semantics, pass the current capability schema, and
 bind every excerpt exactly to the retained source capture. The application
-then replaces only `avionics` in the retained top-level extraction object and
-stores the compact merged JSON; it never accepts aircraft identity, hours,
-price, valuation facts, or other non-avionics values from this scoped pass. A
-missing or invalid prior object fails closed. The write is bound to the exact
-submission, owner, listing, source URL, capture bytes and hash, pending-review
-revision, canonical listing binding, and prior extraction/error state.
+then creates one canonical current checkpoint. When the prior checkpoint is an
+exact current `ParsedListing`, its non-avionics fields are preserved and only
+`avionics` is replaced. When the prior is missing or unusable, the complete
+newly extracted listing supplies those fields instead. Both inputs and the
+final persisted object are checked against the shared exact checkpoint-field
+contract, so unsupported provider-envelope, grounding, dossier, or arbitrary
+keys cannot be retained. The write is bound to the exact submission, owner,
+listing, source URL, capture bytes and hash, pending-review revision, canonical
+listing binding, and prior extraction/error state.
 PostgreSQL takes the project listing-child lock order and locks/revalidates the
 listing, review, and submission rows before updating. The write is idempotent
 for the same extraction and fails closed on any concurrent change. This lets a

@@ -157,7 +157,7 @@ impl From<ListingStoreError> for PluginStoreError {
     }
 }
 
-type StoreResult<T> = Result<T, PluginStoreError>;
+pub(crate) type StoreResult<T> = Result<T, PluginStoreError>;
 pub type PluginProgressSender = tokio::sync::mpsc::UnboundedSender<Value>;
 
 #[derive(Debug)]
@@ -1421,10 +1421,18 @@ fn emit_plugin_progress(progress: Option<&PluginProgressSender>, stage: &str, me
 }
 
 fn extracted_listing_payload(preview: &ListingPreview) -> Value {
-    let mut payload = json!(preview.parsed_listing);
-    if let (Some(object), Some(identity_recovery)) =
-        (payload.as_object_mut(), preview.identity_recovery.as_ref())
-    {
+    canonical_current_checkpoint_payload(
+        &preview.parsed_listing,
+        preview.identity_recovery.as_ref(),
+    )
+}
+
+pub(crate) fn canonical_current_checkpoint_payload(
+    parsed_listing: &ParsedListing,
+    identity_recovery: Option<&crate::aircraft::curation::visual::VisualIdentifierResolution>,
+) -> Value {
+    let mut payload = json!(parsed_listing);
+    if let (Some(object), Some(identity_recovery)) = (payload.as_object_mut(), identity_recovery) {
         object.insert(
             "visual_identity_recovery".to_string(),
             json!(identity_recovery),
@@ -1433,7 +1441,7 @@ fn extracted_listing_payload(preview: &ListingPreview) -> Value {
     payload
 }
 
-fn parse_current_checkpoint_payload(
+pub(crate) fn parse_current_checkpoint_payload(
     extracted_listing_json: &str,
 ) -> StoreResult<(
     ParsedListing,

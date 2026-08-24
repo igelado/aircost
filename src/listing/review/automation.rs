@@ -27,6 +27,7 @@ use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
 use crate::models::ParsedAvionics;
+use crate::plugin::parse_current_checkpoint_payload;
 
 use super::{
     active_collision_closure_member_ids, association_observation_sha256_from_values,
@@ -410,6 +411,11 @@ fn validate_retained_current_extraction(
             "retained capture has an extraction error".to_string(),
         ));
     }
+    parse_current_checkpoint_payload(extracted_listing_json).map_err(|error| {
+        ReviewError::Stale(format!(
+            "retained capture is not an exact current checkpoint: {error}"
+        ))
+    })?;
     let occurrences = validate_current_avionics_extraction(CurrentAvionicsExtraction {
         listing_id: request.listing_id,
         listing_owner_user_id: guard.owner_user_id,
@@ -1995,6 +2001,7 @@ pub(crate) async fn apply_automated_avionics_review(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
     use sqlx::SqlitePool;
 
     use crate::avionics::manufacturer::{
@@ -2024,6 +2031,26 @@ mod tests {
             panic!("automation tests require SQLite");
         };
         pool
+    }
+
+    async fn replace_fixture_avionics(fixture: &Fixture, avionics: Value) {
+        let raw: String = sqlx::query_scalar(
+            "SELECT extracted_listing_json FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(fixture.submission_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        let mut checkpoint: Value = serde_json::from_str(&raw).unwrap();
+        checkpoint["avionics"] = avionics;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        )
+        .bind(checkpoint.to_string())
+        .bind(fixture.submission_id)
+        .execute(pool(&fixture.db))
+        .await
+        .unwrap();
     }
 
     fn pending_aspect(id: &str, label: &str) -> PendingReviewAspect {
@@ -2178,7 +2205,7 @@ mod tests {
         .bind(rendered_html)
         .bind(&rendered_html_sha256)
         .bind(listing_id)
-        .bind(r#"{"avionics":[{"manufacturer":"Garmin","model":"Test Unit","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin Test Unit installed","source_confidence":"high"}]}"#)
+        .bind(r#"{"manufacturer":"Cessna","model":"182T","variant":null,"model_year":2020,"asking_price_usd":450000,"currency":"USD","airframe_hours":900,"engine_hours":null,"engine_time_basis":"unknown","engine_time_evidence":null,"engine_time_confidence":null,"propeller_hours":null,"propeller_time_basis":"unknown","propeller_time_evidence":null,"propeller_time_confidence":null,"installed_engine":null,"installed_propeller":null,"registration_number":"N123AB","serial_number":"182-01234","status":"active","avionics":[{"manufacturer":"Garmin","model":"Test Unit","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin Test Unit installed","source_confidence":"high"}],"valuation_facts":[]}"#)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -2393,22 +2420,37 @@ mod tests {
     ) -> AutomatedReviewApplyRequest {
         let rendered_html = "<p>Garmin GPS replaces Garmin Test Unit</p>";
         fixture.rendered_html_sha256 = sha256_hex(rendered_html.as_bytes());
-        let extracted_listing_json = r#"{"avionics":[{"manufacturer":"Garmin","model":"GPS","types":["GPS"],"quantity":1,"configuration_action":"replaces","replaces":{"manufacturer":"Garmin","model":"Test Unit","types":["GPS"]},"source_evidence_text":"Garmin GPS replaces Garmin Test Unit","source_confidence":"high"}]}"#;
         sqlx::query(
             r#"
             UPDATE plugin_submissions
-            SET rendered_html = ?, rendered_html_sha256 = ?,
-                extracted_listing_json = ?, extraction_error = NULL
+            SET rendered_html = ?, rendered_html_sha256 = ?, extraction_error = NULL
             WHERE id = ?
             "#,
         )
         .bind(rendered_html)
         .bind(&fixture.rendered_html_sha256)
-        .bind(extracted_listing_json)
         .bind(fixture.submission_id)
         .execute(pool(&fixture.db))
         .await
         .unwrap();
+        replace_fixture_avionics(
+            fixture,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "GPS",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "replaces",
+                "replaces": {
+                    "manufacturer": "Garmin",
+                    "model": "Test Unit",
+                    "types": ["GPS"]
+                },
+                "source_evidence_text": "Garmin GPS replaces Garmin Test Unit",
+                "source_confidence": "high"
+            }]),
+        )
+        .await;
 
         let expected_collision_closure_sha256 =
             super::super::active_collision_closure_revision_sha256(&fixture.db, model_id)
@@ -2461,15 +2503,20 @@ mod tests {
     async fn accepted_links_only_apply_rejects_inflated_retained_suite_types() {
         let fixture = fixture().await;
         let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
-        let inflated = r#"{"avionics":[{"manufacturer":"Garmin","model":"Test Unit","types":["Integrated Flight Deck","GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin Test Unit installed","source_confidence":"high"}]}"#;
-        sqlx::query(
-            "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
+        replace_fixture_avionics(
+            &fixture,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "Test Unit",
+                "types": ["Integrated Flight Deck", "GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin Test Unit installed",
+                "source_confidence": "high"
+            }]),
         )
-        .bind(inflated)
-        .bind(fixture.submission_id)
-        .execute(pool(&fixture.db))
-        .await
-        .unwrap();
+        .await;
 
         let error = apply_automated_avionics_review(
             &fixture.db,
@@ -2500,13 +2547,7 @@ mod tests {
     async fn accepted_links_only_apply_rejects_an_empty_retained_extraction() {
         let fixture = fixture().await;
         let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
-        sqlx::query(
-            "UPDATE plugin_submissions SET extracted_listing_json = '{\"avionics\":[]}', extraction_error = NULL WHERE id = ?",
-        )
-        .bind(fixture.submission_id)
-        .execute(pool(&fixture.db))
-        .await
-        .unwrap();
+        replace_fixture_avionics(&fixture, serde_json::json!([])).await;
 
         let error = apply_automated_avionics_review(
             &fixture.db,
@@ -2531,6 +2572,51 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored, 0, "empty extraction rejection must remain atomic");
+    }
+
+    #[tokio::test]
+    async fn accepted_links_only_apply_rejects_unsupported_checkpoint_fields() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        let raw: String = sqlx::query_scalar(
+            "SELECT extracted_listing_json FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(fixture.submission_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        let mut checkpoint: Value = serde_json::from_str(&raw).unwrap();
+        checkpoint["candidates"] = serde_json::json!([{"content": "provider envelope"}]);
+        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = ? WHERE id = ?")
+            .bind(checkpoint.to_string())
+            .bind(fixture.submission_id)
+            .execute(pool(&fixture.db))
+            .await
+            .unwrap();
+
+        let error = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![accepted(&fixture.db, model_id).await],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect_err("unsupported checkpoint fields cannot authorize avionics links");
+
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("unsupported field")
+        ));
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "unsupported checkpoint rejection must be atomic");
     }
 
     #[tokio::test]

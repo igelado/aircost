@@ -49,9 +49,11 @@ use crate::listing::review::{
     ExistingProductAssociationEvaluation, ListingAssociationRole, PendingReviewAspect,
     ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
-use crate::models::{ParsedAvionics, ParsedListing};
+use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
-use crate::plugin::sha256_hex;
+use crate::plugin::{
+    canonical_current_checkpoint_payload, parse_current_checkpoint_payload, sha256_hex,
+};
 
 #[derive(Debug)]
 pub enum AvionicsVerificationError {
@@ -4066,6 +4068,13 @@ fn retained_avionics_source(
             reason: "the retained plugin submission has no source URL".to_string(),
         };
     };
+    if let Err(error) = parse_current_checkpoint_payload(raw_json) {
+        return RetainedAvionicsSource::RequiresReextraction {
+            reason: format!(
+                "the retained plugin extraction is not an exact current checkpoint: {error}"
+            ),
+        };
+    }
     match validate_unbound_current_avionics_extraction(
         raw_json,
         source_url,
@@ -4452,40 +4461,48 @@ fn merge_validated_avionics_into_listing_extraction(
                 .to_string()
         })?
         .insert("avionics".to_string(), avionics_value.clone());
-    validate_complete_current_listing_value(&newly_extracted_listing, "newly extracted")?;
+    let newly_extracted_listing =
+        canonical_complete_current_listing_value(&newly_extracted_listing, "newly extracted")?;
 
     let mut repaired_listing = prior_extracted_listing_json
         .filter(|value| !value.trim().is_empty())
         .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .filter(|value| validate_complete_current_listing_value(value, "retained").is_ok())
+        .and_then(|value| canonical_complete_current_listing_value(&value, "retained").ok())
         .unwrap_or(newly_extracted_listing);
     repaired_listing
         .as_object_mut()
         .expect("a validated current listing extraction is a top-level object")
         .insert("avionics".to_string(), avionics_value);
-    validate_complete_current_listing_value(&repaired_listing, "repaired")?;
+    let repaired_listing = canonical_complete_current_listing_value(&repaired_listing, "repaired")?;
 
     serde_json::to_string(&repaired_listing)
         .map_err(|error| format!("could not serialize validated listing extraction: {error}"))
 }
 
-fn validate_complete_current_listing_value(value: &Value, label: &str) -> Result<(), String> {
+fn canonical_complete_current_listing_value(value: &Value, label: &str) -> Result<Value, String> {
     if !value.is_object() {
         return Err(format!(
             "cannot durably persist avionics re-extraction because the {label} listing extraction is not a top-level object"
         ));
     }
-    serde_json::from_value::<ParsedListing>(value.clone()).map_err(|error| {
-        format!(
-            "cannot durably persist avionics re-extraction because the {label} listing extraction does not match ParsedListing: {error}"
-        )
+    let serialized = serde_json::to_string(value).map_err(|error| {
+        format!("could not serialize the {label} listing extraction for validation: {error}")
     })?;
+    let (parsed_listing, identity_recovery) = parse_current_checkpoint_payload(&serialized)
+        .map_err(|error| {
+            format!(
+                "cannot durably persist avionics re-extraction because the {label} listing extraction is not an exact current checkpoint: {error}"
+            )
+        })?;
     parse_current_avionics_extraction_value(value).map_err(|error| {
         format!(
             "cannot durably persist avionics re-extraction because the {label} listing extraction does not use the current avionics schema: {error}"
         )
     })?;
-    Ok(())
+    Ok(canonical_current_checkpoint_payload(
+        &parsed_listing,
+        identity_recovery.as_ref(),
+    ))
 }
 
 async fn load_listing_sources(
@@ -4799,6 +4816,7 @@ mod tests {
         ensure_manufacturer_identity, ManufacturerIdentityEvidence,
     };
     use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
+    use crate::models::ParsedListing;
     use crate::normalize::{
         normalize_avionics_identifier, normalize_avionics_manufacturer_name,
         normalize_avionics_model_name, normalize_name,
@@ -5165,6 +5183,12 @@ mod tests {
                 "confidence": "low"
             }]
         })
+    }
+
+    fn current_listing_extraction_with_avionics(avionics: Value) -> String {
+        let mut payload = retained_legacy_listing_extraction();
+        payload["avionics"] = avionics;
+        payload.to_string()
     }
 
     async fn store_retained_legacy_listing_extraction(db: &AppDb, submission_id: i64) {
@@ -6263,14 +6287,12 @@ mod tests {
 
     #[test]
     fn legacy_scalar_type_requires_reextraction_without_mechanical_conversion() {
-        let legacy = r#"{
-          "avionics": [
+        let legacy = current_listing_extraction_with_avionics(json!([
             {"manufacturer":"Garmin","model":"GNX 375","type":"GPS","quantity":1}
-          ]
-        }"#;
+        ]));
 
         let source = retained_avionics_source(
-            Some(legacy),
+            Some(&legacy),
             Some("https://example.test/listing/legacy"),
             Some("Garmin GNX 375"),
         );
@@ -6306,7 +6328,9 @@ mod tests {
         )
         .unwrap();
         let merged: Value = serde_json::from_str(&merged).unwrap();
-        for (field, value) in prior.as_object().unwrap() {
+        let canonical_prior =
+            canonical_complete_current_listing_value(&prior, "test prior extraction").unwrap();
+        for (field, value) in canonical_prior.as_object().unwrap() {
             if field != "avionics" {
                 assert_eq!(&merged[field], value, "field {field} changed");
             }
@@ -6320,7 +6344,9 @@ mod tests {
             merge_validated_avionics_into_listing_extraction(None, fresh.clone(), &avionics)
                 .unwrap();
         let repaired_from_missing: Value = serde_json::from_str(&repaired_from_missing).unwrap();
-        assert_eq!(repaired_from_missing, fresh);
+        let canonical_fresh =
+            canonical_complete_current_listing_value(&fresh, "test fresh extraction").unwrap();
+        assert_eq!(repaired_from_missing, canonical_fresh);
 
         let repaired_from_malformed = merge_validated_avionics_into_listing_extraction(
             Some("not json"),
@@ -6330,7 +6356,27 @@ mod tests {
         .unwrap();
         let repaired_from_malformed: Value =
             serde_json::from_str(&repaired_from_malformed).unwrap();
-        assert_eq!(repaired_from_malformed, fresh);
+        assert_eq!(repaired_from_malformed, canonical_fresh);
+
+        let mut unsupported_prior = prior;
+        unsupported_prior["candidates"] = json!([{"content": "provider envelope"}]);
+        let repaired_from_unsupported_prior = merge_validated_avionics_into_listing_extraction(
+            Some(&unsupported_prior.to_string()),
+            fresh.clone(),
+            &avionics,
+        )
+        .unwrap();
+        let repaired_from_unsupported_prior: Value =
+            serde_json::from_str(&repaired_from_unsupported_prior).unwrap();
+        assert_eq!(repaired_from_unsupported_prior, canonical_fresh);
+        assert!(repaired_from_unsupported_prior.get("candidates").is_none());
+
+        let mut unsupported_fresh = fresh;
+        unsupported_fresh["grounding"] = json!({"dossier": "must not persist"});
+        let error =
+            merge_validated_avionics_into_listing_extraction(None, unsupported_fresh, &avionics)
+                .unwrap_err();
+        assert!(error.contains("unsupported field"), "{error}");
     }
 
     #[test]
@@ -6509,6 +6555,8 @@ mod tests {
         );
         let merged: Value = serde_json::from_str(&reextracted.extracted_listing_json).unwrap();
         let prior: Value = serde_json::from_str(&prior).unwrap();
+        let prior =
+            canonical_complete_current_listing_value(&prior, "test prior extraction").unwrap();
         for field in [
             "manufacturer",
             "model",
@@ -6562,8 +6610,7 @@ mod tests {
 
     #[test]
     fn current_multi_capability_payload_is_replayed_without_reextraction() {
-        let current = r#"{
-          "avionics": [
+        let current = current_listing_extraction_with_avionics(json!([
             {
               "manufacturer":"Garmin",
               "model":"GNX 375",
@@ -6574,11 +6621,10 @@ mod tests {
               "source_evidence_text":"Garmin GNX 375",
               "source_confidence":"high"
             }
-          ]
-        }"#;
+        ]));
 
         let source = retained_avionics_source(
-            Some(current),
+            Some(&current),
             Some("https://example.test/listing/current"),
             Some("<p>Garmin GNX 375</p>"),
         );
@@ -6592,21 +6638,19 @@ mod tests {
 
     #[test]
     fn retained_extraction_rejects_exact_evidence_with_inflated_suite_types() {
-        let current = r#"{
-          "avionics": [{
-            "manufacturer":"Garmin",
-            "model":"G1000 NXi",
-            "types":["Integrated Flight Deck","Autopilot"],
-            "quantity":1,
-            "configuration_action":"installed",
-            "replaces":null,
-            "source_evidence_text":"Garmin G1000 NXi",
-            "source_confidence":"high"
-          }]
-        }"#;
+        let current = current_listing_extraction_with_avionics(json!([{
+          "manufacturer":"Garmin",
+          "model":"G1000 NXi",
+          "types":["Integrated Flight Deck","Autopilot"],
+          "quantity":1,
+          "configuration_action":"installed",
+          "replaces":null,
+          "source_evidence_text":"Garmin G1000 NXi",
+          "source_confidence":"high"
+        }]));
 
         let source = retained_avionics_source(
-            Some(current),
+            Some(&current),
             Some("https://example.test/listing/inflated-suite"),
             Some("<p>Garmin G1000 NXi</p>"),
         );
@@ -6619,19 +6663,17 @@ mod tests {
 
     #[test]
     fn capability_array_without_exact_evidence_requires_reextraction() {
-        let missing_evidence = r#"{
-          "avionics": [{
-            "manufacturer":"Garmin",
-            "model":"GNX 375",
-            "types":["GPS","Transponder"],
-            "quantity":1,
-            "configuration_action":"installed",
-            "replaces":null
-          }]
-        }"#;
+        let missing_evidence = current_listing_extraction_with_avionics(json!([{
+          "manufacturer":"Garmin",
+          "model":"GNX 375",
+          "types":["GPS","Transponder"],
+          "quantity":1,
+          "configuration_action":"installed",
+          "replaces":null
+        }]));
 
         let source = retained_avionics_source(
-            Some(missing_evidence),
+            Some(&missing_evidence),
             Some("https://example.test/listing/missing-evidence"),
             Some("Garmin GNX 375"),
         );
@@ -6680,21 +6722,19 @@ mod tests {
 
     #[test]
     fn fabricated_evidence_requires_reextraction() {
-        let fabricated = r#"{
-          "avionics": [{
-            "manufacturer":"Garmin",
-            "model":"GNX 375",
-            "types":["GPS","Transponder"],
-            "quantity":1,
-            "configuration_action":"installed",
-            "replaces":null,
-            "source_evidence_text":"Garmin GNX 375 with invented qualifier",
-            "source_confidence":"high"
-          }]
-        }"#;
+        let fabricated = current_listing_extraction_with_avionics(json!([{
+          "manufacturer":"Garmin",
+          "model":"GNX 375",
+          "types":["GPS","Transponder"],
+          "quantity":1,
+          "configuration_action":"installed",
+          "replaces":null,
+          "source_evidence_text":"Garmin GNX 375 with invented qualifier",
+          "source_confidence":"high"
+        }]));
 
         let source = retained_avionics_source(
-            Some(fabricated),
+            Some(&fabricated),
             Some("https://example.test/listing/fabricated"),
             Some("Garmin GNX 375 installed"),
         );
@@ -6717,7 +6757,7 @@ mod tests {
                 "Garmin G1000 metadata",
             ),
         ] {
-            let payload = json!({"avionics": [{
+            let payload = current_listing_extraction_with_avionics(json!([{
                 "manufacturer": "Garmin",
                 "model": "G1000",
                 "types": ["Flight Display"],
@@ -6726,7 +6766,7 @@ mod tests {
                 "replaces": null,
                 "source_evidence_text": evidence,
                 "source_confidence": "high"
-            }]});
+            }]));
             let RetainedAvionicsSource::RequiresReextraction { reason } =
                 retained_avionics_source(
                     Some(&payload.to_string()),
@@ -7232,7 +7272,6 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-
         let page = load_listing_sources(
             &db,
             &AvionicsVerificationScope::new(1, Some(listing_id), None),
@@ -7416,11 +7455,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_malformed_and_non_object_checkpoints_reextract_once_and_apply() {
-        for (case, retained_extraction) in [
-            ("missing", None),
-            ("malformed", Some("{not-json")),
-            ("non-object", Some("[]")),
-        ] {
+        for case in ["missing", "malformed", "non-object", "unsupported-prior"] {
             let db = AppDb::connect("sqlite::memory:").await.unwrap();
             let product_id = seed_approved_named_product_for_manufacturer(
                 &db,
@@ -7435,12 +7470,34 @@ mod tests {
             let source_url = format!("https://example.test/listing/repair-{case}");
             let listing_id = seed_listing(&db, &source_url).await;
             seed_faa_admission(&db, listing_id).await;
+            let retained_extraction = match case {
+                "missing" => None,
+                "malformed" => Some("{not-json".to_string()),
+                "non-object" => Some("[]".to_string()),
+                "unsupported-prior" => {
+                    let mut checkpoint = retained_legacy_listing_extraction();
+                    checkpoint["avionics"] = json!([{
+                        "manufacturer": "Garmin",
+                        "model": "Fixture",
+                        "types": ["GPS"],
+                        "quantity": 1,
+                        "configuration_action": "installed",
+                        "replaces": null,
+                        "source_evidence_text": "Garmin fixture installed",
+                        "source_confidence": "high"
+                    }]);
+                    checkpoint["candidates"] =
+                        json!([{"content": "provider envelope must not persist"}]);
+                    Some(checkpoint.to_string())
+                }
+                _ => unreachable!(),
+            };
             let submission_id = seed_submission_and_review(
                 &db,
                 listing_id,
                 &source_url,
                 "<p>Garmin fixture installed</p>",
-                retained_extraction,
+                retained_extraction.as_deref(),
                 Some(listing_id),
                 None,
             )
@@ -8144,35 +8201,32 @@ mod tests {
         );
         let rendered_html =
             format!("{rendered_html}<p>{generic_evidence}</p><p>{relationship_evidence}</p>");
-        let extracted_listing_json = json!({
-            "avionics": [
-                {
-                    "manufacturer": "Garmin",
-                    "model": "GPS",
-                    "types": ["GPS"],
-                    "quantity": 1,
-                    "configuration_action": "installed",
-                    "replaces": null,
-                    "source_evidence_text": generic_evidence,
-                    "source_confidence": "high"
+        let extracted_listing_json = current_listing_extraction_with_avionics(json!([
+            {
+                "manufacturer": "Garmin",
+                "model": "GPS",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": generic_evidence,
+                "source_confidence": "high"
+            },
+            {
+                "manufacturer": product.1,
+                "model": product_model,
+                "types": ["Flight Display"],
+                "quantity": 1,
+                "configuration_action": "replaces",
+                "replaces": {
+                    "manufacturer": replacement.1,
+                    "model": replacement_model,
+                    "types": ["Flight Display"]
                 },
-                {
-                    "manufacturer": product.1,
-                    "model": product_model,
-                    "types": ["Flight Display"],
-                    "quantity": 1,
-                    "configuration_action": "replaces",
-                    "replaces": {
-                        "manufacturer": replacement.1,
-                        "model": replacement_model,
-                        "types": ["Flight Display"]
-                    },
-                    "source_evidence_text": relationship_evidence,
-                    "source_confidence": "high"
-                }
-            ]
-        })
-        .to_string();
+                "source_evidence_text": relationship_evidence,
+                "source_confidence": "high"
+            }
+        ]));
         sqlx::query(
             r#"
             UPDATE plugin_submissions
@@ -8313,19 +8367,16 @@ mod tests {
         );
         let paid_evidence = "Garmin GPS capability";
         let rendered_html = format!("{rendered_html}<p>{paid_evidence}</p>");
-        let extracted_listing_json = json!({
-            "avionics": [{
-                "manufacturer": "Garmin",
-                "model": "GPS",
-                "types": ["GPS"],
-                "quantity": 1,
-                "configuration_action": "installed",
-                "replaces": null,
-                "source_evidence_text": paid_evidence,
-                "source_confidence": "high"
-            }]
-        })
-        .to_string();
+        let extracted_listing_json = current_listing_extraction_with_avionics(json!([{
+            "manufacturer": "Garmin",
+            "model": "GPS",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": paid_evidence,
+            "source_confidence": "high"
+        }]));
         sqlx::query(
             r#"
             UPDATE plugin_submissions
@@ -8821,9 +8872,16 @@ mod tests {
         );
         let rendered_html =
             format!("{rendered_html}<p>{ineligible_evidence}</p><p>{ordinary_evidence}</p>");
-        let extracted_listing_json = format!(
-            r#"{{"avionics":[{{"manufacturer":"Unknown","model":"Replacement Package","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"{ordinary_evidence}","source_confidence":"high"}}]}}"#
-        );
+        let extracted_listing_json = current_listing_extraction_with_avionics(json!([{
+            "manufacturer": "Unknown",
+            "model": "Replacement Package",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": ordinary_evidence,
+            "source_confidence": "high"
+        }]));
         sqlx::query(
             r#"
             UPDATE plugin_submissions
@@ -9149,6 +9207,8 @@ mod tests {
             "source_evidence_text": format!("{evidence} fabricated"),
             "source_confidence": "high"
         }]);
+        let canonical_prior =
+            canonical_complete_current_listing_value(&prior, "test prior extraction").unwrap();
         sqlx::query(
             "UPDATE plugin_submissions SET extracted_listing_json = ?, extraction_error = NULL WHERE id = ?",
         )
@@ -9215,7 +9275,10 @@ mod tests {
             "status",
             "valuation_facts",
         ] {
-            assert_eq!(persisted[field], prior[field], "field {field} changed");
+            assert_eq!(
+                persisted[field], canonical_prior[field],
+                "field {field} changed"
+            );
         }
         assert_eq!(persisted["avionics"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -10402,6 +10465,18 @@ mod tests {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             panic!("test expects SQLite")
         };
+        let extracted_listing_json = extracted_listing_json.map(|raw| {
+            let Ok(value) = serde_json::from_str::<Value>(raw) else {
+                return raw.to_string();
+            };
+            if value
+                .as_object()
+                .is_some_and(|object| object.len() == 1 && object.contains_key("avionics"))
+            {
+                return current_listing_extraction_with_avionics(value["avionics"].clone());
+            }
+            raw.to_string()
+        });
         let install_id: i64 = sqlx::query_scalar(
             "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (1, 'fixture') RETURNING id",
         )
@@ -10422,7 +10497,7 @@ mod tests {
         .bind(source_url)
         .bind(rendered_html)
         .bind(sha256_hex(rendered_html.as_bytes()))
-        .bind(extracted_listing_json)
+        .bind(extracted_listing_json.as_deref())
         .bind(extraction_error)
         .bind(canonical_listing_id)
         .fetch_one(pool)
