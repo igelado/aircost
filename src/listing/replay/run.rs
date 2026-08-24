@@ -2438,9 +2438,20 @@ mod tests {
     }
 
     async fn extraction_endpoint(extraction: serde_json::Value) -> String {
-        async fn handler(State(extraction): State<serde_json::Value>) -> Json<serde_json::Value> {
+        async fn handler(
+            State(extraction): State<serde_json::Value>,
+            Json(request): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let is_avionics_correction = request["contents"][0]["parts"][0]["text"]
+                .as_str()
+                .is_some_and(|prompt| prompt.contains("Correct only the avionics extraction"));
+            let content = if is_avionics_correction {
+                json!({"avionics": extraction["avionics"].clone()})
+            } else {
+                extraction
+            };
             Json(json!({
-                "candidates": [{"content": {"parts": [{"text": extraction.to_string()}]}}],
+                "candidates": [{"content": {"parts": [{"text": content.to_string()}]}}],
                 "usageMetadata": {
                     "promptTokenCount": 10,
                     "candidatesTokenCount": 10,

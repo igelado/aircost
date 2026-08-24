@@ -292,14 +292,14 @@ pub struct GeminiRuntimeConfig {
 impl Default for GeminiRuntimeConfig {
     fn default() -> Self {
         let mut tasks = BTreeMap::new();
-        tasks.insert(
-            GeminiTask::ListingExtraction,
-            TaskRoute::new(
-                DEFAULT_LISTING_MODEL,
-                ThinkingLevel::Low,
-                DEFAULT_GENERATE_CONTENT_MAX_OUTPUT_TOKENS,
-            ),
+        let mut listing_extraction = TaskRoute::new(
+            DEFAULT_LISTING_MODEL,
+            ThinkingLevel::Low,
+            DEFAULT_GENERATE_CONTENT_MAX_OUTPUT_TOKENS,
         );
+        listing_extraction.fallback_model = Some(DEFAULT_GROUNDED_MODEL.to_string());
+        listing_extraction.fallback_thinking_level = Some(ThinkingLevel::Low);
+        tasks.insert(GeminiTask::ListingExtraction, listing_extraction);
         for task in [
             GeminiTask::GroundedMetadata,
             GeminiTask::AvionicsIdentity,
@@ -829,6 +829,19 @@ mod tests {
             "gemini-3.5-flash-lite"
         );
         assert_eq!(
+            config
+                .route(GeminiTask::ListingExtraction)
+                .fallback_model
+                .as_deref(),
+            Some("gemini-3.5-flash")
+        );
+        assert_eq!(
+            config
+                .route(GeminiTask::ListingExtraction)
+                .fallback_thinking_level,
+            Some(ThinkingLevel::Low)
+        );
+        assert_eq!(
             config.route(GeminiTask::AvionicsIdentity).model,
             "gemini-3.5-flash"
         );
@@ -923,6 +936,7 @@ mod tests {
     fn checked_in_configs_keep_avionics_curation_retries_on_lite() {
         let config = GeminiRuntimeConfig::from_toml_str(include_str!("../../config/gemini.toml"))
             .expect("checked-in Gemini config must load");
+        assert_listing_extraction_correction_route(&config);
         assert_lite_only_avionics_curation_routes(&config);
 
         let aircraft_adjudication = config.route(GeminiTask::AircraftCatalogAdjudication);
@@ -940,7 +954,17 @@ mod tests {
         let example =
             GeminiRuntimeConfig::from_toml_str(include_str!("../../config/gemini.example.toml"))
                 .expect("example Gemini config must load");
+        assert_listing_extraction_correction_route(&example);
         assert_lite_only_avionics_curation_routes(&example);
+    }
+
+    fn assert_listing_extraction_correction_route(config: &GeminiRuntimeConfig) {
+        let route = config.route(GeminiTask::ListingExtraction);
+        assert_eq!(route.model, "gemini-3.5-flash-lite");
+        assert_eq!(route.thinking_level, ThinkingLevel::Low);
+        assert_eq!(route.fallback_model.as_deref(), Some("gemini-3.5-flash"));
+        assert_eq!(route.fallback_thinking_level, Some(ThinkingLevel::Low));
+        assert_eq!(route.max_output_tokens, 4_096);
     }
 
     fn assert_lite_only_avionics_curation_routes(config: &GeminiRuntimeConfig) {

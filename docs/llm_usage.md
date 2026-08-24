@@ -100,6 +100,25 @@ groups; a task-specific variable wins when both are set.
 Set it to enable extraction and enrichment. If the key is absent, manual
 listing preview still works, but URL/plugin extraction reports an error.
 
+Listing extraction uses its primary route for the full listing response. When
+that response is valid JSON but its transient avionics member still fails the
+current deterministic schema, evidence, capability, or quantity gates, the
+server may make exactly one avionics-only correction request through the
+listing-extraction fallback route. The correction receives only the listing
+text, the prior transient avionics JSON, and bounded validation feedback; it
+returns only a complete replacement `avionics` array. The configured default is
+Flash Lite with low thinking for the primary request and Flash with low
+thinking for that correction. When `fallback_model` is unset, the correction
+reuses the primary model and thinking level.
+
+The listing-extraction envelope is at most two logical requests. A malformed
+primary JSON response may consume the second request for the existing JSON
+repair, or a directly parseable primary may consume it for the semantic
+avionics correction. These paths are mutually exclusive. The correction is
+parsed once and never receives its own JSON repair, so transport failures,
+invalid correction JSON, and invalid corrected avionics fail closed without a
+third request.
+
 ## Request Accounting
 
 Every logical Gemini request creates a `gemini_api_usage` row before the
@@ -144,6 +163,12 @@ unknown rather than guessing how to split it.
 The accounting table stores no prompt text, response body, downloaded image
 bytes, or API key. Prompts and images exist only in memory for the request, and
 `GEMINI_API_KEY` remains process configuration.
+
+An avionics-only listing correction is accounted as a separate logical request
+with purpose `listing_avionics_validation_correction`. It inherits the same
+source, listing, and correlation attribution as the primary listing extraction
+while recording the model actually selected by the fallback route. Neither its
+prompt nor its response is persisted.
 
 Apply-mode recovery of an obsolete listing extraction has a distinct durable
 boundary. The returned raw avionics array must contain explicit quantity,
@@ -209,6 +234,12 @@ copies of one role, non-adjacent mentions, ambiguous proof spans, replacement
 actions, punctuation-equivalent duplicate output rows, and distinct product
 suffixes fail closed. Other publishers receive only the prompt contract until
 they have an equally explicit installed-equipment provenance adapter.
+
+The same atomic Controller repair and complete current extraction validator run
+after an avionics-only correction. On success, only the transient `avionics`
+member is replaced; aircraft identity, visual recovery, price, hours, valuation
+facts, and all other primary values remain byte-for-value unchanged. On failure,
+the original transient extraction is restored and no checkpoint is written.
 
 ## Evidence Retention And Reuse
 
