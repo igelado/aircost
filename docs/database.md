@@ -1862,6 +1862,34 @@ the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
 scope. Missing and ambiguous matches remain ineligible for snapshots, training,
 and serving. The final query must return no rows.
 
+## Avionics Generic Feature-Label Migration
+
+Fresh databases reject the closed feature-only avionics vocabulary at both the
+application and database boundaries. Upgrade an existing database with the
+matching backend migration before starting the new binary:
+
+```text
+migrations/20260824_avionics_generic_feature_labels.sqlite.sql
+migrations/20260824_avionics_generic_feature_labels.postgres.sql
+```
+
+The migration replaces the approved-model trigger/function, audits every
+approved avionics row through that invariant, and records an immutable contract
+receipt. It does not rewrite, demote, or delete a row. If a label such as
+`Synthetic Vision`, Garmin's feature-only `SVT` shorthand, `SafeTaxi`,
+`FliteCharts`, or generic `ADS-B In/Out` is already approved, explicitly
+correct or demote that row and rerun the migration. Concrete labels that merely
+include a feature annotation, such as
+`GTX 345 ADS-B In/Out`, remain admissible because the policy requires exact
+whole-label equality.
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260824_avionics_generic_feature_labels.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+```
+
 ## Gemini Usage Accounting Migration
 
 Fresh databases receive `gemini_api_usage` from `schema/sqlite.sql` or

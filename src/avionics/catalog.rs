@@ -7101,6 +7101,8 @@ mod tests {
             "GDL69A XM Receiver",
             "AHRS-200",
             "TAWS-B",
+            "G1000 SVT",
+            "SVT-100",
         ] {
             request.model = concrete_model.to_string();
             assert!(
@@ -7137,23 +7139,30 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("catalog counts should load");
-        let request = AvionicsIdentityRequest {
-            manufacturer: "Garmin".to_string(),
-            model: "XM Weather & Radio".to_string(),
-            avionics_types: vec!["Datalink".to_string()],
-            listing_context: "XM Weather & Radio".to_string(),
-            ..local_request("")
-        };
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
-
-        let outcome = resolve_avionics_identity(&db, &extractor, &request)
-            .await
-            .expect("exact generic rejection must not contact the unreachable provider");
-        assert!(matches!(outcome, AvionicsIdentityOutcome::Rejected { .. }));
+        for (model, listing_context) in [
+            ("Synthetic Vision", "Synthetic Vision"),
+            ("SVT", "Garmin SVT Synthetic Vision"),
+        ] {
+            let request = AvionicsIdentityRequest {
+                manufacturer: "Garmin".to_string(),
+                model: model.to_string(),
+                avionics_types: vec!["Flight Display".to_string()],
+                listing_context: listing_context.to_string(),
+                ..local_request("")
+            };
+            let outcome = resolve_avionics_identity(&db, &extractor, &request)
+                .await
+                .expect("exact generic rejection must not contact the unreachable provider");
+            assert!(
+                matches!(outcome, AvionicsIdentityOutcome::Rejected { .. }),
+                "{model} must be discarded as a feature-only label"
+            );
+        }
 
         let mut invalid_approved_identity = verified_identity();
-        invalid_approved_identity.canonical_model = "XM Weather & Radio".to_string();
-        invalid_approved_identity.manufacturer_identifier = "XM Weather & Radio".to_string();
+        invalid_approved_identity.canonical_model = "Synthetic Vision".to_string();
+        invalid_approved_identity.manufacturer_identifier = "Synthetic Vision".to_string();
         let approval_error = persist_approved_identity(
             &db,
             None,

@@ -109,11 +109,15 @@ const AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION: &str =
 const AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT: &str =
     "1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6";
-const AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION: i64 = 1;
+const AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION: &str = "20260824_avionics_generic_feature_labels";
+const AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION: i64 = 1;
+const AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT: &str =
+    "4df9f28d6d4ef22245cf1fe0dd4124573a1a03ef36371aba4cbd9d485bc94163";
+const AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION: i64 = 2;
 const SQLITE_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
-    "5f63974c8eb8b39298ee4862904f418f223c41f7c3d46c80f2c069e09fe7372e";
+    "c544640fc9fd748d8601ac21f4510e0659f2039b162bd6ef54485e598ef95355";
 const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
-    "740076e3a5ce9c73bbfaaaf83be2863180e7ab62295217edc0549813b2942d59";
+    "0d3f244fc0ac9324e2c16bb74c489f6aca97ae6ac6a900e98bc8640752b7e850";
 const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE: &str = r#"
 BEGIN
   IF NEW.catalog_status = 'approved' AND (
@@ -128,13 +132,24 @@ BEGIN
     'glass panel', 'flight instruments', 'standard flight instruments',
     'standard vfr avionics', 'standard ifr avionics', 'radio', 'radios', 'nav',
     'com', 'nav com', 'gps nav com', 'navigation system', 'gps', 'autopilot',
-    'flight director', 'transponder', 'ads b', 'weather radar', 'audio panel',
+    'flight director', 'transponder', 'ads b', 'ads b in', 'ads b out',
+    'ads b in out', 'ads b in and out', 'weather radar', 'audio panel',
+    'standard audio panel', 'audio controller', 'audio control panel',
     'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
-    'traffic', 'active traffic', 'traffic advisory system', 'datalink', 'xm',
+    'traffic', 'active traffic', 'traffic advisory system', 'datalink',
+    'datalink weather', 'xm',
     'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
     'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
-    'taws', 'engine monitor', 'standby instrument', 'elt', 'adf', 'dme', 'ahrs',
-    'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'equipment'
+    'taws', 'synthetic vision', 'synthetic vision system', 'svt',
+    'safetaxi', 'safe taxi',
+    'flitecharts', 'flite charts', 'charts', 'electronic charts',
+    'electronic stability and protection', 'electronic stability protection',
+    'stability and protection', 'wireless data loading',
+    'wireless database loading', 'engine monitor', 'engine fuel monitoring',
+    'standby instrument', 'backup instruments', 'elt', 'adf', 'dme', 'ahrs',
+    'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'waas',
+    'waas gps', 'dual waas', 'remote transponder', 'transponder ads b',
+    'stormscope', 'standard radio navigation', 'equipment'
   ) THEN
     RAISE EXCEPTION 'approved avionics model is a generic category; canonicalize, correct, or demote it before retrying migration';
   END IF;
@@ -506,6 +521,11 @@ const COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] = 
         migration_name: AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION,
         contract_version: AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_VERSION,
         contract_fingerprint: AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION,
+        contract_version: AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION,
+        contract_fingerprint: AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT,
     },
 ];
 
@@ -3654,9 +3674,9 @@ impl AppDb {
                     DatabaseKind::Sqlite => "avionics_models",
                     DatabaseKind::Postgres => "public.avionics_models",
                 },
-                AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION,
-                AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_VERSION,
-                AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT,
+                AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION,
+                AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION,
+                AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT,
             )
             .await?;
         let approved_concrete_model_anchor_exists = match &mut *connection {
@@ -3685,7 +3705,7 @@ impl AppDb {
                 self.kind(),
                 "avionics_models",
                 "approved concrete-model invariant",
-                AVIONICS_APPROVED_CONCRETE_MODEL_MIGRATION,
+                AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION,
             ));
         }
         let faa_registry_schema_started = self.faa_registry_schema_started_on(connection).await?;
@@ -9150,6 +9170,9 @@ mod tests {
         AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_FINGERPRINT,
         AVIONICS_DESCRIPTIVE_CONSOLIDATION_CONTRACT_VERSION,
         AVIONICS_DESCRIPTIVE_CONSOLIDATION_MIGRATION,
+        AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT,
+        AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION,
+        AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION,
         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT,
         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_VERSION,
         AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_MIGRATION,
@@ -9209,6 +9232,10 @@ mod tests {
         include_str!("../migrations/20260821_avionics_approved_concrete_model.sqlite.sql");
     const AVIONICS_APPROVED_CONCRETE_MODEL_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260821_avionics_approved_concrete_model.postgres.sql");
+    const AVIONICS_GENERIC_FEATURE_LABELS_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260824_avionics_generic_feature_labels.sqlite.sql");
+    const AVIONICS_GENERIC_FEATURE_LABELS_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260824_avionics_generic_feature_labels.postgres.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260731_avionics_human_reviewed_consolidation.sqlite.sql");
     const AVIONICS_HUMAN_CONSOLIDATION_POSTGRES_MIGRATION_SQL: &str =
@@ -9358,8 +9385,8 @@ mod tests {
             .difference(&postgres_receipts)
             .next()
             .is_none());
-        assert_eq!(sqlite_receipts.len(), 21);
-        assert_eq!(postgres_receipts.len(), 22);
+        assert_eq!(sqlite_receipts.len(), 22);
+        assert_eq!(postgres_receipts.len(), 23);
         assert!(!sqlite_receipts.contains("20260802_default_avionics_candidate_quarantine"));
     }
 
@@ -9722,7 +9749,7 @@ mod tests {
         .await
         .unwrap();
         let expected = sqlite_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 22);
+        assert_eq!(expected.len(), 23);
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -9819,7 +9846,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 21);
+        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 22);
         inspection.close().await;
         std::fs::remove_file(database_path).unwrap();
 
@@ -13180,7 +13207,7 @@ mod tests {
         .await
         .unwrap();
         let expected = postgres_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 23);
+        assert_eq!(expected.len(), 24);
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -13465,7 +13492,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 22);
+        assert_eq!(postgres_receipt_snapshot(&inspection).await.len(), 23);
         inspection.close().await;
     }
 
@@ -14786,6 +14813,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_feature_label_migration_is_idempotent_and_audits_approved_rows() {
+        async fn minimal_connection() -> SqliteConnection {
+            let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE avionics_models (\
+                       id INTEGER PRIMARY KEY, normalized_name TEXT NOT NULL, \
+                       catalog_status TEXT NOT NULL\
+                     )",
+                )
+                .await
+                .unwrap();
+            connection
+        }
+        async fn apply(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+            for statement in
+                split_sql_statements(AVIONICS_GENERIC_FEATURE_LABELS_SQLITE_MIGRATION_SQL)
+            {
+                connection.execute(statement).await?;
+            }
+            Ok(())
+        }
+
+        let mut clean = minimal_connection().await;
+        apply(&mut clean).await.unwrap();
+        apply(&mut clean)
+            .await
+            .expect("the exact installed migration must be idempotent");
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM schema_migration_contracts \
+             WHERE migration_name = ? AND contract_version = ? \
+               AND contract_fingerprint = ?",
+        )
+        .bind(AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION)
+        .bind(AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION)
+        .bind(AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT)
+        .fetch_one(&mut clean)
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 1);
+
+        let mut legacy = minimal_connection().await;
+        legacy
+            .execute(
+                "INSERT INTO avionics_models (id, normalized_name, catalog_status) \
+                 VALUES (21, 'synthetic vision', 'approved')",
+            )
+            .await
+            .unwrap();
+        let error = apply(&mut legacy)
+            .await
+            .expect_err("an approved feature-only row must stop migration")
+            .to_string();
+        assert!(error.contains("canonicalize, correct, or demote it before retrying migration"));
+        let retained: (String, String) = sqlx::query_as(
+            "SELECT normalized_name, catalog_status FROM avionics_models WHERE id = 21",
+        )
+        .fetch_one(&mut legacy)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            ("synthetic vision".to_string(), "approved".to_string())
+        );
+
+        for invalid_key in [
+            "synthetic vision",
+            "svt",
+            "safetaxi",
+            "flitecharts",
+            "electronic stability and protection",
+            "wireless data loading",
+            "ads b in out",
+        ] {
+            let error = sqlx::query(
+                "INSERT INTO avionics_models (normalized_name, catalog_status) \
+                 VALUES (?, 'approved')",
+            )
+            .bind(invalid_key)
+            .execute(&mut clean)
+            .await
+            .expect_err("the installed invariant must reject feature-only approved keys")
+            .to_string();
+            assert!(
+                error.contains("canonicalize, correct, or demote it before retrying migration"),
+                "{invalid_key}: {error}"
+            );
+        }
+        clean
+            .execute(
+                "INSERT INTO avionics_models (normalized_name, catalog_status) \
+                 VALUES ('gtx345 ads b in out', 'approved')",
+            )
+            .await
+            .expect("a concrete product with a feature annotation remains admissible");
+    }
+
+    #[tokio::test]
+    async fn startup_requires_and_accepts_generic_feature_label_migration() {
+        let (database_path, database_url) =
+            unique_sqlite_test_database("generic-feature-migration");
+        AppDb::connect(&database_url).await.unwrap().close().await;
+
+        let mut connection = SqliteConnection::connect(&database_url).await.unwrap();
+        connection
+            .execute(
+                "DELETE FROM schema_migration_contracts \
+                 WHERE migration_name = '20260824_avionics_generic_feature_labels'",
+            )
+            .await
+            .unwrap();
+        for statement in split_sql_statements(AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL)
+        {
+            connection.execute(statement).await.unwrap();
+        }
+        connection.close().await.unwrap();
+
+        let error = connect_error(AppDb::connect(&database_url).await);
+        assert!(
+            error.contains("migrations/20260824_avionics_generic_feature_labels.sqlite.sql"),
+            "{error}"
+        );
+
+        let mut connection = SqliteConnection::connect(&database_url).await.unwrap();
+        for statement in split_sql_statements(AVIONICS_GENERIC_FEATURE_LABELS_SQLITE_MIGRATION_SQL)
+        {
+            connection.execute(statement).await.unwrap();
+        }
+        connection.close().await.unwrap();
+
+        AppDb::connect(&database_url).await.unwrap().close().await;
+        std::fs::remove_file(database_path).unwrap();
+    }
+
+    #[tokio::test]
     async fn startup_rejects_noop_approved_concrete_model_trigger_bodies() {
         for (label, trigger_name, event) in [
             (
@@ -14939,8 +15101,15 @@ mod tests {
             "flight director",
             "transponder",
             "ads b",
+            "ads b in",
+            "ads b out",
+            "ads b in out",
+            "ads b in and out",
             "weather radar",
             "audio panel",
+            "standard audio panel",
+            "audio controller",
+            "audio control panel",
             "display",
             "flight display",
             "pfd",
@@ -14951,6 +15120,7 @@ mod tests {
             "active traffic",
             "traffic advisory system",
             "datalink",
+            "datalink weather",
             "xm",
             "xm weather",
             "xm radio",
@@ -14960,8 +15130,24 @@ mod tests {
             "terrain awareness system",
             "terrain avoidance system",
             "taws",
+            "synthetic vision",
+            "synthetic vision system",
+            "svt",
+            "safetaxi",
+            "safe taxi",
+            "flitecharts",
+            "flite charts",
+            "charts",
+            "electronic charts",
+            "electronic stability and protection",
+            "electronic stability protection",
+            "stability and protection",
+            "wireless data loading",
+            "wireless database loading",
             "engine monitor",
+            "engine fuel monitoring",
             "standby instrument",
+            "backup instruments",
             "elt",
             "adf",
             "dme",
@@ -14970,6 +15156,13 @@ mod tests {
             "radar altimeter",
             "magnetometer",
             "clock timer",
+            "waas",
+            "waas gps",
+            "dual waas",
+            "remote transponder",
+            "transponder ads b",
+            "stormscope",
+            "standard radio navigation",
             "equipment",
         ];
         for label in vocabulary {
@@ -14978,8 +15171,8 @@ mod tests {
             for definition in [
                 SQLITE_SCHEMA_SQL,
                 POSTGRES_SCHEMA_SQL,
-                AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL,
-                AVIONICS_APPROVED_CONCRETE_MODEL_POSTGRES_MIGRATION_SQL,
+                AVIONICS_GENERIC_FEATURE_LABELS_SQLITE_MIGRATION_SQL,
+                AVIONICS_GENERIC_FEATURE_LABELS_POSTGRES_MIGRATION_SQL,
             ] {
                 assert!(
                     definition.contains(&quoted),
@@ -15002,7 +15195,13 @@ mod tests {
             assert!(definition.contains("!~ '^[a-z0-9]+( [a-z0-9]+)*$'"));
             assert!(definition.contains("canonicalize, correct, or demote"));
         }
-        for spelling in ["pfd/mfd", "ads-b", "xm weather &amp; radio"] {
+        for spelling in [
+            "pfd/mfd",
+            "ads-b",
+            "xm weather &amp; radio",
+            "ADS-B In/Out",
+            "Electronic Stability &amp; Protection",
+        ] {
             assert!(crate::normalize::is_generic_avionics_model_name(spelling));
         }
     }
