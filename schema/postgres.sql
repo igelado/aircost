@@ -10595,13 +10595,24 @@ BEGIN
     'glass panel', 'flight instruments', 'standard flight instruments',
     'standard vfr avionics', 'standard ifr avionics', 'radio', 'radios', 'nav',
     'com', 'nav com', 'gps nav com', 'navigation system', 'gps', 'autopilot',
-    'flight director', 'transponder', 'ads b', 'weather radar', 'audio panel',
+    'flight director', 'transponder', 'ads b', 'ads b in', 'ads b out',
+    'ads b in out', 'ads b in and out', 'weather radar', 'audio panel',
+    'standard audio panel', 'audio controller', 'audio control panel',
     'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
-    'traffic', 'active traffic', 'traffic advisory system', 'datalink', 'xm',
+    'traffic', 'active traffic', 'traffic advisory system', 'datalink',
+    'datalink weather', 'xm',
     'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
     'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
-    'taws', 'engine monitor', 'standby instrument', 'elt', 'adf', 'dme', 'ahrs',
-    'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'equipment'
+    'taws', 'synthetic vision', 'synthetic vision system', 'svt',
+    'safetaxi', 'safe taxi',
+    'flitecharts', 'flite charts', 'charts', 'electronic charts',
+    'electronic stability and protection', 'electronic stability protection',
+    'stability and protection', 'wireless data loading',
+    'wireless database loading', 'engine monitor', 'engine fuel monitoring',
+    'standby instrument', 'backup instruments', 'elt', 'adf', 'dme', 'ahrs',
+    'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'waas',
+    'waas gps', 'dual waas', 'remote transponder', 'transponder ads b',
+    'stormscope', 'standard radio navigation', 'equipment'
   ) THEN
     RAISE EXCEPTION 'approved avionics model is a generic category; canonicalize, correct, or demote it before retrying migration';
   END IF;
@@ -10621,6 +10632,15 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260821_avionics_approved_concrete_model', 1,
   '1305564519a99b0ecdfb85a045b9924bf90a33b2914bb6822a219170d541a5f6',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;
+
+INSERT INTO public.schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260824_avionics_generic_feature_labels', 1,
+  '366cf90682d11e71293461aca169445a04f8b906d8c15dab6fde76e1dc2384c8',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

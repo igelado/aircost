@@ -110,8 +110,15 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "flight director"
             | "transponder"
             | "ads b"
+            | "ads b in"
+            | "ads b out"
+            | "ads b in out"
+            | "ads b in and out"
             | "weather radar"
             | "audio panel"
+            | "standard audio panel"
+            | "audio controller"
+            | "audio control panel"
             | "display"
             | "flight display"
             | "pfd"
@@ -122,6 +129,7 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "active traffic"
             | "traffic advisory system"
             | "datalink"
+            | "datalink weather"
             | "xm"
             | "xm weather"
             | "xm radio"
@@ -131,8 +139,24 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "terrain awareness system"
             | "terrain avoidance system"
             | "taws"
+            | "synthetic vision"
+            | "synthetic vision system"
+            | "svt"
+            | "safetaxi"
+            | "safe taxi"
+            | "flitecharts"
+            | "flite charts"
+            | "charts"
+            | "electronic charts"
+            | "electronic stability and protection"
+            | "electronic stability protection"
+            | "stability and protection"
+            | "wireless data loading"
+            | "wireless database loading"
             | "engine monitor"
+            | "engine fuel monitoring"
             | "standby instrument"
+            | "backup instruments"
             | "elt"
             | "adf"
             | "dme"
@@ -141,6 +165,13 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "radar altimeter"
             | "magnetometer"
             | "clock timer"
+            | "waas"
+            | "waas gps"
+            | "dual waas"
+            | "remote transponder"
+            | "transponder ads b"
+            | "stormscope"
+            | "standard radio navigation"
             | "equipment"
     )
 }
@@ -285,10 +316,42 @@ mod tests {
             "AHRS",
             "ADF",
             "PFD/MFD",
+            "Synthetic Vision",
+            "SVT",
+            "SafeTaxi",
+            "FliteCharts",
+            "Electronic Stability & Protection",
+            "Wireless Data Loading",
+            "ADS-B In/Out",
+            "WAAS GPS",
+            "Remote Transponder",
+            "Standard Audio Panel",
+            "Stormscope",
+            "Backup Instruments",
         ] {
             assert!(
                 is_generic_avionics_model_name(label),
                 "{label} should be generic"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_vocabulary_does_not_consume_concrete_product_labels() {
+        for label in [
+            "GTX 345 ADS-B In/Out",
+            "G1000 NXi Synthetic Vision",
+            "G1000 SVT",
+            "SVT-100",
+            "Flight Stream 510",
+            "Stormscope WX-500",
+            "GDL 69A Wireless Data",
+            "GFC 700 Electronic Stability & Protection",
+            "GTN 750 WAAS GPS/NAV/COM",
+        ] {
+            assert!(
+                !is_generic_avionics_model_name(label),
+                "{label} contains a feature but still identifies a concrete product"
             );
         }
     }

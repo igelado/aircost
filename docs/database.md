@@ -1563,7 +1563,7 @@ fingerprint—including a null value exposed by a weakened receipt table—abort
 before subsequent domain statements execute. Operators must investigate a
 mismatch instead of rerunning a migration to heal the marker.
 
-Each of the 24 receipt-bearing PostgreSQL historical migration files pins its
+Each of the 27 receipt-bearing PostgreSQL historical migration files pins its
 transaction-local search path to `public`, `pg_catalog`, and an explicitly last
 `pg_temp`, then holds a transaction-wide `SHARE ROW EXCLUSIVE` lock on
 `public.schema_migration_contracts` from before its guard through the final
@@ -1573,8 +1573,9 @@ objects; shadows on the caller's search path are likewise ignored. The caller's
 search path is restored at commit. A ledger writer that started first must
 commit before the guard reads the receipt, while a later writer waits until the
 migration commits. The guard and domain statements therefore cannot observe
-different committed receipt states during one standalone rerun. SQLite obtains
-the corresponding write serialization from `BEGIN IMMEDIATE`.
+different committed receipt states during one standalone rerun. Each of the 26
+receipt-bearing SQLite migration files obtains the corresponding write
+serialization from `BEGIN IMMEDIATE`.
 
 The only historical in-place receipt upgrades are the documented version-1 to
 version-2 transitions in the default-avionics quarantine and avionics product
@@ -1861,6 +1862,36 @@ Listing reference resolution uses only one complete published version matching
 the current exact FAA identity, model year, `US`/`GLOBAL` market, and FAA serial
 scope. Missing and ambiguous matches remain ineligible for snapshots, training,
 and serving. The final query must return no rows.
+
+## Avionics Generic Feature-Label Migration
+
+Fresh databases reject the closed feature-only avionics vocabulary at both the
+application and database boundaries. Upgrade an existing database with the
+matching backend migration before starting the new binary:
+
+```text
+migrations/20260824_avionics_generic_feature_labels.sqlite.sql
+migrations/20260824_avionics_generic_feature_labels.postgres.sql
+```
+
+The migration replaces the approved-model trigger/function, audits every
+approved avionics row through that invariant, and records an immutable contract
+receipt. The audit is a side-effect-free predicate check: it does not issue
+model updates, rewrite, demote, or delete a row, and therefore does not
+invalidate listing authorization proofs for otherwise valid products. If a
+label such as `Synthetic Vision`, Garmin's feature-only `SVT` shorthand,
+`SafeTaxi`, `FliteCharts`, or generic `ADS-B In/Out` is already approved,
+explicitly correct or demote that row and rerun the migration. Concrete labels
+that merely include a feature annotation, such as
+`GTX 345 ADS-B In/Out`, remain admissible because the policy requires exact
+whole-label equality.
+
+```sh
+sqlite3 -bail data/aircost.sqlite3 \
+  ".read migrations/20260824_avionics_generic_feature_labels.sqlite.sql" \
+  "PRAGMA foreign_key_check;" \
+  "PRAGMA integrity_check;"
+```
 
 ## Gemini Usage Accounting Migration
 
