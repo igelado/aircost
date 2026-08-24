@@ -17,14 +17,15 @@ use crate::aircraft::repair::{
     record_bound_source_serial_correction, record_bound_source_visual_correction,
 };
 use crate::db::{AppDb, DatabaseBackend};
-use crate::extract::{parse_listing_html, validate_source_url, GeminiListingExtractor};
+use crate::extract::{
+    parse_listing_html_for_avionics_validation, validate_source_url, GeminiListingExtractor,
+};
 use crate::html::clean::clean_listing_html;
+use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
 };
-use crate::listing::avionics::extraction::{
-    recover_controller_avionics_extraction, validate_unbound_current_avionics_extraction,
-};
+use crate::listing::avionics::extraction::validate_unbound_current_avionics_extraction;
 use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{
     create_listing_with_progress_and_occurrence_dispositions,
@@ -1537,43 +1538,27 @@ async fn extract_capture_to_current_checkpoint(
     rendered_html: &str,
     extractor: &GeminiListingExtractor,
 ) -> StoreResult<(ListingPreview, Value)> {
-    let mut preview = parse_listing_html(source_url, rendered_html, extractor).await?;
+    let extraction =
+        parse_listing_html_for_avionics_validation(source_url, rendered_html, extractor).await?;
+    let mut preview = extraction.preview;
     let mut payload = extracted_listing_payload(&preview);
-    let recovery = recover_controller_avionics_extraction(&mut payload, source_url, rendered_html)
-        .map_err(PluginStoreError::Validation)?;
-    let validated_occurrences = validate_unbound_current_avionics_extraction(
-        &payload.to_string(),
+    payload["avionics"] = extraction.raw_avionics;
+    let listing_text = preview.context_text.as_deref().ok_or_else(|| {
+        PluginStoreError::Validation(
+            "provider-backed listing extraction requires retained listing text".to_string(),
+        )
+    })?;
+    let validated_occurrences = validate_or_correct_listing_avionics(
+        extractor,
+        extraction.correction_token,
+        listing_text,
         source_url,
         rendered_html,
+        &mut payload,
     )
+    .await
     .map_err(PluginStoreError::Validation)?;
-    if validated_occurrences.len() != preview.parsed_listing.avionics.len() {
-        return Err(PluginStoreError::Validation(
-            "avionics evidence recovery changed the occurrence structure".to_string(),
-        ));
-    }
-    for (preview_occurrence, mut validated_occurrence) in preview
-        .parsed_listing
-        .avionics
-        .iter_mut()
-        .zip(validated_occurrences)
-    {
-        let recovered_evidence = validated_occurrence.source_evidence_text.take();
-        validated_occurrence.source_evidence_text = preview_occurrence.source_evidence_text.clone();
-        if recovery.quantity_recovered
-            && preview_occurrence.quantity == 1
-            && validated_occurrence.quantity == 2
-        {
-            preview_occurrence.quantity = 2;
-        }
-        if *preview_occurrence != validated_occurrence {
-            return Err(PluginStoreError::Validation(
-                "avionics recovery changed a non-evidence value other than one exact role-separated quantity"
-                    .to_string(),
-            ));
-        }
-        preview_occurrence.source_evidence_text = recovered_evidence;
-    }
+    preview.parsed_listing.avionics = validated_occurrences;
     Ok((preview, payload))
 }
 
@@ -2808,6 +2793,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use axum::extract::State;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -2819,7 +2807,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        classify_replay_aircraft_admission, load_checkpoint_capture,
+        classify_replay_aircraft_admission, extract_capture_to_current_checkpoint,
+        load_checkpoint_capture,
         materialize_plugin_submission_checkpoint as materialize_pinned_checkpoint,
         parse_current_checkpoint_payload, reprocess_plugin_submission, sha256_hex,
         signature_message, store_plugin_extraction_checkpoint, submit_plugin_html,
@@ -2833,7 +2822,11 @@ mod tests {
         ReleaseMetadata, TargetCoverage,
     };
     use crate::db::{AppDb, DatabaseBackend};
+    use crate::gemini::usage::{SourceCorrelation, Store as UsageStore};
     use crate::models::{PluginSubmissionRequest, User};
+
+    const CONTROLLER_ROLE_LISTING_URL: &str =
+        "https://www.controller.com/listing/for-sale/252742967/example";
 
     async fn materialize_plugin_submission_checkpoint(
         db: &AppDb,
@@ -3023,6 +3016,381 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{address}/")
+    }
+
+    #[derive(Clone)]
+    struct ExtractionSequenceState {
+        responses: Arc<Vec<String>>,
+        request_count: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn extraction_sequence_handler(
+        State(state): State<ExtractionSequenceState>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let index = state.request_count.fetch_add(1, Ordering::SeqCst);
+        state.requests.lock().unwrap().push(request);
+        let content = state
+            .responses
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| "unexpected third listing extraction request".to_string());
+        Json(json!({
+            "candidates": [{"content": {"parts": [{"text": content}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 10,
+                "totalTokenCount": 20
+            }
+        }))
+    }
+
+    async fn extraction_sequence_endpoint(
+        responses: Vec<String>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = ExtractionSequenceState {
+            responses: Arc::new(responses),
+            request_count: request_count.clone(),
+            requests: requests.clone(),
+        };
+        let app = Router::new()
+            .route("/", post(extraction_sequence_handler))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}/"), request_count, requests)
+    }
+
+    fn listing_extraction_with_avionics(avionics: Value) -> Value {
+        let mut extraction = serial_correction_extraction();
+        extraction["registration_number"] = Value::Null;
+        extraction["serial_number"] = Value::Null;
+        extraction["avionics"] = avionics;
+        extraction
+    }
+
+    fn installed_avionics(
+        manufacturer: &str,
+        model: &str,
+        types: &[&str],
+        quantity: i64,
+        evidence: &str,
+    ) -> Value {
+        json!({
+            "manufacturer": manufacturer,
+            "model": model,
+            "types": types,
+            "quantity": quantity,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": evidence,
+            "source_confidence": "high"
+        })
+    }
+
+    fn controller_avionics_html(avionics: &str, autopilot: &str) -> String {
+        format!(
+            r#"<html><body>
+            <div class="detail__specs-wrapper">
+              <div class="detail__specs-label">Avionics/Radios</div>
+              <div class="detail__specs-value">{avionics}</div>
+              <div class="detail__specs-label">SVT</div>
+              <div class="detail__specs-value">Yes</div>
+              <div class="detail__specs-label">Autopilot</div>
+              <div class="detail__specs-value">{autopilot}</div>
+            </div>
+            </body></html>"#
+        )
+    }
+
+    #[tokio::test]
+    async fn valid_primary_listing_avionics_uses_one_lite_request() {
+        let avionics = json!([installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck", "Flight Display"],
+            1,
+            "GARMIN G1000 NXI",
+        )]);
+        let primary = listing_extraction_with_avionics(avionics.clone());
+        let (endpoint, request_count, _) =
+            extraction_sequence_endpoint(vec![primary.to_string()]).await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html("GARMIN G1000 NXI", "GFC700");
+
+        let (preview, payload) =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(extractor.listing_visual_recovery_call_count(), 1);
+        assert_eq!(payload["avionics"], avionics);
+        assert_eq!(preview.parsed_listing.avionics.len(), 1);
+        assert_eq!(preview.parsed_listing.avionics[0].model, "G1000 NXi");
+    }
+
+    #[tokio::test]
+    async fn invalid_cross_field_avionics_uses_one_flash_correction_and_changes_only_avionics() {
+        let primary_avionics = json!([installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck", "Flight Display", "Autopilot"],
+            1,
+            "GARMIN G1000 NXI SVT Yes",
+        )]);
+        let primary = listing_extraction_with_avionics(primary_avionics);
+        let corrected_avionics = json!([
+            installed_avionics(
+                "Garmin",
+                "G1000 NXi",
+                &["Integrated Flight Deck", "Flight Display"],
+                1,
+                "GARMIN G1000 NXI",
+            ),
+            installed_avionics("Garmin", "GFC700", &["Autopilot"], 1, "GFC700"),
+        ]);
+        let (endpoint, request_count, requests) = extraction_sequence_endpoint(vec![
+            primary.to_string(),
+            json!({"avionics": corrected_avionics.clone()}).to_string(),
+        ])
+        .await;
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let source = SourceCorrelation {
+            kind: "plugin_submission".to_string(),
+            id: "submission-25".to_string(),
+        };
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint)
+            .with_usage_store(UsageStore::new(&db))
+            .with_usage_scope(
+                "listing-avionics-correction-test",
+                None,
+                Some(source.clone()),
+            );
+        let html = controller_avionics_html("GARMIN G1000 NXI", "GFC700");
+
+        let (preview, payload) =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(extractor.listing_visual_recovery_call_count(), 1);
+        assert_eq!(payload["avionics"], corrected_avionics);
+        assert_eq!(preview.parsed_listing.avionics.len(), 2);
+        let mut actual_non_avionics = payload.clone();
+        actual_non_avionics
+            .as_object_mut()
+            .unwrap()
+            .remove("avionics");
+        let mut expected_non_avionics =
+            json!(crate::extract::parsed_listing_from_model_output(&primary));
+        expected_non_avionics
+            .as_object_mut()
+            .unwrap()
+            .remove("avionics");
+        assert_eq!(actual_non_avionics, expected_non_avionics);
+
+        let requests = requests.lock().unwrap();
+        let correction_prompt = requests[1]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(correction_prompt.contains("Previous transient avionics JSON"));
+        assert!(correction_prompt.contains("GARMIN G1000 NXI SVT Yes"));
+        assert!(correction_prompt.contains("bounded source excerpt"));
+        assert!(!correction_prompt.contains("\"asking_price_usd\": 400000"));
+        assert!(!correction_prompt.contains("\"serial_number\""));
+        drop(requests);
+
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let usage: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT task, purpose, model, correlation_id, source_kind, source_id FROM gemini_api_usage ORDER BY id",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            usage,
+            vec![
+                (
+                    "listing_extraction".to_string(),
+                    "listing_extraction".to_string(),
+                    "gemini-3.5-flash-lite".to_string(),
+                    Some("listing-avionics-correction-test".to_string()),
+                    Some(source.kind.clone()),
+                    Some(source.id.clone()),
+                ),
+                (
+                    "listing_extraction".to_string(),
+                    "listing_avionics_validation_correction".to_string(),
+                    "gemini-3.5-flash".to_string(),
+                    Some("listing-avionics-correction-test".to_string()),
+                    Some(source.kind),
+                    Some(source.id),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn correction_reuses_primary_model_when_listing_fallback_is_unset() {
+        let primary = listing_extraction_with_avionics(json!([installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck", "Autopilot"],
+            1,
+            "GARMIN G1000 NXI SVT Yes",
+        )]));
+        let corrected = json!({
+            "avionics": [installed_avionics(
+                "Garmin",
+                "G1000 NXi",
+                &["Integrated Flight Deck", "Flight Display"],
+                1,
+                "GARMIN G1000 NXI",
+            )]
+        });
+        let (endpoint, request_count, _) =
+            extraction_sequence_endpoint(vec![primary.to_string(), corrected.to_string()]).await;
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint)
+            .with_test_listing_fallback_model(None)
+            .with_usage_store(UsageStore::new(&db));
+        let html = controller_avionics_html("GARMIN G1000 NXI", "GFC700");
+
+        extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+            .await
+            .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let usage: Vec<(String, String)> =
+            sqlx::query_as("SELECT purpose, model FROM gemini_api_usage ORDER BY id")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            usage,
+            vec![
+                (
+                    "listing_extraction".to_string(),
+                    "gemini-3.5-flash-lite".to_string(),
+                ),
+                (
+                    "listing_avionics_validation_correction".to_string(),
+                    "gemini-3.5-flash-lite".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_fallback_fails_closed_without_a_checkpoint_or_third_request() {
+        let invalid = installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck", "Autopilot"],
+            1,
+            "GARMIN G1000 NXI SVT Yes",
+        );
+        let primary = listing_extraction_with_avionics(json!([invalid.clone()]));
+        let (endpoint, request_count, _) = extraction_sequence_endpoint(vec![
+            primary.to_string(),
+            json!({"avionics": [invalid]}).to_string(),
+        ])
+        .await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html("GARMIN G1000 NXI", "GFC700");
+
+        let error =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed after its single correction request"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(extractor.listing_visual_recovery_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn primary_json_repair_consumes_the_only_retry_and_never_opens_semantic_correction() {
+        let invalid = installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck", "Autopilot"],
+            1,
+            "GARMIN G1000 NXI SVT Yes",
+        );
+        let repaired_primary = listing_extraction_with_avionics(json!([invalid]));
+        let (endpoint, request_count, requests) = extraction_sequence_endpoint(vec![
+            "not valid json".to_string(),
+            repaired_primary.to_string(),
+        ])
+        .await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html("GARMIN G1000 NXI", "GFC700");
+
+        extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+            .await
+            .unwrap_err();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let requests = requests.lock().unwrap();
+        let retry_prompt = requests[1]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(retry_prompt.contains("previous response was not valid JSON"));
+        assert!(!retry_prompt.contains("Previous transient avionics JSON"));
+    }
+
+    #[tokio::test]
+    async fn corrected_response_still_receives_atomic_controller_quantity_repair() {
+        let primary = listing_extraction_with_avionics(json!([installed_avionics(
+            "Garmin",
+            "G5",
+            &["Flight Display", "Autopilot"],
+            1,
+            "Garmin G5 attitude SVT Yes",
+        )]));
+        let corrected = json!({
+            "avionics": [installed_avionics(
+                "Garmin",
+                "G5",
+                &["Flight Display"],
+                1,
+                "Garmin G5 attitude",
+            )]
+        });
+        let (endpoint, request_count, _) =
+            extraction_sequence_endpoint(vec![primary.to_string(), corrected.to_string()]).await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html("Garmin G5 attitude, Garmin G5 HSI", "Garmin GFC500");
+
+        let (preview, payload) =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(payload["avionics"][0]["quantity"], 2);
+        assert_eq!(
+            payload["avionics"][0]["source_evidence_text"],
+            "Garmin G5 attitude, Garmin G5 HSI"
+        );
+        assert_eq!(preview.parsed_listing.avionics[0].quantity, 2);
     }
 
     async fn signed_submission_request(

@@ -21,10 +21,12 @@ use crate::extract::GeminiListingExtractor;
 use crate::gemini::interactions::RetryPolicy;
 use crate::gemini::usage::SourceCorrelation;
 use crate::html::clean::clean_listing_html;
+use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
+#[cfg(test)]
+use crate::listing::avionics::extraction::parse_current_avionics_extraction_value;
 use crate::listing::avionics::extraction::{
-    parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
-    recover_controller_avionics_extraction, validate_current_avionics_identity_evidence,
+    parse_current_avionics_extraction_json, validate_current_avionics_identity_evidence,
     validate_current_avionics_quantity_completeness,
 };
 use crate::listing::avionics::{
@@ -4362,18 +4364,21 @@ async fn reextract_avionics(
     rendered_html: &str,
     prior_extracted_listing_json: Option<&str>,
 ) -> Result<ValidatedListingReextraction, String> {
-    let mut extracted = extractor
-        .extract(listing_text)
+    let extraction = extractor
+        .extract_for_avionics_validation(listing_text)
         .await
         .map_err(|error| format!("Gemini listing extraction request failed: {error}"))?;
-    recover_controller_avionics_extraction(&mut extracted, source_url, rendered_html).map_err(
-        |error| format!("Gemini returned listing evidence that could not be repaired: {error}"),
-    )?;
-    let avionics = parse_current_avionics_extraction_value(&extracted).map_err(|error| {
-        format!(
-            "Gemini returned output incompatible with the current explicit occurrence schema: {error}"
-        )
-    })?;
+    let mut extracted = extraction.value;
+    let avionics = validate_or_correct_listing_avionics(
+        extractor,
+        extraction.correction_token,
+        listing_text,
+        source_url,
+        rendered_html,
+        &mut extracted,
+    )
+    .await
+    .map_err(|error| format!("Gemini returned invalid listing avionics: {error}"))?;
     for (index, observation) in avionics.iter().enumerate() {
         if let Some(issue) = raw_candidate_structure_issue(observation) {
             return Err(format!(
@@ -4977,17 +4982,22 @@ mod tests {
     #[derive(Clone)]
     struct ListingExtractionEndpointState {
         request_count: Arc<AtomicUsize>,
-        extraction: Value,
+        extractions: Arc<Vec<Value>>,
     }
 
     async fn listing_extraction_endpoint_response(
         State(state): State<ListingExtractionEndpointState>,
         Json(_request): Json<Value>,
     ) -> Json<Value> {
-        state.request_count.fetch_add(1, Ordering::SeqCst);
+        let index = state.request_count.fetch_add(1, Ordering::SeqCst);
+        let extraction = state
+            .extractions
+            .get(index)
+            .or_else(|| state.extractions.last())
+            .expect("the test endpoint requires at least one extraction");
         Json(json!({
             "candidates": [{
-                "content": {"parts": [{"text": state.extraction.to_string()}]}
+                "content": {"parts": [{"text": extraction.to_string()}]}
             }]
         }))
     }
@@ -4995,35 +5005,53 @@ mod tests {
     async fn spawn_listing_extraction_endpoint(
         avionics: Value,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        spawn_listing_extraction_sequence_endpoint(vec![avionics]).await
+    }
+
+    async fn spawn_listing_extraction_sequence_endpoint(
+        avionics: Vec<Value>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let request_count = Arc::new(AtomicUsize::new(0));
         let state = ListingExtractionEndpointState {
             request_count: request_count.clone(),
-            extraction: json!({
-                "manufacturer": "Cessna",
-                "model": "172",
-                "variant": "S",
-                "model_year": 2020,
-                "asking_price_usd": 300000,
-                "currency": "USD",
-                "airframe_hours": 1000,
-                "engine_hours": null,
-                "engine_time_basis": "unknown",
-                "engine_time_evidence": null,
-                "engine_time_confidence": null,
-                "propeller_hours": null,
-                "propeller_time_basis": "unknown",
-                "propeller_time_evidence": null,
-                "propeller_time_confidence": null,
-                "installed_engine": null,
-                "installed_propeller": null,
-                "registration_number": "N12345",
-                "serial_number": null,
-                "status": "active",
-                "avionics": avionics,
-                "valuation_facts": []
-            }),
+            extractions: Arc::new(
+                avionics
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, avionics)| {
+                        if index == 0 {
+                            json!({
+                                "manufacturer": "Cessna",
+                                "model": "172",
+                                "variant": "S",
+                                "model_year": 2020,
+                                "asking_price_usd": 300000,
+                                "currency": "USD",
+                                "airframe_hours": 1000,
+                                "engine_hours": null,
+                                "engine_time_basis": "unknown",
+                                "engine_time_evidence": null,
+                                "engine_time_confidence": null,
+                                "propeller_hours": null,
+                                "propeller_time_basis": "unknown",
+                                "propeller_time_evidence": null,
+                                "propeller_time_confidence": null,
+                                "installed_engine": null,
+                                "installed_propeller": null,
+                                "registration_number": "N12345",
+                                "serial_number": null,
+                                "status": "active",
+                                "avionics": avionics,
+                                "valuation_facts": []
+                            })
+                        } else {
+                            json!({"avionics": avionics})
+                        }
+                    })
+                    .collect(),
+            ),
         };
         let app = Router::new()
             .route("/", post(listing_extraction_endpoint_response))
@@ -6276,7 +6304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_reextraction_rejects_invalid_occurrence_semantics_without_repair() {
+    async fn durable_reextraction_rejects_invalid_occurrence_after_one_bounded_correction() {
         let evidence = "Garmin G5 installed";
         let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
             "manufacturer": "Garmin",
@@ -6308,7 +6336,7 @@ mod tests {
         .unwrap_err();
         server.abort();
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert!(error.contains("quantity must be at least 1"));
     }
 
@@ -6358,7 +6386,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_reextraction_rejects_an_extra_same_product_role_occurrence() {
+    async fn durable_reextraction_uses_one_avionics_only_correction() {
+        let html = trusted_controller_role_html("GARMIN G1000 NXI");
+        let primary = json!([{
+            "manufacturer": "Garmin",
+            "model": "G1000 NXi",
+            "types": ["Integrated Flight Deck", "Autopilot"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "GARMIN G1000 NXI unrelated text",
+            "source_confidence": "high"
+        }]);
+        let corrected = json!([{
+            "manufacturer": "Garmin",
+            "model": "G1000 NXi",
+            "types": ["Integrated Flight Deck", "Flight Display"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "GARMIN G1000 NXI",
+            "source_confidence": "high"
+        }]);
+        let (endpoint, request_count, server) =
+            spawn_listing_extraction_sequence_endpoint(vec![primary, corrected]).await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let prior = retained_legacy_listing_extraction().to_string();
+
+        let reextracted = reextract_avionics(
+            &extractor,
+            &clean_listing_html(&html),
+            &ListingEvidenceContext::from_listing_capture(
+                Some(CONTROLLER_ROLE_LISTING_URL),
+                Some(&html),
+            ),
+            CONTROLLER_ROLE_LISTING_URL,
+            &html,
+            Some(&prior),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(reextracted.avionics.len(), 1);
+        assert_eq!(reextracted.avionics[0].model, "G1000 NXi");
+        assert_eq!(
+            reextracted.avionics[0].avionics_types,
+            vec!["Integrated Flight Deck", "Flight Display"]
+        );
+        let merged: Value = serde_json::from_str(&reextracted.extracted_listing_json).unwrap();
+        let prior: Value = serde_json::from_str(&prior).unwrap();
+        for field in [
+            "manufacturer",
+            "model",
+            "variant",
+            "model_year",
+            "asking_price_usd",
+            "airframe_hours",
+            "valuation_facts",
+        ] {
+            assert_eq!(merged[field], prior[field], "{field} changed");
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_reextraction_rejects_an_extra_role_occurrence_after_one_correction() {
         let html = trusted_controller_role_html(
             "Garmin G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5 standby display",
         );
@@ -6391,7 +6484,7 @@ mod tests {
         .unwrap_err();
         server.abort();
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert!(error.contains("multiple distinct role-separated quantity proofs"));
     }
 

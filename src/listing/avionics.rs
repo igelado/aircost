@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use crate::normalize::{normalize_avionics_manufacturer_name, normalize_avionics_model_name};
 
+pub(crate) mod correction;
 pub(crate) mod disposition;
 pub(crate) mod extraction;
 

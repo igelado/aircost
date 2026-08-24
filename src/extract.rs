@@ -43,6 +43,7 @@ use crate::normalize::{canonical_manufacturer_name, normalize_name};
 
 const DEFAULT_GEMINI_TIMEOUT_SECONDS: u64 = 60;
 const GEMINI_JSON_REPAIR_MAX_OUTPUT_TOKENS: u64 = 8192;
+const LISTING_AVIONICS_CORRECTION_FEEDBACK_MAX_CHARS: usize = 2_000;
 const AVIONICS_GROUNDING_SCHEMA_VERSION: &str = "avionics-grounded-json-v5";
 // Six proved too tight on a real GTS 800 identity pass: Gemini returned seven
 // distinct cited sources on both bounded Search attempts, so the local
@@ -295,6 +296,32 @@ pub struct GeminiListingExtractor {
     browser: Arc<OnceCell<eoka::Browser>>,
     #[cfg(test)]
     primary_visual_recovery_calls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    listing_visual_recovery_calls: Arc<AtomicUsize>,
+}
+
+/// Single-use authority for the one semantic validation correction available
+/// only when the primary listing-extraction response parsed as JSON without
+/// consuming the route's existing JSON-repair request.
+pub(crate) struct ListingAvionicsCorrectionToken {
+    _private: (),
+}
+
+pub(crate) struct ListingExtractionForAvionicsValidation {
+    pub value: Value,
+    pub correction_token: Option<ListingAvionicsCorrectionToken>,
+}
+
+pub(crate) struct ListingPreviewForAvionicsValidation {
+    pub preview: ListingPreview,
+    pub raw_avionics: Value,
+    pub correction_token: Option<ListingAvionicsCorrectionToken>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerateContentRouteAttempt {
+    Primary,
+    ValidationFallback,
 }
 
 #[derive(Clone, Debug)]
@@ -706,12 +733,28 @@ impl GeminiListingExtractor {
             usage_source: None,
             browser: Arc::new(OnceCell::new()),
             primary_visual_recovery_calls: Arc::new(AtomicUsize::new(0)),
+            listing_visual_recovery_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn primary_visual_recovery_call_count(&self) -> usize {
         self.primary_visual_recovery_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn listing_visual_recovery_call_count(&self) -> usize {
+        self.listing_visual_recovery_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_listing_fallback_model(mut self, fallback_model: Option<&str>) -> Self {
+        Arc::make_mut(&mut self.runtime_config)
+            .tasks
+            .get_mut(&GeminiTask::ListingExtraction)
+            .expect("listing extraction route exists")
+            .fallback_model = fallback_model.map(str::to_string);
+        self
     }
 
     pub fn from_environment() -> Result<Self> {
@@ -757,6 +800,8 @@ impl GeminiListingExtractor {
             browser: Arc::new(OnceCell::new()),
             #[cfg(test)]
             primary_visual_recovery_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            listing_visual_recovery_calls: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -857,6 +902,9 @@ impl GeminiListingExtractor {
         source_url: &str,
         retained_html: &str,
     ) -> Result<Option<(VisualIdentifierResolution, usize)>> {
+        #[cfg(test)]
+        self.listing_visual_recovery_calls
+            .fetch_add(1, Ordering::SeqCst);
         let Some(client) = self.interactions_client.as_ref() else {
             return Ok(None);
         };
@@ -956,19 +1004,69 @@ impl GeminiListingExtractor {
     }
 
     pub async fn extract(&self, listing_text: &str) -> Result<Value> {
-        self.generate_json(
-            GeminiTask::ListingExtraction,
-            "listing_extraction",
-            format!(
-                "{SYSTEM_PROMPT}\n\n{}",
-                build_extraction_prompt(listing_text)
-            ),
-            gemini_response_schema(),
-            self.runtime_config
-                .route(GeminiTask::ListingExtraction)
-                .max_output_tokens,
-        )
-        .await
+        Ok(self
+            .extract_for_avionics_validation(listing_text)
+            .await?
+            .value)
+    }
+
+    pub(crate) async fn extract_for_avionics_validation(
+        &self,
+        listing_text: &str,
+    ) -> Result<ListingExtractionForAvionicsValidation> {
+        let (value, primary_json_parsed) = self
+            .generate_json_with_retry_state(
+                GeminiTask::ListingExtraction,
+                "listing_extraction",
+                format!(
+                    "{SYSTEM_PROMPT}\n\n{}",
+                    build_extraction_prompt(listing_text)
+                ),
+                gemini_response_schema(),
+                self.runtime_config
+                    .route(GeminiTask::ListingExtraction)
+                    .max_output_tokens,
+            )
+            .await?;
+        Ok(ListingExtractionForAvionicsValidation {
+            value,
+            correction_token: primary_json_parsed
+                .then_some(ListingAvionicsCorrectionToken { _private: () }),
+        })
+    }
+
+    pub(crate) async fn correct_listing_avionics(
+        &self,
+        _token: ListingAvionicsCorrectionToken,
+        listing_text: &str,
+        previous_avionics: &Value,
+        validation_feedback: &str,
+    ) -> Result<Value> {
+        let response = self
+            .generate_json_once_with_route(
+                GeminiTask::ListingExtraction,
+                "listing_avionics_validation_correction",
+                build_listing_avionics_correction_prompt(
+                    listing_text,
+                    previous_avionics,
+                    validation_feedback,
+                ),
+                gemini_listing_avionics_correction_response_schema(),
+                self.runtime_config
+                    .route(GeminiTask::ListingExtraction)
+                    .max_output_tokens,
+                GenerateContentRouteAttempt::ValidationFallback,
+            )
+            .await?;
+        let object = response.as_object().ok_or_else(|| {
+            anyhow!("Gemini listing avionics correction must return one JSON object")
+        })?;
+        if object.len() != 1 || !object.get("avionics").is_some_and(Value::is_array) {
+            bail!(
+                "Gemini listing avionics correction must return exactly one avionics array member"
+            );
+        }
+        Ok(response)
     }
 
     pub async fn estimate_avionics_metadata(
@@ -1382,6 +1480,29 @@ impl GeminiListingExtractor {
         response_schema: Value,
         max_output_tokens: u64,
     ) -> Result<Value> {
+        Ok(self
+            .generate_json_with_retry_state(
+                task,
+                purpose,
+                prompt,
+                response_schema,
+                max_output_tokens,
+            )
+            .await?
+            .0)
+    }
+
+    /// Return whether the primary provider response parsed directly. A JSON
+    /// repair consumes the route's only second logical request, so callers may
+    /// issue a semantic validation correction only when this flag is true.
+    async fn generate_json_with_retry_state(
+        &self,
+        task: GeminiTask,
+        purpose: &str,
+        prompt: String,
+        response_schema: Value,
+        max_output_tokens: u64,
+    ) -> Result<(Value, bool)> {
         let content = self
             .generate_json_text(
                 task,
@@ -1393,7 +1514,7 @@ impl GeminiListingExtractor {
             )
             .await?;
         match load_model_json(&content) {
-            Ok(value) => Ok(value),
+            Ok(value) => Ok((value, true)),
             Err(parse_error) => {
                 let repair_prompt =
                     build_json_repair_prompt(&prompt, &content, &format!("{parse_error:#}"));
@@ -1411,14 +1532,43 @@ impl GeminiListingExtractor {
                         false,
                     )
                     .await?;
-                load_model_json(&repaired_content).with_context(|| {
+                let value = load_model_json(&repaired_content).with_context(|| {
                     format!(
                         "Gemini returned invalid JSON after repair; original parse error: {parse_error:#}; repair response excerpt: {}",
                         response_excerpt(&repaired_content)
                     )
-                })
+                })?;
+                Ok((value, false))
             }
         }
+    }
+
+    async fn generate_json_once_with_route(
+        &self,
+        task: GeminiTask,
+        purpose: &str,
+        prompt: String,
+        response_schema: Value,
+        max_output_tokens: u64,
+        route_attempt: GenerateContentRouteAttempt,
+    ) -> Result<Value> {
+        let content = self
+            .generate_json_text_with_route(
+                task,
+                purpose,
+                prompt,
+                response_schema,
+                max_output_tokens,
+                false,
+                route_attempt,
+            )
+            .await?;
+        load_model_json(&content).with_context(|| {
+            format!(
+                "Gemini returned invalid JSON for {purpose}; response excerpt: {}",
+                response_excerpt(&content)
+            )
+        })
     }
 
     async fn generate_avionics_grounded_json(
@@ -1665,14 +1815,38 @@ impl GeminiListingExtractor {
         max_output_tokens: u64,
         google_search: bool,
     ) -> Result<String> {
+        self.generate_json_text_with_route(
+            task,
+            purpose,
+            prompt,
+            response_schema,
+            max_output_tokens,
+            google_search,
+            GenerateContentRouteAttempt::Primary,
+        )
+        .await
+    }
+
+    async fn generate_json_text_with_route(
+        &self,
+        task: GeminiTask,
+        purpose: &str,
+        prompt: String,
+        response_schema: Value,
+        max_output_tokens: u64,
+        google_search: bool,
+        route_attempt: GenerateContentRouteAttempt,
+    ) -> Result<String> {
         let response_payload = self
-            .generate_json_response(
+            .generate_json_response_with_schema_policy(
                 task,
                 purpose,
                 prompt,
                 response_schema,
                 max_output_tokens,
                 google_search,
+                !google_search,
+                route_attempt,
             )
             .await?;
         gemini_response_text(&response_payload)
@@ -1695,6 +1869,7 @@ impl GeminiListingExtractor {
             max_output_tokens,
             google_search,
             !google_search,
+            GenerateContentRouteAttempt::Primary,
         )
         .await
     }
@@ -1714,6 +1889,7 @@ impl GeminiListingExtractor {
             max_output_tokens,
             false,
             false,
+            GenerateContentRouteAttempt::Primary,
         )
         .await
     }
@@ -1727,6 +1903,7 @@ impl GeminiListingExtractor {
         max_output_tokens: u64,
         google_search: bool,
         include_response_schema: bool,
+        route_attempt: GenerateContentRouteAttempt,
     ) -> Result<Value> {
         let route = self.runtime_config.route(task);
         let mut generation_config = generate_content_json_config(
@@ -1734,7 +1911,16 @@ impl GeminiListingExtractor {
             max_output_tokens,
             include_response_schema,
         );
-        if let Some(thinking_level) = route.thinking_level.as_wire_value() {
+        let use_fallback = route_attempt == GenerateContentRouteAttempt::ValidationFallback
+            && route.fallback_model.is_some();
+        let thinking_level = if use_fallback {
+            route
+                .fallback_thinking_level
+                .unwrap_or(route.thinking_level)
+        } else {
+            route.thinking_level
+        };
+        if let Some(thinking_level) = thinking_level.as_wire_value() {
             generation_config["thinkingConfig"] = json!({
                 "thinkingLevel": thinking_level,
             });
@@ -1772,11 +1958,18 @@ impl GeminiListingExtractor {
             payload["serviceTier"] = Value::String(service_tier.to_string());
         }
 
-        let model = route
-            .model
+        let configured_model = if use_fallback {
+            route
+                .fallback_model
+                .as_deref()
+                .expect("fallback use requires a configured fallback model")
+        } else {
+            &route.model
+        };
+        let model = configured_model
             .trim()
             .strip_prefix("models/")
-            .unwrap_or(route.model.trim());
+            .unwrap_or(configured_model.trim());
         let url = self.endpoint_override.clone().unwrap_or_else(|| {
             format!(
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -1950,7 +2143,45 @@ pub async fn parse_listing_html(
 ) -> Result<ListingPreview> {
     let listing_text = clean_listing_html(html);
     let structured = extractor.extract(&listing_text).await?;
-    let mut parsed_listing = parsed_listing_from_model_output(&structured);
+    listing_preview_from_structured(source_url, html, extractor, listing_text, &structured).await
+}
+
+pub(crate) async fn parse_listing_html_for_avionics_validation(
+    source_url: &str,
+    html: &str,
+    extractor: &GeminiListingExtractor,
+) -> Result<ListingPreviewForAvionicsValidation> {
+    let listing_text = clean_listing_html(html);
+    let extraction = extractor
+        .extract_for_avionics_validation(&listing_text)
+        .await?;
+    let raw_avionics = model_output_object(&extraction.value)
+        .and_then(|object| object.get("avionics"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let preview = listing_preview_from_structured(
+        source_url,
+        html,
+        extractor,
+        listing_text,
+        &extraction.value,
+    )
+    .await?;
+    Ok(ListingPreviewForAvionicsValidation {
+        preview,
+        raw_avionics,
+        correction_token: extraction.correction_token,
+    })
+}
+
+async fn listing_preview_from_structured(
+    source_url: &str,
+    html: &str,
+    extractor: &GeminiListingExtractor,
+    listing_text: String,
+    structured: &Value,
+) -> Result<ListingPreview> {
+    let mut parsed_listing = parsed_listing_from_model_output(structured);
     let mut warnings = Vec::new();
     let mut identity_recovery = None;
     if parsed_listing.registration_number.is_none() {
@@ -2000,6 +2231,13 @@ pub async fn parse_listing_html(
         identity_recovery,
         context_text: Some(listing_text),
     })
+}
+
+fn model_output_object(value: &Value) -> Option<&Map<String, Value>> {
+    value
+        .get("parsed_listing")
+        .and_then(Value::as_object)
+        .or_else(|| value.as_object())
 }
 
 pub fn preview_manual_listing(listing: &Value) -> ListingPreview {
@@ -2067,6 +2305,35 @@ Rules:\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
 Listing text:\n{listing_text}",
         serde_json::to_string_pretty(&extraction_schema_description()).unwrap()
+    )
+}
+
+fn build_listing_avionics_correction_prompt(
+    listing_text: &str,
+    previous_avionics: &Value,
+    validation_feedback: &str,
+) -> String {
+    let feedback = validation_feedback
+        .chars()
+        .take(LISTING_AVIONICS_CORRECTION_FEEDBACK_MAX_CHARS)
+        .collect::<String>();
+    format!(
+        "Correct only the avionics extraction from one aircraft sale listing.\n\
+Return exactly one JSON object with one member named avionics. The avionics value must be the complete replacement array in the current occurrence schema; do not return a patch, aircraft fields, price, hours, valuation facts, visual results, explanations, or extra keys.\n\n\
+Correction rules:\n\
+- Use only fixed installed avionics explicitly supported by the listing text.\n\
+- Emit each physical product exactly once with all and only its intrinsic capabilities and the supported installed quantity.\n\
+- Keep distinct products separate. Never assign an external autopilot, display, sensor, servo, indicator, or receiver capability to another product.\n\
+- Every source_evidence_text must be one short exact contiguous listing-text span that contains the complete product identity. Never join text across spec-field labels or unrelated equipment entries.\n\
+- Preserve meaningful model suffixes such as W, Xi, NXi, R, and ES.\n\
+- Use configuration_action installed, replaces, or removes exactly as supported; installed requires replaces null.\n\
+- If the evidence cannot support a product identity, omit that occurrence rather than inventing or merging it.\n\n\
+Current occurrence schema:\n{}\n\n\
+Bounded deterministic validation feedback:\n{feedback}\n\n\
+Previous transient avionics JSON:\n{}\n\n\
+Listing text:\n{listing_text}",
+        serde_json::to_string_pretty(&extraction_schema_description()["avionics"]).unwrap(),
+        serde_json::to_string_pretty(previous_avionics).unwrap(),
     )
 }
 
@@ -2968,6 +3235,20 @@ fn gemini_response_schema() -> Value {
             "installed_engine", "installed_propeller",
             "registration_number", "serial_number", "status", "avionics", "valuation_facts"
         ]
+    })
+}
+
+fn gemini_listing_avionics_correction_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "avionics": {
+                "type": "array",
+                "items": gemini_listing_avionics_item_schema()
+            }
+        },
+        "required": ["avionics"],
+        "propertyOrdering": ["avionics"]
     })
 }
 
