@@ -52,6 +52,10 @@ const COLLISION_CANDIDATE_LIMIT: usize = 32;
 const COLLISION_STRUCTURE_CALL_BUDGET: usize = 2;
 const GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:grounded-listing-avionics-resolution:v1";
+const GROUNDED_LISTING_REQUEST_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:grounded-listing-avionics-request:v1";
+const GROUNDED_LISTING_CAPABILITY_FINGERPRINT_DOMAIN: &[u8] =
+    b"aircost:grounded-listing-avionics-capability:v1";
 const EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE: &str = "exact_catalog_product";
 const NO_IDENTIFIER_SCOPE: &str = "none";
 const NO_REJECTION_BASIS: &str = "none";
@@ -493,6 +497,51 @@ pub(crate) struct AutomatedReviewAvionicsIdentityResolution {
     pub grounded_receipt: Option<GroundedAvionicsResolutionReceipt>,
 }
 
+pub(crate) struct ListingMaterializationAvionicsIdentityResolution {
+    pub outcome: AvionicsIdentityOutcome,
+    pub grounded_receipt_seed: Option<GroundedAvionicsResolutionReceiptSeed>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GroundedAvionicsResolutionReceiptSeed {
+    avionics_model_id: i64,
+    request_sha256: String,
+    capability_sha256: String,
+    requested_quantity: i64,
+}
+
+impl GroundedAvionicsResolutionReceiptSeed {
+    pub(crate) fn avionics_model_id(&self) -> i64 {
+        self.avionics_model_id
+    }
+
+    pub(crate) fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    pub(crate) fn capability_sha256(&self) -> &str {
+        &self.capability_sha256
+    }
+
+    pub(crate) fn requested_quantity(&self) -> i64 {
+        self.requested_quantity
+    }
+
+    pub(crate) fn bind(&self, listing_id: i64) -> GroundedAvionicsResolutionReceipt {
+        let mut hasher = Sha256::new();
+        hasher.update(GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN);
+        for value in [listing_id.to_string(), self.capability_sha256.clone()] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        GroundedAvionicsResolutionReceipt {
+            listing_id,
+            avionics_model_id: self.avionics_model_id,
+            resolution_sha256: format!("{:x}", hasher.finalize()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GroundedAvionicsResolutionReceipt {
     listing_id: i64,
@@ -514,14 +563,11 @@ impl GroundedAvionicsResolutionReceipt {
     }
 }
 
-fn grounded_resolution_receipt(
-    listing_id: i64,
+fn grounded_resolution_receipt_seed(
     request: &AvionicsIdentityRequest,
     approved: &ApprovedAvionicsIdentity,
-) -> GroundedAvionicsResolutionReceipt {
-    let mut hasher = Sha256::new();
-    hasher.update(GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN);
-    for value in std::iter::once(listing_id.to_string()).chain([
+) -> GroundedAvionicsResolutionReceiptSeed {
+    let request_values = [
         request.aircraft_manufacturer.clone(),
         request.aircraft_model.clone(),
         request.aircraft_variant.clone(),
@@ -532,6 +578,12 @@ fn grounded_resolution_receipt(
         request.model.clone(),
         request.avionics_types.join("\u{1f}"),
         request.quantity.to_string(),
+    ];
+    let request_sha256 = grounded_resolution_request_sha256_from_values(&request_values);
+
+    let mut capability_hasher = Sha256::new();
+    capability_hasher.update(GROUNDED_LISTING_CAPABILITY_FINGERPRINT_DOMAIN);
+    for value in request_values.into_iter().chain([
         approved.id.to_string(),
         approved.manufacturer.clone(),
         approved.model.clone(),
@@ -542,14 +594,40 @@ fn grounded_resolution_receipt(
         approved.evidence_title.clone(),
         approved.evidence.clone(),
     ]) {
+        capability_hasher.update((value.len() as u64).to_le_bytes());
+        capability_hasher.update(value.as_bytes());
+    }
+    GroundedAvionicsResolutionReceiptSeed {
+        avionics_model_id: approved.id,
+        request_sha256,
+        capability_sha256: format!("{:x}", capability_hasher.finalize()),
+        requested_quantity: request.quantity,
+    }
+}
+
+fn grounded_resolution_request_sha256_from_values(values: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(GROUNDED_LISTING_REQUEST_FINGERPRINT_DOMAIN);
+    for value in values {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
-    GroundedAvionicsResolutionReceipt {
-        listing_id,
-        avionics_model_id: approved.id,
-        resolution_sha256: format!("{:x}", hasher.finalize()),
-    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn grounded_resolution_request_sha256(request: &AvionicsIdentityRequest) -> String {
+    grounded_resolution_request_sha256_from_values(&[
+        request.aircraft_manufacturer.clone(),
+        request.aircraft_model.clone(),
+        request.aircraft_variant.clone(),
+        request.model_year.to_string(),
+        request.source_url.clone(),
+        request.listing_context.clone(),
+        request.manufacturer.clone(),
+        request.model.clone(),
+        request.avionics_types.join("\u{1f}"),
+        request.quantity.to_string(),
+    ])
 }
 
 #[cfg(test)]
@@ -586,7 +664,7 @@ pub(crate) fn grounded_resolution_receipt_for_test(
         grounded_claim_source_urls: Vec::new(),
         verified_local_reuse_proof: None,
     };
-    grounded_resolution_receipt(listing_id, &request, &approved)
+    grounded_resolution_receipt_seed(&request, &approved).bind(listing_id)
 }
 
 fn grounded_consolidation_preview_block(
@@ -874,6 +952,37 @@ pub async fn resolve_avionics_identity(
     resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await
 }
 
+/// Resolve one identity for listing materialization while retaining the
+/// unbound same-case capability produced only by a completed grounded path.
+/// The caller must bind this seed to an exact signed capture and listing
+/// before it can authorize persistence.
+pub(crate) async fn resolve_avionics_identity_for_listing_materialization(
+    db: &AppDb,
+    extractor: &GeminiListingExtractor,
+    request: &AvionicsIdentityRequest,
+) -> CatalogResult<ListingMaterializationAvionicsIdentityResolution> {
+    let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Apply);
+    let outcome =
+        resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
+    let grounded_receipt_seed = match &outcome {
+        AvionicsIdentityOutcome::Approved(approved)
+            if execution.grounded_resolution_completed && approved.id > 0 =>
+        {
+            // A real grounded call always retains its same-case capability.
+            // The storage boundary may prefer a concurrently established
+            // global reuse attestation, but later revocation of that global
+            // attestation alone must not strand this otherwise unchanged
+            // signed case or force the provider call again.
+            Some(grounded_resolution_receipt_seed(request, approved))
+        }
+        _ => None,
+    };
+    Ok(ListingMaterializationAvionicsIdentityResolution {
+        outcome,
+        grounded_receipt_seed,
+    })
+}
+
 /// Apply identity resolution for the automatic listing-review workflow while
 /// retaining exact pending-review revisions caused by a grounded catalog
 /// consolidation in this call. The ordinary public resolver deliberately
@@ -891,7 +1000,7 @@ pub(crate) async fn resolve_avionics_identity_for_automated_review(
         AvionicsIdentityOutcome::Approved(approved)
             if execution.grounded_resolution_completed && listing_id > 0 && approved.id > 0 =>
         {
-            Some(grounded_resolution_receipt(listing_id, request, approved))
+            Some(grounded_resolution_receipt_seed(request, approved).bind(listing_id))
         }
         _ => None,
     };
@@ -3100,6 +3209,45 @@ async fn load_graph_approved_candidates(
 ) -> CatalogResult<Vec<KnownApprovedAvionicsCandidate>> {
     let rows = query_as_all!(db, KnownApprovedRow, KNOWN_APPROVED_SELECT_SQL)?;
     Ok(graph_approved_candidates_from_rows(rows))
+}
+
+/// Load one current graph-approved product without granting global reuse.
+/// This is only an identity snapshot for validating an already durable,
+/// exact same-case capability; callers must independently validate that
+/// capability's listing, capture, request, and collision bindings.
+pub(crate) async fn approved_avionics_identity_for_grounded_replay(
+    db: &AppDb,
+    avionics_model_id: i64,
+) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
+    let matching = load_graph_approved_candidates(db)
+        .await?
+        .into_iter()
+        .filter(|candidate| candidate.id == avionics_model_id)
+        .collect::<Vec<_>>();
+    let [candidate] = matching.as_slice() else {
+        return Ok(None);
+    };
+    Ok(Some(ApprovedAvionicsIdentity {
+        id: candidate.id,
+        manufacturer: candidate.manufacturer.clone(),
+        model: candidate.model.clone(),
+        avionics_types: candidate.avionics_types.clone(),
+        manufacturer_identifier_kind: candidate.manufacturer_identifier_kind.clone(),
+        manufacturer_identifier: candidate.manufacturer_identifier.clone(),
+        evidence_url: candidate.identity_source_url.clone(),
+        evidence_title: candidate.identity_source_title.clone(),
+        evidence: candidate.identity_evidence.clone(),
+        reason: "Replayed one exact current same-case grounded materialization capability without granting global reuse".to_string(),
+        grounded_claim_source_urls: Vec::new(),
+        verified_local_reuse_proof: None,
+    }))
+}
+
+pub(crate) fn grounded_resolution_receipt_seed_for_replay(
+    request: &AvionicsIdentityRequest,
+    approved: &ApprovedAvionicsIdentity,
+) -> GroundedAvionicsResolutionReceiptSeed {
+    grounded_resolution_receipt_seed(request, approved)
 }
 
 fn graph_approved_candidates_from_rows(

@@ -278,6 +278,26 @@ are immutable. A transition to `ready` additionally requires positive quantity,
 approved endpoints, high confidence, and `listing` or `listing_review`
 provenance for every avionics link.
 
+`aircraft_sale_listing_avionics_authorizations` records the current authority
+for each exact installed or replacement endpoint. A link is authorized either
+by a current global manufacturer-reuse attestation or by the independently
+grounded resolution for that exact listing capture. The latter does not confer
+reuse authority on any other listing.
+
+`aircraft_sale_listing_avionics_grounded_capabilities` is a one-use retry
+capability, not an evidence archive or catalog attestation. One row binds an
+exact listing, plugin submission, source-capture hash, parsed-checkpoint hash,
+occurrence coordinate and role, quantity, action, approved product fingerprint,
+and collision closure. It contains only typed identifiers and hashes; prompts,
+provider responses, URLs, and grounding dossiers are never stored. Every
+occurrence contributing to a coalesced association must have a matching row,
+and their exact quantities and actions must cover the final aggregate. The
+link transaction rechecks the current product and collision state, inserts the
+link and `same_case_grounded` authorization, and deletes all consumed
+capabilities atomically. A failed or stale retry therefore cannot mint global
+reuse or authorize a different listing, product, occurrence, quantity, or
+action.
+
 `aircraft_sale_listing_pending_reviews`
 
 Stores the durable handoff for listing avionics that cannot be resolved with

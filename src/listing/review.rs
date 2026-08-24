@@ -84,7 +84,7 @@ const GROUNDED_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
 const EXTRACTION_FINGERPRINT_DOMAIN: &[u8] = b"aircost:listing-avionics-observation:v1";
 const ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:listing-avionics-association-authorization:v1";
-pub(super) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str =
+pub(crate) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str =
     "listing_avionics_authorization_v1";
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
@@ -95,6 +95,7 @@ const REVIEWER_CORRECTED_AVIONICS_KIND: &str = "avionics_reviewer_correction";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
     LOCK TABLE aircraft_sale_listing_avionics,
                aircraft_sale_listing_avionics_authorizations,
+               aircraft_sale_listing_avionics_grounded_capabilities,
                aircraft_sale_listing_avionics_dispositions,
                aircraft_sale_listing_pending_reviews
     IN SHARE ROW EXCLUSIVE MODE
@@ -222,6 +223,15 @@ pub struct StableIdentifier {
 pub enum ListingAssociationRole {
     Installed,
     Replacement,
+}
+
+impl ListingAssociationRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Replacement => "replacement",
+        }
+    }
 }
 
 /// Exact existing listing-link component adjudicated by an aspect. The link
@@ -1160,7 +1170,7 @@ struct CatalogIdentityRow {
     avionics_manufacturer_identity_id: Option<i64>,
 }
 
-const APPROVED_CATALOG_ROWS_SQL: &str = r#"
+pub(crate) const APPROVED_CATALOG_ROWS_SQL: &str = r#"
     SELECT
       model.id,
       manufacturer.name AS manufacturer,
@@ -1277,6 +1287,13 @@ fn catalog_product_fingerprints(products: &[CatalogFingerprintProduct]) -> HashM
         .collect()
 }
 
+pub(crate) fn catalog_product_fingerprint_from_rows(
+    rows: &[CatalogFingerprintRow],
+    avionics_model_id: i64,
+) -> Option<String> {
+    catalog_product_fingerprints(&catalog_products(rows.to_vec())).remove(&avionics_model_id)
+}
+
 pub(crate) fn fingerprint_approved_catalog_rows(rows: Vec<CatalogFingerprintRow>) -> String {
     fingerprint_catalog_products(&catalog_products(rows))
 }
@@ -1296,6 +1313,20 @@ async fn load_catalog_product_fingerprint_map(db: &AppDb) -> ReviewResult<HashMa
         }
     };
     Ok(catalog_product_fingerprints(&catalog_products(rows)))
+}
+
+pub(crate) async fn catalog_product_fingerprint_for_id(
+    db: &AppDb,
+    avionics_model_id: i64,
+) -> ReviewResult<String> {
+    load_catalog_product_fingerprint_map(db)
+        .await?
+        .remove(&avionics_model_id)
+        .ok_or_else(|| {
+            ReviewError::Conflict(format!(
+                "catalog id {avionics_model_id} has no current approved product fingerprint"
+            ))
+        })
 }
 
 fn active_collision_closure_rows(
@@ -1387,7 +1418,7 @@ pub(super) fn fingerprint_active_collision_closure(
     Some(format!("{:x}", hasher.finalize()))
 }
 
-pub(super) fn fingerprint_grounded_collision_closure(
+pub(crate) fn fingerprint_grounded_collision_closure(
     rows: &[ActiveCollisionCatalogFingerprintRow],
     target_id: i64,
 ) -> Option<String> {
@@ -5474,7 +5505,7 @@ fn association_observation_sha256(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn association_observation_sha256_from_values(
+pub(crate) fn association_observation_sha256_from_values(
     listing_id: i64,
     listing_link_id: i64,
     role: ListingAssociationRole,
@@ -10205,14 +10236,26 @@ mod tests {
     #[test]
     fn postgres_listing_child_lock_order_matches_finalization_contract() {
         let avionics = POSTGRES_LISTING_CHILD_LOCK_SQL
-            .find("aircraft_sale_listing_avionics")
+            .find("aircraft_sale_listing_avionics,")
             .expect("child lock must include listing avionics");
+        let authorizations = POSTGRES_LISTING_CHILD_LOCK_SQL
+            .find("aircraft_sale_listing_avionics_authorizations")
+            .expect("child lock must include listing avionics authorizations");
+        let grounded_capabilities = POSTGRES_LISTING_CHILD_LOCK_SQL
+            .find("aircraft_sale_listing_avionics_grounded_capabilities")
+            .expect("child lock must include pending grounded capabilities");
+        let dispositions = POSTGRES_LISTING_CHILD_LOCK_SQL
+            .find("aircraft_sale_listing_avionics_dispositions")
+            .expect("child lock must include occurrence dispositions");
         let pending_review = POSTGRES_LISTING_CHILD_LOCK_SQL
             .find("aircraft_sale_listing_pending_reviews")
             .expect("child lock must include pending reviews");
         assert!(
-            avionics < pending_review,
-            "all PostgreSQL listing writers must lock avionics before pending reviews"
+            avionics < authorizations
+                && authorizations < grounded_capabilities
+                && grounded_capabilities < dispositions
+                && dispositions < pending_review,
+            "all PostgreSQL listing writers must use one exact child-table lock order"
         );
     }
 
@@ -13597,6 +13640,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
                     .contains("aircraft_sale_listing_avionics_authorizations")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
+                    .contains("aircraft_sale_listing_avionics_grounded_capabilities")
+                && POSTGRES_LISTING_CHILD_LOCK_SQL
                     .contains("aircraft_sale_listing_pending_reviews")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL.contains("IN SHARE ROW EXCLUSIVE MODE")
         );
@@ -13614,10 +13659,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         let corroborations = children
             .find("aircraft_sale_listing_avionics_authorizations")
             .expect("association corroborations must be locked");
+        let capabilities = children
+            .find("aircraft_sale_listing_avionics_grounded_capabilities")
+            .expect("pending grounded capabilities must be locked");
         let pending = children
             .find("aircraft_sale_listing_pending_reviews")
             .expect("pending review must be locked");
-        assert!(links < corroborations && corroborations < pending);
+        assert!(links < corroborations && corroborations < capabilities && capabilities < pending);
     }
 
     #[tokio::test]

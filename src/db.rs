@@ -95,6 +95,11 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION: &str =
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1;
 const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
     "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
+    "20260825_listing_avionics_grounded_capabilities";
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
+    "e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -491,6 +496,11 @@ const COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] = 
         migration_name: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
         contract_version: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
         contract_fingerprint: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
+    },
+    MigrationContractReceipt {
+        migration_name: LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION,
+        contract_version: LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
     },
     MigrationContractReceipt {
         migration_name: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
@@ -3629,6 +3639,110 @@ impl AppDb {
                     self.kind()
                 )
             );
+        }
+        let missing_listing_avionics_grounded_capability_objects = match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT
+                      EXISTS (
+                        SELECT 1 FROM sqlite_schema
+                        WHERE type = 'table'
+                          AND name = 'aircraft_sale_listing_avionics'
+                      )
+                      AND (
+                        NOT EXISTS (
+                          SELECT 1 FROM sqlite_schema
+                          WHERE type = 'table'
+                            AND name =
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM sqlite_schema
+                          WHERE type = 'index'
+                            AND name IN (
+                              'idx_listing_avionics_grounded_capabilities_model',
+                              'idx_listing_avionics_grounded_capabilities_submission'
+                            )
+                        ) <> 2
+                        OR (
+                          SELECT COUNT(*)
+                          FROM sqlite_schema
+                          WHERE type = 'trigger'
+                            AND name IN (
+                              'listing_avionics_grounded_capabilities_validate_insert',
+                              'listing_avionics_grounded_capabilities_immutable_update'
+                            )
+                        ) <> 2
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pragma_foreign_key_list(
+                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                        ) <> 3
+                      )
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?
+                    != 0
+            }
+            GateConnection::Postgres(pool) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT
+                      to_regclass('aircraft_sale_listing_avionics') IS NOT NULL
+                      AND (
+                        to_regclass(
+                          'aircraft_sale_listing_avionics_grounded_capabilities'
+                        ) IS NULL
+                        OR to_regclass(
+                          'idx_listing_avionics_grounded_capabilities_model'
+                        ) IS NULL
+                        OR to_regclass(
+                          'idx_listing_avionics_grounded_capabilities_submission'
+                        ) IS NULL
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_trigger
+                          WHERE tgrelid = to_regclass(
+                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND tgname IN (
+                              'listing_avionics_grounded_capabilities_validate_insert',
+                              'listing_avionics_grounded_capabilities_immutable_update'
+                            )
+                            AND NOT tgisinternal
+                        ) <> 2
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_constraint
+                          WHERE conrelid = to_regclass(
+                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND contype = 'f'
+                        ) <> 3
+                      )
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?
+            }
+        };
+        let missing_listing_avionics_grounded_capabilities =
+            missing_listing_avionics_grounded_capability_objects
+                || self
+                    .migration_contract_invalid_on(
+                        connection,
+                        "aircraft_sale_listing_avionics",
+                        LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION,
+                        LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION,
+                        LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
+                    )
+                    .await?;
+        if missing_listing_avionics_grounded_capabilities {
+            bail!(listing_avionics_grounded_capabilities_migration_required_message(self.kind()));
         }
         let missing_occurrence_dispositions = match &mut *connection {
             GateConnection::Sqlite(pool) => {
@@ -9050,6 +9164,19 @@ fn listing_avionics_authorization_hash_domain_reset_migration_required_message(
     )
 }
 
+fn listing_avionics_grounded_capabilities_migration_required_message(kind: DatabaseKind) -> String {
+    let backend = match kind {
+        DatabaseKind::Sqlite => "sqlite",
+        DatabaseKind::Postgres => "postgres",
+    };
+    format!(
+        "database migration required before startup: capture-bound grounded avionics resolutions \
+         must survive listing retries as one-use capabilities; back up the database, apply \
+         `migrations/{LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION}.{backend}.sql`, then \
+         restart aircost"
+    )
+}
+
 fn aircraft_listing_identity_corrections_migration_required_message(kind: DatabaseKind) -> String {
     let backend = match kind {
         DatabaseKind::Sqlite => "sqlite",
@@ -9144,6 +9271,7 @@ mod tests {
         avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
         avionics_product_reuse_attestations_migration_required_message, canonical_sql_definition,
+        canonical_startup_migration_contract_receipts,
         faa_record_hash_domain_migration_required_message, faa_registry_contract_required_message,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
@@ -9193,8 +9321,11 @@ mod tests {
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
         LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-        LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT, LISTING_REPLAY_RUNS_CONTRACT_VERSION,
-        LISTING_REPLAY_RUNS_MIGRATION, POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE,
+        LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
+        LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION,
+        LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION, LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT,
+        LISTING_REPLAY_RUNS_CONTRACT_VERSION, LISTING_REPLAY_RUNS_MIGRATION,
+        POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE,
         POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT,
         POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
         POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
@@ -9274,6 +9405,10 @@ mod tests {
     const LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL: &str = include_str!(
         "../migrations/20260818_listing_avionics_authorization_hash_domain_reset.postgres.sql"
     );
+    const LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260825_listing_avionics_grounded_capabilities.sqlite.sql");
+    const LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260825_listing_avionics_grounded_capabilities.postgres.sql");
     const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260819_aircraft_listing_identity_corrections.sqlite.sql");
     const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL: &str =
@@ -9385,8 +9520,17 @@ mod tests {
             .difference(&postgres_receipts)
             .next()
             .is_none());
-        assert_eq!(sqlite_receipts.len(), 22);
-        assert_eq!(postgres_receipts.len(), 23);
+        let expected_sqlite = canonical_startup_migration_contract_receipts(DatabaseKind::Sqlite)
+            .into_iter()
+            .map(|receipt| receipt.migration_name.to_string())
+            .collect::<BTreeSet<_>>();
+        let expected_postgres =
+            canonical_startup_migration_contract_receipts(DatabaseKind::Postgres)
+                .into_iter()
+                .map(|receipt| receipt.migration_name.to_string())
+                .collect::<BTreeSet<_>>();
+        assert_eq!(sqlite_receipts, expected_sqlite);
+        assert_eq!(postgres_receipts, expected_postgres);
         assert!(!sqlite_receipts.contains("20260802_default_avionics_candidate_quarantine"));
     }
 
@@ -9749,7 +9893,10 @@ mod tests {
         .await
         .unwrap();
         let expected = sqlite_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 23);
+        assert_eq!(
+            expected.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Sqlite).len() + 1
+        );
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -9846,7 +9993,10 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 22);
+        assert_eq!(
+            sqlite_receipt_snapshot(&inspection).await.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Sqlite).len()
+        );
         inspection.close().await;
         std::fs::remove_file(database_path).unwrap();
 
@@ -16476,6 +16626,84 @@ mod tests {
                 assert!(definition.contains(cleanup_trigger));
             }
         }
+    }
+
+    #[test]
+    fn listing_avionics_grounded_capability_contract_has_backend_parity() {
+        let table = "aircraft_sale_listing_avionics_grounded_capabilities";
+        let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
+        assert_eq!(
+            sqlite_columns,
+            table_columns(POSTGRES_SCHEMA_SQL, table),
+            "SQLite/Postgres schema column mismatch for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                table
+            ),
+            "canonical schema and SQLite upgrade disagree for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                table
+            ),
+            "canonical schema and Postgres upgrade disagree for {table}"
+        );
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION));
+            assert!(
+                definition.contains(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT)
+            );
+            assert!(definition.contains("listing_avionics_grounded_capability_v1"));
+            assert!(definition.contains("requested_quantity"));
+            assert!(definition.contains("occurrence_index"));
+            assert!(definition.contains("occurrence_role"));
+        }
+        assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
+    }
+
+    #[tokio::test]
+    async fn grounded_capability_migration_is_required_and_idempotent() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("DROP TABLE aircraft_sale_listing_avionics_grounded_capabilities")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migration_contracts WHERE migration_name = ?")
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("startup must reject a database without durable grounded capabilities")
+            .to_string();
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"));
+
+        for _ in 0..2 {
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(pool)
+                .await
+                .expect("the explicit grounded-capability migration should be idempotent");
+        }
+        db.ensure_required_migrations()
+            .await
+            .expect("startup should pass after the grounded-capability migration");
     }
 
     #[tokio::test]
