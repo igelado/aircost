@@ -111,6 +111,12 @@ Flash Lite with low thinking for the primary request and Flash with low
 thinking for that correction. When `fallback_model` is unset, the correction
 reuses the primary model and thinking level.
 
+The primary listing request is tools-disabled and always sends the complete
+`responseSchema` in `generationConfig`. Its text prompt therefore carries the
+domain and evidence rules but does not repeat a prose rendering of that same
+JSON shape. Tests at both the prompt builder and request boundary require the
+schema to remain attached.
+
 The listing-extraction envelope is at most two logical requests. A malformed
 primary JSON response may consume the second request for the existing JSON
 repair, or a directly parseable primary may consume it for the semantic

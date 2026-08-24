@@ -2264,8 +2264,7 @@ pub fn validate_source_url(source_url: &str) -> Result<()> {
 
 fn build_extraction_prompt(listing_text: &str) -> String {
     format!(
-        "Extract these fields from the aircraft sale listing text.\n\
-Return JSON with exactly this shape:\n{}\n\n\
+        "Extract one complete aircraft sale listing object from the listing text. Return one JSON object that satisfies the enforced response schema.\n\
 Rules:\n\
 - Fill these creation-critical fields with non-null values: manufacturer, model, variant, model_year, asking_price_usd, currency, airframe_hours, status, avionics, valuation_facts.\n\
 - Use values from the listing text whenever possible.\n\
@@ -2303,8 +2302,7 @@ Rules:\n\
 - Keep generic certification, approval, and feature annotations outside the model label. Extract KMA 20 rather than KMA 20 TSO and KT 75 rather than KT 75 TSO. A standalone WAAS immediately before a slash-delimited capability list is an annotation, not automatically part of the model: from Garmin GTN 750 WAAS GPS/NAV/COM return manufacturer Garmin, model GTN 750, types [GPS, NAV, COM], and source_evidence_text Garmin GTN 750 WAAS GPS/NAV/COM. For an identity that already has an attached W designator, IFR between the redundant WAAS label and that capability list is also an annotation, never a type: from Garmin GNS 530W WAAS IFR GPS/NAV/COM preserve model GNS 530W and return types [GPS, NAV, COM]. Preserve actual attached or marketed designators such as W, Xi, NXi, R, and ES exactly.\n\
 - When a listing gives enough surrounding context to identify a common avionics unit, return that unit label, for example IFD 540 instead of 540, IFD 440 instead of 440, S-TEC 55X instead of System 55X, and Century 2000 instead of Autopilot.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
-Listing text:\n{listing_text}",
-        serde_json::to_string_pretty(&extraction_schema_description()).unwrap()
+Listing text:\n{listing_text}"
     )
 }
 
@@ -4242,7 +4240,7 @@ mod tests {
         gemini_avionics_unit_concreteness_response_schema,
         gemini_avionics_unit_resolution_response_schema, gemini_google_search_was_used,
         gemini_grounding_sources, gemini_grounding_supports, gemini_listing_avionics_item_schema,
-        generate_content_json_config, generate_content_usage_metrics,
+        gemini_response_schema, generate_content_json_config, generate_content_usage_metrics,
         parsed_listing_from_model_output, preview_manual_listing,
         validate_avionics_approved_candidate_adjudication_context,
         validate_avionics_candidate_triage_context, AuthorizedDirectSourcePolicy,
@@ -4746,6 +4744,31 @@ mod tests {
         assert!(prompt.contains("Preserve actual attached or marketed designators"));
         assert!(prompt.contains("return the source token GI275s rather than singularizing it"));
         assert!(prompt.contains("Later catalog curation, not listing extraction"));
+    }
+
+    #[test]
+    fn listing_extraction_prompt_uses_the_enforced_response_schema_once() {
+        let prompt = build_extraction_prompt("Dual KX-170B NAV/COM radios installed.");
+        assert!(prompt.contains("satisfies the enforced response schema"));
+        assert!(!prompt.contains("Return JSON with exactly this shape"));
+        assert!(!prompt.contains("\"asking_price_usd\": \"number\""));
+
+        let schema = gemini_response_schema();
+        let request_config = generate_content_json_config(schema.clone(), 8_192, true);
+        assert_eq!(request_config["responseMimeType"], "application/json");
+        assert_eq!(request_config["responseSchema"], schema);
+        let required = schema["required"].as_array().unwrap();
+        for field in [
+            "manufacturer",
+            "model",
+            "variant",
+            "model_year",
+            "asking_price_usd",
+            "avionics",
+            "valuation_facts",
+        ] {
+            assert!(required.iter().any(|value| value == field));
+        }
     }
 
     #[test]
