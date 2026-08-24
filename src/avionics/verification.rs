@@ -1157,7 +1157,7 @@ fn provider_request_plan(
             .to_string(),
         transport_retry_note: "Logical provider-request counts do not multiply transport retries. The default interactions retry policy may make up to four transport attempts for one logical request."
             .to_string(),
-        uncertainty_note: "The minimum baseline assumes every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. Each comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid exact generic-label observations use no provider request and never continue to grounding. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. When legacy_reextraction_identity_outputs_unknown is true, every known-total field is only the calls-before-extraction floor: downstream identity calls are unknown until the validated extraction is durably persisted and preflighted again, so those fields must not be presented as an end-to-end total. Correction and fallback outcomes remain unknowable before execution, so no dollar estimate is inferred."
+        uncertainty_note: "The minimum baseline assumes every listing extraction passes its current-schema validation on the primary request, every bounded approved-candidate adjudication succeeds without Search, every global candidate-triage call produces a usable hint, and every conditional relationship target is skipped. The listing-extraction validation envelope is exactly two logical requests per re-extraction: a malformed primary may use the existing JSON repair, while a parseable primary that fails deterministic avionics validation may instead use one fallback-model avionics-only correction. Those paths are mutually exclusive, and the correction is parsed once without JSON repair. Each candidate comparison is exactly one tools-disabled request. A successful approved-candidate decision does not run the concreteness classifier and still passes the unchanged local reuse gates. Because preflight cannot know the triage decision, it conservatively includes the ordinary classifier and grounded route for every triage component; a current approved singleton that passes reuse can be cheaper, while every unreviewed result must take that grounded route. An uncertain, negative, invalid, or stale answer falls through normally and then incurs exactly one classifier request before grounded research. Structurally valid exact generic-label observations use no provider request and never continue to grounding. The all-positive baseline includes every conditional target but assumes candidate comparison succeeds. The maximum validation envelope includes classifier plus grounded fallback for every candidate. Verified-local identities use neither request. All counts use the catalog as it exists at preflight time; earlier apply pages can approve identities that later pages resolve locally with zero Gemini requests. When legacy_reextraction_identity_outputs_unknown is true, every known-total field is only the calls-before-extraction floor: downstream identity calls are unknown until the validated extraction is durably persisted and preflighted again, so those fields must not be presented as an end-to-end total. Correction and fallback outcomes remain unknowable before execution, so no dollar estimate is inferred."
             .to_string(),
     }
 }
@@ -5177,6 +5177,15 @@ mod tests {
         assert!(plan
             .transport_retry_note
             .contains("four transport attempts"));
+        assert!(plan
+            .uncertainty_note
+            .contains("exactly two logical requests per re-extraction"));
+        assert!(plan
+            .uncertainty_note
+            .contains("Those paths are mutually exclusive"));
+        assert!(plan
+            .uncertainty_note
+            .contains("parsed once without JSON repair"));
         assert!(plan
             .grounded_pass_note
             .contains("exactly one tools-disabled"));

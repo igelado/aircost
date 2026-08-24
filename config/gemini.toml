@@ -5,7 +5,9 @@ version = 1
 
 [tasks.listing_extraction]
 model = "gemini-3.5-flash-lite"
+fallback_model = "gemini-3.5-flash"
 thinking_level = "low"
+fallback_thinking_level = "low"
 max_output_tokens = 4096
 
 [tasks.grounded_metadata]
