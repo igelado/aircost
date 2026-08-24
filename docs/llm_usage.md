@@ -180,14 +180,21 @@ The extraction boundary may also repair one narrowly proved quantity omission
 from a structurally valid Controller `Avionics/Radios` field. Two adjacent
 comma- or semicolon-delimited equipment items must repeat the same complete
 manufacturer/model identity and assign complementary attitude and HSI roles.
-The first item must start with the identity or one four-letter US ICAO airport
-token (`K` plus three uppercase letters); arbitrary qualifiers such as `NEW` or
-`Optional configurations:` are not installed-equipment proof. The model must
-already have returned one ordinary installed occurrence with quantity one and
-exact evidence equal to one of those items. The server then changes only
-quantity to two and replaces the evidence locator with the complete exact
-two-item source span. A completeness
-gate independently requires that shape for current Controller payloads.
+The first item must start with the identity or one four-letter US ICAO-shaped
+token (`K` plus three uppercase letters) that the same retained listing also
+uses in an exact, structurally visible `hangared at CODE` phrase. Shape alone
+does not establish a location: arbitrary prefixes such as `NEW`, `KEEP`,
+`KING`, or `Optional configurations:` are not installed-equipment proof. The
+entire trusted equipment field must contain exactly two bounded occurrences of
+both the complete product identity and its model, so a third role or a
+non-adjacent repeated product makes the proof ambiguous. The model must already
+have returned one ordinary installed occurrence with quantity one and exact
+evidence equal to one of those items. The server then changes only quantity to
+two and replaces the evidence locator with the complete exact two-item source
+span. A completeness gate independently requires that shape for current
+Controller payloads. Initial plugin checkpoint extraction and later automated
+verification re-extraction run this same deterministic repair before that gate;
+the repair does not make another provider request.
 Narrative repetition, whole-page prose outside the trusted field, repeated
 copies of one role, non-adjacent mentions, ambiguous proof spans, replacement
 actions, punctuation-equivalent duplicate output rows, and distinct product

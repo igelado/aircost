@@ -11,7 +11,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::extract::CURATED_AVIONICS_TYPES;
-use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
+use crate::html::clean::{
+    clean_publisher_source_html, listing_body_contains_exact_structurally_visible_text_span,
+};
 use crate::listing::evidence::{
     controller_avionics_evidence, identity_span_has_boundaries, ListingEvidenceContext,
     MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES,
@@ -526,23 +528,39 @@ fn role_separated_quantity_evidence(
     model: &str,
 ) -> RoleSeparatedQuantityEvidence {
     let mut proofs = BTreeSet::new();
+    let mut disqualified_proof = false;
+    let exact_product_occurrences =
+        normalized_identity_occurrence_count(visible_source, &format!("{manufacturer} {model}"));
+    let exact_model_occurrences = normalized_identity_occurrence_count(visible_source, model);
     for line in visible_source.lines() {
         let items = enumerated_items(line);
         for pair in items.windows(2) {
             if !matches!(pair[0].separator_after, Some(',' | ';')) {
                 continue;
             }
-            let Some((first_role, first_identity_start)) =
-                exact_display_installation_role(pair[0].text, manufacturer, model, false)
-            else {
+            let Some((first_role, first_identity_start)) = exact_display_installation_role(
+                pair[0].text,
+                manufacturer,
+                model,
+                false,
+                rendered_html,
+            ) else {
                 continue;
             };
-            let Some((second_role, second_identity_start)) =
-                exact_display_installation_role(pair[1].text, manufacturer, model, true)
-            else {
+            let Some((second_role, second_identity_start)) = exact_display_installation_role(
+                pair[1].text,
+                manufacturer,
+                model,
+                true,
+                rendered_html,
+            ) else {
                 continue;
             };
             if !first_role.is_complementary_to(second_role) {
+                continue;
+            }
+            if exact_product_occurrences != 2 || exact_model_occurrences != 2 {
+                disqualified_proof = true;
                 continue;
             }
             let evidence_start = pair[0].start + first_identity_start;
@@ -565,13 +583,49 @@ fn role_separated_quantity_evidence(
             });
         }
     }
-    match proofs.len() {
-        0 => RoleSeparatedQuantityEvidence::None,
-        1 => RoleSeparatedQuantityEvidence::Unique(
+    match (disqualified_proof, proofs.len()) {
+        (false, 0) => RoleSeparatedQuantityEvidence::None,
+        (false, 1) => RoleSeparatedQuantityEvidence::Unique(
             proofs.into_iter().next().expect("one proof exists"),
         ),
         _ => RoleSeparatedQuantityEvidence::Ambiguous,
     }
+}
+
+fn normalized_identity_occurrence_count(source: &str, identity: &str) -> usize {
+    let normalized_identity = punctuation_insensitive_identity_key(identity);
+    if normalized_identity.is_empty() {
+        return 0;
+    }
+    let mut normalized_source = String::new();
+    let mut source_offsets = Vec::new();
+    for (offset, character) in source.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            normalized_source.push(character.to_ascii_lowercase());
+            source_offsets.push(offset);
+        }
+    }
+    normalized_source
+        .match_indices(&normalized_identity)
+        .filter(|(offset, _)| {
+            let Some(source_start) = source_offsets.get(*offset).copied() else {
+                return false;
+            };
+            let Some(last_offset) = offset.checked_add(normalized_identity.len() - 1) else {
+                return false;
+            };
+            let Some(source_last) = source_offsets.get(last_offset).copied() else {
+                return false;
+            };
+            let source_end = source_last
+                + source[source_last..]
+                    .chars()
+                    .next()
+                    .expect("a recorded source offset has one character")
+                    .len_utf8();
+            identity_span_has_boundaries(source, source_start, source_end)
+        })
+        .count()
 }
 
 fn enumerated_items(line: &str) -> Vec<EnumeratedItem<'_>> {
@@ -604,13 +658,14 @@ fn exact_display_installation_role(
     manufacturer: &str,
     model: &str,
     require_identity_at_start: bool,
+    rendered_html: &str,
 ) -> Option<(DisplayInstallationRole, usize)> {
     let identity = ListingEvidenceContext::from_cleaned_text(item)
         .unique_exact_product_slice(manufacturer, model)?;
     let identity_start = item.find(&identity)?;
     let prefix = item[..identity_start].trim();
     if (require_identity_at_start && !prefix.is_empty())
-        || (!require_identity_at_start && !exact_installed_equipment_prefix(prefix))
+        || (!require_identity_at_start && !exact_installed_equipment_prefix(prefix, rendered_html))
     {
         return None;
     }
@@ -629,11 +684,35 @@ fn exact_display_installation_role(
     Some((role, identity_start))
 }
 
-fn exact_installed_equipment_prefix(prefix: &str) -> bool {
-    prefix.is_empty()
-        || (prefix.len() == 4
-            && prefix.starts_with('K')
-            && prefix.bytes().all(|byte| byte.is_ascii_uppercase()))
+fn exact_installed_equipment_prefix(prefix: &str, rendered_html: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if prefix.len() != 4
+        || !prefix.starts_with('K')
+        || !prefix.bytes().all(|byte| byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let source = clean_publisher_source_html(rendered_html);
+    let lowercase_source = source.to_ascii_lowercase();
+    let needle = format!("hangared at {}", prefix.to_ascii_lowercase());
+    lowercase_source.match_indices(&needle).any(|(start, _)| {
+        let end = start + needle.len();
+        let has_boundaries = source[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !character.is_ascii_alphanumeric())
+            && source[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_ascii_alphanumeric());
+        has_boundaries
+            && listing_body_contains_exact_structurally_visible_text_span(
+                rendered_html,
+                &source[start..end],
+            )
+    })
 }
 
 fn validate_current_avionics_identity_evidence_occurrence(
@@ -969,11 +1048,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/257737897/example";
+    const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/252742967/1965-cessna-182-skylane-piston-single-aircraft";
 
     fn controller_html(field: &str) -> String {
         format!(
             r#"<html><head><meta content="Garmin GMA-1347"></head><body>
+            <p>Currently hangared at KSAR</p>
             <div class="detail__specs-wrapper">
               <div class="detail__specs-label">ADS-B Equipped</div>
               <div class="detail__specs-value">Yes</div>
@@ -1074,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_exact_complementary_role_enumeration_to_two_units() {
+    fn repairs_retained_submission_20_complementary_role_enumeration_to_two_units() {
         let html =
             controller_html("KSAR Garmin G5 attitude, Garmin G5 HSI, Garmin GFC500 auto pilot");
         let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
@@ -1166,6 +1246,34 @@ mod tests {
     }
 
     #[test]
+    fn extra_same_product_occurrences_make_role_quantity_proof_ambiguous() {
+        for field in [
+            "Garmin G5 attitude, Garmin G5 HSI, Garmin G5 HSI",
+            "Garmin G5 attitude, Garmin G5 HSI, Garmin G5 attitude",
+            "Garmin G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5 standby display",
+        ] {
+            let html = controller_html(field);
+            let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
+            let original = payload.clone();
+
+            assert!(!recover_exact_role_separated_avionics_quantity(
+                &mut payload,
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap());
+            assert_eq!(payload, original);
+            assert!(validate_unbound_current_avionics_extraction(
+                &payload.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap_err()
+            .contains("multiple distinct role-separated quantity proofs"));
+        }
+    }
+
+    #[test]
     fn optional_or_untrusted_role_pairs_never_prove_installed_quantity() {
         let cases = [
             (
@@ -1175,6 +1283,14 @@ mod tests {
             (
                 CONTROLLER_URL,
                 controller_html("NEW Garmin G5 attitude, Garmin G5 HSI"),
+            ),
+            (
+                CONTROLLER_URL,
+                controller_html("KEEP Garmin G5 attitude, Garmin G5 HSI"),
+            ),
+            (
+                CONTROLLER_URL,
+                controller_html("KING Garmin G5 attitude, Garmin G5 HSI"),
             ),
             (
                 CONTROLLER_URL,
