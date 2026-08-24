@@ -125,7 +125,16 @@ remain one unit. Generic publishers use structurally visible body units, where
 sibling blocks, table cells, and definition terms/values remain separate.
 Whole-body flattening cannot manufacture an evidence phrase across any of
 these boundaries. The same gate runs for the initial extraction checkpoint and
-durable avionics re-extraction.
+durable avionics re-extraction. Within the one trusted Controller
+`Avionics/Radios` value, an otherwise missing right-hand model boundary is
+accepted only for a source-authored run-on annotation whose immediately
+adjacent and complete suffix consists of capability phrases declared for that
+same occurrence. Slash-delimited multifunction capabilities and an exact
+quantity-consistent `(Dual)` annotation are supported. Undeclared capabilities,
+arbitrary continuations, unrelated trailing words, and product-variant suffixes
+remain identity failures. This extraction-only grammar also applies to an
+explicit replacement identity; it does not weaken catalog-reuse matching and
+never rewrites the retained evidence.
 An `Integrated Flight Deck` identity may establish that core category without
 repeating it in prose; every additional category assigned to the suite must be
 explicit in the same occurrence evidence, and a separately extracted

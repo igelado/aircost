@@ -224,6 +224,7 @@ fn apply_controller_avionics_evidence_typography(
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
     let evidence_units = listing_evidence_units(source_url, rendered_html)
         .map_err(|error| format!("listing evidence source is invalid: {error}"))?;
+    let controller_field = controller_avionics_evidence(source_url, rendered_html);
     let invalid_occurrence = observations.iter().enumerate().any(|(index, observation)| {
         let evidence = observation
             .source_evidence_text
@@ -235,6 +236,7 @@ fn apply_controller_avionics_evidence_typography(
                 index,
                 &listing_context,
                 evidence,
+                controller_field.as_deref(),
             )
             .is_err()
     });
@@ -242,7 +244,7 @@ fn apply_controller_avionics_evidence_typography(
         return Ok(false);
     }
 
-    let Some(controller_field) = controller_avionics_evidence(source_url, rendered_html) else {
+    let Some(controller_field) = controller_field else {
         return Ok(false);
     };
     let full_source = ListingEvidenceContext::from_cleaned_text(&controller_field);
@@ -258,6 +260,7 @@ fn apply_controller_avionics_evidence_typography(
                 index,
                 &listing_context,
                 evidence,
+                Some(&controller_field),
             )
             .is_ok()
         {
@@ -516,6 +519,7 @@ pub(crate) fn validate_current_avionics_identity_evidence(
 ) -> Result<(), String> {
     let evidence_units = listing_evidence_units(source_url, rendered_html)
         .map_err(|error| format!("listing evidence source is invalid: {error}"))?;
+    let controller_field = controller_avionics_evidence(source_url, rendered_html);
     for (index, observation) in observations.iter().enumerate() {
         let evidence = observation
             .source_evidence_text
@@ -532,6 +536,7 @@ pub(crate) fn validate_current_avionics_identity_evidence(
             index,
             listing_context,
             evidence,
+            controller_field.as_deref(),
         )?;
     }
     Ok(())
@@ -959,6 +964,7 @@ fn validate_current_avionics_identity_evidence_occurrence(
     index: usize,
     listing_context: &ListingEvidenceContext,
     exact_visible_evidence_locator: &str,
+    controller_field: Option<&str>,
 ) -> Result<(), String> {
     let evidence = observation
         .source_evidence_text
@@ -971,27 +977,46 @@ fn validate_current_avionics_identity_evidence_occurrence(
         Some(exact_visible_evidence_locator),
     );
     let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
-    if !bounded_source.contains(evidence)
-        || !extraction_occurrence_has_exact_identity(
+    let controller_run_on_identity = controller_field.is_some_and(|field| {
+        controller_field_has_exact_evidence_line(field, evidence)
+            && exact_controller_run_on_capability_annotation(
+                evidence,
+                &observation.model,
+                &observation.avionics_types,
+                observation.quantity == 2,
+            )
+    });
+    if (!bounded_source.contains(evidence) && !controller_run_on_identity)
+        || !(extraction_occurrence_has_exact_identity(
             &evidence_context,
             &observation.manufacturer,
             &observation.model,
             &observation.avionics_types,
             evidence,
-        )
+        ) || controller_run_on_identity)
     {
         return Err(format!(
             "avionics[{index}].source_evidence_text is not one exact bounded source excerpt containing the candidate identity"
         ));
     }
     if let Some(replacement) = observation.replaces.as_ref() {
-        if !extraction_occurrence_has_exact_identity(
+        let replacement_run_on_identity = controller_field.is_some_and(|field| {
+            controller_field_has_exact_evidence_line(field, evidence)
+                && exact_controller_run_on_capability_annotation(
+                    evidence,
+                    &replacement.model,
+                    &replacement.avionics_types,
+                    false,
+                )
+        });
+        if !(extraction_occurrence_has_exact_identity(
             &evidence_context,
             &replacement.manufacturer,
             &replacement.model,
             &replacement.avionics_types,
             evidence,
-        ) {
+        ) || replacement_run_on_identity)
+        {
             return Err(format!(
                 "avionics[{index}].source_evidence_text does not contain the exact replacement identity from avionics[{index}].replaces"
             ));
@@ -1033,6 +1058,133 @@ fn extraction_occurrence_has_exact_identity(
             model,
             avionics_types,
         )
+}
+
+/// Admit one Controller-specific publisher run-on grammar at the extraction
+/// boundary without weakening the ordinary identity or catalog-reuse matchers.
+///
+/// Some Controller `Avionics/Radios` values omit whitespace between a model
+/// and its capability list (for example `GIA63WNAV/COM/GPS(Dual)`). The model
+/// remains an identity only when its sole normalized occurrence is followed
+/// immediately by an exact slash-delimited set of the same curated
+/// capabilities declared for that occurrence. The suffix must end there,
+/// apart from Controller's exact `(Dual)` annotation on a quantity-two
+/// occurrence.
+fn exact_controller_run_on_capability_annotation(
+    evidence: &str,
+    model: &str,
+    avionics_types: &[String],
+    allow_dual_annotation: bool,
+) -> bool {
+    let normalized_model = normalize_evidence_typography(model);
+    if normalized_model.is_empty() || avionics_types.is_empty() {
+        return false;
+    }
+
+    let mut normalized_evidence = String::new();
+    let mut source_offsets = Vec::new();
+    for (offset, character) in evidence.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            normalized_evidence.push(character.to_ascii_lowercase());
+            source_offsets.push(offset);
+        }
+    }
+    let spans = normalized_evidence
+        .match_indices(&normalized_model)
+        .filter_map(|(normalized_start, _)| {
+            let source_start = source_offsets.get(normalized_start).copied()?;
+            let normalized_last = normalized_start
+                .checked_add(normalized_model.len())?
+                .checked_sub(1)?;
+            let source_last = source_offsets.get(normalized_last).copied()?;
+            let source_end = source_last + evidence[source_last..].chars().next()?.len_utf8();
+            evidence[..source_start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric())
+                .then_some(source_end)
+        })
+        .collect::<Vec<_>>();
+    let [identity_end] = spans.as_slice() else {
+        return false;
+    };
+    let suffix = &evidence[*identity_end..];
+    if suffix
+        .chars()
+        .next()
+        .is_none_or(|character| !character.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+
+    let declared = avionics_types
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if declared.len() != avionics_types.len()
+        || declared
+            .iter()
+            .any(|capability| !CURATED_AVIONICS_TYPES.contains(capability))
+    {
+        return false;
+    }
+
+    let mut observed = BTreeSet::new();
+    let mut remaining = suffix;
+    loop {
+        let Some((capability, consumed)) = exact_capability_phrase_prefix(remaining) else {
+            return false;
+        };
+        if !declared.contains(capability) || !observed.insert(capability) {
+            return false;
+        }
+        remaining = &remaining[consumed..];
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            return observed == declared;
+        }
+        if trimmed.eq_ignore_ascii_case("(dual)") {
+            return allow_dual_annotation && observed == declared;
+        }
+        let Some(next) = trimmed.strip_prefix('/') else {
+            return false;
+        };
+        remaining = next.trim_start();
+        if remaining.is_empty() {
+            return false;
+        }
+    }
+}
+
+fn controller_field_has_exact_evidence_line(controller_field: &str, evidence: &str) -> bool {
+    let evidence = evidence.trim();
+    !evidence.is_empty()
+        && controller_field.contains(evidence)
+        && controller_field.lines().any(|line| line.trim() == evidence)
+}
+
+fn exact_capability_phrase_prefix(source: &str) -> Option<(&'static str, usize)> {
+    CURATED_AVIONICS_TYPES
+        .iter()
+        .flat_map(|capability| {
+            capability_evidence_phrases(capability)
+                .iter()
+                .map(move |phrase| (*capability, *phrase))
+        })
+        .filter_map(|(capability, phrase)| {
+            source
+                .char_indices()
+                .map(|(offset, character)| offset + character.len_utf8())
+                .find(|end| {
+                    source[*end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|character| !character.is_ascii_alphanumeric())
+                        && normalize_source_evidence_span(&source[..*end]) == phrase
+                })
+                .map(|end| (capability, end))
+        })
+        .max_by_key(|(_, end)| *end)
 }
 
 #[derive(Debug)]
@@ -1292,6 +1444,7 @@ mod tests {
     use super::*;
 
     const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/252742967/1965-cessna-182-skylane-piston-single-aircraft";
+    const SUBMISSION_26_URL: &str = "https://www.controller.com/listing/for-sale/256441619/2010-cessna-182t-skylane-piston-single-aircraft";
     const CAPTURE_25_URL: &str = "https://www.controller.com/listing/for-sale/257959105/example";
     const GENERIC_URL: &str = "https://example.test/listing/avionics";
 
@@ -1845,6 +1998,185 @@ mod tests {
             .unwrap_err()
             .contains("candidate identity"));
         }
+    }
+
+    #[test]
+    fn controller_accepts_exact_declared_run_on_capabilities_without_rewriting_evidence() {
+        for (model, source_evidence, avionics_types, quantity) in [
+            (
+                "GIA63W",
+                "GIA63WNAV/COM/GPS(Dual)",
+                vec!["NAV", "COM", "GPS"],
+                2,
+            ),
+            ("GDL690A", "GDL690ADatalink", vec!["Datalink"], 1),
+        ] {
+            let html = controller_html(source_evidence);
+            let mut payload = installed("Garmin", model, source_evidence);
+            payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
+            payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
+            let original = payload.clone();
+
+            let observations = validate_unbound_current_avionics_extraction(
+                &payload.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap();
+
+            assert_eq!(
+                observations[0].source_evidence_text.as_deref(),
+                Some(source_evidence)
+            );
+            assert_eq!(
+                recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
+                    .unwrap(),
+                ControllerAvionicsExtractionRecovery::default()
+            );
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn submission_26_run_ons_validate_and_recover_without_a_provider_call() {
+        let controller_field = "G1000 Avionics Suite\n\
+GDU1044B Primary Flight Display (PFD) \n\
+GDU1044B Multi-Function Display (MFD) \n\
+GFC 700 Autopilot \n\
+GMA1347 Digital Audio Panel\n\
+GIA63WNAV/COM/GPS(Dual)\n\
+GTX355R ADS-B Out Transponder \n\
+GEA71 Engine/Airframe Computer\n\
+GRS77 AHRS (Attitude and Heading \n\
+Reference System) \n\
+GDC74 Air Data Computer\n\
+GMU44 Magnetometer \n\
+WX 500 Stormscope\n\
+GDL690ADatalink\n\
+Bendix King KTA-810 TAS (Traffic \n\
+Advisory System)";
+        let html = controller_html(controller_field);
+        let mut payload = serde_json::json!({
+            "avionics": [
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GIA63W",
+                    "types": ["NAV", "COM", "GPS"],
+                    "quantity": 2,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "GIA63WNAV/COM/GPS(Dual)",
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Garmin",
+                    "model": "GDL690A",
+                    "types": ["Datalink"],
+                    "quantity": 1,
+                    "configuration_action": "installed",
+                    "replaces": null,
+                    "source_evidence_text": "GDL690ADatalink",
+                    "source_confidence": "high"
+                }
+            ]
+        });
+        let original = payload.clone();
+
+        let observations = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            SUBMISSION_26_URL,
+            &html,
+        )
+        .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].source_evidence_text.as_deref(),
+            Some("GIA63WNAV/COM/GPS(Dual)")
+        );
+        assert_eq!(
+            observations[1].source_evidence_text.as_deref(),
+            Some("GDL690ADatalink")
+        );
+        assert_eq!(
+            recover_controller_avionics_extraction(&mut payload, SUBMISSION_26_URL, &html).unwrap(),
+            ControllerAvionicsExtractionRecovery::default()
+        );
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn controller_run_on_identity_requires_the_complete_declared_capability_suffix() {
+        for (source_evidence, avionics_types, quantity) in [
+            ("GIA63WWhatever", vec!["NAV"], 1),
+            ("GIA63WNXi", vec!["NAV"], 1),
+            ("GIA63WInstalled", vec!["NAV"], 1),
+            ("GIA63WNAV", vec!["GPS"], 1),
+            ("GIA63WNAVX", vec!["NAV"], 1),
+            ("GIA63WNAV extra", vec!["NAV"], 1),
+            ("GIA63WNAV/COM/GPS", vec!["NAV", "COM"], 1),
+            ("GIA63WNAV(Dual)", vec!["NAV"], 1),
+        ] {
+            let html = controller_html(source_evidence);
+            let mut payload = installed("Garmin", "GIA63W", source_evidence);
+            payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
+            payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
+
+            let error = validate_unbound_current_avionics_extraction(
+                &payload.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("candidate identity"),
+                "{source_evidence:?}: {error}"
+            );
+        }
+
+        let source_evidence = "GIA63WNAV/COM/GPS(Dual)";
+        let html = format!("<html><body><p>{source_evidence}</p></body></html>");
+        let mut payload = installed("Garmin", "GIA63W", source_evidence);
+        payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        assert!(validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            GENERIC_URL,
+            &html,
+        )
+        .unwrap_err()
+        .contains("candidate identity"));
+
+        let html = controller_html("GIA63WNAV/COM/GPS(Dual)");
+        let mut truncated = installed("Garmin", "GIA63W", "GIA63WNAV");
+        truncated["avionics"][0]["types"] = serde_json::json!(["NAV"]);
+        assert!(validate_unbound_current_avionics_extraction(
+            &truncated.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap_err()
+        .contains("candidate identity"));
+    }
+
+    #[test]
+    fn controller_run_on_capability_grammar_also_binds_replacement_identity() {
+        let source_evidence = "Garmin GTN 750Xi replaces Garmin GNS530WNAV";
+        let html = controller_html(source_evidence);
+        let mut payload = replacement(source_evidence);
+        payload["avionics"][0]["replaces"]["types"] = serde_json::json!(["NAV"]);
+
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
+
+        payload["avionics"][0]["replaces"]["types"] = serde_json::json!(["GPS"]);
+        assert!(validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap_err()
+        .contains("exact replacement identity"));
     }
 
     #[test]
