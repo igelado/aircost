@@ -176,6 +176,18 @@ text, variant suffixes, malformed fields, and non-Controller sources fail
 closed. The complete current extraction validator runs again before the
 checkpoint can be stored.
 
+The extraction boundary may also repair one narrowly proved quantity omission.
+Two adjacent comma- or semicolon-delimited equipment items must repeat the same
+complete manufacturer/model identity and assign complementary display roles:
+attitude versus HSI. The model must already have returned one ordinary installed
+occurrence with quantity one and exact evidence equal to one of those items. The
+server then changes only quantity to two and replaces the evidence locator with
+the complete exact two-item source span. A completeness gate independently
+requires that shape even for retained or provider-produced payloads. Narrative
+repetition, repeated copies of one role, non-adjacent mentions, ambiguous proof
+spans, replacement actions, duplicate output rows, and distinct product suffixes
+fail closed.
+
 ## Evidence Retention And Reuse
 
 Search and URL Context output is request-scoped working data, not a durable

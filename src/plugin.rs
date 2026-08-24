@@ -23,7 +23,8 @@ use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
 };
 use crate::listing::avionics::extraction::{
-    recover_controller_avionics_evidence_typography, validate_unbound_current_avionics_extraction,
+    recover_controller_avionics_evidence_typography,
+    recover_exact_role_separated_avionics_quantity, validate_unbound_current_avionics_extraction,
 };
 use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{
@@ -1539,6 +1540,9 @@ async fn extract_capture_to_current_checkpoint(
 ) -> StoreResult<(ListingPreview, Value)> {
     let mut preview = parse_listing_html(source_url, rendered_html, extractor).await?;
     let mut payload = extracted_listing_payload(&preview);
+    let quantity_recovered =
+        recover_exact_role_separated_avionics_quantity(&mut payload, rendered_html)
+            .map_err(PluginStoreError::Validation)?;
     recover_controller_avionics_evidence_typography(&mut payload, source_url, rendered_html)
         .map_err(PluginStoreError::Validation)?;
     let validated_occurrences =
@@ -1557,9 +1561,16 @@ async fn extract_capture_to_current_checkpoint(
     {
         let recovered_evidence = validated_occurrence.source_evidence_text.take();
         validated_occurrence.source_evidence_text = preview_occurrence.source_evidence_text.clone();
+        if quantity_recovered
+            && preview_occurrence.quantity == 1
+            && validated_occurrence.quantity == 2
+        {
+            preview_occurrence.quantity = 2;
+        }
         if *preview_occurrence != validated_occurrence {
             return Err(PluginStoreError::Validation(
-                "avionics evidence recovery changed a non-evidence value".to_string(),
+                "avionics recovery changed a non-evidence value other than one exact role-separated quantity"
+                    .to_string(),
             ));
         }
         preview_occurrence.source_evidence_text = recovered_evidence;
