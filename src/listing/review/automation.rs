@@ -423,6 +423,11 @@ fn validate_retained_current_extraction(
         extracted_listing_json,
     })
     .map_err(ReviewError::Stale)?;
+    if occurrences.is_empty() {
+        return Err(ReviewError::Stale(
+            "retained capture has no avionics observations".to_string(),
+        ));
+    }
     Ok((extraction_sha256(extracted_listing_json), occurrences))
 }
 
@@ -2489,6 +2494,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored, 0, "rejected validation must remain atomic");
+    }
+
+    #[tokio::test]
+    async fn accepted_links_only_apply_rejects_an_empty_retained_extraction() {
+        let fixture = fixture().await;
+        let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
+        sqlx::query(
+            "UPDATE plugin_submissions SET extracted_listing_json = '{\"avionics\":[]}', extraction_error = NULL WHERE id = ?",
+        )
+        .bind(fixture.submission_id)
+        .execute(pool(&fixture.db))
+        .await
+        .unwrap();
+
+        let error = apply_automated_avionics_review(
+            &fixture.db,
+            &request(
+                &fixture,
+                vec![accepted(&fixture.db, model_id).await],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect_err("an empty checkpoint cannot authorize accepted avionics links");
+
+        assert!(matches!(
+            error,
+            ReviewError::Stale(message) if message.contains("no avionics observations")
+        ));
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool(&fixture.db))
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "empty extraction rejection must remain atomic");
     }
 
     #[tokio::test]

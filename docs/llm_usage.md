@@ -214,7 +214,10 @@ authorizations, dispositions, or review state. This is unconditional for
 accepted-links-only and local-reuse results even when they carry no occurrence
 dispositions. When dispositions are present, their fingerprints reuse the
 same parsed and validated observations instead of opening a weaker second
-parse path.
+parse path. An empty avionics array cannot authorize an automated avionics
+write. Pending-review observations are selected only when the attached raw
+checkpoint also passes this complete contract; otherwise the workflow retains
+the review and re-extracts the bound source before it can apply.
 
 Before a fresh listing extraction checkpoint is stored, a narrower
 publisher-specific repair may correct typography in avionics occurrence

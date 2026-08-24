@@ -3790,35 +3790,41 @@ async fn retained_observation_source(
     row: &ListingSourceRow,
     listing_context: &ListingEvidenceContext,
 ) -> Result<RetainedObservationSource, String> {
-    let preserved_aspects = match retained_review_observations(db, row, listing_context).await? {
-        RetainedReviewObservationSource::Current(replay) => {
-            return Ok(RetainedObservationSource::Review {
+    let review_source = retained_review_observations(db, row, listing_context).await?;
+    let extraction_source = retained_avionics_source(
+        row.extracted_listing_json.as_deref(),
+        row.submission_source_url.as_deref(),
+        row.rendered_html.as_deref(),
+    );
+    Ok(match (review_source, extraction_source) {
+        (RetainedReviewObservationSource::Current(replay), RetainedAvionicsSource::Current(_)) => {
+            RetainedObservationSource::Review {
                 avionics: replay.avionics,
                 preserved_aspects: replay.preserved_aspects,
-            });
-        }
-        RetainedReviewObservationSource::RequiresFallback { preserved_aspects } => {
-            preserved_aspects
-        }
-    };
-    Ok(
-        match retained_avionics_source(
-            row.extracted_listing_json.as_deref(),
-            row.submission_source_url.as_deref(),
-            row.rendered_html.as_deref(),
-        ) {
-            RetainedAvionicsSource::Current(avionics) => RetainedObservationSource::Extraction {
-                avionics,
-                preserved_aspects,
-            },
-            RetainedAvionicsSource::RequiresReextraction { reason } => {
-                RetainedObservationSource::RequiresReextraction {
-                    reason,
-                    preserved_aspects,
-                }
             }
+        }
+        (
+            RetainedReviewObservationSource::Current(replay),
+            RetainedAvionicsSource::RequiresReextraction { reason },
+        ) => RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects: replay.preserved_aspects,
         },
-    )
+        (
+            RetainedReviewObservationSource::RequiresFallback { preserved_aspects },
+            RetainedAvionicsSource::Current(avionics),
+        ) => RetainedObservationSource::Extraction {
+            avionics,
+            preserved_aspects,
+        },
+        (
+            RetainedReviewObservationSource::RequiresFallback { preserved_aspects },
+            RetainedAvionicsSource::RequiresReextraction { reason },
+        ) => RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects,
+        },
+    })
 }
 
 async fn retained_review_observations(
@@ -7242,15 +7248,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_exact_review_observations_bypass_stale_plugin_extraction() {
+    async fn current_review_observations_require_and_can_replace_a_stale_plugin_extraction() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_named_product_for_manufacturer(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "Fixture",
+            "FIXTURE-TEST",
+            "GPS",
+        )
+        .await;
         let listing_id = seed_listing(&db, "https://example.test/listing/53").await;
+        seed_faa_admission(&db, listing_id).await;
+        let stale_extraction = retained_legacy_listing_extraction().to_string();
         seed_submission_and_review(
             &db,
             listing_id,
             "https://example.test/listing/53",
             "<p>Garmin fixture installed</p>",
-            Some(r#"{"avionics":[{"manufacturer":"Garmin","model":"Fixture","types":["GPS"]}]}"#),
+            Some(&stale_extraction),
             Some(listing_id),
             None,
         )
@@ -7286,6 +7304,59 @@ mod tests {
         assert_eq!(replay.avionics.len(), 1);
         assert_eq!(replay.avionics[0].model, "Fixture");
         assert!(replay.preserved_aspects.is_empty());
+
+        let RetainedObservationSource::RequiresReextraction {
+            reason,
+            preserved_aspects,
+        } = retained_observation_source(&db, &row, &listing_context)
+            .await
+            .unwrap()
+        else {
+            panic!("a stale attached extraction must not select review observations")
+        };
+        assert!(reason.contains("complete current avionics contract"));
+        assert!(preserved_aspects.is_empty());
+
+        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+            "manufacturer": "Garmin",
+            "model": "Fixture",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "Garmin fixture installed",
+            "source_confidence": "high"
+        }]))
+        .await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
+        let result = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("a validated re-extraction should replace the stale checkpoint and advance");
+        server.abort();
+        let ListingAvionicsVerification::Processed { report } = result else {
+            panic!("the listing should be processed")
+        };
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(report.status, "applied", "{report:#?}");
+        assert_eq!(report.raw_avionics_source, "gemini_reextraction");
+        assert!(report.reextraction_required);
+        assert!(report.reextraction_attempted);
+        assert!(report.reextraction_succeeded);
+        assert_eq!(report.accepted, 1);
+
+        let stored_product_id: i64 = sqlx::query_scalar(
+            "SELECT avionics_model_id FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(stored_product_id, product_id);
     }
 
     #[tokio::test]
@@ -9285,7 +9356,7 @@ mod tests {
             let ListingAvionicsVerification::Processed { report } = result else {
                 panic!("the listing should retain its pending review")
             };
-            assert_eq!(report.status, "blocked");
+            assert_eq!(report.status, "blocked", "fixture {index}: {report:#?}");
             assert_eq!(report.raw_avionics_source, "pending_review");
             assert!(!report.reextraction_attempted);
             assert_eq!(report.accepted, 0);
@@ -9974,14 +10045,18 @@ mod tests {
         .await
         .unwrap();
         let exact_evidence = format!("{manufacturer} {model} standby instrument");
-        let evidence = match fixture {
+        let review_evidence = match fixture {
             PreservedAssociationFixture::AmbiguousQualifier => {
                 format!("{manufacturer} {model} WAAS upgraded")
             }
-            _ => exact_evidence,
+            _ => exact_evidence.clone(),
         };
         let source_url = format!("https://example.test/listing/{suffix}");
-        let rendered_html = format!("<p>{evidence}</p>");
+        let rendered_html = if review_evidence == exact_evidence {
+            format!("<p>{exact_evidence}</p>")
+        } else {
+            format!("<p>{exact_evidence}</p><p>{review_evidence}</p>")
+        };
         let extracted_listing_json = json!({"avionics": [{
             "manufacturer": manufacturer,
             "model": model,
@@ -9989,7 +10064,7 @@ mod tests {
             "quantity": 1,
             "configuration_action": "installed",
             "replaces": null,
-            "source_evidence_text": evidence,
+            "source_evidence_text": exact_evidence,
             "source_confidence": "high"
         }]})
         .to_string();
@@ -10027,7 +10102,7 @@ mod tests {
         )
         .bind(listing_id)
         .bind(product_id)
-        .bind(&evidence)
+        .bind(&review_evidence)
         .bind(configuration_action)
         .bind(replacement_id)
         .fetch_one(pool)
@@ -10044,7 +10119,7 @@ mod tests {
             configuration_action,
             match fixture {
                 PreservedAssociationFixture::MissingEvidence => None,
-                _ => Some(evidence),
+                _ => Some(review_evidence),
             },
             Some("high".to_string()),
         )
