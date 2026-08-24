@@ -70,6 +70,52 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
     Ok(observations)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ControllerAvionicsExtractionRecovery {
+    pub quantity_recovered: bool,
+    pub evidence_recovered: bool,
+}
+
+/// Apply every deterministic Controller extraction repair as one atomic
+/// mutation. A payload that needs more than one scoped repair is validated
+/// only after all qualifying mutations have been applied. Any scoped error or
+/// final extraction-contract failure restores the byte-for-byte input value.
+pub(crate) fn recover_controller_avionics_extraction(
+    extracted_listing: &mut Value,
+    source_url: &str,
+    rendered_html: &str,
+) -> Result<ControllerAvionicsExtractionRecovery, String> {
+    let original = extracted_listing.clone();
+    let recovery = (|| {
+        let quantity_recovered = apply_exact_role_separated_avionics_quantity(
+            extracted_listing,
+            source_url,
+            rendered_html,
+        )?;
+        let evidence_recovered = apply_controller_avionics_evidence_typography(
+            extracted_listing,
+            source_url,
+            rendered_html,
+        )?;
+        let recovery = ControllerAvionicsExtractionRecovery {
+            quantity_recovered,
+            evidence_recovered,
+        };
+        if quantity_recovered || evidence_recovered {
+            validate_unbound_current_avionics_extraction(
+                &extracted_listing.to_string(),
+                source_url,
+                rendered_html,
+            )?;
+        }
+        Ok(recovery)
+    })();
+    if recovery.is_err() {
+        *extracted_listing = original;
+    }
+    recovery
+}
+
 /// Recover one under-counted display product from an exact role-separated
 /// equipment enumeration.
 ///
@@ -81,7 +127,7 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
 /// rejected. The model must already have emitted exactly one ordinary
 /// installed occurrence with quantity one and evidence equal to one of those
 /// two list items. Only its quantity and exact evidence locator are replaced.
-pub(crate) fn recover_exact_role_separated_avionics_quantity(
+fn apply_exact_role_separated_avionics_quantity(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
@@ -123,7 +169,6 @@ pub(crate) fn recover_exact_role_separated_avionics_quantity(
     if repairs.is_empty() {
         return Ok(false);
     }
-    let original = extracted_listing.clone();
     let avionics = extracted_listing
         .get_mut("avionics")
         .and_then(Value::as_array_mut)
@@ -136,14 +181,6 @@ pub(crate) fn recover_exact_role_separated_avionics_quantity(
         occurrence.insert("source_evidence_text".to_string(), Value::String(evidence));
     }
 
-    if let Err(error) = validate_unbound_current_avionics_extraction(
-        &extracted_listing.to_string(),
-        source_url,
-        rendered_html,
-    ) {
-        *extracted_listing = original;
-        return Err(error);
-    }
     Ok(true)
 }
 
@@ -155,22 +192,28 @@ pub(crate) fn recover_exact_role_separated_avionics_quantity(
 /// locator: after lowercasing and removing non-alphanumeric characters, a
 /// source span must be exactly equal to that locator. Every identity and
 /// action field stays model-produced and is revalidated unchanged.
-pub(crate) fn recover_controller_avionics_evidence_typography(
+fn apply_controller_avionics_evidence_typography(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
 ) -> Result<bool, String> {
     let observations = parse_current_avionics_extraction_value(extracted_listing)?;
-    let missing_exact_span = observations.iter().any(|observation| {
-        !listing_body_contains_exact_structurally_visible_text_span(
-            rendered_html,
-            observation
-                .source_evidence_text
-                .as_deref()
-                .expect("the canonical parser requires occurrence evidence"),
-        )
+    let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
+    let invalid_occurrence = observations.iter().enumerate().any(|(index, observation)| {
+        let evidence = observation
+            .source_evidence_text
+            .as_deref()
+            .expect("the canonical parser requires occurrence evidence");
+        !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence)
+            || validate_current_avionics_identity_evidence_occurrence(
+                observation,
+                index,
+                &listing_context,
+                evidence,
+            )
+            .is_err()
     });
-    if !missing_exact_span {
+    if !invalid_occurrence {
         return Ok(false);
     }
 
@@ -184,7 +227,15 @@ pub(crate) fn recover_controller_avionics_evidence_typography(
             .source_evidence_text
             .as_deref()
             .expect("the canonical parser requires occurrence evidence");
-        if listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence) {
+        if listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence)
+            && validate_current_avionics_identity_evidence_occurrence(
+                observation,
+                index,
+                &listing_context,
+                evidence,
+            )
+            .is_ok()
+        {
             continue;
         }
         if !context_has_exact_identity(&full_source, &observation.manufacturer, &observation.model)
@@ -216,9 +267,17 @@ pub(crate) fn recover_controller_avionics_evidence_typography(
                         &replacement.manufacturer,
                         &replacement.model,
                     )
-                })
+                }) && controller_multiline_candidate_matches_observation(candidate, observation)
             })
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        if candidates
+            .iter()
+            .any(|candidate| candidate.contains(['\r', '\n']))
+            && candidates.len() != 1
+        {
+            return Ok(false);
+        }
+        let candidates = candidates.into_iter().collect::<BTreeSet<_>>();
         let mut candidates = candidates.into_iter();
         let Some(candidate) = candidates.next() else {
             return Ok(false);
@@ -232,7 +291,6 @@ pub(crate) fn recover_controller_avionics_evidence_typography(
     if replacements.is_empty() {
         return Ok(false);
     }
-    let original = extracted_listing.clone();
     let avionics = extracted_listing
         .get_mut("avionics")
         .and_then(Value::as_array_mut)
@@ -244,14 +302,6 @@ pub(crate) fn recover_controller_avionics_evidence_typography(
             .insert("source_evidence_text".to_string(), Value::String(evidence));
     }
 
-    if let Err(error) = validate_unbound_current_avionics_extraction(
-        &extracted_listing.to_string(),
-        source_url,
-        rendered_html,
-    ) {
-        *extracted_listing = original;
-        return Err(error);
-    }
     Ok(true)
 }
 
@@ -277,11 +327,53 @@ fn typography_equivalent_visible_spans<'a>(source: &'a str, hint: &str) -> Vec<&
             let source_end = source_last + source[source_last..].chars().next()?.len_utf8();
             let candidate = &source[source_start..source_end];
             (candidate.len() <= MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
-                && !candidate.contains(['\r', '\n'])
                 && identity_span_has_boundaries(source, source_start, source_end))
             .then_some(candidate)
         })
         .collect()
+}
+
+/// Admit only one deterministic Controller line-wrap shape. A wrapped
+/// installed occurrence must retain exactly the declared number of product
+/// identities, and every continuation must split between that identity and a
+/// declared capability. Product/action boundaries therefore remain ineligible
+/// even though generic rendered-text cleanup would flatten them to spaces.
+fn controller_multiline_candidate_matches_observation(
+    candidate: &str,
+    observation: &ParsedAvionics,
+) -> bool {
+    if !candidate.contains(['\r', '\n']) {
+        return true;
+    }
+    if observation.configuration_action != "installed"
+        || observation.replaces.is_some()
+        || observation.quantity < 1
+        || normalized_identity_occurrence_count(candidate, &observation.model)
+            != observation.quantity as usize
+    {
+        return false;
+    }
+
+    let normalized_model = normalize_evidence_typography(&observation.model);
+    let normalized_types = observation
+        .avionics_types
+        .iter()
+        .map(|avionics_type| normalize_evidence_typography(avionics_type))
+        .collect::<BTreeSet<_>>();
+    let lines = candidate
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    lines.len() >= 2
+        && lines.windows(2).all(|pair| {
+            normalize_evidence_typography(pair[0]).ends_with(&normalized_model)
+                && pair[1]
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .find(|token| !token.is_empty())
+                    .map(normalize_evidence_typography)
+                    .is_some_and(|token| normalized_types.contains(&token))
+        })
 }
 
 fn normalize_evidence_typography(value: &str) -> String {
@@ -1064,6 +1156,24 @@ mod tests {
         )
     }
 
+    fn recover_exact_role_separated_avionics_quantity(
+        payload: &mut Value,
+        source_url: &str,
+        rendered_html: &str,
+    ) -> Result<bool, String> {
+        recover_controller_avionics_extraction(payload, source_url, rendered_html)
+            .map(|recovery| recovery.quantity_recovered)
+    }
+
+    fn recover_controller_avionics_evidence_typography(
+        payload: &mut Value,
+        source_url: &str,
+        rendered_html: &str,
+    ) -> Result<bool, String> {
+        recover_controller_avionics_extraction(payload, source_url, rendered_html)
+            .map(|recovery| recovery.evidence_recovered)
+    }
+
     fn installed(manufacturer: &str, model: &str, evidence: &str) -> Value {
         serde_json::json!({
             "avionics": [{
@@ -1674,6 +1784,160 @@ mod tests {
         )
         .unwrap());
         assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn controller_recovery_copies_one_exact_capability_line_wrap() {
+        let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
+        let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
+        let html = controller_html(exact);
+        let mut payload = installed("Garmin", "GIA-63W", flattened);
+        payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["aircraft_marker"] = serde_json::json!({
+            "serial": "unchanged",
+            "nested": [1, 2, 3]
+        });
+        let mut expected = payload.clone();
+        expected["avionics"][0]["source_evidence_text"] = Value::String(exact.to_string());
+
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            &html, flattened
+        ));
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            &html, exact
+        ));
+        assert!(validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap_err()
+        .contains("bounded source excerpt"));
+
+        assert!(recover_controller_avionics_evidence_typography(
+            &mut payload,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(payload, expected);
+        assert_eq!(evidence(&payload), exact);
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
+    }
+
+    #[test]
+    fn controller_quantity_and_multiline_evidence_repairs_compose_atomically() {
+        let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
+        let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
+        let html = controller_html(&format!("Garmin G5 attitude, Garmin G5 HSI\n{exact}"));
+        let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
+        let mut gia = installed("Garmin", "GIA-63W", flattened)["avionics"][0].clone();
+        gia["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        gia["quantity"] = serde_json::json!(2);
+        payload["avionics"].as_array_mut().unwrap().push(gia);
+        payload["aircraft_marker"] = serde_json::json!({
+            "serial": "unchanged",
+            "nested": [1, 2, 3]
+        });
+        let mut expected = payload.clone();
+        expected["avionics"][0]["quantity"] = serde_json::json!(2);
+        expected["avionics"][0]["source_evidence_text"] =
+            serde_json::json!("Garmin G5 attitude, Garmin G5 HSI");
+        expected["avionics"][1]["source_evidence_text"] = Value::String(exact.to_string());
+
+        assert!(validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .is_err());
+
+        let recovery =
+            recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap();
+
+        assert_eq!(
+            recovery,
+            ControllerAvionicsExtractionRecovery {
+                quantity_recovered: true,
+                evidence_recovered: true,
+            }
+        );
+        assert_eq!(payload, expected);
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
+    }
+
+    #[test]
+    fn controller_combined_repair_rolls_back_every_mutation_on_final_validation_failure() {
+        let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
+        let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
+        let html = controller_html(&format!(
+            "Garmin G5 attitude, Garmin G5 HSI\n{exact}\nGarmin GI 275 attitude, Garmin GI 275 HSI"
+        ));
+        let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
+        let mut gia = installed("Garmin", "GIA-63W", flattened)["avionics"][0].clone();
+        gia["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        gia["quantity"] = serde_json::json!(2);
+        payload["avionics"].as_array_mut().unwrap().push(gia);
+        for evidence in ["Garmin GI 275 attitude", "Garmin GI 275 HSI"] {
+            let gi_275 = installed("Garmin", "GI 275", evidence)["avionics"][0].clone();
+            payload["avionics"].as_array_mut().unwrap().push(gi_275);
+        }
+        let original = payload.clone();
+        let mut mutations = payload.clone();
+        assert!(apply_exact_role_separated_avionics_quantity(
+            &mut mutations,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert!(apply_controller_avionics_evidence_typography(
+            &mut mutations,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+
+        let error = recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
+            .unwrap_err();
+
+        assert!(error.contains("exact quantity of two"), "{error}");
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn controller_line_wrap_recovery_rejects_product_boundaries_and_ambiguous_layouts() {
+        let cross_product_exact = "GIA-63W\nGarmin GMA-1347";
+        let html = controller_html(cross_product_exact);
+        let mut cross_product = installed("Garmin", "GIA-63W", "GIA-63W Garmin GMA-1347");
+        cross_product["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        let original = cross_product.clone();
+
+        assert!(!recover_controller_avionics_evidence_typography(
+            &mut cross_product,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(cross_product, original);
+
+        let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
+        let first = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
+        let html = controller_html(&format!("{first}\n{first}"));
+        let mut ambiguous = installed("Garmin", "GIA-63W", flattened);
+        ambiguous["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        ambiguous["avionics"][0]["quantity"] = serde_json::json!(2);
+        let original = ambiguous.clone();
+
+        assert!(!recover_controller_avionics_evidence_typography(
+            &mut ambiguous,
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap());
+        assert_eq!(ambiguous, original);
     }
 
     #[test]

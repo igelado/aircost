@@ -170,11 +170,20 @@ exact `Avionics/Radios` field, copies one unique bounded visible span from that
 field, and changes only `source_evidence_text`. The copied span must be exactly
 equal to the model's evidence locator after case and non-alphanumeric
 typography are removed, must contain every primary and replacement identity,
-and must pass the existing full-source suffix and ambiguity gates. Exact
-visible evidence is never rewritten; distinct spellings, line joins, hidden
-text, variant suffixes, malformed fields, and non-Controller sources fail
-closed. The complete current extraction validator runs again before the
-checkpoint can be stored.
+and must pass the existing full-source suffix and ambiguity gates. Recovery is
+also allowed when generic visible-text cleanup accepts the locator but the
+bounded source retains one exact Controller line break. That narrow form is
+limited to an installed occurrence whose declared quantity equals the exact
+model count, with every continuation splitting the repeated model from one of
+its declared capabilities; competing line layouts fail closed. Already valid
+bounded evidence is never rewritten. Other line joins, distinct spellings,
+hidden text, variant suffixes, malformed fields, and non-Controller sources
+fail closed. Typography and quantity repairs are staged in one atomic
+Controller extraction boundary, so a payload that needs both can be repaired
+without either repair depending on the other's already-valid state. The
+complete current extraction validator runs once after all qualifying mutations;
+any failure restores the entire original payload before the checkpoint can be
+stored.
 
 The extraction boundary may also repair one narrowly proved quantity omission
 from a structurally valid Controller `Avionics/Radios` field. Two adjacent
@@ -193,8 +202,8 @@ evidence equal to one of those items. The server then changes only quantity to
 two and replaces the evidence locator with the complete exact two-item source
 span. A completeness gate independently requires that shape for current
 Controller payloads. Initial plugin checkpoint extraction and later automated
-verification re-extraction run this same deterministic repair before that gate;
-the repair does not make another provider request.
+verification re-extraction run the same atomic deterministic repair boundary
+before that gate; the repair does not make another provider request.
 Narrative repetition, whole-page prose outside the trusted field, repeated
 copies of one role, non-adjacent mentions, ambiguous proof spans, replacement
 actions, punctuation-equivalent duplicate output rows, and distinct product
