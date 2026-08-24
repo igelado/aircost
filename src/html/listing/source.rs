@@ -180,8 +180,9 @@ pub(crate) fn listing_evidence_units(
 /// Rebind one checkpoint occurrence to the bounded text produced by this
 /// source adapter.
 ///
-/// Controller text retains exact field envelopes, so only the unique
-/// `Avionics/Radios` value is eligible. Generic adapter text retains one
+/// Controller text retains exact field envelopes, so evidence must occur wholly
+/// within at least one specification value. Repeated valid values preserve the
+/// extraction checkpoint's `any` contract. Generic adapter text retains one
 /// normalized visible unit per line; matching is restricted to a single line
 /// so a flattened cross-unit substring cannot become identity evidence.
 pub(crate) fn listing_extraction_source_contains_exact_avionics_occurrence(
@@ -195,9 +196,11 @@ pub(crate) fn listing_extraction_source_contains_exact_avionics_occurrence(
     }
     if is_controller_source_host(source_url) {
         validate_controller_listing_source_url(source_url).is_ok()
-            && controller_avionics_value_from_extraction_source(extraction_source).is_some_and(
-                |value| crate::html::clean::exact_normalized_source_span_occurs(value, evidence),
-            )
+            && controller_fields_from_extraction_source(extraction_source).is_some_and(|fields| {
+                fields.iter().any(|(_, value)| {
+                    crate::html::clean::exact_normalized_source_span_occurs(value, evidence)
+                })
+            })
     } else {
         extraction_source
             .lines()
@@ -220,7 +223,16 @@ pub(crate) fn controller_extraction_source_has_exact_avionics_line(
 }
 
 fn controller_avionics_value_from_extraction_source(source: &str) -> Option<&str> {
-    let mut accepted = None;
+    let fields = controller_fields_from_extraction_source(source)?;
+    let mut values = fields
+        .into_iter()
+        .filter_map(|(label, value)| (label == "Avionics/Radios").then_some(value));
+    let accepted = values.next()?;
+    values.next().is_none().then_some(accepted)
+}
+
+fn controller_fields_from_extraction_source(source: &str) -> Option<Vec<(&str, &str)>> {
+    let mut fields = Vec::new();
     let field_marker = format!("{FIELD_OPEN}\n{LABEL_OPEN}\n");
     let label_close = format!("\n{LABEL_CLOSE}\n{VALUE_OPEN}\n");
     let value_close = format!("\n{VALUE_CLOSE}\n{FIELD_CLOSE}");
@@ -231,16 +243,12 @@ fn controller_avionics_value_from_extraction_source(source: &str) -> Option<&str
         let (label, after_label) = field.split_once(&label_close)?;
         let (value, after_value) = after_label.split_once(&value_close)?;
         if after_value.starts_with('\n') || after_value.is_empty() {
-            if label == "Avionics/Radios" && accepted.replace(value).is_some() {
-                return None;
-            }
+            fields.push((label, value));
         } else {
             return None;
         }
     }
-    (field_count > 0 && parsed_count == field_count)
-        .then_some(accepted)
-        .flatten()
+    (field_count > 0 && parsed_count == field_count).then_some(fields)
 }
 
 fn controller_listing_source(
@@ -794,7 +802,7 @@ mod tests {
             !listing_extraction_source_contains_exact_avionics_occurrence(URL, &source, "GIA-63")
         );
         assert!(
-            !listing_extraction_source_contains_exact_avionics_occurrence(
+            listing_extraction_source_contains_exact_avionics_occurrence(
                 URL,
                 &source,
                 "GARMIN G1000 NXI"
@@ -803,12 +811,17 @@ mod tests {
         assert!(!controller_extraction_source_has_exact_avionics_line(
             URL,
             &source,
+            "GARMIN G1000 NXI"
+        ));
+        assert!(!controller_extraction_source_has_exact_avionics_line(
+            URL,
+            &source,
             "GARMIN GIA-63W"
         ));
     }
 
     #[test]
-    fn controller_occurrence_rebinding_rejects_ambiguous_avionics_envelopes() {
+    fn repeated_controller_values_preserve_checkpoint_parity_but_cannot_enable_run_on_reuse() {
         let source = listing_extraction_source(URL, REALISTIC).unwrap();
         let avionics_field = source
             .split("[CONTROLLER FIELD]\n[LABEL]\nAvionics/Radios")
@@ -821,7 +834,7 @@ mod tests {
         let ambiguous = format!("{source}{avionics_field}");
 
         assert!(
-            !listing_extraction_source_contains_exact_avionics_occurrence(
+            listing_extraction_source_contains_exact_avionics_occurrence(
                 URL,
                 &ambiguous,
                 "GARMIN GIA-63W #1"

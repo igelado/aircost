@@ -8547,6 +8547,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_25_flight_deck_occurrence_reuses_g1000_nxi_without_gemini() {
+        const CONTROLLER_URL: &str =
+            "https://www.controller.com/listing/for-sale/257959105/example";
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id = ensure_approved_test_avionics_model(
+            &db,
+            "Garmin",
+            "G1000 NXi",
+            "Integrated Flight Deck",
+        )
+        .await
+        .expect("approved graph identity should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let source = crate::html::listing::source::listing_extraction_source(
+            CONTROLLER_URL,
+            include_str!("../tests/fixtures/controller/id25_like_listing.html"),
+        )
+        .expect("capture-25 fixture should produce a bounded source envelope");
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: "Garmin".to_string(),
+            model: "G1000 NXi".to_string(),
+            avionics_types: vec!["Integrated Flight Deck".to_string()],
+            quantity: 1,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some("GARMIN G1000 NXI".to_string()),
+            source_confidence: Some("high".to_string()),
+        })];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            None,
+            Some(CONTROLLER_URL),
+            Some(&source),
+        )
+        .await
+        .expect("the exact non-radio Controller field should resolve locally");
+
+        assert!(resolved.pending_review_aspects.is_empty());
+        assert_eq!(values.avionics.len(), 1);
+        assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn controller_run_on_variants_and_non_controller_sources_fail_closed() {
         const CONTROLLER_URL: &str =
             "https://www.controller.com/listing/for-sale/257959105/example";
