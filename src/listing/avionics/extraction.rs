@@ -78,6 +78,7 @@ pub(crate) fn recover_exact_role_separated_avionics_quantity(
     rendered_html: &str,
 ) -> Result<bool, String> {
     let observations = parse_current_avionics_extraction_value(extracted_listing)?;
+    let visible_source = clean_publisher_source_html(rendered_html);
     let mut repairs = Vec::new();
     for (index, observation) in observations.iter().enumerate() {
         if observation.quantity != 1
@@ -90,6 +91,7 @@ pub(crate) fn recover_exact_role_separated_avionics_quantity(
             continue;
         }
         let RoleSeparatedQuantityEvidence::Unique(proof) = role_separated_quantity_evidence(
+            &visible_source,
             rendered_html,
             &observation.manufacturer,
             &observation.model,
@@ -407,8 +409,10 @@ fn validate_role_separated_quantity_completeness(
     observations: &[ParsedAvionics],
     rendered_html: &str,
 ) -> Result<(), String> {
+    let visible_source = clean_publisher_source_html(rendered_html);
     for (index, observation) in observations.iter().enumerate() {
         let proof = match role_separated_quantity_evidence(
+            &visible_source,
             rendered_html,
             &observation.manufacturer,
             &observation.model,
@@ -493,11 +497,11 @@ struct EnumeratedItem<'a> {
 }
 
 fn role_separated_quantity_evidence(
+    visible_source: &str,
     rendered_html: &str,
     manufacturer: &str,
     model: &str,
 ) -> RoleSeparatedQuantityEvidence {
-    let visible_source = clean_publisher_source_html(rendered_html);
     let mut proofs = BTreeSet::new();
     for line in visible_source.lines() {
         let items = enumerated_items(line);
