@@ -24,7 +24,7 @@ use crate::html::clean::clean_listing_html;
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::extraction::{
     parse_current_avionics_extraction_json, parse_current_avionics_extraction_value,
-    recover_exact_role_separated_avionics_quantity, validate_current_avionics_identity_evidence,
+    recover_controller_avionics_extraction, validate_current_avionics_identity_evidence,
     validate_current_avionics_quantity_completeness,
 };
 use crate::listing::avionics::{
@@ -4366,10 +4366,9 @@ async fn reextract_avionics(
         .extract(listing_text)
         .await
         .map_err(|error| format!("Gemini listing extraction request failed: {error}"))?;
-    recover_exact_role_separated_avionics_quantity(&mut extracted, source_url, rendered_html)
-        .map_err(|error| {
-            format!("Gemini returned listing quantity evidence that could not be repaired: {error}")
-        })?;
+    recover_controller_avionics_extraction(&mut extracted, source_url, rendered_html).map_err(
+        |error| format!("Gemini returned listing evidence that could not be repaired: {error}"),
+    )?;
     let avionics = parse_current_avionics_extraction_value(&extracted).map_err(|error| {
         format!(
             "Gemini returned output incompatible with the current explicit occurrence schema: {error}"
