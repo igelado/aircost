@@ -20,7 +20,7 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
     parse_listing_html_for_avionics_validation, validate_source_url, GeminiListingExtractor,
 };
-use crate::html::clean::clean_listing_html;
+use crate::html::listing::source::listing_extraction_source;
 use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
@@ -1229,6 +1229,12 @@ async fn automatic_occurrence_disposition_count(
     .0)
 }
 
+fn retained_listing_context(source_url: &str, rendered_html: &str) -> StoreResult<String> {
+    listing_extraction_source(source_url, rendered_html).map_err(|error| {
+        PluginStoreError::Validation(format!("retained listing source is invalid: {error}"))
+    })
+}
+
 async fn recover_bound_source_correction(
     db: &AppDb,
     user: &User,
@@ -1249,7 +1255,10 @@ async fn recover_bound_source_correction(
         parsed_listing,
         warnings: Vec::new(),
         identity_recovery,
-        context_text: Some(clean_listing_html(rendered_html)),
+        context_text: Some(retained_listing_context(
+            &submission.source_url,
+            rendered_html,
+        )?),
     };
     let existing_dispositions = automatic_occurrence_disposition_count(db, submission.id).await?;
     let source_admission = admit_aircraft_source_identity(
@@ -2127,7 +2136,10 @@ async fn complete_bound_replay_materialization(
             parsed_listing,
             warnings: Vec::new(),
             identity_recovery,
-            context_text: Some(clean_listing_html(&stored.rendered_html)),
+            context_text: Some(retained_listing_context(
+                &stored.source_url,
+                &stored.rendered_html,
+            )?),
         };
         let resumed =
             resume_bound_replay_listing(db, user.id, listing_id, &preview, Some(extractor)).await?;
@@ -2213,7 +2225,10 @@ pub async fn materialize_plugin_submission_checkpoint(
         parsed_listing,
         warnings: Vec::new(),
         identity_recovery,
-        context_text: Some(clean_listing_html(&stored.rendered_html)),
+        context_text: Some(retained_listing_context(
+            &stored.source_url,
+            &stored.rendered_html,
+        )?),
     };
     let signed_source_binding = signed_source_listing_binding(
         stored.id,
@@ -3097,14 +3112,34 @@ mod tests {
     fn controller_avionics_html(avionics: &str, autopilot: &str) -> String {
         format!(
             r#"<html><body>
-            <div class="detail__specs-wrapper">
-              <div class="detail__specs-label">Avionics/Radios</div>
-              <div class="detail__specs-value">{avionics}</div>
-              <div class="detail__specs-label">SVT</div>
-              <div class="detail__specs-value">Yes</div>
-              <div class="detail__specs-label">Autopilot</div>
-              <div class="detail__specs-value">{autopilot}</div>
-            </div>
+            <main id="main-content" class="detail__main-content">
+              <h1 class="detail__title">2020 CESSNA 182T</h1>
+              <div class="listing-prices">
+                <strong class="listing-prices__retail-price">$400,000</strong>
+              </div>
+              <div class="detail__specs">
+                <h3 class="detail__specs-heading">General</h3>
+                <div class="detail__specs-wrapper">
+                  <div class="detail__specs-label">Year</div>
+                  <div class="detail__specs-value">2020</div>
+                  <div class="detail__specs-label">Manufacturer</div>
+                  <div class="detail__specs-value">CESSNA</div>
+                  <div class="detail__specs-label">Model</div>
+                  <div class="detail__specs-value">182T</div>
+                  <div class="detail__specs-label">Condition</div>
+                  <div class="detail__specs-value">Used</div>
+                </div>
+                <h3 class="detail__specs-heading">Avionics</h3>
+                <div class="detail__specs-wrapper">
+                  <div class="detail__specs-label">Avionics/Radios</div>
+                  <div class="detail__specs-value">{avionics}</div>
+                  <div class="detail__specs-label">SVT</div>
+                  <div class="detail__specs-value">Yes</div>
+                  <div class="detail__specs-label">Autopilot</div>
+                  <div class="detail__specs-value">{autopilot}</div>
+                </div>
+              </div>
+            </main>
             </body></html>"#
         )
     }

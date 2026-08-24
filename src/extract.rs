@@ -33,9 +33,9 @@ use crate::gemini::usage::{
     estimate_paid_list_cost, ApiFamily, Metrics as UsageMetrics, Outcome as UsageOutcome,
     SourceCorrelation, Start as UsageStart, Store as UsageStore, ToolUseBilling,
 };
-use crate::html::clean::clean_listing_html;
 use crate::html::listing::download::{download_identity_image, download_identity_images};
 use crate::html::listing::media::{discover as discover_listing_media, MediaDiscoveryError};
+use crate::html::listing::source::listing_extraction_source;
 use crate::models::{
     ListingPreview, ListingValuationFact, ParsedAvionics, ParsedInstalledComponent, ParsedListing,
 };
@@ -2141,7 +2141,8 @@ pub async fn parse_listing_html(
     html: &str,
     extractor: &GeminiListingExtractor,
 ) -> Result<ListingPreview> {
-    let listing_text = clean_listing_html(html);
+    let listing_text = listing_extraction_source(source_url, html)
+        .context("could not build bounded listing extraction source")?;
     let structured = extractor.extract(&listing_text).await?;
     listing_preview_from_structured(source_url, html, extractor, listing_text, &structured).await
 }
@@ -2151,7 +2152,8 @@ pub(crate) async fn parse_listing_html_for_avionics_validation(
     html: &str,
     extractor: &GeminiListingExtractor,
 ) -> Result<ListingPreviewForAvionicsValidation> {
-    let listing_text = clean_listing_html(html);
+    let listing_text = listing_extraction_source(source_url, html)
+        .context("could not build bounded listing extraction source")?;
     let extraction = extractor
         .extract_for_avionics_validation(&listing_text)
         .await?;

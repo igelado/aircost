@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::db::{AppDb, DatabaseBackend};
-use crate::html::clean::clean_listing_html;
 use crate::html::listing::media::{discover, MediaReference};
+use crate::html::listing::source::listing_extraction_source;
 use crate::models::{is_plausible_asking_price_usd, ParsedAvionics, ParsedListing};
 
 pub const BENCHMARK_SCHEMA_VERSION: &str = "gemini-model-benchmark-v1";
@@ -347,7 +347,13 @@ fn build_suite(
     let mut cases = Vec::new();
 
     for row in &selected {
-        let listing_text = clean_listing_html(&row.rendered_html);
+        let listing_text = listing_extraction_source(&row.source_url, &row.rendered_html)
+            .with_context(|| {
+                format!(
+                    "could not build extraction source for submission {}",
+                    row.submission_id
+                )
+            })?;
         let reference_output = row
             .extracted_listing_json
             .as_deref()
@@ -1757,6 +1763,31 @@ mod tests {
     use super::*;
 
     fn source_row(id: i64, html: &str, extracted: Option<Value>) -> SourceRow {
+        let rendered_html = format!(
+            r#"<html><body>
+              <main id="main-content" class="detail__main-content">
+                <h1 class="detail__title">2008 CESSNA 182T</h1>
+                <div class="listing-prices">
+                  <strong class="listing-prices__retail-price">$525,000</strong>
+                </div>
+                <div class="detail__specs">
+                  <h3 class="detail__specs-heading">General</h3>
+                  <div class="detail__specs-wrapper">
+                    <div class="detail__specs-label">Year</div>
+                    <div class="detail__specs-value">2008</div>
+                    <div class="detail__specs-label">Manufacturer</div>
+                    <div class="detail__specs-value">Cessna</div>
+                    <div class="detail__specs-label">Model</div>
+                    <div class="detail__specs-value">182T</div>
+                    <div class="detail__specs-label">Condition</div>
+                    <div class="detail__specs-value">Used</div>
+                    <div class="detail__specs-label">Description</div>
+                    <div class="detail__specs-value">{html}</div>
+                  </div>
+                </div>
+              </main>
+            </body></html>"#
+        );
         SourceRow {
             submission_id: id,
             listing_id: Some(id + 100),
@@ -1764,8 +1795,8 @@ mod tests {
                 "https://www.controller.com/listing/for-sale/{}/test-aircraft",
                 100_000_000 + id
             ),
-            rendered_html: html.to_string(),
-            rendered_html_sha256: sha256_hex(html.as_bytes()),
+            rendered_html_sha256: sha256_hex(rendered_html.as_bytes()),
+            rendered_html,
             extracted_listing_json: extracted.map(|value| value.to_string()),
             extraction_error: None,
         }
