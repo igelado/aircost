@@ -2274,6 +2274,7 @@ Rules:\n\
 - Use null for absent registration_number, serial_number, engine_hours, propeller_hours, and their evidence/confidence fields.\n\
 - asking_price_usd must be the aircraft asking price, not a loan payment.\n\
 - model_year must be the aircraft model year, not an inspection or warranty date.\n\
+- status is the sale lifecycle: active, sold, pending, or unknown. Aircraft Condition values such as New or Used never establish sale lifecycle. A Controller listing offer availability of InStock establishes active; any other or missing offer availability remains unknown unless the listing explicitly states sold or pending.\n\
 - airframe_hours is total time, TTAF, TT, TTSN, or flight hours since new.\n\
 - engine_hours is engine TTSN/SNEW/SMOH/SFRM time, not horsepower, TBO, or engine model.\n\
 - propeller_hours is propeller TTSN/SNEW/SMOH/SPOH time, not blade count or model.\n\
@@ -4746,6 +4747,8 @@ mod tests {
         assert!(prompt.contains("Preserve actual attached or marketed designators"));
         assert!(prompt.contains("return the source token GI275s rather than singularizing it"));
         assert!(prompt.contains("Later catalog curation, not listing extraction"));
+        assert!(prompt.contains("Aircraft Condition values such as New or Used never establish"));
+        assert!(prompt.contains("offer availability of InStock establishes active"));
     }
 
     #[test]

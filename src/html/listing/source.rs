@@ -5,9 +5,11 @@
 //! avoids flattening unrelated page chrome and, importantly, keeps every
 //! specification label and value in a separate source unit.
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt};
 
 use scraper::{ElementRef, Html, Selector};
+use serde_json::Value;
+use url::Url;
 
 use crate::html::clean::{clean_listing_html, PublisherTextExtractor};
 use crate::html::listing::media::{
@@ -22,7 +24,6 @@ const CONTROLLER_HEADING_CLASS: &str = "detail__specs-heading";
 const CONTROLLER_WRAPPER_CLASS: &str = "detail__specs-wrapper";
 const CONTROLLER_LABEL_CLASS: &str = "detail__specs-label";
 const CONTROLLER_VALUE_CLASS: &str = "detail__specs-value";
-const CONTROLLER_STATUS_LABEL: &str = "Condition";
 const CONTROLLER_TRAILING_CLASSES: &[&str] = &["detail__specs-service-logs", "acc-container"];
 
 const MAX_CONTROLLER_SOURCE_BYTES: usize = 24_000;
@@ -38,12 +39,12 @@ const TITLE_OPEN: &str = "[CONTROLLER TITLE]";
 const TITLE_CLOSE: &str = "[/CONTROLLER TITLE]";
 const PRICE_OPEN: &str = "[CONTROLLER PRIMARY ASKING PRICE]";
 const PRICE_CLOSE: &str = "[/CONTROLLER PRIMARY ASKING PRICE]";
+const AVAILABILITY_OPEN: &str = "[CONTROLLER LISTING OFFER AVAILABILITY]";
+const AVAILABILITY_CLOSE: &str = "[/CONTROLLER LISTING OFFER AVAILABILITY]";
 const SECTION_OPEN: &str = "[CONTROLLER SPEC SECTION]";
 const SECTION_CLOSE: &str = "[/CONTROLLER SPEC SECTION]";
 const FIELD_OPEN: &str = "[CONTROLLER FIELD]";
-const STATUS_FIELD_OPEN: &str = "[CONTROLLER PRIMARY STATUS FIELD]";
 const FIELD_CLOSE: &str = "[/CONTROLLER FIELD]";
-const STATUS_FIELD_CLOSE: &str = "[/CONTROLLER PRIMARY STATUS FIELD]";
 const LABEL_OPEN: &str = "[LABEL]";
 const LABEL_CLOSE: &str = "[/LABEL]";
 const VALUE_OPEN: &str = "[VALUE]";
@@ -53,12 +54,12 @@ const RESERVED_MARKERS: &[&str] = &[
     TITLE_CLOSE,
     PRICE_OPEN,
     PRICE_CLOSE,
+    AVAILABILITY_OPEN,
+    AVAILABILITY_CLOSE,
     SECTION_OPEN,
     SECTION_CLOSE,
     FIELD_OPEN,
-    STATUS_FIELD_OPEN,
     FIELD_CLOSE,
-    STATUS_FIELD_CLOSE,
     LABEL_OPEN,
     LABEL_CLOSE,
     VALUE_OPEN,
@@ -113,7 +114,6 @@ struct ControllerField {
     section: String,
     label: String,
     value: String,
-    primary_status: bool,
 }
 
 /// Build the bounded source text used for listing extraction.
@@ -137,7 +137,7 @@ fn controller_listing_source(
     source_url: &str,
     retained_html: &str,
 ) -> Result<String, ListingSourceError> {
-    validate_controller_listing_source_url(source_url)
+    let source_url = validate_controller_listing_source_url(source_url)
         .map_err(|error| ListingSourceError::InvalidControllerSourceUrl(error.to_string()))?;
     if retained_html.len() > MAX_RETAINED_HTML_BYTES {
         return Err(ListingSourceError::RetainedHtmlTooLarge {
@@ -147,6 +147,8 @@ fn controller_listing_source(
     }
 
     let document = Html::parse_document(retained_html);
+    let listing_id = controller_listing_id(&source_url)?;
+    let offer_availability = controller_offer_availability(&document, &listing_id)?;
     let text = PublisherTextExtractor::new(&document);
     let main = unique_element(
         document.root_element(),
@@ -186,31 +188,29 @@ fn controller_listing_source(
         MAX_CONTROLLER_PRICE_BYTES,
     )?;
     let fields = parse_controller_fields(&text, specs)?;
-    if fields.iter().filter(|field| field.primary_status).count() != 1 {
-        return Err(invalid_structure(
-            "expected exactly one visible Condition field for primary status",
-        ));
-    }
 
     let mut source = String::new();
     push_envelope(&mut source, TITLE_OPEN, &title, TITLE_CLOSE);
     push_envelope(&mut source, PRICE_OPEN, &price, PRICE_CLOSE);
+    if let Some(availability) = offer_availability {
+        push_envelope(
+            &mut source,
+            AVAILABILITY_OPEN,
+            &availability,
+            AVAILABILITY_CLOSE,
+        );
+    }
     let mut current_section = None;
     for field in fields {
         if current_section.as_deref() != Some(field.section.as_str()) {
             push_envelope(&mut source, SECTION_OPEN, &field.section, SECTION_CLOSE);
             current_section = Some(field.section.clone());
         }
-        let (field_open, field_close) = if field.primary_status {
-            (STATUS_FIELD_OPEN, STATUS_FIELD_CLOSE)
-        } else {
-            (FIELD_OPEN, FIELD_CLOSE)
-        };
-        source.push_str(field_open);
+        source.push_str(FIELD_OPEN);
         source.push('\n');
         push_envelope(&mut source, LABEL_OPEN, &field.label, LABEL_CLOSE);
         push_envelope(&mut source, VALUE_OPEN, &field.value, VALUE_CLOSE);
-        source.push_str(field_close);
+        source.push_str(FIELD_CLOSE);
         source.push('\n');
     }
     if source.len() > MAX_CONTROLLER_SOURCE_BYTES {
@@ -329,12 +329,196 @@ fn parse_controller_wrapper<'document>(
         )?;
         fields.push(ControllerField {
             section: section.to_string(),
-            primary_status: normalized_label(&label) == CONTROLLER_STATUS_LABEL,
             label,
             value,
         });
     }
     Ok(())
+}
+
+fn controller_listing_id(source_url: &str) -> Result<String, ListingSourceError> {
+    let url = Url::parse(source_url)
+        .map_err(|_| invalid_structure("validated Controller source URL could not be parsed"))?;
+    url.path_segments()
+        .and_then(|mut segments| segments.nth(2))
+        .filter(|listing_id| {
+            !listing_id.is_empty() && listing_id.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .map(ToString::to_string)
+        .ok_or_else(|| invalid_structure("validated Controller source URL lost its listing ID"))
+}
+
+/// Extract only the listing-bound Schema.org offer availability value.
+///
+/// Raw JSON-LD is intentionally excluded from model input. Controller binds
+/// the listing Product to the numeric route ID; that exact object may supply
+/// one machine-readable Offer availability value without admitting unrelated
+/// page, recommendation, or seller objects.
+fn controller_offer_availability(
+    document: &Html,
+    listing_id: &str,
+) -> Result<Option<String>, ListingSourceError> {
+    let selector =
+        Selector::parse(r#"script[type="application/ld+json"]"#).expect("static selector is valid");
+    let mut matches = BTreeSet::new();
+    for script in document.select(&selector) {
+        let json = script.text().collect::<String>();
+        let Ok(value) = serde_json::from_str::<Value>(&json) else {
+            continue;
+        };
+        collect_listing_offer_availability(&value, listing_id, false, &mut matches)?;
+    }
+    if matches.len() > 1 {
+        return Err(invalid_structure(
+            "listing-bound offer has conflicting availability values",
+        ));
+    }
+    Ok(matches.into_iter().next())
+}
+
+fn collect_listing_offer_availability(
+    value: &Value,
+    listing_id: &str,
+    inherited_schema_context: bool,
+    matches: &mut BTreeSet<String>,
+) -> Result<(), ListingSourceError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_listing_offer_availability(
+                    value,
+                    listing_id,
+                    inherited_schema_context,
+                    matches,
+                )?;
+            }
+        }
+        Value::Object(object) => {
+            let schema_context = object_schema_context(object, inherited_schema_context);
+            if schema_context
+                && object.get("@id").and_then(Value::as_str) == Some(listing_id)
+                && object_has_schema_type(object, "Product")
+            {
+                if let Some(offers) = object.get("offers") {
+                    collect_offer_availability_values(offers, schema_context, matches)?;
+                }
+            }
+            for child in object.values() {
+                collect_listing_offer_availability(child, listing_id, schema_context, matches)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_offer_availability_values(
+    offers: &Value,
+    schema_context: bool,
+    matches: &mut BTreeSet<String>,
+) -> Result<(), ListingSourceError> {
+    match offers {
+        Value::Array(offers) => {
+            for offer in offers {
+                collect_offer_availability_values(offer, schema_context, matches)?;
+            }
+        }
+        Value::Object(offer) => {
+            let schema_context = object_schema_context(offer, schema_context);
+            if !schema_context || !object_has_schema_type(offer, "Offer") {
+                return Err(invalid_structure(
+                    "listing-bound Product offers must have Schema.org Offer type",
+                ));
+            }
+            let Some(value) = offer.get("availability") else {
+                return Ok(());
+            };
+            let availability = value
+                .as_str()
+                .and_then(schema_availability_name)
+                .ok_or_else(|| invalid_structure("listing-bound offer availability is invalid"))?;
+            matches.insert(availability.to_string());
+        }
+        _ => {
+            return Err(invalid_structure(
+                "listing-bound offers must be an object or array",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn object_schema_context(
+    object: &serde_json::Map<String, Value>,
+    inherited_schema_context: bool,
+) -> bool {
+    object
+        .get("@context")
+        .map_or(inherited_schema_context, |context| {
+            json_ld_context_is_unambiguous_schema_org(context)
+        })
+}
+
+fn json_ld_context_is_unambiguous_schema_org(value: &Value) -> bool {
+    match value {
+        Value::String(value) => schema_org_name(value).is_some_and(|name| name.is_empty()),
+        Value::Array(values) => {
+            values.len() == 1
+                && values
+                    .first()
+                    .is_some_and(json_ld_context_is_unambiguous_schema_org)
+        }
+        Value::Object(context) => {
+            context.len() == 1
+                && context
+                    .get("@vocab")
+                    .and_then(Value::as_str)
+                    .and_then(schema_org_name)
+                    .is_some_and(|name| name.is_empty())
+        }
+        _ => false,
+    }
+}
+
+fn object_has_schema_type(object: &serde_json::Map<String, Value>, expected: &str) -> bool {
+    object
+        .get("@type")
+        .is_some_and(|value| json_ld_type_includes(value, expected))
+}
+
+fn json_ld_type_includes(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => schema_org_name(value).unwrap_or(value) == expected,
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_ld_type_includes(value, expected)),
+        _ => false,
+    }
+}
+
+fn schema_org_name(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("https://schema.org/")
+        .or_else(|| value.strip_prefix("http://schema.org/"))
+        .or_else(|| (value == "https://schema.org" || value == "http://schema.org").then_some(""))
+}
+
+fn schema_availability_name(value: &str) -> Option<&str> {
+    let value = schema_org_name(value).unwrap_or(value);
+    matches!(
+        value,
+        "InStock"
+            | "OutOfStock"
+            | "SoldOut"
+            | "PreOrder"
+            | "PreSale"
+            | "LimitedAvailability"
+            | "OnlineOnly"
+            | "InStoreOnly"
+            | "BackOrder"
+            | "Discontinued"
+    )
+    .then_some(value)
 }
 
 fn unique_element<'document>(
@@ -420,6 +604,8 @@ mod tests {
     use super::{listing_extraction_source, MAX_CONTROLLER_VALUE_BYTES};
 
     const URL: &str = "https://www.controller.com/listing/for-sale/257959105/example";
+    const FROZEN_CORPUS_ID_HTML_FINGERPRINT: &str =
+        "f97628f16b57844ad3ac6858fe9d799ed4208de6594024079b86e73dc3c98a7f";
     const REALISTIC: &str =
         include_str!("../../../tests/fixtures/controller/id25_like_listing.html");
 
@@ -430,8 +616,12 @@ mod tests {
         assert!(source.contains("[CONTROLLER TITLE]\n2022 CESSNA 182T SKYLANE"));
         assert!(source.contains("[CONTROLLER PRIMARY ASKING PRICE]\n$669,500"));
         assert!(source.contains(
-            "[CONTROLLER PRIMARY STATUS FIELD]\n[LABEL]\nCondition\n[/LABEL]\n[VALUE]\nUsed\n[/VALUE]"
+            "[CONTROLLER LISTING OFFER AVAILABILITY]\nInStock\n[/CONTROLLER LISTING OFFER AVAILABILITY]"
         ));
+        assert!(source.contains(
+            "[CONTROLLER FIELD]\n[LABEL]\nCondition\n[/LABEL]\n[VALUE]\nUsed\n[/VALUE]\n[/CONTROLLER FIELD]"
+        ));
+        assert!(!source.contains("PRIMARY STATUS FIELD"));
         assert!(source.contains(
             "[LABEL]\nFlight Deck Manufacturer/Model\n[/LABEL]\n[VALUE]\nGARMIN G1000 NXI\n[/VALUE]"
         ));
@@ -448,6 +638,64 @@ mod tests {
         assert!(!source.contains("$6,206.35"));
         assert!(!source.contains("RELATED AIRCRAFT $99,999"));
         assert!(!source.contains("Browse Aircraft"));
+    }
+
+    #[test]
+    fn controller_aircraft_condition_never_becomes_sale_lifecycle() {
+        let without_availability = REALISTIC.replace(
+            "\"offers\":{\"@type\":\"Offer\",\"availability\":\"InStock\"}",
+            "\"offers\":{\"@type\":\"Offer\"}",
+        );
+        let source = listing_extraction_source(URL, &without_availability).unwrap();
+        assert!(!source.contains("LISTING OFFER AVAILABILITY"));
+        assert!(source.contains("[LABEL]\nCondition\n[/LABEL]\n[VALUE]\nUsed\n[/VALUE]"));
+        assert!(!source.contains("PRIMARY STATUS FIELD"));
+
+        let conflicting = REALISTIC.replace(
+            "\"offers\":{\"@type\":\"Offer\",\"availability\":\"InStock\"}",
+            "\"offers\":[{\"@type\":\"Offer\",\"availability\":\"InStock\"},{\"@type\":\"Offer\",\"availability\":\"OutOfStock\"}]",
+        );
+        let error = listing_extraction_source(URL, &conflicting).unwrap_err();
+        assert!(error.to_string().contains("conflicting availability"));
+
+        let same_id_non_product = REALISTIC.replace(
+            "\"@type\":\"Product\",\"@id\":\"257959105\"",
+            "\"@type\":\"WebPage\",\"@id\":\"257959105\"",
+        );
+        let source = listing_extraction_source(URL, &same_id_non_product).unwrap();
+        assert!(!source.contains("LISTING OFFER AVAILABILITY"));
+
+        let reset_product_context = REALISTIC.replace(
+            "\"mainEntity\":{\"@type\":\"Product\"",
+            "\"mainEntity\":{\"@context\":null,\"@type\":\"Product\"",
+        );
+        let source = listing_extraction_source(URL, &reset_product_context).unwrap();
+        assert!(!source.contains("LISTING OFFER AVAILABILITY"));
+
+        let ambiguous_root_context = REALISTIC.replace(
+            "\"@context\":\"https://schema.org\"",
+            "\"@context\":[\"https://schema.org\",null]",
+        );
+        let source = listing_extraction_source(URL, &ambiguous_root_context).unwrap();
+        assert!(!source.contains("LISTING OFFER AVAILABILITY"));
+
+        let non_offer = REALISTIC.replace(
+            "\"@type\":\"Offer\",\"availability\":\"InStock\"",
+            "\"@type\":\"AggregateOffer\",\"availability\":\"InStock\"",
+        );
+        let error = listing_extraction_source(URL, &non_offer).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must have Schema.org Offer type"));
+
+        let reset_offer_context = REALISTIC.replace(
+            "\"offers\":{\"@type\":\"Offer\"",
+            "\"offers\":{\"@context\":null,\"@type\":\"Offer\"",
+        );
+        let error = listing_extraction_source(URL, &reset_offer_context).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must have Schema.org Offer type"));
     }
 
     #[test]
@@ -515,6 +763,7 @@ mod tests {
     #[ignore = "requires an explicitly supplied retained Controller capture database"]
     async fn controller_real_corpus_contract_audit() {
         use scraper::{Html, Selector};
+        use sha2::{Digest, Sha256};
         use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
         use std::str::FromStr;
 
@@ -529,13 +778,27 @@ mod tests {
             .connect_with(options)
             .await
             .expect("could not open the corpus database read-only");
-        let rows = sqlx::query_as::<_, (i64, String, String)>(
-            "SELECT id, source_url, rendered_html FROM plugin_submissions ORDER BY id",
+        let rows = sqlx::query_as::<_, (i64, String, String, String)>(
+            "SELECT id, source_url, rendered_html, rendered_html_sha256 FROM plugin_submissions ORDER BY id",
         )
         .fetch_all(&pool)
         .await
         .expect("could not read retained plugin captures");
         assert_eq!(rows.len(), 70, "the frozen corpus must contain 70 captures");
+        let mut fingerprint_input = String::new();
+        for (submission_id, _, rendered_html, rendered_html_sha256) in &rows {
+            assert_eq!(
+                format!("{:x}", Sha256::digest(rendered_html.as_bytes())),
+                *rendered_html_sha256,
+                "submission {submission_id} rendered HTML digest is stale"
+            );
+            fingerprint_input.push_str(&format!("{submission_id}:{rendered_html_sha256}\n"));
+        }
+        assert_eq!(
+            format!("{:x}", Sha256::digest(fingerprint_input.as_bytes())),
+            FROZEN_CORPUS_ID_HTML_FINGERPRINT,
+            "the audit database is not the exact frozen capture-ID/HTML corpus"
+        );
 
         let noise_selector = Selector::parse(
             ".payments-as-low-as-route, .detail__additional-listings, .similar-listings, .recently-viewed",
@@ -543,11 +806,17 @@ mod tests {
         .unwrap();
         let mut character_counts = Vec::with_capacity(rows.len());
         let mut finance_or_related_price_tokens = 0usize;
-        for (submission_id, source_url, html) in rows {
+        let mut active_offer_availabilities = 0usize;
+        for (submission_id, source_url, html, _) in rows {
             let source = listing_extraction_source(&source_url, &html).unwrap_or_else(|error| {
                 panic!("submission {submission_id} failed the Controller contract: {error}")
             });
             character_counts.push(source.chars().count());
+            if source.contains(
+                "[CONTROLLER LISTING OFFER AVAILABILITY]\nInStock\n[/CONTROLLER LISTING OFFER AVAILABILITY]",
+            ) {
+                active_offer_availabilities += 1;
+            }
 
             let document = Html::parse_document(&html);
             for noise in document.select(&noise_selector) {
@@ -568,13 +837,18 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            active_offer_availabilities, 70,
+            "every frozen retained listing must expose its exact listing-bound InStock offer"
+        );
         character_counts.sort_unstable();
         eprintln!(
-            "Controller corpus: captures={}, source_chars_min={}, source_chars_median={}, source_chars_max={}, excluded_finance_or_related_prices={}",
+            "Controller corpus: captures={}, source_chars_min={}, source_chars_median={}, source_chars_max={}, active_offer_availabilities={}, excluded_finance_or_related_prices={}",
             character_counts.len(),
             character_counts[0],
             character_counts[character_counts.len() / 2],
             character_counts[character_counts.len() - 1],
+            active_offer_availabilities,
             finance_or_related_price_tokens,
         );
         pool.close().await;
