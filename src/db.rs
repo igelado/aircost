@@ -112,7 +112,7 @@ const AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT: &str =
 const AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION: &str = "20260824_avionics_generic_feature_labels";
 const AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT: &str =
-    "4df9f28d6d4ef22245cf1fe0dd4124573a1a03ef36371aba4cbd9d485bc94163";
+    "366cf90682d11e71293461aca169445a04f8b906d8c15dab6fde76e1dc2384c8";
 const AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION: i64 = 2;
 const SQLITE_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
     "c544640fc9fd748d8601ac21f4510e0659f2039b162bd6ef54485e598ef95355";
@@ -14835,8 +14835,34 @@ mod tests {
             }
             Ok(())
         }
+        async fn apply_predecessor(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+            for statement in
+                split_sql_statements(AVIONICS_APPROVED_CONCRETE_MODEL_SQLITE_MIGRATION_SQL)
+            {
+                connection.execute(statement).await?;
+            }
+            Ok(())
+        }
 
         let mut clean = minimal_connection().await;
+        clean
+            .execute(
+                "CREATE TABLE listing_avionics_authorizations (\
+                   id INTEGER PRIMARY KEY, avionics_model_id INTEGER NOT NULL\
+                 ); \
+                 INSERT INTO avionics_models (id, normalized_name, catalog_status) \
+                 VALUES (1, 'gns430w', 'approved'); \
+                 INSERT INTO listing_avionics_authorizations (id, avionics_model_id) \
+                 VALUES (1, 1); \
+                 CREATE TRIGGER listing_avionics_authorizations_invalidate_model_proof_update \
+                 AFTER UPDATE OF normalized_name ON avionics_models \
+                 BEGIN \
+                   DELETE FROM listing_avionics_authorizations \
+                   WHERE avionics_model_id = OLD.id; \
+                 END",
+            )
+            .await
+            .unwrap();
         apply(&mut clean).await.unwrap();
         apply(&mut clean)
             .await
@@ -14853,6 +14879,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receipt_count, 1);
+        let (model_name, authorization_count): (String, i64) = sqlx::query_as(
+            "SELECT model.normalized_name, \
+               (SELECT count(*) FROM listing_avionics_authorizations) \
+             FROM avionics_models model WHERE model.id = 1",
+        )
+        .fetch_one(&mut clean)
+        .await
+        .unwrap();
+        assert_eq!((model_name.as_str(), authorization_count), ("gns430w", 1));
 
         let mut legacy = minimal_connection().await;
         legacy
@@ -14877,6 +14912,46 @@ mod tests {
             retained,
             ("synthetic vision".to_string(), "approved".to_string())
         );
+
+        for (invalid_key, tamper_predecessor) in [("autopilot", false), ("pfd/mfd", true)] {
+            let mut upgrade = minimal_connection().await;
+            if tamper_predecessor {
+                apply_predecessor(&mut upgrade).await.unwrap();
+                upgrade
+                    .execute(
+                        "DROP TRIGGER avionics_models_approved_concrete_model_insert; \
+                         DROP TRIGGER avionics_models_approved_concrete_model_update",
+                    )
+                    .await
+                    .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO avionics_models (normalized_name, catalog_status) \
+                 VALUES (?, 'approved')",
+            )
+            .bind(invalid_key)
+            .execute(&mut upgrade)
+            .await
+            .unwrap();
+            let error = apply(&mut upgrade)
+                .await
+                .expect_err(
+                    "v2 must audit all approved rows even if the prior invariant is absent or tampered",
+                )
+                .to_string();
+            assert!(
+                error.contains("canonicalize, correct, or demote it before retrying migration"),
+                "{invalid_key}: {error}"
+            );
+            let receipt_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM schema_migration_contracts \
+                 WHERE migration_name = '20260824_avionics_generic_feature_labels'",
+            )
+            .fetch_one(&mut upgrade)
+            .await
+            .unwrap();
+            assert_eq!(receipt_count, 0, "{invalid_key}");
+        }
 
         for invalid_key in [
             "synthetic vision",
@@ -15069,6 +15144,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_generic_feature_label_migration_audits_without_model_updates() {
+        async fn reset_minimal(pool: &sqlx::PgPool) {
+            sqlx::raw_sql(
+                "DROP SCHEMA public CASCADE; \
+                 CREATE SCHEMA public; \
+                 CREATE TABLE public.avionics_models (\
+                   id BIGINT PRIMARY KEY, \
+                   normalized_name TEXT NOT NULL, \
+                   catalog_status TEXT NOT NULL\
+                 )",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+
+        for (invalid_key, tamper_predecessor) in [("autopilot", false), ("pfd/mfd", true)] {
+            reset_minimal(&pool).await;
+            if tamper_predecessor {
+                sqlx::raw_sql(AVIONICS_APPROVED_CONCRETE_MODEL_POSTGRES_MIGRATION_SQL)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                pool.execute(
+                    "DROP TRIGGER avionics_models_approved_concrete_model \
+                     ON public.avionics_models",
+                )
+                .await
+                .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO public.avionics_models (id, normalized_name, catalog_status) \
+                 VALUES (1, $1, 'approved')",
+            )
+            .bind(invalid_key)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let error = sqlx::raw_sql(AVIONICS_GENERIC_FEATURE_LABELS_POSTGRES_MIGRATION_SQL)
+                .execute(&pool)
+                .await
+                .expect_err(
+                    "v2 must audit all approved rows even if the prior invariant is absent or tampered",
+                )
+                .to_string();
+            assert!(
+                error.contains("canonicalize, correct, or demote it before retrying migration"),
+                "{invalid_key}: {error}"
+            );
+            pool.execute("ROLLBACK").await.unwrap();
+        }
+
+        reset_minimal(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TABLE public.listing_avionics_authorizations (\
+               id BIGINT PRIMARY KEY, avionics_model_id BIGINT NOT NULL\
+             ); \
+             CREATE FUNCTION public.invalidate_model_authorization() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $function$ \
+             BEGIN \
+               DELETE FROM public.listing_avionics_authorizations \
+               WHERE avionics_model_id = OLD.id; \
+               RETURN NEW; \
+             END \
+             $function$; \
+             CREATE TRIGGER listing_avionics_authorizations_invalidate_model_proof_update \
+             AFTER UPDATE OF normalized_name ON public.avionics_models \
+             FOR EACH ROW EXECUTE FUNCTION public.invalidate_model_authorization(); \
+             INSERT INTO public.avionics_models (id, normalized_name, catalog_status) \
+             VALUES (1, 'gns430w', 'approved'); \
+             INSERT INTO public.listing_avionics_authorizations (id, avionics_model_id) \
+             VALUES (1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(AVIONICS_GENERIC_FEATURE_LABELS_POSTGRES_MIGRATION_SQL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (model_name, authorization_count): (String, i64) = sqlx::query_as(
+            "SELECT model.normalized_name, \
+               (SELECT count(*) FROM public.listing_avionics_authorizations) \
+             FROM public.avionics_models model WHERE model.id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((model_name.as_str(), authorization_count), ("gns430w", 1));
+    }
+
     #[test]
     fn approved_concrete_model_sql_uses_the_complete_rust_generic_vocabulary() {
         let vocabulary = [
@@ -15195,6 +15371,19 @@ mod tests {
             assert!(definition.contains("!~ '^[a-z0-9]+( [a-z0-9]+)*$'"));
             assert!(definition.contains("canonicalize, correct, or demote"));
         }
+        for definition in [
+            AVIONICS_GENERIC_FEATURE_LABELS_SQLITE_MIGRATION_SQL,
+            AVIONICS_GENERIC_FEATURE_LABELS_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(
+                !definition.contains("SET normalized_name = normalized_name"),
+                "the migration audit must not fire model-update side effects"
+            );
+        }
+        assert!(AVIONICS_GENERIC_FEATURE_LABELS_SQLITE_MIGRATION_SQL
+            .contains("avionics_generic_feature_labels_audit_reject"));
+        assert!(AVIONICS_GENERIC_FEATURE_LABELS_POSTGRES_MIGRATION_SQL
+            .contains("FROM ONLY public.avionics_models"));
         for spelling in [
             "pfd/mfd",
             "ads-b",

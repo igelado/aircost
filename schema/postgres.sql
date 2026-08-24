@@ -10640,7 +10640,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260824_avionics_generic_feature_labels', 1,
-  '4df9f28d6d4ef22245cf1fe0dd4124573a1a03ef36371aba4cbd9d485bc94163',
+  '366cf90682d11e71293461aca169445a04f8b906d8c15dab6fde76e1dc2384c8',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
