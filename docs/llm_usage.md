@@ -117,6 +117,20 @@ domain and evidence rules but does not repeat a prose rendering of that same
 JSON shape. Tests at both the prompt builder and request boundary require the
 schema to remain attached.
 
+Occurrence evidence must be contained within one unit admitted by the same
+publisher source adapter that constructs extraction-model input. For Controller
+that means one exact specification value; labels, sibling values, price/page
+chrome, and JSON-LD are ineligible. Inline markup and line wraps within a value
+remain one unit. Generic publishers use structurally visible body units, where
+sibling blocks, table cells, and definition terms/values remain separate.
+Whole-body flattening cannot manufacture an evidence phrase across any of
+these boundaries. The same gate runs for the initial extraction checkpoint and
+durable avionics re-extraction.
+An `Integrated Flight Deck` identity may establish that core category without
+repeating it in prose; every additional category assigned to the suite must be
+explicit in the same occurrence evidence, and a separately extracted
+component's category cannot also be absorbed into the suite.
+
 The listing-extraction envelope is at most two logical requests. A malformed
 primary JSON response may consume the second request for the existing JSON
 repair, or a directly parseable primary may consume it for the semantic

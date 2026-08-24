@@ -3149,7 +3149,7 @@ mod tests {
         let avionics = json!([installed_avionics(
             "Garmin",
             "G1000 NXi",
-            &["Integrated Flight Deck", "Flight Display"],
+            &["Integrated Flight Deck"],
             1,
             "GARMIN G1000 NXI",
         )]);
@@ -3203,7 +3203,7 @@ mod tests {
             installed_avionics(
                 "Garmin",
                 "G1000 NXi",
-                &["Integrated Flight Deck", "Flight Display"],
+                &["Integrated Flight Deck"],
                 1,
                 "GARMIN G1000 NXI",
             ),
@@ -3256,7 +3256,8 @@ mod tests {
             .unwrap();
         assert!(correction_prompt.contains("Previous transient avionics JSON"));
         assert!(correction_prompt.contains("GARMIN G1000 NXI SVT Yes"));
-        assert!(correction_prompt.contains("bounded source excerpt"));
+        assert!(correction_prompt.contains("structurally visible source unit"));
+        assert!(correction_prompt.contains("Every additional type on that suite row"));
         assert!(!correction_prompt.contains("\"asking_price_usd\": 400000"));
         assert!(!correction_prompt.contains("\"serial_number\""));
         drop(requests);
@@ -3303,15 +3304,14 @@ mod tests {
             1,
             "GARMIN G1000 NXI SVT Yes",
         )]));
-        let corrected = json!({
-            "avionics": [installed_avionics(
-                "Garmin",
-                "G1000 NXi",
-                &["Integrated Flight Deck", "Flight Display"],
-                1,
-                "GARMIN G1000 NXI",
-            )]
-        });
+        let corrected_avionics = json!([installed_avionics(
+            "Garmin",
+            "G1000 NXi",
+            &["Integrated Flight Deck"],
+            1,
+            "GARMIN G1000 NXI",
+        )]);
+        let corrected = json!({"avionics": corrected_avionics});
         let (endpoint, request_count, _) =
             extraction_sequence_endpoint(vec![primary.to_string(), corrected.to_string()]).await;
         let db = AppDb::connect("sqlite::memory:").await.unwrap();

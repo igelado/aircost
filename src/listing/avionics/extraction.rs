@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::extract::CURATED_AVIONICS_TYPES;
 use crate::html::clean::{
     clean_publisher_source_html, listing_body_contains_exact_structurally_visible_text_span,
+    normalize_source_evidence_span,
 };
+use crate::html::listing::source::listing_evidence_units;
 use crate::listing::evidence::{
     controller_avionics_evidence, identity_span_has_boundaries, ListingEvidenceContext,
     MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES,
@@ -44,8 +46,10 @@ pub(crate) fn validate_current_avionics_extraction(
     validate_current_avionics_identity_evidence(
         &observations,
         &listing_context,
+        extraction.submission_source_url,
         extraction.rendered_html,
     )?;
+    validate_current_avionics_type_scope(&observations)?;
     validate_current_avionics_quantity_completeness(
         &observations,
         extraction.submission_source_url,
@@ -65,7 +69,13 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
 ) -> Result<Vec<ParsedAvionics>, String> {
     let observations = parse_current_avionics_extraction_json(extracted_listing_json)?;
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
-    validate_current_avionics_identity_evidence(&observations, &listing_context, rendered_html)?;
+    validate_current_avionics_identity_evidence(
+        &observations,
+        &listing_context,
+        source_url,
+        rendered_html,
+    )?;
+    validate_current_avionics_type_scope(&observations)?;
     validate_current_avionics_quantity_completeness(&observations, source_url, rendered_html)?;
     Ok(observations)
 }
@@ -199,12 +209,14 @@ fn apply_controller_avionics_evidence_typography(
 ) -> Result<bool, String> {
     let observations = parse_current_avionics_extraction_value(extracted_listing)?;
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
+    let evidence_units = listing_evidence_units(source_url, rendered_html)
+        .map_err(|error| format!("listing evidence source is invalid: {error}"))?;
     let invalid_occurrence = observations.iter().enumerate().any(|(index, observation)| {
         let evidence = observation
             .source_evidence_text
             .as_deref()
             .expect("the canonical parser requires occurrence evidence");
-        !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence)
+        !evidence_units.contains_exact_span(evidence)
             || validate_current_avionics_identity_evidence_occurrence(
                 observation,
                 index,
@@ -227,7 +239,7 @@ fn apply_controller_avionics_evidence_typography(
             .source_evidence_text
             .as_deref()
             .expect("the canonical parser requires occurrence evidence");
-        if listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence)
+        if evidence_units.contains_exact_span(evidence)
             && validate_current_avionics_identity_evidence_occurrence(
                 observation,
                 index,
@@ -252,9 +264,7 @@ fn apply_controller_avionics_evidence_typography(
 
         let candidates = typography_equivalent_visible_spans(&controller_field, evidence)
             .into_iter()
-            .filter(|candidate| {
-                listing_body_contains_exact_structurally_visible_text_span(rendered_html, candidate)
-            })
+            .filter(|candidate| evidence_units.contains_exact_span(candidate))
             .filter(|candidate| {
                 let candidate_context = ListingEvidenceContext::from_cleaned_text(*candidate);
                 context_has_exact_identity(
@@ -488,17 +498,20 @@ pub(crate) fn parse_current_avionics_extraction_value(
 pub(crate) fn validate_current_avionics_identity_evidence(
     observations: &[ParsedAvionics],
     listing_context: &ListingEvidenceContext,
+    source_url: &str,
     rendered_html: &str,
 ) -> Result<(), String> {
+    let evidence_units = listing_evidence_units(source_url, rendered_html)
+        .map_err(|error| format!("listing evidence source is invalid: {error}"))?;
     for (index, observation) in observations.iter().enumerate() {
         let evidence = observation
             .source_evidence_text
             .as_deref()
             .expect("the canonical parser requires occurrence evidence")
             .trim();
-        if !listing_body_contains_exact_structurally_visible_text_span(rendered_html, evidence) {
+        if !evidence_units.contains_exact_span(evidence) {
             return Err(format!(
-                "avionics[{index}].source_evidence_text is not one exact structurally visible span in the retained capture"
+                "avionics[{index}].source_evidence_text is not one exact structurally visible source unit in the retained capture"
             ));
         }
         validate_current_avionics_identity_evidence_occurrence(
@@ -509,6 +522,127 @@ pub(crate) fn validate_current_avionics_identity_evidence(
         )?;
     }
     Ok(())
+}
+
+fn validate_current_avionics_type_scope(observations: &[ParsedAvionics]) -> Result<(), String> {
+    for (index, observation) in observations.iter().enumerate() {
+        let evidence = observation
+            .source_evidence_text
+            .as_deref()
+            .expect("the canonical parser requires occurrence evidence");
+        validate_occurrence_type_scope(index, "", &observation.avionics_types, evidence)?;
+        if let Some(replacement) = observation.replaces.as_ref() {
+            validate_occurrence_type_scope(
+                index,
+                ".replaces",
+                &replacement.avionics_types,
+                evidence,
+            )?;
+        }
+    }
+
+    for (suite_index, suite) in observations.iter().enumerate().filter(|(_, observation)| {
+        observation
+            .avionics_types
+            .iter()
+            .any(|capability| capability == "Integrated Flight Deck")
+    }) {
+        for (component_index, component) in observations.iter().enumerate() {
+            if suite_index == component_index || same_product_identity(suite, component) {
+                continue;
+            }
+            let duplicated = suite
+                .avionics_types
+                .iter()
+                .filter(|capability| capability.as_str() != "Integrated Flight Deck")
+                .find(|capability| component.avionics_types.contains(capability));
+            if let Some(capability) = duplicated {
+                return Err(format!(
+                    "avionics[{suite_index}].types assigns {capability} to an integrated suite even though avionics[{component_index}] identifies a separate product with that capability"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_occurrence_type_scope(
+    index: usize,
+    path_suffix: &str,
+    avionics_types: &[String],
+    evidence: &str,
+) -> Result<(), String> {
+    let integrated_suite = avionics_types
+        .iter()
+        .any(|capability| capability == "Integrated Flight Deck");
+    let unsupported_suite_capability = integrated_suite
+        && avionics_types.iter().any(|capability| {
+            capability != "Integrated Flight Deck"
+                && !evidence_explicitly_names_capability(evidence, capability)
+        });
+    if unsupported_suite_capability {
+        return Err(format!(
+            "avionics[{index}]{path_suffix}.types assigns a capability to an integrated suite without explicit support in the same source_evidence_text; the suite identity may establish Integrated Flight Deck, but every additional category requires exact listing evidence"
+        ));
+    }
+    Ok(())
+}
+
+fn evidence_explicitly_names_capability(evidence: &str, capability: &str) -> bool {
+    let evidence = normalize_source_evidence_span(evidence);
+    capability_evidence_phrases(capability)
+        .iter()
+        .any(|phrase| exact_normalized_phrase(&evidence, phrase))
+}
+
+fn exact_normalized_phrase(source: &str, phrase: &str) -> bool {
+    source.match_indices(phrase).any(|(start, matched)| {
+        let end = start + matched.len();
+        (start == 0 || source.as_bytes()[start - 1] == b' ')
+            && (end == source.len() || source.as_bytes()[end] == b' ')
+    })
+}
+
+fn capability_evidence_phrases(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "GPS" => &["gps", "gnss", "satellite navigation"],
+        "NAV" => &["nav", "navigation", "vor", "localizer", "glideslope"],
+        "COM" => &["com", "comm", "communication"],
+        "Transponder" => &["transponder"],
+        "Autopilot" => &["autopilot", "auto pilot"],
+        "Flight Director" => &["flight director"],
+        "Integrated Flight Deck" => &["integrated flight deck", "flight deck", "avionics suite"],
+        "Audio Panel" => &["audio panel", "audio controller"],
+        "Flight Display" => &["flight display", "pfd", "mfd"],
+        "Navigation Indicator" => &["navigation indicator", "cdi", "hsi"],
+        "Traffic" => &["traffic", "tcas", "tas"],
+        "Datalink" => &[
+            "datalink",
+            "data link",
+            "ads b",
+            "fis b",
+            "siriusxm",
+            "sirius xm",
+        ],
+        "Weather Radar" => &["weather radar"],
+        "Lightning Detection" => &["lightning", "stormscope"],
+        "Terrain Awareness" => &["terrain", "taws", "egpws", "gpws"],
+        "Engine Monitor" => &[
+            "engine monitor",
+            "engine monitoring",
+            "engine indicating display",
+        ],
+        "Standby Instrument" => &["standby instrument", "backup instrument"],
+        "ELT" => &["elt", "emergency locator transmitter"],
+        "ADF" => &["adf", "automatic direction finder"],
+        "DME" => &["dme", "distance measuring equipment"],
+        "AHRS" => &["ahrs", "attitude heading reference"],
+        "Air Data Computer" => &["air data computer", "adc"],
+        "Radar Altimeter" => &["radar altimeter", "radio altimeter"],
+        "Magnetometer" => &["magnetometer"],
+        "Clock/Timer" => &["clock timer", "clock", "timer"],
+        _ => &[],
+    }
 }
 
 pub(crate) fn validate_current_avionics_quantity_completeness(
@@ -1111,15 +1245,19 @@ fn validate_capabilities(value: &Value, path: &str) -> Result<(), String> {
             "{path}.types must be a non-empty array; scalar type payloads are intentionally unsupported"
         ));
     };
+    let mut seen = BTreeSet::new();
     if types.is_empty()
         || types.iter().any(|value| {
             value.as_str().map(str::trim).is_none_or(|value| {
-                value.is_empty() || (value != "Unknown" && !CURATED_AVIONICS_TYPES.contains(&value))
+                value.is_empty()
+                    || (value != "Unknown" && !CURATED_AVIONICS_TYPES.contains(&value))
+                    || !seen.insert(value)
             })
         })
+        || (types.len() > 1 && seen.contains("Unknown"))
     {
         return Err(format!(
-            "{path}.types must contain only current curated capabilities or Unknown"
+            "{path}.types must contain distinct current curated capabilities, or Unknown by itself"
         ));
     }
     Ok(())
@@ -1141,19 +1279,32 @@ mod tests {
     use super::*;
 
     const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/252742967/1965-cessna-182-skylane-piston-single-aircraft";
+    const CAPTURE_25_URL: &str = "https://www.controller.com/listing/for-sale/257959105/example";
+    const GENERIC_URL: &str = "https://example.test/listing/avionics";
 
     fn controller_html(field: &str) -> String {
         format!(
             r#"<html><head><meta content="Garmin GMA-1347"></head><body>
             <p>Currently hangared at KSAR</p>
-            <div class="detail__specs-wrapper">
-              <div class="detail__specs-label">ADS-B Equipped</div>
-              <div class="detail__specs-value">Yes</div>
-              <div class="detail__specs-label">Avionics/Radios</div>
-              <div class="detail__specs-value">{field}</div>
-            </div>
+            <main id="main-content" class="detail__main-content">
+              <h1 class="detail__title">Test Aircraft</h1>
+              <div class="listing-prices__retail-price">$100,000</div>
+              <div class="detail__specs">
+                <h3 class="detail__specs-heading">Avionics</h3>
+                <div class="detail__specs-wrapper">
+                  <div class="detail__specs-label">ADS-B Equipped</div>
+                  <div class="detail__specs-value">Yes</div>
+                  <div class="detail__specs-label">Avionics/Radios</div>
+                  <div class="detail__specs-value">{field}</div>
+                </div>
+              </div>
+            </main>
             </body></html>"#
         )
+    }
+
+    fn capture_25_html() -> String {
+        include_str!("../../../tests/fixtures/controller/id25_like_listing.html").to_string()
     }
 
     fn recover_exact_role_separated_avionics_quantity(
@@ -1258,7 +1409,7 @@ mod tests {
         let json = r#"{"avionics":[{"manufacturer":"Garmin","model":"G1000","types":["Flight Display"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin G1000 avionics system","source_confidence":"high"}]}"#;
 
         let parsed =
-            validate_unbound_current_avionics_extraction(json, CONTROLLER_URL, &html).unwrap();
+            validate_unbound_current_avionics_extraction(json, GENERIC_URL, &html).unwrap();
 
         assert_eq!(parsed[0].model, "G1000");
     }
@@ -1403,7 +1554,7 @@ mod tests {
                 controller_html("KING Garmin G5 attitude, Garmin G5 HSI"),
             ),
             (
-                CONTROLLER_URL,
+                GENERIC_URL,
                 r#"<html><body>
                     <p>Garmin G5 attitude, Garmin G5 HSI</p>
                     <div class="detail__specs-wrapper">
@@ -1526,11 +1677,14 @@ mod tests {
         let observations = parse_current_avionics_extraction_value(&payload).unwrap();
         let context = ListingEvidenceContext::from_rendered_html(Some(&html));
 
-        assert!(
-            validate_current_avionics_identity_evidence(&observations, &context, html)
-                .unwrap_err()
-                .contains("structurally visible")
-        );
+        assert!(validate_current_avionics_identity_evidence(
+            &observations,
+            &context,
+            "https://example.test/listing/hidden",
+            html,
+        )
+        .unwrap_err()
+        .contains("structurally visible"));
 
         let metadata_payload = installed("Garmin", "G1000", "Garmin G1000 metadata");
         let metadata_observations =
@@ -1538,10 +1692,124 @@ mod tests {
         assert!(validate_current_avionics_identity_evidence(
             &metadata_observations,
             &context,
+            "https://example.test/listing/hidden",
             html
         )
         .unwrap_err()
         .contains("structurally visible"));
+    }
+
+    #[test]
+    fn retained_capture_25_rejects_cross_field_evidence_and_inflated_suite_types() {
+        let html = capture_25_html();
+        let mut payload = serde_json::json!({"avionics": [
+            {
+                "manufacturer": "GARMIN",
+                "model": "G1000 NXI",
+                "types": [
+                    "Integrated Flight Deck", "Flight Display", "COM", "NAV",
+                    "Autopilot", "Weather Radar", "Traffic", "Terrain Awareness"
+                ],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "GARMIN G1000 NXI SVT",
+                "source_confidence": "high"
+            },
+            {
+                "manufacturer": "GARMIN",
+                "model": "GFC 700",
+                "types": ["Autopilot"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "GFC 700 autopilot",
+                "source_confidence": "high"
+            }
+        ]});
+
+        let error = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CAPTURE_25_URL,
+            &html,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("structurally visible source unit"),
+            "{error}"
+        );
+
+        payload["avionics"][0]["source_evidence_text"] = serde_json::json!("GARMIN G1000 NXI");
+        let error = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CAPTURE_25_URL,
+            &html,
+        )
+        .unwrap_err();
+        assert!(error.contains("integrated suite"), "{error}");
+
+        payload["avionics"][0]["types"] = serde_json::json!(["Integrated Flight Deck"]);
+        let observations = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CAPTURE_25_URL,
+            &html,
+        )
+        .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].avionics_types, ["Integrated Flight Deck"]);
+        assert_eq!(observations[1].avionics_types, ["Autopilot"]);
+    }
+
+    #[test]
+    fn integrated_suite_cannot_absorb_a_separately_extracted_component_type() {
+        let html = "<html><body><p>GARMIN G1000 NXI integrated flight deck and autopilot</p><p>GFC 700 autopilot</p></body></html>";
+        let payload = serde_json::json!({"avionics": [
+            {
+                "manufacturer": "Garmin", "model": "G1000 NXi",
+                "types": ["Integrated Flight Deck", "Autopilot"], "quantity": 1,
+                "configuration_action": "installed", "replaces": null,
+                "source_evidence_text": "GARMIN G1000 NXI integrated flight deck and autopilot",
+                "source_confidence": "high"
+            },
+            {
+                "manufacturer": "Garmin", "model": "GFC 700",
+                "types": ["Autopilot"], "quantity": 1,
+                "configuration_action": "installed", "replaces": null,
+                "source_evidence_text": "GFC 700 autopilot", "source_confidence": "high"
+            }
+        ]});
+
+        let error = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            "https://example.test/listing/suite",
+            html,
+        )
+        .unwrap_err();
+        assert!(error.contains("separate product"), "{error}");
+    }
+
+    #[test]
+    fn integrated_suite_additions_require_exact_capability_evidence() {
+        let html = "<html><body><p>Garmin GTN 750 GPS/NAV/COM installed</p></body></html>";
+        let mut payload = installed("Garmin", "GTN 750", "Garmin GTN 750 GPS/NAV/COM");
+        payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
+        validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            "https://example.test/listing/multifunction",
+            html,
+        )
+        .unwrap();
+
+        payload["avionics"][0]["types"] = serde_json::json!(["Integrated Flight Deck", "GPS"]);
+        payload["avionics"][0]["source_evidence_text"] = serde_json::json!("Garmin GTN 750");
+        let html = "<html><body><p>Garmin GTN 750</p></body></html>";
+        let error = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            "https://example.test/listing/multifunction",
+            html,
+        )
+        .unwrap_err();
+        assert!(error.contains("integrated suite"), "{error}");
     }
 
     #[test]
@@ -1558,7 +1826,7 @@ mod tests {
 
             assert!(validate_unbound_current_avionics_extraction(
                 &payload.to_string(),
-                CONTROLLER_URL,
+                GENERIC_URL,
                 &html,
             )
             .unwrap_err()
@@ -1573,12 +1841,9 @@ mod tests {
         let mut payload = installed("Garmin", "GTN 750", evidence);
         payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
 
-        let parsed = validate_unbound_current_avionics_extraction(
-            &payload.to_string(),
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap();
+        let parsed =
+            validate_unbound_current_avionics_extraction(&payload.to_string(), GENERIC_URL, &html)
+                .unwrap();
 
         assert_eq!(parsed[0].model, "GTN 750");
         assert_eq!(parsed[0].avionics_types, ["GPS", "NAV", "COM"]);
@@ -1591,12 +1856,9 @@ mod tests {
         let mut payload = installed("Garmin", "GNS 530W", evidence);
         payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
 
-        let parsed = validate_unbound_current_avionics_extraction(
-            &payload.to_string(),
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap();
+        let parsed =
+            validate_unbound_current_avionics_extraction(&payload.to_string(), GENERIC_URL, &html)
+                .unwrap();
 
         assert_eq!(parsed[0].model, "GNS 530W");
         assert_eq!(parsed[0].avionics_types, ["GPS", "NAV", "COM"]);
@@ -1669,7 +1931,7 @@ mod tests {
             assert!(
                 validate_unbound_current_avionics_extraction(
                     &payload.to_string(),
-                    CONTROLLER_URL,
+                    GENERIC_URL,
                     &html,
                 )
                 .unwrap_err()
@@ -2056,12 +2318,12 @@ mod tests {
         for html in cases {
             let mut payload = installed("Garmin", "GMA 1347", "Garmin GMA 1347");
             let original = payload.clone();
-            assert!(!recover_controller_avionics_evidence_typography(
+            let outcome = recover_controller_avionics_evidence_typography(
                 &mut payload,
                 CONTROLLER_URL,
                 &html,
-            )
-            .unwrap());
+            );
+            assert!(outcome.is_err() || outcome == Ok(false));
             assert_eq!(payload, original);
         }
     }

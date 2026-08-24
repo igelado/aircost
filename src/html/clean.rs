@@ -339,17 +339,120 @@ pub fn listing_body_contains_exact_structurally_visible_text_span(
         text.push_str(node_text);
     }
     let visible = normalize_page_text(&text);
-    visible.match_indices(&evidence).any(|(start, matched)| {
+    exact_text_span_occurs(&visible, &evidence)
+}
+
+/// One parse-once index of structurally visible source-text units in a retained
+/// body.
+///
+/// A unit is the closest block or semantic text container shared by adjacent
+/// visible text nodes. Inline markup inside a paragraph or field value remains
+/// one unit, while sibling blocks, table cells, definition terms/values, and
+/// publisher label/value elements remain separate. This prevents a flattened
+/// whole-page text stream from manufacturing an evidence phrase across field
+/// boundaries.
+#[derive(Debug, Default)]
+pub(crate) struct ListingBodyEvidenceUnits {
+    units: Vec<String>,
+}
+
+impl ListingBodyEvidenceUnits {
+    pub(crate) fn from_html(html: &str) -> Self {
+        let document = Html::parse_document(html);
+        let stylesheet_hidden_nodes = stylesheet_hidden_node_ids(&document);
+        let mut units = Vec::new();
+        let mut current_container = None;
+        let mut current_text = String::new();
+        for node in document.tree.root().descendants() {
+            let Some(node_text) = node.value().as_text() else {
+                continue;
+            };
+            let inside_body = node.ancestors().any(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .is_some_and(|element| element.name() == "body")
+            });
+            if !inside_body {
+                continue;
+            }
+            let Some(container) = node.ancestors().find(|ancestor| {
+                ancestor
+                    .value()
+                    .as_element()
+                    .is_some_and(|element| listing_evidence_text_unit_element(element.name()))
+            }) else {
+                continue;
+            };
+            if publisher_node_is_hidden(node, &stylesheet_hidden_nodes, structurally_hidden_element)
+            {
+                continue;
+            }
+
+            if current_container.is_some_and(|current| current != container.id()) {
+                push_normalized_evidence_unit(&mut units, &mut current_text);
+            }
+            current_container = Some(container.id());
+            if !current_text.is_empty() {
+                current_text.push(' ');
+            }
+            current_text.push_str(node_text);
+        }
+        push_normalized_evidence_unit(&mut units, &mut current_text);
+        Self { units }
+    }
+
+    pub(crate) fn contains_exact_span(&self, evidence: &str) -> bool {
+        let evidence = normalize_page_text(evidence);
+        !evidence.is_empty()
+            && self
+                .units
+                .iter()
+                .any(|unit| exact_text_span_occurs(unit, &evidence))
+    }
+}
+
+fn listing_evidence_text_unit_element(name: &str) -> bool {
+    matches!(name, "body" | "caption" | "td" | "th") || publisher_text_element_starts_line(name)
+}
+
+/// Return whether one evidence value occurs within one structurally visible
+/// source-text unit in the retained body.
+pub fn listing_body_contains_exact_structurally_visible_text_unit_span(
+    html: &str,
+    evidence: &str,
+) -> bool {
+    ListingBodyEvidenceUnits::from_html(html).contains_exact_span(evidence)
+}
+
+fn push_normalized_evidence_unit(units: &mut Vec<String>, text: &mut String) {
+    let unit = normalize_page_text(text);
+    if !unit.is_empty() {
+        units.push(unit);
+    }
+    text.clear();
+}
+
+fn exact_text_span_occurs(source: &str, evidence: &str) -> bool {
+    source.match_indices(evidence).any(|(start, matched)| {
         let end = start + matched.len();
-        visible[..start]
+        source[..start]
             .chars()
             .next_back()
             .is_none_or(|character| !character.is_alphanumeric())
-            && visible[end..]
+            && source[end..]
                 .chars()
                 .next()
                 .is_none_or(|character| !character.is_alphanumeric())
     })
+}
+
+/// Return whether an exact, token-bounded span occurs after publisher text
+/// normalization on both inputs.
+pub(crate) fn exact_normalized_source_span_occurs(source: &str, evidence: &str) -> bool {
+    let source = normalize_page_text(source);
+    let evidence = normalize_page_text(evidence);
+    !evidence.is_empty() && exact_text_span_occurs(&source, &evidence)
 }
 
 fn inline_style_hides_element(style: &str) -> bool {
@@ -491,8 +594,9 @@ fn nearest_char_boundary(text: &str, index: usize) -> usize {
 mod tests {
     use super::{
         clean_listing_html, clean_publisher_source_html,
-        listing_body_contains_exact_structurally_visible_text_span, normalize_source_evidence_span,
-        publisher_text_contains_evidence_span,
+        listing_body_contains_exact_structurally_visible_text_span,
+        listing_body_contains_exact_structurally_visible_text_unit_span,
+        normalize_source_evidence_span, publisher_text_contains_evidence_span,
     };
 
     #[test]
@@ -730,6 +834,51 @@ mod tests {
                 "{rejected:?} must not become listing evidence"
             );
         }
+    }
+
+    #[test]
+    fn listing_evidence_unit_never_crosses_sibling_field_boundaries() {
+        let html = r#"<html><body>
+          <div class="spec-label">Flight Deck Manufacturer/Model</div>
+          <div class="spec-value">GARMIN <strong>G1000 NXI</strong></div>
+          <div class="spec-label">SVT</div>
+          <div class="spec-value">Yes</div>
+          <p>Description: <span>GFC 700</span> autopilot installed.</p>
+          <table><tr><th>Weather Radar</th><td>None</td></tr></table>
+        </body></html>"#;
+
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            html,
+            "GARMIN G1000 NXI SVT"
+        ));
+        assert!(
+            !listing_body_contains_exact_structurally_visible_text_unit_span(
+                html,
+                "GARMIN G1000 NXI SVT"
+            )
+        );
+        assert!(
+            listing_body_contains_exact_structurally_visible_text_unit_span(
+                html,
+                "GARMIN G1000 NXI"
+            )
+        );
+        assert!(listing_body_contains_exact_structurally_visible_text_span(
+            html,
+            "Weather Radar None"
+        ));
+        assert!(
+            !listing_body_contains_exact_structurally_visible_text_unit_span(
+                html,
+                "Weather Radar None"
+            )
+        );
+        assert!(
+            listing_body_contains_exact_structurally_visible_text_unit_span(
+                html,
+                "Description: GFC 700 autopilot installed."
+            )
+        );
     }
 
     #[test]

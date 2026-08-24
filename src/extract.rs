@@ -2293,6 +2293,7 @@ Rules:\n\
 - Do not convert model names to ICAO type designators.\n\
 - avionics must come from the listing text and should include fixed installed avionics only.\n\
 - Each physical avionics product must appear once. Its types array may contain multiple independently supported atomic capabilities; do not emit duplicate product rows merely to represent GPS, transponder, navigation, communications, or other functions separately. Represent a combined NAV/COM unit with both NAV and COM, never a composite NAV/COM type. Use [Unknown] only when the listing gives no usable capability.\n\
+- An Integrated Flight Deck identity may establish that one core category. Every additional type on that suite row must be explicitly named in the same source_evidence_text, and a capability assigned to a separately extracted component must not also be assigned to the suite.\n\
 - When the listing explicitly enumerates multiple installed units of the exact same product (for example unit #1 and unit #2, dual identical radios, or Garmin G5 attitude plus Garmin G5 HSI), emit one avionics row with quantity equal to the supported installed count. Copy one exact source_evidence_text span that covers every counted list item. Do not emit one row per serial position. Distinct complementary attitude and HSI installation roles in adjacent comma- or semicolon-delimited equipment items prove separate physical units; repeated mentions in narrative text, repeated copies of the same role, or different model suffixes do not.\n\
 - Assign only capabilities intrinsic to the identified physical product. Do not copy capabilities of a compatible external display, sensor, antenna, servo, or indicator into the product. In particular, VOR/localizer/glideslope support on a NAV/COM radio establishes NAV, not a separate Navigation Indicator capability; use Navigation Indicator only when the listing identifies an installed CDI, HSI, or indicator product.\n\
 - Weather delivered by satellite, ADS-B/FIS-B, SiriusXM, or another receiver/datalink is a Datalink capability, not Weather Radar. Assign Weather Radar only to an installed airborne radar sensor/system; the word weather by itself never establishes Weather Radar.\n\
@@ -2325,6 +2326,7 @@ Correction rules:\n\
 - Use only fixed installed avionics explicitly supported by the listing text.\n\
 - Emit each physical product exactly once with all and only its intrinsic capabilities and the supported installed quantity.\n\
 - Keep distinct products separate. Never assign an external autopilot, display, sensor, servo, indicator, or receiver capability to another product.\n\
+- An Integrated Flight Deck identity may establish that one core category. Every additional type on that suite row must be explicitly named in the same source_evidence_text, and a capability assigned to a separately extracted component must not also be assigned to the suite.\n\
 - Every source_evidence_text must be one short exact contiguous listing-text span that contains the complete product identity. Never join text across spec-field labels or unrelated equipment entries.\n\
 - Preserve meaningful model suffixes such as W, Xi, NXi, R, and ES.\n\
 - Use configuration_action installed, replaces, or removes exactly as supported; installed requires replaces null.\n\
@@ -4741,6 +4743,8 @@ mod tests {
         assert!(prompt.contains("not a separate Navigation Indicator capability"));
         assert!(prompt.contains("receiver/datalink is a Datalink capability, not Weather Radar"));
         assert!(prompt.contains("word weather by itself never establishes Weather Radar"));
+        assert!(prompt.contains("Every additional type on that suite row must be explicitly named"));
+        assert!(prompt.contains("separately extracted component"));
         assert!(prompt.contains("KMA 20 rather than KMA 20 TSO"));
         assert!(prompt.contains("standalone WAAS immediately before a slash-delimited"));
         assert!(prompt.contains("model GTN 750, types [GPS, NAV, COM]"));
