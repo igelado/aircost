@@ -11862,12 +11862,28 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     async fn whole_listing_resolution_preserves_current_same_case_link_without_global_reuse() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
-        let product_id = insert_approved_product(&db, "WX-500", "WX500", "Weather Radar").await;
+        let product_id =
+            insert_approved_product(&db, "WX-500", "WX500", "Lightning Detection").await;
         let submission_id = insert_review_bound_submission(
             &db,
             user_id,
             listing_id,
-            "<main>Installed L3 WX-500 stormscope</main>",
+            "<main>Installed Garmin WX-500 stormscope</main>",
+        )
+        .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "WX-500",
+                "types": ["Lightning Detection"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Installed Garmin WX-500 stormscope",
+                "source_confidence": "high"
+            }]),
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
@@ -11875,7 +11891,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             INSERT INTO aircraft_sale_listing_avionics (
               aircraft_sale_listing_id, avionics_model_id, quantity, source,
               source_notes, source_confidence, configuration_action
-            ) VALUES (?, ?, 1, 'listing', 'L3 WX-500', 'high', 'installed')
+            ) VALUES (?, ?, 1, 'listing', 'Installed Garmin WX-500 stormscope', 'high', 'installed')
             RETURNING id
             "#,
         )
@@ -12016,6 +12032,25 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             &format!("<main>{evidence}</main>"),
+        )
+        .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "GTN 750Xi",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "replaces",
+                "replaces": {
+                    "manufacturer": "Garmin",
+                    "model": "GNS 430W",
+                    "types": ["GPS"]
+                },
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]),
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
