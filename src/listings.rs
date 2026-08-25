@@ -9442,14 +9442,15 @@ mod tests {
             .await
             .expect("retry should atomically link, authorize, and consume");
 
-        let state: (i64, i64, i64, i64) = sqlx::query_as(
+        let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
             r#"SELECT
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?),
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations authorization
                     JOIN aircraft_sale_listing_avionics link ON link.id = authorization.listing_link_id
                    WHERE link.aircraft_sale_listing_id = ? AND authorization.authorization_kind = 'same_case_grounded'),
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities WHERE listing_id = ?),
-                 (SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?)"#,
+                 (SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?),
+                 (SELECT COUNT(*) FROM avionics_authoritative_source_origins WHERE https_origin = 'https://manufacturer.example')"#,
         )
         .bind(listing_id)
         .bind(listing_id)
@@ -9458,7 +9459,11 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(state, (1, 1, 0, 0));
+        assert_eq!(
+            state,
+            (1, 1, 0, 0, 0),
+            "the exact signed occurrence must not broaden its historical product into global source authority or reuse"
+        );
         let provider_calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
             .fetch_one(pool)
             .await

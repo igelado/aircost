@@ -2820,20 +2820,14 @@ async fn resolve_verified_identity(
             return Ok(AvionicsIdentityOutcome::Approved(stored.value));
         }
         if execution.mode.persists_ordinary_identity() {
-            let persisted = persist_existing_reuse_attestation(
+            let snapshot = complete_grounded_existing_product_resolution(
                 db,
                 existing,
                 &proposed,
                 reviewed_catalog_fingerprint,
             )
-            .await?
-            .ok_or_else(|| {
-                CatalogError::Validation(
-                    "grounded existing-product resolution could not establish its current reuse attestation"
-                        .to_string(),
-                )
-            })?;
-            execution.grounded_catalog_snapshot = Some(persisted.snapshot);
+            .await?;
+            execution.grounded_catalog_snapshot = Some(snapshot);
         }
         return Ok(AvionicsIdentityOutcome::Approved(
             ApprovedAvionicsIdentity {
@@ -6286,22 +6280,25 @@ fn approved_identity_from_verified(
     }
 }
 
-/// Persist fresh authoritative evidence and the current-policy reuse conclusion
-/// for an immutable approved product after a full identity/collision review.
+/// Complete one grounded resolution of an immutable approved product after a
+/// full identity/collision review.
 ///
-/// Canonical identity and capabilities are compared under the catalog lock.
-/// Only then is the non-identity evidence refreshed and its positive cache
-/// fingerprint computed in the same transaction.
-async fn persist_existing_reuse_attestation(
+/// Canonical identity and capabilities are compared under the catalog lock. A
+/// current manufacturer source may refresh the product evidence and global
+/// reuse attestation. When that independent source authorization is absent,
+/// the tentative refresh is rolled back while the transaction-bound original
+/// product and collision snapshot remains available only to the exact grounded
+/// listing case.
+async fn complete_grounded_existing_product_resolution(
     db: &AppDb,
     reviewed_existing: &AvionicsCatalogCandidate,
     identity: &VerifiedIdentity,
     reviewed_catalog_fingerprint: &str,
-) -> CatalogResult<Option<GroundedCatalogPersistence<()>>> {
+) -> CatalogResult<GroundedCatalogSnapshot> {
     let additions = approved_capability_additions(reviewed_existing, identity)?;
     if !additions.is_empty() {
         return Err(CatalogError::Validation(
-            "existing-product reuse attestation cannot skip reviewed capability enrichment"
+            "grounded existing-product resolution cannot skip reviewed capability enrichment"
                 .to_string(),
         ));
     }
@@ -6327,7 +6324,7 @@ async fn persist_existing_reuse_attestation(
             let current_catalog = catalog_candidates_from_rows(current_rows);
             if catalog_fingerprint(&current_catalog) != reviewed_catalog_fingerprint {
                 return Err(CatalogError::Validation(
-                    "avionics catalog changed during Gemini reuse review; retry against the current catalog"
+                    "avionics catalog changed during grounded existing-product review; retry against the current catalog"
                         .to_string(),
                 ));
             }
@@ -6344,10 +6341,11 @@ async fn persist_existing_reuse_attestation(
                 || !approved_capability_additions(current, identity)?.is_empty()
             {
                 return Err(CatalogError::Validation(
-                    "approved catalog identity changed during Gemini reuse review; retry against the current catalog"
+                    "approved catalog identity changed during grounded existing-product review; retry against the current catalog"
                         .to_string(),
                 ));
             }
+            let original_snapshot = $snapshot(db, &mut transaction, reviewed_existing.id).await?;
             let reuse_attested = $refresh_grounded(
                 db,
                 &mut transaction,
@@ -6360,15 +6358,15 @@ async fn persist_existing_reuse_attestation(
             if reuse_attested {
                 let snapshot = $snapshot(db, &mut transaction, reviewed_existing.id).await?;
                 transaction.commit().await?;
-                (true, Some(snapshot))
+                snapshot
             } else {
                 transaction.rollback().await?;
-                (false, None)
+                original_snapshot
             }
         }};
     }
 
-    let (reuse_attested, snapshot) = match db.backend() {
+    let snapshot = match db.backend() {
         DatabaseBackend::Sqlite(pool) => {
             attest!(
                 pool,
@@ -6382,16 +6380,7 @@ async fn persist_existing_reuse_attestation(
             grounded_catalog_snapshot_postgres
         ),
     };
-    match (reuse_attested, snapshot) {
-        (true, Some(snapshot)) => Ok(Some(GroundedCatalogPersistence {
-            value: (),
-            snapshot,
-        })),
-        (false, None) => Ok(None),
-        _ => Err(CatalogError::Validation(
-            "grounded reuse attestation returned an inconsistent catalog snapshot".to_string(),
-        )),
-    }
+    Ok(snapshot)
 }
 
 async fn persist_approved_capability_enrichment(
@@ -7038,21 +7027,21 @@ mod tests {
         avionics_model_identity_relation, candidate_triage_plan, candidate_triage_selection,
         canonical_avionics_types_for_label, canonical_types_from_response, catalog_fingerprint,
         collision_correction_plan, collision_response_issues,
-        collision_reviews_with_direct_source_proofs, complete_manufacturer_collision_family,
-        deterministic_generic_avionics_rejection_reason,
+        collision_reviews_with_direct_source_proofs, complete_grounded_existing_product_resolution,
+        complete_manufacturer_collision_family, deterministic_generic_avionics_rejection_reason,
         deterministic_graph_approved_identity_from_source,
         evidence_is_bound_to_direct_source_proof, exact_compact_identity_is_present,
         exact_product_identity_signal_is_present, expanded_collision_context,
         expanded_complete_triage_collision_context, explicit_authoritative_direct_source_plan,
         generic_concreteness_rejection_reason, globally_unique_exact_model_local_match_core,
-        grounded_consolidation_preview_block, known_approved_local_match,
-        load_active_collision_catalog_rows, load_catalog_candidates,
+        grounded_consolidation_preview_block, grounded_resolution_receipt_seed,
+        known_approved_local_match, load_active_collision_catalog_rows, load_catalog_candidates,
         load_known_approved_candidates, load_review_catalog_candidates,
         manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
         model_identity_relation_score, nonpositive_identity_outcome,
         opportunistic_authoritative_direct_source_plan, persist_approved_capability_enrichment,
-        persist_approved_identity, persist_existing_reuse_attestation,
-        plan_avionics_identity_verification_route, proposal_attestation_with_direct_source_proofs,
+        persist_approved_identity, plan_avionics_identity_verification_route,
+        proposal_attestation_with_direct_source_proofs,
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_avionics_identity,
         resolve_verified_catalog_avionics_identity, resolve_verified_local_avionics_identity,
@@ -12762,6 +12751,83 @@ mod tests {
                 .is_none(),
             "an unattested approval must not be selected by the local fast path"
         );
+
+        let reviewed_catalog = load_catalog_candidates(&db)
+            .await
+            .expect("the approved historical product should remain reviewable");
+        let reviewed = reviewed_catalog
+            .iter()
+            .find(|candidate| candidate.id == stored.id)
+            .expect("the exact approved historical product should remain in the catalog")
+            .clone();
+        let reviewed_fingerprint = catalog_fingerprint(&reviewed_catalog);
+        let exact_case_snapshot = complete_grounded_existing_product_resolution(
+            &db,
+            &reviewed,
+            &identity,
+            &reviewed_fingerprint,
+        )
+        .await
+        .expect("fresh exact grounding should remain usable without global source authority");
+        assert_eq!(exact_case_snapshot.avionics_model_id, stored.id);
+        let capability = grounded_resolution_receipt_seed(&request, &stored).bind_catalog_snapshot(
+            exact_case_snapshot.product_fingerprint.clone(),
+            exact_case_snapshot.collision_closure_sha256.clone(),
+        );
+        assert_eq!(capability.avionics_model_id(), stored.id);
+        assert_eq!(capability.requested_quantity(), 1);
+        assert_eq!(capability.request_sha256().len(), 64);
+        assert_eq!(capability.capability_sha256().len(), 64);
+        assert_eq!(capability.product_fingerprint().len(), 64);
+        assert_eq!(capability.collision_closure_sha256().len(), 64);
+        assert_eq!(capability.bind(73).listing_id, 73);
+
+        let mut capability_expansion = identity.clone();
+        capability_expansion.canonical_types.push("NAV".to_string());
+        let expansion_error = complete_grounded_existing_product_resolution(
+            &db,
+            &reviewed,
+            &capability_expansion,
+            &reviewed_fingerprint,
+        )
+        .await
+        .expect_err("an exact-case snapshot cannot bypass capability enrichment");
+        assert!(expansion_error
+            .to_string()
+            .contains("cannot skip reviewed capability enrichment"));
+
+        let stale_error = complete_grounded_existing_product_resolution(
+            &db,
+            &reviewed,
+            &identity,
+            &"f".repeat(64),
+        )
+        .await
+        .expect_err("a stale catalog review cannot mint an exact-case capability");
+        assert!(stale_error.to_string().contains("catalog changed"));
+
+        let source_origins_after_exact_case: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_authoritative_source_origins WHERE https_origin = 'https://archive.example'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("source origins should remain independently curated");
+        assert_eq!(source_origins_after_exact_case, 0);
+        let reuse_after_exact_case: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(stored.id)
+        .fetch_one(pool)
+        .await
+        .expect("reuse attestations should remain queryable");
+        assert_eq!(reuse_after_exact_case, 0);
+        assert!(
+            resolve_verified_local_avionics_identity(&db, &request)
+                .await
+                .expect("the local resolver should remain available")
+                .is_none(),
+            "an exact-case capability must not broaden the product into global local reuse"
+        );
     }
 
     #[tokio::test]
@@ -13111,11 +13177,14 @@ mod tests {
         fresh.identity_evidence =
             "The current Garmin manual identifies the exact GTX 345R product.".to_string();
         fresh.grounded_claim_source_urls = vec![fresh.identity_source_url.clone()];
-        let reuse_attested =
-            persist_existing_reuse_attestation(&db, &reviewed, &fresh, &reviewed_fingerprint)
-                .await
-                .expect("fresh automated grounding should commit");
-        assert!(reuse_attested.is_some());
+        complete_grounded_existing_product_resolution(
+            &db,
+            &reviewed,
+            &fresh,
+            &reviewed_fingerprint,
+        )
+        .await
+        .expect("fresh automated grounding should commit");
 
         let persisted: (String, String, String, String, String, String, String) = sqlx::query_as(
             r#"
@@ -13165,7 +13234,7 @@ mod tests {
         unauthorized.identity_source_title = "Unrelated product page".to_string();
         unauthorized.identity_evidence = "An unrelated source mentions GTX 345R.".to_string();
         unauthorized.grounded_claim_source_urls = vec![unauthorized.identity_source_url.clone()];
-        let reuse_attested = persist_existing_reuse_attestation(
+        complete_grounded_existing_product_resolution(
             &db,
             &reviewed,
             &unauthorized,
@@ -13173,7 +13242,6 @@ mod tests {
         )
         .await
         .expect("an unauthorized origin should remain usable only for its grounded case");
-        assert!(reuse_attested.is_none());
         let evidence_after_rollback: (String, String, String) = sqlx::query_as(
             r#"
             SELECT identity_source_url, identity_source_title, identity_evidence_text
