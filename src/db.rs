@@ -18012,6 +18012,41 @@ mod tests {
         (capabilities, authorizations)
     }
 
+    async fn postgres_grounded_authorization_rows(pool: &sqlx::PgPool) -> (String, String) {
+        let capabilities = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT COALESCE(
+              jsonb_agg(to_jsonb(row_value) ORDER BY
+                row_value.listing_id, row_value.plugin_submission_id,
+                row_value.occurrence_index, row_value.occurrence_role
+              ),
+              '[]'::jsonb
+            )::text
+            FROM ONLY public.aircraft_sale_listing_avionics_grounded_capabilities
+              AS row_value
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let authorizations = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT COALESCE(
+              jsonb_agg(to_jsonb(row_value) ORDER BY
+                row_value.listing_link_id, row_value.association_role
+              ),
+              '[]'::jsonb
+            )::text
+            FROM ONLY public.aircraft_sale_listing_avionics_link_authorizations
+              AS row_value
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (capabilities, authorizations)
+    }
+
     #[tokio::test]
     async fn sqlite_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly() {
         let options = "sqlite::memory:"
@@ -18397,6 +18432,289 @@ mod tests {
             .unwrap(),
             hostile_authorization_trigger
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO public.avionics_manufacturers (id, name, normalized_name)
+            VALUES (92001, 'Rerun Test Avionics', 'rerun test avionics');
+            INSERT INTO public.avionics_manufacturer_identities (
+              id, canonical_name, normalized_identity_key,
+              identity_evidence_kind, identity_source_url,
+              identity_source_title, identity_evidence_text, identity_confidence
+            ) VALUES (
+              92002, 'Rerun Test Avionics', 'reruntestavionics',
+              'authoritative_reference', 'https://rerun.example/catalog',
+              'Rerun manufacturer catalog',
+              'The manufacturer catalog establishes the test identity.',
+              'very_high'
+            );
+            INSERT INTO public.avionics_manufacturer_identity_memberships (
+              avionics_manufacturer_id, avionics_manufacturer_identity_id,
+              membership_basis, normalized_name_key, evidence_source_url,
+              evidence_source_title, evidence_text, evidence_confidence
+            ) VALUES (
+              92001, 92002, 'authoritative_primary', 'reruntestavionics',
+              'https://rerun.example/catalog', 'Rerun manufacturer catalog',
+              'The manufacturer catalog establishes the exact manufacturer.',
+              'very_high'
+            );
+            INSERT INTO public.avionics_authoritative_source_origins (
+              id, authority_kind, avionics_manufacturer_identity_id,
+              https_origin, evidence_source_url, evidence_source_title,
+              evidence_text, approval_basis, approval_reason
+            ) VALUES (
+              92003, 'manufacturer_primary', 92002,
+              'https://rerun.example', 'https://rerun.example/catalog',
+              'Rerun manufacturer catalog',
+              'The primary catalog identifies the exact test product.',
+              'curated_bootstrap', 'Exact migration rerun regression fixture'
+            );
+            INSERT INTO public.avionics_types (id, name, normalized_name)
+            VALUES (92004, 'Rerun Test Type', 'rerun test type');
+            INSERT INTO public.avionics_models (
+              id, avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier, identity_source_url,
+              identity_source_title, identity_evidence_text,
+              identity_evidence_kind, identity_confidence
+            ) VALUES (
+              92005, 92001, 'Exact Unit', 'exact unit',
+              'manufacturer_model_number', 'EXACT-UNIT', 'exact-unit',
+              'https://rerun.example/catalog', 'Rerun manufacturer catalog',
+              'The primary catalog identifies the exact unit model.',
+              'authoritative_reference', 'very_high'
+            );
+            INSERT INTO public.avionics_model_types (
+              avionics_model_id, avionics_type_id
+            ) VALUES (92005, 92004);
+            UPDATE public.avionics_models
+            SET catalog_status = 'approved',
+                catalog_reviewed_at = '2026-08-25 09:00:00'
+            WHERE id = 92005;
+            INSERT INTO public.avionics_product_reuse_attestations (
+              avionics_model_id, avionics_authoritative_source_origin_id,
+              policy_version, product_fingerprint, attested_at
+            ) VALUES (
+              92005, 92003, 'avionics_reuse_v2',
+              '9999999999999999999999999999999999999999999999999999999999999999',
+              '2026-08-25 09:01:00'
+            );
+
+            INSERT INTO public.aircraft_sale_listings (
+              id, aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            )
+            SELECT 92006, -1, id, 'https://rerun.example/listing/one',
+                   2020, 250000, 500
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.aircraft_sale_listings (
+              id, aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            )
+            SELECT 92007, -1, id, 'https://rerun.example/listing/two',
+                   2021, 260000, 450
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.plugin_installs (id, user_id, public_key_base64)
+            SELECT 92008, id, 'rerun-test-key'
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.plugin_submissions (
+              id, user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              extraction_error, canonical_listing_id, submitted_at
+            )
+            SELECT 92009, id, 92008, 'https://rerun.example/listing/one',
+                   '<p>Exact Unit</p>',
+                   'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                   'rerun-signature-one', '{"avionics":[]}', NULL, 92006,
+                   '2026-08-25 09:02:00'
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.plugin_submissions (
+              id, user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              extraction_error, canonical_listing_id, submitted_at
+            )
+            SELECT 92010, id, 92008, 'https://rerun.example/listing/two',
+                   '<p>Exact Unit</p>',
+                   'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                   'rerun-signature-two', '{"avionics":[]}', NULL, 92007,
+                   '2026-08-25 09:03:00'
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.aircraft_sale_listing_avionics (
+              id, aircraft_sale_listing_id, avionics_model_id, quantity,
+              source, source_notes, configuration_action, source_confidence,
+              created_at, updated_at
+            ) VALUES
+              (92011, 92006, 92005, 1, 'listing', 'Exact Unit', 'installed',
+               'high', '2026-08-25 09:04:00', '2026-08-25 09:04:00'),
+              (92012, 92007, 92005, 1, 'listing', 'Exact Unit', 'installed',
+               'high', '2026-08-25 09:05:00', '2026-08-25 09:05:00');
+
+            INSERT INTO public.aircraft_sale_listing_avionics_grounded_capabilities (
+              listing_id, plugin_submission_id, occurrence_index,
+              occurrence_role, avionics_model_id, requested_quantity,
+              configuration_action, request_sha256, capability_sha256,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              extracted_listing_sha256, product_fingerprint,
+              collision_closure_sha256, source_revocation_count,
+              policy_version, created_at
+            ) VALUES (
+              92006, 92009, 3, 'primary', 92005, 2, 'installed',
+              '1111111111111111111111111111111111111111111111111111111111111111',
+              '2222222222222222222222222222222222222222222222222222222222222222',
+              '3333333333333333333333333333333333333333333333333333333333333333',
+              'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+              '4444444444444444444444444444444444444444444444444444444444444444',
+              '5555555555555555555555555555555555555555555555555555555555555555',
+              '6666666666666666666666666666666666666666666666666666666666666666',
+              0, 'listing_avionics_grounded_capability',
+              '2026-08-25 09:06:00'
+            );
+            INSERT INTO public.aircraft_sale_listing_avionics_link_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, source_revocation_count,
+              policy_version, authorized_at
+            ) VALUES
+              (92011, 'installed', 92005, 'same_case_grounded',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '5555555555555555555555555555555555555555555555555555555555555555',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+               92009,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               0, 'listing_avionics_authorization',
+               '2026-08-25 09:07:00'),
+              (92012, 'installed', 92005, 'manufacturer_reuse',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '9999999999999999999999999999999999999999999999999999999999999999',
+               NULL,
+               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+               NULL, NULL,
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               NULL, 'listing_avionics_authorization',
+               '2026-08-25 09:08:00');
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("nonempty exact PostgreSQL migration fixture should seed");
+
+        db.ensure_required_migrations()
+            .await
+            .expect("the exact pre-rerun PostgreSQL state should pass startup");
+        let before = postgres_grounded_authorization_rows(pool).await;
+        let receipt_before: (i64, String, String) = sqlx::query_as(
+            "SELECT contract_version::bigint, contract_fingerprint, installed_at \
+             FROM ONLY public.schema_migration_contracts WHERE migration_name = $1",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        for rerun in 1..=2 {
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL)
+                .execute(pool)
+                .await
+                .unwrap_or_else(|error| panic!("exact PostgreSQL rerun {rerun} failed: {error}"));
+            assert_eq!(postgres_grounded_authorization_rows(pool).await, before);
+            let receipt_after: (i64, String, String) = sqlx::query_as(
+                "SELECT contract_version::bigint, contract_fingerprint, installed_at \
+                 FROM ONLY public.schema_migration_contracts WHERE migration_name = $1",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(receipt_after, receipt_before);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM ONLY public.schema_migration_contracts \
+                     WHERE migration_name = $1",
+                )
+                .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+                1
+            );
+        }
+
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                r#"
+                SELECT COUNT(*)::bigint,
+                       COUNT(*) FILTER (WHERE NOT constraint_row.convalidated)::bigint
+                FROM pg_catalog.pg_constraint constraint_row
+                WHERE constraint_row.contype = 'f'
+                  AND constraint_row.conrelid IN (
+                    pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                    ),
+                    pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_link_authorizations'
+                    )
+                  )
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            (6, 0)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)::bigint
+                FROM (
+                  SELECT capability.listing_id
+                  FROM ONLY public.aircraft_sale_listing_avionics_grounded_capabilities AS capability
+                  LEFT JOIN public.aircraft_sale_listings listing
+                    ON listing.id = capability.listing_id
+                  LEFT JOIN public.plugin_submissions submission
+                    ON submission.id = capability.plugin_submission_id
+                  LEFT JOIN public.avionics_models model
+                    ON model.id = capability.avionics_model_id
+                  WHERE listing.id IS NULL OR submission.id IS NULL OR model.id IS NULL
+                  UNION ALL
+                  SELECT authorization_row.listing_link_id
+                  FROM ONLY public.aircraft_sale_listing_avionics_link_authorizations AS authorization_row
+                  LEFT JOIN public.aircraft_sale_listing_avionics link
+                    ON link.id = authorization_row.listing_link_id
+                  LEFT JOIN public.avionics_models model
+                    ON model.id = authorization_row.avionics_model_id
+                  LEFT JOIN public.plugin_submissions submission
+                    ON submission.id = authorization_row.plugin_submission_id
+                  WHERE link.id IS NULL OR model.id IS NULL
+                    OR (authorization_row.plugin_submission_id IS NOT NULL
+                        AND submission.id IS NULL)
+                ) orphan
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            0
+        );
+        db.ensure_required_migrations()
+            .await
+            .expect("startup should accept the preserved exact PostgreSQL state");
     }
 
     async fn assert_corrupt_grounded_capability_schema_rejected(statements: &[&str]) {
