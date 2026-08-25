@@ -94,7 +94,6 @@ const MATERIALIZATION_TABLES: &[&str] = &[
 pub struct CatalogSeedReport {
     pub dry_run: bool,
     pub provider_calls: usize,
-    pub projection_version: u32,
     pub projection_fingerprint_sha256: String,
     pub projection_table_counts: BTreeMap<String, usize>,
     pub required_user_count: usize,
@@ -131,7 +130,7 @@ pub(crate) async fn seed_verified_catalog(
     let projection = CurrentCatalogProjection::load(source).await?;
     if projection.fingerprint_sha256() != expected_fingerprint_sha256 {
         bail!(
-            "prepared catalog fingerprint {} differs from required fingerprint {}",
+            "source catalog fingerprint {} differs from required fingerprint {}",
             projection.fingerprint_sha256(),
             expected_fingerprint_sha256
         );
@@ -151,7 +150,6 @@ pub(crate) async fn seed_verified_catalog(
     Ok(CatalogSeedReport {
         dry_run: !apply,
         provider_calls: 0,
-        projection_version: summary.version,
         projection_fingerprint_sha256: summary.fingerprint_sha256.clone(),
         projection_table_counts: summary.table_counts.clone(),
         required_user_count: summary.required_users.len(),
@@ -1279,6 +1277,9 @@ mod tests {
         assert!(!report.dry_run);
         assert_eq!(report.provider_calls, 0);
         assert_eq!(report.retained_capture_count, 1);
+        let serialized_report = serde_json::to_value(&report).unwrap();
+        assert!(serialized_report.get("version").is_none());
+        assert!(serialized_report.get("projection_version").is_none());
         assert_eq!(sqlite_replay_boundary(pool).await, replay_before);
         projection.require_reloaded_match(&target).await.unwrap();
         let error = seed_verified_catalog(&source, &target, projection.fingerprint_sha256(), true)

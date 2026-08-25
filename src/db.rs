@@ -241,8 +241,10 @@ const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
     "ccc63aa23f2579ec5cec682bf1493a13eb73829718936b5890bd84de51bb828a";
 const LISTING_REPLAY_RUNS_MIGRATION: &str = "20260819_listing_replay_runs";
 const LISTING_REPLAY_RUNS_CONTRACT_VERSION: i64 = 1;
+// SHA-256 of
+// `20260819_listing_replay_runs:unversioned-manifest-identity:exact-replay-ledger-contract`.
 const LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT: &str =
-    "ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1";
+    "41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a";
 const POSTGRES_LISTING_REPLAY_CHECKS_FINGERPRINT: &str =
     "36cb3b5e9642cedfe6e0b2d92c03864fc9ff9cc2d54ee64348f8fca67d567f40";
 const POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT: &str = "7e885abd1d361c7c831c84e5e3a58e1d";
@@ -6483,17 +6485,16 @@ impl AppDb {
                     ) AS (
                       VALUES
                         ('listing_replay_runs', 1, 'id', 'bigint', TRUE, 'd', ''),
-                        ('listing_replay_runs', 2, 'manifest_version', 'bigint', TRUE, '', ''),
-                        ('listing_replay_runs', 3, 'manifest_sha256', 'text', TRUE, '', ''),
-                        ('listing_replay_runs', 4, 'manifest_capture_count', 'bigint', TRUE, '', ''),
-                        ('listing_replay_runs', 5, 'status', 'text', TRUE, '', '''queued''::text'),
-                        ('listing_replay_runs', 6, 'active_phase', 'text', FALSE, '', ''),
-                        ('listing_replay_runs', 7, 'owner_token', 'text', FALSE, '', ''),
-                        ('listing_replay_runs', 8, 'heartbeat_at_epoch_seconds', 'bigint', FALSE, '', ''),
-                        ('listing_replay_runs', 9, 'started_at', 'text', FALSE, '', ''),
-                        ('listing_replay_runs', 10, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
-                        ('listing_replay_runs', 11, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
-                        ('listing_replay_runs', 12, 'completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 2, 'manifest_sha256', 'text', TRUE, '', ''),
+                        ('listing_replay_runs', 3, 'manifest_capture_count', 'bigint', TRUE, '', ''),
+                        ('listing_replay_runs', 4, 'status', 'text', TRUE, '', '''queued''::text'),
+                        ('listing_replay_runs', 5, 'active_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 6, 'owner_token', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 7, 'heartbeat_at_epoch_seconds', 'bigint', FALSE, '', ''),
+                        ('listing_replay_runs', 8, 'started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 9, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_runs', 10, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_runs', 11, 'completed_at', 'text', FALSE, '', ''),
                         ('listing_replay_run_items', 1, 'id', 'bigint', TRUE, 'd', ''),
                         ('listing_replay_run_items', 2, 'run_id', 'bigint', TRUE, '', ''),
                         ('listing_replay_run_items', 3, 'plugin_submission_id', 'bigint', TRUE, '', ''),
@@ -6865,7 +6866,6 @@ impl AppDb {
                         AND constraint_definition.contype = 'f'
                     ), required_check_fragments(relation_name, fragment) AS (
                       VALUES
-                        ('listing_replay_runs', 'manifest_version > 0'),
                         ('listing_replay_runs', '^[0-9a-f]{64}$'),
                         ('listing_replay_runs', 'manifest_capture_count > 0'),
                         ('listing_replay_runs', 'status = ANY'),
@@ -7296,7 +7296,7 @@ impl AppDb {
                           AND child_columns = 'aircraft_sale_listing_id' AND parent_columns = 'id'
                           AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
                           AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
-                      AND (SELECT COUNT(*) = 7 FROM replay_checks
+                      AND (SELECT COUNT(*) = 6 FROM replay_checks
                            WHERE relation_name = 'listing_replay_runs')
                       AND (SELECT COUNT(*) = 20 FROM replay_checks
                            WHERE relation_name = 'listing_replay_run_items')
@@ -11757,7 +11757,7 @@ mod tests {
         .await
         .unwrap();
         let run_id: i64 = sqlx::query_scalar(
-            "INSERT INTO listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, ?, 3) RETURNING id",
+            "INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count) VALUES (?, 3) RETURNING id",
         )
         .bind("a".repeat(64))
         .fetch_one(&mut connection)
@@ -12104,7 +12104,7 @@ mod tests {
         .await
         .unwrap();
         let run_id: i64 = sqlx::query_scalar(
-            "INSERT INTO listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, ?, 1) RETURNING id",
+            "INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count) VALUES (?, 1) RETURNING id",
         )
         .bind("a".repeat(64))
         .fetch_one(&mut connection)
@@ -12221,6 +12221,26 @@ mod tests {
 
     #[test]
     fn postgres_listing_replay_migration_is_public_qualified() {
+        let table = "listing_replay_runs";
+        let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
+        assert!(!sqlite_columns
+            .iter()
+            .any(|column| column == "manifest_version"));
+        assert_eq!(
+            sqlite_columns,
+            table_columns(POSTGRES_SCHEMA_SQL, table),
+            "SQLite/Postgres schema column mismatch for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(LISTING_REPLAY_RUNS_SQLITE_MIGRATION_SQL, table),
+            "canonical schema and SQLite migration disagree for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(LISTING_REPLAY_RUNS_POSTGRES_MIGRATION_SQL, table),
+            "canonical schema and Postgres migration disagree for {table}"
+        );
         for required in [
             "public.schema_migration_contracts",
             "public.listing_replay_runs",
@@ -12244,6 +12264,7 @@ mod tests {
         ] {
             assert!(definition.contains(LISTING_REPLAY_RUNS_MIGRATION));
             assert!(definition.contains(LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT));
+            assert!(!definition.contains("manifest_version"));
             assert!(definition.contains("listing_replay_runs"));
             assert!(definition.contains("listing_replay_run_items"));
             let marker = definition
@@ -15698,7 +15719,7 @@ mod tests {
         .await
         .unwrap();
         let run_id: i64 = sqlx::query_scalar(
-            "INSERT INTO public.listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, $1, 2) RETURNING id",
+            "INSERT INTO public.listing_replay_runs (manifest_sha256, manifest_capture_count) VALUES ($1, 2) RETURNING id",
         )
         .bind("b".repeat(64))
         .fetch_one(pool)

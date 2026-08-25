@@ -16,8 +16,15 @@ use crate::extract::validate_source_url;
 use crate::plugin::{sha256_hex, verify_submission_signature};
 
 pub mod catalog;
+pub mod export;
 pub mod run;
-pub mod source;
+
+pub use export::{
+    export_replay_manifest, CaptureReadiness, DatabaseReadiness, ReadinessCheckStatus,
+    ReadinessDatabaseBackend, ReadinessIssue, ReadinessIssueCode, ReadinessSeverity,
+    ReplayCaptureSelection, ReplayManifestExport, ReplayManifestExportRequest,
+    ReplaySourceInventory, ReplaySourceReadinessReport,
+};
 
 pub use crate::listing::avionics::disposition::OccurrenceDispositionReconciliation;
 
@@ -38,18 +45,18 @@ pub async fn reconcile_replay_occurrence_dispositions(
     .await
 }
 
-const MANIFEST_VERSION: u32 = 1;
-const MANIFEST_HASH_DOMAIN: &[u8] = b"aircost:trusted-capture-manifest:v1\0";
+const MANIFEST_HASH_DOMAIN: &[u8] = b"aircost:trusted-capture-manifest\0";
 const MAX_CAPTURE_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedCaptureManifest {
-    pub version: u32,
     pub captures: Vec<TrustedCaptureEntry>,
     pub manifest_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedCaptureEntry {
     pub submission_id: i64,
     pub user_id: i64,
@@ -75,50 +82,6 @@ pub struct CaptureImportReport {
     pub imported_capture_count: usize,
     pub derived_fields_reset: bool,
     pub dry_run: bool,
-}
-
-pub async fn trusted_bound_capture_ids(source: &AppDb) -> Result<Vec<i64>, String> {
-    let ambiguous_sql = source.sql(
-        r#"
-        SELECT listing.id
-        FROM aircraft_sale_listings listing
-        LEFT JOIN plugin_submissions submission
-          ON submission.canonical_listing_id = listing.id
-        GROUP BY listing.id
-        HAVING COUNT(submission.id) <> 1
-        ORDER BY listing.id
-        "#,
-    );
-    let ambiguous: Vec<i64> = match source.backend() {
-        DatabaseBackend::Sqlite(pool) => sqlx::query_scalar(&ambiguous_sql).fetch_all(pool).await,
-        DatabaseBackend::Postgres(pool) => sqlx::query_scalar(&ambiguous_sql).fetch_all(pool).await,
-    }
-    .map_err(database_error)?;
-    if !ambiguous.is_empty() {
-        return Err(format!(
-            "each replay listing must have exactly one bound capture; ambiguous listing IDs: {}",
-            ambiguous
-                .iter()
-                .map(i64::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        ));
-    }
-    let selected_sql = source.sql(
-        r#"
-        SELECT submission.id
-        FROM aircraft_sale_listings listing
-        JOIN plugin_submissions submission
-          ON submission.canonical_listing_id = listing.id
-        ORDER BY listing.id
-        "#,
-    );
-    let selected = match source.backend() {
-        DatabaseBackend::Sqlite(pool) => sqlx::query_scalar(&selected_sql).fetch_all(pool).await,
-        DatabaseBackend::Postgres(pool) => sqlx::query_scalar(&selected_sql).fetch_all(pool).await,
-    }
-    .map_err(database_error)?;
-    validated_selection(&selected)
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -186,28 +149,22 @@ pub async fn build_trusted_capture_manifest(
     source: &AppDb,
     submission_ids: &[i64],
 ) -> Result<TrustedCaptureManifest, String> {
-    let selection = validated_selection(submission_ids)?;
-    let mut captures = Vec::with_capacity(selection.len());
-    for submission_id in selection {
-        let row = load_source_capture(source, submission_id).await?;
-        validate_source_capture(&row)?;
-        captures.push(entry_from_row(&row));
-    }
-    let manifest_sha256 = manifest_fingerprint(&captures)?;
-    Ok(TrustedCaptureManifest {
-        version: MANIFEST_VERSION,
-        captures,
-        manifest_sha256,
+    let export = export_replay_manifest(
+        source,
+        ReplayManifestExportRequest {
+            selection: ReplayCaptureSelection::SubmissionIds(submission_ids.to_vec()),
+        },
+    )
+    .await?;
+    export.manifest.ok_or_else(|| {
+        format!(
+            "selected captures are not ready for replay manifest export (blocking_issues={}, omitted_issues={})",
+            export.readiness.blocking_issue_count, export.readiness.omitted_issue_count
+        )
     })
 }
 
 pub fn validate_trusted_capture_manifest(manifest: &TrustedCaptureManifest) -> Result<(), String> {
-    if manifest.version != MANIFEST_VERSION {
-        return Err(format!(
-            "unsupported trusted capture manifest version {}",
-            manifest.version
-        ));
-    }
     let ids = manifest
         .captures
         .iter()
@@ -574,16 +531,8 @@ mod tests {
     use super::*;
     use crate::plugin::signature_message;
 
-    #[test]
-    fn manifest_requires_explicit_unique_sorted_ids() {
-        assert!(validated_selection(&[]).is_err());
-        assert!(validated_selection(&[1, 1]).is_err());
-        assert_eq!(validated_selection(&[3, 1, 2]).unwrap(), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn manifest_fingerprint_detects_metadata_changes() {
-        let mut entry = TrustedCaptureEntry {
+    fn fixture_manifest_entry() -> TrustedCaptureEntry {
+        TrustedCaptureEntry {
             submission_id: 1,
             user_id: 1,
             user_email: "owner@example.test".to_string(),
@@ -598,10 +547,57 @@ mod tests {
             submitted_at: "2026-01-02".to_string(),
             rendered_html_sha256: "a".repeat(64),
             signature_base64: "signature".to_string(),
-        };
+        }
+    }
+
+    #[test]
+    fn manifest_requires_explicit_unique_sorted_ids() {
+        assert!(validated_selection(&[]).is_err());
+        assert!(validated_selection(&[1, 1]).is_err());
+        assert_eq!(validated_selection(&[3, 1, 2]).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn manifest_fingerprint_detects_metadata_changes() {
+        let mut entry = fixture_manifest_entry();
         let before = manifest_fingerprint(&[entry.clone()]).unwrap();
         entry.submitted_at = "2026-01-03".to_string();
         assert_ne!(before, manifest_fingerprint(&[entry]).unwrap());
+    }
+
+    #[test]
+    fn manifest_fingerprint_uses_the_unversioned_domain() {
+        let entries = vec![fixture_manifest_entry()];
+        let encoded = serde_json::to_vec(&entries).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(b"aircost:trusted-capture-manifest\0");
+        expected.update(encoded);
+        assert_eq!(
+            manifest_fingerprint(&entries).unwrap(),
+            format!("{:x}", expected.finalize())
+        );
+    }
+
+    #[test]
+    fn manifest_json_is_unversioned_and_rejects_unknown_fields() {
+        let entries = vec![fixture_manifest_entry()];
+        let manifest = TrustedCaptureManifest {
+            manifest_sha256: manifest_fingerprint(&entries).unwrap(),
+            captures: entries,
+        };
+        let value = serde_json::to_value(&manifest).unwrap();
+        assert!(value.get("version").is_none());
+
+        let mut unknown_manifest = value.clone();
+        unknown_manifest
+            .as_object_mut()
+            .unwrap()
+            .insert("version".to_string(), serde_json::json!(1));
+        assert!(serde_json::from_value::<TrustedCaptureManifest>(unknown_manifest).is_err());
+
+        let mut unknown_entry = value;
+        unknown_entry["captures"][0]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TrustedCaptureManifest>(unknown_entry).is_err());
     }
 
     #[tokio::test]
@@ -612,13 +608,20 @@ mod tests {
         let DatabaseBackend::Sqlite(source_pool) = source.backend() else {
             unreachable!()
         };
+        sqlx::query(
+            "UPDATE users SET created_at = '2026-07-01 00:00:00', updated_at = '2026-07-02 00:00:00' WHERE id = ?",
+        )
+        .bind(user.id)
+        .execute(source_pool)
+        .await
+        .unwrap();
         let rng = SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
         let keys = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
             .unwrap();
         let public_key = BASE64_STANDARD.encode(keys.public_key().as_ref());
         let install_id: i64 = sqlx::query_scalar(
-            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, ?) RETURNING id",
+            "INSERT INTO plugin_installs (user_id, public_key_base64, created_at) VALUES (?, ?, '2026-07-03 00:00:00') RETURNING id",
         )
         .bind(user.id)
         .bind(public_key)
