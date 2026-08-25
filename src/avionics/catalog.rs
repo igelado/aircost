@@ -56,11 +56,11 @@ const CANDIDATE_LIMIT: usize = 16;
 const COLLISION_CANDIDATE_LIMIT: usize = 32;
 const COLLISION_STRUCTURE_CALL_BUDGET: usize = 2;
 const GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:grounded-listing-avionics-resolution:v2";
+    b"aircost:grounded-listing-avionics-resolution";
 const GROUNDED_LISTING_REQUEST_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:grounded-listing-avionics-request:v1";
+    b"aircost:grounded-listing-avionics-request";
 const GROUNDED_LISTING_CAPABILITY_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:grounded-listing-avionics-capability:v2";
+    b"aircost:grounded-listing-avionics-capability";
 const EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE: &str = "exact_catalog_product";
 const NO_IDENTIFIER_SCOPE: &str = "none";
 const NO_REJECTION_BASIS: &str = "none";

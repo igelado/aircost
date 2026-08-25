@@ -2684,7 +2684,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_v2_same_case_authorization_is_preserved_read_only_without_global_reuse() {
+    async fn exact_same_case_authorization_is_preserved_read_only_without_global_reuse() {
         let fixture = fixture().await;
         let model_id = insert_product(&fixture.db, "Test Unit", "TEST-UNIT", true).await;
         let listing_link_id = insert_current_same_case_authorization(&fixture, model_id).await;
