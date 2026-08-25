@@ -23,7 +23,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 2
         OR contract_fingerprint IS DISTINCT FROM
-          '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59'
+          '75f65ec05a59e7cd319bce7fa73baea29c5d34e439cd8cfabc09b7a33fa31d5d'
       )
   ) THEN
     RAISE EXCEPTION
@@ -31,9 +31,6 @@ BEGIN
   END IF;
 END
 $migration_guard$;
-
-DROP TABLE IF EXISTS
-  public.aircraft_sale_listing_avionics_grounded_capabilities;
 
 CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_grounded_capabilities (
   listing_id BIGINT NOT NULL
@@ -61,6 +58,8 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_grounded_capabi
     CHECK (product_fingerprint ~ '^[0-9a-f]{64}$'),
   collision_closure_sha256 TEXT NOT NULL
     CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
+  source_revocation_count BIGINT NOT NULL
+    CHECK (source_revocation_count >= 0),
   policy_version TEXT NOT NULL
     CHECK (policy_version = 'listing_avionics_grounded_capability_v2'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -100,8 +99,11 @@ BEGIN
     SELECT 1
     FROM public.avionics_approved_product_graph_identities approved
     WHERE approved.avionics_model_id = NEW.avionics_model_id
+  ) OR NEW.source_revocation_count <> (
+    SELECT COUNT(*)
+    FROM public.avionics_authoritative_source_origin_revocations
   ) THEN
-    RAISE EXCEPTION 'grounded avionics capability requires its exact current capture-bound listing and approved product';
+    RAISE EXCEPTION 'grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch';
   END IF;
   RETURN NEW;
 END;
@@ -154,6 +156,7 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_authorizations 
            extracted_listing_sha256 ~ '^[0-9a-f]{64}$'),
   collision_closure_sha256 TEXT NOT NULL
     CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
+  source_revocation_count BIGINT,
   policy_version TEXT NOT NULL
     CHECK (policy_version = 'listing_avionics_authorization_v2'),
   authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -162,12 +165,15 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_authorizations 
     (authorization_kind = 'manufacturer_reuse'
       AND grounded_resolution_sha256 IS NULL
       AND plugin_submission_id IS NULL
-      AND extracted_listing_sha256 IS NULL)
+      AND extracted_listing_sha256 IS NULL
+      AND source_revocation_count IS NULL)
     OR
     (authorization_kind = 'same_case_grounded'
       AND grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'
       AND plugin_submission_id IS NOT NULL
-      AND extracted_listing_sha256 IS NOT NULL)
+      AND extracted_listing_sha256 IS NOT NULL
+      AND source_revocation_count IS NOT NULL
+      AND source_revocation_count >= 0)
   )
 );
 
@@ -221,6 +227,10 @@ BEGIN
           AND EXISTS (
             SELECT 1 FROM public.avionics_approved_product_graph_identities identity
             WHERE identity.avionics_model_id = NEW.avionics_model_id
+          )
+          AND NEW.source_revocation_count = (
+            SELECT COUNT(*)
+            FROM public.avionics_authoritative_source_origin_revocations
           ))
       )
   ) THEN
@@ -366,36 +376,9 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
+  DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities;
   DELETE FROM public.aircraft_sale_listing_avionics_authorizations
-  WHERE authorization_kind = 'same_case_grounded'
-    AND avionics_model_id IN (
-      SELECT model.id
-      FROM public.avionics_models model
-      JOIN public.avionics_approved_product_graph_identities product_identity
-        ON product_identity.avionics_model_id = model.id
-      JOIN public.avionics_authoritative_source_origins source_origin
-        ON source_origin.id = NEW.avionics_authoritative_source_origin_id
-      LEFT JOIN public.avionics_manufacturer_effective_identities origin_identity
-        ON origin_identity.identity_id =
-           source_origin.avionics_manufacturer_identity_id
-      WHERE (
-          lower(BTRIM(model.identity_source_url)) = source_origin.https_origin
-          OR substring(lower(BTRIM(model.identity_source_url))
-               FROM 1 FOR length(source_origin.https_origin) + 1) IN (
-            source_origin.https_origin || '/',
-            source_origin.https_origin || '?',
-            source_origin.https_origin || '#'
-          )
-        )
-        AND (
-          source_origin.authority_kind = 'regulator_primary'
-          OR (
-            source_origin.authority_kind = 'manufacturer_primary'
-            AND origin_identity.avionics_manufacturer_identity_id =
-                product_identity.avionics_manufacturer_identity_id
-          )
-        )
-    );
+  WHERE authorization_kind = 'same_case_grounded';
   RETURN NEW;
 END
 $function$;
@@ -581,7 +564,7 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   2,
-  '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59',
+  '75f65ec05a59e7cd319bce7fa73baea29c5d34e439cd8cfabc09b7a33fa31d5d',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

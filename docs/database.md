@@ -294,9 +294,14 @@ occurrence contributing to a coalesced association must have a matching row,
 and their exact quantities and actions must cover the final aggregate. The
 link transaction rechecks the current product and collision state, inserts the
 link and `same_case_grounded` authorization, and deletes all consumed
-capabilities atomically. A failed or stale retry therefore cannot mint global
-reuse or authorize a different listing, product, occurrence, quantity, or
-action.
+capabilities atomically. Each capability and resulting same-case authorization
+binds the current count of append-only authoritative-origin revocations. Any
+new revocation conservatively deletes every unconsumed capability and every
+same-case authorization; future writes and runtime replay must bind the new
+count. This global epoch covers fresh grounded origins that are not eligible
+for manufacturer-wide reuse without storing source URLs, excerpts, or a
+dossier. A failed or stale retry therefore cannot mint global reuse or
+authorize a different listing, product, occurrence, quantity, or action.
 
 `aircraft_sale_listing_pending_reviews`
 

@@ -2384,8 +2384,8 @@ mod tests {
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (?, 'installed', ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
+              collision_closure_sha256, source_revocation_count, policy_version
+            ) VALUES (?, 'installed', ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0, ?)
             "#,
         )
         .bind(listing_link_id)

@@ -1063,6 +1063,8 @@ struct AssociationAuthorizationRow {
     evidence_capture_is_current: bool,
     policy_version: String,
     collision_closure_sha256: String,
+    source_revocation_count: Option<i64>,
+    current_source_revocation_count: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -4090,7 +4092,10 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
           AND instr(capture.rendered_html, link.source_notes) > 0
       ) AS evidence_capture_is_current,
       authorization.policy_version,
-      authorization.collision_closure_sha256
+      authorization.collision_closure_sha256,
+      authorization.source_revocation_count,
+      (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
+        AS current_source_revocation_count
     FROM aircraft_sale_listing_avionics_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
@@ -4128,7 +4133,10 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
           AND position(link.source_notes IN capture.rendered_html) > 0
       ) AS evidence_capture_is_current,
       authorization.policy_version,
-      authorization.collision_closure_sha256
+      authorization.collision_closure_sha256,
+      authorization.source_revocation_count,
+      (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
+        AS current_source_revocation_count
     FROM aircraft_sale_listing_avionics_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
@@ -5257,6 +5265,7 @@ fn current_row_backed_authorized_associations(
                 if row.grounded_resolution_sha256.is_none()
                     && row.plugin_submission_id.is_none()
                     && row.extracted_listing_sha256.is_none()
+                    && row.source_revocation_count.is_none()
                     && row.current_reuse_product_fingerprint.as_deref()
                         == Some(row.product_fingerprint.as_str())
                     && reuse_attested_ids.contains(&row.avionics_model_id) =>
@@ -5273,6 +5282,7 @@ fn current_row_backed_authorized_associations(
                     .as_deref()
                     .is_some_and(valid_sha256)
                     && row.plugin_submission_id.is_some()
+                    && row.source_revocation_count == Some(row.current_source_revocation_count)
                     && row
                         .extracted_listing_sha256
                         .as_deref()
@@ -9799,6 +9809,8 @@ mod tests {
                 avionics_model_id,
             )
             .expect("test target must have a collision closure"),
+            source_revocation_count: Some(0),
+            current_source_revocation_count: 0,
         }
     }
 
@@ -11752,8 +11764,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
+              collision_closure_sha256, source_revocation_count, policy_version
+            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0, ?)
             "#,
         )
         .bind(listing_link_id)

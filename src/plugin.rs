@@ -4516,7 +4516,7 @@ mod tests {
             .await
             .unwrap();
         let seed = grounded_resolution_receipt_basis_for_replay(&identity_request, &identity)
-            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone());
+            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone(), 0);
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
         };
@@ -4566,8 +4566,9 @@ mod tests {
                  avionics_model_id, requested_quantity, configuration_action,
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
-                 product_fingerprint, collision_closure_sha256, policy_version
-               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?,
+                 product_fingerprint, collision_closure_sha256,
+                 source_revocation_count, policy_version
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0,
                          'listing_avionics_grounded_capability_v2')"#,
         )
         .bind(listing_id)

@@ -21,7 +21,7 @@ use crate::aircraft::identity::{
 #[cfg(test)]
 use crate::avionics::catalog::grounded_resolution_receipt_seed_for_replay;
 use crate::avionics::catalog::{
-    approved_avionics_identity_for_grounded_replay,
+    approved_avionics_identity_for_grounded_replay, authoritative_source_revocation_count,
     deterministic_generic_avionics_rejection_reason, grounded_resolution_receipt_basis_for_replay,
     grounded_resolution_request_sha256, resolve_avionics_identity_for_listing_materialization,
     resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
@@ -585,6 +585,7 @@ struct StoredGroundedCapabilityRow {
     extraction_error: Option<String>,
     product_fingerprint: String,
     collision_closure_sha256: String,
+    source_revocation_count: i64,
     policy_version: String,
 }
 
@@ -652,6 +653,7 @@ fn grounded_occurrence_capability_sha256(capability: &ListingGroundedCapability)
         capability.seed.capability_sha256().to_string(),
         capability.seed.product_fingerprint().to_string(),
         capability.seed.collision_closure_sha256().to_string(),
+        capability.seed.source_revocation_count().to_string(),
     ] {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
@@ -696,6 +698,7 @@ fn grounded_capability_set_sha256(
             row.extracted_listing_sha256.clone(),
             row.product_fingerprint.clone(),
             row.collision_closure_sha256.clone(),
+            row.source_revocation_count.to_string(),
             row.policy_version.clone(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
@@ -1661,6 +1664,7 @@ async fn grounded_capability_replay_scope(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
+               capability.source_revocation_count,
                capability.policy_version
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         LEFT JOIN plugin_submissions submission
@@ -2195,6 +2199,7 @@ async fn stage_bound_replay_grounded_capabilities(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
+               capability.source_revocation_count,
                capability.policy_version
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         JOIN plugin_submissions submission
@@ -2215,7 +2220,7 @@ async fn stage_bound_replay_grounded_capabilities(
           AND capability_sha256 = ? AND grounded_resolution_sha256 = ?
           AND evidence_capture_sha256 = ? AND extracted_listing_sha256 = ?
           AND product_fingerprint = ? AND collision_closure_sha256 = ?
-          AND policy_version = ?
+          AND source_revocation_count = ? AND policy_version = ?
         "#,
     );
     let insert_sql = db.sql(
@@ -2225,8 +2230,9 @@ async fn stage_bound_replay_grounded_capabilities(
           avionics_model_id, requested_quantity, configuration_action,
           request_sha256, capability_sha256, grounded_resolution_sha256,
           evidence_capture_sha256, extracted_listing_sha256,
-          product_fingerprint, collision_closure_sha256, policy_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          product_fingerprint, collision_closure_sha256,
+          source_revocation_count, policy_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     let approved_catalog_rows_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
@@ -2305,6 +2311,11 @@ async fn stage_bound_replay_grounded_capabilities(
             )
             .fetch_all(&mut *transaction)
             .await?;
+            let source_revocation_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations",
+            )
+            .fetch_one(&mut *transaction)
+            .await?;
             for capability in &prepared {
                 let current_product = catalog_product_fingerprint_from_rows(
                     &catalog_rows,
@@ -2328,6 +2339,7 @@ async fn stage_bound_replay_grounded_capabilities(
                 })?;
                 if current_product != capability.product_fingerprint
                     || current_collision != capability.collision_closure_sha256
+                    || source_revocation_count != capability.seed.source_revocation_count()
                 {
                     return Err(ListingStoreError::State(format!(
                         "grounded replay product {} changed before capability staging",
@@ -2366,6 +2378,7 @@ async fn stage_bound_replay_grounded_capabilities(
                         && existing.extracted_listing_sha256 == scope.extracted_listing_sha256
                         && existing.product_fingerprint == current_product
                         && existing.collision_closure_sha256 == current_collision
+                        && existing.source_revocation_count == source_revocation_count
                         && existing.policy_version == GROUNDED_CAPABILITY_POLICY_VERSION;
                     if exact {
                         continue;
@@ -2385,6 +2398,7 @@ async fn stage_bound_replay_grounded_capabilities(
                         .bind(existing.extracted_listing_sha256.as_str())
                         .bind(existing.product_fingerprint.as_str())
                         .bind(existing.collision_closure_sha256.as_str())
+                        .bind(existing.source_revocation_count)
                         .bind(existing.policy_version.as_str())
                         .execute(&mut *transaction)
                         .await?;
@@ -2410,6 +2424,7 @@ async fn stage_bound_replay_grounded_capabilities(
                     .bind(scope.extracted_listing_sha256.as_str())
                     .bind(current_product)
                     .bind(current_collision)
+                    .bind(source_revocation_count)
                     .bind(GROUNDED_CAPABILITY_POLICY_VERSION)
                     .execute(&mut *transaction)
                     .await?;
@@ -2785,8 +2800,9 @@ async fn insert_listing(
           avionics_model_id, requested_quantity, configuration_action,
           request_sha256, capability_sha256, grounded_resolution_sha256,
           evidence_capture_sha256, extracted_listing_sha256,
-          product_fingerprint, collision_closure_sha256, policy_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          product_fingerprint, collision_closure_sha256,
+          source_revocation_count, policy_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     if let Some(binding) = signed_source_binding {
@@ -2996,6 +3012,7 @@ async fn insert_listing(
                         .bind(binding.bound_extracted_listing_sha256.as_str())
                         .bind(capability.product_fingerprint.as_str())
                         .bind(capability.collision_closure_sha256.as_str())
+                        .bind(capability.seed.source_revocation_count())
                         .bind(GROUNDED_CAPABILITY_POLICY_VERSION)
                         .execute(&mut *transaction)
                         .await?;
@@ -3616,6 +3633,7 @@ async fn retire_exact_stale_grounded_capability(
           AND extracted_listing_sha256 = ?
           AND product_fingerprint = ?
           AND collision_closure_sha256 = ?
+          AND source_revocation_count = ?
           AND policy_version = ?
         "#,
     );
@@ -3636,6 +3654,7 @@ async fn retire_exact_stale_grounded_capability(
                 .bind(row.extracted_listing_sha256.as_str())
                 .bind(row.product_fingerprint.as_str())
                 .bind(row.collision_closure_sha256.as_str())
+                .bind(row.source_revocation_count)
                 .bind(row.policy_version.as_str())
                 .execute($pool)
                 .await
@@ -3680,6 +3699,7 @@ async fn replay_grounded_listing_avionics_identity(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
+               capability.source_revocation_count,
                capability.policy_version
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         LEFT JOIN plugin_submissions submission
@@ -3721,6 +3741,13 @@ async fn replay_grounded_listing_avionics_identity(
         retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
         return Ok(GroundedCapabilityReplayOutcome::RetiredStale);
     }
+    let current_source_revocation_count = authoritative_source_revocation_count(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    if row.source_revocation_count != current_source_revocation_count {
+        retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
+        return Ok(GroundedCapabilityReplayOutcome::RetiredStale);
+    }
     let Some(identity) = approved_avionics_identity_for_grounded_replay(db, row.avionics_model_id)
         .await
         .map_err(|error| error.to_string())?
@@ -3732,6 +3759,7 @@ async fn replay_grounded_listing_avionics_identity(
         .bind_catalog_snapshot(
             row.product_fingerprint.clone(),
             row.collision_closure_sha256.clone(),
+            row.source_revocation_count,
         );
     let current_product = match catalog_product_fingerprint_for_id(db, identity.id).await {
         Ok(fingerprint) => fingerprint,
@@ -6452,6 +6480,7 @@ async fn replace_listing_avionics(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
+               capability.source_revocation_count,
                capability.policy_version
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         LEFT JOIN plugin_submissions submission
@@ -6475,8 +6504,8 @@ async fn replace_listing_avionics(
           authorization_kind, observation_sha256, product_fingerprint,
           grounded_resolution_sha256, evidence_capture_sha256,
           plugin_submission_id, extracted_listing_sha256,
-          collision_closure_sha256, policy_version
-        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
+          collision_closure_sha256, source_revocation_count, policy_version
+        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     let approved_catalog_rows_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
@@ -6523,6 +6552,11 @@ async fn replace_listing_avionics(
                 )
                 .fetch_all(&mut *transaction)
                 .await?;
+            let source_revocation_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations",
+            )
+            .fetch_one(&mut *transaction)
+            .await?;
             let mut authorizations = Vec::with_capacity(prepared.len());
             let mut consumed_coordinates = HashSet::new();
             let mut exact_capability_scope = None;
@@ -6583,6 +6617,7 @@ async fn replace_listing_avionics(
                             != expected_receipt.resolution_sha256()
                         || row.product_fingerprint != current_product_fingerprint
                         || row.collision_closure_sha256 != current_collision
+                        || row.source_revocation_count != source_revocation_count
                         || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
                         || !grounded_capability_submission_checkpoint_is_current(
                             listing_id,
@@ -6681,6 +6716,7 @@ async fn replace_listing_avionics(
                                     != expected_receipt.resolution_sha256()
                                 || row.product_fingerprint != current_target_product
                                 || row.collision_closure_sha256 != current_target_collision
+                                || row.source_revocation_count != source_revocation_count
                                 || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
                                 || !grounded_capability_submission_checkpoint_is_current(
                                     listing_id,
@@ -6833,6 +6869,7 @@ async fn replace_listing_avionics(
                             .bind(exact_scope.plugin_submission_id)
                             .bind(exact_scope.extracted_listing_sha256.as_str())
                             .bind(collision_closure)
+                            .bind(source_revocation_count)
                             .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                             .execute(&mut *transaction)
                             .await?;
@@ -8830,6 +8867,7 @@ mod tests {
             extraction_error: None,
             product_fingerprint: "6".repeat(64),
             collision_closure_sha256: "7".repeat(64),
+            source_revocation_count: 0,
             policy_version: super::GROUNDED_CAPABILITY_POLICY_VERSION.to_string(),
         };
         let ordered = vec![row(0, 'a'), row(1, 'b')];
@@ -9072,6 +9110,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_revocation_invalidates_every_pending_grounded_capability() {
+        let fixture = pending_grounded_replay_fixture(false).await;
+        let DatabaseBackend::Sqlite(pool) = fixture.db.backend() else {
+            unreachable!()
+        };
+        attest_approved_test_avionics_model_for_current_policy_reuse(&fixture.db, fixture.model_id)
+            .await;
+
+        revoke_test_manufacturer_source_origin(&fixture.db, fixture.model_id).await;
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "one append-only authority revocation invalidates every pending grounded capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_revocation_epoch_retires_a_surviving_capability_without_provider_fallback() {
+        let fixture = pending_grounded_replay_fixture(false).await;
+        let DatabaseBackend::Sqlite(pool) = fixture.db.backend() else {
+            unreachable!()
+        };
+        attest_approved_test_avionics_model_for_current_policy_reuse(&fixture.db, fixture.model_id)
+            .await;
+        // Simulate a database whose external cleanup trigger was removed after
+        // startup. Replay must independently reject the stale epoch.
+        sqlx::query("DROP TRIGGER listing_avionics_authorizations_invalidate_origin_revocation")
+            .execute(pool)
+            .await
+            .unwrap();
+        revoke_test_manufacturer_source_origin(&fixture.db, fixture.model_id).await;
+        let surviving: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(surviving, 1, "the fixture must exercise runtime defense");
+
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
+            "GTX 345R",
+        ))];
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let resolution = resolve_listing_avionics_values(
+            &fixture.db,
+            &mut values,
+            Some(&unreachable),
+            Some("https://example.com/listing"),
+            Some("Garmin GTX 345R installed"),
+            Some(&fixture.scope),
+        )
+        .await
+        .expect("a stale source epoch must fail closed as pending review");
+
+        assert_eq!(resolution.pending_review_aspects.len(), 1);
+        assert!(values.avionics.is_empty());
+        let state: (i64, i64, i64) = sqlx::query_as(
+            r#"SELECT
+                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities),
+                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations),
+                 (SELECT COUNT(*) FROM gemini_api_usage)"#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            state,
+            (0, 0, 0),
+            "runtime replay must retire stale authority and invoke no paid fallback"
+        );
+    }
+
+    #[tokio::test]
     async fn paid_same_case_capability_precedes_reuse_and_survives_later_reuse_revocation() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -9106,7 +9224,7 @@ mod tests {
             .await
             .unwrap();
         let seed = super::grounded_resolution_receipt_basis_for_replay(&request, &identity)
-            .bind_catalog_snapshot(product_fingerprint, collision_closure);
+            .bind_catalog_snapshot(product_fingerprint, collision_closure, 0);
         let mut resolved = listing_avionics_value_from_catalog(
             &ListingAvionicsValue::from_parsed(parsed),
             &identity,
@@ -9210,6 +9328,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(provider_calls, 0);
+
+        revoke_test_manufacturer_source_origin(&db, model_id).await;
+        let authorization_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorization_count, 0,
+            "a later authority revocation must invalidate materialized same-case authorization"
+        );
     }
 
     #[tokio::test]
@@ -9285,7 +9415,7 @@ mod tests {
             .await
             .unwrap();
         let seed = super::grounded_resolution_receipt_basis_for_replay(&request, &identity)
-            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone());
+            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone(), 0);
         let capability = super::ListingGroundedCapability {
             occurrence_index: 0,
             occurrence_role: OccurrenceRole::Primary,
@@ -9299,8 +9429,9 @@ mod tests {
                  avionics_model_id, requested_quantity, configuration_action,
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
-                 product_fingerprint, collision_closure_sha256, policy_version
-               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 product_fingerprint, collision_closure_sha256,
+                 source_revocation_count, policy_version
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
         )
         .bind(listing_id)
         .bind(submission_id)
@@ -9376,8 +9507,9 @@ mod tests {
                  avionics_model_id, requested_quantity, configuration_action,
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
-                 product_fingerprint, collision_closure_sha256, policy_version
-               ) VALUES (?, ?, 1, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 product_fingerprint, collision_closure_sha256,
+                 source_revocation_count, policy_version
+               ) VALUES (?, ?, 1, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
         )
         .bind(listing_id)
         .bind(foreign_submission_id)
@@ -9773,6 +9905,40 @@ mod tests {
             .expect("reuse attestation should commit");
     }
 
+    async fn revoke_test_manufacturer_source_origin(db: &AppDb, avionics_model_id: i64) {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!("test uses SQLite")
+        };
+        let user = db.current_user(None).await.unwrap();
+        let source_origin_id: i64 = sqlx::query_scalar(
+            r#"
+            SELECT source_origin.id
+            FROM avionics_authoritative_source_origins source_origin
+            JOIN avionics_approved_product_identities product_identity
+              ON product_identity.avionics_manufacturer_identity_id =
+                 source_origin.avionics_manufacturer_identity_id
+            WHERE product_identity.avionics_model_id = ?
+              AND source_origin.https_origin = 'https://manufacturer.example'
+            "#,
+        )
+        .bind(avionics_model_id)
+        .fetch_one(pool)
+        .await
+        .expect("test authority origin should exist");
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id, reason
+            ) VALUES (?, ?, 'authoritative test source is no longer trusted')
+            "#,
+        )
+        .bind(source_origin_id)
+        .bind(user.id)
+        .execute(pool)
+        .await
+        .expect("test source origin should be revocable");
+    }
+
     async fn pending_grounded_replay_fixture(
         stale_collision_hash: bool,
     ) -> PendingGroundedReplayFixture {
@@ -9850,7 +10016,7 @@ mod tests {
                 .unwrap()
         };
         let seed = super::grounded_resolution_receipt_basis_for_replay(&request, &identity)
-            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone());
+            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone(), 0);
         let capability = super::ListingGroundedCapability {
             occurrence_index: 0,
             occurrence_role: OccurrenceRole::Primary,
@@ -9864,8 +10030,9 @@ mod tests {
                  avionics_model_id, requested_quantity, configuration_action,
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
-                 product_fingerprint, collision_closure_sha256, policy_version
-               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 product_fingerprint, collision_closure_sha256,
+                 source_revocation_count, policy_version
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
         )
         .bind(listing_id)
         .bind(submission_id)

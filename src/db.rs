@@ -99,9 +99,9 @@ const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
     "20260825_listing_avionics_grounded_capabilities";
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 2;
 // SHA-256 of
-// `20260825_listing_avionics_grounded_capabilities:v2:capability-v2:authorization-v2-exact-submission-checkpoint:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair`.
+// `20260825_listing_avionics_grounded_capabilities:v2:capability-v2-global-source-revocation-epoch:authorization-v2-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair`.
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
-    "2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59";
+    "75f65ec05a59e7cd319bce7fa73baea29c5d34e439cd8cfabc09b7a33fa31d5d";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -3742,6 +3742,7 @@ impl AppDb {
                         ('extracted_listing_sha256', 'TEXT', 1, 0, NULL),
                         ('product_fingerprint', 'TEXT', 1, 0, NULL),
                         ('collision_closure_sha256', 'TEXT', 1, 0, NULL),
+                        ('source_revocation_count', 'INTEGER', 1, 0, NULL),
                         ('policy_version', 'TEXT', 1, 0, NULL),
                         ('created_at', 'TEXT', 1, 0, 'CURRENT_TIMESTAMP')
                     ),
@@ -3770,7 +3771,7 @@ impl AppDb {
                       VALUES
                         ('listing_avionics_grounded_capabilities_validate_insert',
                           'beforeinsertonaircraft_sale_listing_avionics_grounded_capabilities',
-                          'groundedavionicscapabilityrequiresitsexactcurrentcapture-boundlistingandapprovedproduct'),
+                          'groundedavionicscapabilityrequiresitsexactcurrentcapture-boundlisting,approvedproduct,andsource-revocationepoch'),
                         ('listing_avionics_grounded_capabilities_immutable_update',
                           'beforeupdateonaircraft_sale_listing_avionics_grounded_capabilities',
                           'groundedavionicscapabilitiesareimmutable')
@@ -3794,7 +3795,9 @@ impl AppDb {
                         ('listing_avionics_grounded_capabilities_validate_insert',
                           'fromavionics_approved_product_graph_identitiesapproved'),
                         ('listing_avionics_grounded_capabilities_validate_insert',
-                          'approved.avionics_model_id=new.avionics_model_id')
+                          'approved.avionics_model_id=new.avionics_model_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'new.source_revocation_count<>(selectcount(*)fromavionics_authoritative_source_origin_revocations)')
                     ),
                     required_checks(definition_fragment) AS (
                       VALUES
@@ -3825,7 +3828,8 @@ impl AppDb {
                         ('check(product_fingerprintnotglob''*[^0-9a-f]*'')'),
                         ('check(length(collision_closure_sha256)=64)'),
                         ('check(collision_closure_sha256=lower(collision_closure_sha256))'),
-                        ('check(collision_closure_sha256notglob''*[^0-9a-f]*'')')
+                        ('check(collision_closure_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(source_revocation_count>=0)')
                     ),
                     table_definition(normalized_sql) AS (
                       SELECT replace(replace(replace(replace(
@@ -3862,7 +3866,7 @@ impl AppDb {
                           SELECT COUNT(*) FROM pragma_table_info(
                             'aircraft_sale_listing_avionics_grounded_capabilities'
                           )
-                        ) <> 16
+                        ) <> 17
                         OR EXISTS (
                           SELECT 1 FROM required_columns required
                           WHERE NOT EXISTS (
@@ -3902,7 +3906,7 @@ impl AppDb {
                             length(normalized_sql) - length(replace(
                               normalized_sql, 'check(', ''
                             ))
-                          ) / length('check(') = 28
+                          ) / length('check(') = 29
                         )
                         OR EXISTS (
                           SELECT 1 FROM required_checks required
@@ -4004,6 +4008,7 @@ impl AppDb {
                         ('extracted_listing_sha256', 'text', TRUE, NULL),
                         ('product_fingerprint', 'text', TRUE, NULL),
                         ('collision_closure_sha256', 'text', TRUE, NULL),
+                        ('source_revocation_count', 'bigint', TRUE, NULL),
                         ('policy_version', 'text', TRUE, NULL),
                         ('created_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
                     ),
@@ -4038,6 +4043,7 @@ impl AppDb {
                         ('extracted_listing_sha256', '^[0-9a-f]{64}$', NULL, NULL),
                         ('product_fingerprint', '^[0-9a-f]{64}$', NULL, NULL),
                         ('collision_closure_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('source_revocation_count', '>= 0', NULL, NULL),
                         ('policy_version',
                           'listing_avionics_grounded_capability_v2', NULL, NULL),
                         ('occurrence_role', 'requested_quantity = 1',
@@ -4076,7 +4082,11 @@ impl AppDb {
                         ('listing_avionics_grounded_capabilities_validate_insert',
                           'approved.avionics_model_id = NEW.avionics_model_id'),
                         ('listing_avionics_grounded_capabilities_validate_insert',
-                          'grounded avionics capability requires its exact current capture-bound listing and approved product')
+                          'grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'NEW.source_revocation_count <>'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'public.avionics_authoritative_source_origin_revocations')
                     )
                     SELECT
                       pg_catalog.to_regclass(
@@ -4101,7 +4111,7 @@ impl AppDb {
                           )
                             AND actual.attnum > 0
                             AND NOT actual.attisdropped
-                        ) <> 16
+                        ) <> 17
                         OR EXISTS (
                           SELECT 1 FROM required_columns required
                           WHERE NOT EXISTS (
@@ -4177,7 +4187,7 @@ impl AppDb {
                             'public.aircraft_sale_listing_avionics_grounded_capabilities'
                           )
                             AND actual.contype = 'c'
-                        ) <> 14
+                        ) <> 15
                         OR EXISTS (
                           SELECT 1 FROM required_checks required
                           WHERE NOT EXISTS (
@@ -5117,6 +5127,7 @@ impl AppDb {
             "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((requested_quantity > 0))",
+            "CHECK ((source_revocation_count >= 0))",
         ];
         const POSTGRES_TRIGGERS: &[(&str, i16, &str)] = &[
             (
@@ -5426,7 +5437,7 @@ impl AppDb {
             ),
         ];
         const POSTGRES_CHECKS: &[&str] = &[
-            "CHECK ((((authorization_kind = 'manufacturer_reuse'::text) AND (grounded_resolution_sha256 IS NULL) AND (plugin_submission_id IS NULL) AND (extracted_listing_sha256 IS NULL)) OR ((authorization_kind = 'same_case_grounded'::text) AND (grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text) AND (plugin_submission_id IS NOT NULL) AND (extracted_listing_sha256 IS NOT NULL))))",
+            "CHECK ((((authorization_kind = 'manufacturer_reuse'::text) AND (grounded_resolution_sha256 IS NULL) AND (plugin_submission_id IS NULL) AND (extracted_listing_sha256 IS NULL) AND (source_revocation_count IS NULL)) OR ((authorization_kind = 'same_case_grounded'::text) AND (grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text) AND (plugin_submission_id IS NOT NULL) AND (extracted_listing_sha256 IS NOT NULL) AND (source_revocation_count IS NOT NULL) AND (source_revocation_count >= 0))))",
             "CHECK (((extracted_listing_sha256 IS NULL) OR (extracted_listing_sha256 ~ '^[0-9a-f]{64}$'::text)))",
             "CHECK ((association_role = ANY (ARRAY['installed'::text, 'replacement'::text])))",
             "CHECK ((authorization_kind = ANY (ARRAY['manufacturer_reuse'::text, 'same_case_grounded'::text])))",
@@ -5532,6 +5543,7 @@ impl AppDb {
                         ('plugin_submission_id', 'bigint', FALSE, NULL),
                         ('extracted_listing_sha256', 'text', FALSE, NULL),
                         ('collision_closure_sha256', 'text', TRUE, NULL),
+                        ('source_revocation_count', 'bigint', FALSE, NULL),
                         ('policy_version', 'text', TRUE, NULL),
                         ('authorized_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
                     )
@@ -5539,7 +5551,7 @@ impl AppDb {
                       (SELECT COUNT(*) FROM pg_catalog.pg_attribute actual
                        WHERE actual.attrelid = pg_catalog.to_regclass(
                          'public.aircraft_sale_listing_avionics_authorizations'
-                       ) AND actual.attnum > 0 AND NOT actual.attisdropped) = 13
+                       ) AND actual.attnum > 0 AND NOT actual.attisdropped) = 14
                       AND NOT EXISTS (
                         SELECT 1 FROM expected
                         WHERE NOT EXISTS (
@@ -18132,8 +18144,13 @@ mod tests {
         assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 2);
         assert_eq!(
             LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
-            "2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59"
+            "75f65ec05a59e7cd319bce7fa73baea29c5d34e439cd8cfabc09b7a33fa31d5d"
         );
+        assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL
+            .contains("DROP TABLE IF EXISTS aircraft_sale_listing_avionics_grounded_capabilities"));
+        assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL.contains(
+            "DROP TABLE IF EXISTS\n  public.aircraft_sale_listing_avionics_grounded_capabilities"
+        ));
     }
 
     #[tokio::test]
@@ -18343,7 +18360,7 @@ mod tests {
         )
         .await;
         assert_weakened_listing_avionics_authorization_table_rejected(
-            ",\n    CHECK (\n      (authorization_kind = 'manufacturer_reuse'\n        AND grounded_resolution_sha256 IS NULL\n        AND plugin_submission_id IS NULL\n        AND extracted_listing_sha256 IS NULL)\n      OR\n      (authorization_kind = 'same_case_grounded'\n        AND length(grounded_resolution_sha256) = 64\n        AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)\n        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'\n        AND plugin_submission_id IS NOT NULL\n        AND extracted_listing_sha256 IS NOT NULL)\n    )",
+            ",\n    CHECK (\n      (authorization_kind = 'manufacturer_reuse'\n        AND grounded_resolution_sha256 IS NULL\n        AND plugin_submission_id IS NULL\n        AND extracted_listing_sha256 IS NULL\n        AND source_revocation_count IS NULL)\n      OR\n      (authorization_kind = 'same_case_grounded'\n        AND length(grounded_resolution_sha256) = 64\n        AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)\n        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'\n        AND plugin_submission_id IS NOT NULL\n        AND extracted_listing_sha256 IS NOT NULL\n        AND source_revocation_count IS NOT NULL\n        AND source_revocation_count >= 0)\n    )",
             "",
         )
         .await;
@@ -18354,6 +18371,11 @@ mod tests {
         .await;
         assert_corrupt_grounded_capability_schema_rejected(&[
             "CREATE TRIGGER unexpected_listing_avionics_authorization_trigger AFTER UPDATE ON plugin_submissions BEGIN DELETE FROM aircraft_sale_listing_avionics_authorizations; END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_authorizations_invalidate_origin_revocation",
+            "CREATE TRIGGER listing_avionics_authorizations_invalidate_origin_revocation AFTER INSERT ON avionics_authoritative_source_origin_revocations BEGIN DELETE FROM aircraft_sale_listing_avionics_authorizations WHERE authorization_kind = 'same_case_grounded'; END",
         ])
         .await;
     }

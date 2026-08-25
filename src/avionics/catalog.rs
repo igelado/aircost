@@ -503,6 +503,7 @@ struct GroundedCatalogSnapshot {
     avionics_model_id: i64,
     product_fingerprint: String,
     collision_closure_sha256: String,
+    source_revocation_count: i64,
 }
 
 #[derive(Debug)]
@@ -542,11 +543,13 @@ impl GroundedAvionicsResolutionReceiptBasis {
         self,
         product_fingerprint: String,
         collision_closure_sha256: String,
+        source_revocation_count: i64,
     ) -> GroundedAvionicsResolutionReceiptSeed {
         GroundedAvionicsResolutionReceiptSeed {
             basis: self,
             product_fingerprint,
             collision_closure_sha256,
+            source_revocation_count,
         }
     }
 }
@@ -556,6 +559,7 @@ pub(crate) struct GroundedAvionicsResolutionReceiptSeed {
     basis: GroundedAvionicsResolutionReceiptBasis,
     product_fingerprint: String,
     collision_closure_sha256: String,
+    source_revocation_count: i64,
 }
 
 impl GroundedAvionicsResolutionReceiptSeed {
@@ -583,6 +587,10 @@ impl GroundedAvionicsResolutionReceiptSeed {
         &self.collision_closure_sha256
     }
 
+    pub(crate) fn source_revocation_count(&self) -> i64 {
+        self.source_revocation_count
+    }
+
     pub(crate) fn bind(&self, listing_id: i64) -> GroundedAvionicsResolutionReceipt {
         let mut hasher = Sha256::new();
         hasher.update(GROUNDED_LISTING_RESOLUTION_FINGERPRINT_DOMAIN);
@@ -591,6 +599,7 @@ impl GroundedAvionicsResolutionReceiptSeed {
             self.capability_sha256().to_string(),
             self.product_fingerprint.clone(),
             self.collision_closure_sha256.clone(),
+            self.source_revocation_count.to_string(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
@@ -939,7 +948,17 @@ async fn grounded_catalog_snapshot_sqlite(
     let collision_rows = sqlx::query_as::<_, ActiveCollisionCatalogFingerprintRow>(&collision_sql)
         .fetch_all(&mut **transaction)
         .await?;
-    grounded_catalog_snapshot_from_rows(&catalog_rows, &collision_rows, avionics_model_id)
+    let source_revocation_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    grounded_catalog_snapshot_from_rows(
+        &catalog_rows,
+        &collision_rows,
+        avionics_model_id,
+        source_revocation_count,
+    )
 }
 
 async fn grounded_catalog_snapshot_postgres(
@@ -955,13 +974,32 @@ async fn grounded_catalog_snapshot_postgres(
     let collision_rows = sqlx::query_as::<_, ActiveCollisionCatalogFingerprintRow>(&collision_sql)
         .fetch_all(&mut **transaction)
         .await?;
-    grounded_catalog_snapshot_from_rows(&catalog_rows, &collision_rows, avionics_model_id)
+    let source_revocation_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    grounded_catalog_snapshot_from_rows(
+        &catalog_rows,
+        &collision_rows,
+        avionics_model_id,
+        source_revocation_count,
+    )
+}
+
+pub(crate) async fn authoritative_source_revocation_count(db: &AppDb) -> CatalogResult<i64> {
+    let sql = "SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations";
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => Ok(sqlx::query_scalar(sql).fetch_one(pool).await?),
+        DatabaseBackend::Postgres(pool) => Ok(sqlx::query_scalar(sql).fetch_one(pool).await?),
+    }
 }
 
 fn grounded_catalog_snapshot_from_rows(
     catalog_rows: &[CatalogFingerprintRow],
     collision_rows: &[ActiveCollisionCatalogFingerprintRow],
     avionics_model_id: i64,
+    source_revocation_count: i64,
 ) -> CatalogResult<GroundedCatalogSnapshot> {
     let product_fingerprint =
         catalog_product_fingerprint_from_rows(catalog_rows, avionics_model_id).ok_or_else(
@@ -983,6 +1021,7 @@ fn grounded_catalog_snapshot_from_rows(
         avionics_model_id,
         product_fingerprint,
         collision_closure_sha256,
+        source_revocation_count,
     })
 }
 
@@ -1023,6 +1062,7 @@ pub(crate) async fn resolve_avionics_identity_for_listing_materialization(
                 grounded_resolution_receipt_seed(request, approved).bind_catalog_snapshot(
                     snapshot.product_fingerprint,
                     snapshot.collision_closure_sha256,
+                    snapshot.source_revocation_count,
                 ),
             )
         }
@@ -2782,6 +2822,7 @@ async fn resolve_verified_identity(
             avionics_model_id: consolidation.report.survivor.id,
             product_fingerprint: consolidation.product_fingerprint,
             collision_closure_sha256: consolidation.collision_closure_sha256,
+            source_revocation_count: authoritative_source_revocation_count(db).await?,
         });
         execution
             .pending_review_revision_receipts
@@ -3276,6 +3317,9 @@ pub(crate) async fn approved_avionics_identity_for_grounded_replay(
     let [candidate] = matching.as_slice() else {
         return Ok(None);
     };
+    require_source_urls_not_revoked(db, std::slice::from_ref(&candidate.identity_source_url))
+        .await
+        .map_err(manufacturer_origin_error)?;
     Ok(Some(ApprovedAvionicsIdentity {
         id: candidate.id,
         manufacturer: candidate.manufacturer.clone(),
@@ -3307,6 +3351,7 @@ pub(crate) fn grounded_resolution_receipt_seed_for_replay(
     grounded_resolution_receipt_seed(request, approved).bind_catalog_snapshot(
         format!("{:064x}", approved.id),
         format!("{:064x}", approved.id.saturating_add(1)),
+        0,
     )
 }
 

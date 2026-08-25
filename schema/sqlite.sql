@@ -8225,6 +8225,8 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities 
     extracted_listing_sha256 TEXT NOT NULL,
     product_fingerprint TEXT NOT NULL,
     collision_closure_sha256 TEXT NOT NULL,
+    source_revocation_count INTEGER NOT NULL
+      CHECK (source_revocation_count >= 0),
     policy_version TEXT NOT NULL
       CHECK (policy_version = 'listing_avionics_grounded_capability_v2'),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -8284,8 +8286,11 @@ OR NOT EXISTS (
   FROM avionics_approved_product_graph_identities approved
   WHERE approved.avionics_model_id = NEW.avionics_model_id
 )
+OR NEW.source_revocation_count <> (
+  SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations
+)
 BEGIN
-  SELECT RAISE(ABORT, 'grounded avionics capability requires its exact current capture-bound listing and approved product');
+  SELECT RAISE(ABORT, 'grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch');
 END;
 
 CREATE TRIGGER IF NOT EXISTS
@@ -8300,7 +8305,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   2,
-  '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59',
+  '75f65ec05a59e7cd319bce7fa73baea29c5d34e439cd8cfabc09b7a33fa31d5d',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
@@ -8325,6 +8330,7 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
       REFERENCES plugin_submissions(id) ON DELETE CASCADE,
     extracted_listing_sha256 TEXT,
     collision_closure_sha256 TEXT NOT NULL,
+    source_revocation_count INTEGER,
     policy_version TEXT NOT NULL
       CHECK (policy_version = 'listing_avionics_authorization_v2'),
     authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -8350,14 +8356,17 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
       (authorization_kind = 'manufacturer_reuse'
         AND grounded_resolution_sha256 IS NULL
         AND plugin_submission_id IS NULL
-        AND extracted_listing_sha256 IS NULL)
+        AND extracted_listing_sha256 IS NULL
+        AND source_revocation_count IS NULL)
       OR
       (authorization_kind = 'same_case_grounded'
         AND length(grounded_resolution_sha256) = 64
         AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)
         AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'
         AND plugin_submission_id IS NOT NULL
-        AND extracted_listing_sha256 IS NOT NULL)
+        AND extracted_listing_sha256 IS NOT NULL
+        AND source_revocation_count IS NOT NULL
+        AND source_revocation_count >= 0)
     )
   );
 
@@ -8411,6 +8420,10 @@ WHEN NOT EXISTS (
         AND EXISTS (
           SELECT 1 FROM avionics_approved_product_graph_identities identity
           WHERE identity.avionics_model_id = NEW.avionics_model_id
+        )
+        AND NEW.source_revocation_count = (
+          SELECT COUNT(*)
+          FROM avionics_authoritative_source_origin_revocations
         ))
     )
 )
@@ -8557,40 +8570,9 @@ CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_origin_revocation
 AFTER INSERT ON avionics_authoritative_source_origin_revocations
 BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_grounded_capabilities;
   DELETE FROM aircraft_sale_listing_avionics_authorizations
-  WHERE authorization_kind = 'same_case_grounded'
-    AND avionics_model_id IN (
-      SELECT model.id
-      FROM avionics_models model
-      JOIN avionics_approved_product_graph_identities product_identity
-        ON product_identity.avionics_model_id = model.id
-      JOIN avionics_authoritative_source_origins source_origin
-        ON source_origin.id =
-             NEW.avionics_authoritative_source_origin_id
-      LEFT JOIN avionics_manufacturer_effective_identities origin_identity
-        ON origin_identity.identity_id =
-             source_origin.avionics_manufacturer_identity_id
-      WHERE (
-          lower(trim(model.identity_source_url)) = source_origin.https_origin
-          OR substr(
-              lower(trim(model.identity_source_url)),
-              1,
-              length(source_origin.https_origin) + 1
-            ) IN (
-              source_origin.https_origin || '/',
-              source_origin.https_origin || '?',
-              source_origin.https_origin || '#'
-            )
-        )
-        AND (
-          source_origin.authority_kind = 'regulator_primary'
-          OR (
-            source_origin.authority_kind = 'manufacturer_primary'
-            AND origin_identity.avionics_manufacturer_identity_id =
-                  product_identity.avionics_manufacturer_identity_id
-          )
-        )
-    );
+  WHERE authorization_kind = 'same_case_grounded';
 END;
 
 
