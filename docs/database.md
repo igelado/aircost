@@ -1870,9 +1870,9 @@ The fingerprint is the SHA-256 of this newline-terminated manifest:
 ```text
 20260819_reference_catalog_cutover:v1
 sqlite-old:238:a2e2d5d3fdbc38847b9bddcebbf587c50447b3415ba3c7f1c3ed8a0b94605b45
-sqlite-post:213:82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1
+sqlite-post:213:de4de587e8b74a7119b2997d39513d02246074d1cd99cf35a1089a98740989ee
 postgres-old:925:379464a027df1c61f99c754b28ff4738
-postgres-post:793:5bea7b82d356e161fe8a160f68845c68
+postgres-post:793:c5c053f43711b4cd719d4b90a8c187b4
 ```
 
 Its `installed_at` value records the first successful installation and remains

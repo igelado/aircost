@@ -23,7 +23,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 2
         OR contract_fingerprint IS DISTINCT FROM
-          'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30'
+          '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59'
       )
   ) THEN
     RAISE EXCEPTION
@@ -131,7 +131,7 @@ FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability
 
 DROP TABLE IF EXISTS public.aircraft_sale_listing_avionics_authorizations;
 
-CREATE TABLE public.aircraft_sale_listing_avionics_authorizations (
+CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_authorizations (
   listing_link_id BIGINT NOT NULL
     REFERENCES public.aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
   association_role TEXT NOT NULL
@@ -430,6 +430,142 @@ END
 $function$;
 
 DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_link_update
+ON public.aircraft_sale_listing_avionics;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_link_update
+AFTER UPDATE OF
+  aircraft_sale_listing_id,
+  avionics_model_id,
+  quantity,
+  source_notes,
+  source_confidence,
+  configuration_action,
+  replaces_avionics_model_id
+ON public.aircraft_sale_listing_avionics
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_link();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_reuse_delete
+ON public.avionics_product_reuse_attestations;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_reuse_delete
+AFTER DELETE ON public.avionics_product_reuse_attestations
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_reuse();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_model_proof_update
+ON public.avionics_models;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_model_proof_update
+AFTER UPDATE OF
+  avionics_manufacturer_id, name, normalized_name, catalog_status,
+  manufacturer_identifier_kind, manufacturer_identifier,
+  normalized_manufacturer_identifier, identity_source_url,
+  identity_source_title, identity_evidence_text
+ON public.avionics_models
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_proof();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_model_type_insert
+ON public.avionics_model_types;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_model_type_insert
+AFTER INSERT ON public.avionics_model_types
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_model_type_delete
+ON public.avionics_model_types;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_model_type_delete
+AFTER DELETE ON public.avionics_model_types
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_model_type_update
+ON public.avionics_model_types;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_model_type_update
+AFTER UPDATE OF avionics_model_id, avionics_type_id
+ON public.avionics_model_types
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_type_update
+ON public.avionics_types;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_type_update
+AFTER UPDATE OF name, normalized_name ON public.avionics_types
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_type();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_graph_insert
+ON public.avionics_approved_product_identities;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_graph_insert
+AFTER INSERT ON public.avionics_approved_product_identities
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_graph_delete
+ON public.avionics_approved_product_identities;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_graph_delete
+AFTER DELETE ON public.avionics_approved_product_identities
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_graph_update
+ON public.avionics_approved_product_identities;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_graph_update
+AFTER UPDATE OF
+  avionics_model_id, avionics_manufacturer_identity_id,
+  canonical_product_key, manufacturer_identifier_kind,
+  canonical_identifier_key
+ON public.avionics_approved_product_identities
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_manufacturer_update
+ON public.avionics_manufacturers;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_manufacturer_update
+AFTER UPDATE OF name, normalized_name ON public.avionics_manufacturers
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_manufacturer();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_origin_revocation
+ON public.avionics_authoritative_source_origin_revocations;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_origin_revocation
+AFTER INSERT ON public.avionics_authoritative_source_origin_revocations
+FOR EACH ROW
+EXECUTE FUNCTION
+  public.invalidate_listing_avionics_same_case_for_origin_revocation();
+
+DROP TRIGGER IF EXISTS
+  listing_avionics_authorizations_invalidate_capture_delete
+ON public.plugin_submissions;
+CREATE TRIGGER
+  listing_avionics_authorizations_invalidate_capture_delete
+AFTER DELETE ON public.plugin_submissions
+FOR EACH ROW
+EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
+
+DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_capture_update
 ON public.plugin_submissions;
 CREATE TRIGGER
@@ -445,7 +581,7 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   2,
-  'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30',
+  '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

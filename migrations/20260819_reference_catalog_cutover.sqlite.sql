@@ -130,7 +130,7 @@ SELECT CASE
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> '82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1'
+        )) <> 'de4de587e8b74a7119b2997d39513d02246074d1cd99cf35a1089a98740989ee'
   ) THEN 0
   WHEN NOT EXISTS (
     SELECT 1 FROM schema_migration_contracts
@@ -1053,7 +1053,7 @@ SELECT CASE WHEN
       ), 256))) FROM (
         SELECT object_key, definition
         FROM reference_catalog_cutover_post_objects ORDER BY object_key
-      )) <> '82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1'
+      )) <> 'de4de587e8b74a7119b2997d39513d02246074d1cd99cf35a1089a98740989ee'
   OR EXISTS (
     SELECT 1 FROM sqlite_schema
     WHERE name IN (

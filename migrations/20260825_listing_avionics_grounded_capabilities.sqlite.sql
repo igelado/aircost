@@ -28,7 +28,7 @@ SELECT CASE
     WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'
       AND contract_version = 2
       AND contract_fingerprint =
-        'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30'
+        '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59'
   ) THEN 1
   ELSE 0
 END;
@@ -144,7 +144,7 @@ DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_capture_delete
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_capture_update;
 DROP TABLE IF EXISTS aircraft_sale_listing_avionics_authorizations;
 
-CREATE TABLE aircraft_sale_listing_avionics_authorizations (
+CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
   listing_link_id INTEGER NOT NULL
     REFERENCES aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
   association_role TEXT NOT NULL
@@ -449,7 +449,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   2,
-  'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30',
+  '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

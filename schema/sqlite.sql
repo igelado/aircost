@@ -8300,7 +8300,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   2,
-  'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30',
+  '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

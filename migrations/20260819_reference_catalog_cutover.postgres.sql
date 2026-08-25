@@ -449,7 +449,7 @@ BEGIN
 
   IF exact_marker AND (
     actual_object_count <> 793
-    OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68'
+    OR actual_definition_digest <> 'c5c053f43711b4cd719d4b90a8c187b4'
   ) THEN
     RAISE EXCEPTION
       'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
@@ -1467,7 +1467,7 @@ BEGIN
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
   IF actual_object_count <> 793
-     OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+     OR actual_definition_digest <> 'c5c053f43711b4cd719d4b90a8c187b4' THEN
     RAISE EXCEPTION
       'reference catalog cutover post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;

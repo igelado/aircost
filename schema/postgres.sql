@@ -278,7 +278,7 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
     IF actual_object_count <> 793
-       OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+       OR actual_definition_digest <> 'c5c053f43711b4cd719d4b90a8c187b4' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -3900,7 +3900,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   2,
-  'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30',
+  '2dd771661eeda5507fecaeb4ae2b87fed452c46500f13e9ce3c3652fca75cf59',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
@@ -10679,7 +10679,7 @@ BEGIN
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
   IF actual_object_count <> 793
-     OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+     OR actual_definition_digest <> 'c5c053f43711b4cd719d4b90a8c187b4' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
