@@ -17824,16 +17824,19 @@ mod tests {
         );
         assert_eq!(
             sqlite_columns,
-            table_columns(LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL, table),
-            "canonical schema and SQLite upgrade disagree for {table}"
+            table_columns(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                table,
+            ),
+            "canonical schema and SQLite v2 upgrade disagree for {table}"
         );
         assert_eq!(
             sqlite_columns,
             table_columns(
-                LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
                 table
             ),
-            "canonical schema and Postgres upgrade disagree for {table}"
+            "canonical schema and Postgres v2 upgrade disagree for {table}"
         );
         for definition in [SQLITE_SCHEMA_SQL, POSTGRES_SCHEMA_SQL] {
             assert!(!definition.contains("aircraft_sale_listing_avionics_corroborations"));
@@ -17881,8 +17884,8 @@ mod tests {
         for definition in [
             SQLITE_SCHEMA_SQL,
             POSTGRES_SCHEMA_SQL,
-            LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL,
-            LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
         ] {
             for cleanup_trigger in [
                 "listing_avionics_authorizations_invalidate_model_proof_update",
@@ -18939,7 +18942,7 @@ mod tests {
         .bind("b".repeat(64))
         .bind("c".repeat(64))
         .bind("d".repeat(64))
-        .bind("listing_avionics_authorization_v1")
+        .bind("listing_avionics_authorization_v2")
         .execute(&mut *connection)
         .await
         .unwrap();
