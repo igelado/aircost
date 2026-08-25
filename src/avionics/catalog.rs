@@ -12818,6 +12818,7 @@ mod tests {
         let capability = grounded_resolution_receipt_seed(&request, &stored).bind_catalog_snapshot(
             exact_case_snapshot.product_fingerprint.clone(),
             exact_case_snapshot.collision_closure_sha256.clone(),
+            exact_case_snapshot.source_revocation_count,
         );
         assert_eq!(capability.avionics_model_id(), stored.id);
         assert_eq!(capability.requested_quantity(), 1);
