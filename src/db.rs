@@ -18685,7 +18685,7 @@ mod tests {
             .expect_err("attacker shadow rows must not satisfy the public validation function")
             .to_string();
         assert!(error.contains(
-            "grounded avionics capability requires its exact current capture-bound listing and approved product"
+            "grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch"
         ));
         connection.execute("RESET search_path").await.unwrap();
         drop(connection);
