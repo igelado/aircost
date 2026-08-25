@@ -61,8 +61,6 @@ const GROUNDED_LISTING_REQUEST_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:grounded-listing-avionics-request:v1";
 const GROUNDED_LISTING_CAPABILITY_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:grounded-listing-avionics-capability:v2";
-const GROUNDED_AUTOMATED_REVIEW_RESOLUTION_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:grounded-listing-avionics-resolution:v1";
 const EXACT_CATALOG_PRODUCT_IDENTIFIER_SCOPE: &str = "exact_catalog_product";
 const NO_IDENTIFIER_SCOPE: &str = "none";
 const NO_REJECTION_BASIS: &str = "none";
@@ -524,7 +522,6 @@ impl<T> std::ops::Deref for GroundedCatalogPersistence<T> {
 pub(crate) struct AutomatedReviewAvionicsIdentityResolution {
     pub outcome: AvionicsIdentityOutcome,
     pub pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
-    pub grounded_receipt: Option<GroundedAvionicsResolutionReceipt>,
 }
 
 pub(crate) struct ListingMaterializationAvionicsIdentityResolution {
@@ -550,20 +547,6 @@ impl GroundedAvionicsResolutionReceiptBasis {
             basis: self,
             product_fingerprint,
             collision_closure_sha256,
-        }
-    }
-
-    fn bind_automated_review(&self, listing_id: i64) -> GroundedAvionicsResolutionReceipt {
-        let mut hasher = Sha256::new();
-        hasher.update(GROUNDED_AUTOMATED_REVIEW_RESOLUTION_FINGERPRINT_DOMAIN);
-        for value in [listing_id.to_string(), self.capability_sha256.clone()] {
-            hasher.update((value.len() as u64).to_le_bytes());
-            hasher.update(value.as_bytes());
-        }
-        GroundedAvionicsResolutionReceipt {
-            listing_id,
-            avionics_model_id: self.avionics_model_id,
-            resolution_sha256: format!("{:x}", hasher.finalize()),
         }
     }
 }
@@ -628,14 +611,6 @@ pub(crate) struct GroundedAvionicsResolutionReceipt {
 }
 
 impl GroundedAvionicsResolutionReceipt {
-    pub(crate) fn listing_id(&self) -> i64 {
-        self.listing_id
-    }
-
-    pub(crate) fn avionics_model_id(&self) -> i64 {
-        self.avionics_model_id
-    }
-
     pub(crate) fn resolution_sha256(&self) -> &str {
         &self.resolution_sha256
     }
@@ -706,43 +681,6 @@ pub(crate) fn grounded_resolution_request_sha256(request: &AvionicsIdentityReque
         request.avionics_types.join("\u{1f}"),
         request.quantity.to_string(),
     ])
-}
-
-#[cfg(test)]
-pub(crate) fn grounded_resolution_receipt_for_test(
-    listing_id: i64,
-    avionics_model_id: i64,
-) -> GroundedAvionicsResolutionReceipt {
-    let request = AvionicsIdentityRequest {
-        aircraft_manufacturer: "Test Aircraft".to_string(),
-        aircraft_model: "Test Model".to_string(),
-        aircraft_variant: "Test Variant".to_string(),
-        model_year: 2026,
-        source_url: "https://example.test/listing".to_string(),
-        listing_context: "Test listing evidence".to_string(),
-        requires_listing_evidence: true,
-        authoritative_direct_source_urls: Vec::new(),
-        authoritative_identity_anchors: Vec::new(),
-        manufacturer: "Test Avionics".to_string(),
-        model: format!("Test Product {avionics_model_id}"),
-        avionics_types: vec!["navigation".to_string()],
-        quantity: 1,
-    };
-    let approved = ApprovedAvionicsIdentity {
-        id: avionics_model_id,
-        manufacturer: request.manufacturer.clone(),
-        model: request.model.clone(),
-        avionics_types: request.avionics_types.clone(),
-        manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
-        manufacturer_identifier: format!("TEST-{avionics_model_id}"),
-        evidence_url: "https://example.test/product".to_string(),
-        evidence_title: "Test product proof".to_string(),
-        evidence: "Test-only grounded identity proof".to_string(),
-        reason: "test-only catalog receipt fixture".to_string(),
-        grounded_claim_source_urls: Vec::new(),
-        verified_local_reuse_proof: None,
-    };
-    grounded_resolution_receipt_seed(&request, &approved).bind_automated_review(listing_id)
 }
 
 fn grounded_consolidation_preview_block(
@@ -1103,27 +1041,14 @@ pub(crate) async fn resolve_avionics_identity_for_listing_materialization(
 pub(crate) async fn resolve_avionics_identity_for_automated_review(
     db: &AppDb,
     extractor: &GeminiListingExtractor,
-    listing_id: i64,
     request: &AvionicsIdentityRequest,
 ) -> CatalogResult<AutomatedReviewAvionicsIdentityResolution> {
     let mut execution = IdentityResolutionExecution::new(IdentityPersistenceMode::Apply);
     let outcome =
         resolve_avionics_identity_with_write_mode(db, extractor, request, &mut execution).await?;
-    let grounded_receipt = match &outcome {
-        AvionicsIdentityOutcome::Approved(approved)
-            if execution.grounded_resolution_completed && listing_id > 0 && approved.id > 0 =>
-        {
-            Some(
-                grounded_resolution_receipt_seed(request, approved)
-                    .bind_automated_review(listing_id),
-            )
-        }
-        _ => None,
-    };
     Ok(AutomatedReviewAvionicsIdentityResolution {
         outcome,
         pending_review_revision_receipts: execution.pending_review_revision_receipts,
-        grounded_receipt,
     })
 }
 
