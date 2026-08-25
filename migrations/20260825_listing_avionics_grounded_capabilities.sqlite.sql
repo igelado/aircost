@@ -23,7 +23,7 @@ SELECT CASE
     WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'
       AND contract_version = 1
       AND contract_fingerprint =
-        '682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338'
+        '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf'
   )
   AND (
     SELECT group_concat(name, ',')
@@ -117,7 +117,7 @@ SELECT EXISTS (
   WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'
     AND contract_version = 1
     AND contract_fingerprint =
-      '682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338'
+      '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf'
 ) AS exact_rerun;
 
 DROP TABLE IF EXISTS temp.listing_avionics_grounded_capabilities_installed_objects;
@@ -637,7 +637,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  '682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338',
+  '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

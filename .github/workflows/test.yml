@@ -67,6 +67,7 @@ jobs:
         run: |
           cargo test postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering -- --ignored --nocapture --test-threads=1
           cargo test postgres_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly -- --ignored --nocapture --test-threads=1
+          cargo test postgres_grounded_capability_migration_rerun_rejects_contract_drift_without_changes -- --ignored --nocapture --test-threads=1
 
       - name: Check historical migration provenance
         run: bash tests/schema/test_historical_migration_provenance.sh

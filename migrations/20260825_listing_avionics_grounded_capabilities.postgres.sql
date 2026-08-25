@@ -36,7 +36,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          '682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338'
+          '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf'
       )
   ) THEN
     RAISE EXCEPTION
@@ -202,14 +202,38 @@ BEGIN
         )
     AND actual.contype = 'c';
 
-  WITH expected(parent_name, child_column) AS (
+  WITH expected(parent_name, child_column, parent_column) AS (
     VALUES
-      ('public.aircraft_sale_listings', 'listing_id'),
-      ('public.plugin_submissions', 'plugin_submission_id'),
-      ('public.avionics_models', 'avionics_model_id')
+      ('public.aircraft_sale_listings', 'listing_id', 'id'),
+      ('public.plugin_submissions', 'plugin_submission_id', 'id'),
+      ('public.avionics_models', 'avionics_model_id', 'id')
   )
   SELECT
-    (SELECT COUNT(*)
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_class relation
+      WHERE relation.oid = pg_catalog.to_regclass(
+              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+            )
+        AND relation.relkind = 'r'
+        AND relation.relpersistence = 'p'
+        AND NOT relation.relispartition
+        AND NOT relation.relrowsecurity
+        AND NOT relation.relforcerowsecurity
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_inherits inheritance
+          WHERE inheritance.inhrelid = relation.oid
+             OR inheritance.inhparent = relation.oid
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+          WHERE rule_row.ev_class = relation.oid
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_policy policy_row
+          WHERE policy_row.polrelid = relation.oid
+        )
+    )
+    AND (SELECT COUNT(*)
      FROM pg_catalog.pg_constraint actual
      WHERE actual.conrelid = pg_catalog.to_regclass(
              'public.aircraft_sale_listing_avionics_grounded_capabilities'
@@ -223,6 +247,9 @@ BEGIN
         JOIN pg_catalog.pg_attribute child_attribute
           ON child_attribute.attrelid = actual.conrelid
          AND child_attribute.attnum = actual.conkey[1]
+        JOIN pg_catalog.pg_attribute parent_attribute
+          ON parent_attribute.attrelid = actual.confrelid
+         AND parent_attribute.attnum = actual.confkey[1]
         WHERE actual.conrelid = pg_catalog.to_regclass(
                 'public.aircraft_sale_listing_avionics_grounded_capabilities'
               )
@@ -230,6 +257,8 @@ BEGIN
           AND actual.confrelid = pg_catalog.to_regclass(expected.parent_name)
           AND child_attribute.attname = expected.child_column
           AND pg_catalog.array_length(actual.conkey, 1) = 1
+          AND pg_catalog.array_length(actual.confkey, 1) = 1
+          AND parent_attribute.attname = expected.parent_column
           AND actual.confupdtype = 'a'
           AND actual.confdeltype = 'c'
           AND actual.confmatchtype = 's'
@@ -251,14 +280,38 @@ BEGIN
                  'PRIMARY KEY (listing_id, plugin_submission_id, occurrence_index, occurrence_role)') = 1
   INTO capability_relations_are_exact;
 
-  WITH expected(parent_name, child_column) AS (
+  WITH expected(parent_name, child_column, parent_column) AS (
     VALUES
-      ('public.aircraft_sale_listing_avionics', 'listing_link_id'),
-      ('public.avionics_models', 'avionics_model_id'),
-      ('public.plugin_submissions', 'plugin_submission_id')
+      ('public.aircraft_sale_listing_avionics', 'listing_link_id', 'id'),
+      ('public.avionics_models', 'avionics_model_id', 'id'),
+      ('public.plugin_submissions', 'plugin_submission_id', 'id')
   )
   SELECT
-    (SELECT COUNT(*)
+    EXISTS (
+      SELECT 1 FROM pg_catalog.pg_class relation
+      WHERE relation.oid = pg_catalog.to_regclass(
+              'public.aircraft_sale_listing_avionics_link_authorizations'
+            )
+        AND relation.relkind = 'r'
+        AND relation.relpersistence = 'p'
+        AND NOT relation.relispartition
+        AND NOT relation.relrowsecurity
+        AND NOT relation.relforcerowsecurity
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_inherits inheritance
+          WHERE inheritance.inhrelid = relation.oid
+             OR inheritance.inhparent = relation.oid
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+          WHERE rule_row.ev_class = relation.oid
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_catalog.pg_policy policy_row
+          WHERE policy_row.polrelid = relation.oid
+        )
+    )
+    AND (SELECT COUNT(*)
      FROM pg_catalog.pg_constraint actual
      WHERE actual.conrelid = pg_catalog.to_regclass(
              'public.aircraft_sale_listing_avionics_link_authorizations'
@@ -272,6 +325,9 @@ BEGIN
         JOIN pg_catalog.pg_attribute child_attribute
           ON child_attribute.attrelid = actual.conrelid
          AND child_attribute.attnum = actual.conkey[1]
+        JOIN pg_catalog.pg_attribute parent_attribute
+          ON parent_attribute.attrelid = actual.confrelid
+         AND parent_attribute.attnum = actual.confkey[1]
         WHERE actual.conrelid = pg_catalog.to_regclass(
                 'public.aircraft_sale_listing_avionics_link_authorizations'
               )
@@ -279,6 +335,8 @@ BEGIN
           AND actual.confrelid = pg_catalog.to_regclass(expected.parent_name)
           AND child_attribute.attname = expected.child_column
           AND pg_catalog.array_length(actual.conkey, 1) = 1
+          AND pg_catalog.array_length(actual.confkey, 1) = 1
+          AND parent_attribute.attname = expected.parent_column
           AND actual.confupdtype = 'a'
           AND actual.confdeltype = 'c'
           AND actual.confmatchtype = 's'
@@ -615,6 +673,26 @@ BEGIN
               'aircraft_sale_listing_avionics_link_authorizations'
             ) > 0
           )) <> 16
+    OR (SELECT COUNT(*)
+        FROM pg_catalog.pg_trigger actual
+        JOIN pg_catalog.pg_proc routine ON routine.oid = actual.tgfoid
+        WHERE NOT actual.tgisinternal
+          AND (
+            actual.tgrelid = pg_catalog.to_regclass(
+              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+            )
+            OR pg_catalog.strpos(
+              routine.prosrc,
+              'aircraft_sale_listing_avionics_grounded_capabilities'
+            ) > 0
+            OR actual.tgrelid = pg_catalog.to_regclass(
+              'public.aircraft_sale_listing_avionics_link_authorizations'
+            )
+            OR pg_catalog.strpos(
+              routine.prosrc,
+              'aircraft_sale_listing_avionics_link_authorizations'
+            ) > 0
+          )) <> 18
   ) THEN
     RAISE EXCEPTION
       'installed listing avionics grounded-capability migration has an unexpected object set';
@@ -1196,7 +1274,7 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  '682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338',
+  '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

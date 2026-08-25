@@ -89,9 +89,9 @@ const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
     "20260825_listing_avionics_grounded_capabilities";
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
 // SHA-256 of
-// `20260825_listing_avionics_grounded_capabilities:v1:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun`.
+// `20260825_listing_avionics_grounded_capabilities:v1:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun:exact-postgres-relation-index-foreign-key-trigger-closure`.
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
-    "682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338";
+    "89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -3939,6 +3939,21 @@ impl AppDb {
                             AND relation.relkind = 'r'
                             AND relation.relpersistence = 'p'
                             AND NOT relation.relispartition
+                            AND NOT relation.relrowsecurity
+                            AND NOT relation.relforcerowsecurity
+                            AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                              WHERE inheritance.inhrelid = relation.oid
+                                 OR inheritance.inhparent = relation.oid
+                            )
+                            AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+                              WHERE rule_row.ev_class = relation.oid
+                            )
+                            AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_policy policy_row
+                              WHERE policy_row.polrelid = relation.oid
+                            )
                         )
                         OR (
                           SELECT COUNT(*)
@@ -3965,6 +3980,8 @@ impl AppDb {
                                 actual.atttypid, actual.atttypmod
                               ) = required.column_type
                               AND actual.attnotnull = required.required_not_null
+                              AND actual.attidentity = ''
+                              AND actual.attgenerated = ''
                               AND (
                                 (required.default_expression IS NULL
                                   AND default_value.oid IS NULL)
@@ -3974,15 +3991,19 @@ impl AppDb {
                               )
                           )
                         )
-                        OR NOT EXISTS (
-                          SELECT 1 FROM pg_catalog.pg_constraint actual
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_constraint actual
                           WHERE actual.conrelid = pg_catalog.to_regclass(
                             'public.aircraft_sale_listing_avionics_grounded_capabilities'
                           )
                             AND actual.contype = 'p'
+                            AND NOT actual.condeferrable
+                            AND NOT actual.condeferred
+                            AND actual.convalidated
                             AND pg_catalog.pg_get_constraintdef(actual.oid) =
                               'PRIMARY KEY (listing_id, plugin_submission_id, occurrence_index, occurrence_role)'
-                        )
+                        ) <> 1
                         OR (
                           SELECT COUNT(*)
                           FROM pg_catalog.pg_constraint actual
@@ -4015,6 +4036,9 @@ impl AppDb {
                               AND actual.confupdtype = 'a'
                               AND actual.confdeltype = 'c'
                               AND actual.confmatchtype = 's'
+                              AND NOT actual.condeferrable
+                              AND NOT actual.condeferred
+                              AND actual.convalidated
                           )
                         )
                         OR (
@@ -4025,6 +4049,18 @@ impl AppDb {
                           )
                             AND actual.contype = 'c'
                         ) <> 15
+                        OR EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'c'
+                            AND (
+                              NOT actual.convalidated
+                              OR actual.connoinherit
+                            )
+                        )
                         OR EXISTS (
                           SELECT 1 FROM required_checks required
                           WHERE NOT EXISTS (
@@ -4061,17 +4097,23 @@ impl AppDb {
                           SELECT 1 FROM required_indexes required
                           WHERE NOT EXISTS (
                             SELECT 1 FROM pg_catalog.pg_index actual
+                            JOIN pg_catalog.pg_class index_relation
+                              ON index_relation.oid = actual.indexrelid
+                            JOIN pg_catalog.pg_am access_method
+                              ON access_method.oid = index_relation.relam
                             WHERE actual.indexrelid =
                                   pg_catalog.to_regclass(required.index_name)
                               AND actual.indrelid = pg_catalog.to_regclass(
                                 'public.aircraft_sale_listing_avionics_grounded_capabilities'
                               )
+                              AND access_method.amname = 'btree'
                               AND NOT actual.indisunique
                               AND NOT actual.indisprimary
                               AND NOT actual.indisexclusion
                               AND actual.indisvalid
                               AND actual.indisready
                               AND actual.indislive
+                              AND NOT actual.indisreplident
                               AND actual.indnatts = 1
                               AND actual.indnkeyatts = 1
                               AND actual.indexprs IS NULL
@@ -4081,6 +4123,14 @@ impl AppDb {
                               ) = required.column_name
                           )
                         )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_index actual
+                          WHERE actual.indrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND NOT actual.indisprimary
+                        ) <> 2
                         OR (
                           SELECT COUNT(*) FROM pg_catalog.pg_trigger actual
                           WHERE actual.tgrelid = pg_catalog.to_regclass(
@@ -4131,6 +4181,29 @@ impl AppDb {
                               ) > 0
                           )
                         )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_trigger actual
+                          JOIN pg_catalog.pg_proc routine
+                            ON routine.oid = actual.tgfoid
+                          WHERE NOT actual.tgisinternal
+                            AND (
+                              actual.tgrelid = pg_catalog.to_regclass(
+                                'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                              )
+                              OR pg_catalog.strpos(
+                                routine.prosrc,
+                                'aircraft_sale_listing_avionics_grounded_capabilities'
+                              ) > 0
+                              OR actual.tgrelid = pg_catalog.to_regclass(
+                                'public.aircraft_sale_listing_avionics_link_authorizations'
+                              )
+                              OR pg_catalog.strpos(
+                                routine.prosrc,
+                                'aircraft_sale_listing_avionics_link_authorizations'
+                              ) > 0
+                            )
+                        ) <> 18
                       )
                     "#,
                 )
@@ -5365,15 +5438,51 @@ impl AppDb {
                 Ok(table_is_exact && indexes_are_exact && triggers_are_exact)
             }
             GateConnection::Postgres(pool) => {
-                let table_exists = sqlx::query_scalar::<_, bool>(
-                    "SELECT pg_catalog.to_regclass( \
-                       'public.aircraft_sale_listing_avionics_link_authorizations' \
-                     ) IS NOT NULL",
+                let (table_exists, table_is_exact) = sqlx::query_as::<_, (bool, bool)>(
+                    r#"
+                    SELECT
+                      pg_catalog.to_regclass(
+                        'public.aircraft_sale_listing_avionics_link_authorizations'
+                      ) IS NOT NULL,
+                      EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_class relation
+                      WHERE relation.oid = pg_catalog.to_regclass(
+                        'public.aircraft_sale_listing_avionics_link_authorizations'
+                      )
+                        AND relation.relkind = 'r'
+                        AND relation.relpersistence = 'p'
+                        AND NOT relation.relispartition
+                        AND NOT relation.relrowsecurity
+                        AND NOT relation.relforcerowsecurity
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                          WHERE inheritance.inhrelid = relation.oid
+                             OR inheritance.inhparent = relation.oid
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+                          WHERE rule_row.ev_class = relation.oid
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_policy policy_row
+                          WHERE policy_row.polrelid = relation.oid
+                        )
+                    )
+                    "#,
                 )
                 .fetch_one(&mut **pool)
                 .await?;
                 if !table_exists {
-                    return Ok(true);
+                    return Ok(sqlx::query_scalar::<_, bool>(
+                        "SELECT pg_catalog.to_regclass( \
+                           'public.aircraft_sale_listing_avionics' \
+                         ) IS NULL",
+                    )
+                    .fetch_one(&mut **pool)
+                    .await?);
+                }
+                if !table_is_exact {
+                    return Ok(false);
                 }
                 let columns_are_exact = sqlx::query_scalar::<_, bool>(
                     r#"
@@ -5414,6 +5523,8 @@ impl AppDb {
                               actual.atttypid, actual.atttypmod
                             ) = expected.data_type
                             AND actual.attnotnull = expected.not_null
+                            AND actual.attidentity = ''
+                            AND actual.attgenerated = ''
                             AND (
                               (expected.default_expression IS NULL
                                 AND default_value.oid IS NULL)
@@ -5432,9 +5543,11 @@ impl AppDb {
                     eprintln!("listing avionics authorization PostgreSQL columns drifted");
                     return Ok(false);
                 }
-                let actual_checks = sqlx::query_scalar::<_, String>(
+                let actual_checks = sqlx::query_as::<_, (String, bool, bool)>(
                     r#"
-                    SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid)
+                    SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid),
+                           constraint_row.convalidated,
+                           NOT constraint_row.connoinherit
                     FROM pg_catalog.pg_constraint constraint_row
                     WHERE constraint_row.conrelid = pg_catalog.to_regclass(
                       'public.aircraft_sale_listing_avionics_link_authorizations'
@@ -5448,7 +5561,7 @@ impl AppDb {
                     || !actual_checks
                         .iter()
                         .zip(POSTGRES_CHECKS)
-                        .all(|(actual, expected)| actual == expected)
+                        .all(|(actual, expected)| actual.0 == *expected && actual.1 && actual.2)
                 {
                     #[cfg(test)]
                     eprintln!(
@@ -5458,11 +5571,11 @@ impl AppDb {
                 }
                 let relations_are_exact = sqlx::query_scalar::<_, bool>(
                     r#"
-                    WITH expected(parent_name, child_column) AS (
+                    WITH expected(parent_name, child_column, parent_column) AS (
                       VALUES
-                        ('public.aircraft_sale_listing_avionics', 'listing_link_id'),
-                        ('public.avionics_models', 'avionics_model_id'),
-                        ('public.plugin_submissions', 'plugin_submission_id')
+                        ('public.aircraft_sale_listing_avionics', 'listing_link_id', 'id'),
+                        ('public.avionics_models', 'avionics_model_id', 'id'),
+                        ('public.plugin_submissions', 'plugin_submission_id', 'id')
                     )
                     SELECT
                       (SELECT COUNT(*) FROM pg_catalog.pg_constraint actual
@@ -5477,6 +5590,9 @@ impl AppDb {
                           JOIN pg_catalog.pg_attribute child_attribute
                             ON child_attribute.attrelid = actual.conrelid
                            AND child_attribute.attnum = actual.conkey[1]
+                          JOIN pg_catalog.pg_attribute parent_attribute
+                            ON parent_attribute.attrelid = actual.confrelid
+                           AND parent_attribute.attnum = actual.confkey[1]
                           WHERE actual.conrelid = pg_catalog.to_regclass(
                             'public.aircraft_sale_listing_avionics_link_authorizations'
                           )
@@ -5485,34 +5601,61 @@ impl AppDb {
                                 pg_catalog.to_regclass(expected.parent_name)
                             AND child_attribute.attname = expected.child_column
                             AND pg_catalog.array_length(actual.conkey, 1) = 1
+                            AND pg_catalog.array_length(actual.confkey, 1) = 1
+                            AND parent_attribute.attname = expected.parent_column
                             AND actual.confupdtype = 'a'
                             AND actual.confdeltype = 'c'
                             AND actual.confmatchtype = 's'
+                            AND NOT actual.condeferrable
+                            AND NOT actual.condeferred
+                            AND actual.convalidated
                         )
                       )
-                      AND EXISTS (
-                        SELECT 1 FROM pg_catalog.pg_constraint actual
+                      AND (
+                        SELECT COUNT(*) FROM pg_catalog.pg_constraint actual
                         WHERE actual.conrelid = pg_catalog.to_regclass(
                           'public.aircraft_sale_listing_avionics_link_authorizations'
                         ) AND actual.contype = 'p'
+                          AND NOT actual.condeferrable
+                          AND NOT actual.condeferred
+                          AND actual.convalidated
                           AND pg_catalog.pg_get_constraintdef(actual.oid) =
                             'PRIMARY KEY (listing_link_id, association_role)'
-                      )
+                      ) = 1
                       AND EXISTS (
                         SELECT 1 FROM pg_catalog.pg_index actual
+                        JOIN pg_catalog.pg_class index_relation
+                          ON index_relation.oid = actual.indexrelid
+                        JOIN pg_catalog.pg_am access_method
+                          ON access_method.oid = index_relation.relam
                         WHERE actual.indexrelid = pg_catalog.to_regclass(
                           'public.idx_listing_avionics_authorizations_model'
                         )
                           AND actual.indrelid = pg_catalog.to_regclass(
                             'public.aircraft_sale_listing_avionics_link_authorizations'
                           )
+                          AND access_method.amname = 'btree'
                           AND NOT actual.indisunique
+                          AND NOT actual.indisprimary
+                          AND NOT actual.indisexclusion
+                          AND actual.indisvalid
+                          AND actual.indisready
+                          AND actual.indislive
+                          AND NOT actual.indisreplident
                           AND actual.indnatts = 1 AND actual.indnkeyatts = 1
                           AND actual.indexprs IS NULL AND actual.indpred IS NULL
                           AND pg_catalog.pg_get_indexdef(
                             actual.indexrelid, 1, TRUE
                           ) = 'avionics_model_id'
                       )
+                      AND (
+                        SELECT COUNT(*)
+                        FROM pg_catalog.pg_index actual
+                        WHERE actual.indrelid = pg_catalog.to_regclass(
+                          'public.aircraft_sale_listing_avionics_link_authorizations'
+                        )
+                          AND NOT actual.indisprimary
+                      ) = 1
                     "#,
                 )
                 .fetch_one(&mut **pool)
@@ -17900,7 +18043,7 @@ mod tests {
         assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
         assert_eq!(
             LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
-            "682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338"
+            "89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf"
         );
         assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL
             .contains("DROP TABLE IF EXISTS aircraft_sale_listing_avionics_grounded_capabilities"));
@@ -18869,6 +19012,141 @@ mod tests {
             .expect("startup should accept the preserved exact PostgreSQL state");
     }
 
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_grounded_capability_migration_rerun_rejects_contract_drift_without_changes() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        for tamper_sql in [
+            "ALTER TABLE public.aircraft_sale_listings \
+             ADD COLUMN hostile_reference_id BIGINT UNIQUE; \
+             DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'listing_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities \
+             ADD CONSTRAINT hostile_capability_listing_fk \
+             FOREIGN KEY (listing_id) \
+             REFERENCES public.aircraft_sale_listings(hostile_reference_id) \
+             ON DELETE CASCADE",
+            "ALTER TABLE public.aircraft_sale_listing_avionics \
+             ADD COLUMN hostile_reference_id BIGINT UNIQUE; \
+             DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'listing_link_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ADD CONSTRAINT hostile_authorization_link_fk \
+             FOREIGN KEY (listing_link_id) \
+             REFERENCES public.aircraft_sale_listing_avionics(hostile_reference_id) \
+             ON DELETE CASCADE",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'plugin_submission_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ADD CONSTRAINT hostile_authorization_submission_fk \
+             FOREIGN KEY (plugin_submission_id) \
+             REFERENCES public.plugin_submissions(id) ON DELETE CASCADE NOT VALID",
+            "CREATE INDEX hostile_extra_grounded_capability_index \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities (listing_id)",
+            "CREATE INDEX hostile_extra_listing_authorization_index \
+             ON public.aircraft_sale_listing_avionics_link_authorizations (listing_link_id)",
+            "ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ENABLE ROW LEVEL SECURITY",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'c' \
+                 AND pg_catalog.strpos( \
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid), \
+                   'occurrence_index' \
+                 ) > 0; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities \
+             ADD CONSTRAINT hostile_occurrence_index_check \
+             CHECK ((occurrence_index >= 0) OR TRUE)",
+            "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() \
+             SET search_path = public",
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities; \
+             CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert \
+             BEFORE INSERT \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             FOR EACH ROW WHEN (false) \
+             EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability()",
+            "CREATE FUNCTION public.hostile_external_capability_delete() \
+             RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog \
+             AS $function$ \
+             BEGIN \
+               DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities \
+               WHERE listing_id = -1; \
+               RETURN NEW; \
+             END \
+             $function$; \
+             CREATE TRIGGER hostile_external_capability_delete \
+             AFTER UPDATE ON public.users FOR EACH ROW \
+             EXECUTE FUNCTION public.hostile_external_capability_delete()",
+        ] {
+            assert_postgres_grounded_migration_rerun_rejected_without_changes(
+                &database_url,
+                tamper_sql,
+            )
+            .await;
+        }
+    }
+
     async fn assert_corrupt_grounded_capability_schema_rejected(statements: &[&str]) {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -19072,6 +19350,268 @@ mod tests {
         assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
     }
 
+    async fn assert_unexpected_postgres_grounded_index_rejected_without_healing(
+        database_url: &str,
+        table: &str,
+        index: &str,
+        column: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let installed_at_before: String = sqlx::query_scalar(
+            "SELECT installed_at FROM ONLY public.schema_migration_contracts \
+             WHERE migration_name = $1",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let definition = format!("CREATE INDEX {index} ON public.{table} ({column})");
+        sqlx::raw_sql(&definition).execute(pool).await.unwrap();
+        drop(db);
+
+        let error = connect_error(AppDb::connect(database_url).await);
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
+
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(database_url)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT pg_catalog.pg_get_indexdef(pg_catalog.to_regclass($1))",
+            )
+            .bind(format!("public.{index}"))
+            .fetch_one(&inspection)
+            .await
+            .unwrap(),
+            format!("CREATE INDEX {index} ON public.{table} USING btree ({column})")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT installed_at FROM ONLY public.schema_migration_contracts \
+                 WHERE migration_name = $1",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(&inspection)
+            .await
+            .unwrap(),
+            installed_at_before
+        );
+        inspection.close().await;
+    }
+
+    async fn postgres_grounded_contract_snapshot(pool: &sqlx::PgPool) -> String {
+        sqlx::query_scalar(
+            r#"
+            WITH protected_relations(name, relation_id) AS (
+              VALUES
+                ('aircraft_sale_listing_avionics_grounded_capabilities',
+                 pg_catalog.to_regclass(
+                   'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                 )),
+                ('aircraft_sale_listing_avionics_link_authorizations',
+                 pg_catalog.to_regclass(
+                   'public.aircraft_sale_listing_avionics_link_authorizations'
+                 ))
+            ), protected_triggers AS (
+              SELECT trigger_row.*
+              FROM pg_catalog.pg_trigger trigger_row
+              JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
+              WHERE NOT trigger_row.tgisinternal
+                AND (
+                  trigger_row.tgrelid IN (
+                    SELECT relation_id FROM protected_relations
+                  )
+                  OR pg_catalog.strpos(
+                    routine.prosrc,
+                    'aircraft_sale_listing_avionics_grounded_capabilities'
+                  ) > 0
+                  OR pg_catalog.strpos(
+                    routine.prosrc,
+                    'aircraft_sale_listing_avionics_link_authorizations'
+                  ) > 0
+                )
+            )
+            SELECT pg_catalog.jsonb_build_object(
+              'capability_rows', COALESCE((
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.to_jsonb(capability)
+                  ORDER BY listing_id, plugin_submission_id,
+                           occurrence_index, occurrence_role
+                )
+                FROM ONLY public.aircraft_sale_listing_avionics_grounded_capabilities capability
+              ), '[]'::jsonb),
+              'authorization_rows', COALESCE((
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.to_jsonb(authorization_row)
+                  ORDER BY listing_link_id, association_role
+                )
+                FROM ONLY public.aircraft_sale_listing_avionics_link_authorizations authorization_row
+              ), '[]'::jsonb),
+              'receipt', (
+                SELECT pg_catalog.to_jsonb(receipt)
+                FROM ONLY public.schema_migration_contracts receipt
+                WHERE migration_name =
+                      '20260825_listing_avionics_grounded_capabilities'
+              ),
+              'relations', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'name', protected.name,
+                    'kind', relation.relkind,
+                    'persistence', relation.relpersistence,
+                    'is_partition', relation.relispartition,
+                    'row_security', relation.relrowsecurity,
+                    'force_row_security', relation.relforcerowsecurity,
+                    'parents', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        inheritance.inhparent ORDER BY inheritance.inhparent
+                      ) FROM pg_catalog.pg_inherits inheritance
+                      WHERE inheritance.inhrelid = protected.relation_id
+                    ), '[]'::jsonb),
+                    'children', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        inheritance.inhrelid ORDER BY inheritance.inhrelid
+                      ) FROM pg_catalog.pg_inherits inheritance
+                      WHERE inheritance.inhparent = protected.relation_id
+                    ), '[]'::jsonb),
+                    'rules', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        pg_catalog.pg_get_ruledef(rule_row.oid)
+                        ORDER BY rule_row.rulename
+                      ) FROM pg_catalog.pg_rewrite rule_row
+                      WHERE rule_row.ev_class = protected.relation_id
+                    ), '[]'::jsonb),
+                    'policies', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        pg_catalog.to_jsonb(policy_row)
+                        ORDER BY policy_row.polname
+                      ) FROM pg_catalog.pg_policy policy_row
+                      WHERE policy_row.polrelid = protected.relation_id
+                    ), '[]'::jsonb)
+                  ) ORDER BY protected.name
+                )
+                FROM protected_relations protected
+                JOIN pg_catalog.pg_class relation
+                  ON relation.oid = protected.relation_id
+              ),
+              'constraints', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'table', constraint_row.conrelid,
+                    'name', constraint_row.conname,
+                    'type', constraint_row.contype,
+                    'definition', pg_catalog.pg_get_constraintdef(
+                      constraint_row.oid
+                    ),
+                    'validated', constraint_row.convalidated,
+                    'no_inherit', constraint_row.connoinherit,
+                    'deferrable', constraint_row.condeferrable,
+                    'deferred', constraint_row.condeferred,
+                    'child_keys', constraint_row.conkey,
+                    'parent', constraint_row.confrelid,
+                    'parent_keys', constraint_row.confkey
+                  ) ORDER BY constraint_row.conrelid,
+                             constraint_row.contype,
+                             constraint_row.conname
+                )
+                FROM pg_catalog.pg_constraint constraint_row
+                WHERE constraint_row.conrelid IN (
+                  SELECT relation_id FROM protected_relations
+                )
+              ),
+              'indexes', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'table', index_row.indrelid,
+                    'name', index_relation.relname,
+                    'definition', pg_catalog.pg_get_indexdef(index_row.indexrelid),
+                    'method', access_method.amname,
+                    'unique', index_row.indisunique,
+                    'primary', index_row.indisprimary,
+                    'exclusion', index_row.indisexclusion,
+                    'valid', index_row.indisvalid,
+                    'ready', index_row.indisready,
+                    'live', index_row.indislive,
+                    'replica_identity', index_row.indisreplident
+                  ) ORDER BY index_row.indrelid, index_relation.relname
+                )
+                FROM pg_catalog.pg_index index_row
+                JOIN pg_catalog.pg_class index_relation
+                  ON index_relation.oid = index_row.indexrelid
+                JOIN pg_catalog.pg_am access_method
+                  ON access_method.oid = index_relation.relam
+                WHERE index_row.indrelid IN (
+                  SELECT relation_id FROM protected_relations
+                )
+              ),
+              'triggers', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'table', trigger_row.tgrelid,
+                    'name', trigger_row.tgname,
+                    'definition', pg_catalog.pg_get_triggerdef(trigger_row.oid),
+                    'enabled', trigger_row.tgenabled,
+                    'function', trigger_row.tgfoid
+                  ) ORDER BY trigger_row.tgrelid, trigger_row.tgname
+                ) FROM protected_triggers trigger_row
+              ),
+              'functions', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'name', routine.proname,
+                    'definition', pg_catalog.pg_get_functiondef(routine.oid),
+                    'configuration', routine.proconfig,
+                    'security_definer', routine.prosecdef
+                  ) ORDER BY routine.proname, routine.oid
+                )
+                FROM pg_catalog.pg_proc routine
+                WHERE routine.oid IN (
+                  SELECT trigger_row.tgfoid FROM protected_triggers trigger_row
+                )
+              )
+            )::text
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn assert_postgres_grounded_migration_rerun_rejected_without_changes(
+        database_url: &str,
+        tamper_sql: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(tamper_sql).execute(pool).await.unwrap();
+        let before = postgres_grounded_contract_snapshot(pool).await;
+        let mut connection = pool.acquire().await.unwrap();
+        let error = sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL)
+            .execute(&mut *connection)
+            .await
+            .expect_err("a marked PostgreSQL contract mutation must reject rerun")
+            .to_string();
+        let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *connection).await;
+        drop(connection);
+        assert!(
+            error.contains("installed listing avionics grounded-capability"),
+            "unexpected migration error: {error}"
+        );
+        assert_eq!(postgres_grounded_contract_snapshot(pool).await, before);
+    }
+
     #[tokio::test]
     #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
     async fn postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering() {
@@ -19161,7 +19701,36 @@ mod tests {
         drop(connection);
         drop(db);
 
+        for (table, index, column) in [
+            (
+                "aircraft_sale_listing_avionics_grounded_capabilities",
+                "hostile_extra_grounded_capability_index",
+                "listing_id",
+            ),
+            (
+                "aircraft_sale_listing_avionics_link_authorizations",
+                "hostile_extra_listing_authorization_index",
+                "listing_link_id",
+            ),
+        ] {
+            assert_unexpected_postgres_grounded_index_rejected_without_healing(
+                &database_url,
+                table,
+                index,
+                column,
+            )
+            .await;
+        }
+
         for tamper_sql in [
+            "DROP INDEX public.idx_listing_avionics_grounded_capabilities_model; \
+             CREATE INDEX idx_listing_avionics_grounded_capabilities_model \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             USING hash (avionics_model_id)",
+            "DROP INDEX public.idx_listing_avionics_authorizations_model; \
+             CREATE INDEX idx_listing_avionics_authorizations_model \
+             ON public.aircraft_sale_listing_avionics_link_authorizations \
+             USING hash (avionics_model_id)",
             "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() SET search_path = public",
             "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() SECURITY DEFINER",
             "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert ON public.aircraft_sale_listing_avionics_grounded_capabilities; \
@@ -19171,6 +19740,18 @@ mod tests {
             "CREATE TRIGGER unexpected_listing_avionics_grounded_capability_trigger \
              BEFORE DELETE ON public.aircraft_sale_listing_avionics_grounded_capabilities \
              FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update()",
+            "CREATE FUNCTION public.hostile_external_capability_delete() \
+             RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog \
+             AS $function$ \
+             BEGIN \
+               DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities \
+               WHERE listing_id = -1; \
+               RETURN NEW; \
+             END \
+             $function$; \
+             CREATE TRIGGER hostile_external_capability_delete \
+             AFTER UPDATE ON public.users FOR EACH ROW \
+             EXECUTE FUNCTION public.hostile_external_capability_delete()",
             "DO $tamper$ \
              DECLARE target_constraint text; \
              BEGIN \
@@ -19232,6 +19813,46 @@ mod tests {
              END \
              $tamper$",
             "ALTER TABLE public.plugin_submissions DISABLE TRIGGER listing_avionics_authorizations_invalidate_capture_update",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'plugin_submission_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities ALTER CONSTRAINT %I DEFERRABLE INITIALLY DEFERRED', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'plugin_submission_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ADD CONSTRAINT hostile_authorization_submission_fk \
+             FOREIGN KEY (plugin_submission_id) \
+             REFERENCES public.plugin_submissions(id) ON DELETE CASCADE NOT VALID",
             "CREATE TRIGGER unexpected_listing_avionics_authorization_trigger \
              AFTER UPDATE ON public.plugin_submissions FOR EACH ROW \
              EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture()",
