@@ -1,4 +1,3 @@
-PRAGMA foreign_keys = OFF;
 BEGIN IMMEDIATE;
 
 CREATE TABLE IF NOT EXISTS schema_migration_contracts (
@@ -130,14 +129,18 @@ SELECT type, name,
 FROM sqlite_schema
 WHERE sql IS NOT NULL
   AND (
-    (type = 'index' AND name IN (
-      'idx_listing_avionics_grounded_capabilities_model',
-      'idx_listing_avionics_grounded_capabilities_submission',
-      'idx_listing_avionics_authorizations_model'
+    (type = 'index' AND tbl_name IN (
+      'aircraft_sale_listing_avionics_grounded_capabilities',
+      'aircraft_sale_listing_avionics_link_authorizations'
     ))
     OR
     (type = 'trigger' AND (
-      tbl_name = 'aircraft_sale_listing_avionics_grounded_capabilities'
+      tbl_name IN (
+        'aircraft_sale_listing_avionics_grounded_capabilities',
+        'aircraft_sale_listing_avionics_link_authorizations'
+      )
+      OR instr(lower(sql),
+        'aircraft_sale_listing_avionics_grounded_capabilities') > 0
       OR instr(lower(sql),
         'aircraft_sale_listing_avionics_link_authorizations') > 0
     ))
@@ -573,14 +576,18 @@ SELECT CASE
         FROM sqlite_schema
         WHERE sql IS NOT NULL
           AND (
-            (type = 'index' AND name IN (
-              'idx_listing_avionics_grounded_capabilities_model',
-              'idx_listing_avionics_grounded_capabilities_submission',
-              'idx_listing_avionics_authorizations_model'
+            (type = 'index' AND tbl_name IN (
+              'aircraft_sale_listing_avionics_grounded_capabilities',
+              'aircraft_sale_listing_avionics_link_authorizations'
             ))
             OR
             (type = 'trigger' AND (
-              tbl_name = 'aircraft_sale_listing_avionics_grounded_capabilities'
+              tbl_name IN (
+                'aircraft_sale_listing_avionics_grounded_capabilities',
+                'aircraft_sale_listing_avionics_link_authorizations'
+              )
+              OR instr(lower(sql),
+                'aircraft_sale_listing_avionics_grounded_capabilities') > 0
               OR instr(lower(sql),
                 'aircraft_sale_listing_avionics_link_authorizations') > 0
             ))
@@ -597,14 +604,18 @@ SELECT CASE
         FROM sqlite_schema
         WHERE sql IS NOT NULL
           AND (
-            (type = 'index' AND name IN (
-              'idx_listing_avionics_grounded_capabilities_model',
-              'idx_listing_avionics_grounded_capabilities_submission',
-              'idx_listing_avionics_authorizations_model'
+            (type = 'index' AND tbl_name IN (
+              'aircraft_sale_listing_avionics_grounded_capabilities',
+              'aircraft_sale_listing_avionics_link_authorizations'
             ))
             OR
             (type = 'trigger' AND (
-              tbl_name = 'aircraft_sale_listing_avionics_grounded_capabilities'
+              tbl_name IN (
+                'aircraft_sale_listing_avionics_grounded_capabilities',
+                'aircraft_sale_listing_avionics_link_authorizations'
+              )
+              OR instr(lower(sql),
+                'aircraft_sale_listing_avionics_grounded_capabilities') > 0
               OR instr(lower(sql),
                 'aircraft_sale_listing_avionics_link_authorizations') > 0
             ))
@@ -632,4 +643,3 @@ INSERT INTO schema_migration_contracts (
 ON CONFLICT (migration_name) DO NOTHING;
 
 COMMIT;
-PRAGMA foreign_keys = ON;

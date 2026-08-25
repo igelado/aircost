@@ -4942,6 +4942,10 @@ impl AppDb {
             ),
             (
                 "trigger",
+                "listing_avionics_authorizations_invalidate_origin_revocation",
+            ),
+            (
+                "trigger",
                 "listing_avionics_grounded_capabilities_immutable_update",
             ),
             (
@@ -4999,9 +5003,15 @@ impl AppDb {
                         .expect("canonical grounded-capability table must exist");
                 let actual_objects = sqlx::query_as::<_, (String, String, Option<String>)>(
                     "SELECT type, name, sql FROM sqlite_schema \
-                     WHERE tbl_name = ? AND type IN ('index', 'trigger') \
-                       AND sql IS NOT NULL ORDER BY type, name",
+                     WHERE sql IS NOT NULL AND ( \
+                       (type = 'index' AND tbl_name = ?) OR \
+                       (type = 'trigger' AND ( \
+                         tbl_name = ? OR instr(lower(sql), ?) > 0 \
+                       )) \
+                     ) ORDER BY type, name",
                 )
+                .bind(TABLE)
+                .bind(TABLE)
                 .bind(TABLE)
                 .fetch_all(&mut **pool)
                 .await?;
@@ -17900,6 +17910,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_grounded_capability_rerun_rejects_unexpected_protected_objects() {
+        for (object_name, statement) in [
+            (
+                "unexpected_grounded_capability_index",
+                "CREATE INDEX unexpected_grounded_capability_index ON aircraft_sale_listing_avionics_grounded_capabilities(requested_quantity)",
+            ),
+            (
+                "unexpected_grounded_authorization_index",
+                "CREATE INDEX unexpected_grounded_authorization_index ON aircraft_sale_listing_avionics_link_authorizations(authorization_kind)",
+            ),
+            (
+                "unexpected_grounded_capability_external_trigger",
+                "CREATE TRIGGER unexpected_grounded_capability_external_trigger \
+                 BEFORE UPDATE ON plugin_submissions BEGIN \
+                   SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities; \
+                 END",
+            ),
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            sqlx::query(statement).execute(pool).await.unwrap();
+            let before = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT type, name, sql FROM sqlite_schema \
+                 WHERE sql IS NOT NULL AND ( \
+                   (type = 'index' AND tbl_name IN ( \
+                     'aircraft_sale_listing_avionics_grounded_capabilities', \
+                     'aircraft_sale_listing_avionics_link_authorizations' \
+                   )) OR (type = 'trigger' AND ( \
+                     tbl_name IN ( \
+                       'aircraft_sale_listing_avionics_grounded_capabilities', \
+                       'aircraft_sale_listing_avionics_link_authorizations' \
+                     ) OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_grounded_capabilities') > 0 \
+                       OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_link_authorizations') > 0 \
+                   )) \
+                 ) \
+                 ORDER BY type, name",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let receipt_before: (i64, String, String) = sqlx::query_as(
+                "SELECT contract_version, contract_fingerprint, installed_at \
+                 FROM schema_migration_contracts WHERE migration_name = ?",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+            let error = sqlx::raw_sql(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+            )
+            .execute(pool)
+            .await
+            .expect_err("an unexpected attached index must fail a marked SQLite rerun")
+            .to_string();
+            assert!(
+                error.contains("CHECK constraint failed")
+                    || error.contains("listing_avionics_grounded_capabilities_object_guard"),
+                "unexpected {object_name} rerun error: {error}"
+            );
+            let _ = sqlx::raw_sql("ROLLBACK").execute(pool).await;
+
+            let after = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT type, name, sql FROM sqlite_schema \
+                 WHERE sql IS NOT NULL AND ( \
+                   (type = 'index' AND tbl_name IN ( \
+                     'aircraft_sale_listing_avionics_grounded_capabilities', \
+                     'aircraft_sale_listing_avionics_link_authorizations' \
+                   )) OR (type = 'trigger' AND ( \
+                     tbl_name IN ( \
+                       'aircraft_sale_listing_avionics_grounded_capabilities', \
+                       'aircraft_sale_listing_avionics_link_authorizations' \
+                     ) OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_grounded_capabilities') > 0 \
+                       OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_link_authorizations') > 0 \
+                   )) \
+                 ) \
+                 ORDER BY type, name",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let receipt_after: (i64, String, String) = sqlx::query_as(
+                "SELECT contract_version, contract_fingerprint, installed_at \
+                 FROM schema_migration_contracts WHERE migration_name = ?",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(after, before, "{object_name} rejection must not heal objects");
+            assert_eq!(receipt_after, receipt_before);
+            assert!(after.iter().any(|(_, name, _)| name == object_name));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap(),
+                1,
+                "{object_name} rejection must preserve FK enforcement"
+            );
+            assert!(db.ensure_required_migrations().await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn grounded_capability_migration_rerun_is_idempotent_and_unmarked_tables_fail_closed() {
         let options = "sqlite::memory:"
             .parse::<sqlx::sqlite::SqliteConnectOptions>()
@@ -17944,6 +18066,13 @@ mod tests {
             "unexpected startup error: {error}"
         );
         sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
         sqlx::raw_sql(
             "DROP TABLE aircraft_sale_listing_avionics_grounded_capabilities; \
              DROP TABLE aircraft_sale_listing_avionics_link_authorizations;",
@@ -17958,6 +18087,13 @@ mod tests {
                 .expect_err("unmarked protected trigger names must fail closed")
                 .to_string();
         sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
         assert!(
             protected_object_error.contains("CHECK constraint failed")
                 || protected_object_error
@@ -18339,6 +18475,14 @@ mod tests {
                 .to_string();
         sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
         assert!(table_error.contains("accepted = 1"), "{table_error}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1,
+            "a rejected table guard must preserve FK enforcement"
+        );
         assert_eq!(sqlite_grounded_authorization_rows(pool).await, before);
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -18411,6 +18555,14 @@ mod tests {
                 .to_string();
         sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
         assert!(trigger_error.contains("accepted = 3"), "{trigger_error}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1,
+            "a rejected object guard must preserve FK enforcement"
+        );
         assert_eq!(sqlite_grounded_authorization_rows(pool).await, before);
         assert_eq!(
             sqlx::query_scalar::<_, String>(
