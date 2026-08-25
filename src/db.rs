@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,7 @@ const SQLITE_SCHEMA_SQL: &str = include_str!("../schema/sqlite.sql");
 const POSTGRES_SCHEMA_SQL: &str = include_str!("../schema/postgres.sql");
 const POSTGRES_SEARCH_PATH: &str = "public,pg_catalog,pg_temp";
 const POSTGRES_STARTUP_ADVISORY_LOCK_KEY: i64 = 0x0041_4952_434f_5354;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const VALUATION_DATA_HARDENING_MIGRATION: &str = "20260720_valuation_data_hardening";
 const AVIONICS_CATALOG_CURATION_MIGRATION: &str = "20260721_avionics_catalog_curation";
 const AVIONICS_MULTI_TYPE_MIGRATION: &str = "20260721_avionics_multi_type";
@@ -85,16 +87,13 @@ const AVIONICS_GROUNDED_EVIDENCE_REFRESH_MIGRATION: &str =
 const AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_GROUNDED_EVIDENCE_REFRESH_CONTRACT_FINGERPRINT: &str =
     "0c44e30c662d8f51c11f7db883251c1356cfda4d53957df038988c32d3b91399";
-const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION: &str =
-    "20260818_listing_avionics_association_authorizations";
-const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION: i64 = 1;
-const LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT: &str =
-    "bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9";
-const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION: &str =
-    "20260818_listing_avionics_authorization_hash_domain_reset";
-const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION: i64 = 1;
-const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &str =
-    "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
+    "20260825_listing_avionics_grounded_capabilities";
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
+// SHA-256 of
+// `20260825_listing_avionics_grounded_capabilities:v1:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun:exact-postgres-relation-index-foreign-key-trigger-closure:collation-independent-check-attestation`.
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
+    "e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -403,7 +402,7 @@ END;
 const REFERENCE_CATALOG_CUTOVER_MIGRATION: &str = "20260819_reference_catalog_cutover";
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_VERSION: i64 = 1;
 const REFERENCE_CATALOG_CUTOVER_CONTRACT_FINGERPRINT: &str =
-    "fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5";
+    "85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_MIGRATION_SQL: &str =
     include_str!("../migrations/20260819_reference_catalog_cutover.sqlite.sql");
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL: &str =
@@ -483,14 +482,9 @@ const COMMON_STARTUP_MIGRATION_CONTRACT_RECEIPTS: &[MigrationContractReceipt] = 
         contract_fingerprint: AVIONICS_GROUNDED_EXACT_MODEL_CONSOLIDATION_CONTRACT_FINGERPRINT,
     },
     MigrationContractReceipt {
-        migration_name: LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
-        contract_version: LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION,
-        contract_fingerprint: LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
-    },
-    MigrationContractReceipt {
-        migration_name: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-        contract_version: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
-        contract_fingerprint: LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
+        migration_name: LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION,
+        contract_version: LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION,
+        contract_fingerprint: LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
     },
     MigrationContractReceipt {
         migration_name: AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_MIGRATION,
@@ -551,7 +545,6 @@ const REFERENCE_CATALOG_CUTOVER_ROUTINES: &[&str] = &[
     "aircraft_serial_natural_sort_key",
     "validate_aircraft_serial_scheme_ordering",
     "prevent_referenced_avionics_catalog_downgrade",
-    "invalidate_listing_avionics_authorization_for_capture",
     "validate_aircraft_valuation_compatibility_projection",
     "require_aircraft_catalog_approval",
     "validate_aircraft_reference_version_insert",
@@ -631,7 +624,7 @@ const REFERENCE_CATALOG_CUTOVER_RETIRED_ROUTINES: &[&str] = &[
 ];
 const REFERENCE_CATALOG_CUTOVER_SQLITE_OBJECT_COUNT: i64 = 213;
 const REFERENCE_CATALOG_CUTOVER_SQLITE_DEFINITION_DIGEST: &str =
-    "82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1";
+    "581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54";
 const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "aircraft_reference_fact_set_attestations:sqlite_autoindex_aircraft_reference_fact_set_attestations_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:fact_set_kind:0:BINARY:1,2:-1::0:BINARY:0",
     "aircraft_reference_prices:sqlite_autoindex_aircraft_reference_prices_1:1:u:0:0:1:aircraft_reference_configuration_version_id:0:BINARY:1,1:2:price_kind:0:BINARY:1,2:4:currency:0:BINARY:1,3:-1::0:BINARY:0",
@@ -643,9 +636,9 @@ const REFERENCE_CATALOG_CUTOVER_SQLITE_INDEX_SIGNATURES: &[&str] = &[
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_1:1:u:0:0:7:evidence_claim_id:0:BINARY:1,1:-1::0:BINARY:0",
     "official_dollar_normalization_facts:sqlite_autoindex_official_dollar_normalization_facts_2:1:u:0:0:1:source_year:0:BINARY:1,1:2:target_year:0:BINARY:1,2:-1::0:BINARY:0",
 ];
-const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 793;
+const REFERENCE_CATALOG_CUTOVER_POSTGRES_OBJECT_COUNT: i64 = 792;
 const REFERENCE_CATALOG_CUTOVER_POSTGRES_DEFINITION_DIGEST: &str =
-    "5bea7b82d356e161fe8a160f68845c68";
+    "a12dfb4a0ff4f026bee8b16c1c26ac0a";
 const SQLITE_SERIAL_SCHEME_INSERT_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_serial_schemes_require_approval
 BEFORE INSERT ON aircraft_serial_number_schemes
@@ -875,6 +868,34 @@ struct PostgresReferenceConstraintDefinition {
     constraint_type: String,
     definition: String,
 }
+
+#[derive(sqlx::FromRow)]
+struct PostgresGroundedCapabilityTriggerDefinition {
+    trigger_name: String,
+    trigger_type: i16,
+    has_no_when_clause: bool,
+    is_enabled: bool,
+    has_zero_trigger_args: bool,
+    is_uninherited: bool,
+    is_non_constraint: bool,
+    has_no_transition_tables: bool,
+    has_no_update_columns: bool,
+    definition: String,
+    function_namespace: String,
+    function_name: String,
+    function_source: String,
+    function_config: String,
+    is_security_invoker: bool,
+    is_ordinary_function: bool,
+    returns_trigger: bool,
+    has_zero_function_args: bool,
+    language_name: String,
+    is_not_strict: bool,
+    is_volatile: bool,
+    is_parallel_unsafe: bool,
+    is_not_leakproof: bool,
+}
+
 fn canonical_sql_definition(value: &str) -> String {
     let mut canonical = String::with_capacity(value.len());
     let mut characters = value.chars().peekable();
@@ -991,19 +1012,53 @@ fn expected_sqlite_faa_registry_definitions() -> Vec<SqliteSchemaDefinition> {
 
 fn sqlite_table_definition<'a>(schema: &'a str, table: &str) -> Option<&'a str> {
     let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
-    let tail = &schema[schema.find(&marker)?..];
-    let end = tail.find("\n);")? + 2;
-    Some(&tail[..end])
+    let qualified_marker = format!("CREATE TABLE IF NOT EXISTS public.{table} (");
+    let start = schema
+        .find(&marker)
+        .or_else(|| schema.find(&qualified_marker))?;
+    let tail = &schema[start..];
+    let mut depth = 0_i64;
+    let mut quote = None;
+    let mut characters = tail.char_indices().peekable();
+    while let Some((offset, character)) = characters.next() {
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                if characters
+                    .peek()
+                    .is_some_and(|(_, next)| *next == active_quote)
+                {
+                    characters.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&tail[..=offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn canonical_table_definition(schema: &str, table: &str) -> Option<String> {
+    Some(
+        canonical_sql_definition(sqlite_table_definition(schema, table)?)
+            .replacen("createtableifnotexists", "createtable", 1)
+            .replace("public.", ""),
+    )
 }
 
 fn canonical_sqlite_table_definition(schema: &str, table: &str) -> Option<String> {
-    Some(
-        canonical_sql_definition(sqlite_table_definition(schema, table)?).replacen(
-            "createtableifnotexists",
-            "createtable",
-            1,
-        ),
-    )
+    canonical_table_definition(schema, table)
 }
 
 fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String> {
@@ -1017,6 +1072,27 @@ fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String>
                 || statement.starts_with(&format!("createuniqueindex{canonical_name}on"))
                 || statement.starts_with(&format!("createtrigger{canonical_name}"))
         })
+}
+
+fn postgres_function_source<'a>(schema: &'a str, function_name: &str) -> Option<&'a str> {
+    let marker = format!("CREATE OR REPLACE FUNCTION public.{function_name}()");
+    let wrapped_marker = format!("CREATE OR REPLACE FUNCTION\n  public.{function_name}()");
+    let declaration = schema
+        .split_once(&marker)
+        .or_else(|| schema.split_once(&wrapped_marker))?
+        .1;
+    let body = declaration.split_once("AS $function$")?.1;
+    body.split_once("$function$;")
+        .map(|(source, _)| source.trim())
+}
+
+fn canonical_postgres_named_trigger_definition(schema: &str, name: &str) -> Option<String> {
+    let marker = format!("createtrigger{}", name.to_ascii_lowercase());
+    split_sql_statements(schema)
+        .into_iter()
+        .map(strip_leading_sql_comments)
+        .map(canonical_postgres_trigger_definition)
+        .find(|statement| statement.starts_with(&marker))
 }
 
 fn postgres_migration_function_source(function_name: &str) -> Option<&'static str> {
@@ -1141,7 +1217,8 @@ impl AppDb {
             let options = SqliteConnectOptions::from_str(&database_url)
                 .with_context(|| format!("invalid SQLite database URL {database_url}"))?
                 .create_if_missing(true)
-                .foreign_keys(true);
+                .foreign_keys(true)
+                .busy_timeout(SQLITE_BUSY_TIMEOUT);
             let pool = SqlitePoolOptions::new()
                 .max_connections(5)
                 .connect_with(options)
@@ -3482,10 +3559,136 @@ impl AppDb {
         {
             bail!(avionics_grounded_evidence_refresh_migration_required_message(self.kind()));
         }
-        let missing_listing_avionics_authorization_objects = match &mut *connection {
+        let missing_listing_avionics_grounded_capability_objects = match &mut *connection {
             GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
+                    WITH required_columns(
+                      column_name, column_type, required_not_null,
+                      primary_key_position, default_value
+                    ) AS (
+                      VALUES
+                        ('listing_id', 'INTEGER', 1, 1, NULL),
+                        ('plugin_submission_id', 'INTEGER', 1, 2, NULL),
+                        ('occurrence_index', 'INTEGER', 1, 3, NULL),
+                        ('occurrence_role', 'TEXT', 1, 4, NULL),
+                        ('avionics_model_id', 'INTEGER', 1, 0, NULL),
+                        ('requested_quantity', 'INTEGER', 1, 0, NULL),
+                        ('configuration_action', 'TEXT', 1, 0, NULL),
+                        ('request_sha256', 'TEXT', 1, 0, NULL),
+                        ('capability_sha256', 'TEXT', 1, 0, NULL),
+                        ('grounded_resolution_sha256', 'TEXT', 1, 0, NULL),
+                        ('evidence_capture_sha256', 'TEXT', 1, 0, NULL),
+                        ('extracted_listing_sha256', 'TEXT', 1, 0, NULL),
+                        ('product_fingerprint', 'TEXT', 1, 0, NULL),
+                        ('collision_closure_sha256', 'TEXT', 1, 0, NULL),
+                        ('source_revocation_count', 'INTEGER', 1, 0, NULL),
+                        ('policy_version', 'TEXT', 1, 0, NULL),
+                        ('created_at', 'TEXT', 1, 0, 'CURRENT_TIMESTAMP')
+                    ),
+                    required_foreign_keys(
+                      parent_table, child_column, parent_column,
+                      update_action, delete_action, match_kind
+                    ) AS (
+                      VALUES
+                        ('aircraft_sale_listings', 'listing_id', 'id',
+                          'NO ACTION', 'CASCADE', 'NONE'),
+                        ('plugin_submissions', 'plugin_submission_id', 'id',
+                          'NO ACTION', 'CASCADE', 'NONE'),
+                        ('avionics_models', 'avionics_model_id', 'id',
+                          'NO ACTION', 'CASCADE', 'NONE')
+                    ),
+                    required_indexes(index_name, column_name) AS (
+                      VALUES
+                        ('idx_listing_avionics_grounded_capabilities_model',
+                          'avionics_model_id'),
+                        ('idx_listing_avionics_grounded_capabilities_submission',
+                          'plugin_submission_id')
+                    ),
+                    required_triggers(
+                      trigger_name, event_fragment, body_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'beforeinsertonaircraft_sale_listing_avionics_grounded_capabilities',
+                          'groundedavionicscapabilityrequiresitsexactcurrentcapture-boundlisting,approvedproduct,andsource-revocationepoch'),
+                        ('listing_avionics_grounded_capabilities_immutable_update',
+                          'beforeupdateonaircraft_sale_listing_avionics_grounded_capabilities',
+                          'groundedavionicscapabilitiesareimmutable')
+                    ),
+                    required_trigger_fragments(
+                      trigger_name, definition_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'fromplugin_submissionssubmission'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.id=new.plugin_submission_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.canonical_listing_id=new.listing_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.rendered_html_sha256=new.evidence_capture_sha256'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extracted_listing_jsonisnotnull'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extraction_errorisnull'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'fromavionics_approved_product_graph_identitiesapproved'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'approved.avionics_model_id=new.avionics_model_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'new.source_revocation_count<>(selectcount(*)fromavionics_authoritative_source_origin_revocations)')
+                    ),
+                    required_checks(definition_fragment) AS (
+                      VALUES
+                        ('check(occurrence_index>=0)'),
+                        ('check(occurrence_rolein(''primary'',''replacement''))'),
+                        ('check(requested_quantity>0)'),
+                        ('check(configuration_actionin(''installed'',''replaces'',''removes''))'),
+                        ('check(policy_version=''listing_avionics_grounded_capability'')'),
+                        ('check(occurrence_role=''primary''orrequested_quantity=1)'),
+                        ('check(occurrence_role=''primary''orconfiguration_actionin(''replaces'',''removes''))'),
+                        ('check(length(request_sha256)=64)'),
+                        ('check(request_sha256=lower(request_sha256))'),
+                        ('check(request_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(capability_sha256)=64)'),
+                        ('check(capability_sha256=lower(capability_sha256))'),
+                        ('check(capability_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(grounded_resolution_sha256)=64)'),
+                        ('check(grounded_resolution_sha256=lower(grounded_resolution_sha256))'),
+                        ('check(grounded_resolution_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(evidence_capture_sha256)=64)'),
+                        ('check(evidence_capture_sha256=lower(evidence_capture_sha256))'),
+                        ('check(evidence_capture_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(extracted_listing_sha256)=64)'),
+                        ('check(extracted_listing_sha256=lower(extracted_listing_sha256))'),
+                        ('check(extracted_listing_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(product_fingerprint)=64)'),
+                        ('check(product_fingerprint=lower(product_fingerprint))'),
+                        ('check(product_fingerprintnotglob''*[^0-9a-f]*'')'),
+                        ('check(length(collision_closure_sha256)=64)'),
+                        ('check(collision_closure_sha256=lower(collision_closure_sha256))'),
+                        ('check(collision_closure_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(source_revocation_count>=0)')
+                    ),
+                    table_definition(normalized_sql) AS (
+                      SELECT replace(replace(replace(replace(
+                        lower(sql), ' ', ''), char(10), ''), char(13), ''),
+                        char(9), '')
+                      FROM sqlite_schema
+                      WHERE type = 'table'
+                        AND name =
+                          'aircraft_sale_listing_avionics_grounded_capabilities'
+                    ),
+                    trigger_definitions(trigger_name, normalized_sql) AS (
+                      SELECT name, replace(replace(replace(replace(
+                        lower(sql), ' ', ''), char(10), ''), char(13), ''),
+                        char(9), '')
+                      FROM sqlite_schema
+                      WHERE type = 'trigger'
+                        AND tbl_name =
+                          'aircraft_sale_listing_avionics_grounded_capabilities'
+                    )
                     SELECT
                       EXISTS (
                         SELECT 1 FROM sqlite_schema
@@ -3497,43 +3700,125 @@ impl AppDb {
                           SELECT 1 FROM sqlite_schema
                           WHERE type = 'table'
                             AND name =
-                              'aircraft_sale_listing_avionics_authorizations'
-                        )
-                        OR NOT EXISTS (
-                          SELECT 1 FROM sqlite_schema
-                          WHERE type = 'index'
-                            AND name =
-                              'idx_listing_avionics_authorizations_model'
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
                         )
                         OR (
-                          SELECT COUNT(*)
-                          FROM sqlite_schema
-                          WHERE type = 'trigger'
-                            AND name IN (
-                              'listing_avionics_authorizations_validate_insert',
-                              'listing_avionics_authorizations_immutable_update',
-                              'listing_avionics_authorizations_invalidate_link_update',
-                              'listing_avionics_authorizations_invalidate_reuse_delete',
-                              'listing_avionics_authorizations_invalidate_model_proof_update',
-                              'listing_avionics_authorizations_invalidate_model_type_insert',
-                              'listing_avionics_authorizations_invalidate_model_type_delete',
-                              'listing_avionics_authorizations_invalidate_model_type_update',
-                              'listing_avionics_authorizations_invalidate_type_update',
-                              'listing_avionics_authorizations_invalidate_graph_insert',
-                              'listing_avionics_authorizations_invalidate_graph_delete',
-                              'listing_avionics_authorizations_invalidate_graph_update',
-                              'listing_avionics_authorizations_invalidate_manufacturer_update',
-                              'listing_avionics_authorizations_invalidate_origin_revocation',
-                              'listing_avionics_authorizations_invalidate_capture_delete',
-                              'listing_avionics_authorizations_invalidate_capture_update'
-                            )
-                        ) <> 16
+                          SELECT COUNT(*) FROM pragma_table_info(
+                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                        ) <> 17
+                        OR EXISTS (
+                          SELECT 1 FROM required_columns required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pragma_table_info(
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                            ) actual
+                            WHERE actual.name = required.column_name
+                              AND upper(actual.type) = required.column_type
+                              AND actual."notnull" = required.required_not_null
+                              AND actual.pk = required.primary_key_position
+                              AND actual.dflt_value IS required.default_value
+                          )
+                        )
                         OR (
                           SELECT COUNT(*)
                           FROM pragma_foreign_key_list(
-                            'aircraft_sale_listing_avionics_authorizations'
+                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                        ) <> 3
+                        OR EXISTS (
+                          SELECT 1 FROM required_foreign_keys required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pragma_foreign_key_list(
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                            ) actual
+                            WHERE actual."table" = required.parent_table
+                              AND actual."from" = required.child_column
+                              AND actual."to" = required.parent_column
+                              AND upper(actual.on_update) = required.update_action
+                              AND upper(actual.on_delete) = required.delete_action
+                              AND upper(actual."match") = required.match_kind
+                          )
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM table_definition
+                          WHERE (
+                            length(normalized_sql) - length(replace(
+                              normalized_sql, 'check(', ''
+                            ))
+                          ) / length('check(') = 29
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_checks required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM table_definition actual
+                            WHERE instr(
+                              actual.normalized_sql,
+                              required.definition_fragment
+                            ) > 0
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_indexes required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM sqlite_schema actual
+                            WHERE actual.type = 'index'
+                              AND actual.name = required.index_name
+                              AND actual.tbl_name =
+                                'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                          OR NOT EXISTS (
+                            SELECT 1 FROM pragma_index_list(
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                            ) actual
+                            WHERE actual.name = required.index_name
+                              AND actual."unique" = 0
+                              AND actual.origin = 'c'
+                              AND actual.partial = 0
+                          )
+                          OR (
+                            SELECT COUNT(*) FROM pragma_index_info(
+                              required.index_name
+                            )
+                          ) <> 1
+                          OR NOT EXISTS (
+                            SELECT 1 FROM pragma_index_info(required.index_name)
+                            WHERE seqno = 0 AND name = required.column_name
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*) FROM trigger_definitions
+                          WHERE trigger_name IN (
+                            'listing_avionics_grounded_capabilities_validate_insert',
+                            'listing_avionics_grounded_capabilities_immutable_update'
                           )
                         ) <> 2
+                        OR EXISTS (
+                          SELECT 1 FROM required_triggers required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM trigger_definitions actual
+                            WHERE actual.trigger_name = required.trigger_name
+                              AND instr(
+                                actual.normalized_sql,
+                                required.event_fragment
+                              ) > 0
+                              AND instr(
+                                actual.normalized_sql,
+                                required.body_fragment
+                              ) > 0
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_trigger_fragments required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM trigger_definitions actual
+                            WHERE actual.trigger_name = required.trigger_name
+                              AND instr(
+                                actual.normalized_sql,
+                                required.definition_fragment
+                              ) > 0
+                          )
+                        )
                       )
                     "#,
                 )
@@ -3544,54 +3829,384 @@ impl AppDb {
             GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
+                    WITH required_columns(
+                      column_name, column_type, required_not_null,
+                      default_expression
+                    ) AS (
+                      VALUES
+                        ('listing_id', 'bigint', TRUE, NULL),
+                        ('plugin_submission_id', 'bigint', TRUE, NULL),
+                        ('occurrence_index', 'bigint', TRUE, NULL),
+                        ('occurrence_role', 'text', TRUE, NULL),
+                        ('avionics_model_id', 'bigint', TRUE, NULL),
+                        ('requested_quantity', 'bigint', TRUE, NULL),
+                        ('configuration_action', 'text', TRUE, NULL),
+                        ('request_sha256', 'text', TRUE, NULL),
+                        ('capability_sha256', 'text', TRUE, NULL),
+                        ('grounded_resolution_sha256', 'text', TRUE, NULL),
+                        ('evidence_capture_sha256', 'text', TRUE, NULL),
+                        ('extracted_listing_sha256', 'text', TRUE, NULL),
+                        ('product_fingerprint', 'text', TRUE, NULL),
+                        ('collision_closure_sha256', 'text', TRUE, NULL),
+                        ('source_revocation_count', 'bigint', TRUE, NULL),
+                        ('policy_version', 'text', TRUE, NULL),
+                        ('created_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
+                    ),
+                    required_foreign_keys(
+                      parent_name, child_column, parent_column
+                    ) AS (
+                      VALUES
+                        ('public.aircraft_sale_listings', 'listing_id', 'id'),
+                        ('public.plugin_submissions', 'plugin_submission_id', 'id'),
+                        ('public.avionics_models', 'avionics_model_id', 'id')
+                    ),
+                    required_indexes(index_name, column_name) AS (
+                      VALUES
+                        ('public.idx_listing_avionics_grounded_capabilities_model',
+                          'avionics_model_id'),
+                        ('public.idx_listing_avionics_grounded_capabilities_submission',
+                          'plugin_submission_id')
+                    ),
+                    required_checks(
+                      first_fragment, second_fragment,
+                      third_fragment, fourth_fragment
+                    ) AS (
+                      VALUES
+                        ('occurrence_index', '>= 0', NULL, NULL),
+                        ('occurrence_role', '= ANY', 'primary', 'replacement'),
+                        ('requested_quantity', '> 0', NULL, NULL),
+                        ('configuration_action', 'installed', 'replaces', 'removes'),
+                        ('request_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('capability_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('grounded_resolution_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('evidence_capture_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('extracted_listing_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('product_fingerprint', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('collision_closure_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('source_revocation_count', '>= 0', NULL, NULL),
+                        ('policy_version',
+                          'listing_avionics_grounded_capability', NULL, NULL),
+                        ('occurrence_role', 'requested_quantity = 1',
+                          'primary', NULL),
+                        ('occurrence_role', 'configuration_action',
+                          'primary', 'replaces')
+                    ),
+                    required_triggers(
+                      trigger_name, function_signature, trigger_type,
+                      definition_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'public.validate_listing_avionics_grounded_capability()',
+                          7, 'public.plugin_submissions'),
+                        ('listing_avionics_grounded_capabilities_immutable_update',
+                          'public.reject_listing_avionics_grounded_capability_update()',
+                          19, 'grounded avionics capabilities are immutable')
+                    ),
+                    required_trigger_fragments(
+                      trigger_name, definition_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'public.avionics_approved_product_graph_identities'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.id = NEW.plugin_submission_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.canonical_listing_id = NEW.listing_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.rendered_html_sha256 = NEW.evidence_capture_sha256'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extracted_listing_json IS NOT NULL'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extraction_error IS NULL'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'approved.avionics_model_id = NEW.avionics_model_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'NEW.source_revocation_count <>'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'public.avionics_authoritative_source_origin_revocations')
+                    )
                     SELECT
-                      to_regclass('aircraft_sale_listing_avionics') IS NOT NULL
+                      pg_catalog.to_regclass(
+                        'public.aircraft_sale_listing_avionics'
+                      ) IS NOT NULL
                       AND (
-                        to_regclass(
-                          'aircraft_sale_listing_avionics_authorizations'
-                        ) IS NULL
-                        OR to_regclass(
-                          'idx_listing_avionics_authorizations_model'
-                        ) IS NULL
+                        NOT EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_class relation
+                          WHERE relation.oid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND relation.relkind = 'r'
+                            AND relation.relpersistence = 'p'
+                            AND NOT relation.relispartition
+                            AND NOT relation.relrowsecurity
+                            AND NOT relation.relforcerowsecurity
+                            AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                              WHERE inheritance.inhrelid = relation.oid
+                                 OR inheritance.inhparent = relation.oid
+                            )
+                            AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+                              WHERE rule_row.ev_class = relation.oid
+                            )
+                            AND NOT EXISTS (
+                              SELECT 1 FROM pg_catalog.pg_policy policy_row
+                              WHERE policy_row.polrelid = relation.oid
+                            )
+                        )
                         OR (
                           SELECT COUNT(*)
-                          FROM pg_trigger
-                          WHERE tgrelid IN (
-                            to_regclass(
-                              'aircraft_sale_listing_avionics_authorizations'
-                            ),
-                            to_regclass('aircraft_sale_listing_avionics'),
-                            to_regclass('avionics_product_reuse_attestations'),
-                            to_regclass('avionics_models'),
-                            to_regclass('avionics_model_types'),
-                            to_regclass('avionics_types'),
-                            to_regclass('avionics_approved_product_identities'),
-                            to_regclass('avionics_manufacturers'),
-                            to_regclass(
-                              'avionics_authoritative_source_origin_revocations'
-                            ),
-                            to_regclass('plugin_submissions')
+                          FROM pg_catalog.pg_attribute actual
+                          WHERE actual.attrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
                           )
-                            AND tgname IN (
-                              'listing_avionics_authorizations_validate_insert',
-                              'listing_avionics_authorizations_immutable_update',
-                              'listing_avionics_authorizations_invalidate_link_update',
-                              'listing_avionics_authorizations_invalidate_reuse_delete',
-                              'listing_avionics_authorizations_invalidate_model_proof_update',
-                              'listing_avionics_authorizations_invalidate_model_type_insert',
-                              'listing_avionics_authorizations_invalidate_model_type_delete',
-                              'listing_avionics_authorizations_invalidate_model_type_update',
-                              'listing_avionics_authorizations_invalidate_type_update',
-                              'listing_avionics_authorizations_invalidate_graph_insert',
-                              'listing_avionics_authorizations_invalidate_graph_delete',
-                              'listing_avionics_authorizations_invalidate_graph_update',
-                              'listing_avionics_authorizations_invalidate_manufacturer_update',
-                              'listing_avionics_authorizations_invalidate_origin_revocation',
-                              'listing_avionics_authorizations_invalidate_capture_delete',
-                              'listing_avionics_authorizations_invalidate_capture_update'
+                            AND actual.attnum > 0
+                            AND NOT actual.attisdropped
+                        ) <> 17
+                        OR EXISTS (
+                          SELECT 1 FROM required_columns required
+                          WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_attribute actual
+                            LEFT JOIN pg_catalog.pg_attrdef default_value
+                              ON default_value.adrelid = actual.attrelid
+                             AND default_value.adnum = actual.attnum
+                            WHERE actual.attrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
                             )
-                            AND NOT tgisinternal
-                        ) <> 16
+                              AND actual.attname = required.column_name
+                              AND pg_catalog.format_type(
+                                actual.atttypid, actual.atttypmod
+                              ) = required.column_type
+                              AND actual.attnotnull = required.required_not_null
+                              AND actual.attidentity = ''
+                              AND actual.attgenerated = ''
+                              AND (
+                                (required.default_expression IS NULL
+                                  AND default_value.oid IS NULL)
+                                OR pg_catalog.pg_get_expr(
+                                  default_value.adbin, default_value.adrelid
+                                ) = required.default_expression
+                              )
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'p'
+                            AND NOT actual.condeferrable
+                            AND NOT actual.condeferred
+                            AND actual.convalidated
+                            AND pg_catalog.pg_get_constraintdef(actual.oid) =
+                              'PRIMARY KEY (listing_id, plugin_submission_id, occurrence_index, occurrence_role)'
+                        ) <> 1
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'f'
+                        ) <> 3
+                        OR EXISTS (
+                          SELECT 1 FROM required_foreign_keys required
+                          WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_constraint actual
+                            JOIN pg_catalog.pg_attribute child_attribute
+                              ON child_attribute.attrelid = actual.conrelid
+                             AND child_attribute.attnum = actual.conkey[1]
+                            JOIN pg_catalog.pg_attribute parent_attribute
+                              ON parent_attribute.attrelid = actual.confrelid
+                             AND parent_attribute.attnum = actual.confkey[1]
+                            WHERE actual.conrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.contype = 'f'
+                              AND actual.confrelid =
+                                pg_catalog.to_regclass(required.parent_name)
+                              AND pg_catalog.array_length(actual.conkey, 1) = 1
+                              AND pg_catalog.array_length(actual.confkey, 1) = 1
+                              AND child_attribute.attname = required.child_column
+                              AND parent_attribute.attname = required.parent_column
+                              AND actual.confupdtype = 'a'
+                              AND actual.confdeltype = 'c'
+                              AND actual.confmatchtype = 's'
+                              AND NOT actual.condeferrable
+                              AND NOT actual.condeferred
+                              AND actual.convalidated
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'c'
+                        ) <> 15
+                        OR EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'c'
+                            AND (
+                              NOT actual.convalidated
+                              OR actual.connoinherit
+                            )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_checks required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_constraint actual
+                            WHERE actual.conrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.contype = 'c'
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_constraintdef(actual.oid),
+                                required.first_fragment
+                              ) > 0
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_constraintdef(actual.oid),
+                                required.second_fragment
+                              ) > 0
+                              AND (
+                                required.third_fragment IS NULL
+                                OR pg_catalog.strpos(
+                                  pg_catalog.pg_get_constraintdef(actual.oid),
+                                  required.third_fragment
+                                ) > 0
+                              )
+                              AND (
+                                required.fourth_fragment IS NULL
+                                OR pg_catalog.strpos(
+                                  pg_catalog.pg_get_constraintdef(actual.oid),
+                                  required.fourth_fragment
+                                ) > 0
+                              )
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_indexes required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_index actual
+                            JOIN pg_catalog.pg_class index_relation
+                              ON index_relation.oid = actual.indexrelid
+                            JOIN pg_catalog.pg_am access_method
+                              ON access_method.oid = index_relation.relam
+                            WHERE actual.indexrelid =
+                                  pg_catalog.to_regclass(required.index_name)
+                              AND actual.indrelid = pg_catalog.to_regclass(
+                                'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                              )
+                              AND access_method.amname = 'btree'
+                              AND NOT actual.indisunique
+                              AND NOT actual.indisprimary
+                              AND NOT actual.indisexclusion
+                              AND actual.indisvalid
+                              AND actual.indisready
+                              AND actual.indislive
+                              AND NOT actual.indisreplident
+                              AND actual.indnatts = 1
+                              AND actual.indnkeyatts = 1
+                              AND actual.indexprs IS NULL
+                              AND actual.indpred IS NULL
+                              AND pg_catalog.pg_get_indexdef(
+                                actual.indexrelid, 1, TRUE
+                              ) = required.column_name
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_index actual
+                          WHERE actual.indrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND NOT actual.indisprimary
+                        ) <> 2
+                        OR (
+                          SELECT COUNT(*) FROM pg_catalog.pg_trigger actual
+                          WHERE actual.tgrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.tgname IN (
+                              'listing_avionics_grounded_capabilities_validate_insert',
+                              'listing_avionics_grounded_capabilities_immutable_update'
+                            )
+                            AND NOT actual.tgisinternal
+                        ) <> 2
+                        OR EXISTS (
+                          SELECT 1 FROM required_triggers required
+                          WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_trigger actual
+                            JOIN pg_catalog.pg_proc routine
+                              ON routine.oid = actual.tgfoid
+                            WHERE actual.tgrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.tgname = required.trigger_name
+                              AND actual.tgfoid = pg_catalog.to_regprocedure(
+                                required.function_signature
+                              )
+                              AND actual.tgtype = required.trigger_type
+                              AND actual.tgenabled = 'O'
+                              AND NOT actual.tgisinternal
+                              AND routine.proconfig =
+                                ARRAY['search_path=pg_catalog']::text[]
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_functiondef(actual.tgfoid),
+                                required.definition_fragment
+                              ) > 0
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_trigger_fragments required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_trigger actual
+                            WHERE actual.tgrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.tgname = required.trigger_name
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_functiondef(actual.tgfoid),
+                                required.definition_fragment
+                              ) > 0
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_trigger actual
+                          JOIN pg_catalog.pg_proc routine
+                            ON routine.oid = actual.tgfoid
+                          WHERE NOT actual.tgisinternal
+                            AND (
+                              actual.tgrelid = pg_catalog.to_regclass(
+                                'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                              )
+                              OR pg_catalog.strpos(
+                                routine.prosrc,
+                                'aircraft_sale_listing_avionics_grounded_capabilities'
+                              ) > 0
+                              OR actual.tgrelid = pg_catalog.to_regclass(
+                                'public.aircraft_sale_listing_avionics_link_authorizations'
+                              )
+                              OR pg_catalog.strpos(
+                                routine.prosrc,
+                                'aircraft_sale_listing_avionics_link_authorizations'
+                              ) > 0
+                            )
+                        ) <> 18
                       )
                     "#,
                 )
@@ -3599,36 +4214,28 @@ impl AppDb {
                 .await?
             }
         };
-        let missing_listing_avionics_authorizations = missing_listing_avionics_authorization_objects
-            || self
-                .migration_contract_invalid_on(
-                    connection,
-                    "aircraft_sale_listing_avionics",
-                    LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
-                    LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_VERSION,
-                    LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
-                )
-                .await?;
-        if missing_listing_avionics_authorizations {
-            bail!(
-                listing_avionics_association_authorizations_migration_required_message(self.kind())
-            );
-        }
-        if self
+        let grounded_capability_definitions_are_valid = self
+            .listing_avionics_grounded_capability_definitions_valid_on(connection)
+            .await?;
+        let authorization_definitions_are_valid = self
+            .listing_avionics_authorization_definitions_valid_on(connection)
+            .await?;
+        let grounded_capability_contract_is_invalid = self
             .migration_contract_invalid_on(
                 connection,
-                "aircraft_sale_listing_avionics_authorizations",
-                LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-                LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
-                LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
+                "aircraft_sale_listing_avionics",
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION,
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION,
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
             )
-            .await?
-        {
-            bail!(
-                listing_avionics_authorization_hash_domain_reset_migration_required_message(
-                    self.kind()
-                )
-            );
+            .await?;
+        let missing_listing_avionics_grounded_capabilities =
+            missing_listing_avionics_grounded_capability_objects
+                || !grounded_capability_definitions_are_valid
+                || !authorization_definitions_are_valid
+                || grounded_capability_contract_is_invalid;
+        if missing_listing_avionics_grounded_capabilities {
+            bail!(listing_avionics_grounded_capabilities_migration_required_message(self.kind()));
         }
         let missing_occurrence_dispositions = match &mut *connection {
             GateConnection::Sqlite(pool) => {
@@ -4396,6 +5003,786 @@ impl AppDb {
             ));
         }
         Ok(())
+    }
+
+    async fn listing_avionics_grounded_capability_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        const TABLE: &str = "aircraft_sale_listing_avionics_grounded_capabilities";
+        const SQLITE_OBJECTS: &[(&str, &str)] = &[
+            ("index", "idx_listing_avionics_grounded_capabilities_model"),
+            (
+                "index",
+                "idx_listing_avionics_grounded_capabilities_submission",
+            ),
+            (
+                "trigger",
+                "listing_avionics_authorizations_invalidate_origin_revocation",
+            ),
+            (
+                "trigger",
+                "listing_avionics_grounded_capabilities_immutable_update",
+            ),
+            (
+                "trigger",
+                "listing_avionics_grounded_capabilities_validate_insert",
+            ),
+        ];
+        const POSTGRES_CHECKS: &[&str] = &[
+            "CHECK (((occurrence_role = 'primary'::text) OR (configuration_action = ANY (ARRAY['replaces'::text, 'removes'::text]))))",
+            "CHECK (((occurrence_role = 'primary'::text) OR (requested_quantity = 1)))",
+            "CHECK ((capability_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((collision_closure_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((configuration_action = ANY (ARRAY['installed'::text, 'replaces'::text, 'removes'::text])))",
+            "CHECK ((evidence_capture_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((extracted_listing_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((occurrence_index >= 0))",
+            "CHECK ((occurrence_role = ANY (ARRAY['primary'::text, 'replacement'::text])))",
+            "CHECK ((policy_version = 'listing_avionics_grounded_capability'::text))",
+            "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((requested_quantity > 0))",
+            "CHECK ((source_revocation_count >= 0))",
+        ];
+        const POSTGRES_TRIGGERS: &[(&str, i16, &str)] = &[
+            (
+                "listing_avionics_grounded_capabilities_immutable_update",
+                19,
+                "reject_listing_avionics_grounded_capability_update",
+            ),
+            (
+                "listing_avionics_grounded_capabilities_validate_insert",
+                7,
+                "validate_listing_avionics_grounded_capability",
+            ),
+        ];
+
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                let table_definition = sqlx::query_scalar::<_, String>(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                )
+                .bind(TABLE)
+                .fetch_optional(&mut **pool)
+                .await?;
+                let Some(table_definition) = table_definition else {
+                    return Ok(true);
+                };
+                let table_is_exact =
+                    canonical_sql_definition(&table_definition).replacen(
+                        "createtableifnotexists",
+                        "createtable",
+                        1,
+                    ) == canonical_sqlite_table_definition(SQLITE_SCHEMA_SQL, TABLE)
+                        .expect("canonical grounded-capability table must exist");
+                let actual_objects = sqlx::query_as::<_, (String, String, Option<String>)>(
+                    "SELECT type, name, sql FROM sqlite_schema \
+                     WHERE sql IS NOT NULL AND ( \
+                       (type = 'index' AND tbl_name = ?) OR \
+                       (type = 'trigger' AND ( \
+                         tbl_name = ? OR instr(lower(sql), ?) > 0 \
+                       )) \
+                     ) ORDER BY type, name",
+                )
+                .bind(TABLE)
+                .bind(TABLE)
+                .bind(TABLE)
+                .fetch_all(&mut **pool)
+                .await?;
+                let expected_objects = SQLITE_OBJECTS
+                    .iter()
+                    .map(|(object_type, name)| {
+                        (
+                            (*object_type).to_owned(),
+                            (*name).to_owned(),
+                            canonical_sqlite_named_definition(SQLITE_SCHEMA_SQL, name)
+                                .unwrap_or_else(|| {
+                                    panic!("canonical grounded-capability object {name} must exist")
+                                }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let objects_are_exact = actual_objects.len() == expected_objects.len()
+                    && actual_objects.iter().zip(&expected_objects).all(
+                        |(
+                            (actual_type, actual_name, actual_definition),
+                            (expected_type, expected_name, expected_definition),
+                        )| {
+                            actual_type == expected_type
+                                && actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    canonical_sqlite_schema_definition(actual)
+                                        == *expected_definition
+                                })
+                        },
+                    );
+                Ok(table_is_exact && objects_are_exact)
+            }
+            GateConnection::Postgres(pool) => {
+                let table_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_catalog.to_regclass( \
+                       'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+                     ) IS NOT NULL",
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                if !table_exists {
+                    return Ok(true);
+                }
+                let mut actual_checks = sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid)
+                    FROM pg_catalog.pg_constraint constraint_row
+                    WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                    )
+                      AND constraint_row.contype = 'c'
+                    "#,
+                )
+                .fetch_all(&mut **pool)
+                .await?;
+                actual_checks.sort();
+                if actual_checks.len() != POSTGRES_CHECKS.len()
+                    || !actual_checks
+                        .iter()
+                        .zip(POSTGRES_CHECKS)
+                        .all(|(actual, expected)| actual == expected)
+                {
+                    return Ok(false);
+                }
+
+                let actual_triggers =
+                    sqlx::query_as::<_, PostgresGroundedCapabilityTriggerDefinition>(
+                        r#"
+                    SELECT trigger_row.tgname AS trigger_name,
+                           trigger_row.tgtype AS trigger_type,
+                           trigger_row.tgqual IS NULL AS has_no_when_clause,
+                           trigger_row.tgenabled = 'O' AS is_enabled,
+                           trigger_row.tgnargs = 0 AS has_zero_trigger_args,
+                           trigger_row.tgparentid = 0 AS is_uninherited,
+                           trigger_row.tgconstraint = 0 AS is_non_constraint,
+                           trigger_row.tgoldtable IS NULL
+                             AND trigger_row.tgnewtable IS NULL
+                             AS has_no_transition_tables,
+                           trigger_row.tgattr::text = '' AS has_no_update_columns,
+                           pg_catalog.pg_get_triggerdef(trigger_row.oid)
+                             AS definition,
+                           routine_namespace.nspname AS function_namespace,
+                           routine.proname AS function_name,
+                           routine.prosrc AS function_source,
+                           COALESCE(
+                             pg_catalog.array_to_string(routine.proconfig, E'\n'),
+                             ''
+                           ) AS function_config,
+                           NOT routine.prosecdef AS is_security_invoker,
+                           routine.prokind = 'f' AS is_ordinary_function,
+                           routine.prorettype = pg_catalog.to_regtype(
+                             'pg_catalog.trigger'
+                           ) AS returns_trigger,
+                           routine.pronargs = 0 AS has_zero_function_args,
+                           language_row.lanname AS language_name,
+                           NOT routine.proisstrict AS is_not_strict,
+                           routine.provolatile = 'v' AS is_volatile,
+                           routine.proparallel = 'u' AS is_parallel_unsafe,
+                           NOT routine.proleakproof AS is_not_leakproof
+                    FROM pg_catalog.pg_trigger trigger_row
+                    JOIN pg_catalog.pg_proc routine
+                      ON routine.oid = trigger_row.tgfoid
+                    JOIN pg_catalog.pg_namespace routine_namespace
+                      ON routine_namespace.oid = routine.pronamespace
+                    JOIN pg_catalog.pg_language language_row
+                      ON language_row.oid = routine.prolang
+                    WHERE trigger_row.tgrelid = pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                    )
+                      AND NOT trigger_row.tgisinternal
+                    ORDER BY trigger_row.tgname
+                    "#,
+                    )
+                    .fetch_all(&mut **pool)
+                    .await?;
+                Ok(actual_triggers.len() == POSTGRES_TRIGGERS.len()
+                    && actual_triggers.iter().zip(POSTGRES_TRIGGERS).all(
+                        |(actual, (expected_name, expected_type, expected_function))| {
+                            actual.trigger_name == *expected_name
+                                && actual.trigger_type == *expected_type
+                                && actual.has_no_when_clause
+                                && actual.is_enabled
+                                && actual.has_zero_trigger_args
+                                && actual.is_uninherited
+                                && actual.is_non_constraint
+                                && actual.has_no_transition_tables
+                                && actual.has_no_update_columns
+                                && actual.function_namespace == "public"
+                                && actual.function_name == *expected_function
+                                && actual.function_config == "search_path=pg_catalog"
+                                && actual.is_security_invoker
+                                && actual.is_ordinary_function
+                                && actual.returns_trigger
+                                && actual.has_zero_function_args
+                                && actual.language_name == "plpgsql"
+                                && actual.is_not_strict
+                                && actual.is_volatile
+                                && actual.is_parallel_unsafe
+                                && actual.is_not_leakproof
+                                && canonical_postgres_trigger_definition(&actual.definition)
+                                    == canonical_postgres_named_trigger_definition(
+                                        POSTGRES_SCHEMA_SQL,
+                                        expected_name,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "canonical grounded-capability trigger {expected_name} must exist"
+                                        )
+                                    })
+                                && canonical_sql_definition(&actual.function_source)
+                                    == canonical_sql_definition(
+                                        postgres_function_source(
+                                            POSTGRES_SCHEMA_SQL,
+                                            expected_function,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "canonical grounded-capability function {expected_function} must exist"
+                                            )
+                                        }),
+                                    )
+                        },
+                    ))
+            }
+        }
+    }
+
+    async fn listing_avionics_authorization_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        const TABLE: &str = "aircraft_sale_listing_avionics_link_authorizations";
+        const SQLITE_INDEXES: &[&str] = &["idx_listing_avionics_authorizations_model"];
+        const TRIGGERS: &[(&str, i16, bool, &str)] = &[
+            (
+                "listing_avionics_authorizations_immutable_update",
+                19,
+                true,
+                "preserve_listing_avionics_authorization",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_capture_delete",
+                9,
+                true,
+                "invalidate_listing_avionics_authorization_for_capture",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_capture_update",
+                17,
+                false,
+                "invalidate_listing_avionics_authorization_for_capture",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_graph_delete",
+                9,
+                true,
+                "invalidate_listing_avionics_same_case_for_graph",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_graph_insert",
+                5,
+                true,
+                "invalidate_listing_avionics_same_case_for_graph",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_graph_update",
+                17,
+                false,
+                "invalidate_listing_avionics_same_case_for_graph",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_link_update",
+                17,
+                false,
+                "invalidate_listing_avionics_authorization_for_link",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_manufacturer_update",
+                17,
+                false,
+                "invalidate_listing_avionics_same_case_for_manufacturer",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_model_proof_update",
+                17,
+                false,
+                "invalidate_listing_avionics_same_case_for_model_proof",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_model_type_delete",
+                9,
+                true,
+                "invalidate_listing_avionics_same_case_for_model_type",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_model_type_insert",
+                5,
+                true,
+                "invalidate_listing_avionics_same_case_for_model_type",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_model_type_update",
+                17,
+                false,
+                "invalidate_listing_avionics_same_case_for_model_type",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_origin_revocation",
+                5,
+                true,
+                "invalidate_listing_avionics_same_case_for_origin_revocation",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_reuse_delete",
+                9,
+                true,
+                "invalidate_listing_avionics_authorization_for_reuse",
+            ),
+            (
+                "listing_avionics_authorizations_invalidate_type_update",
+                17,
+                false,
+                "invalidate_listing_avionics_same_case_for_type",
+            ),
+            (
+                "listing_avionics_authorizations_validate_insert",
+                7,
+                true,
+                "validate_listing_avionics_authorization",
+            ),
+        ];
+        const POSTGRES_CHECKS: &[&str] = &[
+            "CHECK ((((authorization_kind = 'manufacturer_reuse'::text) AND (grounded_resolution_sha256 IS NULL) AND (plugin_submission_id IS NULL) AND (extracted_listing_sha256 IS NULL) AND (source_revocation_count IS NULL)) OR ((authorization_kind = 'same_case_grounded'::text) AND (grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text) AND (plugin_submission_id IS NOT NULL) AND (extracted_listing_sha256 IS NOT NULL) AND (source_revocation_count IS NOT NULL) AND (source_revocation_count >= 0))))",
+            "CHECK (((extracted_listing_sha256 IS NULL) OR (extracted_listing_sha256 ~ '^[0-9a-f]{64}$'::text)))",
+            "CHECK ((association_role = ANY (ARRAY['installed'::text, 'replacement'::text])))",
+            "CHECK ((authorization_kind = ANY (ARRAY['manufacturer_reuse'::text, 'same_case_grounded'::text])))",
+            "CHECK ((collision_closure_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((evidence_capture_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((observation_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((policy_version = 'listing_avionics_authorization'::text))",
+            "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
+        ];
+
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                let table_definition = sqlx::query_scalar::<_, String>(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                )
+                .bind(TABLE)
+                .fetch_optional(&mut **pool)
+                .await?;
+                let Some(table_definition) = table_definition else {
+                    return Ok(true);
+                };
+                let table_is_exact =
+                    canonical_sql_definition(&table_definition).replacen(
+                        "createtableifnotexists",
+                        "createtable",
+                        1,
+                    ) == canonical_sqlite_table_definition(SQLITE_SCHEMA_SQL, TABLE)
+                        .expect("canonical listing authorization table must exist");
+                let actual_indexes = sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT name, sql FROM sqlite_schema \
+                     WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
+                     ORDER BY name",
+                )
+                .bind(TABLE)
+                .fetch_all(&mut **pool)
+                .await?;
+                let indexes_are_exact = actual_indexes.len() == SQLITE_INDEXES.len()
+                    && actual_indexes.iter().zip(SQLITE_INDEXES).all(
+                        |((actual_name, actual_definition), expected_name)| {
+                            actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    canonical_sqlite_schema_definition(actual)
+                                        == canonical_sqlite_named_definition(
+                                            SQLITE_SCHEMA_SQL,
+                                            expected_name,
+                                        )
+                                        .expect("canonical listing authorization index must exist")
+                                })
+                        },
+                    );
+                let actual_triggers = sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT name, sql FROM sqlite_schema \
+                     WHERE type = 'trigger' AND sql IS NOT NULL \
+                       AND instr(lower(sql), ?) > 0 \
+                     ORDER BY name",
+                )
+                .bind(TABLE)
+                .fetch_all(&mut **pool)
+                .await?;
+                let triggers_are_exact = actual_triggers.len() == TRIGGERS.len()
+                    && actual_triggers.iter().zip(TRIGGERS).all(
+                        |((actual_name, actual_definition), (expected_name, _, _, _))| {
+                            actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    canonical_sqlite_schema_definition(actual)
+                                        == canonical_sqlite_named_definition(
+                                            SQLITE_SCHEMA_SQL,
+                                            expected_name,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "canonical listing authorization trigger {expected_name} must exist"
+                                            )
+                                        })
+                                })
+                        },
+                    );
+                Ok(table_is_exact && indexes_are_exact && triggers_are_exact)
+            }
+            GateConnection::Postgres(pool) => {
+                let (table_exists, table_is_exact) = sqlx::query_as::<_, (bool, bool)>(
+                    r#"
+                    SELECT
+                      pg_catalog.to_regclass(
+                        'public.aircraft_sale_listing_avionics_link_authorizations'
+                      ) IS NOT NULL,
+                      EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_class relation
+                      WHERE relation.oid = pg_catalog.to_regclass(
+                        'public.aircraft_sale_listing_avionics_link_authorizations'
+                      )
+                        AND relation.relkind = 'r'
+                        AND relation.relpersistence = 'p'
+                        AND NOT relation.relispartition
+                        AND NOT relation.relrowsecurity
+                        AND NOT relation.relforcerowsecurity
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_inherits inheritance
+                          WHERE inheritance.inhrelid = relation.oid
+                             OR inheritance.inhparent = relation.oid
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+                          WHERE rule_row.ev_class = relation.oid
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_policy policy_row
+                          WHERE policy_row.polrelid = relation.oid
+                        )
+                    )
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                if !table_exists {
+                    return Ok(sqlx::query_scalar::<_, bool>(
+                        "SELECT pg_catalog.to_regclass( \
+                           'public.aircraft_sale_listing_avionics' \
+                         ) IS NULL",
+                    )
+                    .fetch_one(&mut **pool)
+                    .await?);
+                }
+                if !table_is_exact {
+                    return Ok(false);
+                }
+                let columns_are_exact = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    WITH expected(name, data_type, not_null, default_expression) AS (
+                      VALUES
+                        ('listing_link_id', 'bigint', TRUE, NULL),
+                        ('association_role', 'text', TRUE, NULL),
+                        ('avionics_model_id', 'bigint', TRUE, NULL),
+                        ('authorization_kind', 'text', TRUE, NULL),
+                        ('observation_sha256', 'text', TRUE, NULL),
+                        ('product_fingerprint', 'text', TRUE, NULL),
+                        ('grounded_resolution_sha256', 'text', FALSE, NULL),
+                        ('evidence_capture_sha256', 'text', TRUE, NULL),
+                        ('plugin_submission_id', 'bigint', FALSE, NULL),
+                        ('extracted_listing_sha256', 'text', FALSE, NULL),
+                        ('collision_closure_sha256', 'text', TRUE, NULL),
+                        ('source_revocation_count', 'bigint', FALSE, NULL),
+                        ('policy_version', 'text', TRUE, NULL),
+                        ('authorized_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
+                    )
+                    SELECT
+                      (SELECT COUNT(*) FROM pg_catalog.pg_attribute actual
+                       WHERE actual.attrelid = pg_catalog.to_regclass(
+                         'public.aircraft_sale_listing_avionics_link_authorizations'
+                       ) AND actual.attnum > 0 AND NOT actual.attisdropped) = 14
+                      AND NOT EXISTS (
+                        SELECT 1 FROM expected
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_attribute actual
+                          LEFT JOIN pg_catalog.pg_attrdef default_value
+                            ON default_value.adrelid = actual.attrelid
+                           AND default_value.adnum = actual.attnum
+                          WHERE actual.attrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_link_authorizations'
+                          )
+                            AND actual.attname = expected.name
+                            AND pg_catalog.format_type(
+                              actual.atttypid, actual.atttypmod
+                            ) = expected.data_type
+                            AND actual.attnotnull = expected.not_null
+                            AND actual.attidentity = ''
+                            AND actual.attgenerated = ''
+                            AND (
+                              (expected.default_expression IS NULL
+                                AND default_value.oid IS NULL)
+                              OR pg_catalog.pg_get_expr(
+                                default_value.adbin, default_value.adrelid
+                              ) = expected.default_expression
+                            )
+                        )
+                      )
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                if !columns_are_exact {
+                    #[cfg(test)]
+                    eprintln!("listing avionics authorization PostgreSQL columns drifted");
+                    return Ok(false);
+                }
+                let mut actual_checks = sqlx::query_as::<_, (String, bool, bool)>(
+                    r#"
+                    SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid),
+                           constraint_row.convalidated,
+                           NOT constraint_row.connoinherit
+                    FROM pg_catalog.pg_constraint constraint_row
+                    WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_link_authorizations'
+                    ) AND constraint_row.contype = 'c'
+                    "#,
+                )
+                .fetch_all(&mut **pool)
+                .await?;
+                actual_checks.sort_by(|left, right| left.0.cmp(&right.0));
+                if actual_checks.len() != POSTGRES_CHECKS.len()
+                    || !actual_checks
+                        .iter()
+                        .zip(POSTGRES_CHECKS)
+                        .all(|(actual, expected)| actual.0 == *expected && actual.1 && actual.2)
+                {
+                    #[cfg(test)]
+                    eprintln!(
+                        "listing avionics authorization PostgreSQL checks drifted: {actual_checks:?}"
+                    );
+                    return Ok(false);
+                }
+                let relations_are_exact = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    WITH expected(parent_name, child_column, parent_column) AS (
+                      VALUES
+                        ('public.aircraft_sale_listing_avionics', 'listing_link_id', 'id'),
+                        ('public.avionics_models', 'avionics_model_id', 'id'),
+                        ('public.plugin_submissions', 'plugin_submission_id', 'id')
+                    )
+                    SELECT
+                      (SELECT COUNT(*) FROM pg_catalog.pg_constraint actual
+                       WHERE actual.conrelid = pg_catalog.to_regclass(
+                         'public.aircraft_sale_listing_avionics_link_authorizations'
+                       ) AND actual.contype = 'f') = 3
+                      AND NOT EXISTS (
+                        SELECT 1 FROM expected
+                        WHERE NOT EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_constraint actual
+                          JOIN pg_catalog.pg_attribute child_attribute
+                            ON child_attribute.attrelid = actual.conrelid
+                           AND child_attribute.attnum = actual.conkey[1]
+                          JOIN pg_catalog.pg_attribute parent_attribute
+                            ON parent_attribute.attrelid = actual.confrelid
+                           AND parent_attribute.attnum = actual.confkey[1]
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_link_authorizations'
+                          )
+                            AND actual.contype = 'f'
+                            AND actual.confrelid =
+                                pg_catalog.to_regclass(expected.parent_name)
+                            AND child_attribute.attname = expected.child_column
+                            AND pg_catalog.array_length(actual.conkey, 1) = 1
+                            AND pg_catalog.array_length(actual.confkey, 1) = 1
+                            AND parent_attribute.attname = expected.parent_column
+                            AND actual.confupdtype = 'a'
+                            AND actual.confdeltype = 'c'
+                            AND actual.confmatchtype = 's'
+                            AND NOT actual.condeferrable
+                            AND NOT actual.condeferred
+                            AND actual.convalidated
+                        )
+                      )
+                      AND (
+                        SELECT COUNT(*) FROM pg_catalog.pg_constraint actual
+                        WHERE actual.conrelid = pg_catalog.to_regclass(
+                          'public.aircraft_sale_listing_avionics_link_authorizations'
+                        ) AND actual.contype = 'p'
+                          AND NOT actual.condeferrable
+                          AND NOT actual.condeferred
+                          AND actual.convalidated
+                          AND pg_catalog.pg_get_constraintdef(actual.oid) =
+                            'PRIMARY KEY (listing_link_id, association_role)'
+                      ) = 1
+                      AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_index actual
+                        JOIN pg_catalog.pg_class index_relation
+                          ON index_relation.oid = actual.indexrelid
+                        JOIN pg_catalog.pg_am access_method
+                          ON access_method.oid = index_relation.relam
+                        WHERE actual.indexrelid = pg_catalog.to_regclass(
+                          'public.idx_listing_avionics_authorizations_model'
+                        )
+                          AND actual.indrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_link_authorizations'
+                          )
+                          AND access_method.amname = 'btree'
+                          AND NOT actual.indisunique
+                          AND NOT actual.indisprimary
+                          AND NOT actual.indisexclusion
+                          AND actual.indisvalid
+                          AND actual.indisready
+                          AND actual.indislive
+                          AND NOT actual.indisreplident
+                          AND actual.indnatts = 1 AND actual.indnkeyatts = 1
+                          AND actual.indexprs IS NULL AND actual.indpred IS NULL
+                          AND pg_catalog.pg_get_indexdef(
+                            actual.indexrelid, 1, TRUE
+                          ) = 'avionics_model_id'
+                      )
+                      AND (
+                        SELECT COUNT(*)
+                        FROM pg_catalog.pg_index actual
+                        WHERE actual.indrelid = pg_catalog.to_regclass(
+                          'public.aircraft_sale_listing_avionics_link_authorizations'
+                        )
+                          AND NOT actual.indisprimary
+                      ) = 1
+                    "#,
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                if !relations_are_exact {
+                    #[cfg(test)]
+                    eprintln!("listing avionics authorization PostgreSQL relations drifted");
+                    return Ok(false);
+                }
+                let actual_triggers =
+                    sqlx::query_as::<_, PostgresGroundedCapabilityTriggerDefinition>(
+                        r#"
+                    SELECT trigger_row.tgname AS trigger_name,
+                           trigger_row.tgtype AS trigger_type,
+                           trigger_row.tgqual IS NULL AS has_no_when_clause,
+                           trigger_row.tgenabled = 'O' AS is_enabled,
+                           trigger_row.tgnargs = 0 AS has_zero_trigger_args,
+                           trigger_row.tgparentid = 0 AS is_uninherited,
+                           trigger_row.tgconstraint = 0 AS is_non_constraint,
+                           trigger_row.tgoldtable IS NULL
+                             AND trigger_row.tgnewtable IS NULL
+                             AS has_no_transition_tables,
+                           trigger_row.tgattr::text = '' AS has_no_update_columns,
+                           pg_catalog.pg_get_triggerdef(trigger_row.oid) AS definition,
+                           routine_namespace.nspname AS function_namespace,
+                           routine.proname AS function_name,
+                           routine.prosrc AS function_source,
+                           COALESCE(
+                             pg_catalog.array_to_string(routine.proconfig, E'\n'), ''
+                           ) AS function_config,
+                           NOT routine.prosecdef AS is_security_invoker,
+                           routine.prokind = 'f' AS is_ordinary_function,
+                           routine.prorettype = pg_catalog.to_regtype(
+                             'pg_catalog.trigger'
+                           ) AS returns_trigger,
+                           routine.pronargs = 0 AS has_zero_function_args,
+                           language_row.lanname AS language_name,
+                           NOT routine.proisstrict AS is_not_strict,
+                           routine.provolatile = 'v' AS is_volatile,
+                           routine.proparallel = 'u' AS is_parallel_unsafe,
+                           NOT routine.proleakproof AS is_not_leakproof
+                    FROM pg_catalog.pg_trigger trigger_row
+                    JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
+                    JOIN pg_catalog.pg_namespace routine_namespace
+                      ON routine_namespace.oid = routine.pronamespace
+                    JOIN pg_catalog.pg_language language_row
+                      ON language_row.oid = routine.prolang
+                    WHERE NOT trigger_row.tgisinternal
+                      AND (
+                        trigger_row.tgrelid = pg_catalog.to_regclass(
+                          'public.aircraft_sale_listing_avionics_link_authorizations'
+                        )
+                        OR pg_catalog.strpos(
+                          routine.prosrc,
+                          'aircraft_sale_listing_avionics_link_authorizations'
+                        ) > 0
+                      )
+                    ORDER BY trigger_row.tgname
+                    "#,
+                    )
+                    .fetch_all(&mut **pool)
+                    .await?;
+                let triggers_are_exact = actual_triggers.len() == TRIGGERS.len()
+                    && actual_triggers.iter().zip(TRIGGERS).all(
+                        |(actual, (name, trigger_type, no_update_columns, function_name))| {
+                            actual.trigger_name == *name
+                                && actual.trigger_type == *trigger_type
+                                && actual.has_no_when_clause
+                                && actual.is_enabled
+                                && actual.has_zero_trigger_args
+                                && actual.is_uninherited
+                                && actual.is_non_constraint
+                                && actual.has_no_transition_tables
+                                && actual.has_no_update_columns == *no_update_columns
+                                && actual.function_namespace == "public"
+                                && actual.function_name == *function_name
+                                && actual.function_config == "search_path=pg_catalog"
+                                && actual.is_security_invoker
+                                && actual.is_ordinary_function
+                                && actual.returns_trigger
+                                && actual.has_zero_function_args
+                                && actual.language_name == "plpgsql"
+                                && actual.is_not_strict
+                                && actual.is_volatile
+                                && actual.is_parallel_unsafe
+                                && actual.is_not_leakproof
+                                && canonical_postgres_trigger_definition(&actual.definition)
+                                    == canonical_postgres_named_trigger_definition(
+                                        POSTGRES_SCHEMA_SQL,
+                                        name,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "canonical listing authorization trigger {name} must exist"
+                                        )
+                                    })
+                                && canonical_sql_definition(&actual.function_source)
+                                    == canonical_sql_definition(
+                                        postgres_function_source(
+                                            POSTGRES_SCHEMA_SQL,
+                                            function_name,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "canonical listing authorization function {function_name} must exist"
+                                            )
+                                        }),
+                                    )
+                        },
+                    );
+                #[cfg(test)]
+                if !triggers_are_exact {
+                    eprintln!(
+                        "listing avionics authorization PostgreSQL triggers drifted: actual={:?} expected={:?}",
+                        actual_triggers
+                            .iter()
+                            .map(|trigger| (&trigger.trigger_name, trigger.trigger_type, trigger.has_no_update_columns, &trigger.function_name))
+                            .collect::<Vec<_>>(),
+                        TRIGGERS
+                    );
+                }
+                Ok(triggers_are_exact)
+            }
+        }
     }
 
     async fn aircraft_visual_source_correction_definitions_valid_on(
@@ -6273,9 +7660,14 @@ impl AppDb {
                     return Ok(false);
                 }
                 for routine in &routines {
-                    let Some(expected_source) =
+                    let expected_source = if routine.function_name
+                        == "invalidate_listing_avionics_authorization_for_capture"
+                    {
+                        postgres_function_source(POSTGRES_SCHEMA_SQL, &routine.function_name)
+                    } else {
                         postgres_migration_function_source(&routine.function_name)
-                    else {
+                    };
+                    let Some(expected_source) = expected_source else {
                         #[cfg(test)]
                         eprintln!(
                             "missing PostgreSQL migration source for {}",
@@ -9019,34 +10411,16 @@ fn avionics_grounded_evidence_refresh_migration_required_message(kind: DatabaseK
     )
 }
 
-fn listing_avionics_association_authorizations_migration_required_message(
-    kind: DatabaseKind,
-) -> String {
+fn listing_avionics_grounded_capabilities_migration_required_message(kind: DatabaseKind) -> String {
     let backend = match kind {
         DatabaseKind::Sqlite => "sqlite",
         DatabaseKind::Postgres => "postgres",
     };
     format!(
-        "database migration required before startup: exact listing-avionics associations must use \
-         current manufacturer-reuse or same-case grounded authorization; back up the database, apply \
-         `migrations/{LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION}.{backend}.sql`, then \
+        "database migration required before startup: capture-bound grounded avionics resolutions \
+         must survive listing retries as one-use capabilities; back up the database, apply \
+         `migrations/{LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION}.{backend}.sql`, then \
          restart aircost"
-    )
-}
-
-fn listing_avionics_authorization_hash_domain_reset_migration_required_message(
-    kind: DatabaseKind,
-) -> String {
-    let backend = match kind {
-        DatabaseKind::Sqlite => "sqlite",
-        DatabaseKind::Postgres => "postgres",
-    };
-    format!(
-        "database migration required before startup: incompatible derived manufacturer-reuse \
-         receipts must be invalidated without changing listing links or catalog products; back up \
-         the database, apply \
-         `migrations/{LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION}.{backend}.sql`, \
-         then restart aircost"
     )
 }
 
@@ -9143,16 +10517,19 @@ mod tests {
         avionics_authoritative_source_origins_migration_required_message,
         avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
-        avionics_product_reuse_attestations_migration_required_message, canonical_sql_definition,
-        faa_record_hash_domain_migration_required_message, faa_registry_contract_required_message,
+        avionics_product_reuse_attestations_migration_required_message,
+        canonical_postgres_named_trigger_definition, canonical_sql_definition,
+        canonical_sqlite_named_definition, canonical_startup_migration_contract_receipts,
+        canonical_table_definition, faa_record_hash_domain_migration_required_message,
+        faa_registry_contract_required_message,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
         listing_pending_reviews_migration_required_message, migration_required_message,
-        postgres_approved_concrete_model_object_payload, postgres_reference_owned_objects_query,
-        split_sql_statements, sqlite_migration_definition, sqlite_table_definition,
-        versioned_avionics_approved_concrete_model_object_fingerprint, AppDb, DatabaseBackend,
-        DatabaseKind, PostgresApprovedConcreteModelTriggerDefinition,
+        postgres_approved_concrete_model_object_payload, postgres_function_source,
+        postgres_reference_owned_objects_query, split_sql_statements, sqlite_migration_definition,
+        sqlite_table_definition, versioned_avionics_approved_concrete_model_object_fingerprint,
+        AppDb, DatabaseBackend, DatabaseKind, PostgresApprovedConcreteModelTriggerDefinition,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
@@ -9188,13 +10565,11 @@ mod tests {
         FAA_REFERENCE_REACHABILITY_CONTRACT_FINGERPRINT,
         FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION, FAA_REFERENCE_REACHABILITY_MIGRATION,
         IDENTITY_DEDUPLICATION_POSTCONDITIONS_CONTRACT_FINGERPRINT,
-        LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT,
-        LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION,
-        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT,
-        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
-        LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION,
-        LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT, LISTING_REPLAY_RUNS_CONTRACT_VERSION,
-        LISTING_REPLAY_RUNS_MIGRATION, POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE,
+        LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
+        LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION,
+        LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION, LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT,
+        LISTING_REPLAY_RUNS_CONTRACT_VERSION, LISTING_REPLAY_RUNS_MIGRATION,
+        POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE,
         POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT,
         POSTGRES_CORRECTION_DECISION_FUNCTION_SOURCE,
         POSTGRES_FAA_AIRCRAFT_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
@@ -9202,7 +10577,7 @@ mod tests {
         POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
         POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE, POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
         POSTGRES_SCHEMA_SQL, POSTGRES_SEARCH_PATH, REFERENCE_CATALOG_CUTOVER_MIGRATION,
-        REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL, SQLITE_SCHEMA_SQL,
+        REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL, SQLITE_BUSY_TIMEOUT, SQLITE_SCHEMA_SQL,
         VALUATION_DATA_HARDENING_MIGRATION,
     };
 
@@ -9262,18 +10637,10 @@ mod tests {
         include_str!("../migrations/20260807_avionics_product_reuse_v2.sqlite.sql");
     const AVIONICS_REUSE_V2_POSTGRES_MIGRATION_SQL: &str =
         include_str!("../migrations/20260807_avionics_product_reuse_v2.postgres.sql");
-    const LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL: &str = include_str!(
-        "../migrations/20260818_listing_avionics_association_authorizations.sqlite.sql"
-    );
-    const LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL: &str = include_str!(
-        "../migrations/20260818_listing_avionics_association_authorizations.postgres.sql"
-    );
-    const LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL: &str = include_str!(
-        "../migrations/20260818_listing_avionics_authorization_hash_domain_reset.sqlite.sql"
-    );
-    const LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL: &str = include_str!(
-        "../migrations/20260818_listing_avionics_authorization_hash_domain_reset.postgres.sql"
-    );
+    const LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260825_listing_avionics_grounded_capabilities.sqlite.sql");
+    const LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL: &str =
+        include_str!("../migrations/20260825_listing_avionics_grounded_capabilities.postgres.sql");
     const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_SQLITE_MIGRATION_SQL: &str =
         include_str!("../migrations/20260819_aircraft_listing_identity_corrections.sqlite.sql");
     const AIRCRAFT_LISTING_IDENTITY_CORRECTIONS_POSTGRES_MIGRATION_SQL: &str =
@@ -9385,8 +10752,17 @@ mod tests {
             .difference(&postgres_receipts)
             .next()
             .is_none());
-        assert_eq!(sqlite_receipts.len(), 22);
-        assert_eq!(postgres_receipts.len(), 23);
+        let expected_sqlite = canonical_startup_migration_contract_receipts(DatabaseKind::Sqlite)
+            .into_iter()
+            .map(|receipt| receipt.migration_name.to_string())
+            .collect::<BTreeSet<_>>();
+        let expected_postgres =
+            canonical_startup_migration_contract_receipts(DatabaseKind::Postgres)
+                .into_iter()
+                .map(|receipt| receipt.migration_name.to_string())
+                .collect::<BTreeSet<_>>();
+        assert_eq!(sqlite_receipts, expected_sqlite);
+        assert_eq!(postgres_receipts, expected_postgres);
         assert!(!sqlite_receipts.contains("20260802_default_avionics_candidate_quarantine"));
     }
 
@@ -9749,7 +11125,10 @@ mod tests {
         .await
         .unwrap();
         let expected = sqlite_receipt_snapshot(pool).await;
-        assert_eq!(expected.len(), 23);
+        assert_eq!(
+            expected.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Sqlite).len() + 1
+        );
         assert!(expected
             .iter()
             .any(|receipt| receipt.0 == "20260809_listing_verification_runs"));
@@ -9839,14 +11218,29 @@ mod tests {
         let first_url = database_url.clone();
         let second_url = database_url.clone();
         let (first, second) = tokio::join!(AppDb::connect(&first_url), AppDb::connect(&second_url));
-        first.unwrap().close().await;
-        second.unwrap().close().await;
+        let first = first.unwrap();
+        let second = second.unwrap();
+        for db in [&first, &second] {
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let busy_timeout_millis: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(busy_timeout_millis, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+        }
+        first.close().await;
+        second.close().await;
         let inspection = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
             .await
             .unwrap();
-        assert_eq!(sqlite_receipt_snapshot(&inspection).await.len(), 22);
+        assert_eq!(
+            sqlite_receipt_snapshot(&inspection).await.len(),
+            canonical_startup_migration_contract_receipts(DatabaseKind::Sqlite).len()
+        );
         inspection.close().await;
         std::fs::remove_file(database_path).unwrap();
 
@@ -16390,7 +17784,7 @@ mod tests {
 
     #[test]
     fn listing_avionics_authorization_contract_has_backend_parity() {
-        let table = "aircraft_sale_listing_avionics_authorizations";
+        let table = "aircraft_sale_listing_avionics_link_authorizations";
         let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
         assert_eq!(
             sqlite_columns,
@@ -16399,65 +17793,25 @@ mod tests {
         );
         assert_eq!(
             sqlite_columns,
-            table_columns(LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL, table),
-            "canonical schema and SQLite upgrade disagree for {table}"
+            table_columns(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                table,
+            ),
+            "canonical schema and SQLite migration disagree for {table}"
         );
         assert_eq!(
             sqlite_columns,
             table_columns(
-                LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
                 table
             ),
-            "canonical schema and Postgres upgrade disagree for {table}"
+            "canonical schema and Postgres migration disagree for {table}"
         );
-        for definition in [SQLITE_SCHEMA_SQL, POSTGRES_SCHEMA_SQL] {
-            assert!(!definition.contains("aircraft_sale_listing_avionics_corroborations"));
-            assert!(!definition.contains("aircraft_sale_listing_avionics_corroboration_scopes"));
-            assert!(definition.contains(LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_MIGRATION));
-            assert!(definition
-                .contains(LISTING_AVIONICS_ASSOCIATION_AUTHORIZATIONS_CONTRACT_FINGERPRINT));
-            assert!(definition.contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION));
-            assert!(definition
-                .contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT));
-        }
-        assert_eq!(
-            LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_VERSION,
-            1
-        );
-        for migration in [
-            LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL,
-            LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
-        ] {
-            assert!(migration.contains("'manufacturer_reuse'"));
-            assert!(migration.contains("'same_case_grounded'"));
-            assert!(migration.contains("DROP TABLE aircraft_sale_listing_avionics_corroborations"));
-            assert!(migration
-                .contains("DROP TABLE aircraft_sale_listing_avionics_corroboration_scopes"));
-            assert!(migration.contains("link.source_confidence = 'high'"));
-            assert!(
-                migration.contains("corroboration.observation_sha256"),
-                "the already-applied transition must remain immutable"
-            );
-        }
-        for migration in [
-            LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL,
-            LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL,
-        ] {
-            assert!(migration.contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION));
-            assert!(migration
-                .contains(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT));
-            assert!(migration.contains("DELETE FROM aircraft_sale_listing_avionics_authorizations"));
-            assert!(migration.contains("WHERE authorization_kind = 'manufacturer_reuse'"));
-            assert!(migration.contains("Listing links and catalog rows"));
-        }
-        assert!(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_POSTGRES_MIGRATION_SQL.contains(
-            "LOCK TABLE aircraft_sale_listing_avionics_authorizations\nIN SHARE ROW EXCLUSIVE MODE"
-        ));
         for definition in [
             SQLITE_SCHEMA_SQL,
             POSTGRES_SCHEMA_SQL,
-            LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL,
-            LISTING_AVIONICS_AUTHORIZATIONS_POSTGRES_MIGRATION_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
         ] {
             for cleanup_trigger in [
                 "listing_avionics_authorizations_invalidate_model_proof_update",
@@ -16478,447 +17832,2204 @@ mod tests {
         }
     }
 
+    #[test]
+    fn listing_avionics_grounded_capability_contract_has_backend_parity() {
+        let table = "aircraft_sale_listing_avionics_grounded_capabilities";
+        let authorization_table = "aircraft_sale_listing_avionics_link_authorizations";
+        let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
+        assert_eq!(
+            sqlite_columns,
+            table_columns(POSTGRES_SCHEMA_SQL, table),
+            "SQLite/Postgres schema column mismatch for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                table
+            ),
+            "canonical schema and SQLite upgrade disagree for {table}"
+        );
+        assert_eq!(
+            sqlite_columns,
+            table_columns(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                table
+            ),
+            "canonical schema and Postgres upgrade disagree for {table}"
+        );
+        assert_eq!(
+            canonical_table_definition(SQLITE_SCHEMA_SQL, table),
+            canonical_table_definition(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                table,
+            ),
+            "canonical SQLite schema and migration must agree on the complete table declaration"
+        );
+        assert_eq!(
+            canonical_table_definition(POSTGRES_SCHEMA_SQL, table),
+            canonical_table_definition(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                table,
+            ),
+            "canonical PostgreSQL schema and migration must agree on the complete table declaration"
+        );
+        assert_eq!(
+            canonical_table_definition(SQLITE_SCHEMA_SQL, authorization_table),
+            canonical_table_definition(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                authorization_table,
+            ),
+            "canonical SQLite schema and migration must agree on the exact authorization table"
+        );
+        assert_eq!(
+            canonical_table_definition(POSTGRES_SCHEMA_SQL, authorization_table),
+            canonical_table_definition(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                authorization_table,
+            ),
+            "canonical PostgreSQL schema and migration must agree on the exact authorization table"
+        );
+        for definition in [
+            SQLITE_SCHEMA_SQL,
+            POSTGRES_SCHEMA_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION));
+            assert!(
+                definition.contains(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT)
+            );
+            assert!(definition.contains("listing_avionics_grounded_capability"));
+            assert!(definition.contains("requested_quantity"));
+            assert!(definition.contains("occurrence_index"));
+            assert!(definition.contains("occurrence_role"));
+        }
+        for definition in [
+            POSTGRES_SCHEMA_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains(
+                "CREATE OR REPLACE FUNCTION public.validate_listing_avionics_grounded_capability()"
+            ));
+            assert!(definition.contains(
+                "CREATE OR REPLACE FUNCTION public.reject_listing_avionics_grounded_capability_update()"
+            ));
+            assert!(definition.contains("FROM public.plugin_submissions submission"));
+            assert!(definition
+                .contains("FROM public.avionics_approved_product_graph_identities approved"));
+            for function_name in [
+                "public.validate_listing_avionics_grounded_capability",
+                "public.reject_listing_avionics_grounded_capability_update",
+            ] {
+                assert!(definition.contains(&format!(
+                    "CREATE OR REPLACE FUNCTION {function_name}()\nRETURNS TRIGGER\nLANGUAGE plpgsql\nSET search_path = pg_catalog"
+                )));
+            }
+            assert!(definition.contains(
+                "EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability()"
+            ));
+            assert!(definition.contains(
+                "EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update()"
+            ));
+        }
+        for object_name in [
+            "idx_listing_avionics_grounded_capabilities_model",
+            "idx_listing_avionics_grounded_capabilities_submission",
+            "listing_avionics_grounded_capabilities_validate_insert",
+            "listing_avionics_grounded_capabilities_immutable_update",
+        ] {
+            assert_eq!(
+                canonical_sqlite_named_definition(SQLITE_SCHEMA_SQL, object_name),
+                canonical_sqlite_named_definition(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                    object_name,
+                ),
+                "canonical SQLite object and migration drifted for {object_name}"
+            );
+        }
+        for trigger_name in [
+            "listing_avionics_grounded_capabilities_validate_insert",
+            "listing_avionics_grounded_capabilities_immutable_update",
+        ] {
+            assert_eq!(
+                canonical_postgres_named_trigger_definition(POSTGRES_SCHEMA_SQL, trigger_name),
+                canonical_postgres_named_trigger_definition(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                    trigger_name,
+                ),
+                "canonical PostgreSQL trigger and migration drifted for {trigger_name}"
+            );
+        }
+        for function_name in [
+            "validate_listing_avionics_grounded_capability",
+            "reject_listing_avionics_grounded_capability_update",
+        ] {
+            assert_eq!(
+                postgres_function_source(POSTGRES_SCHEMA_SQL, function_name)
+                    .map(canonical_sql_definition),
+                postgres_function_source(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                    function_name,
+                )
+                .map(canonical_sql_definition),
+                "canonical PostgreSQL function and migration drifted for {function_name}"
+            );
+        }
+        for object_name in [
+            "idx_listing_avionics_authorizations_model",
+            "listing_avionics_authorizations_immutable_update",
+            "listing_avionics_authorizations_invalidate_capture_delete",
+            "listing_avionics_authorizations_invalidate_capture_update",
+            "listing_avionics_authorizations_invalidate_graph_delete",
+            "listing_avionics_authorizations_invalidate_graph_insert",
+            "listing_avionics_authorizations_invalidate_graph_update",
+            "listing_avionics_authorizations_invalidate_link_update",
+            "listing_avionics_authorizations_invalidate_manufacturer_update",
+            "listing_avionics_authorizations_invalidate_model_proof_update",
+            "listing_avionics_authorizations_invalidate_model_type_delete",
+            "listing_avionics_authorizations_invalidate_model_type_insert",
+            "listing_avionics_authorizations_invalidate_model_type_update",
+            "listing_avionics_authorizations_invalidate_origin_revocation",
+            "listing_avionics_authorizations_invalidate_reuse_delete",
+            "listing_avionics_authorizations_invalidate_type_update",
+            "listing_avionics_authorizations_validate_insert",
+        ] {
+            assert_eq!(
+                canonical_sqlite_named_definition(SQLITE_SCHEMA_SQL, object_name),
+                canonical_sqlite_named_definition(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                    object_name,
+                ),
+                "canonical SQLite authorization object and migration drifted for {object_name}"
+            );
+        }
+        for trigger_name in [
+            "listing_avionics_authorizations_immutable_update",
+            "listing_avionics_authorizations_invalidate_capture_delete",
+            "listing_avionics_authorizations_invalidate_capture_update",
+            "listing_avionics_authorizations_invalidate_graph_delete",
+            "listing_avionics_authorizations_invalidate_graph_insert",
+            "listing_avionics_authorizations_invalidate_graph_update",
+            "listing_avionics_authorizations_invalidate_link_update",
+            "listing_avionics_authorizations_invalidate_manufacturer_update",
+            "listing_avionics_authorizations_invalidate_model_proof_update",
+            "listing_avionics_authorizations_invalidate_model_type_delete",
+            "listing_avionics_authorizations_invalidate_model_type_insert",
+            "listing_avionics_authorizations_invalidate_model_type_update",
+            "listing_avionics_authorizations_invalidate_origin_revocation",
+            "listing_avionics_authorizations_invalidate_reuse_delete",
+            "listing_avionics_authorizations_invalidate_type_update",
+            "listing_avionics_authorizations_validate_insert",
+        ] {
+            assert_eq!(
+                canonical_postgres_named_trigger_definition(POSTGRES_SCHEMA_SQL, trigger_name),
+                canonical_postgres_named_trigger_definition(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                    trigger_name,
+                ),
+                "canonical PostgreSQL authorization trigger and migration drifted for {trigger_name}"
+            );
+        }
+        for function_name in [
+            "validate_listing_avionics_authorization",
+            "preserve_listing_avionics_authorization",
+            "invalidate_listing_avionics_authorization_for_link",
+            "invalidate_listing_avionics_authorization_for_reuse",
+            "invalidate_listing_avionics_same_case_for_model_proof",
+            "invalidate_listing_avionics_same_case_for_model_type",
+            "invalidate_listing_avionics_same_case_for_type",
+            "invalidate_listing_avionics_same_case_for_graph",
+            "invalidate_listing_avionics_same_case_for_manufacturer",
+            "invalidate_listing_avionics_same_case_for_origin_revocation",
+            "invalidate_listing_avionics_authorization_for_capture",
+        ] {
+            assert_eq!(
+                postgres_function_source(POSTGRES_SCHEMA_SQL, function_name)
+                    .map(canonical_sql_definition),
+                postgres_function_source(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                    function_name,
+                )
+                .map(canonical_sql_definition),
+                "canonical PostgreSQL authorization function and migration drifted for {function_name}"
+            );
+        }
+        assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
+        assert_eq!(
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
+            "e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e"
+        );
+        assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL
+            .contains("DROP TABLE IF EXISTS aircraft_sale_listing_avionics_grounded_capabilities"));
+        assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL.contains(
+            "DROP TABLE IF EXISTS\n  public.aircraft_sale_listing_avionics_grounded_capabilities"
+        ));
+    }
+
     #[tokio::test]
-    async fn sqlite_listing_avionics_authorization_upgrade_is_idempotent_and_integral() {
-        let mut connection = SqliteConnection::connect("sqlite::memory:")
+    async fn sqlite_grounded_capability_rerun_rejects_unexpected_protected_objects() {
+        for (object_name, statement) in [
+            (
+                "unexpected_grounded_capability_index",
+                "CREATE INDEX unexpected_grounded_capability_index ON aircraft_sale_listing_avionics_grounded_capabilities(requested_quantity)",
+            ),
+            (
+                "unexpected_grounded_authorization_index",
+                "CREATE INDEX unexpected_grounded_authorization_index ON aircraft_sale_listing_avionics_link_authorizations(authorization_kind)",
+            ),
+            (
+                "unexpected_grounded_capability_external_trigger",
+                "CREATE TRIGGER unexpected_grounded_capability_external_trigger \
+                 BEFORE UPDATE ON plugin_submissions BEGIN \
+                   SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities; \
+                 END",
+            ),
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            sqlx::query(statement).execute(pool).await.unwrap();
+            let before = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT type, name, sql FROM sqlite_schema \
+                 WHERE sql IS NOT NULL AND ( \
+                   (type = 'index' AND tbl_name IN ( \
+                     'aircraft_sale_listing_avionics_grounded_capabilities', \
+                     'aircraft_sale_listing_avionics_link_authorizations' \
+                   )) OR (type = 'trigger' AND ( \
+                     tbl_name IN ( \
+                       'aircraft_sale_listing_avionics_grounded_capabilities', \
+                       'aircraft_sale_listing_avionics_link_authorizations' \
+                     ) OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_grounded_capabilities') > 0 \
+                       OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_link_authorizations') > 0 \
+                   )) \
+                 ) \
+                 ORDER BY type, name",
+            )
+            .fetch_all(pool)
             .await
-            .expect("SQLite migration fixture should connect");
-        sqlx::raw_sql(
-            r#"
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE schema_migration_contracts (
-              migration_name TEXT PRIMARY KEY,
-              contract_version INTEGER NOT NULL,
-              contract_fingerprint TEXT NOT NULL,
-              installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            .unwrap();
+            let receipt_before: (i64, String, String) = sqlx::query_as(
+                "SELECT contract_version, contract_fingerprint, installed_at \
+                 FROM schema_migration_contracts WHERE migration_name = ?",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+            let error = sqlx::raw_sql(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+            )
+            .execute(pool)
+            .await
+            .expect_err("an unexpected attached index must fail a marked SQLite rerun")
+            .to_string();
+            assert!(
+                error.contains("CHECK constraint failed")
+                    || error.contains("listing_avionics_grounded_capabilities_object_guard"),
+                "unexpected {object_name} rerun error: {error}"
             );
-            INSERT INTO schema_migration_contracts
-              (migration_name, contract_version, contract_fingerprint)
-            VALUES
-              ('20260805_listing_avionics_association_corroborations', 1,
-               '2c4661b8bf76e1a28d5ab5c636ed100f5d73f845c44b9515e5f46c5827e66fc9'),
-              ('20260806_listing_avionics_collision_closure', 1,
-               '363fd039068667cca351c0009c0621e55942186a5d63804cf0e7da8212fa26b3'),
-              ('20260807_avionics_product_reuse_v2', 1,
-               'efcec97dff7c11299536c46a602a4c0e680690434c4bdfb6ba7730b7305b87dc');
-            CREATE TABLE avionics_models (
-              id INTEGER PRIMARY KEY,
-              identity_source_url TEXT
+            let _ = sqlx::raw_sql("ROLLBACK").execute(pool).await;
+
+            let after = sqlx::query_as::<_, (String, String, String)>(
+                "SELECT type, name, sql FROM sqlite_schema \
+                 WHERE sql IS NOT NULL AND ( \
+                   (type = 'index' AND tbl_name IN ( \
+                     'aircraft_sale_listing_avionics_grounded_capabilities', \
+                     'aircraft_sale_listing_avionics_link_authorizations' \
+                   )) OR (type = 'trigger' AND ( \
+                     tbl_name IN ( \
+                       'aircraft_sale_listing_avionics_grounded_capabilities', \
+                       'aircraft_sale_listing_avionics_link_authorizations' \
+                     ) OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_grounded_capabilities') > 0 \
+                       OR instr(lower(sql), \
+                       'aircraft_sale_listing_avionics_link_authorizations') > 0 \
+                   )) \
+                 ) \
+                 ORDER BY type, name",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let receipt_after: (i64, String, String) = sqlx::query_as(
+                "SELECT contract_version, contract_fingerprint, installed_at \
+                 FROM schema_migration_contracts WHERE migration_name = ?",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(after, before, "{object_name} rejection must not heal objects");
+            assert_eq!(receipt_after, receipt_before);
+            assert!(after.iter().any(|(_, name, _)| name == object_name));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap(),
+                1,
+                "{object_name} rejection must preserve FK enforcement"
             );
-            INSERT INTO avionics_models (id, identity_source_url)
-            VALUES (7, 'https://www.garmin.com/en-US/aviation/');
-            CREATE TABLE avionics_manufacturers (id INTEGER PRIMARY KEY);
-            CREATE TABLE avionics_types (
-              id INTEGER PRIMARY KEY,
-              name TEXT,
-              normalized_name TEXT
-            );
-            CREATE TABLE avionics_model_types (
-              avionics_model_id INTEGER NOT NULL,
-              avionics_type_id INTEGER NOT NULL
-            );
-            CREATE TABLE avionics_approved_product_identities (
-              avionics_model_id INTEGER PRIMARY KEY,
-              avionics_manufacturer_identity_id INTEGER,
-              canonical_product_key TEXT,
-              manufacturer_identifier_kind TEXT,
-              canonical_identifier_key TEXT
-            );
-            CREATE TABLE avionics_approved_product_graph_identities (
-              avionics_model_id INTEGER PRIMARY KEY,
-              avionics_manufacturer_identity_id INTEGER
-            );
-            INSERT INTO avionics_approved_product_graph_identities
-              (avionics_model_id, avionics_manufacturer_identity_id)
-            VALUES (7, 3);
-            CREATE TABLE avionics_manufacturer_effective_identities (
-              identity_id INTEGER PRIMARY KEY,
-              avionics_manufacturer_identity_id INTEGER NOT NULL
-            );
-            INSERT INTO avionics_manufacturer_effective_identities
-              (identity_id, avionics_manufacturer_identity_id)
-            VALUES (3, 3);
-            CREATE TABLE avionics_authoritative_source_origins (
-              id INTEGER PRIMARY KEY,
-              authority_kind TEXT NOT NULL,
-              avionics_manufacturer_identity_id INTEGER,
-              https_origin TEXT NOT NULL
-            );
-            INSERT INTO avionics_authoritative_source_origins VALUES (
-              5, 'manufacturer_primary', 3, 'https://www.garmin.com'
-            );
-            CREATE TABLE avionics_authoritative_source_origin_revocations (
-              avionics_authoritative_source_origin_id INTEGER PRIMARY KEY
-            );
-            CREATE TABLE avionics_product_reuse_attestations (
-              avionics_model_id INTEGER PRIMARY KEY,
-              product_fingerprint TEXT NOT NULL,
-              policy_version TEXT NOT NULL
-            );
-            INSERT INTO avionics_product_reuse_attestations
-              (avionics_model_id, product_fingerprint, policy_version)
-            VALUES (7,
-              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-              'avionics_reuse_v2');
-            CREATE TABLE aircraft_sale_listing_avionics (
-              id INTEGER PRIMARY KEY,
-              aircraft_sale_listing_id INTEGER NOT NULL,
-              avionics_model_id INTEGER NOT NULL,
-              quantity INTEGER NOT NULL,
-              source_notes TEXT,
-              source_confidence TEXT,
-              configuration_action TEXT NOT NULL,
-              replaces_avionics_model_id INTEGER
-            );
-            INSERT INTO aircraft_sale_listing_avionics
-              (id, aircraft_sale_listing_id, avionics_model_id, quantity,
-               source_notes, source_confidence, configuration_action)
-            VALUES
-              (11, 23, 7, 1, 'Garmin GTX 345', 'high', 'installed'),
-              (12, 24, 7, 1, 'Garmin GTX 345', 'medium', 'installed'),
-              (13, 25, 7, 1, 'Garmin GTX 345', 'high', 'installed');
-            CREATE TABLE plugin_submissions (
-              canonical_listing_id INTEGER,
-              rendered_html TEXT NOT NULL,
-              rendered_html_sha256 TEXT NOT NULL
-            );
-            INSERT INTO plugin_submissions
-              (canonical_listing_id, rendered_html, rendered_html_sha256)
-            VALUES
-              (23, '<p>Garmin GTX 345</p>',
-               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
-              (24, '<p>Garmin GTX 345</p>',
-               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'),
-              (25, '<p>Garmin GTX 345</p>',
-               '7777777777777777777777777777777777777777777777777777777777777777');
-            CREATE TABLE aircraft_sale_listing_avionics_corroborations (
-              listing_link_id INTEGER NOT NULL,
-              association_role TEXT NOT NULL,
-              avionics_model_id INTEGER NOT NULL,
-              observation_sha256 TEXT NOT NULL,
-              product_fingerprint TEXT NOT NULL,
-              policy_version TEXT NOT NULL,
-              corroborated_at TEXT NOT NULL,
-              PRIMARY KEY (listing_link_id, association_role)
-            );
-            INSERT INTO aircraft_sale_listing_avionics_corroborations VALUES
-              (11, 'installed', 7,
-               'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
-               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-               'listing_avionics_association_v1', '2026-08-18 12:00:00'),
-              (12, 'installed', 7,
-               'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-               'listing_avionics_association_v1', '2026-08-18 12:00:00');
-            CREATE TABLE aircraft_sale_listing_avionics_corroboration_scopes (
-              listing_link_id INTEGER NOT NULL,
-              association_role TEXT NOT NULL,
-              collision_closure_sha256 TEXT NOT NULL,
-              policy_version TEXT NOT NULL,
-              PRIMARY KEY (listing_link_id, association_role)
-            );
-            INSERT INTO aircraft_sale_listing_avionics_corroboration_scopes VALUES
-              (11, 'installed',
-               'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
-               'listing_avionics_collision_closure_v1'),
-              (12, 'installed',
-               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
-               'listing_avionics_collision_closure_v1');
-            "#,
-        )
-        .execute(&mut connection)
-        .await
-        .expect("legacy authorization fixture should initialize");
+            assert!(db.ensure_required_migrations().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn grounded_capability_migration_rerun_is_idempotent_and_unmarked_tables_fail_closed() {
+        let options = "sqlite::memory:"
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let db = AppDb {
+            backend: DatabaseBackend::Sqlite(pool),
+        };
+        db.initialize_transactionally().await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
 
         for _ in 0..2 {
-            sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATIONS_SQLITE_MIGRATION_SQL)
-                .execute(&mut connection)
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(pool)
                 .await
-                .expect("authorization upgrade should be safely repeatable");
+                .expect("the exact installed grounded-capability migration should be idempotent");
         }
+        db.ensure_required_migrations()
+            .await
+            .expect("startup should pass after exact migration reruns");
 
-        let migrated: (i64, String, String, String, String) = sqlx::query_as(
-            r#"
-            SELECT avionics_model_id, authorization_kind, product_fingerprint,
-                   evidence_capture_sha256, policy_version
-            FROM aircraft_sale_listing_avionics_authorizations
-            WHERE listing_link_id = 11 AND association_role = 'installed'
-            "#,
+        sqlx::query("DELETE FROM schema_migration_contracts WHERE migration_name = ?")
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .execute(pool)
+            .await
+            .unwrap();
+        let error = sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .expect_err("unmarked preexisting final tables must fail closed")
+            .to_string();
+        assert!(
+            error.contains("CHECK constraint failed")
+                || error.contains("listing_avionics_grounded_capabilities_migration_guard"),
+            "unexpected startup error: {error}"
+        );
+        sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::raw_sql(
+            "DROP TABLE aircraft_sale_listing_avionics_grounded_capabilities; \
+             DROP TABLE aircraft_sale_listing_avionics_link_authorizations;",
         )
-        .fetch_one(&mut connection)
-        .await
-        .expect("the valid predecessor proof should migrate once");
-        assert_eq!(migrated.0, 7);
-        assert_eq!(migrated.1, "manufacturer_reuse");
-        assert_eq!(migrated.2, "a".repeat(64));
-        assert_eq!(migrated.3, "b".repeat(64));
-        assert_eq!(migrated.4, "listing_avionics_authorization_v1");
-        let downgraded_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = 12",
-        )
-        .fetch_one(&mut connection)
+        .execute(pool)
         .await
         .unwrap();
+        let protected_object_error =
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(pool)
+                .await
+                .expect_err("unmarked protected trigger names must fail closed")
+                .to_string();
+        sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
         assert_eq!(
-            downgraded_count, 0,
-            "a downgraded predecessor link must not acquire authorization"
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1
         );
-        sqlx::query(
+        assert!(
+            protected_object_error.contains("CHECK constraint failed")
+                || protected_object_error
+                    .contains("listing_avionics_grounded_capabilities_migration_guard"),
+            "unexpected protected-object error: {protected_object_error}"
+        );
+    }
+
+    async fn sqlite_complete_grounded_schema_with_nullable_receipt() -> sqlx::SqlitePool {
+        const RECEIPT_COLUMNS: &str =
+            "  contract_version INTEGER NOT NULL,\n  contract_fingerprint TEXT NOT NULL,";
+        const NULLABLE_RECEIPT_COLUMNS: &str =
+            "  contract_version INTEGER,\n  contract_fingerprint TEXT,";
+        const VERSION_CHECK: &str =
+            "  CHECK (typeof(contract_version) = 'integer' AND contract_version > 0),";
+        const NULLABLE_VERSION_CHECK: &str = "  CHECK (contract_version IS NULL OR (typeof(contract_version) = 'integer' AND contract_version > 0)),";
+
+        assert_eq!(SQLITE_SCHEMA_SQL.matches(RECEIPT_COLUMNS).count(), 1);
+        assert_eq!(SQLITE_SCHEMA_SQL.matches(VERSION_CHECK).count(), 1);
+        let schema = SQLITE_SCHEMA_SQL
+            .replacen(RECEIPT_COLUMNS, NULLABLE_RECEIPT_COLUMNS, 1)
+            .replacen(VERSION_CHECK, NULLABLE_VERSION_CHECK, 1);
+        let options = "sqlite::memory:"
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        for statement in split_sql_statements(&schema) {
+            (&mut *transaction).execute(statement).await.unwrap();
+        }
+        transaction.commit().await.unwrap();
+        pool
+    }
+
+    async fn sqlite_grounded_contract_snapshot(
+        pool: &sqlx::SqlitePool,
+    ) -> (
+        Vec<(String, String, String, i64, Option<String>)>,
+        Option<(Option<i64>, Option<String>, String)>,
+        (i64, i64),
+    ) {
+        let schema = sqlx::query_as(
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema \
+             ORDER BY type, name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let receipt = sqlx::query_as(
+            "SELECT contract_version, contract_fingerprint, installed_at \
+             FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        let protected_rows = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities), \
+               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (schema, receipt, protected_rows)
+    }
+
+    #[tokio::test]
+    async fn sqlite_grounded_capability_receipt_mutations_fail_closed_with_complete_objects() {
+        for (label, mutation) in [
+            (
+                "wrong version",
+                "UPDATE schema_migration_contracts SET contract_version = 99 \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "hostile fingerprint",
+                "UPDATE schema_migration_contracts SET contract_fingerprint = \
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "null version",
+                "UPDATE schema_migration_contracts SET contract_version = NULL \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "null fingerprint",
+                "UPDATE schema_migration_contracts SET contract_fingerprint = NULL \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "absent receipt",
+                "DELETE FROM schema_migration_contracts \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+        ] {
+            let pool = sqlite_complete_grounded_schema_with_nullable_receipt().await;
+            sqlx::raw_sql(mutation).execute(&pool).await.unwrap();
+            let before = sqlite_grounded_contract_snapshot(&pool).await;
+            let mut connection = pool.acquire().await.unwrap();
+            let error = sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(&mut *connection)
+                .await
+                .unwrap_err()
+                .to_string();
+            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *connection).await;
+            drop(connection);
+            assert!(
+                error.contains("accepted = 1")
+                    || error.contains("listing_avionics_grounded_capabilities_migration_guard"),
+                "{label}: unexpected migration error: {error}"
+            );
+            assert_eq!(
+                sqlite_grounded_contract_snapshot(&pool).await,
+                before,
+                "{label}: rejected rerun changed the canonical grounded contract"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1,
+                "{label}: rejected rerun changed foreign-key enforcement"
+            );
+            pool.close().await;
+        }
+    }
+
+    async fn sqlite_grounded_authorization_rows(pool: &sqlx::SqlitePool) -> (String, String) {
+        let capabilities = sqlx::query_scalar::<_, String>(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+            SELECT group_concat(row_value, char(10))
+            FROM (
+              SELECT
+                quote(listing_id) || '|' || quote(plugin_submission_id) || '|' ||
+                quote(occurrence_index) || '|' || quote(occurrence_role) || '|' ||
+                quote(avionics_model_id) || '|' || quote(requested_quantity) || '|' ||
+                quote(configuration_action) || '|' || quote(request_sha256) || '|' ||
+                quote(capability_sha256) || '|' || quote(grounded_resolution_sha256) || '|' ||
+                quote(evidence_capture_sha256) || '|' || quote(extracted_listing_sha256) || '|' ||
+                quote(product_fingerprint) || '|' || quote(collision_closure_sha256) || '|' ||
+                quote(source_revocation_count) || '|' || quote(policy_version) || '|' ||
+                quote(created_at) AS row_value
+              FROM aircraft_sale_listing_avionics_grounded_capabilities
+              ORDER BY listing_id, plugin_submission_id, occurrence_index, occurrence_role
+            )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let authorizations = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT group_concat(row_value, char(10))
+            FROM (
+              SELECT
+                quote(listing_link_id) || '|' || quote(association_role) || '|' ||
+                quote(avionics_model_id) || '|' || quote(authorization_kind) || '|' ||
+                quote(observation_sha256) || '|' || quote(product_fingerprint) || '|' ||
+                quote(grounded_resolution_sha256) || '|' || quote(evidence_capture_sha256) || '|' ||
+                quote(plugin_submission_id) || '|' || quote(extracted_listing_sha256) || '|' ||
+                quote(collision_closure_sha256) || '|' || quote(source_revocation_count) || '|' ||
+                quote(policy_version) || '|' || quote(authorized_at) AS row_value
+              FROM aircraft_sale_listing_avionics_link_authorizations
+              ORDER BY listing_link_id, association_role
+            )
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (capabilities, authorizations)
+    }
+
+    async fn postgres_grounded_authorization_rows(pool: &sqlx::PgPool) -> (String, String) {
+        let capabilities = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT COALESCE(
+              jsonb_agg(to_jsonb(row_value) ORDER BY
+                row_value.listing_id, row_value.plugin_submission_id,
+                row_value.occurrence_index, row_value.occurrence_role
+              ),
+              '[]'::jsonb
+            )::text
+            FROM ONLY public.aircraft_sale_listing_avionics_grounded_capabilities
+              AS row_value
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let authorizations = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT COALESCE(
+              jsonb_agg(to_jsonb(row_value) ORDER BY
+                row_value.listing_link_id, row_value.association_role
+              ),
+              '[]'::jsonb
+            )::text
+            FROM ONLY public.aircraft_sale_listing_avionics_link_authorizations
+              AS row_value
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (capabilities, authorizations)
+    }
+
+    #[tokio::test]
+    async fn sqlite_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly() {
+        let options = "sqlite::memory:"
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let db = AppDb {
+            backend: DatabaseBackend::Sqlite(pool),
+        };
+        db.initialize_transactionally().await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let listing_link_insert_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+             AND name = 'aircraft_sale_listing_avionics_approved_insert'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let capability_insert_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+             AND name = 'listing_avionics_grounded_capabilities_validate_insert'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let authorization_insert_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+             AND name = 'listing_avionics_authorizations_validate_insert'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            r#"
+            DROP TRIGGER aircraft_sale_listing_avionics_approved_insert;
+            DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert;
+            DROP TRIGGER listing_avionics_authorizations_validate_insert;
+
+            INSERT INTO avionics_manufacturers (id, name, normalized_name)
+            VALUES (91001, 'Rerun Test Avionics', 'rerun test avionics');
+            INSERT INTO avionics_models (
+              id, avionics_manufacturer_id, name, normalized_name
+            ) VALUES (91002, 91001, 'Exact Unit', 'exact unit');
+
+            INSERT INTO avionics_manufacturer_identities (
+              id, canonical_name, normalized_identity_key,
+              identity_evidence_kind, identity_source_url,
+              identity_source_title, identity_evidence_text, identity_confidence
+            ) VALUES (
+              91003, 'Rerun Test Avionics', 'reruntestavionics',
+              'authoritative_reference', 'https://rerun.example/catalog',
+              'Rerun manufacturer catalog',
+              'The manufacturer catalog establishes the test identity.',
+              'very_high'
+            );
+            INSERT INTO avionics_authoritative_source_origins (
+              id, authority_kind, avionics_manufacturer_identity_id,
+              https_origin, evidence_source_url, evidence_source_title,
+              evidence_text, approval_basis, approval_reason
+            ) VALUES (
+              91004, 'manufacturer_primary', 91003,
+              'https://rerun.example', 'https://rerun.example/catalog',
+              'Rerun manufacturer catalog',
+              'The primary catalog identifies the exact test product.',
+              'curated_bootstrap', 'Exact migration rerun regression fixture'
+            );
+            INSERT INTO avionics_authoritative_source_origin_revocations (
+              avionics_authoritative_source_origin_id, revoked_by_user_id,
+              reason, revoked_at
+            ) SELECT 91004, id, 'Regression fixture revocation epoch',
+                     '2026-08-25 09:00:00'
+              FROM users WHERE email = 'developer@localhost';
+
+            INSERT INTO aircraft_sale_listings (
+              id, aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            )
+            SELECT 91005, -1, id, 'https://rerun.example/listing/one',
+                   2020, 250000, 500
+            FROM users WHERE email = 'developer@localhost';
+            INSERT INTO aircraft_sale_listings (
+              id, aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            )
+            SELECT 91006, -1, id, 'https://rerun.example/listing/two',
+                   2021, 260000, 450
+            FROM users WHERE email = 'developer@localhost';
+            INSERT INTO plugin_installs (id, user_id, public_key_base64)
+            SELECT 91007, id, 'rerun-test-key'
+            FROM users WHERE email = 'developer@localhost';
+            INSERT INTO plugin_submissions (
+              id, user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              extraction_error, canonical_listing_id, submitted_at
+            )
+            SELECT 91008, id, 91007, 'https://rerun.example/listing/one',
+                   '<p>Exact Unit</p>',
+                   'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                   'rerun-signature-one', '{"avionics":[]}', NULL, 91005,
+                   '2026-08-25 09:01:00'
+            FROM users WHERE email = 'developer@localhost';
+            INSERT INTO plugin_submissions (
+              id, user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              extraction_error, canonical_listing_id, submitted_at
+            )
+            SELECT 91009, id, 91007, 'https://rerun.example/listing/two',
+                   '<p>Exact Unit</p>',
+                   'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                   'rerun-signature-two', '{"avionics":[]}', NULL, 91006,
+                   '2026-08-25 09:02:00'
+            FROM users WHERE email = 'developer@localhost';
+            INSERT INTO aircraft_sale_listing_avionics (
+              id, aircraft_sale_listing_id, avionics_model_id, quantity,
+              source, source_notes, configuration_action, source_confidence,
+              created_at, updated_at
+            ) VALUES
+              (91010, 91005, 91002, 1, 'listing', 'Exact Unit', 'installed',
+               'high', '2026-08-25 09:03:00', '2026-08-25 09:03:00'),
+              (91011, 91006, 91002, 1, 'listing', 'Exact Unit', 'installed',
+               'high', '2026-08-25 09:04:00', '2026-08-25 09:04:00');
+
+            INSERT INTO aircraft_sale_listing_avionics_grounded_capabilities (
+              listing_id, plugin_submission_id, occurrence_index,
+              occurrence_role, avionics_model_id, requested_quantity,
+              configuration_action, request_sha256, capability_sha256,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              extracted_listing_sha256, product_fingerprint,
+              collision_closure_sha256, source_revocation_count,
+              policy_version, created_at
+            ) VALUES (
+              91005, 91008, 3, 'primary', 91002, 2, 'installed',
+              '1111111111111111111111111111111111111111111111111111111111111111',
+              '2222222222222222222222222222222222222222222222222222222222222222',
+              '3333333333333333333333333333333333333333333333333333333333333333',
+              'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+              '4444444444444444444444444444444444444444444444444444444444444444',
+              '5555555555555555555555555555555555555555555555555555555555555555',
+              '6666666666666666666666666666666666666666666666666666666666666666',
+              1, 'listing_avionics_grounded_capability',
+              '2026-08-25 09:05:00'
+            );
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (
-              13, 'installed', 7, 'same_case_grounded',
-              '9999999999999999999999999999999999999999999999999999999999999999',
-              'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-              '8888888888888888888888888888888888888888888888888888888888888888',
-              '7777777777777777777777777777777777777777777777777777777777777777',
-              '6666666666666666666666666666666666666666666666666666666666666666',
-              'listing_avionics_authorization_v1'
-            )
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, source_revocation_count,
+              policy_version, authorized_at
+            ) VALUES
+              (91010, 'installed', 91002, 'same_case_grounded',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '5555555555555555555555555555555555555555555555555555555555555555',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+               91008,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               1, 'listing_avionics_authorization',
+               '2026-08-25 09:06:00'),
+              (91011, 'installed', 91002, 'manufacturer_reuse',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '9999999999999999999999999999999999999999999999999999999999999999',
+               NULL,
+               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+               NULL, NULL,
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               NULL, 'listing_avionics_authorization',
+               '2026-08-25 09:07:00');
             "#,
         )
-        .execute(&mut connection)
+        .execute(pool)
         .await
-        .expect("a same-case authorization should be admitted before revocation");
-        sqlx::query("INSERT INTO avionics_authoritative_source_origin_revocations VALUES (5)")
-            .execute(&mut connection)
-            .await
-            .expect("the exact source origin should be revocable");
-        let revoked_same_case_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = 13",
-        )
-        .fetch_one(&mut connection)
-        .await
-        .unwrap();
-        assert_eq!(
-            revoked_same_case_count, 0,
-            "revoking the exact product-proof origin must invalidate same-case authorization"
-        );
-        let old_object_count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM sqlite_schema
-            WHERE name IN (
-              'aircraft_sale_listing_avionics_corroborations',
-              'aircraft_sale_listing_avionics_corroboration_scopes'
-            )
-            "#,
-        )
-        .fetch_one(&mut connection)
-        .await
-        .unwrap();
-        assert_eq!(old_object_count, 0);
-        let foreign_key_errors: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
-                .fetch_one(&mut connection)
-                .await
-                .unwrap();
-        assert_eq!(foreign_key_errors, 0);
-        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
-            .fetch_one(&mut connection)
+        .expect("nonempty exact migration fixture should seed");
+        sqlx::raw_sql(&listing_link_insert_trigger)
+            .execute(pool)
             .await
             .unwrap();
-        assert_eq!(integrity, "ok");
+        sqlx::raw_sql(&capability_insert_trigger)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(&authorization_insert_trigger)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let before = sqlite_grounded_authorization_rows(pool).await;
+        let installed_at_before: String = sqlx::query_scalar(
+            "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+            .execute(pool)
+            .await
+            .expect("the exact nonempty migration should rerun without data loss");
+
+        assert_eq!(sqlite_grounded_authorization_rows(pool).await, before);
+        let installed_at_after: String = sqlx::query_scalar(
+            "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(installed_at_after, installed_at_before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            "ok"
+        );
+        db.ensure_required_migrations()
+            .await
+            .expect("startup attestation should accept the preserved exact state");
+
+        let canonical_capability_table: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' \
+             AND name = 'aircraft_sale_listing_avionics_grounded_capabilities'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let hostile_capability_table = canonical_capability_table.replacen(
+            "CHECK (occurrence_index >= 0)",
+            "CHECK (occurrence_index != 0)",
+            1,
+        );
+        assert_ne!(hostile_capability_table, canonical_capability_table);
+        let mut catalog_connection = pool.acquire().await.unwrap();
+        sqlx::raw_sql("PRAGMA writable_schema = ON")
+            .execute(&mut *catalog_connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sqlite_schema SET sql = ? WHERE type = 'table' \
+             AND name = 'aircraft_sale_listing_avionics_grounded_capabilities'",
+        )
+        .bind(&hostile_capability_table)
+        .execute(&mut *catalog_connection)
+        .await
+        .unwrap();
+        sqlx::raw_sql("PRAGMA writable_schema = OFF")
+            .execute(&mut *catalog_connection)
+            .await
+            .unwrap();
+        drop(catalog_connection);
+        let table_error =
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(pool)
+                .await
+                .expect_err("a marked same-column table mutation must fail before migration DDL")
+                .to_string();
+        sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+        assert!(table_error.contains("accepted = 1"), "{table_error}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1,
+            "a rejected table guard must preserve FK enforcement"
+        );
+        assert_eq!(sqlite_grounded_authorization_rows(pool).await, before);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            installed_at_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' \
+                 AND name = 'aircraft_sale_listing_avionics_grounded_capabilities'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            hostile_capability_table
+        );
+
+        let mut catalog_connection = pool.acquire().await.unwrap();
+        sqlx::raw_sql("PRAGMA writable_schema = ON")
+            .execute(&mut *catalog_connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sqlite_schema SET sql = ? WHERE type = 'table' \
+             AND name = 'aircraft_sale_listing_avionics_grounded_capabilities'",
+        )
+        .bind(&canonical_capability_table)
+        .execute(&mut *catalog_connection)
+        .await
+        .unwrap();
+        sqlx::raw_sql("PRAGMA writable_schema = OFF")
+            .execute(&mut *catalog_connection)
+            .await
+            .unwrap();
+        drop(catalog_connection);
+        let canonical_authorization_trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+             AND name = 'listing_avionics_authorizations_validate_insert'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let hostile_authorization_trigger = canonical_authorization_trigger.replacen(
+            "link.source_confidence = 'high'",
+            "link.source_confidence = 'HIGH'",
+            1,
+        );
+        assert_ne!(
+            hostile_authorization_trigger,
+            canonical_authorization_trigger
+        );
+        sqlx::query("DROP TRIGGER listing_avionics_authorizations_validate_insert")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(&hostile_authorization_trigger)
+            .execute(pool)
+            .await
+            .unwrap();
+        let trigger_error =
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(pool)
+                .await
+                .expect_err("a marked trigger mutation must roll back instead of being healed")
+                .to_string();
+        sqlx::raw_sql("ROLLBACK").execute(pool).await.unwrap();
+        assert!(trigger_error.contains("accepted = 3"), "{trigger_error}");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            1,
+            "a rejected object guard must preserve FK enforcement"
+        );
+        assert_eq!(sqlite_grounded_authorization_rows(pool).await, before);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT installed_at FROM schema_migration_contracts WHERE migration_name = ?",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            installed_at_before
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' \
+                 AND name = 'listing_avionics_authorizations_validate_insert'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            hostile_authorization_trigger
+        );
     }
 
     #[tokio::test]
-    async fn sqlite_listing_avionics_authorization_hash_reset_is_fail_closed_and_idempotent() {
-        let mut connection = SqliteConnection::connect("sqlite::memory:")
-            .await
-            .expect("SQLite hash-reset fixture should connect");
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
         sqlx::raw_sql(
             r#"
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE schema_migration_contracts (
-              migration_name TEXT PRIMARY KEY,
-              contract_version INTEGER NOT NULL,
-              contract_fingerprint TEXT NOT NULL,
-              installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            INSERT INTO public.avionics_manufacturers (id, name, normalized_name)
+            VALUES (92001, 'Rerun Test Avionics', 'rerun test avionics');
+            INSERT INTO public.avionics_manufacturer_identities (
+              id, canonical_name, normalized_identity_key,
+              identity_evidence_kind, identity_source_url,
+              identity_source_title, identity_evidence_text, identity_confidence
+            ) VALUES (
+              92002, 'Rerun Test Avionics', 'reruntestavionics',
+              'authoritative_reference', 'https://rerun.example/catalog',
+              'Rerun manufacturer catalog',
+              'The manufacturer catalog establishes the test identity.',
+              'very_high'
             );
-            INSERT INTO schema_migration_contracts
-              (migration_name, contract_version, contract_fingerprint)
-            VALUES (
-              '20260818_listing_avionics_association_authorizations',
-              1,
-              'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9'
+            INSERT INTO public.avionics_manufacturer_identity_memberships (
+              avionics_manufacturer_id, avionics_manufacturer_identity_id,
+              membership_basis, normalized_name_key, evidence_source_url,
+              evidence_source_title, evidence_text, evidence_confidence
+            ) VALUES (
+              92001, 92002, 'authoritative_primary', 'reruntestavionics',
+              'https://rerun.example/catalog', 'Rerun manufacturer catalog',
+              'The manufacturer catalog establishes the exact manufacturer.',
+              'very_high'
             );
-            CREATE TABLE aircraft_sale_listing_avionics (
-              id INTEGER PRIMARY KEY
+            INSERT INTO public.avionics_authoritative_source_origins (
+              id, authority_kind, avionics_manufacturer_identity_id,
+              https_origin, evidence_source_url, evidence_source_title,
+              evidence_text, approval_basis, approval_reason
+            ) VALUES (
+              92003, 'manufacturer_primary', 92002,
+              'https://rerun.example', 'https://rerun.example/catalog',
+              'Rerun manufacturer catalog',
+              'The primary catalog identifies the exact test product.',
+              'curated_bootstrap', 'Exact migration rerun regression fixture'
             );
-            INSERT INTO aircraft_sale_listing_avionics VALUES (11), (12), (13);
-            CREATE TABLE avionics_models (
-              id INTEGER PRIMARY KEY
+            INSERT INTO public.avionics_types (id, name, normalized_name)
+            VALUES (92004, 'Rerun Test Type', 'rerun test type');
+            INSERT INTO public.avionics_models (
+              id, avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier, identity_source_url,
+              identity_source_title, identity_evidence_text,
+              identity_evidence_kind, identity_confidence
+            ) VALUES (
+              92005, 92001, 'Exact Unit', 'exact unit',
+              'manufacturer_model_number', 'EXACT-UNIT', 'exact-unit',
+              'https://rerun.example/catalog', 'Rerun manufacturer catalog',
+              'The primary catalog identifies the exact unit model.',
+              'authoritative_reference', 'very_high'
             );
-            INSERT INTO avionics_models VALUES (7);
-            CREATE TABLE aircraft_sale_listing_avionics_authorizations (
-              listing_link_id INTEGER NOT NULL,
-              authorization_kind TEXT NOT NULL
+            INSERT INTO public.avionics_model_types (
+              avionics_model_id, avionics_type_id
+            ) VALUES (92005, 92004);
+            UPDATE public.avionics_models
+            SET catalog_status = 'approved',
+                catalog_reviewed_at = '2026-08-25 09:00:00'
+            WHERE id = 92005;
+            INSERT INTO public.avionics_product_reuse_attestations (
+              avionics_model_id, avionics_authoritative_source_origin_id,
+              policy_version, product_fingerprint, attested_at
+            ) VALUES (
+              92005, 92003, 'avionics_reuse_v2',
+              '9999999999999999999999999999999999999999999999999999999999999999',
+              '2026-08-25 09:01:00'
             );
-            INSERT INTO aircraft_sale_listing_avionics_authorizations VALUES
-              (11, 'manufacturer_reuse'),
-              (12, 'same_case_grounded');
+
+            INSERT INTO public.aircraft_sale_listings (
+              id, aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            )
+            SELECT 92006, -1, id, 'https://rerun.example/listing/one',
+                   2020, 250000, 500
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.aircraft_sale_listings (
+              id, aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours
+            )
+            SELECT 92007, -1, id, 'https://rerun.example/listing/two',
+                   2021, 260000, 450
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.plugin_installs (id, user_id, public_key_base64)
+            SELECT 92008, id, 'rerun-test-key'
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.plugin_submissions (
+              id, user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              extraction_error, canonical_listing_id, submitted_at
+            )
+            SELECT 92009, id, 92008, 'https://rerun.example/listing/one',
+                   '<p>Exact Unit</p>',
+                   'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                   'rerun-signature-one', '{"avionics":[]}', NULL, 92006,
+                   '2026-08-25 09:02:00'
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.plugin_submissions (
+              id, user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, extracted_listing_json,
+              extraction_error, canonical_listing_id, submitted_at
+            )
+            SELECT 92010, id, 92008, 'https://rerun.example/listing/two',
+                   '<p>Exact Unit</p>',
+                   'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                   'rerun-signature-two', '{"avionics":[]}', NULL, 92007,
+                   '2026-08-25 09:03:00'
+            FROM public.users WHERE email = 'developer@localhost';
+            INSERT INTO public.aircraft_sale_listing_avionics (
+              id, aircraft_sale_listing_id, avionics_model_id, quantity,
+              source, source_notes, configuration_action, source_confidence,
+              created_at, updated_at
+            ) VALUES
+              (92011, 92006, 92005, 1, 'listing', 'Exact Unit', 'installed',
+               'high', '2026-08-25 09:04:00', '2026-08-25 09:04:00'),
+              (92012, 92007, 92005, 1, 'listing', 'Exact Unit', 'installed',
+               'high', '2026-08-25 09:05:00', '2026-08-25 09:05:00');
+
+            INSERT INTO public.aircraft_sale_listing_avionics_grounded_capabilities (
+              listing_id, plugin_submission_id, occurrence_index,
+              occurrence_role, avionics_model_id, requested_quantity,
+              configuration_action, request_sha256, capability_sha256,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              extracted_listing_sha256, product_fingerprint,
+              collision_closure_sha256, source_revocation_count,
+              policy_version, created_at
+            ) VALUES (
+              92006, 92009, 3, 'primary', 92005, 2, 'installed',
+              '1111111111111111111111111111111111111111111111111111111111111111',
+              '2222222222222222222222222222222222222222222222222222222222222222',
+              '3333333333333333333333333333333333333333333333333333333333333333',
+              'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+              '4444444444444444444444444444444444444444444444444444444444444444',
+              '5555555555555555555555555555555555555555555555555555555555555555',
+              '6666666666666666666666666666666666666666666666666666666666666666',
+              0, 'listing_avionics_grounded_capability',
+              '2026-08-25 09:06:00'
+            );
+            INSERT INTO public.aircraft_sale_listing_avionics_link_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, source_revocation_count,
+              policy_version, authorized_at
+            ) VALUES
+              (92011, 'installed', 92005, 'same_case_grounded',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '5555555555555555555555555555555555555555555555555555555555555555',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+               92009,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               0, 'listing_avionics_authorization',
+               '2026-08-25 09:07:00'),
+              (92012, 'installed', 92005, 'manufacturer_reuse',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '9999999999999999999999999999999999999999999999999999999999999999',
+               NULL,
+               'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+               NULL, NULL,
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               NULL, 'listing_avionics_authorization',
+               '2026-08-25 09:08:00');
             "#,
         )
-        .execute(&mut connection)
+        .execute(pool)
         .await
-        .expect("hash-reset fixture should initialize");
+        .expect("nonempty exact PostgreSQL migration fixture should seed");
 
-        sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL)
-            .execute(&mut connection)
+        db.ensure_required_migrations()
             .await
-            .expect("hash reset should invalidate predecessor-derived receipts");
-
-        let retained_after_reset: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT listing_link_id, authorization_kind \
-             FROM aircraft_sale_listing_avionics_authorizations ORDER BY listing_link_id",
+            .expect("the exact pre-rerun PostgreSQL state should pass startup");
+        let before = postgres_grounded_authorization_rows(pool).await;
+        let receipt_before: (i64, String, String) = sqlx::query_as(
+            "SELECT contract_version::bigint, contract_fingerprint, installed_at \
+             FROM ONLY public.schema_migration_contracts WHERE migration_name = $1",
         )
-        .fetch_all(&mut connection)
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(
-            retained_after_reset,
-            vec![(12, "same_case_grounded".to_string())]
-        );
-        let retained_links: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM aircraft_sale_listing_avionics")
-                .fetch_one(&mut connection)
+
+        for rerun in 1..=2 {
+            sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL)
+                .execute(pool)
                 .await
-                .unwrap();
-        let retained_models: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM avionics_models")
-            .fetch_one(&mut connection)
+                .unwrap_or_else(|error| panic!("exact PostgreSQL rerun {rerun} failed: {error}"));
+            assert_eq!(postgres_grounded_authorization_rows(pool).await, before);
+            let receipt_after: (i64, String, String) = sqlx::query_as(
+                "SELECT contract_version::bigint, contract_fingerprint, installed_at \
+                 FROM ONLY public.schema_migration_contracts WHERE migration_name = $1",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(pool)
             .await
             .unwrap();
-        assert_eq!(retained_links, 3, "listing links are not receipts");
-        assert_eq!(retained_models, 1, "catalog products are not receipts");
+            assert_eq!(receipt_after, receipt_before);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM ONLY public.schema_migration_contracts \
+                     WHERE migration_name = $1",
+                )
+                .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+                1
+            );
+        }
 
-        sqlx::query("INSERT INTO aircraft_sale_listing_avionics_authorizations VALUES (?, ?)")
-            .bind(13_i64)
-            .bind("manufacturer_reuse")
-            .execute(&mut connection)
-            .await
-            .expect("current workflow should be able to issue a new receipt");
-        sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL)
-            .execute(&mut connection)
-            .await
-            .expect("verified migration reapplication should be a no-op");
-
-        let retained_after_reapply: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT listing_link_id, authorization_kind \
-             FROM aircraft_sale_listing_avionics_authorizations ORDER BY listing_link_id",
-        )
-        .fetch_all(&mut connection)
-        .await
-        .unwrap();
         assert_eq!(
-            retained_after_reapply,
-            vec![
-                (12, "same_case_grounded".to_string()),
-                (13, "manufacturer_reuse".to_string()),
-            ]
+            sqlx::query_as::<_, (i64, i64)>(
+                r#"
+                SELECT COUNT(*)::bigint,
+                       COUNT(*) FILTER (WHERE NOT constraint_row.convalidated)::bigint
+                FROM pg_catalog.pg_constraint constraint_row
+                WHERE constraint_row.contype = 'f'
+                  AND constraint_row.conrelid IN (
+                    pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                    ),
+                    pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_link_authorizations'
+                    )
+                  )
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            (6, 0)
         );
-        let reset_contract: (i64, String) = sqlx::query_as(
-            "SELECT contract_version, contract_fingerprint \
-             FROM schema_migration_contracts WHERE migration_name = ?",
-        )
-        .bind(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION)
-        .fetch_one(&mut connection)
-        .await
-        .unwrap();
-        assert_eq!(reset_contract.0, 1);
         assert_eq!(
-            reset_contract.1,
-            LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)::bigint
+                FROM (
+                  SELECT capability.listing_id
+                  FROM ONLY public.aircraft_sale_listing_avionics_grounded_capabilities AS capability
+                  LEFT JOIN public.aircraft_sale_listings listing
+                    ON listing.id = capability.listing_id
+                  LEFT JOIN public.plugin_submissions submission
+                    ON submission.id = capability.plugin_submission_id
+                  LEFT JOIN public.avionics_models model
+                    ON model.id = capability.avionics_model_id
+                  WHERE listing.id IS NULL OR submission.id IS NULL OR model.id IS NULL
+                  UNION ALL
+                  SELECT authorization_row.listing_link_id
+                  FROM ONLY public.aircraft_sale_listing_avionics_link_authorizations AS authorization_row
+                  LEFT JOIN public.aircraft_sale_listing_avionics link
+                    ON link.id = authorization_row.listing_link_id
+                  LEFT JOIN public.avionics_models model
+                    ON model.id = authorization_row.avionics_model_id
+                  LEFT JOIN public.plugin_submissions submission
+                    ON submission.id = authorization_row.plugin_submission_id
+                  WHERE link.id IS NULL OR model.id IS NULL
+                    OR (authorization_row.plugin_submission_id IS NOT NULL
+                        AND submission.id IS NULL)
+                ) orphan
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            0
         );
+        db.ensure_required_migrations()
+            .await
+            .expect("startup should accept the preserved exact PostgreSQL state");
     }
 
     #[tokio::test]
-    async fn stale_manufacturer_reuse_receipt_requires_hash_reset_before_startup() {
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_grounded_capability_migration_rerun_rejects_contract_drift_without_changes() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        for tamper_sql in [
+            "UPDATE ONLY public.schema_migration_contracts \
+             SET contract_version = 99 \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "UPDATE ONLY public.schema_migration_contracts \
+             SET contract_fingerprint = \
+               'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "ALTER TABLE ONLY public.schema_migration_contracts \
+             ALTER COLUMN contract_version DROP NOT NULL; \
+             UPDATE ONLY public.schema_migration_contracts \
+             SET contract_version = NULL \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "ALTER TABLE ONLY public.schema_migration_contracts \
+             ALTER COLUMN contract_fingerprint DROP NOT NULL; \
+             UPDATE ONLY public.schema_migration_contracts \
+             SET contract_fingerprint = NULL \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "DELETE FROM ONLY public.schema_migration_contracts \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "ALTER TABLE public.aircraft_sale_listings \
+             ADD COLUMN hostile_reference_id BIGINT UNIQUE; \
+             DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'listing_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities \
+             ADD CONSTRAINT hostile_capability_listing_fk \
+             FOREIGN KEY (listing_id) \
+             REFERENCES public.aircraft_sale_listings(hostile_reference_id) \
+             ON DELETE CASCADE",
+            "ALTER TABLE public.aircraft_sale_listing_avionics \
+             ADD COLUMN hostile_reference_id BIGINT UNIQUE; \
+             DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'listing_link_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ADD CONSTRAINT hostile_authorization_link_fk \
+             FOREIGN KEY (listing_link_id) \
+             REFERENCES public.aircraft_sale_listing_avionics(hostile_reference_id) \
+             ON DELETE CASCADE",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'plugin_submission_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ADD CONSTRAINT hostile_authorization_submission_fk \
+             FOREIGN KEY (plugin_submission_id) \
+             REFERENCES public.plugin_submissions(id) ON DELETE CASCADE NOT VALID",
+            "CREATE INDEX hostile_extra_grounded_capability_index \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities (listing_id)",
+            "CREATE INDEX hostile_extra_listing_authorization_index \
+             ON public.aircraft_sale_listing_avionics_link_authorizations (listing_link_id)",
+            "ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ENABLE ROW LEVEL SECURITY",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'c' \
+                 AND pg_catalog.strpos( \
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid), \
+                   'occurrence_index' \
+                 ) > 0; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities \
+             ADD CONSTRAINT hostile_occurrence_index_check \
+             CHECK ((occurrence_index >= 0) OR TRUE)",
+            "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() \
+             SET search_path = public",
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities; \
+             CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert \
+             BEFORE INSERT \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             FOR EACH ROW WHEN (false) \
+             EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability()",
+            "CREATE FUNCTION public.hostile_external_capability_delete() \
+             RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog \
+             AS $function$ \
+             BEGIN \
+               DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities \
+               WHERE listing_id = -1; \
+               RETURN NEW; \
+             END \
+             $function$; \
+             CREATE TRIGGER hostile_external_capability_delete \
+             AFTER UPDATE ON public.users FOR EACH ROW \
+             EXECUTE FUNCTION public.hostile_external_capability_delete()",
+        ] {
+            assert_postgres_grounded_migration_rerun_rejected_without_changes(
+                &database_url,
+                tamper_sql,
+            )
+            .await;
+        }
+    }
+
+    async fn assert_corrupt_grounded_capability_schema_rejected(statements: &[&str]) {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
         };
-        let validation_trigger_sql: String = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_schema \
-             WHERE type = 'trigger' \
-               AND name = 'listing_avionics_authorizations_validate_insert'",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        let mut connection = pool.acquire().await.unwrap();
-        sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TRIGGER listing_avionics_authorizations_validate_insert")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
-              listing_link_id, association_role, avionics_model_id,
-              authorization_kind, observation_sha256, product_fingerprint,
-              grounded_resolution_sha256, evidence_capture_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL, ?, ?, ?)
-            "#,
-        )
-        .bind(999_i64)
-        .bind(999_i64)
-        .bind("a".repeat(64))
-        .bind("b".repeat(64))
-        .bind("c".repeat(64))
-        .bind("d".repeat(64))
-        .bind("listing_avionics_authorization_v1")
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::raw_sql(&validation_trigger_sql)
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM schema_migration_contracts WHERE migration_name = ?")
-            .bind(LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_MIGRATION)
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        drop(connection);
-
+        for statement in statements {
+            pool.execute(*statement).await.unwrap();
+        }
         let error = db
             .ensure_required_migrations()
             .await
-            .expect_err("a predecessor receipt without the reset contract must fail startup")
+            .expect_err("tampered grounded-capability objects must fail startup")
             .to_string();
-        assert!(error.contains("incompatible derived manufacturer-reuse receipts"));
-        assert!(
-            error.contains("20260818_listing_avionics_authorization_hash_domain_reset.sqlite.sql")
-        );
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"));
+    }
 
-        sqlx::raw_sql(LISTING_AVIONICS_AUTHORIZATION_HASH_RESET_SQLITE_MIGRATION_SQL)
-            .execute(pool)
+    #[tokio::test]
+    async fn grounded_capability_startup_rejects_wrong_index_and_noop_trigger() {
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP INDEX idx_listing_avionics_grounded_capabilities_model",
+            "CREATE INDEX idx_listing_avionics_grounded_capabilities_model ON users(email)",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert",
+            "CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities WHEN 0 BEGIN SELECT RAISE(ABORT, 'grounded avionics capability requires its exact current capture-bound listing and approved product'); END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "CREATE TRIGGER unexpected_listing_avionics_grounded_capability_trigger BEFORE DELETE ON aircraft_sale_listing_avionics_grounded_capabilities BEGIN SELECT RAISE(ABORT, 'unexpected trigger'); END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert",
+            "CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities BEGIN SELECT 1; END",
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn grounded_capability_startup_rejects_weakened_table_contract() {
+        for (expected, replacement) in [
+            (
+                "CHECK (occurrence_index >= 0)",
+                "CHECK (occurrence_index >= -1)",
+            ),
+            (
+                "CHECK (occurrence_index >= 0)",
+                "CHECK (TRUE /* occurrence_index >= 0 */ OR TRUE)",
+            ),
+            (
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "created_at TEXT NOT NULL DEFAULT 'untrusted'",
+            ),
+            (
+                "REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE",
+                "REFERENCES aircraft_sale_listings(id) ON DELETE RESTRICT",
+            ),
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let table_sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            )
+            .bind("aircraft_sale_listing_avionics_grounded_capabilities")
+            .fetch_one(pool)
             .await
-            .expect("the explicit reset migration should invalidate the stale receipt");
-        db.ensure_required_migrations()
+            .unwrap();
+            let object_sql: Vec<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name",
+            )
+            .bind("aircraft_sale_listing_avionics_grounded_capabilities")
+            .fetch_all(pool)
             .await
-            .expect("startup should pass after the reset contract is installed");
-        let stale_receipts: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations \
-             WHERE authorization_kind = 'manufacturer_reuse'",
+            .unwrap();
+            assert!(table_sql.contains(expected));
+            pool.execute("DROP TABLE aircraft_sale_listing_avionics_grounded_capabilities")
+                .await
+                .unwrap();
+            pool.execute(table_sql.replace(expected, replacement).as_str())
+                .await
+                .unwrap();
+            for statement in object_sql {
+                pool.execute(statement.as_str()).await.unwrap();
+            }
+            let error = db
+                .ensure_required_migrations()
+                .await
+                .expect_err("a weakened grounded-capability table must fail startup")
+                .to_string();
+            assert!(error.contains("capture-bound grounded avionics resolutions"));
+            assert!(error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"));
+        }
+    }
+
+    async fn assert_weakened_listing_avionics_authorization_table_rejected(
+        expected: &str,
+        replacement: &str,
+    ) {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let table = "aircraft_sale_listing_avionics_link_authorizations";
+        let table_sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?")
+                .bind(table)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let objects: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT type, name, sql FROM sqlite_schema \
+             WHERE sql IS NOT NULL AND ( \
+               (type = 'index' AND tbl_name = ?) OR \
+               (type = 'trigger' AND instr(lower(sql), lower(?)) > 0) \
+             ) ORDER BY type, name",
         )
+        .bind(table)
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(table_sql.contains(expected));
+        for (_, name, _) in objects
+            .iter()
+            .filter(|(object_type, _, _)| object_type == "trigger")
+        {
+            pool.execute(format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")).as_str())
+                .await
+                .unwrap();
+        }
+        pool.execute("DROP TABLE aircraft_sale_listing_avionics_link_authorizations")
+            .await
+            .unwrap();
+        pool.execute(table_sql.replace(expected, replacement).as_str())
+            .await
+            .unwrap();
+        for (_, _, statement) in objects {
+            pool.execute(statement.as_str()).await.unwrap();
+        }
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("a weakened listing-avionics authorization table must fail startup")
+            .to_string();
+        assert!(
+            error.contains("capture-bound grounded avionics resolutions"),
+            "unexpected startup error: {error}"
+        );
+        assert!(
+            error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"),
+            "unexpected startup error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_startup_rejects_weakened_scope_and_checkpoint_triggers() {
+        assert_weakened_listing_avionics_authorization_table_rejected(
+            "plugin_submission_id INTEGER\n      REFERENCES plugin_submissions(id) ON DELETE CASCADE",
+            "plugin_submission_id INTEGER",
+        )
+        .await;
+        assert_weakened_listing_avionics_authorization_table_rejected(
+            ",\n    CHECK (\n      (authorization_kind = 'manufacturer_reuse'\n        AND grounded_resolution_sha256 IS NULL\n        AND plugin_submission_id IS NULL\n        AND extracted_listing_sha256 IS NULL\n        AND source_revocation_count IS NULL)\n      OR\n      (authorization_kind = 'same_case_grounded'\n        AND length(grounded_resolution_sha256) = 64\n        AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)\n        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'\n        AND plugin_submission_id IS NOT NULL\n        AND extracted_listing_sha256 IS NOT NULL\n        AND source_revocation_count IS NOT NULL\n        AND source_revocation_count >= 0)\n    )",
+            "",
+        )
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_authorizations_invalidate_capture_update",
+            "CREATE TRIGGER listing_avionics_authorizations_invalidate_capture_update AFTER UPDATE OF canonical_listing_id, rendered_html, rendered_html_sha256, extracted_listing_json, extraction_error ON plugin_submissions WHEN 0 BEGIN DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE plugin_submission_id = OLD.id; END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "CREATE TRIGGER unexpected_listing_avionics_authorization_trigger AFTER UPDATE ON plugin_submissions BEGIN DELETE FROM aircraft_sale_listing_avionics_link_authorizations; END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_authorizations_invalidate_origin_revocation",
+            "CREATE TRIGGER listing_avionics_authorizations_invalidate_origin_revocation AFTER INSERT ON avionics_authoritative_source_origin_revocations BEGIN DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE authorization_kind = 'same_case_grounded'; END",
+        ])
+        .await;
+    }
+
+    async fn assert_corrupt_postgres_grounded_capability_schema_rejected(
+        database_url: &str,
+        tamper_sql: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(tamper_sql).execute(pool).await.unwrap();
+        drop(db);
+        let error = connect_error(AppDb::connect(database_url).await);
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
+    }
+
+    async fn assert_unexpected_postgres_grounded_index_rejected_without_healing(
+        database_url: &str,
+        table: &str,
+        index: &str,
+        column: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let installed_at_before: String = sqlx::query_scalar(
+            "SELECT installed_at FROM ONLY public.schema_migration_contracts \
+             WHERE migration_name = $1",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_eq!(stale_receipts, 0);
+        let definition = format!("CREATE INDEX {index} ON public.{table} ({column})");
+        sqlx::raw_sql(&definition).execute(pool).await.unwrap();
+        drop(db);
+
+        let error = connect_error(AppDb::connect(database_url).await);
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
+
+        let inspection = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(database_url)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT pg_catalog.pg_get_indexdef(pg_catalog.to_regclass($1))",
+            )
+            .bind(format!("public.{index}"))
+            .fetch_one(&inspection)
+            .await
+            .unwrap(),
+            format!("CREATE INDEX {index} ON public.{table} USING btree ({column})")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT installed_at FROM ONLY public.schema_migration_contracts \
+                 WHERE migration_name = $1",
+            )
+            .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+            .fetch_one(&inspection)
+            .await
+            .unwrap(),
+            installed_at_before
+        );
+        inspection.close().await;
     }
 
+    async fn postgres_grounded_contract_snapshot(pool: &sqlx::PgPool) -> String {
+        sqlx::query_scalar(
+            r#"
+            WITH protected_relations(name, relation_id) AS (
+              VALUES
+                ('aircraft_sale_listing_avionics_grounded_capabilities',
+                 pg_catalog.to_regclass(
+                   'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                 )),
+                ('aircraft_sale_listing_avionics_link_authorizations',
+                 pg_catalog.to_regclass(
+                   'public.aircraft_sale_listing_avionics_link_authorizations'
+                 ))
+            ), protected_triggers AS (
+              SELECT trigger_row.*
+              FROM pg_catalog.pg_trigger trigger_row
+              JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
+              WHERE NOT trigger_row.tgisinternal
+                AND (
+                  trigger_row.tgrelid IN (
+                    SELECT relation_id FROM protected_relations
+                  )
+                  OR pg_catalog.strpos(
+                    routine.prosrc,
+                    'aircraft_sale_listing_avionics_grounded_capabilities'
+                  ) > 0
+                  OR pg_catalog.strpos(
+                    routine.prosrc,
+                    'aircraft_sale_listing_avionics_link_authorizations'
+                  ) > 0
+                )
+            )
+            SELECT pg_catalog.jsonb_build_object(
+              'capability_rows', COALESCE((
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.to_jsonb(capability)
+                  ORDER BY listing_id, plugin_submission_id,
+                           occurrence_index, occurrence_role
+                )
+                FROM ONLY public.aircraft_sale_listing_avionics_grounded_capabilities capability
+              ), '[]'::jsonb),
+              'authorization_rows', COALESCE((
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.to_jsonb(authorization_row)
+                  ORDER BY listing_link_id, association_role
+                )
+                FROM ONLY public.aircraft_sale_listing_avionics_link_authorizations authorization_row
+              ), '[]'::jsonb),
+              'receipt', (
+                SELECT pg_catalog.to_jsonb(receipt)
+                FROM ONLY public.schema_migration_contracts receipt
+                WHERE migration_name =
+                      '20260825_listing_avionics_grounded_capabilities'
+              ),
+              'relations', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'name', protected.name,
+                    'kind', relation.relkind,
+                    'persistence', relation.relpersistence,
+                    'is_partition', relation.relispartition,
+                    'row_security', relation.relrowsecurity,
+                    'force_row_security', relation.relforcerowsecurity,
+                    'parents', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        inheritance.inhparent ORDER BY inheritance.inhparent
+                      ) FROM pg_catalog.pg_inherits inheritance
+                      WHERE inheritance.inhrelid = protected.relation_id
+                    ), '[]'::jsonb),
+                    'children', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        inheritance.inhrelid ORDER BY inheritance.inhrelid
+                      ) FROM pg_catalog.pg_inherits inheritance
+                      WHERE inheritance.inhparent = protected.relation_id
+                    ), '[]'::jsonb),
+                    'rules', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        pg_catalog.pg_get_ruledef(rule_row.oid)
+                        ORDER BY rule_row.rulename
+                      ) FROM pg_catalog.pg_rewrite rule_row
+                      WHERE rule_row.ev_class = protected.relation_id
+                    ), '[]'::jsonb),
+                    'policies', COALESCE((
+                      SELECT pg_catalog.jsonb_agg(
+                        pg_catalog.to_jsonb(policy_row)
+                        ORDER BY policy_row.polname
+                      ) FROM pg_catalog.pg_policy policy_row
+                      WHERE policy_row.polrelid = protected.relation_id
+                    ), '[]'::jsonb)
+                  ) ORDER BY protected.name
+                )
+                FROM protected_relations protected
+                JOIN pg_catalog.pg_class relation
+                  ON relation.oid = protected.relation_id
+              ),
+              'constraints', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'table', constraint_row.conrelid,
+                    'name', constraint_row.conname,
+                    'type', constraint_row.contype,
+                    'definition', pg_catalog.pg_get_constraintdef(
+                      constraint_row.oid
+                    ),
+                    'validated', constraint_row.convalidated,
+                    'no_inherit', constraint_row.connoinherit,
+                    'deferrable', constraint_row.condeferrable,
+                    'deferred', constraint_row.condeferred,
+                    'child_keys', constraint_row.conkey,
+                    'parent', constraint_row.confrelid,
+                    'parent_keys', constraint_row.confkey
+                  ) ORDER BY constraint_row.conrelid,
+                             constraint_row.contype,
+                             constraint_row.conname
+                )
+                FROM pg_catalog.pg_constraint constraint_row
+                WHERE constraint_row.conrelid IN (
+                  SELECT relation_id FROM protected_relations
+                )
+              ),
+              'indexes', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'table', index_row.indrelid,
+                    'name', index_relation.relname,
+                    'definition', pg_catalog.pg_get_indexdef(index_row.indexrelid),
+                    'method', access_method.amname,
+                    'unique', index_row.indisunique,
+                    'primary', index_row.indisprimary,
+                    'exclusion', index_row.indisexclusion,
+                    'valid', index_row.indisvalid,
+                    'ready', index_row.indisready,
+                    'live', index_row.indislive,
+                    'replica_identity', index_row.indisreplident
+                  ) ORDER BY index_row.indrelid, index_relation.relname
+                )
+                FROM pg_catalog.pg_index index_row
+                JOIN pg_catalog.pg_class index_relation
+                  ON index_relation.oid = index_row.indexrelid
+                JOIN pg_catalog.pg_am access_method
+                  ON access_method.oid = index_relation.relam
+                WHERE index_row.indrelid IN (
+                  SELECT relation_id FROM protected_relations
+                )
+              ),
+              'triggers', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'table', trigger_row.tgrelid,
+                    'name', trigger_row.tgname,
+                    'definition', pg_catalog.pg_get_triggerdef(trigger_row.oid),
+                    'enabled', trigger_row.tgenabled,
+                    'function', trigger_row.tgfoid
+                  ) ORDER BY trigger_row.tgrelid, trigger_row.tgname
+                ) FROM protected_triggers trigger_row
+              ),
+              'functions', (
+                SELECT pg_catalog.jsonb_agg(
+                  pg_catalog.jsonb_build_object(
+                    'name', routine.proname,
+                    'definition', pg_catalog.pg_get_functiondef(routine.oid),
+                    'configuration', routine.proconfig,
+                    'security_definer', routine.prosecdef
+                  ) ORDER BY routine.proname, routine.oid
+                )
+                FROM pg_catalog.pg_proc routine
+                WHERE routine.oid IN (
+                  SELECT trigger_row.tgfoid FROM protected_triggers trigger_row
+                )
+              )
+            )::text
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn assert_postgres_grounded_migration_rerun_rejected_without_changes(
+        database_url: &str,
+        tamper_sql: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(tamper_sql).execute(pool).await.unwrap();
+        let before = postgres_grounded_contract_snapshot(pool).await;
+        let mut connection = pool.acquire().await.unwrap();
+        let error = sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL)
+            .execute(&mut *connection)
+            .await
+            .expect_err("a marked PostgreSQL contract mutation must reject rerun")
+            .to_string();
+        let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *connection).await;
+        drop(connection);
+        assert!(
+            error.contains("installed listing avionics grounded-capability"),
+            "unexpected migration error: {error}"
+        );
+        assert_eq!(postgres_grounded_contract_snapshot(pool).await, before);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let function_configs: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT routine.proname,
+                   pg_catalog.array_to_string(routine.proconfig, E'\n')
+            FROM pg_catalog.pg_proc routine
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.oid = routine.pronamespace
+            WHERE namespace.nspname = 'public'
+              AND routine.proname IN (
+                'validate_listing_avionics_grounded_capability',
+                'reject_listing_avionics_grounded_capability_update'
+              )
+            ORDER BY routine.proname
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            function_configs,
+            vec![
+                (
+                    "reject_listing_avionics_grounded_capability_update".to_owned(),
+                    "search_path=pg_catalog".to_owned(),
+                ),
+                (
+                    "validate_listing_avionics_grounded_capability".to_owned(),
+                    "search_path=pg_catalog".to_owned(),
+                ),
+            ]
+        );
+
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE SCHEMA attacker_schema; \
+                 CREATE TABLE attacker_schema.plugin_submissions ( \
+                   id BIGINT, canonical_listing_id BIGINT, rendered_html_sha256 TEXT, \
+                   extracted_listing_json TEXT, extraction_error TEXT \
+                 ); \
+                 CREATE TABLE attacker_schema.avionics_approved_product_graph_identities ( \
+                   avionics_model_id BIGINT \
+                 ); \
+                 INSERT INTO attacker_schema.plugin_submissions VALUES ( \
+                   70001, 70002, repeat('a', 64), '{}', NULL \
+                 ); \
+                 INSERT INTO attacker_schema.avionics_approved_product_graph_identities \
+                   VALUES (70003); \
+                 SET search_path = attacker_schema, public, pg_catalog",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        let error = connection
+            .execute(
+                "INSERT INTO public.aircraft_sale_listing_avionics_grounded_capabilities ( \
+                   listing_id, plugin_submission_id, occurrence_index, occurrence_role, \
+                   avionics_model_id, requested_quantity, configuration_action, \
+                   request_sha256, capability_sha256, grounded_resolution_sha256, \
+                   evidence_capture_sha256, extracted_listing_sha256, product_fingerprint, \
+                   collision_closure_sha256, source_revocation_count, policy_version \
+                 ) VALUES ( \
+                   70002, 70001, 0, 'primary', 70003, 1, 'installed', \
+                   repeat('a', 64), repeat('b', 64), repeat('c', 64), \
+                   repeat('a', 64), repeat('d', 64), repeat('e', 64), \
+                   repeat('f', 64), 0, 'listing_avionics_grounded_capability' \
+                 )",
+            )
+            .await
+            .expect_err("attacker shadow rows must not satisfy the public validation function")
+            .to_string();
+        assert!(error.contains(
+            "grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch"
+        ));
+        connection.execute("RESET search_path").await.unwrap();
+        drop(connection);
+        drop(db);
+
+        for (table, index, column) in [
+            (
+                "aircraft_sale_listing_avionics_grounded_capabilities",
+                "hostile_extra_grounded_capability_index",
+                "listing_id",
+            ),
+            (
+                "aircraft_sale_listing_avionics_link_authorizations",
+                "hostile_extra_listing_authorization_index",
+                "listing_link_id",
+            ),
+        ] {
+            assert_unexpected_postgres_grounded_index_rejected_without_healing(
+                &database_url,
+                table,
+                index,
+                column,
+            )
+            .await;
+        }
+
+        for tamper_sql in [
+            "DROP INDEX public.idx_listing_avionics_grounded_capabilities_model; \
+             CREATE INDEX idx_listing_avionics_grounded_capabilities_model \
+             ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             USING hash (avionics_model_id)",
+            "DROP INDEX public.idx_listing_avionics_authorizations_model; \
+             CREATE INDEX idx_listing_avionics_authorizations_model \
+             ON public.aircraft_sale_listing_avionics_link_authorizations \
+             USING hash (avionics_model_id)",
+            "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() SET search_path = public",
+            "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() SECURITY DEFINER",
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert ON public.aircraft_sale_listing_avionics_grounded_capabilities; \
+             CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert \
+             BEFORE INSERT ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             FOR EACH ROW WHEN (false) EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability()",
+            "CREATE TRIGGER unexpected_listing_avionics_grounded_capability_trigger \
+             BEFORE DELETE ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update()",
+            "CREATE FUNCTION public.hostile_external_capability_delete() \
+             RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog \
+             AS $function$ \
+             BEGIN \
+               DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities \
+               WHERE listing_id = -1; \
+               RETURN NEW; \
+             END \
+             $function$; \
+             CREATE TRIGGER hostile_external_capability_delete \
+             AFTER UPDATE ON public.users FOR EACH ROW \
+             EXECUTE FUNCTION public.hostile_external_capability_delete()",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'c' \
+                 AND pg_catalog.strpos( \
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid), \
+                   'occurrence_index' \
+                 ) > 0; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities \
+             ADD CONSTRAINT hostile_occurrence_index_check \
+             CHECK ((occurrence_index >= 0) OR TRUE)",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND constraint_row.confrelid = pg_catalog.to_regclass( \
+                   'public.plugin_submissions' \
+                 ); \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'c' \
+                 AND pg_catalog.strpos( \
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid), \
+                   'plugin_submission_id' \
+                 ) > 0 \
+                 AND pg_catalog.strpos( \
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid), \
+                   'authorization_kind' \
+                 ) > 0; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$",
+            "ALTER TABLE public.plugin_submissions DISABLE TRIGGER listing_avionics_authorizations_invalidate_capture_update",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'plugin_submission_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities ALTER CONSTRAINT %I DEFERRABLE INITIALLY DEFERRED', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               JOIN pg_catalog.pg_attribute child_attribute \
+                 ON child_attribute.attrelid = constraint_row.conrelid \
+                AND child_attribute.attnum = constraint_row.conkey[1] \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_link_authorizations' \
+               ) AND constraint_row.contype = 'f' \
+                 AND child_attribute.attname = 'plugin_submission_id'; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_link_authorizations \
+             ADD CONSTRAINT hostile_authorization_submission_fk \
+             FOREIGN KEY (plugin_submission_id) \
+             REFERENCES public.plugin_submissions(id) ON DELETE CASCADE NOT VALID",
+            "CREATE TRIGGER unexpected_listing_avionics_authorization_trigger \
+             AFTER UPDATE ON public.plugin_submissions FOR EACH ROW \
+             EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture()",
+        ] {
+            assert_corrupt_postgres_grounded_capability_schema_rejected(
+                &database_url,
+                tamper_sql,
+            )
+            .await;
+        }
+    }
     #[test]
     fn pending_review_columns_have_backend_parity() {
         let table = "aircraft_sale_listing_pending_reviews";

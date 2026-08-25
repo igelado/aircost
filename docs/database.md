@@ -278,6 +278,31 @@ are immutable. A transition to `ready` additionally requires positive quantity,
 approved endpoints, high confidence, and `listing` or `listing_review`
 provenance for every avionics link.
 
+`aircraft_sale_listing_avionics_link_authorizations` records the current authority
+for each exact installed or replacement endpoint. A link is authorized either
+by a current global manufacturer-reuse attestation or by the independently
+grounded resolution for that exact listing capture. The latter does not confer
+reuse authority on any other listing.
+
+`aircraft_sale_listing_avionics_grounded_capabilities` is a one-use retry
+capability, not an evidence archive or catalog attestation. One row binds an
+exact listing, plugin submission, source-capture hash, parsed-checkpoint hash,
+occurrence coordinate and role, quantity, action, approved product fingerprint,
+and collision closure. It contains only typed identifiers and hashes; prompts,
+provider responses, URLs, and grounding dossiers are never stored. Every
+occurrence contributing to a coalesced association must have a matching row,
+and their exact quantities and actions must cover the final aggregate. The
+link transaction rechecks the current product and collision state, inserts the
+link and `same_case_grounded` authorization, and deletes all consumed
+capabilities atomically. Each capability and resulting same-case authorization
+binds the current count of append-only authoritative-origin revocations. Any
+new revocation conservatively deletes every unconsumed capability and every
+same-case authorization; future writes and runtime replay must bind the new
+count. This global epoch covers fresh grounded origins that are not eligible
+for manufacturer-wide reuse without storing source URLs, excerpts, or a
+dossier. A failed or stale retry therefore cannot mint global reuse or
+authorize a different listing, product, occurrence, quantity, or action.
+
 `aircraft_sale_listing_pending_reviews`
 
 Stores the durable handoff for listing avionics that cannot be resolved with
@@ -1844,15 +1869,15 @@ WHERE type = 'table'
 ```
 
 The contract must be version `1` with fingerprint
-`fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5`.
+`85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522`.
 The fingerprint is the SHA-256 of this newline-terminated manifest:
 
 ```text
 20260819_reference_catalog_cutover:v1
-sqlite-old:238:a2e2d5d3fdbc38847b9bddcebbf587c50447b3415ba3c7f1c3ed8a0b94605b45
-sqlite-post:213:82cac0c7a143383a589aaf58699690392f111c7e5daa329ec6f6b385e64590d1
-postgres-old:925:379464a027df1c61f99c754b28ff4738
-postgres-post:793:5bea7b82d356e161fe8a160f68845c68
+sqlite-old:238:520dd12118080bb4525f8ef9ce8fdeb3b4d4241c063ee5fc6f0c294fa1d04ecd
+sqlite-post:213:581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54
+postgres-old:924:f4aad204c04ccc9cfb23743ae1c23edd
+postgres-post:792:a12dfb4a0ff4f026bee8b16c1c26ac0a
 ```
 
 Its `installed_at` value records the first successful installation and remains

@@ -25,8 +25,18 @@ use crate::avionics::catalog::{
     exact_product_identity_signal_is_present, ApprovedProductAssociationRequest,
     ApprovedProductAssociationResolver, PendingProductAttestationCommitGuard,
 };
-pub(super) use crate::avionics::catalog::{
-    ActiveCollisionCatalogFingerprintRow, ACTIVE_COLLISION_CATALOG_ROWS_SQL,
+#[cfg(test)]
+use crate::avionics::fingerprint::{
+    active_collision_closure_revision_sha256, fingerprint_catalog_product,
+    grounded_collision_closure_revision_sha256, CatalogFingerprintProduct,
+};
+use crate::avionics::fingerprint::{
+    approved_catalog_revision_sha256, catalog_product_fingerprints, catalog_products,
+    fingerprint_active_collision_closure, fingerprint_catalog_products,
+    fingerprint_grounded_collision_closure, load_active_collision_catalog_rows,
+    load_catalog_product_fingerprint_map, ActiveCollisionCatalogFingerprintRow,
+    AvionicsFingerprintError, CatalogFingerprintRow, ACTIVE_COLLISION_CATALOG_ROWS_SQL,
+    APPROVED_CATALOG_ROWS_SQL,
 };
 use crate::avionics::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
@@ -74,18 +84,10 @@ use self::staging::{
 const DEFAULT_PAGE_LIMIT: i64 = 25;
 const MAX_PAGE_LIMIT: i64 = 100;
 const REVIEW_PAYLOAD_VERSION: u32 = 1;
-const APPROVED_CATALOG_FINGERPRINT_DOMAIN: &[u8] = b"aircost:approved-avionics-catalog:v1";
-const APPROVED_CATALOG_PRODUCT_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:approved-avionics-catalog-product:v1";
-const ACTIVE_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:active-avionics-collision-closure:v1";
-const GROUNDED_COLLISION_CLOSURE_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:grounded-avionics-collision-closure:v1";
 const EXTRACTION_FINGERPRINT_DOMAIN: &[u8] = b"aircost:listing-avionics-observation:v1";
 const ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-association-authorization:v1";
-pub(super) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str =
-    "listing_avionics_authorization_v1";
+    b"aircost:listing-avionics-association-authorization";
+pub(crate) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str = "listing_avionics_authorization";
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
@@ -94,7 +96,8 @@ const PRESERVED_ASSOCIATION_REVIEW_REASON: &str =
 const REVIEWER_CORRECTED_AVIONICS_KIND: &str = "avionics_reviewer_correction";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
     LOCK TABLE aircraft_sale_listing_avionics,
-               aircraft_sale_listing_avionics_authorizations,
+               aircraft_sale_listing_avionics_link_authorizations,
+               aircraft_sale_listing_avionics_grounded_capabilities,
                aircraft_sale_listing_avionics_dispositions,
                aircraft_sale_listing_pending_reviews
     IN SHARE ROW EXCLUSIVE MODE
@@ -142,6 +145,15 @@ impl std::error::Error for ReviewError {}
 impl From<sqlx::Error> for ReviewError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error.to_string())
+    }
+}
+
+impl From<AvionicsFingerprintError> for ReviewError {
+    fn from(error: AvionicsFingerprintError) -> Self {
+        match error {
+            AvionicsFingerprintError::Conflict(message) => Self::Conflict(message),
+            AvionicsFingerprintError::Database(message) => Self::Database(message),
+        }
     }
 }
 
@@ -222,6 +234,15 @@ pub struct StableIdentifier {
 pub enum ListingAssociationRole {
     Installed,
     Replacement,
+}
+
+impl ListingAssociationRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Replacement => "replacement",
+        }
+    }
 }
 
 /// Exact existing listing-link component adjudicated by an aspect. The link
@@ -902,40 +923,6 @@ pub struct ResolvedReview {
     pub listing_id: i64,
 }
 
-#[derive(Clone, Debug, FromRow)]
-pub(crate) struct CatalogFingerprintRow {
-    pub(crate) id: i64,
-    pub(crate) manufacturer: String,
-    pub(crate) model: String,
-    pub(crate) capability: String,
-    pub(crate) manufacturer_identifier_kind: Option<String>,
-    pub(crate) manufacturer_identifier: Option<String>,
-    pub(crate) avionics_manufacturer_identity_id: i64,
-    pub(crate) canonical_product_key: String,
-    pub(crate) graph_manufacturer_identifier_kind: String,
-    pub(crate) canonical_identifier_key: String,
-    pub(crate) identity_source_url: Option<String>,
-    pub(crate) identity_source_title: Option<String>,
-    pub(crate) identity_evidence_text: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct CatalogFingerprintProduct {
-    id: i64,
-    manufacturer: String,
-    model: String,
-    capabilities: Vec<String>,
-    manufacturer_identifier_kind: String,
-    manufacturer_identifier: String,
-    avionics_manufacturer_identity_id: i64,
-    canonical_product_key: String,
-    graph_manufacturer_identifier_kind: String,
-    canonical_identifier_key: String,
-    identity_source_url: String,
-    identity_source_title: String,
-    identity_evidence_text: String,
-}
-
 #[derive(Debug, FromRow)]
 struct QueueRow {
     listing_id: i64,
@@ -1069,9 +1056,14 @@ struct AssociationAuthorizationRow {
     product_fingerprint: String,
     current_reuse_product_fingerprint: Option<String>,
     grounded_resolution_sha256: Option<String>,
+    plugin_submission_id: Option<i64>,
+    extracted_listing_sha256: Option<String>,
+    current_extracted_listing_json: Option<String>,
     evidence_capture_is_current: bool,
     policy_version: String,
     collision_closure_sha256: String,
+    source_revocation_count: Option<i64>,
+    current_source_revocation_count: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -1160,34 +1152,6 @@ struct CatalogIdentityRow {
     avionics_manufacturer_identity_id: Option<i64>,
 }
 
-const APPROVED_CATALOG_ROWS_SQL: &str = r#"
-    SELECT
-      model.id,
-      manufacturer.name AS manufacturer,
-      model.name AS model,
-      capability.name AS capability,
-      model.manufacturer_identifier_kind,
-      model.manufacturer_identifier,
-      graph.avionics_manufacturer_identity_id,
-      graph.canonical_product_key,
-      graph.manufacturer_identifier_kind AS graph_manufacturer_identifier_kind,
-      graph.canonical_identifier_key,
-      model.identity_source_url,
-      model.identity_source_title,
-      model.identity_evidence_text
-    FROM avionics_models model
-    JOIN avionics_manufacturers manufacturer
-      ON manufacturer.id = model.avionics_manufacturer_id
-    JOIN avionics_model_types membership
-      ON membership.avionics_model_id = model.id
-    JOIN avionics_types capability
-      ON capability.id = membership.avionics_type_id
-    JOIN avionics_approved_product_graph_identities graph
-      ON graph.avionics_model_id = model.id
-    WHERE model.catalog_status = 'approved'
-    ORDER BY model.id, capability.normalized_name, capability.id
-"#;
-
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1196,305 +1160,6 @@ fn feed_fingerprint(hasher: &mut Sha256, value: &str) {
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
 }
-
-fn catalog_products(rows: Vec<CatalogFingerprintRow>) -> Vec<CatalogFingerprintProduct> {
-    let mut products = BTreeMap::<i64, CatalogFingerprintProduct>::new();
-    for row in rows {
-        let product = products
-            .entry(row.id)
-            .or_insert_with(|| CatalogFingerprintProduct {
-                id: row.id,
-                manufacturer: row.manufacturer,
-                model: row.model,
-                capabilities: Vec::new(),
-                manufacturer_identifier_kind: row.manufacturer_identifier_kind.unwrap_or_default(),
-                manufacturer_identifier: row.manufacturer_identifier.unwrap_or_default(),
-                avionics_manufacturer_identity_id: row.avionics_manufacturer_identity_id,
-                canonical_product_key: row.canonical_product_key,
-                graph_manufacturer_identifier_kind: row.graph_manufacturer_identifier_kind,
-                canonical_identifier_key: row.canonical_identifier_key,
-                identity_source_url: row.identity_source_url.unwrap_or_default(),
-                identity_source_title: row.identity_source_title.unwrap_or_default(),
-                identity_evidence_text: row.identity_evidence_text.unwrap_or_default(),
-            });
-        product.capabilities.push(row.capability);
-    }
-    products.into_values().collect()
-}
-
-fn fingerprint_catalog_products(products: &[CatalogFingerprintProduct]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(APPROVED_CATALOG_FINGERPRINT_DOMAIN);
-    for product in products {
-        for value in [
-            product.id.to_string(),
-            product.manufacturer.clone(),
-            product.model.clone(),
-            product.capabilities.join("\u{1f}"),
-            product.manufacturer_identifier_kind.clone(),
-            product.manufacturer_identifier.clone(),
-            product.avionics_manufacturer_identity_id.to_string(),
-            product.canonical_product_key.clone(),
-            product.graph_manufacturer_identifier_kind.clone(),
-            product.canonical_identifier_key.clone(),
-            product.identity_source_url.clone(),
-            product.identity_source_title.clone(),
-            product.identity_evidence_text.clone(),
-        ] {
-            feed_fingerprint(&mut hasher, &value);
-        }
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn fingerprint_catalog_product(product: &CatalogFingerprintProduct) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(APPROVED_CATALOG_PRODUCT_FINGERPRINT_DOMAIN);
-    for value in [
-        product.id.to_string(),
-        product.manufacturer.clone(),
-        product.model.clone(),
-        product.capabilities.join("\u{1f}"),
-        product.manufacturer_identifier_kind.clone(),
-        product.manufacturer_identifier.clone(),
-        product.avionics_manufacturer_identity_id.to_string(),
-        product.canonical_product_key.clone(),
-        product.graph_manufacturer_identifier_kind.clone(),
-        product.canonical_identifier_key.clone(),
-        product.identity_source_url.clone(),
-        product.identity_source_title.clone(),
-        product.identity_evidence_text.clone(),
-    ] {
-        feed_fingerprint(&mut hasher, &value);
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-fn catalog_product_fingerprints(products: &[CatalogFingerprintProduct]) -> HashMap<i64, String> {
-    products
-        .iter()
-        .map(|product| (product.id, fingerprint_catalog_product(product)))
-        .collect()
-}
-
-pub(crate) fn fingerprint_approved_catalog_rows(rows: Vec<CatalogFingerprintRow>) -> String {
-    fingerprint_catalog_products(&catalog_products(rows))
-}
-
-async fn load_catalog_product_fingerprint_map(db: &AppDb) -> ReviewResult<HashMap<i64, String>> {
-    let sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
-    let rows = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as::<_, CatalogFingerprintRow>(&sql)
-                .fetch_all(pool)
-                .await?
-        }
-        DatabaseBackend::Postgres(pool) => {
-            sqlx::query_as::<_, CatalogFingerprintRow>(&sql)
-                .fetch_all(pool)
-                .await?
-        }
-    };
-    Ok(catalog_product_fingerprints(&catalog_products(rows)))
-}
-
-fn active_collision_closure_rows(
-    rows: &[ActiveCollisionCatalogFingerprintRow],
-    target_id: i64,
-) -> Option<(
-    &ActiveCollisionCatalogFingerprintRow,
-    Vec<&ActiveCollisionCatalogFingerprintRow>,
-)> {
-    let target_rows = rows
-        .iter()
-        .filter(|row| row.id == target_id)
-        .collect::<Vec<_>>();
-    let [target] = target_rows.as_slice() else {
-        return None;
-    };
-    let target_model_key = normalize_avionics_identifier(&target.model);
-    let target_identifier_key = normalize_avionics_identifier(
-        target
-            .manufacturer_identifier
-            .as_deref()
-            .unwrap_or_default(),
-    );
-    if target_model_key.is_empty() || target_identifier_key.is_empty() {
-        return None;
-    }
-    let members = rows
-        .iter()
-        .filter(|row| {
-            let model_key = normalize_avionics_identifier(&row.model);
-            let identifier_key = normalize_avionics_identifier(
-                row.manufacturer_identifier.as_deref().unwrap_or_default(),
-            );
-            let exact_identity_collision = [model_key.as_str(), identifier_key.as_str()]
-                .into_iter()
-                .filter(|key| !key.is_empty())
-                .any(|key| key == target_model_key || key == target_identifier_key);
-            exact_identity_collision
-                || (!model_key.is_empty()
-                    && (model_key.starts_with(&target_model_key)
-                        || target_model_key.starts_with(&model_key)))
-        })
-        .collect();
-    Some((target, members))
-}
-
-pub(super) fn active_collision_closure_member_ids(
-    rows: &[ActiveCollisionCatalogFingerprintRow],
-    target_id: i64,
-) -> Option<Vec<i64>> {
-    let (_, members) = active_collision_closure_rows(rows, target_id)?;
-    Some(members.into_iter().map(|row| row.id).collect())
-}
-
-pub(super) fn fingerprint_active_collision_closure(
-    rows: &[ActiveCollisionCatalogFingerprintRow],
-    current_reuse_eligible_ids: &HashSet<i64>,
-    target_id: i64,
-) -> Option<String> {
-    let (_, members) = active_collision_closure_rows(rows, target_id)?;
-    let mut keys = members
-        .into_iter()
-        .map(|row| {
-            [
-                row.id.to_string(),
-                row.catalog_status.clone(),
-                row.effective_manufacturer_identity_id
-                    .map(|identity_id| identity_id.to_string())
-                    .unwrap_or_default(),
-                normalize_avionics_identifier(&row.model),
-                row.manufacturer_identifier_kind.clone().unwrap_or_default(),
-                normalize_avionics_identifier(
-                    row.manufacturer_identifier.as_deref().unwrap_or_default(),
-                ),
-                current_reuse_eligible_ids.contains(&row.id).to_string(),
-            ]
-        })
-        .collect::<Vec<_>>();
-    keys.sort();
-
-    let mut hasher = Sha256::new();
-    hasher.update(ACTIVE_COLLISION_CLOSURE_FINGERPRINT_DOMAIN);
-    feed_fingerprint(&mut hasher, &target_id.to_string());
-    for key in keys {
-        for value in key {
-            feed_fingerprint(&mut hasher, &value);
-        }
-    }
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-pub(super) fn fingerprint_grounded_collision_closure(
-    rows: &[ActiveCollisionCatalogFingerprintRow],
-    target_id: i64,
-) -> Option<String> {
-    let (_, members) = active_collision_closure_rows(rows, target_id)?;
-    let mut keys = members
-        .into_iter()
-        .map(|row| {
-            [
-                row.id.to_string(),
-                row.catalog_status.clone(),
-                row.effective_manufacturer_identity_id
-                    .map(|identity_id| identity_id.to_string())
-                    .unwrap_or_default(),
-                normalize_avionics_identifier(&row.model),
-                row.manufacturer_identifier_kind.clone().unwrap_or_default(),
-                normalize_avionics_identifier(
-                    row.manufacturer_identifier.as_deref().unwrap_or_default(),
-                ),
-            ]
-        })
-        .collect::<Vec<_>>();
-    keys.sort();
-
-    let mut hasher = Sha256::new();
-    hasher.update(GROUNDED_COLLISION_CLOSURE_FINGERPRINT_DOMAIN);
-    feed_fingerprint(&mut hasher, &target_id.to_string());
-    for key in keys {
-        for value in key {
-            feed_fingerprint(&mut hasher, &value);
-        }
-    }
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-/// Optimistic token for every catalog fact that can change the zero-Gemini
-/// listing-association resolver's identity decision.
-///
-/// This is intentionally separate from the approved catalog revision exposed
-/// in the review payload: unreviewed rows are collision-only state, while
-/// current reuse eligibility determines which approved graph identities can
-/// participate in the local decision.
-pub(crate) async fn active_collision_closure_revision_sha256(
-    db: &AppDb,
-    target_id: i64,
-) -> ReviewResult<String> {
-    let rows = load_active_collision_catalog_rows(db).await?;
-    let current_reuse_eligible_ids = current_reuse_attested_product_ids(db).await?;
-    fingerprint_active_collision_closure(&rows, &current_reuse_eligible_ids, target_id).ok_or_else(
-        || {
-            ReviewError::Conflict(format!(
-                "catalog id {target_id} has no unique active collision-closure identity"
-            ))
-        },
-    )
-}
-
-pub(crate) async fn grounded_collision_closure_revision_sha256(
-    db: &AppDb,
-    target_id: i64,
-) -> ReviewResult<String> {
-    let rows = load_active_collision_catalog_rows(db).await?;
-    fingerprint_grounded_collision_closure(&rows, target_id).ok_or_else(|| {
-        ReviewError::Conflict(format!(
-            "catalog id {target_id} has no unique grounded collision-closure identity"
-        ))
-    })
-}
-
-async fn load_active_collision_catalog_rows(
-    db: &AppDb,
-) -> ReviewResult<Vec<ActiveCollisionCatalogFingerprintRow>> {
-    let sql = db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
-    match db.backend() {
-        DatabaseBackend::Sqlite(pool) => Ok(sqlx::query_as::<
-            _,
-            ActiveCollisionCatalogFingerprintRow,
-        >(&sql)
-        .fetch_all(pool)
-        .await?),
-        DatabaseBackend::Postgres(pool) => Ok(sqlx::query_as::<
-            _,
-            ActiveCollisionCatalogFingerprintRow,
-        >(&sql)
-        .fetch_all(pool)
-        .await?),
-    }
-}
-
-/// Current approved-only catalog revision used by both ingestion and review.
-/// Unreviewed/rejected legacy rows intentionally cannot invalidate a review.
-pub async fn approved_catalog_revision_sha256(db: &AppDb) -> ReviewResult<String> {
-    let sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
-    let rows = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as::<_, CatalogFingerprintRow>(&sql)
-                .fetch_all(pool)
-                .await?
-        }
-        DatabaseBackend::Postgres(pool) => {
-            sqlx::query_as::<_, CatalogFingerprintRow>(&sql)
-                .fetch_all(pool)
-                .await?
-        }
-    };
-    Ok(fingerprint_approved_catalog_rows(rows))
-}
-
 /// Deterministically serializes a complete review bundle. Producers should use
 /// this rather than hand-building JSON so all optimistic-lock hashes agree.
 pub fn serialize_review_payload(
@@ -2183,7 +1848,7 @@ async fn restage_pending_review_if_current_with_commit(
     );
     let insert_reuse_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_authorizations (
+        INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
           listing_link_id,
           association_role,
           avionics_model_id,
@@ -2204,7 +1869,7 @@ async fn restage_pending_review_if_current_with_commit(
     );
     let delete_existing_authorization = db.sql(
         r#"
-        DELETE FROM aircraft_sale_listing_avionics_authorizations
+        DELETE FROM aircraft_sale_listing_avionics_link_authorizations
         WHERE listing_link_id = ?
           AND association_role = ?
         "#,
@@ -4414,6 +4079,9 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
       authorization.product_fingerprint,
       attestation.product_fingerprint AS current_reuse_product_fingerprint,
       authorization.grounded_resolution_sha256,
+      authorization.plugin_submission_id,
+      authorization.extracted_listing_sha256,
+      grounded_submission.extracted_listing_json AS current_extracted_listing_json,
       EXISTS (
         SELECT 1
         FROM plugin_submissions capture
@@ -4423,13 +4091,21 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
           AND instr(capture.rendered_html, link.source_notes) > 0
       ) AS evidence_capture_is_current,
       authorization.policy_version,
-      authorization.collision_closure_sha256
-    FROM aircraft_sale_listing_avionics_authorizations authorization
+      authorization.collision_closure_sha256,
+      authorization.source_revocation_count,
+      (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
+        AS current_source_revocation_count
+    FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
     LEFT JOIN avionics_product_reuse_attestations attestation
       ON authorization.authorization_kind = 'manufacturer_reuse'
      AND attestation.avionics_model_id = authorization.avionics_model_id
+    LEFT JOIN plugin_submissions grounded_submission
+      ON grounded_submission.id = authorization.plugin_submission_id
+     AND grounded_submission.canonical_listing_id = link.aircraft_sale_listing_id
+     AND grounded_submission.rendered_html_sha256 = authorization.evidence_capture_sha256
+     AND grounded_submission.extraction_error IS NULL
     WHERE link.aircraft_sale_listing_id = ?
     ORDER BY authorization.listing_link_id, authorization.association_role
 "#;
@@ -4444,6 +4120,9 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
       authorization.product_fingerprint,
       attestation.product_fingerprint AS current_reuse_product_fingerprint,
       authorization.grounded_resolution_sha256,
+      authorization.plugin_submission_id,
+      authorization.extracted_listing_sha256,
+      grounded_submission.extracted_listing_json AS current_extracted_listing_json,
       EXISTS (
         SELECT 1
         FROM plugin_submissions capture
@@ -4453,13 +4132,21 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
           AND position(link.source_notes IN capture.rendered_html) > 0
       ) AS evidence_capture_is_current,
       authorization.policy_version,
-      authorization.collision_closure_sha256
-    FROM aircraft_sale_listing_avionics_authorizations authorization
+      authorization.collision_closure_sha256,
+      authorization.source_revocation_count,
+      (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
+        AS current_source_revocation_count
+    FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
     LEFT JOIN avionics_product_reuse_attestations attestation
       ON authorization.authorization_kind = 'manufacturer_reuse'
      AND attestation.avionics_model_id = authorization.avionics_model_id
+    LEFT JOIN plugin_submissions grounded_submission
+      ON grounded_submission.id = authorization.plugin_submission_id
+     AND grounded_submission.canonical_listing_id = link.aircraft_sale_listing_id
+     AND grounded_submission.rendered_html_sha256 = authorization.evidence_capture_sha256
+     AND grounded_submission.extraction_error IS NULL
     WHERE link.aircraft_sale_listing_id = ?
     ORDER BY authorization.listing_link_id, authorization.association_role
 "#;
@@ -5474,7 +5161,7 @@ fn association_observation_sha256(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn association_observation_sha256_from_values(
+pub(crate) fn association_observation_sha256_from_values(
     listing_id: i64,
     listing_link_id: i64,
     role: ListingAssociationRole,
@@ -5575,6 +5262,9 @@ fn current_row_backed_authorized_associations(
         let current_collision_closure_sha256 = match row.authorization_kind.as_str() {
             "manufacturer_reuse"
                 if row.grounded_resolution_sha256.is_none()
+                    && row.plugin_submission_id.is_none()
+                    && row.extracted_listing_sha256.is_none()
+                    && row.source_revocation_count.is_none()
                     && row.current_reuse_product_fingerprint.as_deref()
                         == Some(row.product_fingerprint.as_str())
                     && reuse_attested_ids.contains(&row.avionics_model_id) =>
@@ -5590,6 +5280,18 @@ fn current_row_backed_authorized_associations(
                     .grounded_resolution_sha256
                     .as_deref()
                     .is_some_and(valid_sha256)
+                    && row.plugin_submission_id.is_some()
+                    && row.source_revocation_count == Some(row.current_source_revocation_count)
+                    && row
+                        .extracted_listing_sha256
+                        .as_deref()
+                        .is_some_and(valid_sha256)
+                    && row.current_extracted_listing_json.as_deref().is_some_and(
+                        |checkpoint| {
+                            row.extracted_listing_sha256.as_deref()
+                                == Some(sha256_hex(checkpoint.as_bytes()).as_str())
+                        },
+                    )
                     && catalog_product_fingerprints.get(&row.avionics_model_id)
                         == Some(&row.product_fingerprint) =>
             {
@@ -10096,6 +9798,9 @@ mod tests {
             product_fingerprint: product_fingerprint.to_string(),
             current_reuse_product_fingerprint: None,
             grounded_resolution_sha256: Some("a".repeat(64)),
+            plugin_submission_id: Some(1),
+            extracted_listing_sha256: Some(sha256_hex(b"{}")),
+            current_extracted_listing_json: Some("{}".to_string()),
             evidence_capture_is_current: true,
             policy_version: ASSOCIATION_AUTHORIZATION_POLICY_VERSION.to_string(),
             collision_closure_sha256: fingerprint_grounded_collision_closure(
@@ -10103,6 +9808,8 @@ mod tests {
                 avionics_model_id,
             )
             .expect("test target must have a collision closure"),
+            source_revocation_count: Some(0),
+            current_source_revocation_count: 0,
         }
     }
 
@@ -10205,14 +9912,26 @@ mod tests {
     #[test]
     fn postgres_listing_child_lock_order_matches_finalization_contract() {
         let avionics = POSTGRES_LISTING_CHILD_LOCK_SQL
-            .find("aircraft_sale_listing_avionics")
+            .find("aircraft_sale_listing_avionics,")
             .expect("child lock must include listing avionics");
+        let authorizations = POSTGRES_LISTING_CHILD_LOCK_SQL
+            .find("aircraft_sale_listing_avionics_link_authorizations")
+            .expect("child lock must include listing avionics authorizations");
+        let grounded_capabilities = POSTGRES_LISTING_CHILD_LOCK_SQL
+            .find("aircraft_sale_listing_avionics_grounded_capabilities")
+            .expect("child lock must include pending grounded capabilities");
+        let dispositions = POSTGRES_LISTING_CHILD_LOCK_SQL
+            .find("aircraft_sale_listing_avionics_dispositions")
+            .expect("child lock must include occurrence dispositions");
         let pending_review = POSTGRES_LISTING_CHILD_LOCK_SQL
             .find("aircraft_sale_listing_pending_reviews")
             .expect("child lock must include pending reviews");
         assert!(
-            avionics < pending_review,
-            "all PostgreSQL listing writers must lock avionics before pending reviews"
+            avionics < authorizations
+                && authorizations < grounded_capabilities
+                && grounded_capabilities < dispositions
+                && dispositions < pending_review,
+            "all PostgreSQL listing writers must use one exact child-table lock order"
         );
     }
 
@@ -10975,7 +10694,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_same_case_capture_product_or_collision_proof_is_not_authorized() {
+    fn stale_same_case_scope_capture_product_or_collision_proof_is_not_authorized() {
         let listing_id = 1;
         let assignment = existing_assignment(7, 11, 1, "installed", None);
         let collision_rows = vec![collision_catalog_row(11)];
@@ -10993,9 +10712,24 @@ mod tests {
         stale_capture.evidence_capture_is_current = false;
         let mut stale_product = current.clone();
         stale_product.product_fingerprint = "c".repeat(64);
-        let mut stale_collision = current;
+        let mut stale_collision = current.clone();
         stale_collision.collision_closure_sha256 = "d".repeat(64);
-        for stale in [stale_capture, stale_product, stale_collision] {
+        let mut missing_submission = current.clone();
+        missing_submission.plugin_submission_id = None;
+        let mut changed_checkpoint = current.clone();
+        changed_checkpoint.current_extracted_listing_json = Some("{\"changed\":true}".to_string());
+        let mut failed_checkpoint = current;
+        // The exact-submission LEFT JOIN yields NULL after extraction_error
+        // becomes non-NULL, even when the retained JSON itself is unchanged.
+        failed_checkpoint.current_extracted_listing_json = None;
+        for stale in [
+            stale_capture,
+            stale_product,
+            stale_collision,
+            missing_submission,
+            changed_checkpoint,
+            failed_checkpoint,
+        ] {
             assert!(current_authorized_associations(
                 listing_id,
                 std::slice::from_ref(&assignment),
@@ -11739,8 +11473,9 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
-            ) VALUES (?, ?, ?, ?, ?, 'test-signature', ?)
+              rendered_html_sha256, signature_base64,
+              extracted_listing_json, canonical_listing_id
+            ) VALUES (?, ?, ?, ?, ?, 'test-signature', '{}', ?)
             RETURNING id
             "#,
         )
@@ -12004,12 +11739,17 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             grounded_collision_closure_revision_sha256(db, avionics_model_id)
                 .await
                 .unwrap();
-        let evidence_capture_sha256: String =
-            sqlx::query_scalar("SELECT rendered_html_sha256 FROM plugin_submissions WHERE id = ?")
-                .bind(plugin_submission_id)
-                .fetch_one(sqlite_pool(db))
-                .await
-                .unwrap();
+        let (evidence_capture_sha256, extracted_listing_json): (String, String) = sqlx::query_as(
+            "SELECT rendered_html_sha256, extracted_listing_json \
+                 FROM plugin_submissions \
+                 WHERE id = ? AND extracted_listing_json IS NOT NULL \
+                   AND extraction_error IS NULL",
+        )
+        .bind(plugin_submission_id)
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap();
+        let extracted_listing_sha256 = sha256_hex(extracted_listing_json.as_bytes());
         let observation_sha256 = association_observation_sha256(
             listing_id,
             &assignment,
@@ -12018,12 +11758,13 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         );
         sqlx::query(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?)
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, source_revocation_count, policy_version
+            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0, ?)
             "#,
         )
         .bind(listing_link_id)
@@ -12033,6 +11774,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .bind(product_fingerprint)
         .bind("e".repeat(64))
         .bind(evidence_capture_sha256)
+        .bind(plugin_submission_id)
+        .bind(extracted_listing_sha256)
         .bind(collision_closure_sha256)
         .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
         .execute(sqlite_pool(db))
@@ -12130,12 +11873,28 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     async fn whole_listing_resolution_preserves_current_same_case_link_without_global_reuse() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
-        let product_id = insert_approved_product(&db, "WX-500", "WX500", "Weather Radar").await;
+        let product_id =
+            insert_approved_product(&db, "WX-500", "WX500", "Lightning Detection").await;
         let submission_id = insert_review_bound_submission(
             &db,
             user_id,
             listing_id,
-            "<main>Installed L3 WX-500 stormscope</main>",
+            "<main>Installed Garmin WX-500 stormscope</main>",
+        )
+        .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "WX-500",
+                "types": ["Lightning Detection"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Installed Garmin WX-500 stormscope",
+                "source_confidence": "high"
+            }]),
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
@@ -12143,7 +11902,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             INSERT INTO aircraft_sale_listing_avionics (
               aircraft_sale_listing_id, avionics_model_id, quantity, source,
               source_notes, source_confidence, configuration_action
-            ) VALUES (?, ?, 1, 'listing', 'L3 WX-500', 'high', 'installed')
+            ) VALUES (?, ?, 1, 'listing', 'Installed Garmin WX-500 stormscope', 'high', 'installed')
             RETURNING id
             "#,
         )
@@ -12210,6 +11969,69 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
     }
 
     #[tokio::test]
+    async fn failed_exact_submission_checkpoint_invalidates_same_case_authorization() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "WX-500", "WX500", "Weather Radar").await;
+        let evidence = "L3 WX-500 stormscope";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            &format!("<main>{evidence}</main>"),
+        )
+        .await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(evidence)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        insert_current_same_case_authorization(
+            &db,
+            listing_id,
+            link_id,
+            product_id,
+            submission_id,
+            ListingAssociationRole::Installed,
+        )
+        .await;
+
+        sqlx::query(
+            "UPDATE plugin_submissions \
+             SET extraction_error = 'checkpoint rejected' \
+             WHERE id = ?",
+        )
+        .bind(submission_id)
+        .execute(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM aircraft_sale_listing_avionics_link_authorizations \
+             WHERE listing_link_id = ? AND association_role = 'installed'",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, 0,
+            "a failed exact checkpoint must immediately revoke its same-case proof"
+        );
+    }
+
+    #[tokio::test]
     async fn whole_listing_resolution_preserves_current_same_case_replacement_role() {
         let db = test_db().await;
         let (user_id, listing_id) = insert_listing(&db).await;
@@ -12221,6 +12043,25 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             user_id,
             listing_id,
             &format!("<main>{evidence}</main>"),
+        )
+        .await;
+        store_current_avionics_extraction(
+            &db,
+            submission_id,
+            serde_json::json!([{
+                "manufacturer": "Garmin",
+                "model": "GTN 750Xi",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "replaces",
+                "replaces": {
+                    "manufacturer": "Garmin",
+                    "model": "GNS 430W",
+                    "types": ["GPS"]
+                },
+                "source_evidence_text": evidence,
+                "source_confidence": "high"
+            }]),
         )
         .await;
         let link_id: i64 = sqlx::query_scalar(
@@ -13595,7 +13436,9 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(
             POSTGRES_LISTING_CHILD_LOCK_SQL.contains("aircraft_sale_listing_avionics")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
-                    .contains("aircraft_sale_listing_avionics_authorizations")
+                    .contains("aircraft_sale_listing_avionics_link_authorizations")
+                && POSTGRES_LISTING_CHILD_LOCK_SQL
+                    .contains("aircraft_sale_listing_avionics_grounded_capabilities")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
                     .contains("aircraft_sale_listing_pending_reviews")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL.contains("IN SHARE ROW EXCLUSIVE MODE")
@@ -13612,12 +13455,15 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .find("aircraft_sale_listing_avionics,")
             .expect("listing links must be locked first");
         let corroborations = children
-            .find("aircraft_sale_listing_avionics_authorizations")
+            .find("aircraft_sale_listing_avionics_link_authorizations")
             .expect("association corroborations must be locked");
+        let capabilities = children
+            .find("aircraft_sale_listing_avionics_grounded_capabilities")
+            .expect("pending grounded capabilities must be locked");
         let pending = children
             .find("aircraft_sale_listing_pending_reviews")
             .expect("pending review must be locked");
-        assert!(links < corroborations && corroborations < pending);
+        assert!(links < corroborations && corroborations < capabilities && capabilities < pending);
     }
 
     #[tokio::test]
@@ -14736,7 +14582,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .unwrap();
         assert_eq!(pending_count, 0);
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -14842,7 +14688,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(error.to_string().contains("changed"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -14950,7 +14796,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .contains("active avionics collision catalog"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -15433,7 +15279,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(error.to_string().contains("source capture changed"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))

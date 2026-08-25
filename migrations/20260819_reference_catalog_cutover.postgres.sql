@@ -21,7 +21,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
+          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -33,7 +33,7 @@ BEGIN
     WHERE migration_name = '20260819_reference_catalog_cutover'
       AND contract_version = 1
       AND contract_fingerprint =
-        'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
+        '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
   ) INTO exact_marker;
 
   IF exact_marker THEN
@@ -42,7 +42,6 @@ BEGIN
         ('aircraft_serial_natural_sort_key'),
         ('validate_aircraft_serial_scheme_ordering'),
         ('prevent_referenced_avionics_catalog_downgrade'),
-        ('invalidate_listing_avionics_authorization_for_capture'),
         ('validate_aircraft_valuation_compatibility_projection'),
         ('require_aircraft_catalog_approval'),
         ('validate_aircraft_reference_version_insert'),
@@ -191,9 +190,9 @@ BEGIN
     INTO actual_object_count, actual_definition_digest
     FROM objects;
 
-    IF actual_object_count <> 152
+    IF actual_object_count <> 149
        OR actual_definition_digest <>
-            'd609ec15a4522b9ab15ae7d145e76c67' THEN
+            '49a1d92edd48b2f8b8e8b8a336dd2fa9' THEN
       RAISE EXCEPTION
         'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -217,7 +216,6 @@ active_routines(name) AS (
     ('aircraft_serial_natural_sort_key'),
     ('validate_aircraft_serial_scheme_ordering'),
     ('prevent_referenced_avionics_catalog_downgrade'),
-    ('invalidate_listing_avionics_authorization_for_capture'),
     ('validate_aircraft_valuation_compatibility_projection'),
     ('require_aircraft_catalog_approval'),
     ('validate_aircraft_reference_version_insert'),
@@ -448,8 +446,8 @@ BEGIN
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
   IF exact_marker AND (
-    actual_object_count <> 793
-    OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68'
+    actual_object_count <> 792
+    OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a'
   ) THEN
     RAISE EXCEPTION
       'reference catalog cutover marker-present owned-object mismatch (% objects, digest %)',
@@ -457,8 +455,8 @@ BEGIN
   END IF;
 
   IF NOT exact_marker AND (
-    actual_object_count <> 925
-    OR actual_definition_digest <> '379464a027df1c61f99c754b28ff4738'
+    actual_object_count <> 924
+    OR actual_definition_digest <> 'f4aad204c04ccc9cfb23743ae1c23edd'
   ) THEN
     RAISE EXCEPTION
       'reference catalog cutover marker-absent pre-state mismatch (% objects, digest %)',
@@ -811,34 +809,6 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
-$function$;
-
-CREATE OR REPLACE FUNCTION
-  public.invalidate_listing_avionics_authorization_for_capture()
-RETURNS TRIGGER LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $function$
-BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations authorization_row
-  USING public.aircraft_sale_listing_avionics link
-  WHERE link.id = authorization_row.listing_link_id
-    AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
-    AND link.aircraft_sale_listing_id = OLD.canonical_listing_id
-    AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
-    AND position(link.source_notes IN OLD.rendered_html) > 0
-    AND NOT EXISTS (
-      SELECT 1 FROM public.plugin_submissions retained_capture
-      WHERE retained_capture.canonical_listing_id =
-              link.aircraft_sale_listing_id
-        AND retained_capture.rendered_html_sha256 =
-              authorization_row.evidence_capture_sha256
-        AND position(link.source_notes IN retained_capture.rendered_html) > 0
-    );
-  IF TG_OP = 'DELETE' THEN
-    RETURN OLD;
-  END IF;
-  RETURN NEW;
-END
 $function$;
 
 CREATE OR REPLACE FUNCTION public.validate_aircraft_valuation_compatibility_projection()
@@ -1466,8 +1436,8 @@ BEGIN
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_cutover_owned_objects();
 
-  IF actual_object_count <> 793
-     OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+  IF actual_object_count <> 792
+     OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
     RAISE EXCEPTION
       'reference catalog cutover post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -1512,7 +1482,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5', CURRENT_TIMESTAMP
+  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

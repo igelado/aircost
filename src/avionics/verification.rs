@@ -12,9 +12,13 @@ use crate::avionics::catalog::{
     resolve_verified_local_avionics_identity, unique_exact_avionics_review_candidate,
     ApprovedAvionicsIdentity, AvionicsExistingCatalogScope, AvionicsIdentityOutcome,
     AvionicsIdentityRequest, AvionicsIdentityVerificationPlan, AvionicsIdentityVerificationRoute,
-    GroundedAvionicsResolutionReceipt, VerifiedLocalReuseProof,
+    VerifiedLocalReuseProof,
 };
 use crate::avionics::consolidation::PendingReviewRevisionReceipt;
+use crate::avionics::fingerprint::{
+    active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
+    AvionicsFingerprintError,
+};
 use crate::avionics::reuse::product_reuse_attestation_is_current;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
@@ -43,11 +47,10 @@ use crate::listing::review::automation::{
     AutomatedReviewApplyRequest,
 };
 use crate::listing::review::{
-    active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
-    evaluate_existing_product_associations, grounded_collision_closure_revision_sha256,
-    parse_current_pending_review_aspects, ExistingProductAssociationCommit,
-    ExistingProductAssociationEvaluation, ListingAssociationRole, PendingReviewAspect,
-    ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL,
+    evaluate_existing_product_associations, parse_current_pending_review_aspects,
+    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingAssociationRole,
+    PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
+    POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
 use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
@@ -1650,9 +1653,7 @@ async fn process_listing(
                         )),
                     }
                 }
-                if let Err(error) =
-                    validate_prepared_link_commit_readiness(row.listing_id, &prepared)
-                {
+                if let Err(error) = validate_prepared_link_commit_readiness(&prepared) {
                     blocking_reasons.push(format!(
                         "prepared listing avionics cannot commit before paid identity work: {error}"
                     ));
@@ -2324,7 +2325,7 @@ async fn process_listing(
             blocking_reasons.push(format!("listing avionics action graph is invalid: {error}"));
         }
         if apply {
-            if let Err(error) = validate_prepared_link_commit_readiness(row.listing_id, &prepared) {
+            if let Err(error) = validate_prepared_link_commit_readiness(&prepared) {
                 blocking_reasons.push(format!("prepared listing avionics cannot commit: {error}"));
             }
         }
@@ -2345,7 +2346,7 @@ async fn process_listing(
 
     let accepted_links = match prepared
         .iter()
-        .map(|link| automated_link_from_prepared(row.listing_id, link))
+        .map(automated_link_from_prepared)
         .collect::<VerificationResult<Vec<_>>>()
     {
         Ok(links) => links,
@@ -3081,6 +3082,13 @@ fn verified_local_reuse_authorization(
     }
 }
 
+fn current_manufacturer_reuse_authorization(
+    approved: &ApprovedAvionicsIdentity,
+    reuse_is_current: bool,
+) -> Option<AutomatedAssociationAuthorization> {
+    reuse_is_current.then(|| verified_local_reuse_authorization(approved))
+}
+
 /// Resolve one preflight-local identity without any provider or catalog write.
 ///
 /// `None` means the exact local reuse proof changed after route planning. The
@@ -3179,16 +3187,8 @@ async fn resolve_identity_attempt(
         &identity,
         source_evidence_text,
     );
-    let mut grounded_receipt: Option<GroundedAvionicsResolutionReceipt> = None;
     let outcome = if apply {
-        match resolve_avionics_identity_for_automated_review(
-            db,
-            extractor,
-            row.listing_id,
-            &request,
-        )
-        .await
-        {
+        match resolve_avionics_identity_for_automated_review(db, extractor, &request).await {
             Ok(resolution) => {
                 if let Err(error) =
                     review_revision.advance(&resolution.pending_review_revision_receipts)
@@ -3215,7 +3215,6 @@ async fn resolve_identity_attempt(
                         suggested_product: None,
                     };
                 }
-                grounded_receipt = resolution.grounded_receipt;
                 Ok(resolution.outcome)
             }
             Err(error) => Err(error),
@@ -3226,7 +3225,6 @@ async fn resolve_identity_attempt(
     match outcome {
         Ok(AvionicsIdentityOutcome::Approved(approved)) => {
             let suggested_product = Some(review_product_from_approved(&approved));
-            let reuse_authorization = verified_local_reuse_authorization(&approved);
             let mut authorization = None;
             if apply && approved.id > 0 {
                 let reuse_is_current = match product_reuse_attestation_is_current(db, approved.id)
@@ -3259,19 +3257,10 @@ async fn resolve_identity_attempt(
                             };
                     }
                 };
-                if reuse_is_current {
-                    authorization = Some(reuse_authorization);
-                } else if let Some(receipt) = grounded_receipt.take().filter(|receipt| {
-                    receipt.listing_id() == row.listing_id
-                        && receipt.avionics_model_id() == approved.id
-                        && receipt.resolution_sha256().len() == 64
-                        && receipt
-                            .resolution_sha256()
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                }) {
-                    authorization =
-                        Some(AutomatedAssociationAuthorization::SameCaseGrounded(receipt));
+                if let Some(current_authorization) =
+                    current_manufacturer_reuse_authorization(&approved, reuse_is_current)
+                {
+                    authorization = Some(current_authorization);
                 } else {
                     if approved.id > 0 {
                         catalog_statuses.insert(approved.id, "approved".to_string());
@@ -3289,7 +3278,7 @@ async fn resolve_identity_attempt(
                             Some(approved.manufacturer),
                             Some(approved.model),
                             approved.avionics_types,
-                            "the product identity is approved, but this resolution produced neither manufacturer reuse nor a same-case grounded association authorization"
+                            "the product identity is approved, but it has no current manufacturer-primary reuse attestation"
                                 .to_string(),
                         ),
                         approved_id: None,
@@ -3356,10 +3345,7 @@ async fn resolve_identity_attempt(
                             AutomatedAssociationAuthorization::ManufacturerReuse
                             | AutomatedAssociationAuthorization::GlobalExactModelReuse,
                         ) => active_collision_closure_revision_sha256(db, model_id).await,
-                        Some(AutomatedAssociationAuthorization::SameCaseGrounded(_)) => {
-                            grounded_collision_closure_revision_sha256(db, model_id).await
-                        }
-                        None => Err(crate::listing::review::ReviewError::Conflict(format!(
+                        None => Err(AvionicsFingerprintError::Conflict(format!(
                             "catalog id {model_id} has no automatic association authorization"
                         ))),
                     };
@@ -4650,10 +4636,7 @@ async fn load_catalog_statuses(db: &AppDb) -> VerificationResult<HashMap<i64, St
         .collect())
 }
 
-fn automated_link_from_prepared(
-    listing_id: i64,
-    link: &PreparedLink,
-) -> VerificationResult<AutomatedAvionicsLink> {
+fn automated_link_from_prepared(link: &PreparedLink) -> VerificationResult<AutomatedAvionicsLink> {
     let authorization = link.authorization.clone().ok_or_else(|| {
         AvionicsVerificationError::Validation(format!(
             "catalog id {} is not commit-ready: automatic association authorization is missing",
@@ -4704,17 +4687,14 @@ fn automated_link_from_prepared(
             .clone(),
         preserved_association_guard: link.preserved_association_guard.clone(),
     };
-    validate_automated_avionics_link(listing_id, &accepted)
+    validate_automated_avionics_link(&accepted)
         .map_err(|error| AvionicsVerificationError::Validation(error.to_string()))?;
     Ok(accepted)
 }
 
-fn validate_prepared_link_commit_readiness(
-    listing_id: i64,
-    links: &[PreparedLink],
-) -> VerificationResult<()> {
+fn validate_prepared_link_commit_readiness(links: &[PreparedLink]) -> VerificationResult<()> {
     for link in links {
-        automated_link_from_prepared(listing_id, link)?;
+        automated_link_from_prepared(link)?;
     }
     Ok(())
 }
@@ -5666,6 +5646,33 @@ mod tests {
     }
 
     #[test]
+    fn grounded_approval_requires_current_reuse_before_automatic_association() {
+        let approved = ApprovedAvionicsIdentity {
+            id: 42,
+            manufacturer: "Garmin".to_string(),
+            model: "GNX 375".to_string(),
+            avionics_types: vec!["GPS".to_string(), "Transponder".to_string()],
+            manufacturer_identifier_kind: "manufacturer_model_number".to_string(),
+            manufacturer_identifier: "GNX-375".to_string(),
+            evidence_url: "https://www.garmin.com/gnx375".to_string(),
+            evidence_title: "GNX 375".to_string(),
+            evidence: "Grounded manufacturer evidence identifies the product.".to_string(),
+            reason: "freshly curated exact product".to_string(),
+            grounded_claim_source_urls: vec!["https://www.garmin.com/gnx375".to_string()],
+            verified_local_reuse_proof: None,
+        };
+
+        assert_eq!(
+            current_manufacturer_reuse_authorization(&approved, false),
+            None
+        );
+        assert_eq!(
+            current_manufacturer_reuse_authorization(&approved, true),
+            Some(AutomatedAssociationAuthorization::ManufacturerReuse)
+        );
+    }
+
+    #[test]
     fn dry_run_promotion_uses_an_ephemeral_identity_until_apply_persists_the_graph() {
         assert!(!requires_persisted_graph_identity(
             false,
@@ -6279,7 +6286,7 @@ mod tests {
                 assert_eq!(report.grounded_initial_identity_components, 0);
                 assert_eq!(report.grounded_conditional_relationship_components, 0);
                 assert!(report.note.contains(&format!(
-                    "preserved avionics catalog id {blocker_id} has neither current manufacturer-reuse nor same-case grounded authorization"
+                    "preserved avionics catalog id {blocker_id} has neither current manufacturer-reuse nor exact same-case authorization"
                 )));
             }
         }
@@ -7938,7 +7945,7 @@ mod tests {
         .await
         .unwrap();
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)
@@ -8474,7 +8481,7 @@ mod tests {
         assert_eq!(report.prepared_link_count, 0);
         assert_eq!(report.accepted, 0);
         assert!(report.error.as_deref().is_some_and(|error| error.contains(
-            &format!("preserved avionics catalog id {product_id} has neither current manufacturer-reuse nor same-case grounded authorization")
+            &format!("preserved avionics catalog id {product_id} has neither current manufacturer-reuse nor exact same-case authorization")
         )));
 
         let catalog_after: Vec<(i64, String)> =
@@ -8942,7 +8949,7 @@ mod tests {
         )
         .unwrap();
         let proof_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)
@@ -9147,7 +9154,7 @@ mod tests {
         .await
         .unwrap();
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)

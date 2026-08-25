@@ -231,6 +231,26 @@ write. Pending-review observations are selected only when the attached raw
 checkpoint also passes this complete contract; otherwise the workflow retains
 the review and re-extracts the bound source before it can apply.
 
+A newly grounded positive resolution in signed listing create or bound
+materialization replay also creates a one-use, capture-bound capability for its
+exact occurrence. A retry after a later association-write failure loads the
+capability, recomputes its request, approved-product, and collision hashes from
+current data, and makes no provider request for that unchanged same-case
+occurrence. The capability is not a manufacturer-reuse attestation. Coalescing
+requires a complete set of occurrence capabilities whose quantities and
+actions exactly cover the proposed association; one quantity-one result cannot
+authorize a quantity-two link. Final link insertion, `same_case_grounded` authorization,
+and capability deletion share one transaction, so a failed apply leaves the
+capability available and a successful apply cannot replay it.
+
+This durable capability currently covers the signed listing create and bound
+materialization-replay path only. Automatic-review receipts still remain
+in-memory until their apply transaction, and globally reusable matches,
+rejections, and other paid occurrence decisions are not a durable whole-graph
+retry cache. Extending the same boundary to the verifier and staging a complete
+capture-bound materialization/action plan are separate required changes; this
+path does not claim a zero-provider-call retry for those cases.
+
 Successful re-extraction always produces one complete current listing
 checkpoint. If the retained checkpoint is a structurally current
 `ParsedListing`, its non-avionics values are preserved and only avionics are

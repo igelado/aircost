@@ -25,12 +25,13 @@ strict_migrations=(
   20260808_avionics_descriptive_consolidation
   20260809_listing_verification_runs
   20260810_avionics_grounded_exact_model_consolidation
-  20260818_listing_avionics_association_authorizations
-  20260818_listing_avionics_authorization_hash_domain_reset
   20260819_aircraft_listing_identity_corrections
   20260821_aircraft_visual_source_corrections
   20260821_avionics_approved_concrete_model
   20260824_avionics_generic_feature_labels
+)
+object_attested_migrations=(
+  20260825_listing_avionics_grounded_capabilities
 )
 transition_migrations=(
   20260802_default_avionics_candidate_quarantine
@@ -38,6 +39,7 @@ transition_migrations=(
 )
 all_migrations=(
   "${strict_migrations[@]}"
+  "${object_attested_migrations[@]}"
   "${transition_migrations[@]}"
 )
 specialized_postgres_migrations=(
@@ -275,8 +277,8 @@ mapfile -t receipt_postgres_migrations < <(
     "$repository_root"/migrations/*.postgres.sql |
     sed -E 's|.*/([^/]+)[.]postgres[.]sql|\1|' | sort
 )
-test "${#receipt_postgres_migrations[@]}" = 27
-test "${#all_postgres_migrations[@]}" = 27
+test "${#receipt_postgres_migrations[@]}" = 26
+test "${#all_postgres_migrations[@]}" = 26
 diff -u \
   <(printf '%s\n' "${all_postgres_migrations[@]}" | sort) \
   <(printf '%s\n' "${receipt_postgres_migrations[@]}")
@@ -286,9 +288,11 @@ for migration in "${all_postgres_migrations[@]}"; do
   assert_postgres_parent_only_ledger_references "$file"
 done
 
-# Strict receipts are literal conflict no-ops. Only the two explicit v1-to-v2
-# migrations may assign installed_at.
-for migration in "${strict_migrations[@]}"; do
+# Strict receipts are literal conflict no-ops. Object-attested migrations share
+# that receipt contract, but their guards require the complete canonical domain
+# shape and are exercised by their dedicated backend tests. Only the two
+# explicit v1-to-v2 migrations may assign installed_at.
+for migration in "${strict_migrations[@]}" "${object_attested_migrations[@]}"; do
   for backend in sqlite postgres; do
     file="$repository_root/migrations/$migration.$backend.sql"
     marker_insert="$(extract_marker_insert "$file")"

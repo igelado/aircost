@@ -34,7 +34,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
+          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -49,7 +49,6 @@ active_routines(name) AS (
     ('aircraft_serial_natural_sort_key'),
     ('validate_aircraft_serial_scheme_ordering'),
     ('prevent_referenced_avionics_catalog_downgrade'),
-    ('invalidate_listing_avionics_authorization_for_capture'),
     ('validate_aircraft_valuation_compatibility_projection'),
     ('require_aircraft_catalog_approval'),
     ('validate_aircraft_reference_version_insert'),
@@ -277,8 +276,8 @@ BEGIN
     ))
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
-    IF actual_object_count <> 793
-       OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+    IF actual_object_count <> 792
+       OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -3798,16 +3797,128 @@ CREATE UNIQUE INDEX IF NOT EXISTS
   )
   WHERE configuration_action IN ('replaces', 'removes');
 
+-- One-use capability proving that one exact grounded identity resolution may
+-- authorize one component of one capture-bound listing. It is consumed only
+-- when the final listing link and same-case authorization commit atomically.
+CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities (
+    listing_id BIGINT NOT NULL
+      REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE,
+    plugin_submission_id BIGINT NOT NULL
+      REFERENCES plugin_submissions(id) ON DELETE CASCADE,
+    occurrence_index BIGINT NOT NULL CHECK (occurrence_index >= 0),
+    occurrence_role TEXT NOT NULL
+      CHECK (occurrence_role IN ('primary', 'replacement')),
+    avionics_model_id BIGINT NOT NULL
+      REFERENCES avionics_models(id) ON DELETE CASCADE,
+    requested_quantity BIGINT NOT NULL CHECK (requested_quantity > 0),
+    configuration_action TEXT NOT NULL
+      CHECK (configuration_action IN ('installed', 'replaces', 'removes')),
+    request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+    capability_sha256 TEXT NOT NULL
+      CHECK (capability_sha256 ~ '^[0-9a-f]{64}$'),
+    grounded_resolution_sha256 TEXT NOT NULL
+      CHECK (grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'),
+    evidence_capture_sha256 TEXT NOT NULL
+      CHECK (evidence_capture_sha256 ~ '^[0-9a-f]{64}$'),
+    extracted_listing_sha256 TEXT NOT NULL
+      CHECK (extracted_listing_sha256 ~ '^[0-9a-f]{64}$'),
+    product_fingerprint TEXT NOT NULL
+      CHECK (product_fingerprint ~ '^[0-9a-f]{64}$'),
+    collision_closure_sha256 TEXT NOT NULL
+      CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
+    source_revocation_count BIGINT NOT NULL
+      CHECK (source_revocation_count >= 0),
+    policy_version TEXT NOT NULL
+      CHECK (policy_version = 'listing_avionics_grounded_capability'),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (
+      listing_id, plugin_submission_id, occurrence_index, occurrence_role
+    ),
+    CHECK (occurrence_role = 'primary' OR requested_quantity = 1),
+    CHECK (
+      occurrence_role = 'primary'
+      OR configuration_action IN ('replaces', 'removes')
+    )
+  );
+
+CREATE INDEX IF NOT EXISTS
+  idx_listing_avionics_grounded_capabilities_model
+ON aircraft_sale_listing_avionics_grounded_capabilities (avionics_model_id);
+
+CREATE INDEX IF NOT EXISTS
+  idx_listing_avionics_grounded_capabilities_submission
+ON aircraft_sale_listing_avionics_grounded_capabilities (plugin_submission_id);
+
+CREATE OR REPLACE FUNCTION public.validate_listing_avionics_grounded_capability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.plugin_submissions submission
+    WHERE submission.id = NEW.plugin_submission_id
+      AND submission.canonical_listing_id = NEW.listing_id
+      AND submission.rendered_html_sha256 = NEW.evidence_capture_sha256
+      AND submission.extracted_listing_json IS NOT NULL
+      AND submission.extraction_error IS NULL
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM public.avionics_approved_product_graph_identities approved
+    WHERE approved.avionics_model_id = NEW.avionics_model_id
+  ) OR NEW.source_revocation_count <> (
+    SELECT COUNT(*)
+    FROM public.avionics_authoritative_source_origin_revocations
+  ) THEN
+    RAISE EXCEPTION 'grounded avionics capability requires its exact current capture-bound listing, approved product, and source-revocation epoch';
+  END IF;
+  RETURN NEW;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS listing_avionics_grounded_capabilities_validate_insert
+  ON aircraft_sale_listing_avionics_grounded_capabilities;
+CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert
+BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities
+FOR EACH ROW EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability();
+
+CREATE OR REPLACE FUNCTION public.reject_listing_avionics_grounded_capability_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'grounded avionics capabilities are immutable';
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS listing_avionics_grounded_capabilities_immutable_update
+  ON aircraft_sale_listing_avionics_grounded_capabilities;
+CREATE TRIGGER listing_avionics_grounded_capabilities_immutable_update
+BEFORE UPDATE ON aircraft_sale_listing_avionics_grounded_capabilities
+FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update();
+
+INSERT INTO schema_migration_contracts (
+  migration_name, contract_version, contract_fingerprint, installed_at
+) VALUES (
+  '20260825_listing_avionics_grounded_capabilities',
+  1,
+  'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e',
+  CURRENT_TIMESTAMP
+)
+ON CONFLICT (migration_name) DO NOTHING;
+
 -- Exact authorization for one listing-link component. Manufacturer-reuse
 -- authorizations bind the current global attestation; same-case authorizations
 -- bind the transient grounded resolution that approved this exact association.
-CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
+CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizations (
     listing_link_id BIGINT NOT NULL
-      REFERENCES aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
+      REFERENCES public.aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
     association_role TEXT NOT NULL
       CHECK (association_role IN ('installed', 'replacement')),
     avionics_model_id BIGINT NOT NULL
-      REFERENCES avionics_models(id) ON DELETE CASCADE,
+      REFERENCES public.avionics_models(id) ON DELETE CASCADE,
     authorization_kind TEXT NOT NULL
       CHECK (authorization_kind IN ('manufacturer_reuse', 'same_case_grounded')),
     observation_sha256 TEXT NOT NULL
@@ -3817,33 +3928,47 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
     grounded_resolution_sha256 TEXT,
     evidence_capture_sha256 TEXT NOT NULL
       CHECK (evidence_capture_sha256 ~ '^[0-9a-f]{64}$'),
+    plugin_submission_id BIGINT
+      REFERENCES public.plugin_submissions(id) ON DELETE CASCADE,
+    extracted_listing_sha256 TEXT
+      CHECK (extracted_listing_sha256 IS NULL OR
+             extracted_listing_sha256 ~ '^[0-9a-f]{64}$'),
     collision_closure_sha256 TEXT NOT NULL
       CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
+    source_revocation_count BIGINT,
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_authorization_v1'),
+      CHECK (policy_version = 'listing_avionics_authorization'),
     authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (listing_link_id, association_role),
     CHECK (
       (authorization_kind = 'manufacturer_reuse'
-        AND grounded_resolution_sha256 IS NULL)
+      AND grounded_resolution_sha256 IS NULL
+      AND plugin_submission_id IS NULL
+      AND extracted_listing_sha256 IS NULL
+      AND source_revocation_count IS NULL)
       OR
       (authorization_kind = 'same_case_grounded'
-        AND grounded_resolution_sha256 ~ '^[0-9a-f]{64}$')
+      AND grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'
+      AND plugin_submission_id IS NOT NULL
+      AND extracted_listing_sha256 IS NOT NULL
+      AND source_revocation_count IS NOT NULL
+      AND source_revocation_count >= 0)
     )
   );
 
 CREATE INDEX IF NOT EXISTS
   idx_listing_avionics_authorizations_model
-ON aircraft_sale_listing_avionics_authorizations (avionics_model_id);
+ON public.aircraft_sale_listing_avionics_link_authorizations (avionics_model_id);
 
-CREATE OR REPLACE FUNCTION validate_listing_avionics_authorization()
+CREATE OR REPLACE FUNCTION public.validate_listing_avionics_authorization()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
-    FROM aircraft_sale_listing_avionics link
+    FROM public.aircraft_sale_listing_avionics link
     WHERE link.id = NEW.listing_link_id
       AND link.source_confidence = 'high'
       AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
@@ -3857,23 +3982,38 @@ BEGIN
           AND link.replaces_avionics_model_id = NEW.avionics_model_id
         )
       )
-      AND EXISTS (
-        SELECT 1 FROM plugin_submissions capture
-        WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
-          AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
-          AND position(link.source_notes IN capture.rendered_html) > 0
-      )
       AND (
-        (NEW.authorization_kind = 'manufacturer_reuse' AND EXISTS (
-          SELECT 1 FROM avionics_product_reuse_attestations attestation
-          WHERE attestation.avionics_model_id = NEW.avionics_model_id
-            AND attestation.product_fingerprint = NEW.product_fingerprint
-        ))
+        (NEW.authorization_kind = 'manufacturer_reuse'
+          AND EXISTS (
+            SELECT 1 FROM public.plugin_submissions capture
+            WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+              AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
+              AND position(link.source_notes IN capture.rendered_html) > 0
+          )
+          AND EXISTS (
+            SELECT 1 FROM public.avionics_product_reuse_attestations attestation
+            WHERE attestation.avionics_model_id = NEW.avionics_model_id
+              AND attestation.product_fingerprint = NEW.product_fingerprint
+          ))
         OR
-        (NEW.authorization_kind = 'same_case_grounded' AND EXISTS (
-          SELECT 1 FROM avionics_approved_product_graph_identities identity
-          WHERE identity.avionics_model_id = NEW.avionics_model_id
-        ))
+        (NEW.authorization_kind = 'same_case_grounded'
+          AND EXISTS (
+            SELECT 1 FROM public.plugin_submissions submission
+            WHERE submission.id = NEW.plugin_submission_id
+              AND submission.canonical_listing_id = link.aircraft_sale_listing_id
+              AND submission.rendered_html_sha256 = NEW.evidence_capture_sha256
+              AND submission.extracted_listing_json IS NOT NULL
+              AND submission.extraction_error IS NULL
+              AND position(link.source_notes IN submission.rendered_html) > 0
+          )
+          AND EXISTS (
+            SELECT 1 FROM public.avionics_approved_product_graph_identities identity
+            WHERE identity.avionics_model_id = NEW.avionics_model_id
+          )
+          AND NEW.source_revocation_count = (
+            SELECT COUNT(*)
+            FROM public.avionics_authoritative_source_origin_revocations
+          ))
       )
   ) THEN
     RAISE EXCEPTION
@@ -3884,14 +4024,15 @@ END;
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_validate_insert
-  ON aircraft_sale_listing_avionics_authorizations;
+  ON public.aircraft_sale_listing_avionics_link_authorizations;
 CREATE TRIGGER listing_avionics_authorizations_validate_insert
-BEFORE INSERT ON aircraft_sale_listing_avionics_authorizations
-FOR EACH ROW EXECUTE FUNCTION validate_listing_avionics_authorization();
+BEFORE INSERT ON public.aircraft_sale_listing_avionics_link_authorizations
+FOR EACH ROW EXECUTE FUNCTION public.validate_listing_avionics_authorization();
 
-CREATE OR REPLACE FUNCTION preserve_listing_avionics_authorization()
+CREATE OR REPLACE FUNCTION public.preserve_listing_avionics_authorization()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   RAISE EXCEPTION 'listing avionics authorizations are replaced, never updated';
@@ -3900,24 +4041,25 @@ END;
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_immutable_update
-  ON aircraft_sale_listing_avionics_authorizations;
+  ON public.aircraft_sale_listing_avionics_link_authorizations;
 CREATE TRIGGER listing_avionics_authorizations_immutable_update
-BEFORE UPDATE ON aircraft_sale_listing_avionics_authorizations
-FOR EACH ROW EXECUTE FUNCTION preserve_listing_avionics_authorization();
+BEFORE UPDATE ON public.aircraft_sale_listing_avionics_link_authorizations
+FOR EACH ROW EXECUTE FUNCTION public.preserve_listing_avionics_authorization();
 
-CREATE OR REPLACE FUNCTION invalidate_listing_avionics_authorization_for_link()
+CREATE OR REPLACE FUNCTION public.invalidate_listing_avionics_authorization_for_link()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE listing_link_id = NEW.id;
   RETURN NEW;
 END;
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_link_update
-  ON aircraft_sale_listing_avionics;
+  ON public.aircraft_sale_listing_avionics;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_link_update
 AFTER UPDATE OF
   aircraft_sale_listing_id,
@@ -3927,15 +4069,16 @@ AFTER UPDATE OF
   source_confidence,
   configuration_action,
   replaces_avionics_model_id
-ON aircraft_sale_listing_avionics
-FOR EACH ROW EXECUTE FUNCTION invalidate_listing_avionics_authorization_for_link();
+ON public.aircraft_sale_listing_avionics
+FOR EACH ROW EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_link();
 
-CREATE OR REPLACE FUNCTION invalidate_listing_avionics_authorization_for_reuse()
+CREATE OR REPLACE FUNCTION public.invalidate_listing_avionics_authorization_for_reuse()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'manufacturer_reuse'
     AND avionics_model_id = OLD.avionics_model_id;
   RETURN OLD;
@@ -3943,17 +4086,19 @@ END;
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_reuse_delete
-  ON avionics_product_reuse_attestations;
+  ON public.avionics_product_reuse_attestations;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_reuse_delete
-AFTER DELETE ON avionics_product_reuse_attestations
-FOR EACH ROW EXECUTE FUNCTION invalidate_listing_avionics_authorization_for_reuse();
+AFTER DELETE ON public.avionics_product_reuse_attestations
+FOR EACH ROW EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_reuse();
 
 
 CREATE OR REPLACE FUNCTION
-  invalidate_listing_avionics_same_case_for_model_proof()
-RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+  public.invalidate_listing_avionics_same_case_for_model_proof()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND avionics_model_id = OLD.id;
   RETURN NEW;
@@ -3962,7 +4107,7 @@ $function$;
 
 DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_model_proof_update
-ON avionics_models;
+ON public.avionics_models;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_model_proof_update
 AFTER UPDATE OF
@@ -3970,21 +4115,23 @@ AFTER UPDATE OF
   manufacturer_identifier_kind, manufacturer_identifier,
   normalized_manufacturer_identifier, identity_source_url,
   identity_source_title, identity_evidence_text
-ON avionics_models
+ON public.avionics_models
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_model_proof();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_proof();
 
 CREATE OR REPLACE FUNCTION
-  invalidate_listing_avionics_same_case_for_model_type()
-RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+  public.invalidate_listing_avionics_same_case_for_model_type()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
 BEGIN
   IF TG_OP IN ('DELETE', 'UPDATE') THEN
-    DELETE FROM aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = OLD.avionics_model_id;
   END IF;
   IF TG_OP IN ('INSERT', 'UPDATE') THEN
-    DELETE FROM aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = NEW.avionics_model_id;
   END IF;
@@ -3997,39 +4144,41 @@ $function$;
 
 DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_model_type_insert
-ON avionics_model_types;
+ON public.avionics_model_types;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_model_type_insert
-AFTER INSERT ON avionics_model_types
+AFTER INSERT ON public.avionics_model_types
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_model_type();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
 
 DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_model_type_delete
-ON avionics_model_types;
+ON public.avionics_model_types;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_model_type_delete
-AFTER DELETE ON avionics_model_types
+AFTER DELETE ON public.avionics_model_types
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_model_type();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
 
 DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_model_type_update
-ON avionics_model_types;
+ON public.avionics_model_types;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_model_type_update
-AFTER UPDATE OF avionics_model_id, avionics_type_id ON avionics_model_types
+AFTER UPDATE OF avionics_model_id, avionics_type_id ON public.avionics_model_types
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_model_type();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_model_type();
 
 CREATE OR REPLACE FUNCTION
-  invalidate_listing_avionics_same_case_for_type()
-RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+  public.invalidate_listing_avionics_same_case_for_type()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND avionics_model_id IN (
-      SELECT avionics_model_id FROM avionics_model_types
+      SELECT avionics_model_id FROM public.avionics_model_types
       WHERE avionics_type_id = OLD.id
     );
   RETURN NEW;
@@ -4037,23 +4186,25 @@ END
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_type_update
-ON avionics_types;
+ON public.avionics_types;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_type_update
-AFTER UPDATE OF name, normalized_name ON avionics_types
+AFTER UPDATE OF name, normalized_name ON public.avionics_types
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_type();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_type();
 
 CREATE OR REPLACE FUNCTION
-  invalidate_listing_avionics_same_case_for_graph()
-RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+  public.invalidate_listing_avionics_same_case_for_graph()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
 BEGIN
   IF TG_OP IN ('DELETE', 'UPDATE') THEN
-    DELETE FROM aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = OLD.avionics_model_id;
   END IF;
   IF TG_OP IN ('INSERT', 'UPDATE') THEN
-    DELETE FROM aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = NEW.avionics_model_id;
   END IF;
@@ -4065,38 +4216,40 @@ END
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_graph_insert
-ON avionics_approved_product_identities;
+ON public.avionics_approved_product_identities;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_graph_insert
-AFTER INSERT ON avionics_approved_product_identities
+AFTER INSERT ON public.avionics_approved_product_identities
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_graph();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_graph_delete
-ON avionics_approved_product_identities;
+ON public.avionics_approved_product_identities;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_graph_delete
-AFTER DELETE ON avionics_approved_product_identities
+AFTER DELETE ON public.avionics_approved_product_identities
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_graph();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_graph_update
-ON avionics_approved_product_identities;
+ON public.avionics_approved_product_identities;
 CREATE TRIGGER listing_avionics_authorizations_invalidate_graph_update
 AFTER UPDATE OF
   avionics_model_id, avionics_manufacturer_identity_id,
   canonical_product_key, manufacturer_identifier_kind,
   canonical_identifier_key
-ON avionics_approved_product_identities
+ON public.avionics_approved_product_identities
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_graph();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_graph();
 
 CREATE OR REPLACE FUNCTION
-  invalidate_listing_avionics_same_case_for_manufacturer()
-RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+  public.invalidate_listing_avionics_same_case_for_manufacturer()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND avionics_model_id IN (
-      SELECT id FROM avionics_models
+      SELECT id FROM public.avionics_models
       WHERE avionics_manufacturer_id = OLD.id
     );
   RETURN NEW;
@@ -4105,63 +4258,35 @@ $function$;
 
 DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_manufacturer_update
-ON avionics_manufacturers;
+ON public.avionics_manufacturers;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_manufacturer_update
-AFTER UPDATE OF name, normalized_name ON avionics_manufacturers
+AFTER UPDATE OF name, normalized_name ON public.avionics_manufacturers
 FOR EACH ROW
-EXECUTE FUNCTION invalidate_listing_avionics_same_case_for_manufacturer();
+EXECUTE FUNCTION public.invalidate_listing_avionics_same_case_for_manufacturer();
 
 CREATE OR REPLACE FUNCTION
-  invalidate_listing_avionics_same_case_for_origin_revocation()
-RETURNS TRIGGER LANGUAGE plpgsql AS $function$
+  public.invalidate_listing_avionics_same_case_for_origin_revocation()
+RETURNS TRIGGER LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
 BEGIN
-  DELETE FROM aircraft_sale_listing_avionics_authorizations
-  WHERE authorization_kind = 'same_case_grounded'
-    AND avionics_model_id IN (
-      SELECT model.id
-      FROM avionics_models model
-      JOIN avionics_approved_product_graph_identities product_identity
-        ON product_identity.avionics_model_id = model.id
-      JOIN avionics_authoritative_source_origins source_origin
-        ON source_origin.id =
-             NEW.avionics_authoritative_source_origin_id
-      LEFT JOIN avionics_manufacturer_effective_identities origin_identity
-        ON origin_identity.identity_id =
-             source_origin.avionics_manufacturer_identity_id
-      WHERE (
-          lower(BTRIM(model.identity_source_url)) = source_origin.https_origin
-          OR substring(
-              lower(BTRIM(model.identity_source_url))
-              FROM 1 FOR length(source_origin.https_origin) + 1
-            ) IN (
-              source_origin.https_origin || '/',
-              source_origin.https_origin || '?',
-              source_origin.https_origin || '#'
-            )
-        )
-        AND (
-          source_origin.authority_kind = 'regulator_primary'
-          OR (
-            source_origin.authority_kind = 'manufacturer_primary'
-            AND origin_identity.avionics_manufacturer_identity_id =
-                  product_identity.avionics_manufacturer_identity_id
-          )
-        )
-    );
+  DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities;
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
+  WHERE authorization_kind = 'same_case_grounded';
   RETURN NEW;
 END
 $function$;
 
 DROP TRIGGER IF EXISTS
   listing_avionics_authorizations_invalidate_origin_revocation
-ON avionics_authoritative_source_origin_revocations;
+ON public.avionics_authoritative_source_origin_revocations;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_origin_revocation
-AFTER INSERT ON avionics_authoritative_source_origin_revocations
+AFTER INSERT ON public.avionics_authoritative_source_origin_revocations
 FOR EACH ROW
 EXECUTE FUNCTION
-  invalidate_listing_avionics_same_case_for_origin_revocation();
+  public.invalidate_listing_avionics_same_case_for_origin_revocation();
 
 
 CREATE OR REPLACE FUNCTION
@@ -4170,7 +4295,7 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations authorization_row
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations authorization_row
   USING public.aircraft_sale_listing_avionics link
   WHERE link.id = authorization_row.listing_link_id
     AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
@@ -4185,6 +4310,9 @@ BEGIN
               authorization_row.evidence_capture_sha256
         AND position(link.source_notes IN retained_capture.rendered_html) > 0
     );
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND plugin_submission_id = OLD.id;
   IF TG_OP = 'DELETE' THEN
     RETURN OLD;
   END IF;
@@ -4206,31 +4334,16 @@ DROP TRIGGER IF EXISTS
 ON public.plugin_submissions;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_capture_update
-AFTER UPDATE OF canonical_listing_id, rendered_html, rendered_html_sha256
+AFTER UPDATE OF
+  canonical_listing_id,
+  rendered_html,
+  rendered_html_sha256,
+  extracted_listing_json,
+  extraction_error
 ON public.plugin_submissions
 FOR EACH ROW
 EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
 
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260818_listing_avionics_association_authorizations',
-  1,
-  'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO NOTHING;
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260818_listing_avionics_authorization_hash_domain_reset',
-  1,
-  'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO NOTHING;
 
 -- Audit surfaces for legacy action graphs. Non-ready legacy listings may
 -- retain invalid rows until review; no represented listing may become ready.
@@ -10527,8 +10640,8 @@ BEGIN
   ))
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
-  IF actual_object_count <> 793
-     OR actual_definition_digest <> '5bea7b82d356e161fe8a160f68845c68' THEN
+  IF actual_object_count <> 792
+     OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -10573,7 +10686,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5',
+  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
