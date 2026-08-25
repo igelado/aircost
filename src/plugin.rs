@@ -3608,7 +3608,7 @@ mod tests {
         source_notes: &str,
     ) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"aircost:listing-avionics-grounded-occurrence-capability:v2");
+        hasher.update(b"aircost:listing-avionics-grounded-occurrence-capability");
         for value in [
             "0".to_string(),
             "primary".to_string(),
@@ -4569,7 +4569,7 @@ mod tests {
                  product_fingerprint, collision_closure_sha256,
                  source_revocation_count, policy_version
                ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0,
-                         'listing_avionics_grounded_capability_v2')"#,
+                         'listing_avionics_grounded_capability')"#,
         )
         .bind(listing_id)
         .bind(submission_id)
@@ -4600,7 +4600,7 @@ mod tests {
             r#"SELECT
                  (SELECT count(*) FROM aircraft_sale_listing_avionics
                    WHERE aircraft_sale_listing_id = ?),
-                 (SELECT count(*) FROM aircraft_sale_listing_avionics_authorizations authorization
+                 (SELECT count(*) FROM aircraft_sale_listing_avionics_link_authorizations authorization
                     JOIN aircraft_sale_listing_avionics link
                       ON link.id = authorization.listing_link_id
                    WHERE link.aircraft_sale_listing_id = ?

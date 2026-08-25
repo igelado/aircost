@@ -25,8 +25,6 @@ strict_migrations=(
   20260808_avionics_descriptive_consolidation
   20260809_listing_verification_runs
   20260810_avionics_grounded_exact_model_consolidation
-  20260818_listing_avionics_association_authorizations
-  20260818_listing_avionics_authorization_hash_domain_reset
   20260819_aircraft_listing_identity_corrections
   20260821_aircraft_visual_source_corrections
   20260821_avionics_approved_concrete_model

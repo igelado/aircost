@@ -83,6 +83,10 @@ WHERE (
     schema_row.tbl_name IN (SELECT name FROM owned_relations)
     OR schema_row.name IN (SELECT name FROM owned_trigger_names)
   )
+  AND schema_row.name NOT IN (
+    'avionics_models_approved_concrete_model_insert',
+    'avionics_models_approved_concrete_model_update'
+  )
 )
 UNION ALL
 SELECT
@@ -116,7 +120,7 @@ SELECT CASE
       AND (
         contract_version IS NOT 1
         OR contract_fingerprint IS NOT
-          'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
+          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
       )
   ) THEN 0
   WHEN EXISTS (
@@ -130,7 +134,7 @@ SELECT CASE
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> 'de4de587e8b74a7119b2997d39513d02246074d1cd99cf35a1089a98740989ee'
+        )) <> '581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54'
   ) THEN 0
   WHEN NOT EXISTS (
     SELECT 1 FROM schema_migration_contracts
@@ -143,7 +147,7 @@ SELECT CASE
         ), 256))) FROM (
           SELECT object_key, definition
           FROM reference_catalog_cutover_owned_objects ORDER BY object_key
-        )) <> 'a2e2d5d3fdbc38847b9bddcebbf587c50447b3415ba3c7f1c3ed8a0b94605b45'
+        )) <> '520dd12118080bb4525f8ef9ce8fdeb3b4d4241c063ee5fc6f0c294fa1d04ecd'
     OR EXISTS (
       SELECT 1 FROM listing_verification_run_items
       WHERE status = 'pending_reference'
@@ -1019,6 +1023,10 @@ WHERE (
     schema_row.tbl_name IN (SELECT name FROM owned_relations)
     OR schema_row.name IN (SELECT name FROM owned_trigger_names)
   )
+  AND schema_row.name NOT IN (
+    'avionics_models_approved_concrete_model_insert',
+    'avionics_models_approved_concrete_model_update'
+  )
 )
 UNION ALL
 SELECT
@@ -1053,7 +1061,7 @@ SELECT CASE WHEN
       ), 256))) FROM (
         SELECT object_key, definition
         FROM reference_catalog_cutover_post_objects ORDER BY object_key
-      )) <> 'de4de587e8b74a7119b2997d39513d02246074d1cd99cf35a1089a98740989ee'
+      )) <> '581bc9491e66de7fcb0c81d6d0fd0c26abbed74dac4c56de6d133643dd4b4b54'
   OR EXISTS (
     SELECT 1 FROM sqlite_schema
     WHERE name IN (
@@ -1082,7 +1090,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5', CURRENT_TIMESTAMP
+  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522', CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
 

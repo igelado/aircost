@@ -112,7 +112,7 @@ DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_manufacturer_u
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_origin_revocation;
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_capture_delete;
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_invalidate_capture_update;
-DROP TABLE aircraft_sale_listing_avionics_authorizations;
+DROP TABLE aircraft_sale_listing_avionics_link_authorizations;
 DROP TRIGGER IF EXISTS avionics_product_reuse_attestations_validate_insert;
 DROP TRIGGER IF EXISTS avionics_product_reuse_attestations_immutable_update;
 DROP TRIGGER IF EXISTS avionics_product_reuse_invalidate_type_insert;
@@ -138,8 +138,7 @@ CREATE TABLE avionics_product_reuse_attestations (
 );
 DELETE FROM schema_migration_contracts
 WHERE migration_name IN (
-  '20260807_avionics_product_reuse_v2',
-  '20260818_listing_avionics_association_authorizations'
+  '20260807_avionics_product_reuse_v2'
 );
 
 .read $repository_root/migrations/20260803_avionics_product_reuse_attestations.sqlite.sql

@@ -34,7 +34,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5'
+          '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522'
       )
   ) THEN
     RAISE EXCEPTION 'reference catalog cutover contract marker mismatch';
@@ -49,7 +49,6 @@ active_routines(name) AS (
     ('aircraft_serial_natural_sort_key'),
     ('validate_aircraft_serial_scheme_ordering'),
     ('prevent_referenced_avionics_catalog_downgrade'),
-    ('invalidate_listing_avionics_authorization_for_capture'),
     ('validate_aircraft_valuation_compatibility_projection'),
     ('require_aircraft_catalog_approval'),
     ('validate_aircraft_reference_version_insert'),
@@ -277,8 +276,8 @@ BEGIN
     ))
     INTO actual_object_count, actual_definition_digest
     FROM pg_temp.reference_catalog_schema_owned_objects;
-    IF actual_object_count <> 793
-       OR actual_definition_digest <> 'c5c053f43711b4cd719d4b90a8c187b4' THEN
+    IF actual_object_count <> 792
+       OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
       RAISE EXCEPTION
         'reference catalog canonical schema owned-object mismatch (% objects, digest %)',
         actual_object_count, actual_definition_digest;
@@ -3830,7 +3829,7 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities 
     source_revocation_count BIGINT NOT NULL
       CHECK (source_revocation_count >= 0),
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_grounded_capability_v2'),
+      CHECK (policy_version = 'listing_avionics_grounded_capability'),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (
       listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -3904,8 +3903,8 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
-  2,
-  '75f65ec05a59e7cd319bce7fa73baea29c5d34e439cd8cfabc09b7a33fa31d5d',
+  1,
+  '682ca4e44ced30b0d14da879c31e0fa4b24cc1b6fceb9f213ecc39d9abca0338',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
@@ -3913,7 +3912,7 @@ ON CONFLICT (migration_name) DO NOTHING;
 -- Exact authorization for one listing-link component. Manufacturer-reuse
 -- authorizations bind the current global attestation; same-case authorizations
 -- bind the transient grounded resolution that approved this exact association.
-CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_authorizations (
+CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizations (
     listing_link_id BIGINT NOT NULL
       REFERENCES public.aircraft_sale_listing_avionics(id) ON DELETE CASCADE,
     association_role TEXT NOT NULL
@@ -3938,7 +3937,7 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_authorizations 
       CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
     source_revocation_count BIGINT,
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_authorization_v2'),
+      CHECK (policy_version = 'listing_avionics_authorization'),
     authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (listing_link_id, association_role),
     CHECK (
@@ -3959,7 +3958,7 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_authorizations 
 
 CREATE INDEX IF NOT EXISTS
   idx_listing_avionics_authorizations_model
-ON public.aircraft_sale_listing_avionics_authorizations (avionics_model_id);
+ON public.aircraft_sale_listing_avionics_link_authorizations (avionics_model_id);
 
 CREATE OR REPLACE FUNCTION public.validate_listing_avionics_authorization()
 RETURNS TRIGGER
@@ -4025,9 +4024,9 @@ END;
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_validate_insert
-  ON public.aircraft_sale_listing_avionics_authorizations;
+  ON public.aircraft_sale_listing_avionics_link_authorizations;
 CREATE TRIGGER listing_avionics_authorizations_validate_insert
-BEFORE INSERT ON public.aircraft_sale_listing_avionics_authorizations
+BEFORE INSERT ON public.aircraft_sale_listing_avionics_link_authorizations
 FOR EACH ROW EXECUTE FUNCTION public.validate_listing_avionics_authorization();
 
 CREATE OR REPLACE FUNCTION public.preserve_listing_avionics_authorization()
@@ -4042,9 +4041,9 @@ END;
 $function$;
 
 DROP TRIGGER IF EXISTS listing_avionics_authorizations_immutable_update
-  ON public.aircraft_sale_listing_avionics_authorizations;
+  ON public.aircraft_sale_listing_avionics_link_authorizations;
 CREATE TRIGGER listing_avionics_authorizations_immutable_update
-BEFORE UPDATE ON public.aircraft_sale_listing_avionics_authorizations
+BEFORE UPDATE ON public.aircraft_sale_listing_avionics_link_authorizations
 FOR EACH ROW EXECUTE FUNCTION public.preserve_listing_avionics_authorization();
 
 CREATE OR REPLACE FUNCTION public.invalidate_listing_avionics_authorization_for_link()
@@ -4053,7 +4052,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE listing_link_id = NEW.id;
   RETURN NEW;
 END;
@@ -4079,7 +4078,7 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'manufacturer_reuse'
     AND avionics_model_id = OLD.avionics_model_id;
   RETURN OLD;
@@ -4099,7 +4098,7 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND avionics_model_id = OLD.id;
   RETURN NEW;
@@ -4127,12 +4126,12 @@ SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF TG_OP IN ('DELETE', 'UPDATE') THEN
-    DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = OLD.avionics_model_id;
   END IF;
   IF TG_OP IN ('INSERT', 'UPDATE') THEN
-    DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = NEW.avionics_model_id;
   END IF;
@@ -4176,7 +4175,7 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND avionics_model_id IN (
       SELECT avionics_model_id FROM public.avionics_model_types
@@ -4200,12 +4199,12 @@ SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF TG_OP IN ('DELETE', 'UPDATE') THEN
-    DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = OLD.avionics_model_id;
   END IF;
   IF TG_OP IN ('INSERT', 'UPDATE') THEN
-    DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+    DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
     WHERE authorization_kind = 'same_case_grounded'
       AND avionics_model_id = NEW.avionics_model_id;
   END IF;
@@ -4247,7 +4246,7 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND avionics_model_id IN (
       SELECT id FROM public.avionics_models
@@ -4273,7 +4272,7 @@ SET search_path = pg_catalog
 AS $function$
 BEGIN
   DELETE FROM public.aircraft_sale_listing_avionics_grounded_capabilities;
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded';
   RETURN NEW;
 END
@@ -4296,7 +4295,7 @@ RETURNS TRIGGER LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations authorization_row
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations authorization_row
   USING public.aircraft_sale_listing_avionics link
   WHERE link.id = authorization_row.listing_link_id
     AND authorization_row.evidence_capture_sha256 = OLD.rendered_html_sha256
@@ -4311,7 +4310,7 @@ BEGIN
               authorization_row.evidence_capture_sha256
         AND position(link.source_notes IN retained_capture.rendered_html) > 0
     );
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  DELETE FROM public.aircraft_sale_listing_avionics_link_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND plugin_submission_id = OLD.id;
   IF TG_OP = 'DELETE' THEN
@@ -4345,26 +4344,6 @@ ON public.plugin_submissions
 FOR EACH ROW
 EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
 
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260818_listing_avionics_association_authorizations',
-  1,
-  'bbb76c8535647f2ecaab3179d5ef483bdef9ca23a0e14e3fd0888912fc3d90f9',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO NOTHING;
-
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260818_listing_avionics_authorization_hash_domain_reset',
-  1,
-  'cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO NOTHING;
 
 -- Audit surfaces for legacy action graphs. Non-ready legacy listings may
 -- retain invalid rows until review; no represented listing may become ready.
@@ -10661,8 +10640,8 @@ BEGIN
   ))
   INTO actual_object_count, actual_definition_digest
   FROM pg_temp.reference_catalog_schema_owned_objects;
-  IF actual_object_count <> 793
-     OR actual_definition_digest <> 'c5c053f43711b4cd719d4b90a8c187b4' THEN
+  IF actual_object_count <> 792
+     OR actual_definition_digest <> 'a12dfb4a0ff4f026bee8b16c1c26ac0a' THEN
     RAISE EXCEPTION
       'reference catalog canonical schema post-state mismatch (% objects, digest %)',
       actual_object_count, actual_definition_digest;
@@ -10707,7 +10686,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_reference_catalog_cutover', 1,
-  'fe31ca0eaae57cfc4ba5c824679bd950fcb98e20d6dd3e686a477fd22d05aab5',
+  '85b97a46a697a3b835e5c8817821722fd558120700b1725615161b357bc63522',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

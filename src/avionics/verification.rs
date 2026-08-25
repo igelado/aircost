@@ -7945,7 +7945,7 @@ mod tests {
         .await
         .unwrap();
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)
@@ -8949,7 +8949,7 @@ mod tests {
         )
         .unwrap();
         let proof_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)
@@ -9154,7 +9154,7 @@ mod tests {
         .await
         .unwrap();
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)

@@ -661,7 +661,7 @@ const EXISTING_SAME_CASE_AUTHORIZATIONS_SQLITE_SQL: &str = r#"
            THEN 1 ELSE 0 END AS exact_submission_is_current,
       authorization.collision_closure_sha256,
       authorization.policy_version
-    FROM aircraft_sale_listing_avionics_authorizations authorization
+    FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
     LEFT JOIN plugin_submissions grounded_submission
@@ -691,7 +691,7 @@ const EXISTING_SAME_CASE_AUTHORIZATIONS_POSTGRES_SQL: &str = r#"
            THEN TRUE ELSE FALSE END AS exact_submission_is_current,
       authorization.collision_closure_sha256,
       authorization.policy_version
-    FROM aircraft_sale_listing_avionics_authorizations authorization
+    FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
     LEFT JOIN plugin_submissions grounded_submission
@@ -1020,14 +1020,14 @@ pub(crate) async fn apply_automated_avionics_review(
     );
     let delete_authorization = db.sql(
         r#"
-        DELETE FROM aircraft_sale_listing_avionics_authorizations
+        DELETE FROM aircraft_sale_listing_avionics_link_authorizations
         WHERE listing_link_id = ?
           AND association_role = ?
         "#,
     );
     let insert_reuse_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_authorizations (
+        INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
           listing_link_id,
           association_role,
           avionics_model_id,
@@ -2379,7 +2379,7 @@ mod tests {
         );
         sqlx::query(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
@@ -2436,7 +2436,7 @@ mod tests {
                 .unwrap();
         sqlx::query(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
@@ -2540,14 +2540,14 @@ mod tests {
               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
                WHERE aircraft_sale_listing_id = ?),
               (SELECT COUNT(*)
-               FROM aircraft_sale_listing_avionics_authorizations authorization
+               FROM aircraft_sale_listing_avionics_link_authorizations authorization
                JOIN aircraft_sale_listing_avionics link
                  ON link.id = authorization.listing_link_id
                WHERE link.aircraft_sale_listing_id = ?
                  AND authorization.authorization_kind = 'manufacturer_reuse'
                  AND authorization.grounded_resolution_sha256 IS NULL),
               (SELECT COUNT(*)
-               FROM aircraft_sale_listing_avionics_authorizations authorization
+               FROM aircraft_sale_listing_avionics_link_authorizations authorization
                JOIN aircraft_sale_listing_avionics link
                  ON link.id = authorization.listing_link_id
                WHERE link.aircraft_sale_listing_id = ?
@@ -2722,7 +2722,7 @@ mod tests {
             r#"
             SELECT authorization_kind, plugin_submission_id,
                    extracted_listing_sha256
-            FROM aircraft_sale_listing_avionics_authorizations
+            FROM aircraft_sale_listing_avionics_link_authorizations
             WHERE listing_link_id = ? AND association_role = 'installed'
             "#,
         )
@@ -2783,7 +2783,7 @@ mod tests {
                     .await
                     .unwrap();
                     sqlx::query(
-                        "UPDATE aircraft_sale_listing_avionics_authorizations SET plugin_submission_id = ? WHERE listing_link_id = ?",
+                        "UPDATE aircraft_sale_listing_avionics_link_authorizations SET plugin_submission_id = ? WHERE listing_link_id = ?",
                     )
                     .bind(wrong_submission_id)
                     .bind(listing_link_id)
@@ -2793,7 +2793,7 @@ mod tests {
                 }
                 "checkpoint" => {
                     sqlx::query(
-                        "UPDATE aircraft_sale_listing_avionics_authorizations SET extracted_listing_sha256 = ? WHERE listing_link_id = ?",
+                        "UPDATE aircraft_sale_listing_avionics_link_authorizations SET extracted_listing_sha256 = ? WHERE listing_link_id = ?",
                     )
                     .bind("f".repeat(64))
                     .bind(listing_link_id)
@@ -3027,7 +3027,7 @@ mod tests {
             SELECT
               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_dispositions
                WHERE aircraft_sale_listing_id = ?),
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations)
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations)
             "#,
         )
         .bind(fixture.listing_id)
@@ -3090,7 +3090,7 @@ mod tests {
         let authorization_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             JOIN aircraft_sale_listing_avionics link
               ON link.id = authorization.listing_link_id
             WHERE link.aircraft_sale_listing_id = ?
@@ -3192,7 +3192,7 @@ mod tests {
             r#"
             SELECT authorization.observation_sha256,
                    authorization.collision_closure_sha256
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             WHERE authorization.listing_link_id = ?
               AND authorization.association_role = 'installed'
             "#,
@@ -3239,7 +3239,7 @@ mod tests {
             r#"
             SELECT authorization.observation_sha256,
                    authorization.collision_closure_sha256
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             WHERE authorization.listing_link_id = ?
               AND authorization.association_role = 'installed'
             "#,
@@ -3295,9 +3295,9 @@ mod tests {
             SELECT authorization.observation_sha256,
                    authorization.collision_closure_sha256,
                    (SELECT COUNT(*)
-                    FROM aircraft_sale_listing_avionics_authorizations
+                    FROM aircraft_sale_listing_avionics_link_authorizations
                     WHERE listing_link_id = ?)
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             WHERE authorization.listing_link_id = ?
               AND authorization.association_role = 'installed'
             "#,
@@ -3358,7 +3358,7 @@ mod tests {
         .unwrap();
         assert_eq!(repaired_notes.as_deref(), Some("GIA-63W"));
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(pool)
@@ -3455,7 +3455,7 @@ mod tests {
         .unwrap();
         assert_eq!(stored_link_id, existing_link_id);
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(existing_link_id)
         .fetch_one(pool)
@@ -3466,7 +3466,7 @@ mod tests {
             r#"
             SELECT authorization.observation_sha256,
                    authorization.collision_closure_sha256
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             WHERE authorization.listing_link_id = ?
               AND authorization.association_role = 'installed'
             "#,
@@ -3528,7 +3528,7 @@ mod tests {
         .unwrap();
         assert_ne!(stored_link_id, existing_link_id);
         let old_authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(existing_link_id)
         .fetch_one(pool)
@@ -3536,7 +3536,7 @@ mod tests {
         .unwrap();
         assert_eq!(old_authorization_count, 0);
         let replacement_authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(stored_link_id)
         .fetch_one(pool)
@@ -3618,7 +3618,7 @@ mod tests {
         .await
         .unwrap();
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(listing_link_id)
         .fetch_one(pool)
@@ -3816,7 +3816,7 @@ mod tests {
         let authorization_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             JOIN aircraft_sale_listing_avionics link
               ON link.id = authorization.listing_link_id
             WHERE link.aircraft_sale_listing_id = ?
@@ -3972,7 +3972,7 @@ mod tests {
             SELECT
               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
                WHERE aircraft_sale_listing_id = ?),
-              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations)
+              (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations)
             "#,
         )
         .bind(fixture.listing_id)
@@ -4014,7 +4014,7 @@ mod tests {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             r#"
             SELECT authorization.association_role, authorization.avionics_model_id
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             JOIN aircraft_sale_listing_avionics link
               ON link.id = authorization.listing_link_id
             WHERE link.aircraft_sale_listing_id = ?
@@ -4035,7 +4035,7 @@ mod tests {
         let authorization_count: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM aircraft_sale_listing_avionics_authorizations authorization
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
             JOIN aircraft_sale_listing_avionics link
               ON link.id = authorization.listing_link_id
             WHERE link.aircraft_sale_listing_id = ?

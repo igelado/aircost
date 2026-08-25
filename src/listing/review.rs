@@ -86,9 +86,8 @@ const MAX_PAGE_LIMIT: i64 = 100;
 const REVIEW_PAYLOAD_VERSION: u32 = 1;
 const EXTRACTION_FINGERPRINT_DOMAIN: &[u8] = b"aircost:listing-avionics-observation:v1";
 const ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-association-authorization:v2";
-pub(crate) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str =
-    "listing_avionics_authorization_v2";
+    b"aircost:listing-avionics-association-authorization";
+pub(crate) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str = "listing_avionics_authorization";
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
@@ -97,7 +96,7 @@ const PRESERVED_ASSOCIATION_REVIEW_REASON: &str =
 const REVIEWER_CORRECTED_AVIONICS_KIND: &str = "avionics_reviewer_correction";
 pub(crate) const POSTGRES_LISTING_CHILD_LOCK_SQL: &str = r#"
     LOCK TABLE aircraft_sale_listing_avionics,
-               aircraft_sale_listing_avionics_authorizations,
+               aircraft_sale_listing_avionics_link_authorizations,
                aircraft_sale_listing_avionics_grounded_capabilities,
                aircraft_sale_listing_avionics_dispositions,
                aircraft_sale_listing_pending_reviews
@@ -1849,7 +1848,7 @@ async fn restage_pending_review_if_current_with_commit(
     );
     let insert_reuse_authorization = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_authorizations (
+        INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
           listing_link_id,
           association_role,
           avionics_model_id,
@@ -1870,7 +1869,7 @@ async fn restage_pending_review_if_current_with_commit(
     );
     let delete_existing_authorization = db.sql(
         r#"
-        DELETE FROM aircraft_sale_listing_avionics_authorizations
+        DELETE FROM aircraft_sale_listing_avionics_link_authorizations
         WHERE listing_link_id = ?
           AND association_role = ?
         "#,
@@ -4096,7 +4095,7 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
       authorization.source_revocation_count,
       (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
         AS current_source_revocation_count
-    FROM aircraft_sale_listing_avionics_authorizations authorization
+    FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
     LEFT JOIN avionics_product_reuse_attestations attestation
@@ -4137,7 +4136,7 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
       authorization.source_revocation_count,
       (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
         AS current_source_revocation_count
-    FROM aircraft_sale_listing_avionics_authorizations authorization
+    FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
     LEFT JOIN avionics_product_reuse_attestations attestation
@@ -9916,7 +9915,7 @@ mod tests {
             .find("aircraft_sale_listing_avionics,")
             .expect("child lock must include listing avionics");
         let authorizations = POSTGRES_LISTING_CHILD_LOCK_SQL
-            .find("aircraft_sale_listing_avionics_authorizations")
+            .find("aircraft_sale_listing_avionics_link_authorizations")
             .expect("child lock must include listing avionics authorizations");
         let grounded_capabilities = POSTGRES_LISTING_CHILD_LOCK_SQL
             .find("aircraft_sale_listing_avionics_grounded_capabilities")
@@ -11759,7 +11758,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         );
         sqlx::query(
             r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
@@ -12019,7 +12018,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
 
         let retained: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) \
-             FROM aircraft_sale_listing_avionics_authorizations \
+             FROM aircraft_sale_listing_avionics_link_authorizations \
              WHERE listing_link_id = ? AND association_role = 'installed'",
         )
         .bind(link_id)
@@ -13437,7 +13436,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(
             POSTGRES_LISTING_CHILD_LOCK_SQL.contains("aircraft_sale_listing_avionics")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
-                    .contains("aircraft_sale_listing_avionics_authorizations")
+                    .contains("aircraft_sale_listing_avionics_link_authorizations")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
                     .contains("aircraft_sale_listing_avionics_grounded_capabilities")
                 && POSTGRES_LISTING_CHILD_LOCK_SQL
@@ -13456,7 +13455,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .find("aircraft_sale_listing_avionics,")
             .expect("listing links must be locked first");
         let corroborations = children
-            .find("aircraft_sale_listing_avionics_authorizations")
+            .find("aircraft_sale_listing_avionics_link_authorizations")
             .expect("association corroborations must be locked");
         let capabilities = children
             .find("aircraft_sale_listing_avionics_grounded_capabilities")
@@ -14583,7 +14582,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .unwrap();
         assert_eq!(pending_count, 0);
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -14689,7 +14688,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(error.to_string().contains("changed"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -14797,7 +14796,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             .contains("active avionics collision catalog"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))
@@ -15280,7 +15279,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         assert!(error.to_string().contains("source capture changed"));
 
         let corroboration_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations WHERE listing_link_id = ?",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
         )
         .bind(link_id)
         .fetch_one(sqlite_pool(&db))

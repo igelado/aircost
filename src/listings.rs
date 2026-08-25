@@ -520,11 +520,11 @@ struct ResolvedListingAvionics {
     occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
 }
 
-const GROUNDED_CAPABILITY_POLICY_VERSION: &str = "listing_avionics_grounded_capability_v2";
+const GROUNDED_CAPABILITY_POLICY_VERSION: &str = "listing_avionics_grounded_capability";
 const GROUNDED_CAPABILITY_SET_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-grounded-capability-set:v2";
+    b"aircost:listing-avionics-grounded-capability-set";
 const GROUNDED_OCCURRENCE_CAPABILITY_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-grounded-occurrence-capability:v2";
+    b"aircost:listing-avionics-grounded-occurrence-capability";
 
 #[derive(Clone, Debug)]
 struct ListingGroundedCapability {
@@ -6499,7 +6499,7 @@ async fn replace_listing_avionics(
     );
     let insert_grounded_authorization_sql = db.sql(
         r#"
-        INSERT INTO aircraft_sale_listing_avionics_authorizations (
+        INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
           listing_link_id, association_role, avionics_model_id,
           authorization_kind, observation_sha256, product_fingerprint,
           grounded_resolution_sha256, evidence_capture_sha256,
@@ -9176,7 +9176,7 @@ mod tests {
         let state: (i64, i64, i64) = sqlx::query_as(
             r#"SELECT
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities),
-                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations),
+                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations),
                  (SELECT COUNT(*) FROM gemini_api_usage)"#,
         )
         .fetch_one(pool)
@@ -9309,7 +9309,7 @@ mod tests {
         let state: (i64, i64, i64, i64) = sqlx::query_as(
             r#"SELECT
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?),
-                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations authorization
+                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations authorization
                     JOIN aircraft_sale_listing_avionics link ON link.id = authorization.listing_link_id
                    WHERE link.aircraft_sale_listing_id = ? AND authorization.authorization_kind = 'same_case_grounded'),
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities WHERE listing_id = ?),
@@ -9331,7 +9331,7 @@ mod tests {
 
         revoke_test_manufacturer_source_origin(&db, model_id).await;
         let authorization_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations",
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations",
         )
         .fetch_one(pool)
         .await
@@ -9577,7 +9577,7 @@ mod tests {
         let state: (i64, i64, i64, i64, i64) = sqlx::query_as(
             r#"SELECT
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics WHERE aircraft_sale_listing_id = ?),
-                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_authorizations authorization
+                 (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations authorization
                     JOIN aircraft_sale_listing_avionics link ON link.id = authorization.listing_link_id
                    WHERE link.aircraft_sale_listing_id = ? AND authorization.authorization_kind = 'same_case_grounded'),
                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities WHERE listing_id = ?),
