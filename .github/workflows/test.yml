@@ -63,6 +63,11 @@ jobs:
           cargo test postgres_listing_replay_rerun_rejects_unexpected_indexes_and_triggers -- --ignored --nocapture --test-threads=1
           cargo test postgres_replay_ledger_rejects_invalid_state_outcome_pairings -- --ignored --nocapture --test-threads=1
 
+      - name: Check PostgreSQL grounded avionics capability contract
+        run: >-
+          cargo test postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering --
+          --ignored --nocapture --test-threads=1
+
       - name: Check historical migration provenance
         run: bash tests/schema/test_historical_migration_provenance.sh
 

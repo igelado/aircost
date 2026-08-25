@@ -887,6 +887,34 @@ struct PostgresReferenceConstraintDefinition {
     constraint_type: String,
     definition: String,
 }
+
+#[derive(sqlx::FromRow)]
+struct PostgresGroundedCapabilityTriggerDefinition {
+    trigger_name: String,
+    trigger_type: i16,
+    has_no_when_clause: bool,
+    is_enabled: bool,
+    has_zero_trigger_args: bool,
+    is_uninherited: bool,
+    is_non_constraint: bool,
+    has_no_transition_tables: bool,
+    has_no_update_columns: bool,
+    definition: String,
+    function_namespace: String,
+    function_name: String,
+    function_source: String,
+    function_config: String,
+    is_security_invoker: bool,
+    is_ordinary_function: bool,
+    returns_trigger: bool,
+    has_zero_function_args: bool,
+    language_name: String,
+    is_not_strict: bool,
+    is_volatile: bool,
+    is_parallel_unsafe: bool,
+    is_not_leakproof: bool,
+}
+
 fn canonical_sql_definition(value: &str) -> String {
     let mut canonical = String::with_capacity(value.len());
     let mut characters = value.chars().peekable();
@@ -1003,19 +1031,53 @@ fn expected_sqlite_faa_registry_definitions() -> Vec<SqliteSchemaDefinition> {
 
 fn sqlite_table_definition<'a>(schema: &'a str, table: &str) -> Option<&'a str> {
     let marker = format!("CREATE TABLE IF NOT EXISTS {table} (");
-    let tail = &schema[schema.find(&marker)?..];
-    let end = tail.find("\n);")? + 2;
-    Some(&tail[..end])
+    let qualified_marker = format!("CREATE TABLE IF NOT EXISTS public.{table} (");
+    let start = schema
+        .find(&marker)
+        .or_else(|| schema.find(&qualified_marker))?;
+    let tail = &schema[start..];
+    let mut depth = 0_i64;
+    let mut quote = None;
+    let mut characters = tail.char_indices().peekable();
+    while let Some((offset, character)) = characters.next() {
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                if characters
+                    .peek()
+                    .is_some_and(|(_, next)| *next == active_quote)
+                {
+                    characters.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&tail[..=offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn canonical_table_definition(schema: &str, table: &str) -> Option<String> {
+    Some(
+        canonical_sql_definition(sqlite_table_definition(schema, table)?)
+            .replacen("createtableifnotexists", "createtable", 1)
+            .replace("public.", ""),
+    )
 }
 
 fn canonical_sqlite_table_definition(schema: &str, table: &str) -> Option<String> {
-    Some(
-        canonical_sql_definition(sqlite_table_definition(schema, table)?).replacen(
-            "createtableifnotexists",
-            "createtable",
-            1,
-        ),
-    )
+    canonical_table_definition(schema, table)
 }
 
 fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String> {
@@ -1029,6 +1091,23 @@ fn canonical_sqlite_named_definition(schema: &str, name: &str) -> Option<String>
                 || statement.starts_with(&format!("createuniqueindex{canonical_name}on"))
                 || statement.starts_with(&format!("createtrigger{canonical_name}"))
         })
+}
+
+fn postgres_function_source<'a>(schema: &'a str, function_name: &str) -> Option<&'a str> {
+    let marker = format!("CREATE OR REPLACE FUNCTION public.{function_name}()");
+    let declaration = schema.split_once(&marker)?.1;
+    let body = declaration.split_once("AS $function$")?.1;
+    body.split_once("$function$;")
+        .map(|(source, _)| source.trim())
+}
+
+fn canonical_postgres_named_trigger_definition(schema: &str, name: &str) -> Option<String> {
+    let marker = format!("createtrigger{}", name.to_ascii_lowercase());
+    split_sql_statements(schema)
+        .into_iter()
+        .map(strip_leading_sql_comments)
+        .map(canonical_postgres_trigger_definition)
+        .find(|statement| statement.starts_with(&marker))
 }
 
 fn postgres_migration_function_source(function_name: &str) -> Option<&'static str> {
@@ -4216,6 +4295,9 @@ impl AppDb {
         };
         let missing_listing_avionics_grounded_capabilities =
             missing_listing_avionics_grounded_capability_objects
+                || !self
+                    .listing_avionics_grounded_capability_definitions_valid_on(connection)
+                    .await?
                 || self
                     .migration_contract_invalid_on(
                         connection,
@@ -4994,6 +5076,245 @@ impl AppDb {
             ));
         }
         Ok(())
+    }
+
+    async fn listing_avionics_grounded_capability_definitions_valid_on(
+        &self,
+        connection: &mut GateConnection<'_>,
+    ) -> Result<bool> {
+        const TABLE: &str = "aircraft_sale_listing_avionics_grounded_capabilities";
+        const SQLITE_OBJECTS: &[(&str, &str)] = &[
+            ("index", "idx_listing_avionics_grounded_capabilities_model"),
+            (
+                "index",
+                "idx_listing_avionics_grounded_capabilities_submission",
+            ),
+            (
+                "trigger",
+                "listing_avionics_grounded_capabilities_immutable_update",
+            ),
+            (
+                "trigger",
+                "listing_avionics_grounded_capabilities_validate_insert",
+            ),
+        ];
+        const POSTGRES_CHECKS: &[&str] = &[
+            "CHECK ((capability_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((collision_closure_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((configuration_action = ANY (ARRAY['installed'::text, 'replaces'::text, 'removes'::text])))",
+            "CHECK ((evidence_capture_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((extracted_listing_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((occurrence_index >= 0))",
+            "CHECK ((occurrence_role = ANY (ARRAY['primary'::text, 'replacement'::text])))",
+            "CHECK (((occurrence_role = 'primary'::text) OR (configuration_action = ANY (ARRAY['replaces'::text, 'removes'::text]))))",
+            "CHECK (((occurrence_role = 'primary'::text) OR (requested_quantity = 1)))",
+            "CHECK ((policy_version = 'listing_avionics_grounded_capability_v1'::text))",
+            "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
+            "CHECK ((requested_quantity > 0))",
+            "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))",
+        ];
+        const POSTGRES_TRIGGERS: &[(&str, i16, &str)] = &[
+            (
+                "listing_avionics_grounded_capabilities_immutable_update",
+                19,
+                "reject_listing_avionics_grounded_capability_update",
+            ),
+            (
+                "listing_avionics_grounded_capabilities_validate_insert",
+                7,
+                "validate_listing_avionics_grounded_capability",
+            ),
+        ];
+
+        match &mut *connection {
+            GateConnection::Sqlite(pool) => {
+                let table_definition = sqlx::query_scalar::<_, String>(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                )
+                .bind(TABLE)
+                .fetch_optional(&mut **pool)
+                .await?;
+                let Some(table_definition) = table_definition else {
+                    return Ok(true);
+                };
+                let table_is_exact =
+                    canonical_sql_definition(&table_definition).replacen(
+                        "createtableifnotexists",
+                        "createtable",
+                        1,
+                    ) == canonical_sqlite_table_definition(SQLITE_SCHEMA_SQL, TABLE)
+                        .expect("canonical grounded-capability table must exist");
+                let actual_objects = sqlx::query_as::<_, (String, String, Option<String>)>(
+                    "SELECT type, name, sql FROM sqlite_schema \
+                     WHERE tbl_name = ? AND type IN ('index', 'trigger') \
+                       AND sql IS NOT NULL ORDER BY type, name",
+                )
+                .bind(TABLE)
+                .fetch_all(&mut **pool)
+                .await?;
+                let expected_objects = SQLITE_OBJECTS
+                    .iter()
+                    .map(|(object_type, name)| {
+                        (
+                            (*object_type).to_owned(),
+                            (*name).to_owned(),
+                            canonical_sqlite_named_definition(SQLITE_SCHEMA_SQL, name)
+                                .unwrap_or_else(|| {
+                                    panic!("canonical grounded-capability object {name} must exist")
+                                }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let objects_are_exact = actual_objects.len() == expected_objects.len()
+                    && actual_objects.iter().zip(&expected_objects).all(
+                        |(
+                            (actual_type, actual_name, actual_definition),
+                            (expected_type, expected_name, expected_definition),
+                        )| {
+                            actual_type == expected_type
+                                && actual_name == expected_name
+                                && actual_definition.as_deref().is_some_and(|actual| {
+                                    canonical_sqlite_schema_definition(actual)
+                                        == *expected_definition
+                                })
+                        },
+                    );
+                Ok(table_is_exact && objects_are_exact)
+            }
+            GateConnection::Postgres(pool) => {
+                let table_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_catalog.to_regclass( \
+                       'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+                     ) IS NOT NULL",
+                )
+                .fetch_one(&mut **pool)
+                .await?;
+                if !table_exists {
+                    return Ok(true);
+                }
+                let actual_checks = sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid)
+                    FROM pg_catalog.pg_constraint constraint_row
+                    WHERE constraint_row.conrelid = pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                    )
+                      AND constraint_row.contype = 'c'
+                    ORDER BY pg_catalog.pg_get_constraintdef(constraint_row.oid)
+                    "#,
+                )
+                .fetch_all(&mut **pool)
+                .await?;
+                if actual_checks.len() != POSTGRES_CHECKS.len()
+                    || !actual_checks
+                        .iter()
+                        .zip(POSTGRES_CHECKS)
+                        .all(|(actual, expected)| actual == expected)
+                {
+                    return Ok(false);
+                }
+
+                let actual_triggers =
+                    sqlx::query_as::<_, PostgresGroundedCapabilityTriggerDefinition>(
+                        r#"
+                    SELECT trigger_row.tgname AS trigger_name,
+                           trigger_row.tgtype AS trigger_type,
+                           trigger_row.tgqual IS NULL AS has_no_when_clause,
+                           trigger_row.tgenabled = 'O' AS is_enabled,
+                           trigger_row.tgnargs = 0 AS has_zero_trigger_args,
+                           trigger_row.tgparentid = 0 AS is_uninherited,
+                           trigger_row.tgconstraint = 0 AS is_non_constraint,
+                           trigger_row.tgoldtable IS NULL
+                             AND trigger_row.tgnewtable IS NULL
+                             AS has_no_transition_tables,
+                           trigger_row.tgattr::text = '' AS has_no_update_columns,
+                           pg_catalog.pg_get_triggerdef(trigger_row.oid)
+                             AS definition,
+                           routine_namespace.nspname AS function_namespace,
+                           routine.proname AS function_name,
+                           routine.prosrc AS function_source,
+                           COALESCE(
+                             pg_catalog.array_to_string(routine.proconfig, E'\n'),
+                             ''
+                           ) AS function_config,
+                           NOT routine.prosecdef AS is_security_invoker,
+                           routine.prokind = 'f' AS is_ordinary_function,
+                           routine.prorettype = pg_catalog.to_regtype(
+                             'pg_catalog.trigger'
+                           ) AS returns_trigger,
+                           routine.pronargs = 0 AS has_zero_function_args,
+                           language_row.lanname AS language_name,
+                           NOT routine.proisstrict AS is_not_strict,
+                           routine.provolatile = 'v' AS is_volatile,
+                           routine.proparallel = 'u' AS is_parallel_unsafe,
+                           NOT routine.proleakproof AS is_not_leakproof
+                    FROM pg_catalog.pg_trigger trigger_row
+                    JOIN pg_catalog.pg_proc routine
+                      ON routine.oid = trigger_row.tgfoid
+                    JOIN pg_catalog.pg_namespace routine_namespace
+                      ON routine_namespace.oid = routine.pronamespace
+                    JOIN pg_catalog.pg_language language_row
+                      ON language_row.oid = routine.prolang
+                    WHERE trigger_row.tgrelid = pg_catalog.to_regclass(
+                      'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                    )
+                      AND NOT trigger_row.tgisinternal
+                    ORDER BY trigger_row.tgname
+                    "#,
+                    )
+                    .fetch_all(&mut **pool)
+                    .await?;
+                Ok(actual_triggers.len() == POSTGRES_TRIGGERS.len()
+                    && actual_triggers.iter().zip(POSTGRES_TRIGGERS).all(
+                        |(actual, (expected_name, expected_type, expected_function))| {
+                            actual.trigger_name == *expected_name
+                                && actual.trigger_type == *expected_type
+                                && actual.has_no_when_clause
+                                && actual.is_enabled
+                                && actual.has_zero_trigger_args
+                                && actual.is_uninherited
+                                && actual.is_non_constraint
+                                && actual.has_no_transition_tables
+                                && actual.has_no_update_columns
+                                && actual.function_namespace == "public"
+                                && actual.function_name == *expected_function
+                                && actual.function_config == "search_path=pg_catalog"
+                                && actual.is_security_invoker
+                                && actual.is_ordinary_function
+                                && actual.returns_trigger
+                                && actual.has_zero_function_args
+                                && actual.language_name == "plpgsql"
+                                && actual.is_not_strict
+                                && actual.is_volatile
+                                && actual.is_parallel_unsafe
+                                && actual.is_not_leakproof
+                                && canonical_postgres_trigger_definition(&actual.definition)
+                                    == canonical_postgres_named_trigger_definition(
+                                        POSTGRES_SCHEMA_SQL,
+                                        expected_name,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "canonical grounded-capability trigger {expected_name} must exist"
+                                        )
+                                    })
+                                && canonical_sql_definition(&actual.function_source)
+                                    == canonical_sql_definition(
+                                        postgres_function_source(
+                                            POSTGRES_SCHEMA_SQL,
+                                            expected_function,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "canonical grounded-capability function {expected_function} must exist"
+                                            )
+                                        }),
+                                    )
+                        },
+                    ))
+            }
+        }
     }
 
     async fn aircraft_visual_source_correction_definitions_valid_on(
@@ -9754,17 +10075,19 @@ mod tests {
         avionics_authoritative_source_origins_migration_required_message,
         avionics_descriptive_consolidation_migration_required_message,
         avionics_multi_type_migration_required_message,
-        avionics_product_reuse_attestations_migration_required_message, canonical_sql_definition,
-        canonical_startup_migration_contract_receipts,
-        faa_record_hash_domain_migration_required_message, faa_registry_contract_required_message,
+        avionics_product_reuse_attestations_migration_required_message,
+        canonical_postgres_named_trigger_definition, canonical_sql_definition,
+        canonical_sqlite_named_definition, canonical_startup_migration_contract_receipts,
+        canonical_table_definition, faa_record_hash_domain_migration_required_message,
+        faa_registry_contract_required_message,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
         listing_pending_reviews_migration_required_message, migration_required_message,
-        postgres_approved_concrete_model_object_payload, postgres_reference_owned_objects_query,
-        split_sql_statements, sqlite_migration_definition, sqlite_table_definition,
-        versioned_avionics_approved_concrete_model_object_fingerprint, AppDb, DatabaseBackend,
-        DatabaseKind, PostgresApprovedConcreteModelTriggerDefinition,
+        postgres_approved_concrete_model_object_payload, postgres_function_source,
+        postgres_reference_owned_objects_query, split_sql_statements, sqlite_migration_definition,
+        sqlite_table_definition, versioned_avionics_approved_concrete_model_object_fingerprint,
+        AppDb, DatabaseBackend, DatabaseKind, PostgresApprovedConcreteModelTriggerDefinition,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_FINGERPRINT,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_CONTRACT_VERSION,
         AIRCRAFT_CATALOG_RETRIEVAL_KEYS_MIGRATION,
@@ -17137,6 +17460,22 @@ mod tests {
             ),
             "canonical schema and Postgres upgrade disagree for {table}"
         );
+        assert_eq!(
+            canonical_table_definition(SQLITE_SCHEMA_SQL, table),
+            canonical_table_definition(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                table,
+            ),
+            "canonical SQLite schema and migration must agree on the complete table declaration"
+        );
+        assert_eq!(
+            canonical_table_definition(POSTGRES_SCHEMA_SQL, table),
+            canonical_table_definition(
+                LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                table,
+            ),
+            "canonical PostgreSQL schema and migration must agree on the complete table declaration"
+        );
         for definition in [
             SQLITE_SCHEMA_SQL,
             POSTGRES_SCHEMA_SQL,
@@ -17179,6 +17518,49 @@ mod tests {
             assert!(definition.contains(
                 "EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update()"
             ));
+        }
+        for object_name in [
+            "idx_listing_avionics_grounded_capabilities_model",
+            "idx_listing_avionics_grounded_capabilities_submission",
+            "listing_avionics_grounded_capabilities_validate_insert",
+            "listing_avionics_grounded_capabilities_immutable_update",
+        ] {
+            assert_eq!(
+                canonical_sqlite_named_definition(SQLITE_SCHEMA_SQL, object_name),
+                canonical_sqlite_named_definition(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL,
+                    object_name,
+                ),
+                "canonical SQLite object and migration drifted for {object_name}"
+            );
+        }
+        for trigger_name in [
+            "listing_avionics_grounded_capabilities_validate_insert",
+            "listing_avionics_grounded_capabilities_immutable_update",
+        ] {
+            assert_eq!(
+                canonical_postgres_named_trigger_definition(POSTGRES_SCHEMA_SQL, trigger_name),
+                canonical_postgres_named_trigger_definition(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                    trigger_name,
+                ),
+                "canonical PostgreSQL trigger and migration drifted for {trigger_name}"
+            );
+        }
+        for function_name in [
+            "validate_listing_avionics_grounded_capability",
+            "reject_listing_avionics_grounded_capability_update",
+        ] {
+            assert_eq!(
+                postgres_function_source(POSTGRES_SCHEMA_SQL, function_name)
+                    .map(canonical_sql_definition),
+                postgres_function_source(
+                    LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+                    function_name,
+                )
+                .map(canonical_sql_definition),
+                "canonical PostgreSQL function and migration drifted for {function_name}"
+            );
         }
         assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
         assert_eq!(
@@ -17248,6 +17630,15 @@ mod tests {
         .await;
         assert_corrupt_grounded_capability_schema_rejected(&[
             "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert",
+            "CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities WHEN 0 BEGIN SELECT RAISE(ABORT, 'grounded avionics capability requires its exact current capture-bound listing and approved product'); END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "CREATE TRIGGER unexpected_listing_avionics_grounded_capability_trigger BEFORE DELETE ON aircraft_sale_listing_avionics_grounded_capabilities BEGIN SELECT RAISE(ABORT, 'unexpected trigger'); END",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert",
             "CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities BEGIN SELECT 1; END",
         ])
         .await;
@@ -17259,6 +17650,10 @@ mod tests {
             (
                 "CHECK (occurrence_index >= 0)",
                 "CHECK (occurrence_index >= -1)",
+            ),
+            (
+                "CHECK (occurrence_index >= 0)",
+                "CHECK (TRUE /* occurrence_index >= 0 */ OR TRUE)",
             ),
             (
                 "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
@@ -17305,6 +17700,23 @@ mod tests {
             assert!(error.contains("capture-bound grounded avionics resolutions"));
             assert!(error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"));
         }
+    }
+
+    async fn assert_corrupt_postgres_grounded_capability_schema_rejected(
+        database_url: &str,
+        tamper_sql: &str,
+    ) {
+        let reset = reset_isolated_postgres(database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(tamper_sql).execute(pool).await.unwrap();
+        drop(db);
+        let error = connect_error(AppDb::connect(database_url).await);
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
     }
 
     #[tokio::test]
@@ -17393,19 +17805,47 @@ mod tests {
             "grounded avionics capability requires its exact current capture-bound listing and approved product"
         ));
         connection.execute("RESET search_path").await.unwrap();
-        connection
-            .execute(
-                "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() \
-                 SET search_path = public",
-            )
-            .await
-            .unwrap();
         drop(connection);
         drop(db);
 
-        let error = connect_error(AppDb::connect(&database_url).await);
-        assert!(error.contains("capture-bound grounded avionics resolutions"));
-        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
+        for tamper_sql in [
+            "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() SET search_path = public",
+            "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() SECURITY DEFINER",
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert ON public.aircraft_sale_listing_avionics_grounded_capabilities; \
+             CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert \
+             BEFORE INSERT ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             FOR EACH ROW WHEN (false) EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability()",
+            "CREATE TRIGGER unexpected_listing_avionics_grounded_capability_trigger \
+             BEFORE DELETE ON public.aircraft_sale_listing_avionics_grounded_capabilities \
+             FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update()",
+            "DO $tamper$ \
+             DECLARE target_constraint text; \
+             BEGIN \
+               SELECT constraint_row.conname INTO STRICT target_constraint \
+               FROM pg_catalog.pg_constraint constraint_row \
+               WHERE constraint_row.conrelid = pg_catalog.to_regclass( \
+                 'public.aircraft_sale_listing_avionics_grounded_capabilities' \
+               ) AND constraint_row.contype = 'c' \
+                 AND pg_catalog.strpos( \
+                   pg_catalog.pg_get_constraintdef(constraint_row.oid), \
+                   'occurrence_index' \
+                 ) > 0; \
+               EXECUTE pg_catalog.format( \
+                 'ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities DROP CONSTRAINT %I', \
+                 target_constraint \
+               ); \
+             END \
+             $tamper$; \
+             ALTER TABLE public.aircraft_sale_listing_avionics_grounded_capabilities \
+             ADD CONSTRAINT hostile_occurrence_index_check \
+             CHECK ((occurrence_index >= 0) OR TRUE)",
+        ] {
+            assert_corrupt_postgres_grounded_capability_schema_rejected(
+                &database_url,
+                tamper_sql,
+            )
+            .await;
+        }
     }
 
     #[tokio::test]
