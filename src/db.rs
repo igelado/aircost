@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,7 @@ const SQLITE_SCHEMA_SQL: &str = include_str!("../schema/sqlite.sql");
 const POSTGRES_SCHEMA_SQL: &str = include_str!("../schema/postgres.sql");
 const POSTGRES_SEARCH_PATH: &str = "public,pg_catalog,pg_temp";
 const POSTGRES_STARTUP_ADVISORY_LOCK_KEY: i64 = 0x0041_4952_434f_5354;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 const VALUATION_DATA_HARDENING_MIGRATION: &str = "20260720_valuation_data_hardening";
 const AVIONICS_CATALOG_CURATION_MIGRATION: &str = "20260721_avionics_catalog_curation";
 const AVIONICS_MULTI_TYPE_MIGRATION: &str = "20260721_avionics_multi_type";
@@ -1215,7 +1217,8 @@ impl AppDb {
             let options = SqliteConnectOptions::from_str(&database_url)
                 .with_context(|| format!("invalid SQLite database URL {database_url}"))?
                 .create_if_missing(true)
-                .foreign_keys(true);
+                .foreign_keys(true)
+                .busy_timeout(SQLITE_BUSY_TIMEOUT);
             let pool = SqlitePoolOptions::new()
                 .max_connections(5)
                 .connect_with(options)
@@ -10574,7 +10577,7 @@ mod tests {
         POSTGRES_FAA_ENGINE_REFERENCE_REACHABILITY_FUNCTION_SOURCE,
         POSTGRES_FAA_IMMUTABILITY_FUNCTION_SOURCE, POSTGRES_FAA_SNAPSHOT_EVIDENCE_FUNCTION_SOURCE,
         POSTGRES_SCHEMA_SQL, POSTGRES_SEARCH_PATH, REFERENCE_CATALOG_CUTOVER_MIGRATION,
-        REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL, SQLITE_SCHEMA_SQL,
+        REFERENCE_CATALOG_CUTOVER_POSTGRES_MIGRATION_SQL, SQLITE_BUSY_TIMEOUT, SQLITE_SCHEMA_SQL,
         VALUATION_DATA_HARDENING_MIGRATION,
     };
 
@@ -11215,8 +11218,20 @@ mod tests {
         let first_url = database_url.clone();
         let second_url = database_url.clone();
         let (first, second) = tokio::join!(AppDb::connect(&first_url), AppDb::connect(&second_url));
-        first.unwrap().close().await;
-        second.unwrap().close().await;
+        let first = first.unwrap();
+        let second = second.unwrap();
+        for db in [&first, &second] {
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let busy_timeout_millis: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(busy_timeout_millis, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+        }
+        first.close().await;
+        second.close().await;
         let inspection = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
