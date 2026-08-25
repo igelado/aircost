@@ -18260,6 +18260,133 @@ mod tests {
         );
     }
 
+    async fn sqlite_complete_grounded_schema_with_nullable_receipt() -> sqlx::SqlitePool {
+        const RECEIPT_COLUMNS: &str =
+            "  contract_version INTEGER NOT NULL,\n  contract_fingerprint TEXT NOT NULL,";
+        const NULLABLE_RECEIPT_COLUMNS: &str =
+            "  contract_version INTEGER,\n  contract_fingerprint TEXT,";
+        const VERSION_CHECK: &str =
+            "  CHECK (typeof(contract_version) = 'integer' AND contract_version > 0),";
+        const NULLABLE_VERSION_CHECK: &str = "  CHECK (contract_version IS NULL OR (typeof(contract_version) = 'integer' AND contract_version > 0)),";
+
+        assert_eq!(SQLITE_SCHEMA_SQL.matches(RECEIPT_COLUMNS).count(), 1);
+        assert_eq!(SQLITE_SCHEMA_SQL.matches(VERSION_CHECK).count(), 1);
+        let schema = SQLITE_SCHEMA_SQL
+            .replacen(RECEIPT_COLUMNS, NULLABLE_RECEIPT_COLUMNS, 1)
+            .replacen(VERSION_CHECK, NULLABLE_VERSION_CHECK, 1);
+        let options = "sqlite::memory:"
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        for statement in split_sql_statements(&schema) {
+            (&mut *transaction).execute(statement).await.unwrap();
+        }
+        transaction.commit().await.unwrap();
+        pool
+    }
+
+    async fn sqlite_grounded_contract_snapshot(
+        pool: &sqlx::SqlitePool,
+    ) -> (
+        Vec<(String, String, String, i64, Option<String>)>,
+        Option<(Option<i64>, Option<String>, String)>,
+        (i64, i64),
+    ) {
+        let schema = sqlx::query_as(
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema \
+             ORDER BY type, name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let receipt = sqlx::query_as(
+            "SELECT contract_version, contract_fingerprint, installed_at \
+             FROM schema_migration_contracts WHERE migration_name = ?",
+        )
+        .bind(LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        let protected_rows = sqlx::query_as(
+            "SELECT \
+               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities), \
+               (SELECT COUNT(*) FROM aircraft_sale_listing_avionics_link_authorizations)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (schema, receipt, protected_rows)
+    }
+
+    #[tokio::test]
+    async fn sqlite_grounded_capability_receipt_mutations_fail_closed_with_complete_objects() {
+        for (label, mutation) in [
+            (
+                "wrong version",
+                "UPDATE schema_migration_contracts SET contract_version = 99 \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "hostile fingerprint",
+                "UPDATE schema_migration_contracts SET contract_fingerprint = \
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "null version",
+                "UPDATE schema_migration_contracts SET contract_version = NULL \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "null fingerprint",
+                "UPDATE schema_migration_contracts SET contract_fingerprint = NULL \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+            (
+                "absent receipt",
+                "DELETE FROM schema_migration_contracts \
+                 WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'",
+            ),
+        ] {
+            let pool = sqlite_complete_grounded_schema_with_nullable_receipt().await;
+            sqlx::raw_sql(mutation).execute(&pool).await.unwrap();
+            let before = sqlite_grounded_contract_snapshot(&pool).await;
+            let mut connection = pool.acquire().await.unwrap();
+            let error = sqlx::raw_sql(LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL)
+                .execute(&mut *connection)
+                .await
+                .unwrap_err()
+                .to_string();
+            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *connection).await;
+            drop(connection);
+            assert!(
+                error.contains("accepted = 1")
+                    || error.contains("listing_avionics_grounded_capabilities_migration_guard"),
+                "{label}: unexpected migration error: {error}"
+            );
+            assert_eq!(
+                sqlite_grounded_contract_snapshot(&pool).await,
+                before,
+                "{label}: rejected rerun changed the canonical grounded contract"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1,
+                "{label}: rejected rerun changed foreign-key enforcement"
+            );
+            pool.close().await;
+        }
+    }
+
     async fn sqlite_grounded_authorization_rows(pool: &sqlx::SqlitePool) -> (String, String) {
         let capabilities = sqlx::query_scalar::<_, String>(
             r#"
@@ -19033,6 +19160,30 @@ mod tests {
         let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
             .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
         for tamper_sql in [
+            "UPDATE ONLY public.schema_migration_contracts \
+             SET contract_version = 99 \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "UPDATE ONLY public.schema_migration_contracts \
+             SET contract_fingerprint = \
+               'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "ALTER TABLE ONLY public.schema_migration_contracts \
+             ALTER COLUMN contract_version DROP NOT NULL; \
+             UPDATE ONLY public.schema_migration_contracts \
+             SET contract_version = NULL \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "ALTER TABLE ONLY public.schema_migration_contracts \
+             ALTER COLUMN contract_fingerprint DROP NOT NULL; \
+             UPDATE ONLY public.schema_migration_contracts \
+             SET contract_fingerprint = NULL \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
+            "DELETE FROM ONLY public.schema_migration_contracts \
+             WHERE migration_name = \
+               '20260825_listing_avionics_grounded_capabilities'",
             "ALTER TABLE public.aircraft_sale_listings \
              ADD COLUMN hostile_reference_id BIGINT UNIQUE; \
              DO $tamper$ \
