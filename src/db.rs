@@ -91,9 +91,9 @@ const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
     "20260825_listing_avionics_grounded_capabilities";
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
 // SHA-256 of
-// `20260825_listing_avionics_grounded_capabilities:v1:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun:exact-postgres-relation-index-foreign-key-trigger-closure`.
+// `20260825_listing_avionics_grounded_capabilities:v1:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun:exact-postgres-relation-index-foreign-key-trigger-closure:collation-independent-check-attestation`.
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
-    "89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf";
+    "e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -5131,7 +5131,7 @@ impl AppDb {
                 if !table_exists {
                     return Ok(true);
                 }
-                let actual_checks = sqlx::query_scalar::<_, String>(
+                let mut actual_checks = sqlx::query_scalar::<_, String>(
                     r#"
                     SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid)
                     FROM pg_catalog.pg_constraint constraint_row
@@ -5139,11 +5139,11 @@ impl AppDb {
                       'public.aircraft_sale_listing_avionics_grounded_capabilities'
                     )
                       AND constraint_row.contype = 'c'
-                    ORDER BY pg_catalog.pg_get_constraintdef(constraint_row.oid)
                     "#,
                 )
                 .fetch_all(&mut **pool)
                 .await?;
+                actual_checks.sort();
                 if actual_checks.len() != POSTGRES_CHECKS.len()
                     || !actual_checks
                         .iter()
@@ -5546,7 +5546,7 @@ impl AppDb {
                     eprintln!("listing avionics authorization PostgreSQL columns drifted");
                     return Ok(false);
                 }
-                let actual_checks = sqlx::query_as::<_, (String, bool, bool)>(
+                let mut actual_checks = sqlx::query_as::<_, (String, bool, bool)>(
                     r#"
                     SELECT pg_catalog.pg_get_constraintdef(constraint_row.oid),
                            constraint_row.convalidated,
@@ -5555,11 +5555,11 @@ impl AppDb {
                     WHERE constraint_row.conrelid = pg_catalog.to_regclass(
                       'public.aircraft_sale_listing_avionics_link_authorizations'
                     ) AND constraint_row.contype = 'c'
-                    ORDER BY pg_catalog.pg_get_constraintdef(constraint_row.oid)
                     "#,
                 )
                 .fetch_all(&mut **pool)
                 .await?;
+                actual_checks.sort_by(|left, right| left.0.cmp(&right.0));
                 if actual_checks.len() != POSTGRES_CHECKS.len()
                     || !actual_checks
                         .iter()
@@ -18058,7 +18058,7 @@ mod tests {
         assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
         assert_eq!(
             LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
-            "89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf"
+            "e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e"
         );
         assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL
             .contains("DROP TABLE IF EXISTS aircraft_sale_listing_avionics_grounded_capabilities"));

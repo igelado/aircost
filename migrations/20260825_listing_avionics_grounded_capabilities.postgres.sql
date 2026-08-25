@@ -36,7 +36,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf'
+          'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e'
       )
   ) THEN
     RAISE EXCEPTION
@@ -173,7 +173,7 @@ BEGIN
   SELECT
     pg_catalog.array_agg(
       pg_catalog.pg_get_constraintdef(actual.oid)
-      ORDER BY pg_catalog.pg_get_constraintdef(actual.oid)
+      ORDER BY pg_catalog.pg_get_constraintdef(actual.oid) COLLATE pg_catalog."C"
     ),
     COALESCE(
       pg_catalog.bool_and(actual.convalidated AND NOT actual.connoinherit),
@@ -189,7 +189,7 @@ BEGIN
   SELECT
     pg_catalog.array_agg(
       pg_catalog.pg_get_constraintdef(actual.oid)
-      ORDER BY pg_catalog.pg_get_constraintdef(actual.oid)
+      ORDER BY pg_catalog.pg_get_constraintdef(actual.oid) COLLATE pg_catalog."C"
     ),
     COALESCE(
       pg_catalog.bool_and(actual.convalidated AND NOT actual.connoinherit),
@@ -1274,7 +1274,7 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  '89130fed0cce6ce0dccf31a895356149ca0fb6462041b6a7e05d1d58de570cbf',
+  'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
