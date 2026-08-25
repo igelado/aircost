@@ -52,8 +52,7 @@ use crate::listing::evidence::MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES;
 use crate::listing::review::{
     association_observation_sha256_from_values, clear_pending_review, replace_pending_review,
     ListingAssociationRole, PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct,
-    StableIdentifier, ASSOCIATION_AUTHORIZATION_POLICY_VERSION, POSTGRES_LISTING_CHILD_LOCK_SQL,
-    POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
+    StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
 };
 use crate::models::{
     is_plausible_asking_price_usd, AircraftSummary, ListingPreview, ListingValuationFact,
@@ -526,7 +525,6 @@ struct ResolvedListingAvionics {
     occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
 }
 
-const GROUNDED_CAPABILITY_POLICY_VERSION: &str = "listing_avionics_grounded_capability";
 const GROUNDED_CAPABILITY_SET_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:listing-avionics-grounded-capability-set";
 const GROUNDED_OCCURRENCE_CAPABILITY_FINGERPRINT_DOMAIN: &[u8] =
@@ -592,7 +590,6 @@ struct StoredGroundedCapabilityRow {
     product_fingerprint: String,
     collision_closure_sha256: String,
     source_revocation_count: i64,
-    policy_version: String,
 }
 
 fn grounded_capability_submission_checkpoint_is_current(
@@ -705,7 +702,6 @@ fn grounded_capability_set_sha256(
             row.product_fingerprint.clone(),
             row.collision_closure_sha256.clone(),
             row.source_revocation_count.to_string(),
-            row.policy_version.clone(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
@@ -1674,8 +1670,7 @@ async fn grounded_capability_replay_scope(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
-               capability.source_revocation_count,
-               capability.policy_version
+               capability.source_revocation_count
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         LEFT JOIN plugin_submissions submission
           ON submission.id = capability.plugin_submission_id
@@ -2210,8 +2205,7 @@ async fn stage_bound_replay_grounded_capabilities(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
-               capability.source_revocation_count,
-               capability.policy_version
+               capability.source_revocation_count
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         JOIN plugin_submissions submission
           ON submission.id = capability.plugin_submission_id
@@ -2231,7 +2225,7 @@ async fn stage_bound_replay_grounded_capabilities(
           AND capability_sha256 = ? AND grounded_resolution_sha256 = ?
           AND evidence_capture_sha256 = ? AND extracted_listing_sha256 = ?
           AND product_fingerprint = ? AND collision_closure_sha256 = ?
-          AND source_revocation_count = ? AND policy_version = ?
+          AND source_revocation_count = ?
         "#,
     );
     let insert_sql = db.sql(
@@ -2242,8 +2236,8 @@ async fn stage_bound_replay_grounded_capabilities(
           request_sha256, capability_sha256, grounded_resolution_sha256,
           evidence_capture_sha256, extracted_listing_sha256,
           product_fingerprint, collision_closure_sha256,
-          source_revocation_count, policy_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          source_revocation_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     let approved_catalog_rows_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
@@ -2389,8 +2383,7 @@ async fn stage_bound_replay_grounded_capabilities(
                         && existing.extracted_listing_sha256 == scope.extracted_listing_sha256
                         && existing.product_fingerprint == current_product
                         && existing.collision_closure_sha256 == current_collision
-                        && existing.source_revocation_count == source_revocation_count
-                        && existing.policy_version == GROUNDED_CAPABILITY_POLICY_VERSION;
+                        && existing.source_revocation_count == source_revocation_count;
                     if exact {
                         continue;
                     }
@@ -2410,7 +2403,6 @@ async fn stage_bound_replay_grounded_capabilities(
                         .bind(existing.product_fingerprint.as_str())
                         .bind(existing.collision_closure_sha256.as_str())
                         .bind(existing.source_revocation_count)
-                        .bind(existing.policy_version.as_str())
                         .execute(&mut *transaction)
                         .await?;
                     if deleted.rows_affected() != 1 {
@@ -2436,7 +2428,6 @@ async fn stage_bound_replay_grounded_capabilities(
                     .bind(current_product)
                     .bind(current_collision)
                     .bind(source_revocation_count)
-                    .bind(GROUNDED_CAPABILITY_POLICY_VERSION)
                     .execute(&mut *transaction)
                     .await?;
             }
@@ -2812,8 +2803,8 @@ async fn insert_listing(
           request_sha256, capability_sha256, grounded_resolution_sha256,
           evidence_capture_sha256, extracted_listing_sha256,
           product_fingerprint, collision_closure_sha256,
-          source_revocation_count, policy_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          source_revocation_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     if let Some(binding) = signed_source_binding {
@@ -3024,7 +3015,6 @@ async fn insert_listing(
                         .bind(capability.product_fingerprint.as_str())
                         .bind(capability.collision_closure_sha256.as_str())
                         .bind(capability.seed.source_revocation_count())
-                        .bind(GROUNDED_CAPABILITY_POLICY_VERSION)
                         .execute(&mut *transaction)
                         .await?;
                 }
@@ -3659,7 +3649,6 @@ async fn retire_exact_stale_grounded_capability(
           AND product_fingerprint = ?
           AND collision_closure_sha256 = ?
           AND source_revocation_count = ?
-          AND policy_version = ?
         "#,
     );
     macro_rules! delete_exact {
@@ -3680,7 +3669,6 @@ async fn retire_exact_stale_grounded_capability(
                 .bind(row.product_fingerprint.as_str())
                 .bind(row.collision_closure_sha256.as_str())
                 .bind(row.source_revocation_count)
-                .bind(row.policy_version.as_str())
                 .execute($pool)
                 .await
                 .map(|result| result.rows_affected())
@@ -3724,8 +3712,7 @@ async fn replay_grounded_listing_avionics_identity(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
-               capability.source_revocation_count,
-               capability.policy_version
+               capability.source_revocation_count
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         LEFT JOIN plugin_submissions submission
           ON submission.id = capability.plugin_submission_id
@@ -3820,7 +3807,6 @@ async fn replay_grounded_listing_avionics_identity(
         || row.grounded_resolution_sha256 != seed.bind(scope.listing_id).resolution_sha256()
         || row.product_fingerprint != current_product
         || row.collision_closure_sha256 != current_collision
-        || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
         || !grounded_capability_submission_checkpoint_is_current(scope.listing_id, &row)
     {
         retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
@@ -6544,8 +6530,7 @@ async fn replace_listing_avionics(
                submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
-               capability.source_revocation_count,
-               capability.policy_version
+               capability.source_revocation_count
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         LEFT JOIN plugin_submissions submission
           ON submission.id = capability.plugin_submission_id
@@ -6568,8 +6553,8 @@ async fn replace_listing_avionics(
           authorization_kind, observation_sha256, product_fingerprint,
           grounded_resolution_sha256, evidence_capture_sha256,
           plugin_submission_id, extracted_listing_sha256,
-          collision_closure_sha256, source_revocation_count, policy_version
-        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          collision_closure_sha256, source_revocation_count
+        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     let approved_catalog_rows_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
@@ -6682,7 +6667,6 @@ async fn replace_listing_avionics(
                         || row.product_fingerprint != current_product_fingerprint
                         || row.collision_closure_sha256 != current_collision
                         || row.source_revocation_count != source_revocation_count
-                        || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
                         || !grounded_capability_submission_checkpoint_is_current(
                             listing_id,
                             &row,
@@ -6781,7 +6765,6 @@ async fn replace_listing_avionics(
                                 || row.product_fingerprint != current_target_product
                                 || row.collision_closure_sha256 != current_target_collision
                                 || row.source_revocation_count != source_revocation_count
-                                || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
                                 || !grounded_capability_submission_checkpoint_is_current(
                                     listing_id,
                                     &row,
@@ -6934,7 +6917,6 @@ async fn replace_listing_avionics(
                             .bind(exact_scope.extracted_listing_sha256.as_str())
                             .bind(collision_closure)
                             .bind(source_revocation_count)
-                            .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                             .execute(&mut *transaction)
                             .await?;
                     }
@@ -9353,7 +9335,6 @@ mod tests {
             product_fingerprint: "6".repeat(64),
             collision_closure_sha256: "7".repeat(64),
             source_revocation_count: 0,
-            policy_version: super::GROUNDED_CAPABILITY_POLICY_VERSION.to_string(),
         };
         let ordered = vec![row(0, 'a'), row(1, 'b')];
         let reversed = vec![row(1, 'b'), row(0, 'a')];
@@ -9925,8 +9906,8 @@ mod tests {
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
                  product_fingerprint, collision_closure_sha256,
-                 source_revocation_count, policy_version
-               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
+                 source_revocation_count
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(listing_id)
         .bind(submission_id)
@@ -9938,7 +9919,6 @@ mod tests {
         .bind(extracted_listing_sha256.as_str())
         .bind(product_fingerprint.as_str())
         .bind(collision_closure.as_str())
-        .bind(super::GROUNDED_CAPABILITY_POLICY_VERSION)
         .execute(pool)
         .await
         .unwrap();
@@ -10003,8 +9983,8 @@ mod tests {
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
                  product_fingerprint, collision_closure_sha256,
-                 source_revocation_count, policy_version
-               ) VALUES (?, ?, 1, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
+                 source_revocation_count
+               ) VALUES (?, ?, 1, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(listing_id)
         .bind(foreign_submission_id)
@@ -10018,7 +9998,6 @@ mod tests {
         .bind(extracted_listing_sha256.as_str())
         .bind(product_fingerprint.as_str())
         .bind(collision_closure.as_str())
-        .bind(super::GROUNDED_CAPABILITY_POLICY_VERSION)
         .execute(pool)
         .await
         .unwrap();
@@ -10531,8 +10510,8 @@ mod tests {
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
                  product_fingerprint, collision_closure_sha256,
-                 source_revocation_count, policy_version
-               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0, ?)"#,
+                 source_revocation_count
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(listing_id)
         .bind(submission_id)
@@ -10544,7 +10523,6 @@ mod tests {
         .bind(extracted_listing_sha256.as_str())
         .bind(product_fingerprint)
         .bind(collision_closure)
-        .bind(super::GROUNDED_CAPABILITY_POLICY_VERSION)
         .execute(pool)
         .await
         .unwrap();

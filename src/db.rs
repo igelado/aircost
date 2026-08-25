@@ -91,9 +91,9 @@ const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
     "20260825_listing_avionics_grounded_capabilities";
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
 // SHA-256 of
-// `20260825_listing_avionics_grounded_capabilities:v1:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun:exact-postgres-relation-index-foreign-key-trigger-closure:collation-independent-check-attestation`.
+// `20260825_listing_avionics_grounded_capabilities:unversioned-capability-and-link-authorization:capability-global-source-revocation-epoch:link-authorization-exact-submission-checkpoint-global-source-revocation-epoch:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract:complete-external-trigger-repair:data-preserving-rerun:exact-postgres-relation-index-foreign-key-trigger-closure:collation-independent-check-attestation`.
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
-    "e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e";
+    "461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -3583,7 +3583,6 @@ impl AppDb {
                         ('product_fingerprint', 'TEXT', 1, 0, NULL),
                         ('collision_closure_sha256', 'TEXT', 1, 0, NULL),
                         ('source_revocation_count', 'INTEGER', 1, 0, NULL),
-                        ('policy_version', 'TEXT', 1, 0, NULL),
                         ('created_at', 'TEXT', 1, 0, 'CURRENT_TIMESTAMP')
                     ),
                     required_foreign_keys(
@@ -3645,7 +3644,6 @@ impl AppDb {
                         ('check(occurrence_rolein(''primary'',''replacement''))'),
                         ('check(requested_quantity>0)'),
                         ('check(configuration_actionin(''installed'',''replaces'',''removes''))'),
-                        ('check(policy_version=''listing_avionics_grounded_capability'')'),
                         ('check(occurrence_role=''primary''orrequested_quantity=1)'),
                         ('check(occurrence_role=''primary''orconfiguration_actionin(''replaces'',''removes''))'),
                         ('check(length(request_sha256)=64)'),
@@ -3706,7 +3704,7 @@ impl AppDb {
                           SELECT COUNT(*) FROM pragma_table_info(
                             'aircraft_sale_listing_avionics_grounded_capabilities'
                           )
-                        ) <> 17
+                        ) <> 16
                         OR EXISTS (
                           SELECT 1 FROM required_columns required
                           WHERE NOT EXISTS (
@@ -3746,7 +3744,7 @@ impl AppDb {
                             length(normalized_sql) - length(replace(
                               normalized_sql, 'check(', ''
                             ))
-                          ) / length('check(') = 29
+                          ) / length('check(') = 28
                         )
                         OR EXISTS (
                           SELECT 1 FROM required_checks required
@@ -3849,7 +3847,6 @@ impl AppDb {
                         ('product_fingerprint', 'text', TRUE, NULL),
                         ('collision_closure_sha256', 'text', TRUE, NULL),
                         ('source_revocation_count', 'bigint', TRUE, NULL),
-                        ('policy_version', 'text', TRUE, NULL),
                         ('created_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
                     ),
                     required_foreign_keys(
@@ -3884,8 +3881,6 @@ impl AppDb {
                         ('product_fingerprint', '^[0-9a-f]{64}$', NULL, NULL),
                         ('collision_closure_sha256', '^[0-9a-f]{64}$', NULL, NULL),
                         ('source_revocation_count', '>= 0', NULL, NULL),
-                        ('policy_version',
-                          'listing_avionics_grounded_capability', NULL, NULL),
                         ('occurrence_role', 'requested_quantity = 1',
                           'primary', NULL),
                         ('occurrence_role', 'configuration_action',
@@ -3966,7 +3961,7 @@ impl AppDb {
                           )
                             AND actual.attnum > 0
                             AND NOT actual.attisdropped
-                        ) <> 17
+                        ) <> 16
                         OR EXISTS (
                           SELECT 1 FROM required_columns required
                           WHERE NOT EXISTS (
@@ -4051,7 +4046,7 @@ impl AppDb {
                             'public.aircraft_sale_listing_avionics_grounded_capabilities'
                           )
                             AND actual.contype = 'c'
-                        ) <> 15
+                        ) <> 14
                         OR EXISTS (
                           SELECT 1
                           FROM pg_catalog.pg_constraint actual
@@ -5040,7 +5035,6 @@ impl AppDb {
             "CHECK ((grounded_resolution_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((occurrence_index >= 0))",
             "CHECK ((occurrence_role = ANY (ARRAY['primary'::text, 'replacement'::text])))",
-            "CHECK ((policy_version = 'listing_avionics_grounded_capability'::text))",
             "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((requested_quantity > 0))",
@@ -5367,7 +5361,6 @@ impl AppDb {
             "CHECK ((collision_closure_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((evidence_capture_sha256 ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((observation_sha256 ~ '^[0-9a-f]{64}$'::text))",
-            "CHECK ((policy_version = 'listing_avionics_authorization'::text))",
             "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
         ];
 
@@ -5503,14 +5496,13 @@ impl AppDb {
                         ('extracted_listing_sha256', 'text', FALSE, NULL),
                         ('collision_closure_sha256', 'text', TRUE, NULL),
                         ('source_revocation_count', 'bigint', FALSE, NULL),
-                        ('policy_version', 'text', TRUE, NULL),
                         ('authorized_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
                     )
                     SELECT
                       (SELECT COUNT(*) FROM pg_catalog.pg_attribute actual
                        WHERE actual.attrelid = pg_catalog.to_regclass(
                          'public.aircraft_sale_listing_avionics_link_authorizations'
-                       ) AND actual.attnum > 0 AND NOT actual.attisdropped) = 14
+                       ) AND actual.attnum > 0 AND NOT actual.attisdropped) = 13
                       AND NOT EXISTS (
                         SELECT 1 FROM expected
                         WHERE NOT EXISTS (
@@ -17786,6 +17778,9 @@ mod tests {
     fn listing_avionics_authorization_contract_has_backend_parity() {
         let table = "aircraft_sale_listing_avionics_link_authorizations";
         let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
+        assert!(!sqlite_columns
+            .iter()
+            .any(|column| column == "policy_version"));
         assert_eq!(
             sqlite_columns,
             table_columns(POSTGRES_SCHEMA_SQL, table),
@@ -17837,6 +17832,9 @@ mod tests {
         let table = "aircraft_sale_listing_avionics_grounded_capabilities";
         let authorization_table = "aircraft_sale_listing_avionics_link_authorizations";
         let sqlite_columns = table_columns(SQLITE_SCHEMA_SQL, table);
+        assert!(!sqlite_columns
+            .iter()
+            .any(|column| column == "policy_version"));
         assert_eq!(
             sqlite_columns,
             table_columns(POSTGRES_SCHEMA_SQL, table),
@@ -17900,7 +17898,6 @@ mod tests {
             assert!(
                 definition.contains(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT)
             );
-            assert!(definition.contains("listing_avionics_grounded_capability"));
             assert!(definition.contains("requested_quantity"));
             assert!(definition.contains("occurrence_index"));
             assert!(definition.contains("occurrence_role"));
@@ -18058,7 +18055,7 @@ mod tests {
         assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
         assert_eq!(
             LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
-            "e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e"
+            "461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef"
         );
         assert!(!LISTING_AVIONICS_GROUNDED_CAPABILITIES_SQLITE_MIGRATION_SQL
             .contains("DROP TABLE IF EXISTS aircraft_sale_listing_avionics_grounded_capabilities"));
@@ -18400,7 +18397,7 @@ mod tests {
                 quote(capability_sha256) || '|' || quote(grounded_resolution_sha256) || '|' ||
                 quote(evidence_capture_sha256) || '|' || quote(extracted_listing_sha256) || '|' ||
                 quote(product_fingerprint) || '|' || quote(collision_closure_sha256) || '|' ||
-                quote(source_revocation_count) || '|' || quote(policy_version) || '|' ||
+                quote(source_revocation_count) || '|' ||
                 quote(created_at) AS row_value
               FROM aircraft_sale_listing_avionics_grounded_capabilities
               ORDER BY listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -18421,7 +18418,7 @@ mod tests {
                 quote(grounded_resolution_sha256) || '|' || quote(evidence_capture_sha256) || '|' ||
                 quote(plugin_submission_id) || '|' || quote(extracted_listing_sha256) || '|' ||
                 quote(collision_closure_sha256) || '|' || quote(source_revocation_count) || '|' ||
-                quote(policy_version) || '|' || quote(authorized_at) AS row_value
+                quote(authorized_at) AS row_value
               FROM aircraft_sale_listing_avionics_link_authorizations
               ORDER BY listing_link_id, association_role
             )
@@ -18603,8 +18600,7 @@ mod tests {
               configuration_action, request_sha256, capability_sha256,
               grounded_resolution_sha256, evidence_capture_sha256,
               extracted_listing_sha256, product_fingerprint,
-              collision_closure_sha256, source_revocation_count,
-              policy_version, created_at
+              collision_closure_sha256, source_revocation_count, created_at
             ) VALUES (
               91005, 91008, 3, 'primary', 91002, 2, 'installed',
               '1111111111111111111111111111111111111111111111111111111111111111',
@@ -18614,7 +18610,7 @@ mod tests {
               '4444444444444444444444444444444444444444444444444444444444444444',
               '5555555555555555555555555555555555555555555555555555555555555555',
               '6666666666666666666666666666666666666666666666666666666666666666',
-              1, 'listing_avionics_grounded_capability',
+              1,
               '2026-08-25 09:05:00'
             );
             INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
@@ -18622,8 +18618,7 @@ mod tests {
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, source_revocation_count,
-              policy_version, authorized_at
+              collision_closure_sha256, source_revocation_count, authorized_at
             ) VALUES
               (91010, 'installed', 91002, 'same_case_grounded',
                '7777777777777777777777777777777777777777777777777777777777777777',
@@ -18633,7 +18628,7 @@ mod tests {
                91008,
                '4444444444444444444444444444444444444444444444444444444444444444',
                '6666666666666666666666666666666666666666666666666666666666666666',
-               1, 'listing_avionics_authorization',
+               1,
                '2026-08-25 09:06:00'),
               (91011, 'installed', 91002, 'manufacturer_reuse',
                '8888888888888888888888888888888888888888888888888888888888888888',
@@ -18642,7 +18637,7 @@ mod tests {
                'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
                NULL, NULL,
                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-               NULL, 'listing_avionics_authorization',
+               NULL,
                '2026-08-25 09:07:00');
             "#,
         )
@@ -19005,8 +19000,7 @@ mod tests {
               configuration_action, request_sha256, capability_sha256,
               grounded_resolution_sha256, evidence_capture_sha256,
               extracted_listing_sha256, product_fingerprint,
-              collision_closure_sha256, source_revocation_count,
-              policy_version, created_at
+              collision_closure_sha256, source_revocation_count, created_at
             ) VALUES (
               92006, 92009, 3, 'primary', 92005, 2, 'installed',
               '1111111111111111111111111111111111111111111111111111111111111111',
@@ -19016,7 +19010,7 @@ mod tests {
               '4444444444444444444444444444444444444444444444444444444444444444',
               '5555555555555555555555555555555555555555555555555555555555555555',
               '6666666666666666666666666666666666666666666666666666666666666666',
-              0, 'listing_avionics_grounded_capability',
+              0,
               '2026-08-25 09:06:00'
             );
             INSERT INTO public.aircraft_sale_listing_avionics_link_authorizations (
@@ -19024,8 +19018,7 @@ mod tests {
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, source_revocation_count,
-              policy_version, authorized_at
+              collision_closure_sha256, source_revocation_count, authorized_at
             ) VALUES
               (92011, 'installed', 92005, 'same_case_grounded',
                '7777777777777777777777777777777777777777777777777777777777777777',
@@ -19035,7 +19028,7 @@ mod tests {
                92009,
                '4444444444444444444444444444444444444444444444444444444444444444',
                '6666666666666666666666666666666666666666666666666666666666666666',
-               0, 'listing_avionics_authorization',
+               0,
                '2026-08-25 09:07:00'),
               (92012, 'installed', 92005, 'manufacturer_reuse',
                '8888888888888888888888888888888888888888888888888888888888888888',
@@ -19044,7 +19037,7 @@ mod tests {
                'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
                NULL, NULL,
                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-               NULL, 'listing_avionics_authorization',
+               NULL,
                '2026-08-25 09:08:00');
             "#,
         )
@@ -19849,12 +19842,12 @@ mod tests {
                    avionics_model_id, requested_quantity, configuration_action, \
                    request_sha256, capability_sha256, grounded_resolution_sha256, \
                    evidence_capture_sha256, extracted_listing_sha256, product_fingerprint, \
-                   collision_closure_sha256, source_revocation_count, policy_version \
+                   collision_closure_sha256, source_revocation_count \
                  ) VALUES ( \
                    70002, 70001, 0, 'primary', 70003, 1, 'installed', \
                    repeat('a', 64), repeat('b', 64), repeat('c', 64), \
                    repeat('a', 64), repeat('d', 64), repeat('e', 64), \
-                   repeat('f', 64), 0, 'listing_avionics_grounded_capability' \
+                   repeat('f', 64), 0 \
                  )",
             )
             .await

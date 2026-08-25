@@ -36,7 +36,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e'
+          '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef'
       )
   ) THEN
     RAISE EXCEPTION
@@ -69,7 +69,6 @@ BEGIN
       ('product_fingerprint', 'text', TRUE, NULL::TEXT),
       ('collision_closure_sha256', 'text', TRUE, NULL::TEXT),
       ('source_revocation_count', 'bigint', TRUE, NULL::TEXT),
-      ('policy_version', 'text', TRUE, NULL::TEXT),
       ('created_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
   )
   SELECT
@@ -79,7 +78,7 @@ BEGIN
              'public.aircraft_sale_listing_avionics_grounded_capabilities'
            )
        AND actual.attnum > 0
-       AND NOT actual.attisdropped) = 17
+       AND NOT actual.attisdropped) = 16
     AND NOT EXISTS (
       SELECT 1
       FROM expected
@@ -131,7 +130,6 @@ BEGIN
       ('extracted_listing_sha256', 'text', FALSE, NULL::TEXT),
       ('collision_closure_sha256', 'text', TRUE, NULL::TEXT),
       ('source_revocation_count', 'bigint', FALSE, NULL::TEXT),
-      ('policy_version', 'text', TRUE, NULL::TEXT),
       ('authorized_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
   )
   SELECT
@@ -141,7 +139,7 @@ BEGIN
              'public.aircraft_sale_listing_avionics_link_authorizations'
            )
        AND actual.attnum > 0
-       AND NOT actual.attisdropped) = 14
+       AND NOT actual.attisdropped) = 13
     AND NOT EXISTS (
       SELECT 1
       FROM expected
@@ -456,15 +454,13 @@ BEGIN
       'configuration_action', 'request_sha256', 'capability_sha256',
       'grounded_resolution_sha256', 'evidence_capture_sha256',
       'extracted_listing_sha256', 'product_fingerprint',
-      'collision_closure_sha256', 'source_revocation_count',
-      'policy_version', 'created_at'
+      'collision_closure_sha256', 'source_revocation_count', 'created_at'
     ]::TEXT[] OR authorization_columns IS DISTINCT FROM ARRAY[
       'listing_link_id', 'association_role', 'avionics_model_id',
       'authorization_kind', 'observation_sha256', 'product_fingerprint',
       'grounded_resolution_sha256', 'evidence_capture_sha256',
       'plugin_submission_id', 'extracted_listing_sha256',
-      'collision_closure_sha256', 'source_revocation_count',
-      'policy_version', 'authorized_at'
+      'collision_closure_sha256', 'source_revocation_count', 'authorized_at'
     ]::TEXT[]
     OR NOT capability_columns_are_exact
     OR NOT authorization_columns_are_exact
@@ -479,7 +475,6 @@ BEGIN
       'CHECK ((grounded_resolution_sha256 ~ ''^[0-9a-f]{64}$''::text))',
       'CHECK ((occurrence_index >= 0))',
       'CHECK ((occurrence_role = ANY (ARRAY[''primary''::text, ''replacement''::text])))',
-      'CHECK ((policy_version = ''listing_avionics_grounded_capability''::text))',
       'CHECK ((product_fingerprint ~ ''^[0-9a-f]{64}$''::text))',
       'CHECK ((request_sha256 ~ ''^[0-9a-f]{64}$''::text))',
       'CHECK ((requested_quantity > 0))',
@@ -493,7 +488,6 @@ BEGIN
       'CHECK ((collision_closure_sha256 ~ ''^[0-9a-f]{64}$''::text))',
       'CHECK ((evidence_capture_sha256 ~ ''^[0-9a-f]{64}$''::text))',
       'CHECK ((observation_sha256 ~ ''^[0-9a-f]{64}$''::text))',
-      'CHECK ((policy_version = ''listing_avionics_authorization''::text))',
       'CHECK ((product_fingerprint ~ ''^[0-9a-f]{64}$''::text))'
     ]::TEXT[]
     OR NOT capability_checks_are_valid
@@ -738,8 +732,6 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_grounded_capabi
     CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
   source_revocation_count BIGINT NOT NULL
     CHECK (source_revocation_count >= 0),
-  policy_version TEXT NOT NULL
-    CHECK (policy_version = 'listing_avionics_grounded_capability'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (
     listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -833,8 +825,6 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizat
   collision_closure_sha256 TEXT NOT NULL
     CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
   source_revocation_count BIGINT,
-  policy_version TEXT NOT NULL
-    CHECK (policy_version = 'listing_avionics_authorization'),
   authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (listing_link_id, association_role),
   CHECK (
@@ -1274,7 +1264,7 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e',
+  '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
