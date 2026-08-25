@@ -2404,6 +2404,61 @@ mod tests {
         listing_link_id
     }
 
+    async fn insert_current_manufacturer_reuse_authorization(
+        fixture: &Fixture,
+        listing_link_id: i64,
+        model_id: i64,
+        quantity: i64,
+        evidence_text: &str,
+    ) -> (String, String) {
+        let pool = pool(&fixture.db);
+        let product_fingerprint: String = sqlx::query_scalar(
+            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        )
+        .bind(model_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let observation_sha256 = association_observation_sha256_from_values(
+            fixture.listing_id,
+            listing_link_id,
+            ListingAssociationRole::Installed,
+            model_id,
+            model_id,
+            None,
+            quantity,
+            "installed",
+            evidence_text,
+        );
+        let collision_closure_sha256 =
+            super::super::active_collision_closure_revision_sha256(&fixture.db, model_id)
+                .await
+                .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              grounded_resolution_sha256, evidence_capture_sha256,
+              plugin_submission_id, extracted_listing_sha256,
+              collision_closure_sha256, policy_version
+            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL,
+                      ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(listing_link_id)
+        .bind(model_id)
+        .bind(&observation_sha256)
+        .bind(product_fingerprint)
+        .bind(&fixture.rendered_html_sha256)
+        .bind(&collision_closure_sha256)
+        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
+        .execute(pool)
+        .await
+        .unwrap();
+        (observation_sha256, collision_closure_sha256)
+    }
+
     async fn linked_only_request(
         fixture: &mut Fixture,
         model_id: i64,
@@ -3368,33 +3423,14 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let product_fingerprint: String = sqlx::query_scalar(
-            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        let original_authorization = insert_current_manufacturer_reuse_authorization(
+            &fixture,
+            existing_link_id,
+            accepted_id,
+            1,
+            "Garmin GTX 345",
         )
-        .bind(accepted_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
-              listing_link_id, association_role, avionics_model_id,
-              authorization_kind, observation_sha256, product_fingerprint,
-              grounded_resolution_sha256, evidence_capture_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL,
-                      ?, ?, 'listing_avionics_authorization_v1')
-            "#,
-        )
-        .bind(existing_link_id)
-        .bind(accepted_id)
-        .bind("1".repeat(64))
-        .bind(&product_fingerprint)
-        .bind(&fixture.rendered_html_sha256)
-        .bind("2".repeat(64))
-        .execute(pool)
-        .await
-        .unwrap();
+        .await;
 
         let result = apply_automated_avionics_review(
             &fixture.db,
@@ -3439,8 +3475,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        assert_ne!(refreshed.0, "1".repeat(64));
-        assert_ne!(refreshed.1, "2".repeat(64));
+        assert_eq!(refreshed, original_authorization);
     }
 
     #[tokio::test]
@@ -3463,33 +3498,14 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let product_fingerprint: String = sqlx::query_scalar(
-            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+        insert_current_manufacturer_reuse_authorization(
+            &fixture,
+            existing_link_id,
+            accepted_id,
+            2,
+            "Garmin GTX 345",
         )
-        .bind(accepted_id)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO aircraft_sale_listing_avionics_authorizations (
-              listing_link_id, association_role, avionics_model_id,
-              authorization_kind, observation_sha256, product_fingerprint,
-              grounded_resolution_sha256, evidence_capture_sha256,
-              collision_closure_sha256, policy_version
-            ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL,
-                      ?, ?, 'listing_avionics_authorization_v1')
-            "#,
-        )
-        .bind(existing_link_id)
-        .bind(accepted_id)
-        .bind("1".repeat(64))
-        .bind(product_fingerprint)
-        .bind(&fixture.rendered_html_sha256)
-        .bind("2".repeat(64))
-        .execute(pool)
-        .await
-        .unwrap();
+        .await;
 
         apply_automated_avionics_review(
             &fixture.db,
