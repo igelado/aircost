@@ -11462,8 +11462,9 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             r#"
             INSERT INTO plugin_submissions (
               user_id, plugin_install_id, source_url, rendered_html,
-              rendered_html_sha256, signature_base64, canonical_listing_id
-            ) VALUES (?, ?, ?, ?, ?, 'test-signature', ?)
+              rendered_html_sha256, signature_base64,
+              extracted_listing_json, canonical_listing_id
+            ) VALUES (?, ?, ?, ?, ?, 'test-signature', '{}', ?)
             RETURNING id
             "#,
         )
@@ -11727,12 +11728,17 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
             grounded_collision_closure_revision_sha256(db, avionics_model_id)
                 .await
                 .unwrap();
-        let evidence_capture_sha256: String =
-            sqlx::query_scalar("SELECT rendered_html_sha256 FROM plugin_submissions WHERE id = ?")
-                .bind(plugin_submission_id)
-                .fetch_one(sqlite_pool(db))
-                .await
-                .unwrap();
+        let (evidence_capture_sha256, extracted_listing_json): (String, String) = sqlx::query_as(
+            "SELECT rendered_html_sha256, extracted_listing_json \
+                 FROM plugin_submissions \
+                 WHERE id = ? AND extracted_listing_json IS NOT NULL \
+                   AND extraction_error IS NULL",
+        )
+        .bind(plugin_submission_id)
+        .fetch_one(sqlite_pool(db))
+        .await
+        .unwrap();
+        let extracted_listing_sha256 = sha256_hex(extracted_listing_json.as_bytes());
         let observation_sha256 = association_observation_sha256(
             listing_id,
             &assignment,
@@ -11745,8 +11751,9 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
               listing_link_id, association_role, avionics_model_id,
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
+              plugin_submission_id, extracted_listing_sha256,
               collision_closure_sha256, policy_version
-            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(listing_link_id)
@@ -11756,6 +11763,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .bind(product_fingerprint)
         .bind("e".repeat(64))
         .bind(evidence_capture_sha256)
+        .bind(plugin_submission_id)
+        .bind(extracted_listing_sha256)
         .bind(collision_closure_sha256)
         .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
         .execute(sqlite_pool(db))
@@ -11930,6 +11939,69 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .await
         .unwrap();
         assert_eq!(preserved, vec![(product_id, 1)]);
+    }
+
+    #[tokio::test]
+    async fn failed_exact_submission_checkpoint_invalidates_same_case_authorization() {
+        let db = test_db().await;
+        let (user_id, listing_id) = insert_listing(&db).await;
+        let product_id = insert_approved_product(&db, "WX-500", "WX500", "Weather Radar").await;
+        let evidence = "L3 WX-500 stormscope";
+        let submission_id = insert_review_bound_submission(
+            &db,
+            user_id,
+            listing_id,
+            &format!("<main>{evidence}</main>"),
+        )
+        .await;
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 1, 'listing', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .bind(evidence)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        insert_current_same_case_authorization(
+            &db,
+            listing_id,
+            link_id,
+            product_id,
+            submission_id,
+            ListingAssociationRole::Installed,
+        )
+        .await;
+
+        sqlx::query(
+            "UPDATE plugin_submissions \
+             SET extraction_error = 'checkpoint rejected' \
+             WHERE id = ?",
+        )
+        .bind(submission_id)
+        .execute(sqlite_pool(&db))
+        .await
+        .unwrap();
+
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM aircraft_sale_listing_avionics_authorizations \
+             WHERE listing_link_id = ? AND association_role = 'installed'",
+        )
+        .bind(link_id)
+        .fetch_one(sqlite_pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            retained, 0,
+            "a failed exact checkpoint must immediately revoke its same-case proof"
+        );
     }
 
     #[tokio::test]

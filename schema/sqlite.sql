@@ -8321,9 +8321,12 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
     product_fingerprint TEXT NOT NULL,
     grounded_resolution_sha256 TEXT,
     evidence_capture_sha256 TEXT NOT NULL,
+    plugin_submission_id INTEGER
+      REFERENCES plugin_submissions(id) ON DELETE CASCADE,
+    extracted_listing_sha256 TEXT,
     collision_closure_sha256 TEXT NOT NULL,
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_authorization_v1'),
+      CHECK (policy_version = 'listing_avionics_authorization_v2'),
     authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (listing_link_id, association_role),
     CHECK (length(observation_sha256) = 64),
@@ -8335,17 +8338,26 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_authorizations (
     CHECK (length(evidence_capture_sha256) = 64),
     CHECK (evidence_capture_sha256 = lower(evidence_capture_sha256)),
     CHECK (evidence_capture_sha256 NOT GLOB '*[^0-9a-f]*'),
+    CHECK (extracted_listing_sha256 IS NULL OR (
+      length(extracted_listing_sha256) = 64
+      AND extracted_listing_sha256 = lower(extracted_listing_sha256)
+      AND extracted_listing_sha256 NOT GLOB '*[^0-9a-f]*'
+    )),
     CHECK (length(collision_closure_sha256) = 64),
     CHECK (collision_closure_sha256 = lower(collision_closure_sha256)),
     CHECK (collision_closure_sha256 NOT GLOB '*[^0-9a-f]*'),
     CHECK (
       (authorization_kind = 'manufacturer_reuse'
-        AND grounded_resolution_sha256 IS NULL)
+        AND grounded_resolution_sha256 IS NULL
+        AND plugin_submission_id IS NULL
+        AND extracted_listing_sha256 IS NULL)
       OR
       (authorization_kind = 'same_case_grounded'
         AND length(grounded_resolution_sha256) = 64
         AND grounded_resolution_sha256 = lower(grounded_resolution_sha256)
-        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*')
+        AND grounded_resolution_sha256 NOT GLOB '*[^0-9a-f]*'
+        AND plugin_submission_id IS NOT NULL
+        AND extracted_listing_sha256 IS NOT NULL)
     )
   );
 
@@ -8372,23 +8384,34 @@ WHEN NOT EXISTS (
         AND link.replaces_avionics_model_id = NEW.avionics_model_id
       )
     )
-    AND EXISTS (
-      SELECT 1 FROM plugin_submissions capture
-      WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
-        AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
-        AND instr(capture.rendered_html, link.source_notes) > 0
-    )
     AND (
-      (NEW.authorization_kind = 'manufacturer_reuse' AND EXISTS (
-        SELECT 1 FROM avionics_product_reuse_attestations attestation
-        WHERE attestation.avionics_model_id = NEW.avionics_model_id
-          AND attestation.product_fingerprint = NEW.product_fingerprint
-      ))
+      (NEW.authorization_kind = 'manufacturer_reuse'
+        AND EXISTS (
+          SELECT 1 FROM plugin_submissions capture
+          WHERE capture.canonical_listing_id = link.aircraft_sale_listing_id
+            AND capture.rendered_html_sha256 = NEW.evidence_capture_sha256
+            AND instr(capture.rendered_html, link.source_notes) > 0
+        )
+        AND EXISTS (
+          SELECT 1 FROM avionics_product_reuse_attestations attestation
+          WHERE attestation.avionics_model_id = NEW.avionics_model_id
+            AND attestation.product_fingerprint = NEW.product_fingerprint
+        ))
       OR
-      (NEW.authorization_kind = 'same_case_grounded' AND EXISTS (
-        SELECT 1 FROM avionics_approved_product_graph_identities identity
-        WHERE identity.avionics_model_id = NEW.avionics_model_id
-      ))
+      (NEW.authorization_kind = 'same_case_grounded'
+        AND EXISTS (
+          SELECT 1 FROM plugin_submissions submission
+          WHERE submission.id = NEW.plugin_submission_id
+            AND submission.canonical_listing_id = link.aircraft_sale_listing_id
+            AND submission.rendered_html_sha256 = NEW.evidence_capture_sha256
+            AND submission.extracted_listing_json IS NOT NULL
+            AND submission.extraction_error IS NULL
+            AND instr(submission.rendered_html, link.source_notes) > 0
+        )
+        AND EXISTS (
+          SELECT 1 FROM avionics_approved_product_graph_identities identity
+          WHERE identity.avionics_model_id = NEW.avionics_model_id
+        ))
     )
 )
 BEGIN
@@ -8620,6 +8643,21 @@ BEGIN
     );
 END;
 
+CREATE TRIGGER IF NOT EXISTS
+  listing_avionics_authorizations_invalidate_submission_checkpoint_update
+AFTER UPDATE OF
+  canonical_listing_id,
+  rendered_html,
+  rendered_html_sha256,
+  extracted_listing_json,
+  extraction_error
+ON plugin_submissions
+BEGIN
+  DELETE FROM aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND plugin_submission_id = OLD.id;
+END;
+
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
@@ -8702,6 +8740,7 @@ BEGIN
     WHERE character_offset > length(NEW.name)
   );
 END;
+
 CREATE TRIGGER IF NOT EXISTS aircraft_make_retrieval_key_validate_update
 BEFORE UPDATE OF name, normalized_name ON aircraft_makes
 BEGIN
