@@ -45,6 +45,8 @@ use crate::gemini::curation::workflow::{
     direct_source_product_identity_signal_is_present, SourceEvidenceProof,
 };
 use crate::gemini::interactions::FetchedSourceDocument;
+use crate::html::listing::media::validate_controller_listing_source_url;
+use crate::listing::avionics::extraction::exact_controller_run_on_capability_annotation;
 use crate::listing::evidence::ListingEvidenceContext;
 use crate::normalize::{
     is_generic_avionics_manufacturer_name, is_generic_avionics_model_name,
@@ -288,6 +290,7 @@ impl ApprovedProductAssociationResolver {
             manufacturer_identity_id,
             &self.approved_candidates,
             &self.catalog,
+            false,
         )
     }
 }
@@ -1658,6 +1661,7 @@ pub async fn resolve_verified_local_avionics_identity(
             manufacturer_identity_id,
             &approved_candidates,
             &catalog,
+            false,
         ) {
             return Ok(Some(approved));
         }
@@ -1676,6 +1680,67 @@ pub async fn resolve_verified_local_avionics_identity(
         &approved_candidates,
         &catalog,
         &active_collision_catalog,
+    ))
+}
+
+/// Resolve one already-validated Controller run-on occurrence without Gemini.
+///
+/// The caller remains responsible for proving that `listing_context` is the
+/// exact retained occurrence rather than a page-wide context. This boundary
+/// adds only the run-on grammar proof; current approval, reuse attestation,
+/// effective manufacturer identity, exact canonical product key, and catalog
+/// collision checks remain unchanged. It intentionally has no global
+/// model-only fallback because an attached suffix must never repair a maker.
+pub(crate) async fn resolve_verified_local_controller_run_on_avionics_identity(
+    db: &AppDb,
+    request: &AvionicsIdentityRequest,
+) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
+    if validate_controller_listing_source_url(&request.source_url).is_err()
+        || !request.requires_listing_evidence
+        || request.listing_context.trim().is_empty()
+        || request.manufacturer.trim().is_empty()
+        || request.model.trim().is_empty()
+        || request.avionics_types.is_empty()
+        || request.avionics_types.iter().any(|capability| {
+            let capability = capability.trim();
+            capability.is_empty() || !CURATED_AVIONICS_TYPES.contains(&capability)
+        })
+        || attached_quantity_plural_ambiguity(request).is_some()
+        || !exact_controller_run_on_capability_annotation(
+            request.listing_context.trim(),
+            &request.model,
+            &request.avionics_types,
+            request.quantity == 2,
+        )
+    {
+        return Ok(None);
+    }
+
+    let Some(manufacturer_identity_id) =
+        resolve_input_manufacturer_identity(db, &request.manufacturer).await?
+    else {
+        return Ok(None);
+    };
+    let catalog = load_catalog_candidates(db).await?;
+    let approved_candidates = load_known_approved_candidates(db).await?;
+    let observed_product_key = normalize_avionics_identifier(&request.model);
+    if !approved_candidates.iter().any(|candidate| {
+        candidate.avionics_manufacturer_identity_id == manufacturer_identity_id
+            && candidate.canonical_product_key == observed_product_key
+            && request
+                .avionics_types
+                .iter()
+                .all(|capability| candidate.avionics_types.contains(capability))
+    }) {
+        return Ok(None);
+    }
+    Ok(known_approved_local_match_core(
+        &request.model,
+        &request.listing_context,
+        manufacturer_identity_id,
+        &approved_candidates,
+        &catalog,
+        true,
     ))
 }
 
@@ -4264,6 +4329,7 @@ fn known_approved_local_match(
         manufacturer_identity_id,
         candidates,
         catalog,
+        false,
     )
 }
 
@@ -4273,6 +4339,7 @@ fn known_approved_local_match_core(
     manufacturer_identity_id: i64,
     candidates: &[KnownApprovedAvionicsCandidate],
     catalog: &[AvionicsCatalogCandidate],
+    validated_controller_run_on: bool,
 ) -> Option<ApprovedAvionicsIdentity> {
     let observed_product_key = normalize_avionics_identifier(observed_model);
     if observed_product_key.is_empty() {
@@ -4316,10 +4383,10 @@ fn known_approved_local_match_core(
                 .iter()
                 .filter_map(|candidate| {
                     (observed_product_key == candidate.canonical_product_key
-                        && exact_compact_identity_is_present(
+                        && (exact_compact_identity_is_present(
                             listing_evidence_text,
                             &candidate.canonical_product_key,
-                        ))
+                        ) || validated_controller_run_on))
                     .then_some(*candidate)
                 })
                 .collect::<Vec<_>>();
@@ -7080,7 +7147,8 @@ mod tests {
         expanded_complete_triage_collision_context, explicit_authoritative_direct_source_plan,
         generic_concreteness_rejection_reason, globally_unique_exact_model_local_match_core,
         grounded_consolidation_preview_block, grounded_resolution_receipt_seed,
-        known_approved_local_match, load_active_collision_catalog_rows, load_catalog_candidates,
+        known_approved_local_match, known_approved_local_match_core,
+        load_active_collision_catalog_rows, load_catalog_candidates,
         load_known_approved_candidates, load_review_catalog_candidates,
         manufacturer_collision_snapshot_sha256, manufacturer_scoped_catalog_candidates,
         model_identity_relation_score, nonpositive_identity_outcome,
@@ -9687,6 +9755,22 @@ mod tests {
         assert!(approved
             .reason
             .contains("exact retained manufacturer/model"));
+    }
+
+    #[test]
+    fn validated_controller_run_on_cannot_bypass_the_exact_product_key() {
+        let selected = known_candidate(7, "GIA 63W");
+        let selected_catalog = candidate(7, "GIA 63W", "approved");
+
+        assert!(known_approved_local_match_core(
+            "GIA 63W NXi",
+            "GIA63WNXiNAV/COM/GPS",
+            1,
+            &[selected],
+            &[selected_catalog],
+            true,
+        )
+        .is_none());
     }
 
     #[test]
@@ -12589,6 +12673,32 @@ mod tests {
             .existing_catalog_scope
             .manufacturer_identity_ids
             .contains(&cessna_identity.avionics_manufacturer_identity_id));
+    }
+
+    #[tokio::test]
+    async fn manufacturer_omitting_occurrence_still_routes_to_grounded_curation() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let request = AvionicsIdentityRequest {
+            manufacturer: "Garmin".to_string(),
+            model: "GDC 74".to_string(),
+            avionics_types: vec!["Air Data Computer".to_string()],
+            listing_context: "GDC74 Air Data Computer".to_string(),
+            source_url: "https://www.controller.com/listing/for-sale/25/example".to_string(),
+            ..local_request("")
+        };
+
+        let plan = plan_avionics_identity_verification_route(&db, &request)
+            .await
+            .expect("a manufacturer-omitting occurrence should retain a safe paid route");
+
+        assert_eq!(
+            plan.route,
+            AvionicsIdentityVerificationRoute::GroundedCuration
+        );
+        assert_eq!(request.manufacturer, "Garmin");
+        assert_eq!(request.listing_context, "GDC74 Air Data Computer");
     }
 
     #[tokio::test]

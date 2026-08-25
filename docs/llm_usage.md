@@ -125,7 +125,20 @@ remain one unit. Generic publishers use structurally visible body units, where
 sibling blocks, table cells, and definition terms/values remain separate.
 Whole-body flattening cannot manufacture an evidence phrase across any of
 these boundaries. The same gate runs for the initial extraction checkpoint and
-durable avionics re-extraction. Within the one trusted Controller
+durable avionics re-extraction. During materialization, local matching and any
+paid avionics prompt receive only that checkpoint occurrence when it is
+nonempty, no more than 256 bytes, and can be rebound to the retained source
+adapter's exact source-unit proof. The flattened extraction text is not a
+materialization proof and cannot join sibling DOM units. Identity work never
+receives a page excerpt containing adjacent listing fields. The observed
+manufacturer remains separate structured request data, so an exact occurrence
+need not repeat it merely to preserve the paid fallback.
+After any exact same-case replay is considered, a missing, oversized, or
+unrebindable occurrence stops as pending before local matching or a provider
+call. A paid fallback is therefore possible only for a successfully rebound
+occurrence and only when replay policy permits it.
+
+Within the one trusted Controller
 `Avionics/Radios` value, an otherwise missing right-hand model boundary is
 accepted only for a source-authored run-on annotation whose immediately
 adjacent and complete suffix consists of capability phrases declared for that
@@ -133,8 +146,13 @@ same occurrence. Slash-delimited multifunction capabilities and an exact
 quantity-consistent `(Dual)` annotation are supported. Undeclared capabilities,
 arbitrary continuations, unrelated trailing words, and product-variant suffixes
 remain identity failures. This extraction-only grammar also applies to an
-explicit replacement identity; it does not weaken catalog-reuse matching and
-never rewrites the retained evidence.
+explicit replacement identity and never rewrites the retained evidence. During
+materialization the same exact-line grammar may corroborate one ordinary local
+reuse decision only after the observed model already equals the canonical
+product key inside the effective manufacturer identity and the complete product
+graph has a current reuse attestation. Duplicate identities, variants,
+unattested products, type mismatches, and non-Controller occurrences still use
+the normal fail-closed or paid path.
 An `Integrated Flight Deck` identity may establish that core category without
 repeating it in prose; every additional category assigned to the suite must be
 explicit in the same occurrence evidence, and a separately extracted

@@ -19,7 +19,9 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{
     parse_listing_html_for_avionics_validation, validate_source_url, GeminiListingExtractor,
 };
-use crate::html::listing::source::listing_extraction_source;
+use crate::html::listing::source::{
+    listing_evidence_units, listing_extraction_source, ListingEvidenceUnits,
+};
 use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
 use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
@@ -1127,6 +1129,15 @@ fn retained_listing_context(source_url: &str, rendered_html: &str) -> StoreResul
     })
 }
 
+fn retained_listing_evidence_units(
+    source_url: &str,
+    rendered_html: &str,
+) -> StoreResult<ListingEvidenceUnits> {
+    listing_evidence_units(source_url, rendered_html).map_err(|error| {
+        PluginStoreError::Validation(format!("retained listing source is invalid: {error}"))
+    })
+}
+
 async fn recover_bound_source_correction(
     db: &AppDb,
     user: &User,
@@ -1148,6 +1159,10 @@ async fn recover_bound_source_correction(
         warnings: Vec::new(),
         identity_recovery,
         context_text: Some(retained_listing_context(
+            &submission.source_url,
+            rendered_html,
+        )?),
+        source_evidence_units: Some(retained_listing_evidence_units(
             &submission.source_url,
             rendered_html,
         )?),
@@ -2099,6 +2114,10 @@ async fn complete_bound_replay_materialization(
                 &stored.source_url,
                 &stored.rendered_html,
             )?),
+            source_evidence_units: Some(retained_listing_evidence_units(
+                &stored.source_url,
+                &stored.rendered_html,
+            )?),
         };
         let resumed = resume_bound_replay_listing(
             db,
@@ -2194,6 +2213,10 @@ pub async fn materialize_plugin_submission_checkpoint(
         warnings: Vec::new(),
         identity_recovery,
         context_text: Some(retained_listing_context(
+            &stored.source_url,
+            &stored.rendered_html,
+        )?),
+        source_evidence_units: Some(retained_listing_evidence_units(
             &stored.source_url,
             &stored.rendered_html,
         )?),
@@ -4485,12 +4508,6 @@ mod tests {
         let extracted_listing_json = extraction.to_string();
         let extracted_listing_sha256 = sha256_hex(extracted_listing_json.as_bytes());
         let rendered_html_sha256 = sha256_hex(html.as_bytes());
-        let listing_context = super::retained_listing_context(source_url, &html)
-            .unwrap()
-            .split_whitespace()
-            .take(900)
-            .collect::<Vec<_>>()
-            .join(" ");
         let identity = approved_avionics_identity_for_grounded_replay(&db, avionics_model_id)
             .await
             .unwrap()
@@ -4501,7 +4518,7 @@ mod tests {
             aircraft_variant: "182T".to_string(),
             model_year: 2020,
             source_url: source_url.to_string(),
-            listing_context,
+            listing_context: source_notes.to_string(),
             requires_listing_evidence: true,
             authoritative_direct_source_urls: Vec::new(),
             authoritative_identity_anchors: Vec::new(),
