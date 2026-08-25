@@ -4453,7 +4453,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires the separately integrated grounded-capability v2 schema"]
     async fn bound_signed_retry_consumes_retained_capability_without_gemini() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let user = db.current_user(None).await.unwrap();
