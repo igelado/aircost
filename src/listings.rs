@@ -1168,42 +1168,27 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
 
     if may_reuse_listing && resolved_avionics.pending_review_aspects.is_empty() {
         if let Some(listing_id) = matching_verified_listing_id(db, &values).await? {
-            let has_grounded_capabilities =
-                !prepare_grounded_capability_bindings(&values.avionics)?.is_empty();
-            if has_grounded_capabilities {
-                emit_listing_progress(
-                    progress,
-                    "saving_listing",
-                    "Re-authorizing matching listing avionics",
-                );
-                stage_existing_listing_signed_source_grounded_capabilities(
+            stage_existing_listing_signed_source_grounded_capabilities(
+                db,
+                listing_id,
+                signed_source_binding,
+                &values.avionics,
+            )
+            .await?;
+            emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
+            refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
+            if let Some(binding) = signed_source_binding {
+                retire_exact_bound_grounded_capabilities(
                     db,
-                    listing_id,
-                    signed_source_binding,
-                    &values.avionics,
+                    &GroundedCapabilityReplayScope {
+                        listing_id,
+                        plugin_submission_id: binding.submission_id,
+                        rendered_html_sha256: binding.rendered_html_sha256.clone(),
+                        extracted_listing_sha256: binding.bound_extracted_listing_sha256.clone(),
+                    },
                 )
                 .await?;
-                update_listing_values(
-                    db,
-                    listing_id,
-                    &values,
-                    &literal_identity_values,
-                    true,
-                    true,
-                    false,
-                )
-                .await?;
-            } else {
-                emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
-                refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
             }
-            emit_listing_progress(
-                progress,
-                "refreshing_estimates",
-                "Refreshing valuation inputs",
-            );
-            mark_listing_incomplete(db, listing_id).await?;
-            finalize_listing_ingestion(db, listing_id).await?;
             return Ok(ListingCreationResult {
                 listing: get_listing(db, user_id, listing_id).await?,
                 occurrence_dispositions: resolved_avionics.occurrence_dispositions,
@@ -1522,6 +1507,9 @@ pub(crate) async fn resume_bound_replay_listing(
     db: &AppDb,
     user_id: i64,
     listing_id: i64,
+    plugin_submission_id: i64,
+    rendered_html_sha256: &str,
+    extracted_listing_sha256: &str,
     preview: &ListingPreview,
     extractor: Option<&GeminiListingExtractor>,
 ) -> StoreResult<ListingCreationResult> {
@@ -1555,17 +1543,38 @@ pub(crate) async fn resume_bound_replay_listing(
             "bound replay listing {listing_id} changed before deterministic recovery"
         )));
     }
-    let replay_scope = grounded_capability_replay_scope(db, listing_id).await?;
+    let replay_scope = GroundedCapabilityReplayScope {
+        listing_id,
+        plugin_submission_id,
+        rendered_html_sha256: rendered_html_sha256.to_string(),
+        extracted_listing_sha256: extracted_listing_sha256.to_string(),
+    };
     let resolved_avionics = resolve_listing_avionics_values(
         db,
         &mut values,
         extractor,
         preview.source_url.as_deref(),
         preview.context_text.as_deref(),
-        replay_scope.as_ref(),
+        Some(&replay_scope),
     )
     .await?;
-    stage_bound_replay_grounded_capabilities(db, replay_scope.as_ref(), &values.avionics).await?;
+    if current.is_verified {
+        if !resolved_avionics.pending_review_aspects.is_empty()
+            || !listing_matches_values(db, &current, &values).await?
+        {
+            return Err(ListingStoreError::State(format!(
+                "verified bound replay listing {listing_id} no longer matches its retained checkpoint"
+            )));
+        }
+        retire_exact_bound_grounded_capabilities(db, &replay_scope).await?;
+        return Ok(ListingCreationResult {
+            listing: current,
+            occurrence_dispositions: resolved_avionics.occurrence_dispositions,
+            source_serial_correction: None,
+            source_visual_correction: None,
+        });
+    }
+    stage_bound_replay_grounded_capabilities(db, Some(&replay_scope), &values.avionics).await?;
     update_listing_values(
         db,
         listing_id,
@@ -2390,13 +2399,35 @@ async fn stage_bound_replay_grounded_capabilities(
     Ok(())
 }
 
+async fn retire_exact_bound_grounded_capabilities(
+    db: &AppDb,
+    scope: &GroundedCapabilityReplayScope,
+) -> StoreResult<()> {
+    execute_query!(
+        db,
+        r#"
+        DELETE FROM aircraft_sale_listing_avionics_grounded_capabilities
+        WHERE listing_id = ?
+          AND plugin_submission_id = ?
+          AND evidence_capture_sha256 = ?
+          AND extracted_listing_sha256 = ?
+        "#,
+        scope.listing_id,
+        scope.plugin_submission_id,
+        scope.rendered_html_sha256.as_str(),
+        scope.extracted_listing_sha256.as_str(),
+    )?;
+    Ok(())
+}
+
 async fn stage_existing_listing_signed_source_grounded_capabilities(
     db: &AppDb,
     listing_id: i64,
     binding: Option<&SignedSourceListingBinding>,
     avionics: &[ListingAvionicsValue],
 ) -> StoreResult<()> {
-    if prepare_grounded_capability_bindings(avionics)?.is_empty() {
+    let grounded_capabilities = prepare_grounded_capability_bindings(avionics)?;
+    if grounded_capabilities.is_empty() && binding.is_none() {
         return Ok(());
     }
     let binding = binding.ok_or_else(|| {
@@ -2485,17 +2516,15 @@ async fn stage_existing_listing_signed_source_grounded_capabilities(
         }
     });
     let listing_lock_sql = db.sql(match db.backend() {
-        DatabaseBackend::Sqlite(_) => {
-            "UPDATE aircraft_sale_listings SET updated_at = updated_at WHERE id = ? RETURNING id"
-        }
-        DatabaseBackend::Postgres(_) => {
-            "SELECT id FROM aircraft_sale_listings WHERE id = ? FOR UPDATE"
+        DatabaseBackend::Sqlite(_) | DatabaseBackend::Postgres(_) => {
+            "UPDATE aircraft_sale_listings SET source_url = ? WHERE id = ? RETURNING id"
         }
     });
     macro_rules! bind_in_transaction {
         ($pool:expr) => {{
             let mut transaction = $pool.begin().await?;
             let locked_listing: Option<i64> = sqlx::query_scalar(&listing_lock_sql)
+                .bind(binding.source_url.as_str())
                 .bind(listing_id)
                 .fetch_optional(&mut *transaction)
                 .await?;
@@ -5061,6 +5090,10 @@ async fn matching_verified_listing_id(
         WHERE UPPER(l.registration_number) = UPPER(?)
           AND l.is_verified = TRUE
           AND l.ingestion_state = 'ready'
+          AND NOT EXISTS (
+            SELECT 1 FROM plugin_submission_materialization_receipts receipt
+            WHERE receipt.aircraft_sale_listing_id = l.id
+          )
         ORDER BY l.added_at DESC, l.id DESC
         "#,
         registration_number
@@ -5643,22 +5676,6 @@ async fn prepare_listing_canonical_aircraft_identity(
         .await
         .map_err(listing_admission_error)?;
     Ok(CanonicalAircraftIdentityPreparation::Ready)
-}
-
-async fn mark_listing_incomplete(db: &AppDb, listing_id: i64) -> StoreResult<()> {
-    execute_query!(
-        db,
-        r#"
-        UPDATE aircraft_sale_listings
-        SET ingestion_state = 'incomplete',
-            ingestion_error = NULL,
-            ingestion_completed_at = NULL,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-        "#,
-        listing_id
-    )?;
-    Ok(())
 }
 
 async fn listing_has_pending_review(db: &AppDb, listing_id: i64) -> StoreResult<bool> {

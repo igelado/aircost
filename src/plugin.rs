@@ -11,7 +11,6 @@ use sqlx::FromRow;
 
 use crate::aircraft::faa::{
     admit_aircraft_source_identity, AircraftAdmissionError, BlockReason, FaaSerialCorrection,
-    SourceAircraftAdmission,
 };
 use crate::aircraft::repair::{
     record_bound_source_serial_correction, record_bound_source_visual_correction,
@@ -437,35 +436,8 @@ pub async fn submit_plugin_html_with_progress(
         let Some(listing_id) = existing.canonical_listing_id else {
             return reprocess_plugin_submission(db, user, existing.id, extractor).await;
         };
-        if existing.extraction_error.is_some() {
-            return Err(PluginStoreError::Validation(
-                "this exact signed capture already has an extraction failure".to_string(),
-            ));
-        }
-        let mut listing = get_listing(db, user.id, listing_id).await?;
-        if listing.ingestion_error.as_deref() == Some(SOURCE_IDENTITY_RECEIPT_PENDING) {
-            return recover_bound_source_correction(
-                db,
-                user,
-                &existing,
-                listing_id,
-                extractor,
-                &request.rendered_html,
-            )
-            .await;
-        }
-        if listing.ingestion_state != "ready"
-            && bound_source_correction_receipt_exists(db, user.id, existing.id, listing_id).await?
-        {
-            listing =
-                finalize_signed_source_listing_after_receipt(db, user.id, listing_id, existing.id)
-                    .await?;
-        }
-        return Ok(PluginSubmissionOutcome {
-            submission: existing,
-            preview: None,
-            listing: Some(listing),
-        });
+        debug_assert_eq!(existing.canonical_listing_id, Some(listing_id));
+        return recover_or_return_bound_signed_submission(db, user, existing.id, extractor).await;
     }
 
     let mut preview = None;
@@ -501,8 +473,6 @@ pub async fn submit_plugin_html_with_progress(
                     parsed_preview.context_text.as_deref(),
                 )
                 .await;
-                let durable_corrected_capture =
-                    source_admission_requires_durable_correction_capture(&source_admission);
                 let submission = insert_plugin_submission(
                     db,
                     user.id,
@@ -569,12 +539,7 @@ pub async fn submit_plugin_html_with_progress(
                         .await
                         .ok()
                         .and_then(|admission| admission.serial_correction);
-                        if !durable_corrected_capture {
-                            extraction_error =
-                                Some(format!("listing {listing_id} was quarantined: {message}"));
-                        } else {
-                            durable_materialization_error = Some(message);
-                        }
+                        durable_materialization_error = Some(message);
                     }
                     Err(error) => {
                         let prepared = prepared_submission.as_ref().ok_or_else(|| {
@@ -692,6 +657,14 @@ pub async fn submit_plugin_html_with_progress(
         );
     }
 
+    if submission.canonical_listing_id.is_some() {
+        let retained = load_checkpoint_capture(db, user.id, submission.id).await?;
+        let (listing_id, extracted_listing_sha256) =
+            validate_bound_signed_checkpoint(db, &retained).await?;
+        record_materialization_receipt(db, &retained, listing_id, &extracted_listing_sha256)
+            .await?;
+    }
+
     Ok(PluginSubmissionOutcome {
         submission,
         preview,
@@ -751,20 +724,8 @@ pub async fn reprocess_plugin_submission(
 ) -> StoreResult<PluginSubmissionOutcome> {
     let stored = load_checkpoint_capture(db, user.id, submission_id).await?;
     validate_stored_checkpoint_capture(db, &stored).await?;
-    if let Some(listing_id) = stored.canonical_listing_id {
-        let listing = get_listing(db, user.id, listing_id).await?;
-        if listing.ingestion_error.as_deref() == Some(SOURCE_IDENTITY_RECEIPT_PENDING) {
-            let submission = plugin_submission_for_user(db, user.id, stored.id).await?;
-            return recover_bound_source_correction(
-                db,
-                user,
-                &submission,
-                listing_id,
-                extractor,
-                &stored.rendered_html,
-            )
-            .await;
-        }
+    if stored.canonical_listing_id.is_some() {
+        return recover_or_return_bound_signed_submission(db, user, stored.id, extractor).await;
     }
     let mut preview = None;
     let mut listing = None;
@@ -894,15 +855,7 @@ pub async fn reprocess_plugin_submission(
                         .await
                         .ok()
                         .and_then(|admission| admission.serial_correction);
-                        if !source_admission_requires_durable_correction_capture(
-                            &preflight_source_admission,
-                        ) || stored.canonical_listing_id.is_some()
-                        {
-                            extraction_error =
-                                Some(format!("listing {listing_id} was quarantined: {message}"));
-                        } else {
-                            durable_materialization_error = Some(message);
-                        }
+                        durable_materialization_error = Some(message);
                     }
                     Err(error) => {
                         if signed_source_binding.is_some() {
@@ -993,6 +946,14 @@ pub async fn reprocess_plugin_submission(
         );
     }
 
+    if submission.canonical_listing_id.is_some() {
+        let retained = load_checkpoint_capture(db, user.id, submission.id).await?;
+        let (listing_id, extracted_listing_sha256) =
+            validate_bound_signed_checkpoint(db, &retained).await?;
+        record_materialization_receipt(db, &retained, listing_id, &extracted_listing_sha256)
+            .await?;
+    }
+
     Ok(PluginSubmissionOutcome {
         submission,
         preview,
@@ -1051,21 +1012,6 @@ async fn record_source_serial_correction_if_present(
             ))
         })?;
     Ok(())
-}
-
-fn source_admission_requires_durable_correction_capture(
-    admission: &Result<SourceAircraftAdmission, AircraftAdmissionError>,
-) -> bool {
-    matches!(
-        admission,
-        Ok(SourceAircraftAdmission {
-            serial_correction: Some(_),
-            ..
-        }) | Err(AircraftAdmissionError::Rejected {
-            reason: BlockReason::RegistrationNotFound,
-            ..
-        })
-    )
 }
 
 async fn record_source_visual_correction_if_present(
@@ -1160,47 +1106,6 @@ async fn plugin_submission_for_user(
     )?
     .ok_or_else(|| PluginStoreError::NotFound("plugin submission not found".to_string()))?;
     plugin_submission_from_row(row)
-}
-
-async fn bound_source_correction_receipt_exists(
-    db: &AppDb,
-    owner_user_id: i64,
-    submission_id: i64,
-    listing_id: i64,
-) -> StoreResult<bool> {
-    Ok(query_as_one!(
-        db,
-        (i64,),
-        r#"
-        SELECT COUNT(*)
-        FROM aircraft_listing_identity_correction_decisions decision
-        JOIN plugin_submissions submission
-          ON submission.id = decision.plugin_submission_id
-        JOIN aircraft_sale_listings listing
-          ON listing.id = decision.aircraft_sale_listing_id
-        WHERE decision.correction_kind IN ('faa_serial', 'visual_identifier')
-          AND decision.plugin_submission_id = ?
-          AND decision.aircraft_sale_listing_id = ?
-          AND decision.rendered_html_sha256 = submission.rendered_html_sha256
-          AND submission.user_id = ?
-          AND submission.canonical_listing_id = listing.id
-          AND submission.extraction_error IS NULL
-          AND listing.created_by_user_id = ?
-          AND (
-            listing.registration_number = decision.corrected_registration_number
-            OR (listing.registration_number IS NULL AND decision.corrected_registration_number IS NULL)
-          )
-          AND (
-            listing.serial_number = decision.corrected_serial_number
-            OR (listing.serial_number IS NULL AND decision.corrected_serial_number IS NULL)
-          )
-        "#,
-        submission_id,
-        listing_id,
-        owner_user_id,
-        owner_user_id
-    )?
-    .0 == 1)
 }
 
 async fn automatic_occurrence_disposition_count(
@@ -2084,12 +1989,71 @@ pub async fn inspect_plugin_replay_capture_state(
     })
 }
 
+async fn validate_bound_signed_checkpoint(
+    db: &AppDb,
+    stored: &PluginCheckpointRow,
+) -> StoreResult<(i64, String)> {
+    validate_stored_checkpoint_capture(db, stored).await?;
+    let listing_id = stored.canonical_listing_id.ok_or_else(|| {
+        PluginStoreError::Database("signed capture lost its bound listing identifier".to_string())
+    })?;
+    if stored.extraction_error.is_some() {
+        return Err(PluginStoreError::Validation(
+            "bound signed capture has an extraction failure".to_string(),
+        ));
+    }
+    let extracted = stored.extracted_listing_json.as_deref().ok_or_else(|| {
+        PluginStoreError::Validation(
+            "bound signed capture has no retained extraction checkpoint".to_string(),
+        )
+    })?;
+    parse_current_checkpoint_payload(extracted)?;
+    validate_unbound_current_avionics_extraction(
+        extracted,
+        &stored.source_url,
+        &stored.rendered_html,
+    )
+    .map_err(PluginStoreError::Validation)?;
+    Ok((listing_id, sha256_hex(extracted.as_bytes())))
+}
+
+async fn recover_or_return_bound_signed_submission(
+    db: &AppDb,
+    user: &User,
+    submission_id: i64,
+    extractor: Option<&GeminiListingExtractor>,
+) -> StoreResult<PluginSubmissionOutcome> {
+    let stored = load_checkpoint_capture(db, user.id, submission_id).await?;
+    let (listing_id, extracted_listing_sha256) =
+        validate_bound_signed_checkpoint(db, &stored).await?;
+    let listing =
+        if exact_materialization_receipt_listing_id(db, &stored, &extracted_listing_sha256).await?
+            == Some(listing_id)
+        {
+            get_listing(db, user.id, listing_id).await?
+        } else {
+            complete_bound_replay_materialization(
+                db,
+                user,
+                &stored,
+                &extracted_listing_sha256,
+                extractor,
+            )
+            .await?
+        };
+    Ok(PluginSubmissionOutcome {
+        submission: plugin_submission_for_user(db, user.id, submission_id).await?,
+        preview: None,
+        listing: Some(listing),
+    })
+}
+
 async fn complete_bound_replay_materialization(
     db: &AppDb,
     user: &User,
     stored: &PluginCheckpointRow,
     extracted_listing_sha256: &str,
-    extractor: &GeminiListingExtractor,
+    extractor: Option<&GeminiListingExtractor>,
 ) -> StoreResult<SaleListing> {
     validate_stored_checkpoint_capture(db, stored).await?;
     let listing_id = stored.canonical_listing_id.ok_or_else(|| {
@@ -2111,7 +2075,7 @@ async fn complete_bound_replay_materialization(
             user,
             &submission,
             listing_id,
-            Some(extractor),
+            extractor,
             &stored.rendered_html,
         ))
         .await?
@@ -2136,8 +2100,17 @@ async fn complete_bound_replay_materialization(
                 &stored.rendered_html,
             )?),
         };
-        let resumed =
-            resume_bound_replay_listing(db, user.id, listing_id, &preview, Some(extractor)).await?;
+        let resumed = resume_bound_replay_listing(
+            db,
+            user.id,
+            listing_id,
+            stored.id,
+            &stored.rendered_html_sha256,
+            extracted_listing_sha256,
+            &preview,
+            extractor,
+        )
+        .await?;
         attach_submission_to_pending_review_if_needed(
             db,
             user,
@@ -2193,7 +2166,7 @@ pub async fn materialize_plugin_submission_checkpoint(
             user,
             &stored,
             expected_extracted_listing_sha256,
-            extractor,
+            Some(extractor),
         )
         .await?;
         return Ok(PluginListingReplayOutcome::Materialized {
@@ -2259,7 +2232,7 @@ pub async fn materialize_plugin_submission_checkpoint(
                 user,
                 &retained,
                 expected_extracted_listing_sha256,
-                extractor,
+                Some(extractor),
             )
             .await
             .map(|listing| PluginListingReplayOutcome::Materialized {
@@ -2814,6 +2787,7 @@ mod tests {
     use ring::rand::SystemRandom;
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
     use serde_json::{json, Value};
+    use sha2::{Digest as Sha2Digest, Sha256};
     use tokio::net::TcpListener;
 
     use super::{
@@ -2830,6 +2804,16 @@ mod tests {
         require_listing_faa_admission, store_release, AircraftAdmissionError, AircraftRecord,
         AircraftReference, BlockReason, MemberProvenance, Release, ReleaseFixtureBuilder,
         ReleaseMetadata, TargetCoverage,
+    };
+    use crate::avionics::catalog::{
+        approved_avionics_identity_for_grounded_replay,
+        grounded_resolution_receipt_basis_for_replay, AvionicsIdentityRequest,
+    };
+    use crate::avionics::fingerprint::{
+        catalog_product_fingerprint_for_id, grounded_collision_closure_revision_sha256,
+    };
+    use crate::avionics::manufacturer::{
+        ensure_manufacturer_identity, ManufacturerIdentityEvidence,
     };
     use crate::db::{AppDb, DatabaseBackend};
     use crate::gemini::usage::{SourceCorrelation, Store as UsageStore};
@@ -3549,6 +3533,98 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    async fn seed_grounded_test_avionics(db: &AppDb) -> i64 {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', 'garmin') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let avionics_type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('Transponder', 'transponder') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let model_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_models (avionics_manufacturer_id, name, normalized_name) VALUES (?, 'GTX 345R', 'gtx345r') RETURNING id",
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(avionics_type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        ensure_manufacturer_identity(
+            db,
+            manufacturer_id,
+            &ManufacturerIdentityEvidence {
+                source_url: "https://manufacturer.example/aviation/".to_string(),
+                source_title: "Manufacturer aviation catalog".to_string(),
+                evidence_text: "The manufacturer catalog identifies Garmin aviation products."
+                    .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE avionics_models
+               SET catalog_status = 'approved',
+                   manufacturer_identifier_kind = 'manufacturer_part_number',
+                   manufacturer_identifier = 'TEST-GTX-345R',
+                   normalized_manufacturer_identifier = 'testgtx345r',
+                   identity_source_url = 'https://manufacturer.example/manuals/gtx-345r.pdf',
+                   identity_source_title = 'Manufacturer GTX 345R manual',
+                   identity_evidence_text = 'The manufacturer manual identifies the GTX 345R.',
+                   identity_evidence_kind = 'authoritative_reference',
+                   identity_confidence = 'very_high',
+                   catalog_reviewed_at = CURRENT_TIMESTAMP
+               WHERE id = ?"#,
+        )
+        .bind(model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(approved_avionics_identity_for_grounded_replay(db, model_id)
+            .await
+            .unwrap()
+            .is_some());
+        model_id
+    }
+
+    fn grounded_occurrence_capability_sha256_for_test(
+        seed: &crate::avionics::catalog::GroundedAvionicsResolutionReceiptSeed,
+        source_notes: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aircost:listing-avionics-grounded-occurrence-capability:v2");
+        for value in [
+            "0".to_string(),
+            "primary".to_string(),
+            "installed".to_string(),
+            source_notes.to_string(),
+            seed.avionics_model_id().to_string(),
+            seed.requested_quantity().to_string(),
+            seed.request_sha256().to_string(),
+            seed.capability_sha256().to_string(),
+            seed.product_fingerprint().to_string(),
+            seed.collision_closure_sha256().to_string(),
+        ] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
     }
 
     #[test]
@@ -4305,6 +4381,394 @@ mod tests {
             Some(extraction),
             "the atomically bound checkpoint must be the exact extracted payload"
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_signed_submit_recovers_new_listing_without_reextracting() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        store_release(&db, &replay_release("N482TW", "18283006"))
+            .await
+            .unwrap();
+        seed_replay_curated_aircraft(&db, user.id).await;
+        let mut extraction = serial_correction_extraction();
+        extraction["serial_number"] = json!("18283006");
+        let (endpoint, request_count, _) =
+            extraction_sequence_endpoint(vec![extraction.to_string()]).await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let source_url = "https://example.test/signed-submit-new-recovery";
+        let html = "<html><body><p>N482TW serial 18283006</p></body></html>";
+        let request = signed_submission_request(&db, &user, source_url, html).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER force_new_signed_child_projection_failure
+               BEFORE INSERT ON aircraft_listing_identity_input_observations
+               BEGIN SELECT RAISE(ABORT, 'forced new signed child projection failure'); END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        submit_plugin_html(&db, &user, &request, Some(&extractor))
+            .await
+            .expect_err("the child projection failure must retain an incomplete exact binding");
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let retained: (i64, i64, Option<String>, i64) = sqlx::query_as(
+            r#"SELECT submission.id, submission.canonical_listing_id,
+                      submission.extraction_error,
+                      (SELECT count(*) FROM plugin_submission_materialization_receipts receipt
+                        WHERE receipt.plugin_submission_id = submission.id)
+               FROM plugin_submissions submission WHERE submission.source_url = ?"#,
+        )
+        .bind(source_url)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained.2, None);
+        assert_eq!(retained.3, 0);
+
+        sqlx::query("DROP TRIGGER force_new_signed_child_projection_failure")
+            .execute(pool)
+            .await
+            .unwrap();
+        let recovered = submit_plugin_html(&db, &user, &request, None)
+            .await
+            .expect("the retained signed checkpoint must recover without an extractor");
+        assert_eq!(recovered.submission.id, retained.0);
+        assert_eq!(
+            recovered.listing.as_ref().map(|listing| listing.id),
+            Some(retained.1)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM plugin_submission_materialization_receipts WHERE plugin_submission_id = ?",
+        )
+        .bind(retained.0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the separately integrated grounded-capability v2 schema"]
+    async fn bound_signed_retry_consumes_retained_capability_without_gemini() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        store_release(&db, &replay_release("N482TW", "18283006"))
+            .await
+            .unwrap();
+        seed_replay_curated_aircraft(&db, user.id).await;
+        let avionics_model_id = seed_grounded_test_avionics(&db).await;
+        let source_url = "https://example.test/signed-retained-capability";
+        let source_notes = "Garmin GTX 345R installed";
+        let html =
+            format!("<html><body><p>N482TW serial 18283006</p><p>{source_notes}</p></body></html>");
+        let request = signed_submission_request(&db, &user, source_url, &html).await;
+        let extraction = json!({
+            "manufacturer":"Cessna","model":"182","variant":"182T","model_year":2020,
+            "asking_price_usd":400000.0,"currency":"USD","airframe_hours":900.0,
+            "engine_hours":null,"engine_time_basis":"unknown","engine_time_evidence":null,
+            "engine_time_confidence":null,"propeller_hours":null,
+            "propeller_time_basis":"unknown","propeller_time_evidence":null,
+            "propeller_time_confidence":null,"installed_engine":null,"installed_propeller":null,
+            "registration_number":"N482TW","serial_number":"18283006","status":"active",
+            "avionics":[{
+                "manufacturer":"Garmin","model":"GTX 345R","types":["Transponder"],
+                "quantity":1,"configuration_action":"installed","replaces":null,
+                "source_evidence_text":source_notes,"source_confidence":"high"
+            }],
+            "valuation_facts":[]
+        });
+        let extracted_listing_json = extraction.to_string();
+        let extracted_listing_sha256 = sha256_hex(extracted_listing_json.as_bytes());
+        let rendered_html_sha256 = sha256_hex(html.as_bytes());
+        let listing_context = super::retained_listing_context(source_url, &html)
+            .unwrap()
+            .split_whitespace()
+            .take(900)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let identity = approved_avionics_identity_for_grounded_replay(&db, avionics_model_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let identity_request = AvionicsIdentityRequest {
+            aircraft_manufacturer: "Cessna".to_string(),
+            aircraft_model: "182".to_string(),
+            aircraft_variant: "182T".to_string(),
+            model_year: 2020,
+            source_url: source_url.to_string(),
+            listing_context,
+            requires_listing_evidence: true,
+            authoritative_direct_source_urls: Vec::new(),
+            authoritative_identity_anchors: Vec::new(),
+            manufacturer: "Garmin".to_string(),
+            model: "GTX 345R".to_string(),
+            avionics_types: vec!["Transponder".to_string()],
+            quantity: 1,
+        };
+        let product_fingerprint = catalog_product_fingerprint_for_id(&db, avionics_model_id)
+            .await
+            .unwrap();
+        let collision_closure = grounded_collision_closure_revision_sha256(&db, avionics_model_id)
+            .await
+            .unwrap();
+        let seed = grounded_resolution_receipt_basis_for_replay(&identity_request, &identity)
+            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone());
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let variant_id: i64 = sqlx::query_scalar(
+            "SELECT aircraft_model_variant_id FROM aircraft_sale_listing_pending_compatibility_placeholder WHERE singleton_id = 1",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO aircraft_sale_listings (
+                 aircraft_model_variant_id, created_by_user_id, source_url, model_year,
+                 asking_price_usd, currency, status, ingestion_state,
+                 registration_number, serial_number, airframe_hours
+               ) VALUES (?, ?, ?, 2020, 400000, 'USD', 'active', 'incomplete',
+                         'N482TW', '18283006', 900)
+               RETURNING id"#,
+        )
+        .bind(variant_id)
+        .bind(user.id)
+        .bind(source_url)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, rendered_html,
+                 rendered_html_sha256, signature_base64, extracted_listing_json,
+                 extraction_error, canonical_listing_id
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+               RETURNING id"#,
+        )
+        .bind(user.id)
+        .bind(request.plugin_install_id)
+        .bind(source_url)
+        .bind(html.as_str())
+        .bind(rendered_html_sha256.as_str())
+        .bind(request.signature.as_str())
+        .bind(extracted_listing_json.as_str())
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO aircraft_sale_listing_avionics_grounded_capabilities (
+                 listing_id, plugin_submission_id, occurrence_index, occurrence_role,
+                 avionics_model_id, requested_quantity, configuration_action,
+                 request_sha256, capability_sha256, grounded_resolution_sha256,
+                 evidence_capture_sha256, extracted_listing_sha256,
+                 product_fingerprint, collision_closure_sha256, policy_version
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?,
+                         'listing_avionics_grounded_capability_v2')"#,
+        )
+        .bind(listing_id)
+        .bind(submission_id)
+        .bind(avionics_model_id)
+        .bind(seed.request_sha256())
+        .bind(grounded_occurrence_capability_sha256_for_test(
+            &seed,
+            source_notes,
+        ))
+        .bind(seed.bind(listing_id).resolution_sha256())
+        .bind(rendered_html_sha256.as_str())
+        .bind(extracted_listing_sha256.as_str())
+        .bind(product_fingerprint.as_str())
+        .bind(collision_closure.as_str())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let recovered = submit_plugin_html(&db, &user, &request, None)
+            .await
+            .expect("the exact retained capability must complete without Gemini");
+        assert_eq!(recovered.submission.id, submission_id);
+        assert_eq!(
+            recovered.listing.as_ref().map(|listing| listing.id),
+            Some(listing_id)
+        );
+        let state: (i64, i64, i64, i64) = sqlx::query_as(
+            r#"SELECT
+                 (SELECT count(*) FROM aircraft_sale_listing_avionics
+                   WHERE aircraft_sale_listing_id = ?),
+                 (SELECT count(*) FROM aircraft_sale_listing_avionics_authorizations authorization
+                    JOIN aircraft_sale_listing_avionics link
+                      ON link.id = authorization.listing_link_id
+                   WHERE link.aircraft_sale_listing_id = ?
+                     AND authorization.authorization_kind = 'same_case_grounded'),
+                 (SELECT count(*) FROM aircraft_sale_listing_avionics_grounded_capabilities
+                   WHERE listing_id = ?),
+                 (SELECT count(*) FROM gemini_api_usage)"#,
+        )
+        .bind(listing_id)
+        .bind(listing_id)
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(state, (1, 1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn signed_submit_recovers_matching_verified_listing_without_reextracting() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        store_release(&db, &replay_release("N482TW", "18283006"))
+            .await
+            .unwrap();
+        seed_replay_curated_aircraft(&db, user.id).await;
+        let mut extraction = serial_correction_extraction();
+        extraction["serial_number"] = json!("18283006");
+        let (endpoint, request_count, _) =
+            extraction_sequence_endpoint(vec![extraction.to_string(), extraction.to_string()])
+                .await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER force_matching_baseline_receipt_failure
+               BEFORE INSERT ON plugin_submission_materialization_receipts
+               BEGIN SELECT RAISE(ABORT, 'forced baseline receipt failure'); END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let original_source = "https://example.test/signed-matching-original";
+        let original_request = signed_submission_request(
+            &db,
+            &user,
+            original_source,
+            "<html><body><p>N482TW serial 18283006 original</p></body></html>",
+        )
+        .await;
+        submit_plugin_html(&db, &user, &original_request, Some(&extractor))
+            .await
+            .expect_err("the baseline completion receipt is intentionally interrupted");
+        let listing_id: i64 = sqlx::query_scalar(
+            "SELECT canonical_listing_id FROM plugin_submissions WHERE source_url = ?",
+        )
+        .bind(original_source)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER force_matching_baseline_receipt_failure")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM plugin_submissions WHERE source_url = ?")
+            .bind(original_source)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE aircraft_sale_listings SET is_verified = TRUE WHERE id = ?")
+            .bind(listing_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            r#"CREATE TRIGGER force_matching_signed_projection_failure
+               BEFORE UPDATE OF added_at ON aircraft_sale_listings
+               WHEN OLD.id = {listing_id}
+               BEGIN SELECT RAISE(ABORT, 'forced matching signed projection failure'); END"#
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let matching_source = "https://example.test/signed-matching-recovery";
+        let matching_request = signed_submission_request(
+            &db,
+            &user,
+            matching_source,
+            "<html><body><p>N482TW serial 18283006 matching</p></body></html>",
+        )
+        .await;
+        submit_plugin_html(&db, &user, &matching_request, Some(&extractor))
+            .await
+            .expect_err("the matching projection failure must retain its exact binding");
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let retained: (i64, i64, Option<String>, i64, String) = sqlx::query_as(
+            r#"SELECT submission.id, submission.canonical_listing_id,
+                      submission.extraction_error,
+                      (SELECT count(*) FROM plugin_submission_materialization_receipts receipt
+                        WHERE receipt.plugin_submission_id = submission.id),
+                      listing.source_url
+               FROM plugin_submissions submission
+               JOIN aircraft_sale_listings listing
+                 ON listing.id = submission.canonical_listing_id
+               WHERE submission.source_url = ?"#,
+        )
+        .bind(matching_source)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained.1, listing_id);
+        assert_eq!(retained.2, None);
+        assert_eq!(retained.3, 0);
+        assert_eq!(retained.4, matching_source);
+
+        sqlx::query("DROP TRIGGER force_matching_signed_projection_failure")
+            .execute(pool)
+            .await
+            .unwrap();
+        let recovered = submit_plugin_html(&db, &user, &matching_request, None)
+            .await
+            .expect("the matching exact checkpoint must recover without an extractor");
+        assert_eq!(recovered.submission.id, retained.0);
+        assert_eq!(
+            recovered.listing.as_ref().map(|listing| listing.id),
+            Some(listing_id)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM plugin_submission_materialization_receipts WHERE plugin_submission_id = ?",
+        )
+        .bind(retained.0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn signed_extraction_failure_remains_unbound_without_completion_receipt() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let request = signed_submission_request(
+            &db,
+            &user,
+            "https://example.test/signed-extraction-failure",
+            "<html><body>not extracted</body></html>",
+        )
+        .await;
+
+        let outcome = submit_plugin_html(&db, &user, &request, None)
+            .await
+            .expect("an extraction failure remains a retained submission outcome");
+        assert!(outcome.listing.is_none());
+        assert!(outcome.submission.canonical_listing_id.is_none());
+        assert!(outcome.submission.extraction_error.is_some());
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let receipt_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM plugin_submission_materialization_receipts WHERE plugin_submission_id = ?",
+        )
+        .bind(outcome.submission.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(receipt_count, 0);
     }
 
     #[tokio::test]
