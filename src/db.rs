@@ -97,11 +97,11 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &st
     "cd0c1e10c508017f7053d0ab418e627ef993029ab7523a045eb7b66b802d5033";
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
     "20260825_listing_avionics_grounded_capabilities";
-const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
+const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 2;
 // SHA-256 of
-// `20260825_listing_avionics_grounded_capabilities:v1:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract`.
+// `20260825_listing_avionics_grounded_capabilities:v2:capability-v2:authorization-v2-exact-submission-checkpoint:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract`.
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
-    "a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31";
+    "fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -3804,7 +3804,7 @@ impl AppDb {
                         ('check(occurrence_rolein(''primary'',''replacement''))'),
                         ('check(requested_quantity>0)'),
                         ('check(configuration_actionin(''installed'',''replaces'',''removes''))'),
-                        ('check(policy_version=''listing_avionics_grounded_capability_v1'')'),
+                        ('check(policy_version=''listing_avionics_grounded_capability_v2'')'),
                         ('check(occurrence_role=''primary''orrequested_quantity=1)'),
                         ('check(occurrence_role=''primary''orconfiguration_actionin(''replaces'',''removes''))'),
                         ('check(length(request_sha256)=64)'),
@@ -4041,7 +4041,7 @@ impl AppDb {
                         ('product_fingerprint', '^[0-9a-f]{64}$', NULL, NULL),
                         ('collision_closure_sha256', '^[0-9a-f]{64}$', NULL, NULL),
                         ('policy_version',
-                          'listing_avionics_grounded_capability_v1', NULL, NULL),
+                          'listing_avionics_grounded_capability_v2', NULL, NULL),
                         ('occurrence_role', 'requested_quantity = 1',
                           'primary', NULL),
                         ('occurrence_role', 'configuration_action',
@@ -5109,7 +5109,7 @@ impl AppDb {
             "CHECK ((occurrence_role = ANY (ARRAY['primary'::text, 'replacement'::text])))",
             "CHECK (((occurrence_role = 'primary'::text) OR (configuration_action = ANY (ARRAY['replaces'::text, 'removes'::text]))))",
             "CHECK (((occurrence_role = 'primary'::text) OR (requested_quantity = 1)))",
-            "CHECK ((policy_version = 'listing_avionics_grounded_capability_v1'::text))",
+            "CHECK ((policy_version = 'listing_avionics_grounded_capability_v2'::text))",
             "CHECK ((product_fingerprint ~ '^[0-9a-f]{64}$'::text))",
             "CHECK ((requested_quantity > 0))",
             "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))",
@@ -17486,7 +17486,7 @@ mod tests {
             assert!(
                 definition.contains(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT)
             );
-            assert!(definition.contains("listing_avionics_grounded_capability_v1"));
+            assert!(definition.contains("listing_avionics_grounded_capability_v2"));
             assert!(definition.contains("requested_quantity"));
             assert!(definition.contains("occurrence_index"));
             assert!(definition.contains("occurrence_role"));
@@ -17562,10 +17562,10 @@ mod tests {
                 "canonical PostgreSQL function and migration drifted for {function_name}"
             );
         }
-        assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
+        assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 2);
         assert_eq!(
             LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
-            "a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31"
+            "fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30"
         );
     }
 
@@ -17795,7 +17795,7 @@ mod tests {
                    70002, 70001, 0, 'primary', 70003, 1, 'installed', \
                    repeat('a', 64), repeat('b', 64), repeat('c', 64), \
                    repeat('a', 64), repeat('d', 64), repeat('e', 64), \
-                   repeat('f', 64), 'listing_avionics_grounded_capability_v1' \
+                   repeat('f', 64), 'listing_avionics_grounded_capability_v2' \
                  )",
             )
             .await

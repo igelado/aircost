@@ -3828,7 +3828,7 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities 
     collision_closure_sha256 TEXT NOT NULL
       CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_grounded_capability_v1'),
+      CHECK (policy_version = 'listing_avionics_grounded_capability_v2'),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (
       listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -3899,8 +3899,8 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
-  1,
-  'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31',
+  2,
+  'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
@@ -4328,6 +4328,9 @@ BEGIN
               authorization_row.evidence_capture_sha256
         AND position(link.source_notes IN retained_capture.rendered_html) > 0
     );
+  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
+  WHERE authorization_kind = 'same_case_grounded'
+    AND plugin_submission_id = OLD.id;
   IF TG_OP = 'DELETE' THEN
     RETURN OLD;
   END IF;
@@ -4349,29 +4352,6 @@ DROP TRIGGER IF EXISTS
 ON public.plugin_submissions;
 CREATE TRIGGER
   listing_avionics_authorizations_invalidate_capture_update
-AFTER UPDATE OF canonical_listing_id, rendered_html, rendered_html_sha256
-ON public.plugin_submissions
-FOR EACH ROW
-EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
-
-CREATE OR REPLACE FUNCTION
-  public.invalidate_listing_avionics_authorization_for_submission_checkpoint()
-RETURNS TRIGGER LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $function$
-BEGIN
-  DELETE FROM public.aircraft_sale_listing_avionics_authorizations
-  WHERE authorization_kind = 'same_case_grounded'
-    AND plugin_submission_id = OLD.id;
-  RETURN NEW;
-END
-$function$;
-
-DROP TRIGGER IF EXISTS
-  listing_avionics_authorizations_invalidate_submission_checkpoint_update
-ON public.plugin_submissions;
-CREATE TRIGGER
-  listing_avionics_authorizations_invalidate_submission_checkpoint_update
 AFTER UPDATE OF
   canonical_listing_id,
   rendered_html,
@@ -4380,8 +4360,7 @@ AFTER UPDATE OF
   extraction_error
 ON public.plugin_submissions
 FOR EACH ROW
-EXECUTE FUNCTION
-  public.invalidate_listing_avionics_authorization_for_submission_checkpoint();
+EXECUTE FUNCTION public.invalidate_listing_avionics_authorization_for_capture();
 
 
 INSERT INTO schema_migration_contracts (

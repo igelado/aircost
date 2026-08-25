@@ -260,7 +260,7 @@ VALUES
 ('trigger:compatibility_projected_package_link_immutable_delete', 'createtriggercompatibility_projected_package_link_immutable_deletebeforedeleteonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
 ('trigger:compatibility_projected_package_link_immutable_update', 'createtriggercompatibility_projected_package_link_immutable_updatebeforeupdateonaircraft_package_applicabilitywhenexists(select1fromaircraft_valuation_compatibility_projectionsprojectionwhereprojection.aircraft_factory_package_id=old.aircraft_factory_package_idandprojection.aircraft_designation_id=old.aircraft_designation_idand(old.aircraft_generation_idisnullorprojection.aircraft_generation_id=old.aircraft_generation_id))beginselectraise(abort,''compatibility-projectedpackageapplicabilityisimmutable'');end'),
 ('trigger:listing_avionics_authorizations_invalidate_capture_delete', 'createtriggerlisting_avionics_authorizations_invalidate_capture_deleteafterdeleteonplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));end'),
-('trigger:listing_avionics_authorizations_invalidate_capture_update', 'createtriggerlisting_avionics_authorizations_invalidate_capture_updateafterupdateofcanonical_listing_id,rendered_html,rendered_html_sha256onplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));end'),
+('trigger:listing_avionics_authorizations_invalidate_capture_update', 'createtriggerlisting_avionics_authorizations_invalidate_capture_updateafterupdateofcanonical_listing_id,rendered_html,rendered_html_sha256,extracted_listing_json,extraction_erroronplugin_submissionsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereevidence_capture_sha256=old.rendered_html_sha256andexists(select1fromaircraft_sale_listing_avionicslinkwherelink.id=aircraft_sale_listing_avionics_authorizations.listing_link_idandlink.aircraft_sale_listing_id=old.canonical_listing_idandlength(trim(coalesce(link.source_notes,'''')))>0andinstr(old.rendered_html,link.source_notes)>0andnotexists(select1fromplugin_submissionsretained_capturewhereretained_capture.canonical_listing_id=link.aircraft_sale_listing_idandretained_capture.rendered_html_sha256=aircraft_sale_listing_avionics_authorizations.evidence_capture_sha256andinstr(retained_capture.rendered_html,link.source_notes)>0));deletefromaircraft_sale_listing_avionics_authorizationswhereauthorization_kind=''same_case_grounded''andplugin_submission_id=old.id;end'),
 ('trigger:listing_avionics_authorizations_invalidate_model_proof_update', 'createtriggerlisting_avionics_authorizations_invalidate_model_proof_updateafterupdateofavionics_manufacturer_id,name,normalized_name,catalog_status,manufacturer_identifier_kind,manufacturer_identifier,normalized_manufacturer_identifier,identity_source_url,identity_source_title,identity_evidence_textonavionics_modelsbegindeletefromaircraft_sale_listing_avionics_authorizationswhereauthorization_kind=''same_case_grounded''andavionics_model_id=old.id;end'),
 ('trigger:official_dollar_normalization_immutable_delete', 'createtriggerofficial_dollar_normalization_immutable_deletebeforedeleteonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
 ('trigger:official_dollar_normalization_immutable_update', 'createtriggerofficial_dollar_normalization_immutable_updatebeforeupdateonofficial_dollar_normalization_factsbeginselectraise(abort,''officialdollarnormalizationfactsareimmutable'');end'),
@@ -8226,7 +8226,7 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities 
     product_fingerprint TEXT NOT NULL,
     collision_closure_sha256 TEXT NOT NULL,
     policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_grounded_capability_v1'),
+      CHECK (policy_version = 'listing_avionics_grounded_capability_v2'),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (
       listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -8299,8 +8299,8 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
-  1,
-  'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31',
+  2,
+  'fa4cbe0caefd049a712d3b7bdbc593a1984171d2a663b70a49591ccfb1d7ca30',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
@@ -8620,7 +8620,12 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS
   listing_avionics_authorizations_invalidate_capture_update
-AFTER UPDATE OF canonical_listing_id, rendered_html, rendered_html_sha256
+AFTER UPDATE OF
+  canonical_listing_id,
+  rendered_html,
+  rendered_html_sha256,
+  extracted_listing_json,
+  extraction_error
 ON plugin_submissions
 BEGIN
   DELETE FROM aircraft_sale_listing_avionics_authorizations
@@ -8641,18 +8646,6 @@ BEGIN
             AND instr(retained_capture.rendered_html, link.source_notes) > 0
         )
     );
-END;
-
-CREATE TRIGGER IF NOT EXISTS
-  listing_avionics_authorizations_invalidate_submission_checkpoint_update
-AFTER UPDATE OF
-  canonical_listing_id,
-  rendered_html,
-  rendered_html_sha256,
-  extracted_listing_json,
-  extraction_error
-ON plugin_submissions
-BEGIN
   DELETE FROM aircraft_sale_listing_avionics_authorizations
   WHERE authorization_kind = 'same_case_grounded'
     AND plugin_submission_id = OLD.id;
