@@ -3620,6 +3620,7 @@ mod tests {
             seed.capability_sha256().to_string(),
             seed.product_fingerprint().to_string(),
             seed.collision_closure_sha256().to_string(),
+            seed.source_revocation_count().to_string(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
