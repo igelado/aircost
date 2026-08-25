@@ -87,7 +87,6 @@ const REVIEW_PAYLOAD_VERSION: u32 = 1;
 const EXTRACTION_FINGERPRINT_DOMAIN: &[u8] = b"aircost:listing-avionics-observation:v1";
 const ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN: &[u8] =
     b"aircost:listing-avionics-association-authorization";
-pub(crate) const ASSOCIATION_AUTHORIZATION_POLICY_VERSION: &str = "listing_avionics_authorization";
 const MAX_REVIEW_PRODUCT_IDENTITY_LABEL_CHARACTERS: usize = 128;
 const MAX_REVIEW_PRODUCT_SOURCE_TITLE_CHARACTERS: usize = 200;
 const MAX_REVIEW_PRODUCT_SOURCE_URL_CHARACTERS: usize = 2_048;
@@ -1060,7 +1059,6 @@ struct AssociationAuthorizationRow {
     extracted_listing_sha256: Option<String>,
     current_extracted_listing_json: Option<String>,
     evidence_capture_is_current: bool,
-    policy_version: String,
     collision_closure_sha256: String,
     source_revocation_count: Option<i64>,
     current_source_revocation_count: i64,
@@ -1857,11 +1855,10 @@ async fn restage_pending_review_if_current_with_commit(
           product_fingerprint,
           grounded_resolution_sha256,
           evidence_capture_sha256,
-          collision_closure_sha256,
-          policy_version
+          collision_closure_sha256
         )
         SELECT ?, ?, ?, 'manufacturer_reuse', ?, attestation.product_fingerprint,
-               NULL, ?, ?, ?
+               NULL, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         ON CONFLICT (listing_link_id, association_role) DO NOTHING
@@ -2557,7 +2554,6 @@ async fn restage_pending_review_if_current_with_commit(
                     .bind(observation_sha256)
                     .bind(evidence_capture_sha256)
                     .bind(collision_closure_sha256)
-                    .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                     .bind(association.avionics_model_id)
                     .execute(&mut *transaction)
                     .await?
@@ -2713,7 +2709,6 @@ async fn restage_pending_review_if_current_with_commit(
                         .bind(commit.observation_sha256.as_str())
                         .bind(commit.evidence_provenance.rendered_html_sha256.as_str())
                         .bind(commit.expected_collision_closure_sha256.as_str())
-                        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                         .bind(commit.avionics_model_id)
                         .execute(&mut *transaction)
                         .await?;
@@ -4090,7 +4085,6 @@ const ASSOCIATION_AUTHORIZATION_ROWS_SQLITE: &str = r#"
           AND length(trim(COALESCE(link.source_notes, ''))) > 0
           AND instr(capture.rendered_html, link.source_notes) > 0
       ) AS evidence_capture_is_current,
-      authorization.policy_version,
       authorization.collision_closure_sha256,
       authorization.source_revocation_count,
       (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
@@ -4131,7 +4125,6 @@ const ASSOCIATION_AUTHORIZATION_ROWS_POSTGRES: &str = r#"
           AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
           AND position(link.source_notes IN capture.rendered_html) > 0
       ) AS evidence_capture_is_current,
-      authorization.policy_version,
       authorization.collision_closure_sha256,
       authorization.source_revocation_count,
       (SELECT COUNT(*) FROM avionics_authoritative_source_origin_revocations)
@@ -5175,7 +5168,6 @@ pub(crate) fn association_observation_sha256_from_values(
     let mut hasher = Sha256::new();
     hasher.update(ASSOCIATION_AUTHORIZATION_FINGERPRINT_DOMAIN);
     for value in [
-        ASSOCIATION_AUTHORIZATION_POLICY_VERSION.to_string(),
         listing_id.to_string(),
         listing_link_id.to_string(),
         association_role_label(role).to_string(),
@@ -5254,9 +5246,7 @@ fn current_row_backed_authorized_associations(
     let mut authorized = HashSet::new();
 
     for row in rows {
-        if row.policy_version != ASSOCIATION_AUTHORIZATION_POLICY_VERSION
-            || !row.evidence_capture_is_current
-        {
+        if !row.evidence_capture_is_current {
             continue;
         }
         let current_collision_closure_sha256 = match row.authorization_kind.as_str() {
@@ -9802,7 +9792,6 @@ mod tests {
             extracted_listing_sha256: Some(sha256_hex(b"{}")),
             current_extracted_listing_json: Some("{}".to_string()),
             evidence_capture_is_current: true,
-            policy_version: ASSOCIATION_AUTHORIZATION_POLICY_VERSION.to_string(),
             collision_closure_sha256: fingerprint_grounded_collision_closure(
                 collision_rows,
                 avionics_model_id,
@@ -11763,8 +11752,8 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, source_revocation_count, policy_version
-            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0, ?)
+              collision_closure_sha256, source_revocation_count
+            ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0)
             "#,
         )
         .bind(listing_link_id)
@@ -11777,7 +11766,6 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
         .bind(plugin_submission_id)
         .bind(extracted_listing_sha256)
         .bind(collision_closure_sha256)
-        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
         .execute(sqlite_pool(db))
         .await
         .unwrap();

@@ -3828,8 +3828,6 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities 
       CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
     source_revocation_count BIGINT NOT NULL
       CHECK (source_revocation_count >= 0),
-    policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_grounded_capability'),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (
       listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -3904,7 +3902,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e',
+  '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
@@ -3936,8 +3934,6 @@ CREATE TABLE IF NOT EXISTS public.aircraft_sale_listing_avionics_link_authorizat
     collision_closure_sha256 TEXT NOT NULL
       CHECK (collision_closure_sha256 ~ '^[0-9a-f]{64}$'),
     source_revocation_count BIGINT,
-    policy_version TEXT NOT NULL
-      CHECK (policy_version = 'listing_avionics_authorization'),
     authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (listing_link_id, association_role),
     CHECK (

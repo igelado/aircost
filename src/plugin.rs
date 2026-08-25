@@ -4585,9 +4585,8 @@ mod tests {
                  request_sha256, capability_sha256, grounded_resolution_sha256,
                  evidence_capture_sha256, extracted_listing_sha256,
                  product_fingerprint, collision_closure_sha256,
-                 source_revocation_count, policy_version
-               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0,
-                         'listing_avionics_grounded_capability')"#,
+                 source_revocation_count
+               ) VALUES (?, ?, 0, 'primary', ?, 1, 'installed', ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(listing_id)
         .bind(submission_id)

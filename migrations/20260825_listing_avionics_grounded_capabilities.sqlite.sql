@@ -23,7 +23,7 @@ SELECT CASE
     WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'
       AND contract_version = 1
       AND contract_fingerprint =
-        'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e'
+        '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef'
   )
   AND (
     SELECT group_concat(name, ',')
@@ -34,14 +34,14 @@ SELECT CASE
       )
       ORDER BY cid
     )
-  ) = 'listing_id,plugin_submission_id,occurrence_index,occurrence_role,avionics_model_id,requested_quantity,configuration_action,request_sha256,capability_sha256,grounded_resolution_sha256,evidence_capture_sha256,extracted_listing_sha256,product_fingerprint,collision_closure_sha256,source_revocation_count,policy_version,created_at'
+  ) = 'listing_id,plugin_submission_id,occurrence_index,occurrence_role,avionics_model_id,requested_quantity,configuration_action,request_sha256,capability_sha256,grounded_resolution_sha256,evidence_capture_sha256,extracted_listing_sha256,product_fingerprint,collision_closure_sha256,source_revocation_count,created_at'
   AND (
     SELECT replace(replace(replace(replace(
       sql, char(9), ''), char(10), ''), char(13), ''), ' ', '')
     FROM sqlite_schema
     WHERE type = 'table'
       AND name = 'aircraft_sale_listing_avionics_grounded_capabilities'
-  ) = 'CREATETABLEaircraft_sale_listing_avionics_grounded_capabilities(listing_idINTEGERNOTNULLREFERENCESaircraft_sale_listings(id)ONDELETECASCADE,plugin_submission_idINTEGERNOTNULLREFERENCESplugin_submissions(id)ONDELETECASCADE,occurrence_indexINTEGERNOTNULLCHECK(occurrence_index>=0),occurrence_roleTEXTNOTNULLCHECK(occurrence_roleIN(''primary'',''replacement'')),avionics_model_idINTEGERNOTNULLREFERENCESavionics_models(id)ONDELETECASCADE,requested_quantityINTEGERNOTNULLCHECK(requested_quantity>0),configuration_actionTEXTNOTNULLCHECK(configuration_actionIN(''installed'',''replaces'',''removes'')),request_sha256TEXTNOTNULL,capability_sha256TEXTNOTNULL,grounded_resolution_sha256TEXTNOTNULL,evidence_capture_sha256TEXTNOTNULL,extracted_listing_sha256TEXTNOTNULL,product_fingerprintTEXTNOTNULL,collision_closure_sha256TEXTNOTNULL,source_revocation_countINTEGERNOTNULLCHECK(source_revocation_count>=0),policy_versionTEXTNOTNULLCHECK(policy_version=''listing_avionics_grounded_capability''),created_atTEXTNOTNULLDEFAULTCURRENT_TIMESTAMP,PRIMARYKEY(listing_id,plugin_submission_id,occurrence_index,occurrence_role),CHECK(occurrence_role=''primary''ORrequested_quantity=1),CHECK(occurrence_role=''primary''ORconfiguration_actionIN(''replaces'',''removes'')),CHECK(length(request_sha256)=64),CHECK(request_sha256=lower(request_sha256)),CHECK(request_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(capability_sha256)=64),CHECK(capability_sha256=lower(capability_sha256)),CHECK(capability_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(grounded_resolution_sha256)=64),CHECK(grounded_resolution_sha256=lower(grounded_resolution_sha256)),CHECK(grounded_resolution_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(evidence_capture_sha256)=64),CHECK(evidence_capture_sha256=lower(evidence_capture_sha256)),CHECK(evidence_capture_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(extracted_listing_sha256)=64),CHECK(extracted_listing_sha256=lower(extracted_listing_sha256)),CHECK(extracted_listing_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(product_fingerprint)=64),CHECK(product_fingerprint=lower(product_fingerprint)),CHECK(product_fingerprintNOTGLOB''*[^0-9a-f]*''),CHECK(length(collision_closure_sha256)=64),CHECK(collision_closure_sha256=lower(collision_closure_sha256)),CHECK(collision_closure_sha256NOTGLOB''*[^0-9a-f]*''))'
+  ) = 'CREATETABLEaircraft_sale_listing_avionics_grounded_capabilities(listing_idINTEGERNOTNULLREFERENCESaircraft_sale_listings(id)ONDELETECASCADE,plugin_submission_idINTEGERNOTNULLREFERENCESplugin_submissions(id)ONDELETECASCADE,occurrence_indexINTEGERNOTNULLCHECK(occurrence_index>=0),occurrence_roleTEXTNOTNULLCHECK(occurrence_roleIN(''primary'',''replacement'')),avionics_model_idINTEGERNOTNULLREFERENCESavionics_models(id)ONDELETECASCADE,requested_quantityINTEGERNOTNULLCHECK(requested_quantity>0),configuration_actionTEXTNOTNULLCHECK(configuration_actionIN(''installed'',''replaces'',''removes'')),request_sha256TEXTNOTNULL,capability_sha256TEXTNOTNULL,grounded_resolution_sha256TEXTNOTNULL,evidence_capture_sha256TEXTNOTNULL,extracted_listing_sha256TEXTNOTNULL,product_fingerprintTEXTNOTNULL,collision_closure_sha256TEXTNOTNULL,source_revocation_countINTEGERNOTNULLCHECK(source_revocation_count>=0),created_atTEXTNOTNULLDEFAULTCURRENT_TIMESTAMP,PRIMARYKEY(listing_id,plugin_submission_id,occurrence_index,occurrence_role),CHECK(occurrence_role=''primary''ORrequested_quantity=1),CHECK(occurrence_role=''primary''ORconfiguration_actionIN(''replaces'',''removes'')),CHECK(length(request_sha256)=64),CHECK(request_sha256=lower(request_sha256)),CHECK(request_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(capability_sha256)=64),CHECK(capability_sha256=lower(capability_sha256)),CHECK(capability_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(grounded_resolution_sha256)=64),CHECK(grounded_resolution_sha256=lower(grounded_resolution_sha256)),CHECK(grounded_resolution_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(evidence_capture_sha256)=64),CHECK(evidence_capture_sha256=lower(evidence_capture_sha256)),CHECK(evidence_capture_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(extracted_listing_sha256)=64),CHECK(extracted_listing_sha256=lower(extracted_listing_sha256)),CHECK(extracted_listing_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(product_fingerprint)=64),CHECK(product_fingerprint=lower(product_fingerprint)),CHECK(product_fingerprintNOTGLOB''*[^0-9a-f]*''),CHECK(length(collision_closure_sha256)=64),CHECK(collision_closure_sha256=lower(collision_closure_sha256)),CHECK(collision_closure_sha256NOTGLOB''*[^0-9a-f]*''))'
   AND (
     SELECT group_concat(name, ',')
     FROM (
@@ -51,14 +51,14 @@ SELECT CASE
       )
       ORDER BY cid
     )
-  ) = 'listing_link_id,association_role,avionics_model_id,authorization_kind,observation_sha256,product_fingerprint,grounded_resolution_sha256,evidence_capture_sha256,plugin_submission_id,extracted_listing_sha256,collision_closure_sha256,source_revocation_count,policy_version,authorized_at'
+  ) = 'listing_link_id,association_role,avionics_model_id,authorization_kind,observation_sha256,product_fingerprint,grounded_resolution_sha256,evidence_capture_sha256,plugin_submission_id,extracted_listing_sha256,collision_closure_sha256,source_revocation_count,authorized_at'
   AND (
     SELECT replace(replace(replace(replace(
       sql, char(9), ''), char(10), ''), char(13), ''), ' ', '')
     FROM sqlite_schema
     WHERE type = 'table'
       AND name = 'aircraft_sale_listing_avionics_link_authorizations'
-  ) = 'CREATETABLEaircraft_sale_listing_avionics_link_authorizations(listing_link_idINTEGERNOTNULLREFERENCESaircraft_sale_listing_avionics(id)ONDELETECASCADE,association_roleTEXTNOTNULLCHECK(association_roleIN(''installed'',''replacement'')),avionics_model_idINTEGERNOTNULLREFERENCESavionics_models(id)ONDELETECASCADE,authorization_kindTEXTNOTNULLCHECK(authorization_kindIN(''manufacturer_reuse'',''same_case_grounded'')),observation_sha256TEXTNOTNULL,product_fingerprintTEXTNOTNULL,grounded_resolution_sha256TEXT,evidence_capture_sha256TEXTNOTNULL,plugin_submission_idINTEGERREFERENCESplugin_submissions(id)ONDELETECASCADE,extracted_listing_sha256TEXT,collision_closure_sha256TEXTNOTNULL,source_revocation_countINTEGER,policy_versionTEXTNOTNULLCHECK(policy_version=''listing_avionics_authorization''),authorized_atTEXTNOTNULLDEFAULTCURRENT_TIMESTAMP,PRIMARYKEY(listing_link_id,association_role),CHECK(length(observation_sha256)=64),CHECK(observation_sha256=lower(observation_sha256)),CHECK(observation_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(product_fingerprint)=64),CHECK(product_fingerprint=lower(product_fingerprint)),CHECK(product_fingerprintNOTGLOB''*[^0-9a-f]*''),CHECK(length(evidence_capture_sha256)=64),CHECK(evidence_capture_sha256=lower(evidence_capture_sha256)),CHECK(evidence_capture_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(extracted_listing_sha256ISNULLOR(length(extracted_listing_sha256)=64ANDextracted_listing_sha256=lower(extracted_listing_sha256)ANDextracted_listing_sha256NOTGLOB''*[^0-9a-f]*'')),CHECK(length(collision_closure_sha256)=64),CHECK(collision_closure_sha256=lower(collision_closure_sha256)),CHECK(collision_closure_sha256NOTGLOB''*[^0-9a-f]*''),CHECK((authorization_kind=''manufacturer_reuse''ANDgrounded_resolution_sha256ISNULLANDplugin_submission_idISNULLANDextracted_listing_sha256ISNULLANDsource_revocation_countISNULL)OR(authorization_kind=''same_case_grounded''ANDlength(grounded_resolution_sha256)=64ANDgrounded_resolution_sha256=lower(grounded_resolution_sha256)ANDgrounded_resolution_sha256NOTGLOB''*[^0-9a-f]*''ANDplugin_submission_idISNOTNULLANDextracted_listing_sha256ISNOTNULLANDsource_revocation_countISNOTNULLANDsource_revocation_count>=0)))'
+  ) = 'CREATETABLEaircraft_sale_listing_avionics_link_authorizations(listing_link_idINTEGERNOTNULLREFERENCESaircraft_sale_listing_avionics(id)ONDELETECASCADE,association_roleTEXTNOTNULLCHECK(association_roleIN(''installed'',''replacement'')),avionics_model_idINTEGERNOTNULLREFERENCESavionics_models(id)ONDELETECASCADE,authorization_kindTEXTNOTNULLCHECK(authorization_kindIN(''manufacturer_reuse'',''same_case_grounded'')),observation_sha256TEXTNOTNULL,product_fingerprintTEXTNOTNULL,grounded_resolution_sha256TEXT,evidence_capture_sha256TEXTNOTNULL,plugin_submission_idINTEGERREFERENCESplugin_submissions(id)ONDELETECASCADE,extracted_listing_sha256TEXT,collision_closure_sha256TEXTNOTNULL,source_revocation_countINTEGER,authorized_atTEXTNOTNULLDEFAULTCURRENT_TIMESTAMP,PRIMARYKEY(listing_link_id,association_role),CHECK(length(observation_sha256)=64),CHECK(observation_sha256=lower(observation_sha256)),CHECK(observation_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(length(product_fingerprint)=64),CHECK(product_fingerprint=lower(product_fingerprint)),CHECK(product_fingerprintNOTGLOB''*[^0-9a-f]*''),CHECK(length(evidence_capture_sha256)=64),CHECK(evidence_capture_sha256=lower(evidence_capture_sha256)),CHECK(evidence_capture_sha256NOTGLOB''*[^0-9a-f]*''),CHECK(extracted_listing_sha256ISNULLOR(length(extracted_listing_sha256)=64ANDextracted_listing_sha256=lower(extracted_listing_sha256)ANDextracted_listing_sha256NOTGLOB''*[^0-9a-f]*'')),CHECK(length(collision_closure_sha256)=64),CHECK(collision_closure_sha256=lower(collision_closure_sha256)),CHECK(collision_closure_sha256NOTGLOB''*[^0-9a-f]*''),CHECK((authorization_kind=''manufacturer_reuse''ANDgrounded_resolution_sha256ISNULLANDplugin_submission_idISNULLANDextracted_listing_sha256ISNULLANDsource_revocation_countISNULL)OR(authorization_kind=''same_case_grounded''ANDlength(grounded_resolution_sha256)=64ANDgrounded_resolution_sha256=lower(grounded_resolution_sha256)ANDgrounded_resolution_sha256NOTGLOB''*[^0-9a-f]*''ANDplugin_submission_idISNOTNULLANDextracted_listing_sha256ISNOTNULLANDsource_revocation_countISNOTNULLANDsource_revocation_count>=0)))'
   THEN 1
   WHEN NOT EXISTS (
     SELECT 1 FROM schema_migration_contracts
@@ -117,7 +117,7 @@ SELECT EXISTS (
   WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'
     AND contract_version = 1
     AND contract_fingerprint =
-      'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e'
+      '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef'
 ) AS exact_rerun;
 
 DROP TABLE IF EXISTS temp.listing_avionics_grounded_capabilities_installed_objects;
@@ -185,8 +185,6 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_grounded_capabilities 
   collision_closure_sha256 TEXT NOT NULL,
   source_revocation_count INTEGER NOT NULL
     CHECK (source_revocation_count >= 0),
-  policy_version TEXT NOT NULL
-    CHECK (policy_version = 'listing_avionics_grounded_capability'),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (
     listing_id, plugin_submission_id, occurrence_index, occurrence_role
@@ -293,8 +291,6 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listing_avionics_link_authorizations (
   extracted_listing_sha256 TEXT,
   collision_closure_sha256 TEXT NOT NULL,
   source_revocation_count INTEGER,
-  policy_version TEXT NOT NULL
-    CHECK (policy_version = 'listing_avionics_authorization'),
   authorized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (listing_link_id, association_role),
   CHECK (length(observation_sha256) = 64),
@@ -637,7 +633,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  'e29dd6062dca13f4b97cdc9a78666bf407ec791d78e7a858c4ae09333fcf677e',
+  '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

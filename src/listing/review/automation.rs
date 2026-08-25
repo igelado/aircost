@@ -40,7 +40,7 @@ use super::{
     parse_payload, serialize_review_payload, sha256_hex, valid_sha256,
     validate_exact_listing_evidence_span, validate_exact_listing_product_evidence,
     ListingAssociationRole, PendingReviewAspect, ReviewError, ReviewResult,
-    ASSOCIATION_AUTHORIZATION_POLICY_VERSION, POSTGRES_LISTING_CHILD_LOCK_SQL,
+    POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
 use crate::avionics::catalog::globally_unique_active_exact_model_id;
 
@@ -173,7 +173,6 @@ struct ExistingSameCaseAuthorizationRow {
     current_extracted_listing_json: Option<String>,
     exact_submission_is_current: bool,
     collision_closure_sha256: String,
-    policy_version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -556,8 +555,7 @@ fn current_same_case_authorization(
         .filter(|hash| valid_sha256(hash))
         .zip(authorization.current_extracted_listing_json.as_deref())
         .is_some_and(|(stored_hash, checkpoint)| stored_hash == sha256_hex(checkpoint.as_bytes()));
-    if authorization.policy_version != ASSOCIATION_AUTHORIZATION_POLICY_VERSION
-        || !authorization.exact_submission_is_current
+    if !authorization.exact_submission_is_current
         || !authorization
             .plugin_submission_id
             .is_some_and(|submission_id| submission_id > 0)
@@ -659,8 +657,7 @@ const EXISTING_SAME_CASE_AUTHORIZATIONS_SQLITE_SQL: &str = r#"
              AND length(trim(COALESCE(link.source_notes, ''))) > 0
              AND instr(grounded_submission.rendered_html, link.source_notes) > 0
            THEN 1 ELSE 0 END AS exact_submission_is_current,
-      authorization.collision_closure_sha256,
-      authorization.policy_version
+      authorization.collision_closure_sha256
     FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
@@ -689,8 +686,7 @@ const EXISTING_SAME_CASE_AUTHORIZATIONS_POSTGRES_SQL: &str = r#"
              AND length(BTRIM(COALESCE(link.source_notes, ''))) > 0
              AND position(link.source_notes IN grounded_submission.rendered_html) > 0
            THEN TRUE ELSE FALSE END AS exact_submission_is_current,
-      authorization.collision_closure_sha256,
-      authorization.policy_version
+      authorization.collision_closure_sha256
     FROM aircraft_sale_listing_avionics_link_authorizations authorization
     JOIN aircraft_sale_listing_avionics link
       ON link.id = authorization.listing_link_id
@@ -1036,11 +1032,10 @@ pub(crate) async fn apply_automated_avionics_review(
           product_fingerprint,
           grounded_resolution_sha256,
           evidence_capture_sha256,
-          collision_closure_sha256,
-          policy_version
+          collision_closure_sha256
         )
         SELECT ?, ?, ?, 'manufacturer_reuse', ?, attestation.product_fingerprint,
-               NULL, ?, ?, ?
+               NULL, ?, ?
         FROM avionics_product_reuse_attestations attestation
         WHERE attestation.avionics_model_id = ?
         "#,
@@ -1798,7 +1793,6 @@ pub(crate) async fn apply_automated_avionics_review(
                         .bind(observation_sha256.as_str())
                         .bind(request.expected_rendered_html_sha256.as_str())
                         .bind(collision_closure)
-                        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                         .bind(target_id)
                         .execute(&mut *transaction)
                         .await?
@@ -2384,8 +2378,8 @@ mod tests {
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, source_revocation_count, policy_version
-            ) VALUES (?, 'installed', ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0, ?)
+              collision_closure_sha256, source_revocation_count
+            ) VALUES (?, 'installed', ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, 0)
             "#,
         )
         .bind(listing_link_id)
@@ -2397,7 +2391,6 @@ mod tests {
         .bind(fixture.submission_id)
         .bind(extracted_listing_sha256)
         .bind(collision_closure_sha256)
-        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
         .execute(pool)
         .await
         .unwrap();
@@ -2441,9 +2434,9 @@ mod tests {
               authorization_kind, observation_sha256, product_fingerprint,
               grounded_resolution_sha256, evidence_capture_sha256,
               plugin_submission_id, extracted_listing_sha256,
-              collision_closure_sha256, policy_version
+              collision_closure_sha256
             ) VALUES (?, 'installed', ?, 'manufacturer_reuse', ?, ?, NULL,
-                      ?, NULL, NULL, ?, ?)
+                      ?, NULL, NULL, ?)
             "#,
         )
         .bind(listing_link_id)
@@ -2452,7 +2445,6 @@ mod tests {
         .bind(product_fingerprint)
         .bind(&fixture.rendered_html_sha256)
         .bind(&collision_closure_sha256)
-        .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
         .execute(pool)
         .await
         .unwrap();
