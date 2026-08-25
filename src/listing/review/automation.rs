@@ -2715,7 +2715,8 @@ mod tests {
                           rendered_html_sha256, signature_base64,
                           canonical_listing_id, extracted_listing_json
                         )
-                        SELECT user_id, plugin_install_id, source_url, rendered_html,
+                        SELECT user_id, plugin_install_id,
+                               source_url || '?wrong-submission=1', rendered_html,
                                rendered_html_sha256, signature_base64, NULL,
                                extracted_listing_json
                         FROM plugin_submissions WHERE id = ?
