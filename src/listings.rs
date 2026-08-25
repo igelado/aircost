@@ -42,8 +42,7 @@ use crate::cleanup::{cleanup_orphan_records, CleanupError};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::{optional_f64, optional_i64, optional_string, GeminiListingExtractor};
 use crate::html::listing::source::{
-    controller_extraction_source_has_exact_avionics_line,
-    listing_extraction_source_contains_exact_avionics_occurrence,
+    controller_extraction_source_has_exact_avionics_line, ListingEvidenceUnits,
 };
 use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
 use crate::listing::avionics::{
@@ -1066,6 +1065,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
         avionics_extractor,
         preview.source_url.as_deref(),
         preview.context_text.as_deref(),
+        preview.source_evidence_units.as_ref(),
         None,
     )
     .await?;
@@ -1328,6 +1328,7 @@ pub(crate) async fn resume_signed_source_correction_listing(
         extractor,
         preview.source_url.as_deref(),
         preview.context_text.as_deref(),
+        preview.source_evidence_units.as_ref(),
         replay_scope.as_ref(),
     )
     .await?;
@@ -1508,6 +1509,7 @@ async fn resume_signed_source_visual_correction_listing_with_correction(
             extractor,
             preview.source_url.as_deref(),
             preview.context_text.as_deref(),
+            preview.source_evidence_units.as_ref(),
             replay_scope.as_ref(),
         )
         .await?;
@@ -1598,6 +1600,7 @@ pub(crate) async fn resume_bound_replay_listing(
         extractor,
         preview.source_url.as_deref(),
         preview.context_text.as_deref(),
+        preview.source_evidence_units.as_ref(),
         Some(&replay_scope),
     )
     .await?;
@@ -1949,6 +1952,7 @@ pub async fn update_listing(
                 // the signed ingestion or manual review workflow.
                 None,
                 source_url.as_deref(),
+                None,
                 None,
                 None,
             )
@@ -3312,6 +3316,7 @@ async fn resolve_listing_avionics_values(
     extractor: Option<&GeminiListingExtractor>,
     source_url: Option<&str>,
     listing_context: Option<&str>,
+    source_evidence_units: Option<&ListingEvidenceUnits>,
     replay_scope: Option<&GroundedCapabilityReplayScope>,
 ) -> StoreResult<ResolvedListingAvionics> {
     let retained_listing_context = listing_context.unwrap_or_default();
@@ -3320,9 +3325,8 @@ async fn resolve_listing_avionics_values(
     let mut dispositions = Vec::new();
 
     for (index, item) in values.avionics.clone().into_iter().enumerate() {
-        let occurrence_evidence = exact_occurrence_evidence_from_retained_listing_context(
-            source_url,
-            retained_listing_context,
+        let occurrence_evidence = exact_occurrence_evidence_from_source_units(
+            source_evidence_units,
             item.source_notes.as_deref(),
         );
         let controller_run_on_line = source_url.is_some_and(|source_url| {
@@ -4463,21 +4467,14 @@ fn coalesce_resolved_listing_avionics(
 /// Select only one extraction-validated occurrence from the bounded source
 /// adapter context. Provider and local identity work must never receive page
 /// fields unrelated to the occurrence being resolved.
-fn exact_occurrence_evidence_from_retained_listing_context<'a>(
-    source_url: Option<&str>,
-    retained_listing_context: &'a str,
+fn exact_occurrence_evidence_from_source_units<'a>(
+    source_evidence_units: Option<&ListingEvidenceUnits>,
     source_evidence_text: Option<&'a str>,
 ) -> &'a str {
     let evidence = source_evidence_text.map(str::trim).unwrap_or_default();
     if evidence.is_empty()
         || evidence.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
-        || source_url.is_none_or(|source_url| {
-            !listing_extraction_source_contains_exact_avionics_occurrence(
-                source_url,
-                retained_listing_context,
-                evidence,
-            )
-        })
+        || !source_evidence_units.is_some_and(|units| units.contains_exact_span(evidence))
     {
         ""
     } else {
@@ -7252,12 +7249,11 @@ mod tests {
     use crate::models::{ParsedAvionics, ParsedAvionicsReference};
 
     use super::{
-        coalesce_resolved_listing_avionics,
-        exact_occurrence_evidence_from_retained_listing_context, listing_avionics_identity_request,
-        listing_avionics_identity_resolution, listing_avionics_value_from_catalog,
-        replace_listing_avionics, resolve_listing_avionics_values,
-        ListingAvionicsIdentityResolution, ListingAvionicsValue, ListingValues,
-        AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
+        coalesce_resolved_listing_avionics, exact_occurrence_evidence_from_source_units,
+        listing_avionics_identity_request, listing_avionics_identity_resolution,
+        listing_avionics_value_from_catalog, replace_listing_avionics,
+        resolve_listing_avionics_values, ListingAvionicsIdentityResolution, ListingAvionicsValue,
+        ListingValues, AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
         AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON,
     };
 
@@ -8381,6 +8377,7 @@ mod tests {
             None,
             Some("https://example.com/listing"),
             None,
+            None,
         )
         .await
         .expect("unknown equipment should be staged for explicit review");
@@ -8419,13 +8416,16 @@ mod tests {
         values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
             "GTX-345R",
         ))];
+        let retained = "<main>The aircraft has a Garmin GTX-345R installed.</main>";
+        let source_units = test_listing_evidence_units("https://example.com/listing", retained);
 
         let pending = resolve_listing_avionics_values(
             &db,
             &mut values,
             None,
             Some("https://example.com/listing"),
-            Some("The aircraft has a Garmin GTX-345R transponder installed."),
+            Some("The aircraft has a Garmin GTX-345R installed."),
+            Some(&source_units),
             None,
         )
         .await
@@ -8460,10 +8460,10 @@ mod tests {
 
     #[test]
     fn identity_work_receives_only_the_checkpoint_occurrence_not_adjacent_fields() {
-        let retained = "UNRELATED AIRCRAFT DESCRIPTION\nGDC74 Air Data Computer\nUNRELATED PRICE";
-        let occurrence = exact_occurrence_evidence_from_retained_listing_context(
-            Some("https://example.com/listing"),
-            retained,
+        let retained = "<main><div>UNRELATED AIRCRAFT DESCRIPTION</div><div>GDC74 Air Data Computer</div><div>UNRELATED PRICE</div></main>";
+        let source_units = test_listing_evidence_units("https://example.com/listing", retained);
+        let occurrence = exact_occurrence_evidence_from_source_units(
+            Some(&source_units),
             Some("GDC74 Air Data Computer"),
         );
         let values = listing_values_with_variant("182T SKYLANE");
@@ -8493,6 +8493,9 @@ mod tests {
         values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
             "GTX 345R",
         ))];
+        let retained =
+            "<main>The retained listing contains no matching avionics occurrence.</main>";
+        let source_units = test_listing_evidence_units("https://example.com/listing", retained);
 
         let resolved = resolve_listing_avionics_values(
             &db,
@@ -8500,10 +8503,55 @@ mod tests {
             Some(&unreachable),
             Some("https://example.com/listing"),
             Some("The retained listing contains no matching avionics occurrence."),
+            Some(&source_units),
             None,
         )
         .await
         .expect("failed occurrence rebinding should stage review without provider work");
+
+        assert_eq!(resolved.pending_review_aspects.len(), 1);
+        assert!(values.avionics.is_empty());
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_sibling_dom_units_cannot_authorize_cross_unit_occurrence() {
+        const SOURCE_URL: &str = "https://example.com/listing";
+        const RETAINED_HTML: &str = "<main><div>Garmin GTX</div><div>345R installed</div></main>";
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "GTX 345R", "Transponder")
+                .await
+                .expect("approved graph identity should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let flattened =
+            crate::html::listing::source::listing_extraction_source(SOURCE_URL, RETAINED_HTML)
+                .expect("generic extraction source should build");
+        assert!(flattened.contains("Garmin GTX 345R installed"));
+        let source_units = test_listing_evidence_units(SOURCE_URL, RETAINED_HTML);
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
+            "GTX 345R",
+        ))];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            Some(&unreachable),
+            Some(SOURCE_URL),
+            Some(&flattened),
+            Some(&source_units),
+            None,
+        )
+        .await
+        .expect("cross-unit evidence should stage review without provider work");
 
         assert_eq!(resolved.pending_review_aspects.len(), 1);
         assert!(values.avionics.is_empty());
@@ -8561,6 +8609,7 @@ mod tests {
         );
         let source = crate::html::listing::source::listing_extraction_source(CONTROLLER_URL, &html)
             .expect("Controller fixture should produce a bounded source envelope");
+        let source_units = test_listing_evidence_units(CONTROLLER_URL, &html);
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
             manufacturer: "Garmin".to_string(),
@@ -8579,6 +8628,7 @@ mod tests {
             Some(&unreachable),
             Some(CONTROLLER_URL),
             Some(&source),
+            Some(&source_units),
             None,
         )
         .await
@@ -8612,11 +8662,10 @@ mod tests {
         .expect("approved graph identity should seed");
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
         let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
-        let source = crate::html::listing::source::listing_extraction_source(
-            CONTROLLER_URL,
-            include_str!("../tests/fixtures/controller/id25_like_listing.html"),
-        )
-        .expect("capture-25 fixture should produce a bounded source envelope");
+        let html = include_str!("../tests/fixtures/controller/id25_like_listing.html");
+        let source = crate::html::listing::source::listing_extraction_source(CONTROLLER_URL, html)
+            .expect("capture-25 fixture should produce a bounded source envelope");
+        let source_units = test_listing_evidence_units(CONTROLLER_URL, html);
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
             manufacturer: "Garmin".to_string(),
@@ -8635,6 +8684,7 @@ mod tests {
             Some(&unreachable),
             Some(CONTROLLER_URL),
             Some(&source),
+            Some(&source_units),
             None,
         )
         .await
@@ -8704,16 +8754,22 @@ mod tests {
                 2,
             ),
         ] {
-            let source = if source_url == CONTROLLER_URL {
+            let (source, source_units) = if source_url == CONTROLLER_URL {
                 let html = include_str!("../tests/fixtures/controller/id25_like_listing.html")
                     .replace(
                         "GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140",
                         evidence,
                     );
-                crate::html::listing::source::listing_extraction_source(source_url, &html)
-                    .expect("Controller fixture should produce a bounded source envelope")
+                (
+                    crate::html::listing::source::listing_extraction_source(source_url, &html)
+                        .expect("Controller fixture should produce a bounded source envelope"),
+                    test_listing_evidence_units(source_url, &html),
+                )
             } else {
-                evidence.to_string()
+                (
+                    evidence.to_string(),
+                    test_listing_evidence_units(source_url, evidence),
+                )
             };
             let mut values = listing_values_with_variant("182T SKYLANE");
             values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
@@ -8733,6 +8789,7 @@ mod tests {
                 None,
                 Some(source_url),
                 Some(&source),
+                Some(&source_units),
                 None,
             )
             .await
@@ -8768,15 +8825,17 @@ mod tests {
             ListingAvionicsValue::from_parsed(parsed.clone()),
             ListingAvionicsValue::from_parsed(parsed),
         ];
+        let retained =
+            "Garmin GDU 1044B Flight Display\nGarmin GDU 1044B Flight Display\nUNRELATED FIELD";
+        let source_units = test_listing_evidence_units("https://example.com/listing", retained);
 
         let resolved = resolve_listing_avionics_values(
             &db,
             &mut values,
             None,
             Some("https://example.com/listing"),
-            Some(
-                "Garmin GDU 1044B Flight Display\nGarmin GDU 1044B Flight Display\nUNRELATED FIELD",
-            ),
+            Some(retained),
+            Some(&source_units),
             None,
         )
         .await
@@ -8889,6 +8948,8 @@ mod tests {
         values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
             "GTX 345R",
         ))];
+        let source_units =
+            test_listing_evidence_units("https://example.com/listing", "GTX 345R installed");
 
         let pending = resolve_listing_avionics_values(
             &db,
@@ -8896,6 +8957,7 @@ mod tests {
             Some(&extractor),
             Some("https://example.com/listing"),
             Some("GTX 345R installed"),
+            Some(&source_units),
             None,
         )
         .await
@@ -8931,6 +8993,7 @@ mod tests {
                 Some("https://example.com/listing"),
                 Some("XM Weather & Radio"),
                 None,
+                None,
             )
             .await
             .expect("exact generic discard must not depend on provider availability");
@@ -8956,6 +9019,10 @@ mod tests {
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, replacement_id).await;
         let unreachable =
             crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let source_units = test_listing_evidence_units(
+            "https://example.com/listing",
+            "Garmin GPS replaces Garmin GNS 430W",
+        );
 
         for configured_extractor in [None, Some(&unreachable)] {
             let mut values = listing_values_with_variant("182T SKYLANE");
@@ -8975,6 +9042,7 @@ mod tests {
                 configured_extractor,
                 Some("https://example.com/listing"),
                 Some("Garmin GPS replaces Garmin GNS 430W"),
+                Some(&source_units),
                 None,
             )
             .await
@@ -9014,6 +9082,10 @@ mod tests {
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, primary_id).await;
         let unreachable =
             crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let source_units = test_listing_evidence_units(
+            "https://example.com/listing",
+            "Garmin GNS 430W changes Garmin GPS",
+        );
 
         for configured_extractor in [None, Some(&unreachable)] {
             for action in ["replaces", "removes"] {
@@ -9035,6 +9107,7 @@ mod tests {
                     configured_extractor,
                     Some("https://example.com/listing"),
                     Some("Garmin GNS 430W changes Garmin GPS"),
+                    Some(&source_units),
                     None,
                 )
                 .await
@@ -9486,12 +9559,17 @@ mod tests {
             "GTX 345R",
         ))];
         let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let source_units = test_listing_evidence_units(
+            "https://example.com/listing",
+            "<p>Garmin GTX 345R installed</p>",
+        );
         let resolution = resolve_listing_avionics_values(
             &fixture.db,
             &mut values,
             Some(&unreachable),
             Some("https://example.com/listing"),
             Some("Garmin GTX 345R installed"),
+            Some(&source_units),
             Some(&scope),
         )
         .await
@@ -9572,12 +9650,17 @@ mod tests {
             "GTX 345R",
         ))];
         let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let source_units = test_listing_evidence_units(
+            "https://example.com/listing",
+            "<p>Garmin GTX 345R installed</p>",
+        );
         let resolution = resolve_listing_avionics_values(
             &fixture.db,
             &mut values,
             Some(&unreachable),
             Some("https://example.com/listing"),
             Some("Garmin GTX 345R installed"),
+            Some(&source_units),
             Some(&fixture.scope),
         )
         .await
@@ -9971,12 +10054,17 @@ mod tests {
             allow_provider_fallback: true,
         };
         let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let source_units = test_listing_evidence_units(
+            "https://example.com/listing",
+            "<p>Garmin GTX 345R installed</p>",
+        );
         let resolved = resolve_listing_avionics_values(
             &db,
             &mut values,
             Some(&unreachable),
             Some("https://example.com/listing"),
             Some("Garmin GTX 345R installed"),
+            Some(&source_units),
             Some(&replay_scope),
         )
         .await
@@ -10473,6 +10561,14 @@ mod tests {
                 allow_provider_fallback: true,
             },
         }
+    }
+
+    fn test_listing_evidence_units(
+        source_url: &str,
+        retained_html: &str,
+    ) -> crate::html::listing::source::ListingEvidenceUnits {
+        crate::html::listing::source::listing_evidence_units(source_url, retained_html)
+            .expect("test listing should produce source-unit proof")
     }
 
     fn parsed_avionics(model: &str) -> ParsedAvionics {

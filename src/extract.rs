@@ -35,7 +35,7 @@ use crate::gemini::usage::{
 };
 use crate::html::listing::download::{download_identity_image, download_identity_images};
 use crate::html::listing::media::{discover as discover_listing_media, MediaDiscoveryError};
-use crate::html::listing::source::listing_extraction_source;
+use crate::html::listing::source::{listing_evidence_units, listing_extraction_source};
 use crate::models::{
     ListingPreview, ListingValuationFact, ParsedAvionics, ParsedInstalledComponent, ParsedListing,
 };
@@ -2226,12 +2226,15 @@ async fn listing_preview_from_structured(
         }
     }
     warnings.extend(missing_field_warnings(&parsed_listing));
+    let source_evidence_units = listing_evidence_units(source_url, html)
+        .context("could not build listing source-unit proof")?;
     Ok(ListingPreview {
         source_url: Some(source_url.to_string()),
         parsed_listing,
         warnings,
         identity_recovery,
         context_text: Some(listing_text),
+        source_evidence_units: Some(source_evidence_units),
     })
 }
 
@@ -2253,6 +2256,7 @@ pub fn preview_manual_listing(listing: &Value) -> ListingPreview {
         warnings,
         identity_recovery: None,
         context_text: None,
+        source_evidence_units: None,
     }
 }
 

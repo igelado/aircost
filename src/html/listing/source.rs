@@ -128,7 +128,7 @@ struct ControllerListingSource {
 /// Controller evidence is restricted to one exact specification value. Labels,
 /// adjacent values, price/page chrome, and JSON-LD cannot become avionics
 /// evidence. Other publishers retain the generic visible-body unit contract.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ListingEvidenceUnits {
     Controller(Vec<String>),
     Generic(ListingBodyEvidenceUnits),
@@ -174,37 +174,6 @@ pub(crate) fn listing_evidence_units(
         Ok(ListingEvidenceUnits::Generic(
             ListingBodyEvidenceUnits::from_html(retained_html),
         ))
-    }
-}
-
-/// Rebind one checkpoint occurrence to the bounded text produced by this
-/// source adapter.
-///
-/// Controller text retains exact field envelopes, so evidence must occur wholly
-/// within at least one specification value. Repeated valid values preserve the
-/// extraction checkpoint's `any` contract. Generic adapter text retains one
-/// normalized visible unit per line; matching is restricted to a single line
-/// so a flattened cross-unit substring cannot become identity evidence.
-pub(crate) fn listing_extraction_source_contains_exact_avionics_occurrence(
-    source_url: &str,
-    extraction_source: &str,
-    evidence: &str,
-) -> bool {
-    let evidence = evidence.trim();
-    if evidence.is_empty() {
-        return false;
-    }
-    if is_controller_source_host(source_url) {
-        validate_controller_listing_source_url(source_url).is_ok()
-            && controller_fields_from_extraction_source(extraction_source).is_some_and(|fields| {
-                fields.iter().any(|(_, value)| {
-                    crate::html::clean::exact_normalized_source_span_occurs(value, evidence)
-                })
-            })
-    } else {
-        extraction_source
-            .lines()
-            .any(|unit| crate::html::clean::exact_normalized_source_span_occurs(unit, evidence))
     }
 }
 
@@ -730,8 +699,7 @@ fn invalid_structure(error: impl Into<String>) -> ListingSourceError {
 mod tests {
     use super::{
         controller_extraction_source_has_exact_avionics_line, listing_evidence_units,
-        listing_extraction_source, listing_extraction_source_contains_exact_avionics_occurrence,
-        MAX_CONTROLLER_VALUE_BYTES,
+        listing_extraction_source, MAX_CONTROLLER_VALUE_BYTES,
     };
 
     const URL: &str = "https://www.controller.com/listing/for-sale/257959105/example";
@@ -785,29 +753,16 @@ mod tests {
     #[test]
     fn checkpoint_occurrence_rebinding_stays_inside_controller_field_values() {
         let source = listing_extraction_source(URL, REALISTIC).unwrap();
+        let units = listing_evidence_units(URL, REALISTIC).unwrap();
 
-        assert!(
-            listing_extraction_source_contains_exact_avionics_occurrence(
-                URL,
-                &source,
-                "GARMIN GIA-63W #1"
-            )
-        );
+        assert!(units.contains_exact_span("GARMIN GIA-63W #1"));
         assert!(controller_extraction_source_has_exact_avionics_line(
             URL,
             &source,
             "GARMIN GIA-63W #1"
         ));
-        assert!(
-            !listing_extraction_source_contains_exact_avionics_occurrence(URL, &source, "GIA-63")
-        );
-        assert!(
-            listing_extraction_source_contains_exact_avionics_occurrence(
-                URL,
-                &source,
-                "GARMIN G1000 NXI"
-            )
-        );
+        assert!(!units.contains_exact_span("GIA-63"));
+        assert!(units.contains_exact_span("GARMIN G1000 NXI"));
         assert!(!controller_extraction_source_has_exact_avionics_line(
             URL,
             &source,
@@ -822,24 +777,12 @@ mod tests {
 
     #[test]
     fn repeated_controller_values_preserve_checkpoint_parity_but_cannot_enable_run_on_reuse() {
-        let source = listing_extraction_source(URL, REALISTIC).unwrap();
-        let avionics_field = source
-            .split("[CONTROLLER FIELD]\n[LABEL]\nAvionics/Radios")
-            .nth(1)
-            .and_then(|tail| tail.split_once("[/CONTROLLER FIELD]\n"))
-            .map(|(field, _)| {
-                format!("[CONTROLLER FIELD]\n[LABEL]\nAvionics/Radios{field}[/CONTROLLER FIELD]\n")
-            })
-            .expect("fixture should contain the Controller avionics field");
-        let ambiguous = format!("{source}{avionics_field}");
+        let field = "<div class=\"detail__specs-label\">Avionics/Radios</div>\n          <div class=\"detail__specs-value\">GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140</div>";
+        let ambiguous_html = REALISTIC.replace(field, &format!("{field}\n{field}"));
+        let ambiguous = listing_extraction_source(URL, &ambiguous_html).unwrap();
+        let units = listing_evidence_units(URL, &ambiguous_html).unwrap();
 
-        assert!(
-            listing_extraction_source_contains_exact_avionics_occurrence(
-                URL,
-                &ambiguous,
-                "GARMIN GIA-63W #1"
-            )
-        );
+        assert!(units.contains_exact_span("GARMIN GIA-63W #1"));
         assert!(!controller_extraction_source_has_exact_avionics_line(
             URL,
             &ambiguous,
@@ -849,29 +792,15 @@ mod tests {
 
     #[test]
     fn generic_checkpoint_occurrence_cannot_cross_adapter_units() {
-        let source = "Garmin GIA 63W\nNAV/COM/GPS\nUnrelated aircraft field";
+        let html = "<main><div>Garmin GTX</div><div>345R installed</div></main>";
+        let source = listing_extraction_source("https://example.com/listing", html).unwrap();
+        let units = listing_evidence_units("https://example.com/listing", html).unwrap();
 
-        assert!(
-            listing_extraction_source_contains_exact_avionics_occurrence(
-                "https://example.com/listing",
-                source,
-                "Garmin GIA 63W"
-            )
-        );
-        assert!(
-            !listing_extraction_source_contains_exact_avionics_occurrence(
-                "https://example.com/listing",
-                source,
-                "GIA 63"
-            )
-        );
-        assert!(
-            !listing_extraction_source_contains_exact_avionics_occurrence(
-                "https://example.com/listing",
-                source,
-                "GIA 63W NAV/COM/GPS"
-            )
-        );
+        assert!(source.contains("Garmin GTX 345R installed"));
+        assert!(units.contains_exact_span("Garmin GTX"));
+        assert!(units.contains_exact_span("345R installed"));
+        assert!(!units.contains_exact_span("Garmin GTX 345R installed"));
+        assert!(!units.contains_exact_span("GTX 345R installed"));
     }
 
     #[test]

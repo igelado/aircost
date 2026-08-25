@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::aircraft::curation::visual::VisualIdentifierResolution;
+use crate::html::listing::source::ListingEvidenceUnits;
 
 pub const MIN_PLAUSIBLE_ASKING_PRICE_USD: f64 = 1_000.0;
 pub const MAX_PLAUSIBLE_ASKING_PRICE_USD: f64 = 250_000_000.0;
@@ -105,6 +106,10 @@ pub struct ListingPreview {
     pub identity_recovery: Option<VisualIdentifierResolution>,
     #[serde(skip_serializing, skip_deserializing)]
     pub context_text: Option<String>,
+    /// Runtime-only source-unit proof derived from the retained HTML by the
+    /// same publisher adapter that validated extraction evidence.
+    #[serde(skip_serializing, skip_deserializing)]
+    pub(crate) source_evidence_units: Option<ListingEvidenceUnits>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

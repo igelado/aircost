@@ -128,9 +128,11 @@ these boundaries. The same gate runs for the initial extraction checkpoint and
 durable avionics re-extraction. During materialization, local matching and any
 paid avionics prompt receive only that checkpoint occurrence when it is
 nonempty, no more than 256 bytes, and can be rebound to the retained source
-adapter output. They never receive a page excerpt containing adjacent listing
-fields. The observed manufacturer remains separate structured request data, so
-an exact occurrence need not repeat it merely to preserve the paid fallback.
+adapter's exact source-unit proof. The flattened extraction text is not a
+materialization proof and cannot join sibling DOM units. Identity work never
+receives a page excerpt containing adjacent listing fields. The observed
+manufacturer remains separate structured request data, so an exact occurrence
+need not repeat it merely to preserve the paid fallback.
 After any exact same-case replay is considered, a missing, oversized, or
 unrebindable occurrence stops as pending before local matching or a provider
 call. A paid fallback is therefore possible only for a successfully rebound

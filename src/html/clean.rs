@@ -351,7 +351,7 @@ pub fn listing_body_contains_exact_structurally_visible_text_span(
 /// publisher label/value elements remain separate. This prevents a flattened
 /// whole-page text stream from manufacturing an evidence phrase across field
 /// boundaries.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ListingBodyEvidenceUnits {
     units: Vec<String>,
 }
