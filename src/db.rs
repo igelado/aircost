@@ -4311,12 +4311,6 @@ impl AppDb {
                 || !grounded_capability_definitions_are_valid
                 || !authorization_definitions_are_valid
                 || grounded_capability_contract_is_invalid;
-        #[cfg(test)]
-        if missing_listing_avionics_grounded_capabilities {
-            eprintln!(
-                "grounded avionics startup gate: shallow_missing={missing_listing_avionics_grounded_capability_objects} capability_exact={grounded_capability_definitions_are_valid} authorization_exact={authorization_definitions_are_valid} receipt_invalid={grounded_capability_contract_is_invalid}"
-            );
-        }
         if missing_listing_avionics_grounded_capabilities {
             bail!(listing_avionics_grounded_capabilities_migration_required_message(self.kind()));
         }
