@@ -28,7 +28,7 @@ SELECT CASE
     WHERE migration_name = '20260825_listing_avionics_grounded_capabilities'
       AND contract_version = 1
       AND contract_fingerprint =
-        'e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298'
+        'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31'
   ) THEN 1
   ELSE 0
 END;
@@ -129,7 +129,7 @@ INSERT INTO schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  'e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298',
+  'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

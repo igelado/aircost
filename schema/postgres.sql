@@ -3848,14 +3848,15 @@ CREATE INDEX IF NOT EXISTS
   idx_listing_avionics_grounded_capabilities_submission
 ON aircraft_sale_listing_avionics_grounded_capabilities (plugin_submission_id);
 
-CREATE OR REPLACE FUNCTION validate_listing_avionics_grounded_capability()
+CREATE OR REPLACE FUNCTION public.validate_listing_avionics_grounded_capability()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
-    FROM plugin_submissions submission
+    FROM public.plugin_submissions submission
     WHERE submission.id = NEW.plugin_submission_id
       AND submission.canonical_listing_id = NEW.listing_id
       AND submission.rendered_html_sha256 = NEW.evidence_capture_sha256
@@ -3863,7 +3864,7 @@ BEGIN
       AND submission.extraction_error IS NULL
   ) OR NOT EXISTS (
     SELECT 1
-    FROM avionics_approved_product_graph_identities approved
+    FROM public.avionics_approved_product_graph_identities approved
     WHERE approved.avionics_model_id = NEW.avionics_model_id
   ) THEN
     RAISE EXCEPTION 'grounded avionics capability requires its exact current capture-bound listing and approved product';
@@ -3876,11 +3877,12 @@ DROP TRIGGER IF EXISTS listing_avionics_grounded_capabilities_validate_insert
   ON aircraft_sale_listing_avionics_grounded_capabilities;
 CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert
 BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities
-FOR EACH ROW EXECUTE FUNCTION validate_listing_avionics_grounded_capability();
+FOR EACH ROW EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability();
 
-CREATE OR REPLACE FUNCTION reject_listing_avionics_grounded_capability_update()
+CREATE OR REPLACE FUNCTION public.reject_listing_avionics_grounded_capability_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   RAISE EXCEPTION 'grounded avionics capabilities are immutable';
@@ -3891,14 +3893,14 @@ DROP TRIGGER IF EXISTS listing_avionics_grounded_capabilities_immutable_update
   ON aircraft_sale_listing_avionics_grounded_capabilities;
 CREATE TRIGGER listing_avionics_grounded_capabilities_immutable_update
 BEFORE UPDATE ON aircraft_sale_listing_avionics_grounded_capabilities
-FOR EACH ROW EXECUTE FUNCTION reject_listing_avionics_grounded_capability_update();
+FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update();
 
 INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  'e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298',
+  'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

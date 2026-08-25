@@ -98,8 +98,10 @@ const LISTING_AVIONICS_AUTHORIZATION_HASH_DOMAIN_RESET_CONTRACT_FINGERPRINT: &st
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_MIGRATION: &str =
     "20260825_listing_avionics_grounded_capabilities";
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION: i64 = 1;
+// SHA-256 of
+// `20260825_listing_avionics_grounded_capabilities:v1:public-qualified-trigger-functions:pg_catalog-search-path:exact-startup-object-contract`.
 const LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT: &str =
-    "e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298";
+    "a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31";
 const LISTING_AVIONICS_DISPOSITIONS_MIGRATION: &str = "20260819_listing_avionics_dispositions";
 const FAA_REFERENCE_REACHABILITY_MIGRATION: &str = "20260819_faa_reference_reachability";
 const FAA_REFERENCE_REACHABILITY_CONTRACT_VERSION: i64 = 1;
@@ -3644,6 +3646,128 @@ impl AppDb {
             GateConnection::Sqlite(pool) => {
                 sqlx::query_scalar::<_, i64>(
                     r#"
+                    WITH required_columns(
+                      column_name, column_type, required_not_null,
+                      primary_key_position, default_value
+                    ) AS (
+                      VALUES
+                        ('listing_id', 'INTEGER', 1, 1, NULL),
+                        ('plugin_submission_id', 'INTEGER', 1, 2, NULL),
+                        ('occurrence_index', 'INTEGER', 1, 3, NULL),
+                        ('occurrence_role', 'TEXT', 1, 4, NULL),
+                        ('avionics_model_id', 'INTEGER', 1, 0, NULL),
+                        ('requested_quantity', 'INTEGER', 1, 0, NULL),
+                        ('configuration_action', 'TEXT', 1, 0, NULL),
+                        ('request_sha256', 'TEXT', 1, 0, NULL),
+                        ('capability_sha256', 'TEXT', 1, 0, NULL),
+                        ('grounded_resolution_sha256', 'TEXT', 1, 0, NULL),
+                        ('evidence_capture_sha256', 'TEXT', 1, 0, NULL),
+                        ('extracted_listing_sha256', 'TEXT', 1, 0, NULL),
+                        ('product_fingerprint', 'TEXT', 1, 0, NULL),
+                        ('collision_closure_sha256', 'TEXT', 1, 0, NULL),
+                        ('policy_version', 'TEXT', 1, 0, NULL),
+                        ('created_at', 'TEXT', 1, 0, 'CURRENT_TIMESTAMP')
+                    ),
+                    required_foreign_keys(
+                      parent_table, child_column, parent_column,
+                      update_action, delete_action, match_kind
+                    ) AS (
+                      VALUES
+                        ('aircraft_sale_listings', 'listing_id', 'id',
+                          'NO ACTION', 'CASCADE', 'NONE'),
+                        ('plugin_submissions', 'plugin_submission_id', 'id',
+                          'NO ACTION', 'CASCADE', 'NONE'),
+                        ('avionics_models', 'avionics_model_id', 'id',
+                          'NO ACTION', 'CASCADE', 'NONE')
+                    ),
+                    required_indexes(index_name, column_name) AS (
+                      VALUES
+                        ('idx_listing_avionics_grounded_capabilities_model',
+                          'avionics_model_id'),
+                        ('idx_listing_avionics_grounded_capabilities_submission',
+                          'plugin_submission_id')
+                    ),
+                    required_triggers(
+                      trigger_name, event_fragment, body_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'beforeinsertonaircraft_sale_listing_avionics_grounded_capabilities',
+                          'groundedavionicscapabilityrequiresitsexactcurrentcapture-boundlistingandapprovedproduct'),
+                        ('listing_avionics_grounded_capabilities_immutable_update',
+                          'beforeupdateonaircraft_sale_listing_avionics_grounded_capabilities',
+                          'groundedavionicscapabilitiesareimmutable')
+                    ),
+                    required_trigger_fragments(
+                      trigger_name, definition_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'fromplugin_submissionssubmission'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.id=new.plugin_submission_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.canonical_listing_id=new.listing_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.rendered_html_sha256=new.evidence_capture_sha256'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extracted_listing_jsonisnotnull'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extraction_errorisnull'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'fromavionics_approved_product_graph_identitiesapproved'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'approved.avionics_model_id=new.avionics_model_id')
+                    ),
+                    required_checks(definition_fragment) AS (
+                      VALUES
+                        ('check(occurrence_index>=0)'),
+                        ('check(occurrence_rolein(''primary'',''replacement''))'),
+                        ('check(requested_quantity>0)'),
+                        ('check(configuration_actionin(''installed'',''replaces'',''removes''))'),
+                        ('check(policy_version=''listing_avionics_grounded_capability_v1'')'),
+                        ('check(occurrence_role=''primary''orrequested_quantity=1)'),
+                        ('check(occurrence_role=''primary''orconfiguration_actionin(''replaces'',''removes''))'),
+                        ('check(length(request_sha256)=64)'),
+                        ('check(request_sha256=lower(request_sha256))'),
+                        ('check(request_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(capability_sha256)=64)'),
+                        ('check(capability_sha256=lower(capability_sha256))'),
+                        ('check(capability_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(grounded_resolution_sha256)=64)'),
+                        ('check(grounded_resolution_sha256=lower(grounded_resolution_sha256))'),
+                        ('check(grounded_resolution_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(evidence_capture_sha256)=64)'),
+                        ('check(evidence_capture_sha256=lower(evidence_capture_sha256))'),
+                        ('check(evidence_capture_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(extracted_listing_sha256)=64)'),
+                        ('check(extracted_listing_sha256=lower(extracted_listing_sha256))'),
+                        ('check(extracted_listing_sha256notglob''*[^0-9a-f]*'')'),
+                        ('check(length(product_fingerprint)=64)'),
+                        ('check(product_fingerprint=lower(product_fingerprint))'),
+                        ('check(product_fingerprintnotglob''*[^0-9a-f]*'')'),
+                        ('check(length(collision_closure_sha256)=64)'),
+                        ('check(collision_closure_sha256=lower(collision_closure_sha256))'),
+                        ('check(collision_closure_sha256notglob''*[^0-9a-f]*'')')
+                    ),
+                    table_definition(normalized_sql) AS (
+                      SELECT replace(replace(replace(replace(
+                        lower(sql), ' ', ''), char(10), ''), char(13), ''),
+                        char(9), '')
+                      FROM sqlite_schema
+                      WHERE type = 'table'
+                        AND name =
+                          'aircraft_sale_listing_avionics_grounded_capabilities'
+                    ),
+                    trigger_definitions(trigger_name, normalized_sql) AS (
+                      SELECT name, replace(replace(replace(replace(
+                        lower(sql), ' ', ''), char(10), ''), char(13), ''),
+                        char(9), '')
+                      FROM sqlite_schema
+                      WHERE type = 'trigger'
+                        AND tbl_name =
+                          'aircraft_sale_listing_avionics_grounded_capabilities'
+                    )
                     SELECT
                       EXISTS (
                         SELECT 1 FROM sqlite_schema
@@ -3658,29 +3782,122 @@ impl AppDb {
                               'aircraft_sale_listing_avionics_grounded_capabilities'
                         )
                         OR (
-                          SELECT COUNT(*)
-                          FROM sqlite_schema
-                          WHERE type = 'index'
-                            AND name IN (
-                              'idx_listing_avionics_grounded_capabilities_model',
-                              'idx_listing_avionics_grounded_capabilities_submission'
-                            )
-                        ) <> 2
-                        OR (
-                          SELECT COUNT(*)
-                          FROM sqlite_schema
-                          WHERE type = 'trigger'
-                            AND name IN (
-                              'listing_avionics_grounded_capabilities_validate_insert',
-                              'listing_avionics_grounded_capabilities_immutable_update'
-                            )
-                        ) <> 2
+                          SELECT COUNT(*) FROM pragma_table_info(
+                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                        ) <> 16
+                        OR EXISTS (
+                          SELECT 1 FROM required_columns required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pragma_table_info(
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                            ) actual
+                            WHERE actual.name = required.column_name
+                              AND upper(actual.type) = required.column_type
+                              AND actual."notnull" = required.required_not_null
+                              AND actual.pk = required.primary_key_position
+                              AND actual.dflt_value IS required.default_value
+                          )
+                        )
                         OR (
                           SELECT COUNT(*)
                           FROM pragma_foreign_key_list(
                             'aircraft_sale_listing_avionics_grounded_capabilities'
                           )
                         ) <> 3
+                        OR EXISTS (
+                          SELECT 1 FROM required_foreign_keys required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pragma_foreign_key_list(
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                            ) actual
+                            WHERE actual."table" = required.parent_table
+                              AND actual."from" = required.child_column
+                              AND actual."to" = required.parent_column
+                              AND upper(actual.on_update) = required.update_action
+                              AND upper(actual.on_delete) = required.delete_action
+                              AND upper(actual."match") = required.match_kind
+                          )
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM table_definition
+                          WHERE (
+                            length(normalized_sql) - length(replace(
+                              normalized_sql, 'check(', ''
+                            ))
+                          ) / length('check(') = 28
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_checks required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM table_definition actual
+                            WHERE instr(
+                              actual.normalized_sql,
+                              required.definition_fragment
+                            ) > 0
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_indexes required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM sqlite_schema actual
+                            WHERE actual.type = 'index'
+                              AND actual.name = required.index_name
+                              AND actual.tbl_name =
+                                'aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                          OR NOT EXISTS (
+                            SELECT 1 FROM pragma_index_list(
+                              'aircraft_sale_listing_avionics_grounded_capabilities'
+                            ) actual
+                            WHERE actual.name = required.index_name
+                              AND actual."unique" = 0
+                              AND actual.origin = 'c'
+                              AND actual.partial = 0
+                          )
+                          OR (
+                            SELECT COUNT(*) FROM pragma_index_info(
+                              required.index_name
+                            )
+                          ) <> 1
+                          OR NOT EXISTS (
+                            SELECT 1 FROM pragma_index_info(required.index_name)
+                            WHERE seqno = 0 AND name = required.column_name
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*) FROM trigger_definitions
+                          WHERE trigger_name IN (
+                            'listing_avionics_grounded_capabilities_validate_insert',
+                            'listing_avionics_grounded_capabilities_immutable_update'
+                          )
+                        ) <> 2
+                        OR EXISTS (
+                          SELECT 1 FROM required_triggers required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM trigger_definitions actual
+                            WHERE actual.trigger_name = required.trigger_name
+                              AND instr(
+                                actual.normalized_sql,
+                                required.event_fragment
+                              ) > 0
+                              AND instr(
+                                actual.normalized_sql,
+                                required.body_fragment
+                              ) > 0
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_trigger_fragments required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM trigger_definitions actual
+                            WHERE actual.trigger_name = required.trigger_name
+                              AND instr(
+                                actual.normalized_sql,
+                                required.definition_fragment
+                              ) > 0
+                          )
+                        )
                       )
                     "#,
                 )
@@ -3691,38 +3908,305 @@ impl AppDb {
             GateConnection::Postgres(pool) => {
                 sqlx::query_scalar::<_, bool>(
                     r#"
+                    WITH required_columns(
+                      column_name, column_type, required_not_null,
+                      default_expression
+                    ) AS (
+                      VALUES
+                        ('listing_id', 'bigint', TRUE, NULL),
+                        ('plugin_submission_id', 'bigint', TRUE, NULL),
+                        ('occurrence_index', 'bigint', TRUE, NULL),
+                        ('occurrence_role', 'text', TRUE, NULL),
+                        ('avionics_model_id', 'bigint', TRUE, NULL),
+                        ('requested_quantity', 'bigint', TRUE, NULL),
+                        ('configuration_action', 'text', TRUE, NULL),
+                        ('request_sha256', 'text', TRUE, NULL),
+                        ('capability_sha256', 'text', TRUE, NULL),
+                        ('grounded_resolution_sha256', 'text', TRUE, NULL),
+                        ('evidence_capture_sha256', 'text', TRUE, NULL),
+                        ('extracted_listing_sha256', 'text', TRUE, NULL),
+                        ('product_fingerprint', 'text', TRUE, NULL),
+                        ('collision_closure_sha256', 'text', TRUE, NULL),
+                        ('policy_version', 'text', TRUE, NULL),
+                        ('created_at', 'text', TRUE, 'CURRENT_TIMESTAMP')
+                    ),
+                    required_foreign_keys(
+                      parent_name, child_column, parent_column
+                    ) AS (
+                      VALUES
+                        ('public.aircraft_sale_listings', 'listing_id', 'id'),
+                        ('public.plugin_submissions', 'plugin_submission_id', 'id'),
+                        ('public.avionics_models', 'avionics_model_id', 'id')
+                    ),
+                    required_indexes(index_name, column_name) AS (
+                      VALUES
+                        ('public.idx_listing_avionics_grounded_capabilities_model',
+                          'avionics_model_id'),
+                        ('public.idx_listing_avionics_grounded_capabilities_submission',
+                          'plugin_submission_id')
+                    ),
+                    required_checks(
+                      first_fragment, second_fragment,
+                      third_fragment, fourth_fragment
+                    ) AS (
+                      VALUES
+                        ('occurrence_index', '>= 0', NULL, NULL),
+                        ('occurrence_role', '= ANY', 'primary', 'replacement'),
+                        ('requested_quantity', '> 0', NULL, NULL),
+                        ('configuration_action', 'installed', 'replaces', 'removes'),
+                        ('request_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('capability_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('grounded_resolution_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('evidence_capture_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('extracted_listing_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('product_fingerprint', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('collision_closure_sha256', '^[0-9a-f]{64}$', NULL, NULL),
+                        ('policy_version',
+                          'listing_avionics_grounded_capability_v1', NULL, NULL),
+                        ('occurrence_role', 'requested_quantity = 1',
+                          'primary', NULL),
+                        ('occurrence_role', 'configuration_action',
+                          'primary', 'replaces')
+                    ),
+                    required_triggers(
+                      trigger_name, function_signature, trigger_type,
+                      definition_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'public.validate_listing_avionics_grounded_capability()',
+                          7, 'public.plugin_submissions'),
+                        ('listing_avionics_grounded_capabilities_immutable_update',
+                          'public.reject_listing_avionics_grounded_capability_update()',
+                          19, 'grounded avionics capabilities are immutable')
+                    ),
+                    required_trigger_fragments(
+                      trigger_name, definition_fragment
+                    ) AS (
+                      VALUES
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'public.avionics_approved_product_graph_identities'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.id = NEW.plugin_submission_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.canonical_listing_id = NEW.listing_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.rendered_html_sha256 = NEW.evidence_capture_sha256'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extracted_listing_json IS NOT NULL'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'submission.extraction_error IS NULL'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'approved.avionics_model_id = NEW.avionics_model_id'),
+                        ('listing_avionics_grounded_capabilities_validate_insert',
+                          'grounded avionics capability requires its exact current capture-bound listing and approved product')
+                    )
                     SELECT
-                      to_regclass('aircraft_sale_listing_avionics') IS NOT NULL
+                      pg_catalog.to_regclass(
+                        'public.aircraft_sale_listing_avionics'
+                      ) IS NOT NULL
                       AND (
-                        to_regclass(
-                          'aircraft_sale_listing_avionics_grounded_capabilities'
-                        ) IS NULL
-                        OR to_regclass(
-                          'idx_listing_avionics_grounded_capabilities_model'
-                        ) IS NULL
-                        OR to_regclass(
-                          'idx_listing_avionics_grounded_capabilities_submission'
-                        ) IS NULL
+                        NOT EXISTS (
+                          SELECT 1
+                          FROM pg_catalog.pg_class relation
+                          WHERE relation.oid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND relation.relkind = 'r'
+                            AND relation.relpersistence = 'p'
+                            AND NOT relation.relispartition
+                        )
                         OR (
                           SELECT COUNT(*)
-                          FROM pg_trigger
-                          WHERE tgrelid = to_regclass(
-                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                          FROM pg_catalog.pg_attribute actual
+                          WHERE actual.attrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
                           )
-                            AND tgname IN (
+                            AND actual.attnum > 0
+                            AND NOT actual.attisdropped
+                        ) <> 16
+                        OR EXISTS (
+                          SELECT 1 FROM required_columns required
+                          WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_attribute actual
+                            LEFT JOIN pg_catalog.pg_attrdef default_value
+                              ON default_value.adrelid = actual.attrelid
+                             AND default_value.adnum = actual.attnum
+                            WHERE actual.attrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.attname = required.column_name
+                              AND pg_catalog.format_type(
+                                actual.atttypid, actual.atttypmod
+                              ) = required.column_type
+                              AND actual.attnotnull = required.required_not_null
+                              AND (
+                                (required.default_expression IS NULL
+                                  AND default_value.oid IS NULL)
+                                OR pg_catalog.pg_get_expr(
+                                  default_value.adbin, default_value.adrelid
+                                ) = required.default_expression
+                              )
+                          )
+                        )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'p'
+                            AND pg_catalog.pg_get_constraintdef(actual.oid) =
+                              'PRIMARY KEY (listing_id, plugin_submission_id, occurrence_index, occurrence_role)'
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'f'
+                        ) <> 3
+                        OR EXISTS (
+                          SELECT 1 FROM required_foreign_keys required
+                          WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_constraint actual
+                            JOIN pg_catalog.pg_attribute child_attribute
+                              ON child_attribute.attrelid = actual.conrelid
+                             AND child_attribute.attnum = actual.conkey[1]
+                            JOIN pg_catalog.pg_attribute parent_attribute
+                              ON parent_attribute.attrelid = actual.confrelid
+                             AND parent_attribute.attnum = actual.confkey[1]
+                            WHERE actual.conrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.contype = 'f'
+                              AND actual.confrelid =
+                                pg_catalog.to_regclass(required.parent_name)
+                              AND pg_catalog.array_length(actual.conkey, 1) = 1
+                              AND pg_catalog.array_length(actual.confkey, 1) = 1
+                              AND child_attribute.attname = required.child_column
+                              AND parent_attribute.attname = required.parent_column
+                              AND actual.confupdtype = 'a'
+                              AND actual.confdeltype = 'c'
+                              AND actual.confmatchtype = 's'
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*)
+                          FROM pg_catalog.pg_constraint actual
+                          WHERE actual.conrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.contype = 'c'
+                        ) <> 14
+                        OR EXISTS (
+                          SELECT 1 FROM required_checks required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_constraint actual
+                            WHERE actual.conrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.contype = 'c'
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_constraintdef(actual.oid),
+                                required.first_fragment
+                              ) > 0
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_constraintdef(actual.oid),
+                                required.second_fragment
+                              ) > 0
+                              AND (
+                                required.third_fragment IS NULL
+                                OR pg_catalog.strpos(
+                                  pg_catalog.pg_get_constraintdef(actual.oid),
+                                  required.third_fragment
+                                ) > 0
+                              )
+                              AND (
+                                required.fourth_fragment IS NULL
+                                OR pg_catalog.strpos(
+                                  pg_catalog.pg_get_constraintdef(actual.oid),
+                                  required.fourth_fragment
+                                ) > 0
+                              )
+                          )
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_indexes required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_index actual
+                            WHERE actual.indexrelid =
+                                  pg_catalog.to_regclass(required.index_name)
+                              AND actual.indrelid = pg_catalog.to_regclass(
+                                'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                              )
+                              AND NOT actual.indisunique
+                              AND NOT actual.indisprimary
+                              AND NOT actual.indisexclusion
+                              AND actual.indisvalid
+                              AND actual.indisready
+                              AND actual.indislive
+                              AND actual.indnatts = 1
+                              AND actual.indnkeyatts = 1
+                              AND actual.indexprs IS NULL
+                              AND actual.indpred IS NULL
+                              AND pg_catalog.pg_get_indexdef(
+                                actual.indexrelid, 1, TRUE
+                              ) = required.column_name
+                          )
+                        )
+                        OR (
+                          SELECT COUNT(*) FROM pg_catalog.pg_trigger actual
+                          WHERE actual.tgrelid = pg_catalog.to_regclass(
+                            'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                          )
+                            AND actual.tgname IN (
                               'listing_avionics_grounded_capabilities_validate_insert',
                               'listing_avionics_grounded_capabilities_immutable_update'
                             )
-                            AND NOT tgisinternal
+                            AND NOT actual.tgisinternal
                         ) <> 2
-                        OR (
-                          SELECT COUNT(*)
-                          FROM pg_constraint
-                          WHERE conrelid = to_regclass(
-                            'aircraft_sale_listing_avionics_grounded_capabilities'
+                        OR EXISTS (
+                          SELECT 1 FROM required_triggers required
+                          WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_trigger actual
+                            JOIN pg_catalog.pg_proc routine
+                              ON routine.oid = actual.tgfoid
+                            WHERE actual.tgrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.tgname = required.trigger_name
+                              AND actual.tgfoid = pg_catalog.to_regprocedure(
+                                required.function_signature
+                              )
+                              AND actual.tgtype = required.trigger_type
+                              AND actual.tgenabled = 'O'
+                              AND NOT actual.tgisinternal
+                              AND routine.proconfig =
+                                ARRAY['search_path=pg_catalog']::text[]
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_functiondef(actual.tgfoid),
+                                required.definition_fragment
+                              ) > 0
                           )
-                            AND contype = 'f'
-                        ) <> 3
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM required_trigger_fragments required
+                          WHERE NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_trigger actual
+                            WHERE actual.tgrelid = pg_catalog.to_regclass(
+                              'public.aircraft_sale_listing_avionics_grounded_capabilities'
+                            )
+                              AND actual.tgname = required.trigger_name
+                              AND pg_catalog.strpos(
+                                pg_catalog.pg_get_functiondef(actual.tgfoid),
+                                required.definition_fragment
+                              ) > 0
+                          )
+                        )
                       )
                     "#,
                 )
@@ -16668,7 +17152,39 @@ mod tests {
             assert!(definition.contains("occurrence_index"));
             assert!(definition.contains("occurrence_role"));
         }
+        for definition in [
+            POSTGRES_SCHEMA_SQL,
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_POSTGRES_MIGRATION_SQL,
+        ] {
+            assert!(definition.contains(
+                "CREATE OR REPLACE FUNCTION public.validate_listing_avionics_grounded_capability()"
+            ));
+            assert!(definition.contains(
+                "CREATE OR REPLACE FUNCTION public.reject_listing_avionics_grounded_capability_update()"
+            ));
+            assert!(definition.contains("FROM public.plugin_submissions submission"));
+            assert!(definition
+                .contains("FROM public.avionics_approved_product_graph_identities approved"));
+            for function_name in [
+                "public.validate_listing_avionics_grounded_capability",
+                "public.reject_listing_avionics_grounded_capability_update",
+            ] {
+                assert!(definition.contains(&format!(
+                    "CREATE OR REPLACE FUNCTION {function_name}()\nRETURNS TRIGGER\nLANGUAGE plpgsql\nSET search_path = pg_catalog"
+                )));
+            }
+            assert!(definition.contains(
+                "EXECUTE FUNCTION public.validate_listing_avionics_grounded_capability()"
+            ));
+            assert!(definition.contains(
+                "EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update()"
+            ));
+        }
         assert_eq!(LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_VERSION, 1);
+        assert_eq!(
+            LISTING_AVIONICS_GROUNDED_CAPABILITIES_CONTRACT_FINGERPRINT,
+            "a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31"
+        );
     }
 
     #[tokio::test]
@@ -16704,6 +17220,192 @@ mod tests {
         db.ensure_required_migrations()
             .await
             .expect("startup should pass after the grounded-capability migration");
+    }
+
+    async fn assert_corrupt_grounded_capability_schema_rejected(statements: &[&str]) {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        for statement in statements {
+            pool.execute(*statement).await.unwrap();
+        }
+        let error = db
+            .ensure_required_migrations()
+            .await
+            .expect_err("tampered grounded-capability objects must fail startup")
+            .to_string();
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"));
+    }
+
+    #[tokio::test]
+    async fn grounded_capability_startup_rejects_wrong_index_and_noop_trigger() {
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP INDEX idx_listing_avionics_grounded_capabilities_model",
+            "CREATE INDEX idx_listing_avionics_grounded_capabilities_model ON users(email)",
+        ])
+        .await;
+        assert_corrupt_grounded_capability_schema_rejected(&[
+            "DROP TRIGGER listing_avionics_grounded_capabilities_validate_insert",
+            "CREATE TRIGGER listing_avionics_grounded_capabilities_validate_insert BEFORE INSERT ON aircraft_sale_listing_avionics_grounded_capabilities BEGIN SELECT 1; END",
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn grounded_capability_startup_rejects_weakened_table_contract() {
+        for (expected, replacement) in [
+            (
+                "CHECK (occurrence_index >= 0)",
+                "CHECK (occurrence_index >= -1)",
+            ),
+            (
+                "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                "created_at TEXT NOT NULL DEFAULT 'untrusted'",
+            ),
+            (
+                "REFERENCES aircraft_sale_listings(id) ON DELETE CASCADE",
+                "REFERENCES aircraft_sale_listings(id) ON DELETE RESTRICT",
+            ),
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let table_sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            )
+            .bind("aircraft_sale_listing_avionics_grounded_capabilities")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let object_sql: Vec<String> = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL ORDER BY type, name",
+            )
+            .bind("aircraft_sale_listing_avionics_grounded_capabilities")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            assert!(table_sql.contains(expected));
+            pool.execute("DROP TABLE aircraft_sale_listing_avionics_grounded_capabilities")
+                .await
+                .unwrap();
+            pool.execute(table_sql.replace(expected, replacement).as_str())
+                .await
+                .unwrap();
+            for statement in object_sql {
+                pool.execute(statement.as_str()).await.unwrap();
+            }
+            let error = db
+                .ensure_required_migrations()
+                .await
+                .expect_err("a weakened grounded-capability table must fail startup")
+                .to_string();
+            assert!(error.contains("capture-bound grounded avionics resolutions"));
+            assert!(error.contains("20260825_listing_avionics_grounded_capabilities.sqlite.sql"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let function_configs: Vec<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT routine.proname,
+                   pg_catalog.array_to_string(routine.proconfig, E'\n')
+            FROM pg_catalog.pg_proc routine
+            JOIN pg_catalog.pg_namespace namespace
+              ON namespace.oid = routine.pronamespace
+            WHERE namespace.nspname = 'public'
+              AND routine.proname IN (
+                'validate_listing_avionics_grounded_capability',
+                'reject_listing_avionics_grounded_capability_update'
+              )
+            ORDER BY routine.proname
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            function_configs,
+            vec![
+                (
+                    "reject_listing_avionics_grounded_capability_update".to_owned(),
+                    "search_path=pg_catalog".to_owned(),
+                ),
+                (
+                    "validate_listing_avionics_grounded_capability".to_owned(),
+                    "search_path=pg_catalog".to_owned(),
+                ),
+            ]
+        );
+
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::raw_sql(
+            "CREATE SCHEMA attacker_schema; \
+                 CREATE TABLE attacker_schema.plugin_submissions ( \
+                   id BIGINT, canonical_listing_id BIGINT, rendered_html_sha256 TEXT, \
+                   extracted_listing_json TEXT, extraction_error TEXT \
+                 ); \
+                 CREATE TABLE attacker_schema.avionics_approved_product_graph_identities ( \
+                   avionics_model_id BIGINT \
+                 ); \
+                 INSERT INTO attacker_schema.plugin_submissions VALUES ( \
+                   70001, 70002, repeat('a', 64), '{}', NULL \
+                 ); \
+                 INSERT INTO attacker_schema.avionics_approved_product_graph_identities \
+                   VALUES (70003); \
+                 SET search_path = attacker_schema, public, pg_catalog",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        let error = connection
+            .execute(
+                "INSERT INTO public.aircraft_sale_listing_avionics_grounded_capabilities ( \
+                   listing_id, plugin_submission_id, occurrence_index, occurrence_role, \
+                   avionics_model_id, requested_quantity, configuration_action, \
+                   request_sha256, capability_sha256, grounded_resolution_sha256, \
+                   evidence_capture_sha256, extracted_listing_sha256, product_fingerprint, \
+                   collision_closure_sha256, policy_version \
+                 ) VALUES ( \
+                   70002, 70001, 0, 'primary', 70003, 1, 'installed', \
+                   repeat('a', 64), repeat('b', 64), repeat('c', 64), \
+                   repeat('a', 64), repeat('d', 64), repeat('e', 64), \
+                   repeat('f', 64), 'listing_avionics_grounded_capability_v1' \
+                 )",
+            )
+            .await
+            .expect_err("attacker shadow rows must not satisfy the public validation function")
+            .to_string();
+        assert!(error.contains(
+            "grounded avionics capability requires its exact current capture-bound listing and approved product"
+        ));
+        connection.execute("RESET search_path").await.unwrap();
+        connection
+            .execute(
+                "ALTER FUNCTION public.validate_listing_avionics_grounded_capability() \
+                 SET search_path = public",
+            )
+            .await
+            .unwrap();
+        drop(connection);
+        drop(db);
+
+        let error = connect_error(AppDb::connect(&database_url).await);
+        assert!(error.contains("capture-bound grounded avionics resolutions"));
+        assert!(error.contains("20260825_listing_avionics_grounded_capabilities.postgres.sql"));
     }
 
     #[tokio::test]

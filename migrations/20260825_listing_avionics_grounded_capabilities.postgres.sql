@@ -23,7 +23,7 @@ BEGIN
       AND (
         contract_version IS DISTINCT FROM 1
         OR contract_fingerprint IS DISTINCT FROM
-          'e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298'
+          'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31'
       )
   ) THEN
     RAISE EXCEPTION
@@ -82,6 +82,7 @@ ON public.aircraft_sale_listing_avionics_grounded_capabilities (plugin_submissio
 CREATE OR REPLACE FUNCTION public.validate_listing_avionics_grounded_capability()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF NOT EXISTS (
@@ -112,6 +113,7 @@ FOR EACH ROW EXECUTE FUNCTION public.validate_listing_avionics_grounded_capabili
 CREATE OR REPLACE FUNCTION public.reject_listing_avionics_grounded_capability_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   RAISE EXCEPTION 'grounded avionics capabilities are immutable';
@@ -129,7 +131,7 @@ INSERT INTO public.schema_migration_contracts (
 ) VALUES (
   '20260825_listing_avionics_grounded_capabilities',
   1,
-  'e0954a9ec364b5a427fd190e3fc89df562b9e98e1063ce3daa57be9d88647298',
+  'a7a249e910f4c16530760d18786f106f11f3b36a25c6a3e80fa8adacd1b79b31',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
