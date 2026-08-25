@@ -18,6 +18,11 @@ use sqlx::FromRow;
 use crate::avionics::catalog::{
     current_catalog_review_fingerprints_postgres, current_catalog_review_fingerprints_sqlite,
 };
+use crate::avionics::fingerprint::{
+    catalog_product_fingerprint_from_rows, fingerprint_approved_catalog_rows,
+    fingerprint_grounded_collision_closure, ActiveCollisionCatalogFingerprintRow,
+    CatalogFingerprintRow, ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
+};
 use crate::avionics::manufacturer::{
     admit_manufacturer_product_scope_postgres, admit_manufacturer_product_scope_sqlite,
     ManufacturerIdentityError, ManufacturerIdentityEvidence, ManufacturerProductAdmission,
@@ -28,10 +33,7 @@ use crate::avionics::reuse::{
     refresh_reuse_attestation_postgres, refresh_reuse_attestation_sqlite,
 };
 use crate::db::{AppDb, DatabaseBackend};
-use crate::listing::review::{
-    fingerprint_approved_catalog_rows, serialize_review_payload, CatalogFingerprintRow,
-    PendingReviewAspect, ReviewProduct,
-};
+use crate::listing::review::{serialize_review_payload, PendingReviewAspect, ReviewProduct};
 use crate::normalize::{
     normalize_avionics_identifier, normalize_avionics_manufacturer_name,
     normalize_avionics_model_name, normalize_name,
@@ -125,6 +127,8 @@ pub(crate) struct PendingReviewRevisionReceipt {
 pub(crate) struct GroundedExactModelConsolidationOutcome {
     pub report: AvionicsConsolidationReport,
     pub pending_review_revision_receipts: Vec<PendingReviewRevisionReceipt>,
+    pub product_fingerprint: String,
+    pub collision_closure_sha256: String,
 }
 
 /// Optional listing-review provenance for a human duplicate adjudication.
@@ -2908,6 +2912,7 @@ async fn consolidate_avionics_models_internal(
     AvionicsConsolidationReport,
     Option<HumanReviewedConsolidationAuthorization>,
     Vec<PendingReviewRevisionReceipt>,
+    Option<(String, String)>,
 )> {
     // Validate cheap request-shape errors before opening a write transaction.
     normalized_request(request)?;
@@ -3809,6 +3814,47 @@ async fn consolidate_avionics_models_internal(
                     collision.id, final_survivor.id
                 )));
             }
+            // A grounded resolution may authorize listing materialization only
+            // against the exact approved product and collision closure that
+            // survived this locked mutation. Capture both tokens before commit;
+            // a caller must never re-stamp the outcome from a later catalog read.
+            let grounded_catalog_snapshot = if grounded_review.is_some() {
+                let approved_catalog_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
+                let active_collision_sql = db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
+                let approved_catalog_rows =
+                    sqlx::query_as::<_, CatalogFingerprintRow>(&approved_catalog_sql)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                let active_collision_rows = sqlx::query_as::<
+                    _,
+                    ActiveCollisionCatalogFingerprintRow,
+                >(&active_collision_sql)
+                .fetch_all(&mut *transaction)
+                .await?;
+                let product_fingerprint = catalog_product_fingerprint_from_rows(
+                    &approved_catalog_rows,
+                    request.survivor_id,
+                )
+                .ok_or_else(|| {
+                    ConsolidationError::Conflict(format!(
+                        "grounded consolidation survivor {} has no approved product fingerprint",
+                        request.survivor_id
+                    ))
+                })?;
+                let collision_closure_sha256 = fingerprint_grounded_collision_closure(
+                    &active_collision_rows,
+                    request.survivor_id,
+                )
+                .ok_or_else(|| {
+                    ConsolidationError::Conflict(format!(
+                        "grounded consolidation survivor {} has no collision closure",
+                        request.survivor_id
+                    ))
+                })?;
+                Some((product_fingerprint, collision_closure_sha256))
+            } else {
+                None
+            };
             transaction.commit().await?;
             let pending_review_revision_receipts = plan
                 .pending_reviews
@@ -3830,12 +3876,14 @@ async fn consolidate_avionics_models_internal(
                     AvionicsConsolidationReport,
                     Option<HumanReviewedConsolidationAuthorization>,
                     Vec<PendingReviewRevisionReceipt>,
+                    Option<(String, String)>,
                 ),
                 ConsolidationError,
             >((
                 plan.report,
                 authorization,
                 pending_review_revision_receipts,
+                grounded_catalog_snapshot,
             ))
         }};
     }
@@ -3865,9 +3913,10 @@ pub async fn consolidate_avionics_models(
     db: &AppDb,
     request: &AvionicsConsolidationRequest,
 ) -> ConsolidationResult<AvionicsConsolidationReport> {
-    let (report, authorization, _pending_review_revision_receipts) =
+    let (report, authorization, _pending_review_revision_receipts, grounded_catalog_snapshot) =
         consolidate_avionics_models_internal(db, request, None, None).await?;
     debug_assert!(authorization.is_none());
+    debug_assert!(grounded_catalog_snapshot.is_none());
     Ok(report)
 }
 
@@ -3878,8 +3927,13 @@ pub async fn consolidate_avionics_models_with_human_review(
     request: &HumanReviewedAvionicsConsolidationRequest,
 ) -> ConsolidationResult<HumanReviewedAvionicsConsolidationReport> {
     let base = human_request_base(request)?;
-    let (consolidation, authorization, _pending_review_revision_receipts) =
-        consolidate_avionics_models_internal(db, &base, Some(request), None).await?;
+    let (
+        consolidation,
+        authorization,
+        _pending_review_revision_receipts,
+        grounded_catalog_snapshot,
+    ) = consolidate_avionics_models_internal(db, &base, Some(request), None).await?;
+    debug_assert!(grounded_catalog_snapshot.is_none());
     let authorization = authorization.ok_or_else(|| {
         ConsolidationError::Conflict(
             "human-reviewed consolidation completed without an authorization audit".to_string(),
@@ -3901,12 +3955,20 @@ pub(crate) async fn consolidate_and_approve_grounded_exact_model_with_receipts(
 ) -> ConsolidationResult<GroundedExactModelConsolidationOutcome> {
     let state = load_state(db).await?;
     let (base, _) = grounded_exact_model_request(&state, grounded)?;
-    let (report, authorization, pending_review_revision_receipts) =
+    let (report, authorization, pending_review_revision_receipts, grounded_catalog_snapshot) =
         consolidate_avionics_models_internal(db, &base, None, Some(grounded)).await?;
     debug_assert!(authorization.is_none());
+    let (product_fingerprint, collision_closure_sha256) =
+        grounded_catalog_snapshot.ok_or_else(|| {
+            ConsolidationError::Conflict(
+                "grounded consolidation completed without its locked catalog snapshot".to_string(),
+            )
+        })?;
     Ok(GroundedExactModelConsolidationOutcome {
         report,
         pending_review_revision_receipts,
+        product_fingerprint,
+        collision_closure_sha256,
     })
 }
 
@@ -4348,7 +4410,7 @@ mod tests {
             provenance: None,
             expected_authorization_sha256: None,
             expected_catalog_revision_sha256: Some(
-                crate::listing::review::approved_catalog_revision_sha256(db)
+                crate::avionics::fingerprint::approved_catalog_revision_sha256(db)
                     .await
                     .unwrap(),
             ),
@@ -4611,12 +4673,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receipt.after_sha256, stored_review_sha256);
+        let outcome_product_fingerprint = outcome.product_fingerprint.clone();
+        let outcome_collision_closure_sha256 = outcome.collision_closure_sha256.clone();
         let report = outcome.report;
         assert!(report
             .matches
             .iter()
             .all(|identity_match| identity_match.basis == IdentityMatchBasis::GroundedExactModel));
         let survivor_id = report.survivor.id;
+        let approved_catalog_rows =
+            sqlx::query_as::<_, CatalogFingerprintRow>(APPROVED_CATALOG_ROWS_SQL)
+                .fetch_all(pool(&db))
+                .await
+                .unwrap();
+        let active_collision_rows = sqlx::query_as::<_, ActiveCollisionCatalogFingerprintRow>(
+            ACTIVE_COLLISION_CATALOG_ROWS_SQL,
+        )
+        .fetch_all(pool(&db))
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome_product_fingerprint,
+            catalog_product_fingerprint_from_rows(&approved_catalog_rows, survivor_id).unwrap()
+        );
+        assert_eq!(
+            outcome_collision_closure_sha256,
+            fingerprint_grounded_collision_closure(&active_collision_rows, survivor_id).unwrap()
+        );
         let duplicate_id = if survivor_id == first_id {
             second_id
         } else {
@@ -5098,7 +5181,7 @@ mod tests {
             .fetch_one(pool(&db))
             .await
             .unwrap();
-        let catalog_revision = crate::listing::review::approved_catalog_revision_sha256(&db)
+        let catalog_revision = crate::avionics::fingerprint::approved_catalog_revision_sha256(&db)
             .await
             .unwrap();
         let mut request = HumanReviewedAvionicsConsolidationRequest {

@@ -477,7 +477,6 @@ pub async fn submit_plugin_html_with_progress(
     let mut source_serial_correction = None;
     let mut source_visual_correction = None;
     let mut prepared_submission: Option<PluginSubmission> = None;
-    let mut durable_corrected_capture = false;
     let mut durable_materialization_error = None;
 
     if let Some(extractor) = extractor {
@@ -502,46 +501,41 @@ pub async fn submit_plugin_html_with_progress(
                     parsed_preview.context_text.as_deref(),
                 )
                 .await;
-                let binding =
-                    if source_admission_requires_durable_correction_capture(&source_admission) {
-                        let submission = insert_plugin_submission(
-                            db,
-                            user.id,
-                            request.plugin_install_id,
-                            &request.source_url,
-                            &request.rendered_html,
-                            &rendered_html_sha256,
-                            &request.signature,
-                            extracted_listing_json.as_ref(),
-                            None,
-                            None,
-                        )
-                        .await?;
-                        let bound_extracted_listing_json = extracted_listing_json
-                            .as_ref()
-                            .expect("the extracted checkpoint was assigned before admission")
-                            .to_string();
-                        let binding = signed_source_listing_binding(
-                            submission.id,
-                            submission.user_id,
-                            submission.plugin_install_id,
-                            &install.public_key_base64,
-                            install.revoked_at.as_deref(),
-                            &submission.source_url,
-                            &submission.submitted_at,
-                            &request.rendered_html,
-                            &submission.rendered_html_sha256,
-                            &submission.signature_base64,
-                            Some(bound_extracted_listing_json.clone()),
-                            None,
-                            bound_extracted_listing_json,
-                        );
-                        prepared_submission = Some(submission);
-                        durable_corrected_capture = true;
-                        Some(binding)
-                    } else {
-                        None
-                    };
+                let durable_corrected_capture =
+                    source_admission_requires_durable_correction_capture(&source_admission);
+                let submission = insert_plugin_submission(
+                    db,
+                    user.id,
+                    request.plugin_install_id,
+                    &request.source_url,
+                    &request.rendered_html,
+                    &rendered_html_sha256,
+                    &request.signature,
+                    extracted_listing_json.as_ref(),
+                    None,
+                    None,
+                )
+                .await?;
+                let bound_extracted_listing_json = extracted_listing_json
+                    .as_ref()
+                    .expect("the extracted checkpoint was assigned before admission")
+                    .to_string();
+                let binding = signed_source_listing_binding(
+                    submission.id,
+                    submission.user_id,
+                    submission.plugin_install_id,
+                    &install.public_key_base64,
+                    install.revoked_at.as_deref(),
+                    &submission.source_url,
+                    &submission.submitted_at,
+                    &request.rendered_html,
+                    &submission.rendered_html_sha256,
+                    &submission.signature_base64,
+                    Some(bound_extracted_listing_json.clone()),
+                    None,
+                    bound_extracted_listing_json,
+                );
+                prepared_submission = Some(submission);
                 match create_listing_with_progress_and_occurrence_dispositions(
                     db,
                     user.id,
@@ -550,7 +544,7 @@ pub async fn submit_plugin_html_with_progress(
                     Some(extractor),
                     progress,
                     ListingCreationMode::SignedSource,
-                    binding.as_ref(),
+                    Some(&binding),
                 )
                 .await
                 {
@@ -583,25 +577,20 @@ pub async fn submit_plugin_html_with_progress(
                         }
                     }
                     Err(error) => {
-                        if durable_corrected_capture {
-                            let prepared = prepared_submission.as_ref().ok_or_else(|| {
-                                PluginStoreError::Database(
-                                    "corrected signed capture lost its prepared checkpoint"
-                                        .to_string(),
-                                )
-                            })?;
-                            let retained =
-                                plugin_submission_for_user(db, user.id, prepared.id).await?;
-                            if let Some(listing_id) = retained.canonical_listing_id {
-                                canonical_listing_id = Some(listing_id);
-                                source_serial_correction = source_admission
-                                    .as_ref()
-                                    .ok()
-                                    .and_then(|admission| admission.serial_correction.clone());
-                                durable_materialization_error = Some(error.to_string());
-                            } else {
-                                extraction_error = Some(error.to_string());
-                            }
+                        let prepared = prepared_submission.as_ref().ok_or_else(|| {
+                            PluginStoreError::Database(
+                                "signed capture lost its prepared extraction checkpoint"
+                                    .to_string(),
+                            )
+                        })?;
+                        let retained = plugin_submission_for_user(db, user.id, prepared.id).await?;
+                        if let Some(listing_id) = retained.canonical_listing_id {
+                            canonical_listing_id = Some(listing_id);
+                            source_serial_correction = source_admission
+                                .as_ref()
+                                .ok()
+                                .and_then(|admission| admission.serial_correction.clone());
+                            durable_materialization_error = Some(error.to_string());
                         } else {
                             extraction_error = Some(error.to_string());
                         }
@@ -625,7 +614,7 @@ pub async fn submit_plugin_html_with_progress(
     );
     if let Some(message) = durable_materialization_error {
         return Err(PluginStoreError::Database(format!(
-            "corrected signed capture stopped after its atomic listing binding: {message}"
+            "signed capture stopped after its atomic listing binding: {message}"
         )));
     }
     let materialized = async {
@@ -851,29 +840,27 @@ pub async fn reprocess_plugin_submission(
                 }
                 let checkpoint_payload_json = checkpoint_payload.to_string();
                 extracted_listing_json = Some(checkpoint_payload);
-                let signed_source_binding = source_admission_requires_durable_correction_capture(
-                    &preflight_source_admission,
-                )
-                .then(|| {
-                    stored.canonical_listing_id.is_none().then(|| {
-                        signed_source_listing_binding(
-                            stored.id,
-                            stored.user_id,
-                            stored.plugin_install_id,
-                            &stored.public_key_base64,
-                            stored.install_revoked_at.as_deref(),
-                            &stored.source_url,
-                            &stored.submitted_at,
-                            &stored.rendered_html,
-                            &stored.rendered_html_sha256,
-                            &stored.signature_base64,
-                            stored.extracted_listing_json.clone(),
-                            stored.extraction_error.clone(),
-                            checkpoint_payload_json.clone(),
-                        )
-                    })
-                })
-                .flatten();
+                // Every newly materialized signed capture supplies the exact
+                // source/checkpoint binding. Paid avionics grounding can be
+                // reached independently of FAA correction, and its same-case
+                // capability must never exist without this durable scope.
+                let signed_source_binding = stored.canonical_listing_id.is_none().then(|| {
+                    signed_source_listing_binding(
+                        stored.id,
+                        stored.user_id,
+                        stored.plugin_install_id,
+                        &stored.public_key_base64,
+                        stored.install_revoked_at.as_deref(),
+                        &stored.source_url,
+                        &stored.submitted_at,
+                        &stored.rendered_html,
+                        &stored.rendered_html_sha256,
+                        &stored.signature_base64,
+                        stored.extracted_listing_json.clone(),
+                        stored.extraction_error.clone(),
+                        checkpoint_payload_json.clone(),
+                    )
+                });
                 match create_listing_with_progress_and_occurrence_dispositions(
                     db,
                     user.id,
@@ -4269,6 +4256,55 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn ordinary_signed_submit_prepares_and_atomically_binds_exact_checkpoint() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        store_release(&db, &replay_release("N482TW", "18283006"))
+            .await
+            .unwrap();
+        seed_replay_curated_aircraft(&db, user.id).await;
+        let mut extraction = serial_correction_extraction();
+        extraction["serial_number"] = json!("18283006");
+        let endpoint = extraction_endpoint(extraction.clone()).await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let source_url = "https://example.test/signed-submit-exact-checkpoint";
+        let html = "<html><body><h1>2020 Cessna 182T</h1><p>Registration N482TW; Serial Number 18283006</p></body></html>";
+        let request = signed_submission_request(&db, &user, source_url, html).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER require_prepared_signed_checkpoint
+               BEFORE INSERT ON aircraft_sale_listings
+               WHEN NEW.source_url = 'https://example.test/signed-submit-exact-checkpoint'
+                AND NOT EXISTS (
+                  SELECT 1 FROM plugin_submissions submission
+                  WHERE submission.source_url = NEW.source_url
+                    AND submission.canonical_listing_id IS NULL
+                    AND submission.extracted_listing_json IS NOT NULL
+                    AND submission.extraction_error IS NULL
+                )
+               BEGIN
+                 SELECT RAISE(ABORT, 'signed checkpoint was not prepared before listing insert');
+               END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let outcome = submit_plugin_html(&db, &user, &request, Some(&extractor))
+            .await
+            .expect("ordinary signed materialization must prepare its exact checkpoint first");
+        let listing_id = outcome.listing.expect("listing should materialize").id;
+        assert_eq!(outcome.submission.canonical_listing_id, Some(listing_id));
+        assert_eq!(
+            outcome.submission.extracted_listing_json,
+            Some(extraction),
+            "the atomically bound checkpoint must be the exact extracted payload"
+        );
     }
 
     #[tokio::test]

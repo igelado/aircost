@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod consolidation;
+pub(crate) mod fingerprint;
 pub mod inspection;
 pub mod manufacturer;
 pub(crate) mod model;

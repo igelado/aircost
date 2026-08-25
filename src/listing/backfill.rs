@@ -12,15 +12,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
+use crate::avionics::fingerprint::approved_catalog_revision_sha256;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::CURATED_AVIONICS_TYPES;
 use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
 use crate::listing::review::{
-    approved_catalog_revision_sha256, replace_pending_review, serialize_review_payload,
-    stage_pending_review, CoveredListingAssociation, ListingAssociationRole, PendingReviewAspect,
-    ReviewError, ReviewProduct,
+    replace_pending_review, serialize_review_payload, stage_pending_review,
+    CoveredListingAssociation, ListingAssociationRole, PendingReviewAspect, ReviewError,
+    ReviewProduct,
 };
 use crate::normalize::{
     is_usable_avionics_label, normalize_avionics_manufacturer_name, normalize_avionics_model_name,
@@ -369,7 +370,9 @@ pub async fn stage_legacy_listing_reviews(
         .cloned()
         .map(|product| (product.id, product))
         .collect::<HashMap<_, _>>();
-    let catalog_revision = approved_catalog_revision_sha256(db).await?;
+    let catalog_revision = approved_catalog_revision_sha256(db)
+        .await
+        .map_err(ReviewError::from)?;
     let mut listings = Vec::with_capacity(sources.len());
 
     for source in &sources {

@@ -18,13 +18,20 @@ use crate::aircraft::faa::{
 use crate::aircraft::identity::{
     ensure_listing_identity_assignment_from_approved_catalog, EnsureIdentityAssignmentOutcome,
 };
+#[cfg(test)]
+use crate::avionics::catalog::grounded_resolution_receipt_seed_for_replay;
 use crate::avionics::catalog::{
     approved_avionics_identity_for_grounded_replay,
-    deterministic_generic_avionics_rejection_reason, grounded_resolution_receipt_seed_for_replay,
+    deterministic_generic_avionics_rejection_reason, grounded_resolution_receipt_basis_for_replay,
     grounded_resolution_request_sha256, resolve_avionics_identity_for_listing_materialization,
-    resolve_verified_local_avionics_identity, ActiveCollisionCatalogFingerprintRow,
-    ApprovedAvionicsIdentity, AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
-    GroundedAvionicsResolutionReceiptSeed, ACTIVE_COLLISION_CATALOG_ROWS_SQL,
+    resolve_verified_local_avionics_identity, ApprovedAvionicsIdentity, AvionicsIdentityOutcome,
+    AvionicsIdentityRequest, CatalogError, GroundedAvionicsResolutionReceiptSeed,
+};
+use crate::avionics::fingerprint::{
+    catalog_product_fingerprint_for_id, catalog_product_fingerprint_from_rows,
+    fingerprint_grounded_collision_closure, grounded_collision_closure_revision_sha256,
+    ActiveCollisionCatalogFingerprintRow, AvionicsFingerprintError, CatalogFingerprintRow,
+    ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
 };
 use crate::avionics::reuse::{
     reuse_attestation_is_current_postgres, reuse_attestation_is_current_sqlite,
@@ -37,13 +44,10 @@ use crate::listing::avionics::{
     approved_avionics_product_key, validate_canonical_avionics_actions, CanonicalAvionicsAction,
 };
 use crate::listing::review::{
-    association_observation_sha256_from_values, catalog_product_fingerprint_for_id,
-    catalog_product_fingerprint_from_rows, clear_pending_review,
-    fingerprint_grounded_collision_closure, grounded_collision_closure_revision_sha256,
-    replace_pending_review, CatalogFingerprintRow, ListingAssociationRole, PendingReviewAspect,
-    ReviewAction, ReviewAspectId, ReviewError, ReviewProduct, StableIdentifier,
-    APPROVED_CATALOG_ROWS_SQL, ASSOCIATION_AUTHORIZATION_POLICY_VERSION,
-    POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
+    association_observation_sha256_from_values, clear_pending_review, replace_pending_review,
+    ListingAssociationRole, PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct,
+    StableIdentifier, ASSOCIATION_AUTHORIZATION_POLICY_VERSION, POSTGRES_LISTING_CHILD_LOCK_SQL,
+    POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
 };
 use crate::models::{
     is_plausible_asking_price_usd, AircraftSummary, ListingPreview, ListingValuationFact,
@@ -516,11 +520,11 @@ struct ResolvedListingAvionics {
     occurrence_dispositions: Vec<AutomaticOccurrenceDisposition>,
 }
 
-const GROUNDED_CAPABILITY_POLICY_VERSION: &str = "listing_avionics_grounded_capability_v1";
+const GROUNDED_CAPABILITY_POLICY_VERSION: &str = "listing_avionics_grounded_capability_v2";
 const GROUNDED_CAPABILITY_SET_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-grounded-capability-set:v1";
+    b"aircost:listing-avionics-grounded-capability-set:v2";
 const GROUNDED_OCCURRENCE_CAPABILITY_FINGERPRINT_DOMAIN: &[u8] =
-    b"aircost:listing-avionics-grounded-occurrence-capability:v1";
+    b"aircost:listing-avionics-grounded-occurrence-capability:v2";
 
 #[derive(Clone, Debug)]
 struct ListingGroundedCapability {
@@ -565,7 +569,8 @@ struct StoredGroundedCapabilityRow {
     grounded_resolution_sha256: String,
     evidence_capture_sha256: String,
     extracted_listing_sha256: String,
-    extracted_listing_json: String,
+    extracted_listing_json: Option<String>,
+    extraction_error: Option<String>,
     product_fingerprint: String,
     collision_closure_sha256: String,
     policy_version: String,
@@ -614,7 +619,12 @@ fn grounded_occurrence_capability_sha256(capability: &ListingGroundedCapability)
         capability.occurrence_role.as_str().to_string(),
         capability.configuration_action.clone(),
         capability.source_notes.clone().unwrap_or_default(),
+        capability.seed.avionics_model_id().to_string(),
+        capability.seed.requested_quantity().to_string(),
+        capability.seed.request_sha256().to_string(),
         capability.seed.capability_sha256().to_string(),
+        capability.seed.product_fingerprint().to_string(),
+        capability.seed.collision_closure_sha256().to_string(),
     ] {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
@@ -630,18 +640,8 @@ fn grounded_capability_set_sha256(
     configuration_action: &str,
     rows: &[StoredGroundedCapabilityRow],
 ) -> String {
-    let mut receipts = rows
-        .iter()
-        .map(|row| {
-            (
-                row.occurrence_index,
-                row.occurrence_role.as_str(),
-                row.capability_sha256.as_str(),
-                row.grounded_resolution_sha256.as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
-    receipts.sort_unstable();
+    let mut receipts = rows.iter().collect::<Vec<_>>();
+    receipts.sort_by_key(|row| (row.occurrence_index, row.occurrence_role.clone()));
     let mut hasher = Sha256::new();
     hasher.update(GROUNDED_CAPABILITY_SET_FINGERPRINT_DOMAIN);
     for value in [
@@ -654,12 +654,22 @@ fn grounded_capability_set_sha256(
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
-    for (occurrence_index, occurrence_role, capability, resolution) in receipts {
+    for row in receipts {
         for value in [
-            occurrence_index.to_string(),
-            occurrence_role.to_string(),
-            capability.to_string(),
-            resolution.to_string(),
+            row.plugin_submission_id.to_string(),
+            row.occurrence_index.to_string(),
+            row.occurrence_role.clone(),
+            row.avionics_model_id.to_string(),
+            row.requested_quantity.to_string(),
+            row.configuration_action.clone(),
+            row.request_sha256.clone(),
+            row.capability_sha256.clone(),
+            row.grounded_resolution_sha256.clone(),
+            row.evidence_capture_sha256.clone(),
+            row.extracted_listing_sha256.clone(),
+            row.product_fingerprint.clone(),
+            row.collision_closure_sha256.clone(),
+            row.policy_version.clone(),
         ] {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
@@ -1025,6 +1035,13 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
     if may_reuse_listing {
         if let Some(listing_id) = identity_repair_listing_id {
             emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
+            stage_existing_listing_signed_source_grounded_capabilities(
+                db,
+                listing_id,
+                signed_source_binding,
+                &values.avionics,
+            )
+            .await?;
             update_listing_values(
                 db,
                 listing_id,
@@ -1063,6 +1080,13 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 unverified_listing_id_for_tail(db, user_id, registration_number).await?
             {
                 emit_listing_progress(progress, "saving_listing", "Updating existing listing");
+                stage_existing_listing_signed_source_grounded_capabilities(
+                    db,
+                    listing_id,
+                    signed_source_binding,
+                    &values.avionics,
+                )
+                .await?;
                 update_listing_values(
                     db,
                     listing_id,
@@ -1102,6 +1126,13 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                 unverified_listing_id_for_missing_identity_source(db, user_id, source_url).await?
             {
                 emit_listing_progress(progress, "saving_listing", "Repairing existing listing");
+                stage_existing_listing_signed_source_grounded_capabilities(
+                    db,
+                    listing_id,
+                    signed_source_binding,
+                    &values.avionics,
+                )
+                .await?;
                 update_listing_values(
                     db,
                     listing_id,
@@ -1137,8 +1168,35 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
 
     if may_reuse_listing && resolved_avionics.pending_review_aspects.is_empty() {
         if let Some(listing_id) = matching_verified_listing_id(db, &values).await? {
-            emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
-            refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
+            let has_grounded_capabilities =
+                !prepare_grounded_capability_bindings(&values.avionics)?.is_empty();
+            if has_grounded_capabilities {
+                emit_listing_progress(
+                    progress,
+                    "saving_listing",
+                    "Re-authorizing matching listing avionics",
+                );
+                stage_existing_listing_signed_source_grounded_capabilities(
+                    db,
+                    listing_id,
+                    signed_source_binding,
+                    &values.avionics,
+                )
+                .await?;
+                update_listing_values(
+                    db,
+                    listing_id,
+                    &values,
+                    &literal_identity_values,
+                    true,
+                    true,
+                    false,
+                )
+                .await?;
+            } else {
+                emit_listing_progress(progress, "saving_listing", "Refreshing matching listing");
+                refresh_listing_timestamp(db, listing_id, values.source_url.as_deref()).await?;
+            }
             emit_listing_progress(
                 progress,
                 "refreshing_estimates",
@@ -1542,17 +1600,24 @@ async fn grounded_capability_replay_scope(
     struct Row {
         plugin_submission_id: i64,
         rendered_html_sha256: String,
-        extracted_listing_sha256: String,
         extracted_listing_json: Option<String>,
     }
-    let rows = query_as_all!(
+    let capability_rows = query_as_all!(
         db,
-        Row,
+        StoredGroundedCapabilityRow,
         r#"
-        SELECT DISTINCT capability.plugin_submission_id,
-               capability.evidence_capture_sha256 AS rendered_html_sha256,
+        SELECT capability.plugin_submission_id, capability.occurrence_index,
+               capability.occurrence_role, capability.avionics_model_id,
+               capability.requested_quantity, capability.configuration_action,
+               capability.request_sha256, capability.capability_sha256,
+               capability.grounded_resolution_sha256,
+               capability.evidence_capture_sha256,
                capability.extracted_listing_sha256,
-               submission.extracted_listing_json
+               submission.extracted_listing_json,
+               submission.extraction_error,
+               capability.product_fingerprint,
+               capability.collision_closure_sha256,
+               capability.policy_version
         FROM aircraft_sale_listing_avionics_grounded_capabilities capability
         JOIN plugin_submissions submission
           ON submission.id = capability.plugin_submission_id
@@ -1562,19 +1627,43 @@ async fn grounded_capability_replay_scope(
         "#,
         listing_id
     )?;
-    let ([] | [_]) = rows.as_slice() else {
+    let mut scopes = Vec::<StoredGroundedCapabilityScope>::new();
+    for row in capability_rows {
+        if row.extraction_error.is_some()
+            || row
+                .extracted_listing_json
+                .as_deref()
+                .map(|checkpoint| format!("{:x}", Sha256::digest(checkpoint.as_bytes())))
+                != Some(row.extracted_listing_sha256.clone())
+        {
+            // Retire only the exact stale proof. The retained submission may
+            // still be a valid paid-grounding scope for a fresh resolution.
+            retire_exact_stale_grounded_capability(db, listing_id, &row)
+                .await
+                .map_err(ListingStoreError::State)?;
+            continue;
+        }
+        let scope = StoredGroundedCapabilityScope {
+            plugin_submission_id: row.plugin_submission_id,
+            evidence_capture_sha256: row.evidence_capture_sha256,
+            extracted_listing_sha256: row.extracted_listing_sha256,
+        };
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    let ([] | [_]) = scopes.as_slice() else {
         return Err(ListingStoreError::State(format!(
             "listing {listing_id} has pending grounded capabilities from multiple source checkpoints"
         )));
     };
-    let Some(row) = rows.into_iter().next() else {
+    let Some(scope) = scopes.into_iter().next() else {
         let bound_rows = query_as_all!(
             db,
             Row,
             r#"
             SELECT submission.id AS plugin_submission_id,
                    submission.rendered_html_sha256,
-                   '' AS extracted_listing_sha256,
                    submission.extracted_listing_json
             FROM plugin_submissions submission
             WHERE submission.canonical_listing_id = ?
@@ -1605,21 +1694,11 @@ async fn grounded_capability_replay_scope(
             extracted_listing_sha256: format!("{:x}", Sha256::digest(extracted.as_bytes())),
         }));
     };
-    let extracted = row.extracted_listing_json.as_deref().ok_or_else(|| {
-        ListingStoreError::State(
-            "pending grounded capability lost its retained extraction checkpoint".to_string(),
-        )
-    })?;
-    if format!("{:x}", Sha256::digest(extracted.as_bytes())) != row.extracted_listing_sha256 {
-        return Err(ListingStoreError::State(
-            "pending grounded capability extraction checkpoint changed".to_string(),
-        ));
-    }
     Ok(Some(GroundedCapabilityReplayScope {
         listing_id,
-        plugin_submission_id: row.plugin_submission_id,
-        rendered_html_sha256: row.rendered_html_sha256,
-        extracted_listing_sha256: row.extracted_listing_sha256,
+        plugin_submission_id: scope.plugin_submission_id,
+        rendered_html_sha256: scope.evidence_capture_sha256,
+        extracted_listing_sha256: scope.extracted_listing_sha256,
     }))
 }
 
@@ -1747,7 +1826,7 @@ pub async fn update_listing(
     user_id: i64,
     listing_id: i64,
     listing: &Value,
-    extractor: Option<&GeminiListingExtractor>,
+    _extractor: Option<&GeminiListingExtractor>,
 ) -> StoreResult<SaleListing> {
     let row = listing_owner_row(db, listing_id).await?;
     assert_user_can_mutate(&row, user_id, "update")?;
@@ -1804,7 +1883,11 @@ pub async fn update_listing(
             resolve_listing_avionics_values(
                 db,
                 &mut values,
-                extractor,
+                // Unsigned PATCH has no exact retained capture/checkpoint to
+                // own a paid same-case capability. It may use current local
+                // reuse only; every unattested identity remains pending for
+                // the signed ingestion or manual review workflow.
+                None,
                 source_url.as_deref(),
                 None,
                 None,
@@ -1911,8 +1994,7 @@ async fn pending_aircraft_compatibility_variant_id(db: &AppDb) -> StoreResult<i6
     )?)
 }
 
-async fn prepare_grounded_capability_bindings(
-    db: &AppDb,
+fn prepare_grounded_capability_bindings(
     avionics: &[ListingAvionicsValue],
 ) -> StoreResult<Vec<PreparedGroundedCapabilityBinding>> {
     let mut prepared = Vec::new();
@@ -1955,15 +2037,8 @@ async fn prepare_grounded_capability_bindings(
                 configuration_action: item.configuration_action.clone(),
                 source_notes: capability.source_notes.clone(),
                 seed: capability.seed.clone(),
-                product_fingerprint: catalog_product_fingerprint_for_id(db, installed_id)
-                    .await
-                    .map_err(|error| ListingStoreError::State(error.to_string()))?,
-                collision_closure_sha256: grounded_collision_closure_revision_sha256(
-                    db,
-                    installed_id,
-                )
-                .await
-                .map_err(|error| ListingStoreError::State(error.to_string()))?,
+                product_fingerprint: capability.seed.product_fingerprint().to_string(),
+                collision_closure_sha256: capability.seed.collision_closure_sha256().to_string(),
             });
         }
 
@@ -2008,15 +2083,11 @@ async fn prepare_grounded_capability_bindings(
                     configuration_action: item.configuration_action.clone(),
                     source_notes: capability.source_notes.clone(),
                     seed: capability.seed.clone(),
-                    product_fingerprint: catalog_product_fingerprint_for_id(db, replacement_id)
-                        .await
-                        .map_err(|error| ListingStoreError::State(error.to_string()))?,
-                    collision_closure_sha256: grounded_collision_closure_revision_sha256(
-                        db,
-                        replacement_id,
-                    )
-                    .await
-                    .map_err(|error| ListingStoreError::State(error.to_string()))?,
+                    product_fingerprint: capability.seed.product_fingerprint().to_string(),
+                    collision_closure_sha256: capability
+                        .seed
+                        .collision_closure_sha256()
+                        .to_string(),
                 });
             }
         }
@@ -2037,7 +2108,7 @@ async fn stage_bound_replay_grounded_capabilities(
     scope: Option<&GroundedCapabilityReplayScope>,
     avionics: &[ListingAvionicsValue],
 ) -> StoreResult<()> {
-    let prepared = prepare_grounded_capability_bindings(db, avionics).await?;
+    let prepared = prepare_grounded_capability_bindings(avionics)?;
     if prepared.is_empty() {
         return Ok(());
     }
@@ -2087,6 +2158,7 @@ async fn stage_bound_replay_grounded_capabilities(
                capability.evidence_capture_sha256,
                capability.extracted_listing_sha256,
                submission.extracted_listing_json,
+               submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
                capability.policy_version
@@ -2318,6 +2390,188 @@ async fn stage_bound_replay_grounded_capabilities(
     Ok(())
 }
 
+async fn stage_existing_listing_signed_source_grounded_capabilities(
+    db: &AppDb,
+    listing_id: i64,
+    binding: Option<&SignedSourceListingBinding>,
+    avionics: &[ListingAvionicsValue],
+) -> StoreResult<()> {
+    if prepare_grounded_capability_bindings(avionics)?.is_empty() {
+        return Ok(());
+    }
+    let binding = binding.ok_or_else(|| {
+        ListingStoreError::State(
+            "grounded existing-listing update requires its exact signed source binding".to_string(),
+        )
+    })?;
+    let expected_sha256 = binding
+        .expected_extracted_listing_json
+        .as_deref()
+        .map(|checkpoint| format!("{:x}", Sha256::digest(checkpoint.as_bytes())));
+    if expected_sha256 != binding.expected_extracted_listing_sha256
+        || format!(
+            "{:x}",
+            Sha256::digest(binding.bound_extracted_listing_json.as_bytes())
+        ) != binding.bound_extracted_listing_sha256
+    {
+        return Err(ListingStoreError::State(
+            "signed source binding does not match its exact extraction checkpoint".to_string(),
+        ));
+    }
+    let bind_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            UPDATE plugin_submissions
+            SET canonical_listing_id = ?, extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ? AND user_id = ? AND plugin_install_id = ?
+              AND source_url = ? AND submitted_at = ?
+              AND rendered_html = ? AND rendered_html_sha256 = ?
+              AND signature_base64 = ? AND canonical_listing_id IS NULL
+              AND extracted_listing_json IS ? AND extraction_error IS ?
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            UPDATE plugin_submissions
+            SET canonical_listing_id = ?, extracted_listing_json = ?, extraction_error = NULL
+            WHERE id = ? AND user_id = ? AND plugin_install_id = ?
+              AND source_url = ? AND submitted_at = ?
+              AND rendered_html = ? AND rendered_html_sha256 = ?
+              AND signature_base64 = ? AND canonical_listing_id IS NULL
+              AND extracted_listing_json IS NOT DISTINCT FROM ?
+              AND extraction_error IS NOT DISTINCT FROM ?
+            "#
+        }
+    });
+    let exact_bound_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            SELECT COUNT(*) FROM plugin_submissions
+            WHERE id = ? AND user_id = ? AND plugin_install_id = ?
+              AND canonical_listing_id = ? AND source_url = ? AND submitted_at = ?
+              AND rendered_html = ? AND rendered_html_sha256 = ?
+              AND signature_base64 = ? AND extracted_listing_json = ?
+              AND extraction_error IS NULL
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            SELECT COUNT(*) FROM plugin_submissions
+            WHERE id = ? AND user_id = ? AND plugin_install_id = ?
+              AND canonical_listing_id = ? AND source_url = ? AND submitted_at = ?
+              AND rendered_html = ? AND rendered_html_sha256 = ?
+              AND signature_base64 = ? AND extracted_listing_json = ?
+              AND extraction_error IS NULL
+            "#
+        }
+    });
+    let install_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS ?
+              AND (revoked_at IS NULL OR julianday(?) <= julianday(revoked_at))
+            "#
+        }
+        DatabaseBackend::Postgres(_) => {
+            r#"
+            SELECT id FROM plugin_installs
+            WHERE id = ? AND user_id = ? AND public_key_base64 = ?
+              AND revoked_at IS NOT DISTINCT FROM ?
+              AND (revoked_at IS NULL OR CAST(? AS TIMESTAMPTZ) <= CAST(revoked_at AS TIMESTAMPTZ))
+            FOR SHARE
+            "#
+        }
+    });
+    let listing_lock_sql = db.sql(match db.backend() {
+        DatabaseBackend::Sqlite(_) => {
+            "UPDATE aircraft_sale_listings SET updated_at = updated_at WHERE id = ? RETURNING id"
+        }
+        DatabaseBackend::Postgres(_) => {
+            "SELECT id FROM aircraft_sale_listings WHERE id = ? FOR UPDATE"
+        }
+    });
+    macro_rules! bind_in_transaction {
+        ($pool:expr) => {{
+            let mut transaction = $pool.begin().await?;
+            let locked_listing: Option<i64> = sqlx::query_scalar(&listing_lock_sql)
+                .bind(listing_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if locked_listing != Some(listing_id) {
+                return Err(ListingStoreError::State(format!(
+                    "existing listing {listing_id} changed before signed capability binding"
+                )));
+            }
+            let install_id: Option<i64> = sqlx::query_scalar(&install_sql)
+                .bind(binding.plugin_install_id)
+                .bind(binding.user_id)
+                .bind(binding.install_public_key_base64.as_str())
+                .bind(binding.install_revoked_at.as_deref())
+                .bind(binding.submitted_at.as_str())
+                .fetch_optional(&mut *transaction)
+                .await?;
+            if install_id != Some(binding.plugin_install_id) {
+                return Err(ListingStoreError::State(
+                    "signed source install changed before existing-listing capability binding"
+                        .to_string(),
+                ));
+            }
+            let bound = sqlx::query(&bind_sql)
+                .bind(listing_id)
+                .bind(binding.bound_extracted_listing_json.as_str())
+                .bind(binding.submission_id)
+                .bind(binding.user_id)
+                .bind(binding.plugin_install_id)
+                .bind(binding.source_url.as_str())
+                .bind(binding.submitted_at.as_str())
+                .bind(binding.rendered_html.as_str())
+                .bind(binding.rendered_html_sha256.as_str())
+                .bind(binding.signature_base64.as_str())
+                .bind(binding.expected_extracted_listing_json.as_deref())
+                .bind(binding.expected_extraction_error.as_deref())
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+            if bound != 1 {
+                let exact_count: i64 = sqlx::query_scalar(&exact_bound_sql)
+                    .bind(binding.submission_id)
+                    .bind(binding.user_id)
+                    .bind(binding.plugin_install_id)
+                    .bind(listing_id)
+                    .bind(binding.source_url.as_str())
+                    .bind(binding.submitted_at.as_str())
+                    .bind(binding.rendered_html.as_str())
+                    .bind(binding.rendered_html_sha256.as_str())
+                    .bind(binding.signature_base64.as_str())
+                    .bind(binding.bound_extracted_listing_json.as_str())
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                if exact_count != 1 {
+                    return Err(ListingStoreError::State(
+                        "signed source changed before existing-listing capability binding"
+                            .to_string(),
+                    ));
+                }
+            }
+            transaction.commit().await?;
+            Ok::<_, ListingStoreError>(())
+        }};
+    }
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => bind_in_transaction!(pool)?,
+        DatabaseBackend::Postgres(pool) => bind_in_transaction!(pool)?,
+    }
+    let scope = GroundedCapabilityReplayScope {
+        listing_id,
+        plugin_submission_id: binding.submission_id,
+        rendered_html_sha256: binding.rendered_html_sha256.clone(),
+        extracted_listing_sha256: binding.bound_extracted_listing_sha256.clone(),
+    };
+    stage_bound_replay_grounded_capabilities(db, Some(&scope), avionics).await
+}
+
 async fn insert_listing(
     db: &AppDb,
     user_id: i64,
@@ -2330,7 +2584,7 @@ async fn insert_listing(
     let aircraft_model_variant_id = pending_aircraft_compatibility_variant_id(db).await?;
     let installed_engine_model_id = resolve_installed_engine_model_id(db, values).await?;
     let installed_propeller_model_id = resolve_installed_propeller_model_id(db, values).await?;
-    let grounded_capabilities = prepare_grounded_capability_bindings(db, &values.avionics).await?;
+    let grounded_capabilities = prepare_grounded_capability_bindings(&values.avionics)?;
     if !grounded_capabilities.is_empty() && signed_source_binding.is_none() {
         return Err(ListingStoreError::State(
             "grounded listing capabilities require an exact signed source binding".to_string(),
@@ -3372,6 +3626,7 @@ async fn replay_grounded_listing_avionics_identity(
                capability.evidence_capture_sha256,
                capability.extracted_listing_sha256,
                submission.extracted_listing_json,
+               submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
                capability.policy_version
@@ -3423,10 +3678,14 @@ async fn replay_grounded_listing_avionics_identity(
         retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
         return Ok(None);
     };
-    let seed = grounded_resolution_receipt_seed_for_replay(request, &identity);
+    let seed = grounded_resolution_receipt_basis_for_replay(request, &identity)
+        .bind_catalog_snapshot(
+            row.product_fingerprint.clone(),
+            row.collision_closure_sha256.clone(),
+        );
     let current_product = match catalog_product_fingerprint_for_id(db, identity.id).await {
         Ok(fingerprint) => fingerprint,
-        Err(ReviewError::Conflict(_)) => {
+        Err(AvionicsFingerprintError::Conflict(_)) => {
             retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
             return Ok(None);
         }
@@ -3435,7 +3694,7 @@ async fn replay_grounded_listing_avionics_identity(
     let current_collision = match grounded_collision_closure_revision_sha256(db, identity.id).await
     {
         Ok(fingerprint) => fingerprint,
-        Err(ReviewError::Conflict(_)) => {
+        Err(AvionicsFingerprintError::Conflict(_)) => {
             retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
             return Ok(None);
         }
@@ -3459,10 +3718,12 @@ async fn replay_grounded_listing_avionics_identity(
         || row.product_fingerprint != current_product
         || row.collision_closure_sha256 != current_collision
         || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
-        || format!(
-            "{:x}",
-            Sha256::digest(row.extracted_listing_json.as_bytes())
-        ) != row.extracted_listing_sha256
+        || row.extraction_error.is_some()
+        || row
+            .extracted_listing_json
+            .as_deref()
+            .map(|checkpoint| format!("{:x}", Sha256::digest(checkpoint.as_bytes())))
+            != Some(row.extracted_listing_sha256.clone())
     {
         retire_exact_stale_grounded_capability(db, scope.listing_id, &row).await?;
         return Ok(None);
@@ -6146,6 +6407,7 @@ async fn replace_listing_avionics(
                capability.evidence_capture_sha256,
                capability.extracted_listing_sha256,
                submission.extracted_listing_json,
+               submission.extraction_error,
                capability.product_fingerprint,
                capability.collision_closure_sha256,
                capability.policy_version
@@ -6172,8 +6434,9 @@ async fn replace_listing_avionics(
           listing_link_id, association_role, avionics_model_id,
           authorization_kind, observation_sha256, product_fingerprint,
           grounded_resolution_sha256, evidence_capture_sha256,
+          plugin_submission_id, extracted_listing_sha256,
           collision_closure_sha256, policy_version
-        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'same_case_grounded', ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     );
     let approved_catalog_rows_sql = db.sql(APPROVED_CATALOG_ROWS_SQL);
@@ -6281,10 +6544,10 @@ async fn replace_listing_avionics(
                         || row.product_fingerprint != current_product_fingerprint
                         || row.collision_closure_sha256 != current_collision
                         || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
-                        || format!(
-                            "{:x}",
-                            Sha256::digest(row.extracted_listing_json.as_bytes())
-                        ) != row.extracted_listing_sha256
+                        || row.extraction_error.is_some()
+                        || row.extracted_listing_json.as_deref().map(|checkpoint| {
+                            format!("{:x}", Sha256::digest(checkpoint.as_bytes()))
+                        }) != Some(row.extracted_listing_sha256.clone())
                     {
                         return Err(ListingStoreError::Validation(format!(
                             "pending grounded capability for avionics catalog id {} is stale or not bound to the exact occurrence",
@@ -6384,10 +6647,10 @@ async fn replace_listing_avionics(
                                 || row.product_fingerprint != current_target_product
                                 || row.collision_closure_sha256 != current_target_collision
                                 || row.policy_version != GROUNDED_CAPABILITY_POLICY_VERSION
-                                || format!(
-                                    "{:x}",
-                                    Sha256::digest(row.extracted_listing_json.as_bytes())
-                                ) != row.extracted_listing_sha256
+                                || row.extraction_error.is_some()
+                                || row.extracted_listing_json.as_deref().map(|checkpoint| {
+                                    format!("{:x}", Sha256::digest(checkpoint.as_bytes()))
+                                }) != Some(row.extracted_listing_sha256.clone())
                             {
                                 return Err(ListingStoreError::Validation(format!(
                                     "pending grounded capability for replacement avionics catalog id {target_id} is stale or not bound to the exact occurrence"
@@ -6504,16 +6767,14 @@ async fn replace_listing_avionics(
                     if !reuse {
                         let product_fingerprint = capabilities[0].product_fingerprint.as_str();
                         let collision_closure = capabilities[0].collision_closure_sha256.as_str();
-                        let evidence_capture = exact_capability_scope
+                        let exact_scope = exact_capability_scope
                             .as_ref()
                             .ok_or_else(|| {
                                 ListingStoreError::Validation(
                                     "same-case authorization has no exact capability scope"
                                         .to_string(),
                                 )
-                            })?
-                            .evidence_capture_sha256
-                            .as_str();
+                            })?;
                         let resolution_sha256 = grounded_capability_set_sha256(
                             listing_id,
                             target_id,
@@ -6543,7 +6804,9 @@ async fn replace_listing_avionics(
                             .bind(observation_sha256)
                             .bind(product_fingerprint)
                             .bind(resolution_sha256)
-                            .bind(evidence_capture)
+                            .bind(exact_scope.evidence_capture_sha256.as_str())
+                            .bind(exact_scope.plugin_submission_id)
+                            .bind(exact_scope.extracted_listing_sha256.as_str())
                             .bind(collision_closure)
                             .bind(ASSOCIATION_AUTHORIZATION_POLICY_VERSION)
                             .execute(&mut *transaction)
@@ -8433,9 +8696,8 @@ mod tests {
         assert_eq!(link_count, 0);
     }
 
-    #[tokio::test]
-    async fn grounded_capability_prebind_rejects_quantity_overflow() {
-        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+    #[test]
+    fn grounded_capability_prebind_rejects_quantity_overflow() {
         let values = listing_values_with_variant("182T SKYLANE");
         let context = super::listing_context_excerpt("GTX 345R installed");
         let identity = approved_avionics_identity();
@@ -8473,8 +8735,7 @@ mod tests {
             },
         ];
 
-        let error = super::prepare_grounded_capability_bindings(&db, &[item])
-            .await
+        let error = super::prepare_grounded_capability_bindings(&[item])
             .expect_err("capability quantity coverage must use checked addition");
         assert!(error.to_string().contains("quantity coverage overflowed"));
     }
@@ -8493,7 +8754,8 @@ mod tests {
             grounded_resolution_sha256: "3".repeat(64),
             evidence_capture_sha256: "4".repeat(64),
             extracted_listing_sha256: "5".repeat(64),
-            extracted_listing_json: "{}".to_string(),
+            extracted_listing_json: Some("{}".to_string()),
+            extraction_error: None,
             product_fingerprint: "6".repeat(64),
             collision_closure_sha256: "7".repeat(64),
             policy_version: super::GROUNDED_CAPABILITY_POLICY_VERSION.to_string(),
@@ -8607,6 +8869,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_scope_retires_capability_when_extraction_checkpoint_is_cleared() {
+        let fixture = pending_grounded_replay_fixture(false).await;
+        let DatabaseBackend::Sqlite(pool) = fixture.db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = NULL WHERE id = ?")
+            .bind(fixture.scope.plugin_submission_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert!(
+            super::grounded_capability_replay_scope(&fixture.db, fixture.listing_id)
+                .await
+                .expect("a cleared checkpoint is stale proof, not a replay error")
+                .is_none()
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities WHERE listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn replay_scope_retires_capability_when_extraction_becomes_failed() {
+        let fixture = pending_grounded_replay_fixture(false).await;
+        let DatabaseBackend::Sqlite(pool) = fixture.db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "UPDATE plugin_submissions SET extraction_error = 'invalid checkpoint' WHERE id = ?",
+        )
+        .bind(fixture.scope.plugin_submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        assert!(
+            super::grounded_capability_replay_scope(&fixture.db, fixture.listing_id)
+                .await
+                .expect("a failed checkpoint is stale proof, not a replay error")
+                .is_none()
+        );
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_avionics_grounded_capabilities WHERE listing_id = ?",
+        )
+        .bind(fixture.listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
     async fn signed_listing_materialization_consumes_new_grounded_product_capability() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -8633,7 +8953,14 @@ mod tests {
             &parsed.avionics_types,
             parsed.quantity,
         );
-        let seed = super::grounded_resolution_receipt_seed_for_replay(&request, &identity);
+        let product_fingerprint = super::catalog_product_fingerprint_for_id(&db, model_id)
+            .await
+            .unwrap();
+        let collision_closure = super::grounded_collision_closure_revision_sha256(&db, model_id)
+            .await
+            .unwrap();
+        let seed = super::grounded_resolution_receipt_basis_for_replay(&request, &identity)
+            .bind_catalog_snapshot(product_fingerprint, collision_closure);
         let mut resolved = listing_avionics_value_from_catalog(
             &ListingAvionicsValue::from_parsed(parsed),
             &identity,
@@ -8766,14 +9093,6 @@ mod tests {
             &["Transponder".to_string()],
             1,
         );
-        let seed = super::grounded_resolution_receipt_seed_for_replay(&request, &identity);
-        let capability = super::ListingGroundedCapability {
-            occurrence_index: 0,
-            occurrence_role: OccurrenceRole::Primary,
-            configuration_action: "installed".to_string(),
-            source_notes: Some("GTX 345R installed".to_string()),
-            seed: seed.clone(),
-        };
         let rendered_html = "<p>Garmin GTX 345R installed</p>";
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
         let extraction_json = "{}";
@@ -8808,6 +9127,15 @@ mod tests {
         let collision_closure = super::grounded_collision_closure_revision_sha256(&db, model_id)
             .await
             .unwrap();
+        let seed = super::grounded_resolution_receipt_basis_for_replay(&request, &identity)
+            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone());
+        let capability = super::ListingGroundedCapability {
+            occurrence_index: 0,
+            occurrence_role: OccurrenceRole::Primary,
+            configuration_action: "installed".to_string(),
+            source_notes: Some("GTX 345R installed".to_string()),
+            seed: seed.clone(),
+        };
         sqlx::query(
             r#"INSERT INTO aircraft_sale_listing_avionics_grounded_capabilities (
                  listing_id, plugin_submission_id, occurrence_index, occurrence_role,
@@ -9363,14 +9691,6 @@ mod tests {
             &["Transponder".to_string()],
             1,
         );
-        let seed = super::grounded_resolution_receipt_seed_for_replay(&request, &identity);
-        let capability = super::ListingGroundedCapability {
-            occurrence_index: 0,
-            occurrence_role: OccurrenceRole::Primary,
-            configuration_action: "installed".to_string(),
-            source_notes: Some("GTX 345R installed".to_string()),
-            seed: seed.clone(),
-        };
         let rendered_html = "<p>Garmin GTX 345R installed</p>";
         let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
         let extraction_json = "{}";
@@ -9409,6 +9729,15 @@ mod tests {
             super::grounded_collision_closure_revision_sha256(&db, model_id)
                 .await
                 .unwrap()
+        };
+        let seed = super::grounded_resolution_receipt_basis_for_replay(&request, &identity)
+            .bind_catalog_snapshot(product_fingerprint.clone(), collision_closure.clone());
+        let capability = super::ListingGroundedCapability {
+            occurrence_index: 0,
+            occurrence_role: OccurrenceRole::Primary,
+            configuration_action: "installed".to_string(),
+            source_notes: Some("GTX 345R installed".to_string()),
+            seed: seed.clone(),
         };
         sqlx::query(
             r#"INSERT INTO aircraft_sale_listing_avionics_grounded_capabilities (

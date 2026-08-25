@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 use crate::aircraft::faa::{normalize_n_number, normalize_serial_key};
+use crate::avionics::fingerprint::{
+    active_collision_closure_member_ids, catalog_product_fingerprints, catalog_products,
+    fingerprint_active_collision_closure, fingerprint_catalog_products,
+    fingerprint_grounded_collision_closure, ActiveCollisionCatalogFingerprintRow,
+    CatalogFingerprintRow, ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
+};
 use crate::avionics::reuse::{
     product_reuse_attestation_is_current, reuse_attestation_is_current_postgres,
     reuse_attestation_is_current_sqlite,
@@ -30,14 +36,10 @@ use crate::models::ParsedAvionics;
 use crate::plugin::parse_current_checkpoint_payload;
 
 use super::{
-    active_collision_closure_member_ids, association_observation_sha256_from_values,
-    catalog_product_fingerprints, catalog_products, conservative_confidence,
-    fingerprint_active_collision_closure, fingerprint_catalog_products,
-    fingerprint_grounded_collision_closure, merged_notes, parse_payload, serialize_review_payload,
-    sha256_hex, valid_sha256, validate_exact_listing_evidence_span,
-    validate_exact_listing_product_evidence, ActiveCollisionCatalogFingerprintRow,
-    CatalogFingerprintRow, ListingAssociationRole, PendingReviewAspect, ReviewError, ReviewResult,
-    ACTIVE_COLLISION_CATALOG_ROWS_SQL, APPROVED_CATALOG_ROWS_SQL,
+    association_observation_sha256_from_values, conservative_confidence, merged_notes,
+    parse_payload, serialize_review_payload, sha256_hex, valid_sha256,
+    validate_exact_listing_evidence_span, validate_exact_listing_product_evidence,
+    ListingAssociationRole, PendingReviewAspect, ReviewError, ReviewResult,
     ASSOCIATION_AUTHORIZATION_POLICY_VERSION, POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
 use crate::avionics::catalog::{

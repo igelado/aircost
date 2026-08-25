@@ -15,6 +15,10 @@ use crate::avionics::catalog::{
     GroundedAvionicsResolutionReceipt, VerifiedLocalReuseProof,
 };
 use crate::avionics::consolidation::PendingReviewRevisionReceipt;
+use crate::avionics::fingerprint::{
+    active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
+    grounded_collision_closure_revision_sha256, AvionicsFingerprintError,
+};
 use crate::avionics::reuse::product_reuse_attestation_is_current;
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
@@ -43,11 +47,10 @@ use crate::listing::review::automation::{
     AutomatedReviewApplyRequest,
 };
 use crate::listing::review::{
-    active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
-    evaluate_existing_product_associations, grounded_collision_closure_revision_sha256,
-    parse_current_pending_review_aspects, ExistingProductAssociationCommit,
-    ExistingProductAssociationEvaluation, ListingAssociationRole, PendingReviewAspect,
-    ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL,
+    evaluate_existing_product_associations, parse_current_pending_review_aspects,
+    ExistingProductAssociationCommit, ExistingProductAssociationEvaluation, ListingAssociationRole,
+    PendingReviewAspect, ReviewAction, ReviewAspectId, ReviewProduct, StableIdentifier,
+    POSTGRES_LISTING_CHILD_LOCK_SQL,
 };
 use crate::models::ParsedAvionics;
 use crate::normalize::is_generic_avionics_model_name;
@@ -3359,7 +3362,7 @@ async fn resolve_identity_attempt(
                         Some(AutomatedAssociationAuthorization::SameCaseGrounded(_)) => {
                             grounded_collision_closure_revision_sha256(db, model_id).await
                         }
-                        None => Err(crate::listing::review::ReviewError::Conflict(format!(
+                        None => Err(AvionicsFingerprintError::Conflict(format!(
                             "catalog id {model_id} has no automatic association authorization"
                         ))),
                     };

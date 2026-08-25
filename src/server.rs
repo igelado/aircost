@@ -41,6 +41,7 @@ use crate::avionics::consolidation::{
     preview_human_reviewed_avionics_model_consolidation, ConsolidationError,
     HumanReviewedAvionicsConsolidationRequest, HumanReviewedConsolidationProvenance,
 };
+use crate::avionics::fingerprint::active_collision_closure_revision_sha256;
 use crate::avionics::inspection::{
     avionics_catalog_options, get_avionics_catalog_detail, list_avionics_catalog,
     AvionicsCatalogQuery, AvionicsInspectionError,
@@ -56,7 +57,7 @@ use crate::listing::review::replacement::{
     approve_replacement_products_and_restage, ApproveReplacementProductsRequest,
 };
 use crate::listing::review::{
-    active_collision_closure_revision_sha256, approve_locally_verified_ordinary_aspect_and_restage,
+    approve_locally_verified_ordinary_aspect_and_restage,
     corroborate_existing_product_association_and_restage, evaluate_existing_product_association,
     get_listing_review, list_listing_reviews, list_pending_product_associations,
     list_pending_product_reviews, preflight_listing_review_resolution,
@@ -1738,7 +1739,9 @@ async fn verify_existing_review_avionics_handler(
     // Capture the complete collision closure immediately before the local
     // association decision that consumes it.
     let expected_collision_closure_sha256 =
-        active_collision_closure_revision_sha256(&state.db, target_id).await?;
+        active_collision_closure_revision_sha256(&state.db, target_id)
+            .await
+            .map_err(ReviewError::from)?;
 
     let staged = match target.commit {
         ExistingProductAssociationCommit::CorroboratePreserved { observation_sha256 } => {
