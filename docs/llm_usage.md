@@ -131,6 +131,10 @@ nonempty, no more than 256 bytes, and can be rebound to the retained source
 adapter output. They never receive a page excerpt containing adjacent listing
 fields. The observed manufacturer remains separate structured request data, so
 an exact occurrence need not repeat it merely to preserve the paid fallback.
+After any exact same-case replay is considered, a missing, oversized, or
+unrebindable occurrence stops as pending before local matching or a provider
+call. A paid fallback is therefore possible only for a successfully rebound
+occurrence and only when replay policy permits it.
 
 Within the one trusted Controller
 `Avionics/Radios` value, an otherwise missing right-hand model boundary is

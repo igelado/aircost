@@ -8484,6 +8484,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrebindable_occurrence_never_reaches_the_configured_provider() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(parsed_avionics(
+            "GTX 345R",
+        ))];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            Some(&unreachable),
+            Some("https://example.com/listing"),
+            Some("The retained listing contains no matching avionics occurrence."),
+            None,
+        )
+        .await
+        .expect("failed occurrence rebinding should stage review without provider work");
+
+        assert_eq!(resolved.pending_review_aspects.len(), 1);
+        assert!(values.avionics.is_empty());
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn exact_controller_run_on_reuses_only_the_attested_canonical_product() {
         const CONTROLLER_URL: &str =
             "https://www.controller.com/listing/for-sale/257959105/example";
@@ -8506,6 +8537,23 @@ mod tests {
             .expect("capability membership should seed");
         }
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let neighboring_id = ensure_approved_test_avionics_model(&db, "Garmin", "GIA 64W", "GPS")
+            .await
+            .expect("same-maker neighboring identity should seed");
+        for capability in ["NAV", "COM"] {
+            let type_id = super::ensure_named_row(&db, "avionics_types", capability)
+                .await
+                .expect("neighboring capability should seed");
+            execute_query!(
+                &db,
+                "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+                neighboring_id,
+                type_id,
+            )
+            .expect("neighboring capability membership should seed");
+        }
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, neighboring_id).await;
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
 
         let html = include_str!("../tests/fixtures/controller/id25_like_listing.html").replace(
             "GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140",
@@ -8528,9 +8576,10 @@ mod tests {
         let resolved = resolve_listing_avionics_values(
             &db,
             &mut values,
-            None,
+            Some(&unreachable),
             Some(CONTROLLER_URL),
             Some(&source),
+            None,
         )
         .await
         .expect("the exact Controller run-on should resolve without Gemini");
@@ -8562,6 +8611,7 @@ mod tests {
         .await
         .expect("approved graph identity should seed");
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         let source = crate::html::listing::source::listing_extraction_source(
             CONTROLLER_URL,
             include_str!("../tests/fixtures/controller/id25_like_listing.html"),
@@ -8582,9 +8632,10 @@ mod tests {
         let resolved = resolve_listing_avionics_values(
             &db,
             &mut values,
-            None,
+            Some(&unreachable),
             Some(CONTROLLER_URL),
             Some(&source),
+            None,
         )
         .await
         .expect("the exact non-radio Controller field should resolve locally");
@@ -8682,6 +8733,7 @@ mod tests {
                 None,
                 Some(source_url),
                 Some(&source),
+                None,
             )
             .await
             .expect("unsafe run-on shape should stage review rather than assign");
@@ -8725,6 +8777,7 @@ mod tests {
             Some(
                 "Garmin GDU 1044B Flight Display\nGarmin GDU 1044B Flight Display\nUNRELATED FIELD",
             ),
+            None,
         )
         .await
         .expect("each exact occurrence should use the same attested local identity");
@@ -9120,13 +9173,13 @@ mod tests {
     #[test]
     fn grounded_capability_prebind_uses_max_quantity_for_duplicate_mentions() {
         let values = listing_values_with_variant("182T SKYLANE");
-        let context = super::listing_context_excerpt("GTX 345R installed");
+        let context = "GTX 345R installed";
         let identity = approved_avionics_identity();
         let make_seed = |quantity| {
             let request = super::listing_avionics_identity_request(
                 &values,
                 values.source_url.as_deref(),
-                &context,
+                context,
                 "Garmin",
                 "GTX 345R",
                 &["Transponder".to_string()],
@@ -9166,14 +9219,14 @@ mod tests {
     #[test]
     fn grounded_replacement_capabilities_are_nonadditive_occurrence_evidence() {
         let values = listing_values_with_variant("182T SKYLANE");
-        let context = super::listing_context_excerpt("GTX 345R replaces GTX 327");
+        let context = "GTX 345R replaces GTX 327";
         let mut replacement_identity = approved_avionics_identity();
         replacement_identity.id = 327;
         replacement_identity.model = "GTX 327".to_string();
         let replacement_request = super::listing_avionics_identity_request(
             &values,
             values.source_url.as_deref(),
-            &context,
+            context,
             "Garmin",
             "GTX 327",
             &["Transponder".to_string()],
@@ -9566,11 +9619,11 @@ mod tests {
             .unwrap();
         let mut values = listing_values_with_variant("182T SKYLANE");
         let parsed = parsed_avionics("GTX 345R");
-        let context = super::listing_context_excerpt("GTX 345R installed");
+        let context = "GTX 345R installed";
         let request = super::listing_avionics_identity_request(
             &values,
             values.source_url.as_deref(),
-            &context,
+            context,
             &parsed.manufacturer,
             &parsed.model,
             &parsed.avionics_types,
@@ -9729,11 +9782,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut values = listing_values_with_variant("182T SKYLANE");
-        let listing_context = super::listing_context_excerpt("Garmin GTX 345R installed");
+        let listing_context = "GTX 345R installed";
         let request = super::listing_avionics_identity_request(
             &values,
             Some("https://example.com/listing"),
-            &listing_context,
+            listing_context,
             "Garmin",
             "GTX 345R",
             &["Transponder".to_string()],
@@ -10329,7 +10382,7 @@ mod tests {
         let request = super::listing_avionics_identity_request(
             &values,
             Some("https://example.com/listing"),
-            &super::listing_context_excerpt("Garmin GTX 345R installed"),
+            "GTX 345R installed",
             "Garmin",
             "GTX 345R",
             &["Transponder".to_string()],

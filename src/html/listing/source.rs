@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_occurrence_rebinding_stays_inside_the_controller_avionics_field() {
+    fn checkpoint_occurrence_rebinding_stays_inside_controller_field_values() {
         let source = listing_extraction_source(URL, REALISTIC).unwrap();
 
         assert!(
