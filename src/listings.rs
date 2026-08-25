@@ -1216,6 +1216,7 @@ pub(crate) async fn create_listing_with_progress_and_occurrence_dispositions(
                         plugin_submission_id: binding.submission_id,
                         rendered_html_sha256: binding.rendered_html_sha256.clone(),
                         extracted_listing_sha256: binding.bound_extracted_listing_sha256.clone(),
+                        allow_provider_fallback: true,
                     },
                 )
                 .await?;
@@ -1579,6 +1580,7 @@ pub(crate) async fn resume_bound_replay_listing(
         plugin_submission_id,
         rendered_html_sha256: rendered_html_sha256.to_string(),
         extracted_listing_sha256: extracted_listing_sha256.to_string(),
+        allow_provider_fallback: true,
     };
     let resolved_avionics = resolve_listing_avionics_values(
         db,
