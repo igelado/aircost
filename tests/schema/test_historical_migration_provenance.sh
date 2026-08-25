@@ -31,6 +31,7 @@ strict_migrations=(
   20260821_aircraft_visual_source_corrections
   20260821_avionics_approved_concrete_model
   20260824_avionics_generic_feature_labels
+  20260825_listing_avionics_grounded_capabilities
 )
 transition_migrations=(
   20260802_default_avionics_candidate_quarantine
@@ -275,8 +276,8 @@ mapfile -t receipt_postgres_migrations < <(
     "$repository_root"/migrations/*.postgres.sql |
     sed -E 's|.*/([^/]+)[.]postgres[.]sql|\1|' | sort
 )
-test "${#receipt_postgres_migrations[@]}" = 27
-test "${#all_postgres_migrations[@]}" = 27
+test "${#receipt_postgres_migrations[@]}" = 28
+test "${#all_postgres_migrations[@]}" = 28
 diff -u \
   <(printf '%s\n' "${all_postgres_migrations[@]}" | sort) \
   <(printf '%s\n' "${receipt_postgres_migrations[@]}")
