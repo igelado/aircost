@@ -6286,7 +6286,7 @@ mod tests {
                 assert_eq!(report.grounded_initial_identity_components, 0);
                 assert_eq!(report.grounded_conditional_relationship_components, 0);
                 assert!(report.note.contains(&format!(
-                    "preserved avionics catalog id {blocker_id} has no current manufacturer-reuse authorization"
+                    "preserved avionics catalog id {blocker_id} has neither current manufacturer-reuse nor exact same-case authorization"
                 )));
             }
         }
@@ -8481,7 +8481,7 @@ mod tests {
         assert_eq!(report.prepared_link_count, 0);
         assert_eq!(report.accepted, 0);
         assert!(report.error.as_deref().is_some_and(|error| error.contains(
-            &format!("preserved avionics catalog id {product_id} has no current manufacturer-reuse authorization")
+            &format!("preserved avionics catalog id {product_id} has neither current manufacturer-reuse nor exact same-case authorization")
         )));
 
         let catalog_after: Vec<(i64, String)> =
