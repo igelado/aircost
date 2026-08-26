@@ -153,6 +153,14 @@ product key inside the effective manufacturer identity and the complete product
 graph has a current reuse attestation. Duplicate identities, variants,
 unattested products, type mismatches, and non-Controller occurrences still use
 the normal fail-closed or paid path.
+Two additional Controller-only source grammars treat `WAAS` as an extraction
+annotation for a model that already ends in an attached `W`: an exact
+`model/WAAS CAPABILITY/CAPABILITY` line for one unit, and an exact
+`Dual manufacturer model WAAS CAPABILITY/CAPABILITYs` line for quantity two.
+The latter permits one plural `s` only on the final capability. Both require the
+complete slash-delimited capability set to equal the occurrence's declared
+atomic types. Near matches, other quantities, trailing text, generic sources,
+and local catalog reuse remain ineligible.
 An `Integrated Flight Deck` identity may establish that core category without
 repeating it in prose; every additional category assigned to the suite must be
 explicit in the same occurrence evidence, and a separately extracted
