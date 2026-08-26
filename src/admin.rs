@@ -2385,7 +2385,6 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use zip::write::SimpleFileOptions;

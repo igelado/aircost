@@ -462,7 +462,7 @@ BEGIN
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 40 FROM actual_columns)
+                      (SELECT COUNT(*) = 39 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
@@ -899,7 +899,7 @@ BEGIN
       );
 
     IF NOT COALESCE(contract_is_exact, FALSE)
-       OR check_signature IS DISTINCT FROM 'b33af6b1c9969a333dbdb7d8a5910e92'
+       OR check_signature IS DISTINCT FROM '9a030ed4847f98cd98891f37e57cd516'
        OR function_signature IS DISTINCT FROM '7e885abd1d361c7c831c84e5e3a58e1d' THEN
       RAISE EXCEPTION
         'installed listing replay migration contract has noncanonical objects';

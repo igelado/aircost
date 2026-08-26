@@ -246,7 +246,7 @@ const LISTING_REPLAY_RUNS_CONTRACT_VERSION: i64 = 1;
 const LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT: &str =
     "41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a";
 const POSTGRES_LISTING_REPLAY_CHECKS_FINGERPRINT: &str =
-    "36cb3b5e9642cedfe6e0b2d92c03864fc9ff9cc2d54ee64348f8fca67d567f40";
+    "a80c28cfeeeecd8bf83e130603fd8d81bd3e7c2354b486daa8123a4b084d6791";
 const POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT: &str = "7e885abd1d361c7c831c84e5e3a58e1d";
 const SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update
@@ -6911,7 +6911,7 @@ impl AppDb {
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 40 FROM actual_columns)
+                      (SELECT COUNT(*) = 39 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
