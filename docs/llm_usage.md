@@ -316,20 +316,26 @@ mutation; any failure restores the entire original payload before the
 checkpoint can be stored.
 
 Quantity remains explicitly model-produced and is never inferred or mutated
-locally. A completeness gate examines only the authoritative Controller
-`Avionics/Radios` field. Punctuation-insensitive, token-bounded repeated exact
-candidate model mentions and direct `Dual`, `#N`, or decimal quantity markers
-form quantity signals. The exact Controller run-on form with a unique
+locally. Every current extraction, regardless of publisher, must emit a
+normalized manufacturer/model identity only once. A quantity greater than one
+can never carry high source confidence; without a quantity signal, only one
+exact identity with quantity one is eligible for automatic admission.
+
+The Controller adapter treats punctuation-insensitive repeated model mentions
+and bounded `Dual`, `#N`, or decimal markers only as quantity ambiguity. It
+does not convert them into an expected physical count. This includes negated,
+optional, and contextual wording such as `Not Dual`, `Optional Dual`, or
+`dual screen`, lone ordinals, and the exact run-on shape with a unique
 left-bounded model, slash-delimited alphanumeric suffix, and terminal `(Dual)`
-in the same evidence line is also a quantity-two signal. Those signals must
-agree with each other, with exactly one emitted occurrence of the normalized
-manufacturer/model identity, and with that occurrence's explicit `quantity`.
-Its exact `source_evidence_text` must cover the entire source span that
-established the signal. Conflicting signals, duplicate output rows, an under-
-or over-count, and incomplete evidence all fail closed into the existing
-avionics correction path. A typography repair that exposes a quantity failure
-is rolled back atomically. Other publishers rely on the extraction prompt
-until they have an equally explicit authoritative equipment-field adapter.
+in one evidence line. A high-confidence occurrence with any such ambiguity
+fails into the single avionics correction request. A corrected medium- or
+low-confidence candidate may checkpoint only when its exact
+`source_evidence_text` covers the complete bounded ambiguity, including count
+qualifiers such as `units` or `each`; downstream reuse and valuation continue
+to require high source confidence, so it remains pending. A typography repair
+that exposes a quantity failure is rolled back atomically. Other publishers
+rely on the extraction prompt until they have an equally explicit
+authoritative equipment-field adapter.
 
 The same atomic Controller typography repair and complete current extraction
 validator run after an avionics-only correction. On success, only the transient

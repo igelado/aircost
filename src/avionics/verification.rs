@@ -6464,7 +6464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_reextraction_accepts_explicit_quantity_from_one_bounded_correction() {
+    async fn durable_reextraction_checkpoints_ambiguous_quantity_below_high_confidence() {
         let html = trusted_controller_role_html(
             "KSAR Garmin G5 attitude, Garmin G5 HSI, Garmin GFC500 auto pilot",
         );
@@ -6486,7 +6486,7 @@ mod tests {
             "configuration_action": "installed",
             "replaces": null,
             "source_evidence_text": "Garmin G5 attitude, Garmin G5 HSI",
-            "source_confidence": "high"
+            "source_confidence": "medium"
         }]);
         let (endpoint, request_count, server) =
             spawn_listing_extraction_sequence_endpoint(vec![primary, corrected]).await;
@@ -6511,6 +6511,10 @@ mod tests {
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(reextracted.avionics.len(), 1);
         assert_eq!(reextracted.avionics[0].quantity, 2);
+        assert_eq!(
+            reextracted.avionics[0].source_confidence.as_deref(),
+            Some("medium")
+        );
         assert_eq!(
             reextracted.avionics[0].source_evidence_text.as_deref(),
             Some("Garmin G5 attitude, Garmin G5 HSI")
@@ -6623,7 +6627,7 @@ mod tests {
         server.abort();
 
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        assert!(error.contains("quantity does not unambiguously represent"));
+        assert!(error.contains("ambiguous Controller quantity evidence"));
     }
 
     #[test]

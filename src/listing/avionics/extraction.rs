@@ -189,13 +189,13 @@ impl AvionicsValidationRule {
                 "integrated suite assigns a capability to a separate product"
             }
             Self::QuantityProofAmbiguous => {
-                "conflicting exact Controller quantity signals exist"
+                "ambiguous Controller quantity evidence cannot have high source confidence"
             }
             Self::QuantityMismatch => {
-                "occurrence quantity does not unambiguously represent the exact Controller quantity signals"
+                "one normalized product must appear once, and quantity greater than one cannot have high source confidence"
             }
             Self::QuantityEvidenceIncomplete => {
-                "source_evidence_text does not cover every exact Controller quantity signal"
+                "source_evidence_text does not cover the complete bounded Controller quantity ambiguity"
             }
             Self::InvalidBindingIdentifiers => {
                 "listing and retained submission IDs must be positive"
@@ -947,6 +947,26 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
     source_url: &str,
     rendered_html: &str,
 ) -> Result<(), AvionicsValidationFailure> {
+    for (index, observation) in observations.iter().enumerate() {
+        if let Some(related_index) = observations[..index]
+            .iter()
+            .position(|candidate| same_product_identity(observation, candidate))
+        {
+            return Err(AvionicsValidationFailure::related(
+                AvionicsValidationRule::QuantityMismatch,
+                index,
+                AvionicsValidationField::Quantity,
+                related_index,
+            ));
+        }
+        if observation.quantity > 1 && observation.source_confidence.as_deref() == Some("high") {
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::QuantityMismatch,
+                index,
+                AvionicsValidationField::Quantity,
+            ));
+        }
+    }
     let Some(installed_equipment) = controller_avionics_evidence(source_url, rendered_html) else {
         return Ok(());
     };
@@ -956,34 +976,22 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             .as_deref()
             .expect("the canonical parser requires occurrence evidence")
             .trim();
-        let signal = match controller_quantity_signal(
+        let Some(signal) = controller_quantity_ambiguity_signal(
             &installed_equipment,
             &observation.manufacturer,
             &observation.model,
             evidence,
-        ) {
-            ControllerQuantitySignal::None => continue,
-            ControllerQuantitySignal::Unique(signal) => signal,
-            ControllerQuantitySignal::Ambiguous => {
-                return Err(AvionicsValidationFailure::occurrence(
-                    AvionicsValidationRule::QuantityProofAmbiguous,
-                    index,
-                    AvionicsValidationField::Quantity,
-                ));
-            }
+        ) else {
+            continue;
         };
-        let matching_count = observations
-            .iter()
-            .filter(|candidate| same_product_identity(observation, candidate))
-            .count();
-        if matching_count != 1 || observation.quantity != signal.quantity {
+        if observation.source_confidence.as_deref() == Some("high") {
             return Err(AvionicsValidationFailure::occurrence(
-                AvionicsValidationRule::QuantityMismatch,
+                AvionicsValidationRule::QuantityProofAmbiguous,
                 index,
-                AvionicsValidationField::Quantity,
+                AvionicsValidationField::SourceConfidence,
             ));
         }
-        if !evidence.contains(&signal.evidence) {
+        if !evidence.contains(&installed_equipment[signal.start..signal.end]) {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::QuantityEvidenceIncomplete,
                 index,
@@ -1009,105 +1017,40 @@ fn punctuation_insensitive_identity_key(value: &str) -> String {
         .collect()
 }
 
-#[derive(Debug)]
-struct ExactControllerQuantitySignal {
-    quantity: i64,
-    evidence: String,
-}
-
-#[derive(Debug)]
-enum ControllerQuantitySignal {
-    None,
-    Unique(ExactControllerQuantitySignal),
-    Ambiguous,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct IdentityRange {
     start: usize,
     end: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QuantityMarkerKind {
-    Total,
-    Ordinal,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct QuantityMarker {
-    quantity: i64,
-    start: usize,
-    end: usize,
-    kind: QuantityMarkerKind,
-}
-
-fn controller_quantity_signal(
+fn controller_quantity_ambiguity_signal(
     source: &str,
     manufacturer: &str,
     model: &str,
     evidence: &str,
-) -> ControllerQuantitySignal {
+) -> Option<IdentityRange> {
     let ranges = normalized_identity_occurrence_ranges(source, model);
-    let run_on_dual = match controller_run_on_dual_evidence_range(source, evidence, model) {
-        Ok(range) => range,
-        Err(()) => return ControllerQuantitySignal::Ambiguous,
-    };
-    let mut quantities = BTreeSet::new();
-    let mut ordinals = BTreeSet::new();
-    let mut evidence_start = ranges
-        .first()
-        .map(|range| range.start)
-        .or_else(|| run_on_dual.map(|range| range.start));
-    let mut evidence_end = ranges
-        .last()
-        .map(|range| range.end)
-        .or_else(|| run_on_dual.map(|range| range.end));
-    if ranges.len() > 1 {
-        quantities.insert(ranges.len() as i64);
-    }
-    if let Some(range) = run_on_dual {
-        quantities.insert(2);
-        evidence_start = Some(evidence_start.map_or(range.start, |start| start.min(range.start)));
-        evidence_end = Some(evidence_end.map_or(range.end, |end| end.max(range.end)));
+    let mut ambiguity = (ranges.len() > 1).then(|| IdentityRange {
+        start: ranges.first().expect("two ranges have a first").start,
+        end: ranges.last().expect("two ranges have a last").end,
+    });
+    if let Some(run_on_dual) = controller_run_on_dual_evidence_range(source, evidence, model) {
+        include_ambiguity_range(&mut ambiguity, run_on_dual);
     }
     for range in &ranges {
-        for marker in [
-            quantity_marker_before_identity(source, *range, manufacturer),
-            quantity_marker_after_identity(source, *range),
-        ] {
-            let marker = match marker {
-                Ok(marker) => marker,
-                Err(()) => return ControllerQuantitySignal::Ambiguous,
-            };
-            let Some(marker) = marker else {
-                continue;
-            };
-            evidence_start =
-                Some(evidence_start.map_or(marker.start, |start| start.min(marker.start)));
-            evidence_end = Some(evidence_end.map_or(marker.end, |end| end.max(marker.end)));
-            match marker.kind {
-                QuantityMarkerKind::Total => {
-                    quantities.insert(marker.quantity);
-                }
-                QuantityMarkerKind::Ordinal => {
-                    ordinals.insert(marker.quantity);
-                }
-            }
+        if let Some(marker) = quantity_marker_in_identity_item(source, *range, manufacturer) {
+            include_ambiguity_range(&mut ambiguity, marker);
         }
     }
-    if let Some(maximum) = ordinals.last() {
-        quantities.insert(*maximum);
-    }
-    match quantities.len() {
-        0 => ControllerQuantitySignal::None,
-        1 => ControllerQuantitySignal::Unique(ExactControllerQuantitySignal {
-            quantity: *quantities.first().expect("one quantity exists"),
-            evidence: source[evidence_start.expect("one signal has a start")
-                ..evidence_end.expect("one signal has an end")]
-                .to_string(),
-        }),
-        _ => ControllerQuantitySignal::Ambiguous,
+    ambiguity
+}
+
+fn include_ambiguity_range(ambiguity: &mut Option<IdentityRange>, range: IdentityRange) {
+    if let Some(ambiguity) = ambiguity {
+        ambiguity.start = ambiguity.start.min(range.start);
+        ambiguity.end = ambiguity.end.max(range.end);
+    } else {
+        *ambiguity = Some(range);
     }
 }
 
@@ -1115,39 +1058,34 @@ fn controller_run_on_dual_evidence_range(
     source: &str,
     evidence: &str,
     model: &str,
-) -> Result<Option<IdentityRange>, ()> {
+) -> Option<IdentityRange> {
     if !controller_field_has_exact_evidence_line(source, evidence) {
-        return Ok(None);
+        return None;
     }
     let Some(identity_end) = normalized_left_bounded_identity_end(evidence, model) else {
-        return Ok(None);
+        return None;
     };
     let suffix = &evidence[identity_end..];
     let Some(capabilities) = suffix
         .get(..suffix.len().saturating_sub("(Dual)".len()))
         .filter(|_| suffix.to_ascii_lowercase().ends_with("(dual)"))
     else {
-        return Ok(None);
+        return None;
     };
     let parts = capabilities.split('/').collect::<Vec<_>>();
-    if parts.len() < 2
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
     {
-        return Ok(None);
+        return None;
     }
-    let mut matches = source.match_indices(evidence);
-    let Some((start, _)) = matches.next() else {
-        return Ok(None);
-    };
-    if matches.next().is_some() {
-        return Err(());
-    }
-    Ok(Some(IdentityRange {
-        start,
-        end: start + evidence.len(),
-    }))
+    let matches = source.match_indices(evidence).collect::<Vec<_>>();
+    let (first, _) = *matches.first()?;
+    let (last, _) = *matches.last()?;
+    Some(IdentityRange {
+        start: first,
+        end: last + evidence.len(),
+    })
 }
 
 fn normalized_left_bounded_identity_end(source: &str, identity: &str) -> Option<usize> {
@@ -1256,13 +1194,35 @@ fn source_words(source: &str, start: usize, end: usize) -> Vec<SourceWord> {
     words
 }
 
-fn quantity_marker_before_identity(
+fn quantity_marker_in_identity_item(
     source: &str,
     identity: IdentityRange,
     manufacturer: &str,
-) -> Result<Option<QuantityMarker>, ()> {
-    let (line_start, _) = line_bounds(source, identity.start);
-    let words = source_words(source, line_start, identity.start);
+) -> Option<IdentityRange> {
+    let (item_start, item_end) = item_bounds(source, identity.start);
+    let item_words = source_words(source, item_start, item_end);
+    let item_range = || {
+        let start = item_words.first().map_or(identity.start, |word| word.start);
+        let end = item_words.last().map_or(identity.end, |word| word.end);
+        IdentityRange { start, end }
+    };
+    if item_words.iter().any(|word| word.value == "dual")
+        || item_words
+            .iter()
+            .any(|word| decimal_quantity_is_multiplier(&word.value))
+        || source[item_start..item_end]
+            .match_indices('#')
+            .any(|(offset, _)| {
+                source[item_start + offset + 1..item_end]
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_digit())
+            })
+    {
+        return Some(item_range());
+    }
+
+    let words = source_words(source, item_start, identity.start);
     let manufacturer_words = source_words(manufacturer, 0, manufacturer.len());
     let mut end = words.len();
     if !manufacturer_words.is_empty()
@@ -1276,128 +1236,44 @@ fn quantity_marker_before_identity(
     {
         end -= manufacturer_words.len();
     }
-    let Some(last_word) = end.checked_sub(1) else {
-        return Ok(None);
-    };
-    let word = &words[last_word];
-    if word.value == "dual" {
-        return Ok(Some(QuantityMarker {
-            quantity: 2,
-            start: word.start,
-            end: identity.end,
-            kind: QuantityMarkerKind::Total,
-        }));
-    }
-    let Some(quantity) = decimal_quantity_word(&word.value) else {
-        return Ok(None);
-    };
-    let quantity = quantity?;
-    let prefix = source[line_start..word.start].trim_end();
-    if prefix.ends_with('#') {
-        return Ok(None);
-    }
-    if !decimal_quantity_is_multiplier(&word.value)
-        && prefix
-            .chars()
-            .next_back()
-            .is_some_and(|character| !matches!(character, ',' | ';' | ':' | '('))
-    {
-        return Ok(None);
-    }
-    Ok(Some(QuantityMarker {
-        quantity,
-        start: word.start,
-        end: identity.end,
-        kind: QuantityMarkerKind::Total,
-    }))
-}
-
-fn quantity_marker_after_identity(
-    source: &str,
-    identity: IdentityRange,
-) -> Result<Option<QuantityMarker>, ()> {
-    let (_, line_end) = line_bounds(source, identity.end);
-    let suffix = &source[identity.end..line_end];
-    let trimmed = suffix.trim_start();
-    let marker_start = line_end - trimmed.len();
-    if let Some(after_hash) = trimmed.strip_prefix('#') {
-        let digits = after_hash.bytes().take_while(u8::is_ascii_digit).count();
-        if digits == 0 {
-            return Err(());
-        }
-        let quantity = after_hash[..digits].parse::<i64>().map_err(|_| ())?;
-        if quantity < 1 {
-            return Err(());
-        }
-        return Ok(Some(QuantityMarker {
-            quantity,
-            start: marker_start,
-            end: marker_start + 1 + digits,
-            kind: QuantityMarkerKind::Ordinal,
-        }));
-    }
-    let words = source_words(source, identity.end, line_end);
-    let Some(word) = words.first() else {
-        return Ok(None);
-    };
-    if source[identity.end..word.start]
-        .chars()
-        .any(|character| character.is_ascii_alphanumeric())
-    {
-        return Ok(None);
-    }
-    if word.value == "dual" {
-        return Ok(Some(QuantityMarker {
-            quantity: 2,
-            start: word.start,
-            end: word.end,
-            kind: QuantityMarkerKind::Total,
-        }));
-    }
-    let Some(quantity) = decimal_quantity_word(&word.value) else {
-        return Ok(None);
-    };
-    if !decimal_quantity_is_multiplier(&word.value)
-        && !words
+    let plain_decimal_prefix = end.checked_sub(1).is_some_and(|last_word| {
+        let word = &words[last_word];
+        let prefix = source[item_start..word.start].trim_end();
+        decimal_quantity_word(&word.value)
+            && !prefix.ends_with('#')
+            && prefix
+                .chars()
+                .next_back()
+                .is_none_or(|character| matches!(character, ':' | '('))
+    });
+    let after_words = source_words(source, identity.end, item_end);
+    let labeled_decimal_suffix = after_words
+        .first()
+        .is_some_and(|word| decimal_quantity_word(&word.value))
+        && after_words
             .get(1)
-            .is_some_and(|word| matches!(word.value.as_str(), "unit" | "units" | "each" | "ea"))
-    {
-        return Ok(None);
-    }
-    Ok(Some(QuantityMarker {
-        quantity: quantity?,
-        start: word.start,
-        end: word.end,
-        kind: QuantityMarkerKind::Total,
-    }))
+            .is_some_and(|word| matches!(word.value.as_str(), "unit" | "units" | "each" | "ea"));
+    (plain_decimal_prefix || labeled_decimal_suffix).then(item_range)
 }
 
-fn decimal_quantity_word(value: &str) -> Option<Result<i64, ()>> {
+fn decimal_quantity_word(value: &str) -> bool {
     let digits = value
         .strip_prefix('x')
         .or_else(|| value.strip_suffix('x'))
         .unwrap_or(value);
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    Some(
-        digits
-            .parse::<i64>()
-            .map_err(|_| ())
-            .and_then(|quantity| (quantity >= 1).then_some(quantity).ok_or(())),
-    )
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn decimal_quantity_is_multiplier(value: &str) -> bool {
-    value.starts_with('x') || value.ends_with('x')
+    (value.starts_with('x') || value.ends_with('x')) && decimal_quantity_word(value)
 }
 
-fn line_bounds(source: &str, offset: usize) -> (usize, usize) {
+fn item_bounds(source: &str, offset: usize) -> (usize, usize) {
     let start = source[..offset]
-        .rfind(['\r', '\n'])
+        .rfind([',', ';', '\r', '\n'])
         .map_or(0, |index| index + 1);
     let end = source[offset..]
-        .find(['\r', '\n'])
+        .find([',', ';', '\r', '\n'])
         .map_or(source.len(), |index| offset + index);
     (start, end)
 }
@@ -1426,7 +1302,7 @@ fn validate_current_avionics_identity_evidence_occurrence(
                 evidence,
                 &observation.model,
                 &observation.avionics_types,
-                observation.quantity == 2,
+                true,
             ) || exact_controller_waas_capability_annotation(
                 evidence,
                 &observation.manufacturer,
@@ -1530,8 +1406,8 @@ fn extraction_occurrence_has_exact_identity(
 /// remains an identity only when its sole normalized occurrence is followed
 /// immediately by an exact slash-delimited set of the same curated
 /// capabilities declared for that occurrence. The suffix must end there,
-/// apart from Controller's exact `(Dual)` annotation on a quantity-two
-/// occurrence.
+/// apart from Controller's exact `(Dual)` ambiguity annotation. This grammar
+/// proves identity only; it never establishes a physical count.
 pub(crate) fn exact_controller_run_on_capability_annotation(
     evidence: &str,
     model: &str,
@@ -2260,52 +2136,43 @@ mod tests {
     }
 
     #[test]
-    fn repeated_controller_identities_require_explicit_quantity_and_complete_evidence() {
+    fn controller_quantity_ambiguity_never_authorizes_high_confidence() {
         for (manufacturer, model, field) in [
-            ("Garmin", "GDU-1040", "GDU-1040 MFD\nGDU-1040 PFD"),
+            ("Garmin", "G1000", "Garmin G1000 PFD\nGarmin G1000 MFD"),
             (
                 "Garmin",
-                "GDU 1044B",
-                "GDU-1044B Primary Flight Display (PFD)\nGDU-1044B Multi-Function Display (MFD)",
+                "G5",
+                "Garmin G5 was installed previously. Later the Garmin G5 was serviced.",
             ),
-            (
-                "Garmin",
-                "GI275",
-                "Garmin GI275 Primary Electronic Attitude Indicator\nGarmin GI275 Primary Electronic HSI",
-            ),
-            (
-                "King",
-                "KX-170B",
-                "King KX-170B Nav-Com w/ VOR, Localizer & Glideslope\nKing KX-170B Nav-Com #2 w/ VOR & Localizer",
-            ),
+            ("Garmin", "G5", "Garmin G5 PFD\nDynon G5 backup"),
+            ("Garmin", "G5", "Dual Garmin G5"),
+            ("Garmin", "G5", "Not Dual Garmin G5"),
+            ("Garmin", "G5", "Optional Dual Garmin G5"),
+            ("Garmin", "G5", "Garmin G5 dual screen"),
+            ("Garmin", "G5", "Garmin G5 #3"),
+            ("Garmin", "G5", "Garmin G5 2 units"),
+            ("Garmin", "GIA63W", "GIA63WNAV/COM/GPS(Dual)"),
             (
                 "Garmin",
                 "G5",
                 "Garmin G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5 attitude",
             ),
         ] {
-            let first_mention = field.lines().next().unwrap();
-            let mut payload = installed(manufacturer, model, first_mention);
+            let mut payload = installed(manufacturer, model, field);
             let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-            let error = validate_current_avionics_quantity_completeness(
+            let result = validate_current_avionics_quantity_completeness(
                 &observations,
                 CONTROLLER_URL,
                 &controller_html(field),
-            )
-            .unwrap_err();
-            assert!(error.contains("quantity does not unambiguously represent"), "{error}");
+            );
+            assert!(result.is_err(), "{field:?} was admitted as high confidence");
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("ambiguous Controller quantity evidence"),
+                "{field:?}: {error}"
+            );
 
-            payload["avionics"][0]["quantity"] = serde_json::json!(2);
-            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-            let error = validate_current_avionics_quantity_completeness(
-                &observations,
-                CONTROLLER_URL,
-                &controller_html(field),
-            )
-            .unwrap_err();
-            assert!(error.contains("does not cover every exact Controller quantity signal"), "{error}");
-
-            payload["avionics"][0]["source_evidence_text"] = serde_json::json!(field);
+            payload["avionics"][0]["source_confidence"] = serde_json::json!("low");
             let observations = parse_current_avionics_extraction_value(&payload).unwrap();
             validate_current_avionics_quantity_completeness(
                 &observations,
@@ -2317,33 +2184,82 @@ mod tests {
     }
 
     #[test]
-    fn explicit_controller_quantity_markers_must_match_the_emitted_occurrence() {
-        for (field, manufacturer, model) in [
-            ("Dual Garmin GIA-63W", "Garmin", "GIA-63W"),
-            ("2 Garmin G5", "Garmin", "G5"),
-            ("Garmin G5 x2", "Garmin", "G5"),
-            ("Garmin G5 2 units", "Garmin", "G5"),
-            ("Garmin G5 #2", "Garmin", "G5"),
+    fn controller_quantity_ambiguity_requires_complete_exact_evidence() {
+        for (field, evidence) in [
+            ("Garmin G1000 PFD\nGarmin G1000 MFD", "Garmin G1000 PFD"),
+            ("Optional Dual Garmin G5", "Dual Garmin G5"),
+            ("Garmin G5 dual screen", "Garmin G5 dual"),
+            ("Garmin G5 2 units", "Garmin G5 2"),
         ] {
-            let mut payload = installed(manufacturer, model, field);
+            let model = if field.contains("G1000") {
+                "G1000"
+            } else {
+                "G5"
+            };
+            let mut payload = installed("Garmin", model, evidence);
+            payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
             let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-            assert!(validate_current_avionics_quantity_completeness(
+            let result = validate_current_avionics_quantity_completeness(
                 &observations,
                 CONTROLLER_URL,
                 &controller_html(field),
-            )
-            .unwrap_err()
-            .contains("quantity does not unambiguously represent"));
-
-            payload["avionics"][0]["quantity"] = serde_json::json!(2);
-            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-            validate_current_avionics_quantity_completeness(
-                &observations,
-                CONTROLLER_URL,
-                &controller_html(field),
-            )
-            .unwrap();
+            );
+            assert!(
+                result.is_err(),
+                "{field:?} admitted incomplete evidence {evidence:?}"
+            );
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("complete bounded Controller quantity ambiguity"),
+                "{field:?}: {error}"
+            );
         }
+    }
+
+    #[test]
+    fn duplicate_normalized_products_are_rejected_globally_without_source_signals() {
+        let html = "<html><body><p>Garmin G5 installed</p></body></html>";
+        let mut duplicate = installed("Garmin", "G5", "Garmin G5 installed");
+        let second = installed("Gar-min", "G-5", "Garmin G5 installed")["avionics"][0].clone();
+        duplicate["avionics"].as_array_mut().unwrap().push(second);
+        let observations = parse_current_avionics_extraction_value(&duplicate).unwrap();
+        assert!(
+            validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html,)
+                .unwrap_err()
+                .contains("duplicates an earlier normalized manufacturer/model identity")
+        );
+
+        let mut different_manufacturers = installed("Garmin", "G5", "Garmin G5 installed");
+        let dynon = installed("Dynon", "G5", "Dynon G5 installed")["avionics"][0].clone();
+        different_manufacturers["avionics"]
+            .as_array_mut()
+            .unwrap()
+            .push(dynon);
+        let observations =
+            parse_current_avionics_extraction_value(&different_manufacturers).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html).unwrap();
+    }
+
+    #[test]
+    fn unsupported_high_confidence_quantity_is_rejected_without_a_controller_adapter() {
+        let html = "<html><body><p>Garmin G5 installed</p></body></html>";
+        let mut payload = installed("Garmin", "G5", "Garmin G5 installed");
+        payload["avionics"][0]["quantity"] = serde_json::json!(99);
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        assert!(
+            validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html,)
+                .unwrap_err()
+                .contains("quantity greater than one cannot have high source confidence")
+        );
+
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("low");
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html).unwrap();
+
+        payload["avionics"][0]["quantity"] = serde_json::json!(1);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("high");
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html).unwrap();
     }
 
     #[test]
@@ -2352,16 +2268,9 @@ mod tests {
         let html = controller_html(field);
         let mut payload = installed("Garmin", "GIA63W", field);
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
-
-        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-        assert!(validate_current_avionics_quantity_completeness(
-            &observations,
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap_err()
-        .contains("quantity does not unambiguously represent"));
-
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
+            .unwrap();
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
         validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
             .unwrap();
@@ -2378,61 +2287,6 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_controller_quantity_signals_fail_closed() {
-        for field in [
-            "Dual Garmin G5\nGarmin G5\nGarmin G5",
-            "Garmin G5 #2\nGarmin G5 #3",
-        ] {
-            let mut payload = installed("Garmin", "G5", field);
-            payload["avionics"][0]["quantity"] = serde_json::json!(2);
-            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-            assert!(validate_current_avionics_quantity_completeness(
-                &observations,
-                CONTROLLER_URL,
-                &controller_html(field),
-            )
-            .unwrap_err()
-            .contains("conflicting exact Controller quantity signals"));
-        }
-    }
-
-    #[test]
-    fn unmarked_or_non_controller_mentions_do_not_create_quantity_signals() {
-        for (source_url, field, evidence) in [
-            (CONTROLLER_URL, "Garmin G5 attitude", "Garmin G5 attitude"),
-            (
-                CONTROLLER_URL,
-                "Garmin G5 installed; Garmin G5X spare",
-                "Garmin G5 installed",
-            ),
-            (
-                GENERIC_URL,
-                "Garmin G5 attitude; Garmin G5 HSI",
-                "Garmin G5 attitude",
-            ),
-            (
-                CONTROLLER_URL,
-                "Garmin G5 2020 upgrade",
-                "Garmin G5 2020 upgrade",
-            ),
-            (
-                CONTROLLER_URL,
-                "Upgraded 2020 Garmin G5",
-                "Upgraded 2020 Garmin G5",
-            ),
-        ] {
-            let payload = installed("Garmin", "G5", evidence);
-            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-            validate_current_avionics_quantity_completeness(
-                &observations,
-                source_url,
-                &controller_html(field),
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
     fn nonadjacent_repeated_identity_is_rejected_without_mutating_model_output() {
         let field = "Garmin G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5 attitude";
         let html = controller_html(field);
@@ -2440,7 +2294,7 @@ mod tests {
         let original = payload.clone();
 
         assert!(
-            !recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html,).unwrap()
+            !recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap()
         );
         assert_eq!(payload, original);
         assert!(validate_unbound_current_avionics_extraction(
@@ -2450,16 +2304,6 @@ mod tests {
         )
         .is_err());
         assert_eq!(payload, original);
-
-        let duplicate = installed("Gar-min", "G-5", "Garmin G5 HSI")["avionics"][0].clone();
-        payload["avionics"].as_array_mut().unwrap().push(duplicate);
-        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
-        assert!(validate_current_avionics_quantity_completeness(
-            &observations,
-            CONTROLLER_URL,
-            &html,
-        )
-        .is_err());
     }
 
     #[test]
@@ -2641,6 +2485,9 @@ mod tests {
             let mut payload = installed("Garmin", model, source_evidence);
             payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
             payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
+            if quantity > 1 {
+                payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
+            }
             let original = payload.clone();
 
             let observations = validate_unbound_current_avionics_extraction(
@@ -2692,7 +2539,7 @@ Advisory System)";
                     "configuration_action": "installed",
                     "replaces": null,
                     "source_evidence_text": "GIA63WNAV/COM/GPS(Dual)",
-                    "source_confidence": "high"
+                    "source_confidence": "medium"
                 },
                 {
                     "manufacturer": "Garmin",
@@ -2740,7 +2587,6 @@ Advisory System)";
             ("GIA63WNAVX", vec!["NAV"], 1),
             ("GIA63WNAV extra", vec!["NAV"], 1),
             ("GIA63WNAV/COM/GPS", vec!["NAV", "COM"], 1),
-            ("GIA63WNAV(Dual)", vec!["NAV"], 1),
         ] {
             let html = controller_html(source_evidence);
             let mut payload = installed("Garmin", "GIA63W", source_evidence);
@@ -2765,6 +2611,7 @@ Advisory System)";
         let mut payload = installed("Garmin", "GIA63W", source_evidence);
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
         assert!(validate_unbound_current_avionics_extraction(
             &payload.to_string(),
             GENERIC_URL,
@@ -3201,6 +3048,7 @@ Advisory System)";
         let mut payload = installed("Garmin", "GIA-63W", flattened);
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
         payload["aircraft_marker"] = serde_json::json!({
             "serial": "unchanged",
             "nested": [1, 2, 3]
@@ -3243,6 +3091,7 @@ Advisory System)";
         let mut gia = installed("Garmin", "GIA-63W", flattened)["avionics"][0].clone();
         gia["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         gia["quantity"] = serde_json::json!(2);
+        gia["source_confidence"] = serde_json::json!("medium");
         payload["avionics"].as_array_mut().unwrap().push(gia);
         payload["aircraft_marker"] = serde_json::json!({
             "serial": "unchanged",
@@ -3254,7 +3103,7 @@ Advisory System)";
             .unwrap_err();
 
         assert!(
-            error.contains("quantity does not unambiguously represent"),
+            error.contains("ambiguous Controller quantity evidence"),
             "{error}"
         );
         assert_eq!(payload, original);

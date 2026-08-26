@@ -17982,6 +17982,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 observations
                     .iter()
                     .map(|(model, capability, quantity, evidence)| {
+                        let source_confidence = if *quantity > 1 { "medium" } else { "high" };
                         serde_json::json!({
                             "manufacturer": "Garmin",
                             "model": model,
@@ -17990,7 +17991,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                             "configuration_action": "installed",
                             "replaces": null,
                             "source_evidence_text": evidence,
-                            "source_confidence": "high"
+                            "source_confidence": source_confidence
                         })
                     })
                     .collect(),
