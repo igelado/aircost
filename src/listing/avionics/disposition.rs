@@ -237,7 +237,8 @@ pub(crate) async fn record_automatic_occurrence_dispositions(
         rendered_html: &capture.rendered_html,
         rendered_html_sha256: &capture.rendered_html_sha256,
         extracted_listing_json,
-    })?;
+    })
+    .map_err(|error| error.to_string())?;
     if capture
         .pending_submission_id
         .is_some_and(|id| id != submission_id)
@@ -396,7 +397,8 @@ pub(crate) async fn reconcile_current_occurrence_dispositions(
         rendered_html: &capture.rendered_html,
         rendered_html_sha256: &capture.rendered_html_sha256,
         extracted_listing_json,
-    })?;
+    })
+    .map_err(|error| error.to_string())?;
     if capture
         .pending_submission_id
         .is_some_and(|id| id != submission_id)

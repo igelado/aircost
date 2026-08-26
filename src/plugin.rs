@@ -22,7 +22,10 @@ use crate::extract::{
 use crate::html::listing::source::{
     listing_evidence_units, listing_extraction_source, ListingEvidenceUnits,
 };
-use crate::listing::avionics::correction::validate_or_correct_listing_avionics;
+pub use crate::listing::avionics::correction::ListingAvionicsDeterministicFailure;
+use crate::listing::avionics::correction::{
+    validate_or_correct_listing_avionics, ListingAvionicsValidationError,
+};
 use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
 };
@@ -100,6 +103,7 @@ macro_rules! query_as_optional {
 #[derive(Debug)]
 pub enum PluginStoreError {
     Validation(String),
+    DeterministicValidation(ListingAvionicsDeterministicFailure),
     Permission(String),
     NotFound(String),
     AircraftAdmission(AircraftAdmissionError),
@@ -114,6 +118,7 @@ impl fmt::Display for PluginStoreError {
             | PluginStoreError::Permission(message)
             | PluginStoreError::NotFound(message)
             | PluginStoreError::Database(message) => write!(formatter, "{message}"),
+            PluginStoreError::DeterministicValidation(error) => write!(formatter, "{error}"),
             PluginStoreError::AdmissionBlocked(reason) => {
                 write!(formatter, "replay admission is blocked: {}", reason.code())
             }
@@ -1481,7 +1486,14 @@ async fn extract_capture_to_current_checkpoint(
         &mut payload,
     )
     .await
-    .map_err(PluginStoreError::Validation)?;
+    .map_err(|error| match error {
+        ListingAvionicsValidationError::Deterministic(error) => {
+            PluginStoreError::DeterministicValidation(error)
+        }
+        ListingAvionicsValidationError::CorrectionOperation(message) => {
+            PluginStoreError::Validation(message)
+        }
+    })?;
     preview.parsed_listing.avionics = validated_occurrences;
     Ok((preview, payload))
 }
@@ -1511,7 +1523,7 @@ pub async fn checkpoint_plugin_submission_extraction(
         &stored.source_url,
         &stored.rendered_html,
     )
-    .map_err(PluginStoreError::Validation)?;
+    .map_err(|error| PluginStoreError::Validation(error.to_string()))?;
     let payload_sha256 = sha256_hex(payload_json.as_bytes());
     store_plugin_extraction_checkpoint(db, &stored, &payload_json).await?;
     Ok(PluginExtractionCheckpoint {
@@ -1701,7 +1713,7 @@ pub async fn inspect_plugin_submission_extraction(
         &stored.source_url,
         &stored.rendered_html,
     )
-    .map_err(PluginStoreError::Validation)?;
+    .map_err(|error| PluginStoreError::Validation(error.to_string()))?;
     Ok(PluginExtractionCheckpoint {
         submission_id,
         rendered_html_sha256: stored.rendered_html_sha256.clone(),
@@ -1739,7 +1751,7 @@ pub async fn preflight_plugin_submission_extraction(
                 &stored.source_url,
                 &stored.rendered_html,
             )
-            .map_err(PluginStoreError::Validation)?;
+            .map_err(|error| PluginStoreError::Validation(error.to_string()))?;
             parse_current_checkpoint_payload(extracted)?;
             Some(PluginExtractionCheckpoint {
                 submission_id,
@@ -1973,7 +1985,7 @@ pub async fn inspect_plugin_replay_capture_state(
                 &stored.source_url,
                 &stored.rendered_html,
             )
-            .map_err(PluginStoreError::Validation)?;
+            .map_err(|error| PluginStoreError::Validation(error.to_string()))?;
             Ok::<_, PluginStoreError>(PluginExtractionCheckpoint {
                 submission_id,
                 rendered_html_sha256: stored.rendered_html_sha256.clone(),
@@ -2028,7 +2040,7 @@ async fn validate_bound_signed_checkpoint(
         &stored.source_url,
         &stored.rendered_html,
     )
-    .map_err(PluginStoreError::Validation)?;
+    .map_err(|error| PluginStoreError::Validation(error.to_string()))?;
     Ok((listing_id, sha256_hex(extracted.as_bytes())))
 }
 
@@ -2204,7 +2216,7 @@ pub async fn materialize_plugin_submission_checkpoint(
         &stored.source_url,
         &stored.rendered_html,
     )
-    .map_err(PluginStoreError::Validation)?;
+    .map_err(|error| PluginStoreError::Validation(error.to_string()))?;
     let (parsed_listing, identity_recovery) =
         parse_current_checkpoint_payload(extracted_listing_json)?;
     let preview = ListingPreview {
@@ -3643,9 +3655,21 @@ mod tests {
                 .await
                 .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("failed after its single correction request"));
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("primary_avionics_validation:source_evidence_not_visible"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("corrected_avionics_validation:source_evidence_not_visible"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("avionics[0].source_evidence_text"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("GARMIN G1000 NXI"));
+        assert!(!diagnostic.contains("GFC700"));
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(extractor.listing_visual_recovery_call_count(), 1);
     }

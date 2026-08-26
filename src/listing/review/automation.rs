@@ -395,7 +395,7 @@ fn validate_retained_current_extraction(
         rendered_html_sha256: &guard.rendered_html_sha256,
         extracted_listing_json,
     })
-    .map_err(ReviewError::Stale)?;
+    .map_err(|error| ReviewError::Stale(error.to_string()))?;
     if occurrences.is_empty() {
         return Err(ReviewError::Stale(
             "retained capture has no avionics observations".to_string(),

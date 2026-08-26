@@ -2467,6 +2467,9 @@ impl From<PluginStoreError> for ApiError {
             PluginStoreError::Validation(message) => {
                 ApiError::new(StatusCode::BAD_REQUEST, message)
             }
+            PluginStoreError::DeterministicValidation(error) => {
+                ApiError::new(StatusCode::BAD_REQUEST, error.to_string())
+            }
             PluginStoreError::Permission(message) => ApiError::new(StatusCode::FORBIDDEN, message),
             PluginStoreError::NotFound(message) => ApiError::new(StatusCode::NOT_FOUND, message),
             PluginStoreError::AircraftAdmission(error) => {
