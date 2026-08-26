@@ -3466,6 +3466,13 @@ mod tests {
             "number"
         );
         assert_eq!(response_schema["properties"]["avionics"]["type"], "array");
+        assert!(
+            response_schema["properties"]["avionics"]["items"]["properties"]["model"]
+                ["description"]
+                .as_str()
+                .expect("listing avionics model schema description")
+                .contains("Literal model spelling")
+        );
         assert!(response_schema["required"]
             .as_array()
             .unwrap()
@@ -3542,6 +3549,16 @@ mod tests {
         assert!(correction_prompt.contains("GARMIN G1000 NXI SVT Yes"));
         assert!(correction_prompt.contains("structurally visible source unit"));
         assert!(correction_prompt.contains("Every additional type on that suite row"));
+        assert!(correction_prompt
+            .contains("literal listing observation, not a canonical catalog identity"));
+        let correction_schema = &requests[1]["generationConfig"]["responseSchema"];
+        assert!(
+            correction_schema["properties"]["avionics"]["items"]["properties"]["model"]
+                ["description"]
+                .as_str()
+                .expect("correction avionics model schema description")
+                .contains("without familiar-name expansion")
+        );
         assert!(!correction_prompt.contains("\"asking_price_usd\": 400000"));
         assert!(!correction_prompt.contains("\"serial_number\""));
         drop(requests);

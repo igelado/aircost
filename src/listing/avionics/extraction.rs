@@ -1348,23 +1348,29 @@ fn validate_current_avionics_identity_evidence_occurrence(
         Some(exact_visible_evidence_locator),
     );
     let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
-    let controller_run_on_identity = controller_field.is_some_and(|field| {
+    let controller_annotation_identity = controller_field.is_some_and(|field| {
         controller_field_has_exact_evidence_line(field, evidence)
-            && exact_controller_run_on_capability_annotation(
+            && (exact_controller_run_on_capability_annotation(
                 evidence,
                 &observation.model,
                 &observation.avionics_types,
                 observation.quantity == 2,
-            )
+            ) || exact_controller_waas_capability_annotation(
+                evidence,
+                &observation.manufacturer,
+                &observation.model,
+                &observation.avionics_types,
+                Some(observation.quantity),
+            ))
     });
-    if (!bounded_source.contains(evidence) && !controller_run_on_identity)
+    if (!bounded_source.contains(evidence) && !controller_annotation_identity)
         || !(extraction_occurrence_has_exact_identity(
             &evidence_context,
             &observation.manufacturer,
             &observation.model,
             &observation.avionics_types,
             evidence,
-        ) || controller_run_on_identity)
+        ) || controller_annotation_identity)
     {
         return Err(AvionicsValidationFailure::occurrence(
             AvionicsValidationRule::CandidateIdentityNotInEvidence,
@@ -1373,14 +1379,20 @@ fn validate_current_avionics_identity_evidence_occurrence(
         ));
     }
     if let Some(replacement) = observation.replaces.as_ref() {
-        let replacement_run_on_identity = controller_field.is_some_and(|field| {
+        let replacement_annotation_identity = controller_field.is_some_and(|field| {
             controller_field_has_exact_evidence_line(field, evidence)
-                && exact_controller_run_on_capability_annotation(
+                && (exact_controller_run_on_capability_annotation(
                     evidence,
                     &replacement.model,
                     &replacement.avionics_types,
                     false,
-                )
+                ) || exact_controller_waas_capability_annotation(
+                    evidence,
+                    &replacement.manufacturer,
+                    &replacement.model,
+                    &replacement.avionics_types,
+                    None,
+                ))
         });
         if !(extraction_occurrence_has_exact_identity(
             &evidence_context,
@@ -1388,7 +1400,7 @@ fn validate_current_avionics_identity_evidence_occurrence(
             &replacement.model,
             &replacement.avionics_types,
             evidence,
-        ) || replacement_run_on_identity)
+        ) || replacement_annotation_identity)
         {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::ReplacementIdentityNotInEvidence,
@@ -1532,6 +1544,182 @@ pub(crate) fn exact_controller_run_on_capability_annotation(
             return false;
         }
     }
+}
+
+/// Recognize two exact Controller publisher spellings where `WAAS` annotates
+/// an attached-`W` product identity instead of extending it.
+///
+/// This remains an extraction-only exception. Callers must separately prove
+/// that `evidence` is one complete line from Controller's admitted
+/// `Avionics/Radios` field. The ordinary catalog identity matcher deliberately
+/// continues to reject both qualified source spellings.
+fn exact_controller_waas_capability_annotation(
+    evidence: &str,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+    quantity: Option<i64>,
+) -> bool {
+    if !model_has_attached_w_designator(model) {
+        return false;
+    }
+
+    let evidence = evidence.trim();
+    exact_controller_slash_waas_annotation(evidence, manufacturer, model, avionics_types, quantity)
+        || exact_controller_dual_plural_waas_annotation(
+            evidence,
+            manufacturer,
+            model,
+            avionics_types,
+            quantity,
+        )
+}
+
+fn exact_controller_slash_waas_annotation(
+    evidence: &str,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+    quantity: Option<i64>,
+) -> bool {
+    if !matches!(quantity, None | Some(1)) {
+        return false;
+    }
+    let Some(identity_end) = exact_normalized_identity_prefix_end(evidence, manufacturer, model)
+    else {
+        return false;
+    };
+    let Some(capabilities) = strip_ascii_case_prefix(&evidence[identity_end..], "/WAAS")
+        .and_then(strip_required_whitespace_prefix)
+    else {
+        return false;
+    };
+    exact_declared_slash_capabilities(capabilities, avionics_types, false)
+}
+
+fn exact_controller_dual_plural_waas_annotation(
+    evidence: &str,
+    manufacturer: &str,
+    model: &str,
+    avionics_types: &[String],
+    quantity: Option<i64>,
+) -> bool {
+    if quantity != Some(2) {
+        return false;
+    }
+    let Some(after_dual) =
+        strip_ascii_case_prefix(evidence, "Dual").and_then(strip_required_whitespace_prefix)
+    else {
+        return false;
+    };
+    let Some(identity_end) = exact_normalized_identity_prefix_end(after_dual, manufacturer, model)
+    else {
+        return false;
+    };
+    let Some(after_identity) = strip_required_whitespace_prefix(&after_dual[identity_end..]) else {
+        return false;
+    };
+    let Some(capabilities) =
+        strip_ascii_case_prefix(after_identity, "WAAS").and_then(strip_required_whitespace_prefix)
+    else {
+        return false;
+    };
+    exact_declared_slash_capabilities(capabilities, avionics_types, true)
+}
+
+fn exact_normalized_identity_prefix_end(
+    source: &str,
+    manufacturer: &str,
+    model: &str,
+) -> Option<usize> {
+    let expected = normalize_evidence_typography(&format!("{manufacturer} {model}"));
+    if expected.is_empty()
+        || source
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+
+    let mut observed = String::new();
+    for (offset, character) in source.char_indices() {
+        if !character.is_ascii_alphanumeric() {
+            continue;
+        }
+        observed.push(character.to_ascii_lowercase());
+        if observed.len() == expected.len() {
+            return (observed == expected).then_some(offset + character.len_utf8());
+        }
+        if !expected.starts_with(&observed) {
+            return None;
+        }
+    }
+    None
+}
+
+fn strip_ascii_case_prefix<'a>(source: &'a str, prefix: &str) -> Option<&'a str> {
+    source
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .and_then(|_| source.get(prefix.len()..))
+}
+
+fn strip_required_whitespace_prefix(source: &str) -> Option<&str> {
+    let trimmed = source.trim_start_matches(char::is_whitespace);
+    (trimmed.len() < source.len()).then_some(trimmed)
+}
+
+fn exact_declared_slash_capabilities(
+    source: &str,
+    avionics_types: &[String],
+    require_plural_final_capability: bool,
+) -> bool {
+    if avionics_types.len() < 2
+        || avionics_types
+            .iter()
+            .any(|capability| !CURATED_AVIONICS_TYPES.contains(&capability.as_str()))
+    {
+        return false;
+    }
+    let declared = avionics_types
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if declared.len() != avionics_types.len() {
+        return false;
+    }
+
+    let capabilities = source.split('/').map(str::trim).collect::<Vec<_>>();
+    if capabilities.len() != avionics_types.len()
+        || capabilities.iter().any(|capability| capability.is_empty())
+    {
+        return false;
+    }
+
+    let mut observed = BTreeSet::new();
+    for (index, source_capability) in capabilities.iter().enumerate() {
+        let final_capability = index + 1 == capabilities.len();
+        let source_capability = if require_plural_final_capability && final_capability {
+            let Some(singular) = source_capability.strip_suffix(['s', 'S']) else {
+                return false;
+            };
+            singular
+        } else {
+            source_capability
+        };
+        let Some(declared_capability) = declared
+            .iter()
+            .copied()
+            .find(|declared| source_capability.eq_ignore_ascii_case(declared))
+        else {
+            return false;
+        };
+        if !observed.insert(declared_capability) {
+            return false;
+        }
+    }
+    observed == declared
 }
 
 fn controller_field_has_exact_evidence_line(controller_field: &str, evidence: &str) -> bool {
@@ -2606,6 +2794,180 @@ Advisory System)";
         )
         .unwrap_err()
         .contains("exact replacement identity"));
+    }
+
+    #[test]
+    fn controller_accepts_attached_w_slash_waas_with_exact_capabilities() {
+        let evidence = "GARMIN GNS-430W/WAAS GPS/NAV/COM";
+        let html = controller_html(evidence);
+        let mut payload = installed("Garmin", "GNS-430W", evidence);
+        payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
+
+        let parsed = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap();
+
+        assert_eq!(parsed[0].model, "GNS-430W");
+        assert_eq!(parsed[0].avionics_types, ["GPS", "NAV", "COM"]);
+        let context = ListingEvidenceContext::from_cleaned_text(evidence);
+        assert_eq!(
+            context.unique_exact_product_slice("Garmin", "GNS-430W"),
+            None,
+            "the extraction exception must not weaken local catalog reuse"
+        );
+        assert_eq!(context.unique_exact_model_slice("GNS-430W"), None);
+
+        let generic_html = format!("<html><body><p>{evidence}</p></body></html>");
+        assert!(validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            GENERIC_URL,
+            &generic_html,
+        )
+        .unwrap_err()
+        .contains("candidate identity"));
+    }
+
+    #[test]
+    fn controller_slash_waas_grammar_rejects_inexact_identity_and_capabilities() {
+        for (model, evidence, avionics_types, quantity) in [
+            (
+                "GNS-430W",
+                "GARMIN GNS-430W/WAAS GPS/NAV/COM",
+                vec!["GPS", "NAV"],
+                1,
+            ),
+            (
+                "GNS-430W",
+                "GARMIN GNS-430W/WAAS GPS/NAV/COMs",
+                vec!["GPS", "NAV", "COM"],
+                1,
+            ),
+            (
+                "GNS-430",
+                "GARMIN GNS-430W/WAAS GPS/NAV/COM",
+                vec!["GPS", "NAV", "COM"],
+                1,
+            ),
+            (
+                "GNS-430W",
+                "GARMIN GNS-430W/WAAS GPS/NAV/COM",
+                vec!["GPS", "NAV", "COM"],
+                2,
+            ),
+            (
+                "GNS-430W",
+                "GARMIN GNS-430W/WAAS GPS NAV COM",
+                vec!["GPS", "NAV", "COM"],
+                1,
+            ),
+        ] {
+            let html = controller_html(evidence);
+            let mut payload = installed("Garmin", model, evidence);
+            payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
+            payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
+
+            let error = validate_unbound_current_avionics_extraction(
+                &payload.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("candidate identity"),
+                "{evidence:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_accepts_dual_waas_capabilities_with_one_final_plural() {
+        let evidence = "Dual Garmin GIA-63W WAAS GPS/NAV/COMs";
+        let html = controller_html(evidence);
+        let mut payload = installed("Garmin", "GIA-63W", evidence);
+        payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+
+        let parsed = validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap();
+
+        assert_eq!(parsed[0].model, "GIA-63W");
+        assert_eq!(parsed[0].quantity, 2);
+        assert_eq!(parsed[0].avionics_types, ["GPS", "NAV", "COM"]);
+        let context = ListingEvidenceContext::from_cleaned_text(evidence);
+        assert_eq!(
+            context.unique_exact_product_slice("Garmin", "GIA-63W"),
+            None,
+            "the extraction exception must not weaken local catalog reuse"
+        );
+        assert_eq!(context.unique_exact_model_slice("GIA-63W"), None);
+
+        let generic_html = format!("<html><body><p>{evidence}</p></body></html>");
+        assert!(validate_unbound_current_avionics_extraction(
+            &payload.to_string(),
+            GENERIC_URL,
+            &generic_html,
+        )
+        .unwrap_err()
+        .contains("candidate identity"));
+    }
+
+    #[test]
+    fn controller_dual_plural_waas_grammar_rejects_near_matches() {
+        for (evidence, avionics_types, quantity) in [
+            (
+                "Dual Garmin GIA-63W WAAS GPS/NAV/COMs",
+                vec!["GPS", "NAV", "COM"],
+                1,
+            ),
+            (
+                "Triple Garmin GIA-63W WAAS GPS/NAV/COMs",
+                vec!["GPS", "NAV", "COM"],
+                2,
+            ),
+            (
+                "Dual Garmin GIA-63W WAAS GPSs/NAV/COMs",
+                vec!["GPS", "NAV", "COM"],
+                2,
+            ),
+            (
+                "Dual Garmin GIA-63W WAAS GPS/NAV/COMss",
+                vec!["GPS", "NAV", "COM"],
+                2,
+            ),
+            (
+                "Dual Garmin GIA-63W WAAS GPS/NAV/COMs",
+                vec!["GPS", "NAV"],
+                2,
+            ),
+            (
+                "Dual Garmin GIA-63W WAAS GPS/NAV/COM",
+                vec!["GPS", "NAV", "COM"],
+                2,
+            ),
+        ] {
+            let html = controller_html(evidence);
+            let mut payload = installed("Garmin", "GIA-63W", evidence);
+            payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
+            payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
+
+            let error = validate_unbound_current_avionics_extraction(
+                &payload.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("candidate identity"),
+                "{evidence:?}: {error}"
+            );
+        }
     }
 
     #[test]

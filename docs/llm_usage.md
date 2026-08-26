@@ -117,6 +117,17 @@ domain and evidence rules but does not repeat a prose rendering of that same
 JSON shape. Tests at both the prompt builder and request boundary require the
 schema to remain attached.
 
+Listing extraction records avionics manufacturer and model labels as literal
+source observations, not canonical catalog identities. A source-authored
+shared prefix may apply within one selected evidence span, but extraction does
+not reconstruct an omitted familiar series prefix, expand an OEM name, or
+normalize compact model typography from product knowledge. For example, the
+right-hand shorthand in `Garmin GTN 750 & 650` remains model `650`, and source
+labels such as `G3X Touchscreen`, `Garmin 255`, `JPI 830`, and `GFC500` remain
+literal. Later catalog curation resolves aliases, canonical OEMs, and expanded
+product identities. An occurrence without a useful source-supported literal
+identity is omitted rather than repaired from model familiarity.
+
 Occurrence evidence must be contained within one unit admitted by the same
 publisher source adapter that constructs extraction-model input. For Controller
 that means one exact specification value; labels, sibling values, price/page
@@ -153,6 +164,14 @@ product key inside the effective manufacturer identity and the complete product
 graph has a current reuse attestation. Duplicate identities, variants,
 unattested products, type mismatches, and non-Controller occurrences still use
 the normal fail-closed or paid path.
+Two additional Controller-only source grammars treat `WAAS` as an extraction
+annotation for a model that already ends in an attached `W`: an exact
+`model/WAAS CAPABILITY/CAPABILITY` line for one unit, and an exact
+`Dual manufacturer model WAAS CAPABILITY/CAPABILITYs` line for quantity two.
+The latter permits one plural `s` only on the final capability. Both require the
+complete slash-delimited capability set to equal the occurrence's declared
+atomic types. Near matches, other quantities, trailing text, generic sources,
+and local catalog reuse remain ineligible.
 An `Integrated Flight Deck` identity may establish that core category without
 repeating it in prose; every additional category assigned to the suite must be
 explicit in the same occurrence evidence, and a separately extracted

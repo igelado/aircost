@@ -238,8 +238,12 @@ impl ListingEvidenceContext {
             return Vec::new();
         }
 
-        let raw_hint_anchor =
-            raw_evidence_hint.and_then(|hint| self.exact_anchors(hint).into_iter().next());
+        let raw_hint_anchor = raw_evidence_hint.and_then(|hint| {
+            self.exact_source_anchors(hint)
+                .into_iter()
+                .next()
+                .or_else(|| self.exact_anchors(hint).into_iter().next())
+        });
         let Some(model_anchor) = self.model_anchor(manufacturer, model, raw_hint_anchor) else {
             return Vec::new();
         };
@@ -317,6 +321,20 @@ impl ListingEvidenceContext {
         }
         self.lowercase
             .match_indices(&value)
+            .filter_map(|(offset, _)| {
+                identity_span_has_boundaries(&self.cleaned, offset, offset + value.len())
+                    .then_some(offset)
+            })
+            .collect()
+    }
+
+    fn exact_source_anchors(&self, value: &str) -> Vec<usize> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Vec::new();
+        }
+        self.cleaned
+            .match_indices(value)
             .filter_map(|(offset, _)| {
                 identity_span_has_boundaries(&self.cleaned, offset, offset + value.len())
                     .then_some(offset)
@@ -650,6 +668,34 @@ mod tests {
 
         assert_eq!(context, source);
         assert!(!context.contains("IGNORE ALL RULES"));
+    }
+
+    #[test]
+    fn raw_evidence_prefers_the_exact_source_spelling_over_an_earlier_case_folded_match() {
+        let source = format!(
+            "Garmin GFC500 autopilot.{}\nGarmin GFC500 Autopilot{}",
+            " unrelated narrative".repeat(400),
+            " trailing details".repeat(400),
+        );
+        let context = ListingEvidenceContext::from_cleaned_text(source).for_candidate(
+            "Garmin",
+            "GFC500",
+            Some("Garmin GFC500 Autopilot"),
+        );
+
+        assert!(context.contains("Garmin GFC500 Autopilot"));
+    }
+
+    #[test]
+    fn raw_evidence_keeps_case_folded_locator_fallback_when_no_exact_spelling_exists() {
+        let source = format!("Garmin GFC500 autopilot{}", " trailing details".repeat(400),);
+        let context = ListingEvidenceContext::from_cleaned_text(source).for_candidate(
+            "Garmin",
+            "GFC500",
+            Some("Garmin GFC500 Autopilot"),
+        );
+
+        assert!(context.contains("Garmin GFC500 autopilot"));
     }
 
     #[test]
