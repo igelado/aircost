@@ -570,8 +570,10 @@ The extractor returns:
 - model year
 - asking price and currency
 - airframe hours and, only when explicitly stated, nullable engine and
-  propeller hours with their source labels (`SNEW`, `SMOH`, `SFOH`, or `SPOH`),
-  evidence text, and confidence
+  propeller hours with their source labels (engine: `SNEW`, `SMOH`, `SFOH`, or
+  `SFRM`; propeller: `SNEW`, `SMOH`, `SFOH`, or `SPOH`), evidence text, and
+  confidence. `STOH`/`TSTOH` is top-overhaul-only time and is omitted rather
+  than reinterpreted as an engine time basis
 - explicitly identified installed engine and propeller models with source
   evidence; listing equipment never changes the factory variant spec
 - registration and serial number when present

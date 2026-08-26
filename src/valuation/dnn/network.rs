@@ -6,13 +6,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::valuation::ValuationError;
 
-use super::features::{EncodedInput, RESIDUAL_NUMERIC_FEATURES};
+use super::features::{EncodedInput, COMPONENT_TIME_BASIS_COUNT, RESIDUAL_NUMERIC_FEATURES};
 use super::DnnCapacity;
 
 pub const MAX_DNN_PARAMETERS: usize = 10_000;
 const CONTEXT_DIMENSIONS: [usize; 4] = [3, 3, 4, 4];
 const PROJECTED_CONTEXT_DIMENSION: usize = 8;
 const EQUIPMENT_EMBEDDING_DIMENSION: usize = 4;
+const COMPONENT_TYPE_COUNT: usize = 2;
+const COMPONENT_FEATURE_WIDTH: usize = COMPONENT_TYPE_COUNT * COMPONENT_TIME_BASIS_COUNT;
+const COMPONENT_BASIS_DIRECTIONS: [f32; COMPONENT_TIME_BASIS_COUNT] = [
+    0.0,  // Unknown.
+    -1.0, // Since new.
+    -1.0, // Since overhaul.
+    -1.0, // Since factory remanufacture.
+    -1.0, // Since inspection.
+    1.0,  // Time remaining.
+];
 const AGE_CATEGORY_DELTA_BOUND: f64 = 0.25;
 pub const HOURS_EFFECT_BOUND: f64 = 0.35;
 pub const COMPONENT_EFFECT_BOUND: f64 = 0.25;
@@ -60,7 +70,7 @@ impl DnnArchitectureConfig {
             count += self.equipment_bucket_count * EQUIPMENT_EMBEDDING_DIMENSION;
         }
         if self.component_branch_enabled {
-            count += 10;
+            count += COMPONENT_FEATURE_WIDTH;
         }
         count
     }
@@ -205,9 +215,15 @@ impl<B: Backend> TinyValuationNet<B> {
             equipment_embedding: config.equipment_branch_enabled.then(|| {
                 zero_embedding(config.equipment_bucket_count, EQUIPMENT_EMBEDDING_DIMENSION)
             }),
-            component_raw_weights: config
-                .component_branch_enabled
-                .then(|| Param::from_data(TensorData::full([2, 5], -20.0_f32), device)),
+            component_raw_weights: config.component_branch_enabled.then(|| {
+                Param::from_data(
+                    TensorData::full(
+                        [COMPONENT_TYPE_COUNT, COMPONENT_TIME_BASIS_COUNT],
+                        -20.0_f32,
+                    ),
+                    device,
+                )
+            }),
             residual_hidden_1: contextual.then(|| small_linear(residual_input, 24)),
             residual_hidden_2: contextual.then(|| small_linear(24, 12)),
             residual_output: contextual.then(|| zero_linear(12, 1)),
@@ -250,13 +266,13 @@ impl<B: Backend> TinyValuationNet<B> {
             Some(raw_weights) => {
                 let direction = Tensor::<B, 2>::from_data(
                     TensorData::new(
-                        vec![0.0_f32, -1.0, -1.0, -1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 1.0],
-                        [2, 5],
+                        COMPONENT_BASIS_DIRECTIONS.repeat(COMPONENT_TYPE_COUNT),
+                        [COMPONENT_TYPE_COUNT, COMPONENT_TIME_BASIS_COUNT],
                     ),
                     &batch.component_features.device(),
                 );
                 let weights = softplus(raw_weights.val(), 1.0) * direction;
-                (batch.component_features.clone() * weights.reshape([1, 10]))
+                (batch.component_features.clone() * weights.reshape([1, COMPONENT_FEATURE_WIDTH]))
                     .sum_dim(1)
                     .clamp(-COMPONENT_EFFECT_BOUND, COMPONENT_EFFECT_BOUND)
             }
@@ -428,7 +444,7 @@ impl<B: Backend> EncodedBatch<B> {
         let floats = |values: Vec<f32>, width: usize| {
             Tensor::<B, 2>::from_data(TensorData::new(values, [batch, width]), device)
         };
-        let mut component_features = vec![0.0_f32; batch * 10];
+        let mut component_features = vec![0.0_f32; batch * COMPONENT_FEATURE_WIDTH];
         for (row_index, input) in inputs.iter().enumerate() {
             for (type_index, components) in [
                 input.engine_components.as_slice(),
@@ -443,9 +459,10 @@ impl<B: Backend> EncodedBatch<B> {
                     .sum::<f32>()
                     .max(1.0);
                 for component in components {
-                    if component.basis_index < 5 {
-                        component_features
-                            [row_index * 10 + type_index * 5 + component.basis_index] +=
+                    if component.basis_index < COMPONENT_TIME_BASIS_COUNT {
+                        component_features[row_index * COMPONENT_FEATURE_WIDTH
+                            + type_index * COMPONENT_TIME_BASIS_COUNT
+                            + component.basis_index] +=
                             component.log_hours * component.count / total_count;
                     }
                 }
@@ -485,7 +502,7 @@ impl<B: Backend> EncodedBatch<B> {
                     .collect(),
                 RESIDUAL_NUMERIC_FEATURES,
             ),
-            component_features: floats(component_features, 10),
+            component_features: floats(component_features, COMPONENT_FEATURE_WIDTH),
             equipment_indices: Tensor::<B, 2, Int>::from_data(
                 TensorData::new(
                     inputs
@@ -516,7 +533,7 @@ mod tests {
     use burn::backend::Flex;
     use burn::module::Module;
 
-    use super::super::features::EncodedComponent;
+    use super::super::features::{EncodedComponent, COMPONENT_TIME_BASIS_VOCABULARY};
     use super::*;
     use crate::valuation::ComponentTimeBasis;
 
@@ -554,6 +571,14 @@ mod tests {
             )
             .unwrap();
             assert_eq!(config.parameter_count(), model.num_params());
+            if config.component_branch_enabled {
+                let mut without_components = config.clone();
+                without_components.component_branch_enabled = false;
+                assert_eq!(
+                    config.parameter_count() - without_components.parameter_count(),
+                    COMPONENT_FEATURE_WIDTH
+                );
+            }
         }
     }
 
@@ -613,10 +638,14 @@ mod tests {
             &device,
         )
         .unwrap();
+        let since_overhaul_index = COMPONENT_TIME_BASIS_VOCABULARY
+            .iter()
+            .position(|basis| *basis == ComponentTimeBasis::SinceOverhaul)
+            .unwrap();
         let component = |hours| EncodedComponent {
             log_hours: hours,
             count: 1.0,
-            basis_index: ComponentTimeBasis::SinceOverhaul as usize,
+            basis_index: since_overhaul_index,
         };
         let mut first = encoded(20.0, 0.0);
         first.engine_components = vec![component(4.0), component(6.0)];
@@ -629,5 +658,65 @@ mod tests {
         let left = model.predict_one(&first, &device).unwrap();
         let right = model.predict_one(&second, &device).unwrap();
         assert!((left.log_value - right.log_value).abs() < 1e-6);
+    }
+
+    #[test]
+    fn six_slot_batch_and_network_preserve_late_basis_positions_and_directions() {
+        let device = Default::default();
+        let basis_index = |basis| {
+            COMPONENT_TIME_BASIS_VOCABULARY
+                .iter()
+                .position(|candidate| *candidate == basis)
+                .unwrap()
+        };
+        let bases = [
+            ComponentTimeBasis::SinceFactoryRemanufacture,
+            ComponentTimeBasis::SinceInspection,
+            ComponentTimeBasis::TimeRemaining,
+        ];
+        let inputs = bases.map(|basis| {
+            let mut input = encoded(20.0, 0.0);
+            input.engine_components = vec![EncodedComponent {
+                log_hours: 1.0,
+                count: 1.0,
+                basis_index: basis_index(basis),
+            }];
+            input
+        });
+        let batch = EncodedBatch::<Flex>::from_inputs(&inputs, &device).unwrap();
+        let component_features = batch.component_features.to_data().to_vec::<f32>().unwrap();
+        assert_eq!(
+            component_features.len(),
+            bases.len() * COMPONENT_FEATURE_WIDTH
+        );
+        for (row, basis) in bases.into_iter().enumerate() {
+            let occupied = component_features
+                [row * COMPONENT_FEATURE_WIDTH..(row + 1) * COMPONENT_FEATURE_WIDTH]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| (*value != 0.0).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(occupied, vec![basis_index(basis)]);
+        }
+
+        let mut model = TinyValuationNet::<Flex>::new(
+            &config(DnnCapacity::Full),
+            12.0,
+            [0.08, 0.18, 0.42, 0.52],
+            -0.02,
+            &device,
+        )
+        .unwrap();
+        model.component_raw_weights = Some(Param::from_data(
+            TensorData::full([COMPONENT_TYPE_COUNT, COMPONENT_TIME_BASIS_COUNT], 0.0_f32),
+            &device,
+        ));
+        let effects = inputs
+            .iter()
+            .map(|input| model.predict_one(input, &device).unwrap().component_effect)
+            .collect::<Vec<_>>();
+        assert!(effects[0] < 0.0, "SFRM is elapsed time");
+        assert!(effects[1] < 0.0, "since-inspection is elapsed time");
+        assert!(effects[2] > 0.0, "time remaining has positive direction");
     }
 }
