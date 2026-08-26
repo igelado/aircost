@@ -4,88 +4,11 @@ Clean replay rebuilds derived listing state from an explicit set of retained,
 signed plugin captures. It never copies listings, catalogs, reviews, Gemini
 responses, or other derived rows from the source database.
 
-The source must be a file-backed SQLite database. Replay commands open it with
-SQLite read-only mode and do not run schema initialization, migrations, or seed
-writes. The target must be a different database.
-
-FAA registry dry runs have the same boundary: they require an existing target
-database and use a dedicated read-only diagnostic connection. They do not
-create a SQLite file or upgrade either backend. Before materialization, import
-the exact retained FAA ZIP into the shadow database with `--apply`; projection
-hashes cannot be recovered by relabeling or mechanically rehashing legacy FAA
-rows.
-
-## Frozen legacy source preparation
-
-One historical SQLite source predates the versioned FAA retained-record hash
-domain and the resumable replay ledger. It is not opened through ordinary
-application startup and must never be repaired in place. The temporary
-`prepare-legacy-replay-source` command is the only admitted conversion:
-
-```text
-aircost-admin prepare-legacy-replay-source \
-  --source-database FROZEN_SOURCE \
-  --source-database-sha256 3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc \
-  --manifest captures.json \
-  --manifest-sha256 345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00 \
-  --faa-archive ReleasableAircraft.zip \
-  --faa-archive-sha256 14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724 \
-  --output PREPARED_SOURCE
-aircost-admin prepare-legacy-replay-source \
-  --source-database FROZEN_SOURCE \
-  --source-database-sha256 3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc \
-  --manifest captures.json \
-  --manifest-sha256 345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00 \
-  --faa-archive ReleasableAircraft.zip \
-  --faa-archive-sha256 14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724 \
-  --output PREPARED_SOURCE --apply
-```
-
-Dry run is the default and creates no output file. Both modes require the exact
-reviewed source-database byte digest and semantic capture-manifest fingerprint,
-the fixed legacy schema and migration-receipt inventories, and the exact
-retained FAA ZIP. The source may not have a `-wal`, `-shm`, or `-journal`
-sidecar. The bridge opens the original file once, copies and hashes those same
-bytes into a private `0600` snapshot, and opens only that snapshot as immutable
-and read-only. It then revalidates every selected signed capture and timestamp
-and parses the FAA ZIP through the current privacy-minimizing importer. A
-different source byte, schema, receipt set, archive, manifest member,
-signature, owner, install, key, revocation instant, capture hash, or retained
-non-PII FAA fact is rejected.
-
-The output is a new current canonical-schema SQLite file. It contains only the
-selected users, installs, signed captures with all derived fields reset, the
-current-domain FAA projection rebuilt by the normal importer, and a typed
-provider-free projection of the reusable verified aircraft and avionics
-catalog closure. It does not copy listings, reviews, valuation data, provider
-usage, Gemini responses, or legacy FAA projection rows. FAA-bound claims,
-observations, resolution cases, decisions, and catalog bindings are rebuilt
-against the parsed current-domain records. An exhaustive final scan rejects
-any retained legacy FAA record or source-manifest digest.
-
-The reported catalog fingerprint is loaded from that finished current-schema
-output; it is not the legacy adapter's intermediate fingerprint. Version 1 uses
-the `aircost:current-verified-catalog-projection:v1` domain and binds an exact
-ordered table inventory (including zero-row tables), per-table counts, and
-canonical sorted rows. It covers the complete target-scoped rows of every FAA
-snapshot in the prepared source, approved aircraft hierarchy and its bounded
-provenance, and approved avionics closure. Capture, listing, review, valuation,
-provider, candidate, and history rows are outside the domain. Reviewer users
-are reported as dependencies but capture import remains their owner, so users
-are not catalog-fingerprinted. Apply closes and reopens the published candidate
-and requires the reloaded current-schema projection to match before publication.
-
-Apply builds a sibling temporary file and publishes it with a no-replace
-atomic rename only after current diagnostic startup, integrity, foreign-key,
-taint, and zero-provider-usage checks pass. It synchronizes both the published
-file and its parent directory before reporting success. Failures before the
-rename remove the temporary file and leave the requested output absent. A
-directory-synchronization failure occurs after publication and can therefore
-leave a complete output whose crash durability is uncertain; inspect that file
-before deciding whether to retain or remove it. The frozen source is never
-modified. This command is a one-time administrative bridge, not runtime
-compatibility; remove it after the reviewed source has been prepared and the
-clean rebuild has cut over.
+The source must be a current-schema, verified SQLite or PostgreSQL database.
+Replay commands open it diagnostically without schema initialization,
+migrations, or seed writes. SQLite sources must be existing file-backed
+databases and are opened read-only; PostgreSQL diagnostic connections enforce
+read-only transactions. The target must be a different database.
 
 ## Phases
 
@@ -95,13 +18,46 @@ All operational commands are dry-run unless `--apply` is supplied.
 
    ```text
    aircost-admin export-replay-manifest --database SOURCE --all-bound \
-     --output captures.json --apply
+     --expected-capture-count 70 --output captures.json \
+     --readiness-output capture-readiness.json
+   aircost-admin export-replay-manifest --database SOURCE --all-bound \
+     --expected-capture-count 70 --output captures.json \
+     --readiness-output capture-readiness.json --apply
    ```
 
-   `--all-bound` fails unless each selected listing has exactly one retained
-   capture. `--submission-id` can instead select exact capture IDs. Export
-   recomputes every HTML hash, verifies capture ownership and install ownership,
-   and verifies the P-256 signature.
+   Export evaluates the complete source inventory and builds the manifest from
+   one read transaction, so readiness, exclusions, capture count, and manifest
+   fingerprint all describe the same database snapshot. `--all-bound` includes
+   `--expected-capture-count` when the operator knows the reviewed inventory;
+   a count change makes the source not ready instead of silently shrinking or
+   expanding the replay. `--submission-id` can instead select exact capture IDs
+   and cannot be combined with the expected-count option.
+
+   The readiness report contains the closed database checks, source inventory,
+   per-capture results, excluded submission IDs, and manifest fingerprint. The
+   export recomputes every HTML hash, verifies capture and install ownership,
+   requires every all-bound capture owner and signed source URL to match its
+   listing creator and source URL exactly, checks install/submission/revocation
+   chronology, and verifies the P-256 signature. Unbound submissions outside
+   the selected listing set are reported explicitly as exclusions and warnings.
+   An ambiguous or hostile listing binding, count mismatch, corrupt selected
+   capture, or database-integrity failure leaves the source not ready.
+
+   Dry-run prints that readiness report and creates neither requested file.
+   With `--apply`, a ready snapshot publishes the manifest and, when requested,
+   the readiness report. A non-ready snapshot publishes only the requested
+   readiness report, leaves `captures.json` absent, and exits unsuccessfully.
+   The two output paths must be different and neither is overwritten. Each JSON
+   artifact is pretty-printed with a final newline into a sibling `0600`
+   temporary file, flushed and synchronized, then published without clobbering
+   an existing path; its parent directory is synchronized before success is
+   reported. When both artifacts are requested, the readiness report is
+   published first and the manifest last, making the manifest the final usable
+   replay artifact. A failure after publishing the readiness report can leave
+   that diagnostic file while the manifest remains absent. A file or directory
+   synchronization failure after a no-clobber rename can leave a complete
+   artifact whose crash durability is uncertain; inspect it before deciding
+   whether to retain it, because a retry will not overwrite it.
 
 2. Import into an empty shadow target:
 
@@ -115,13 +71,12 @@ All operational commands are dry-run unless `--apply` is supplied.
    submission timestamps, and resets extraction, error, and canonical-listing
    fields.
 
-3. Seed the exact reviewed catalog closure from the prepared current-schema
-   source:
+3. Seed the exact reviewed catalog closure from the current verified source:
 
    ```text
-   aircost-admin seed-verified-catalog --source-database PREPARED_SOURCE \
+   aircost-admin seed-verified-catalog --source-database SOURCE \
      --catalog-fingerprint-sha256 REVIEWED_SHA256 --database SHADOW
-   aircost-admin seed-verified-catalog --source-database PREPARED_SOURCE \
+   aircost-admin seed-verified-catalog --source-database SOURCE \
      --catalog-fingerprint-sha256 REVIEWED_SHA256 --database SHADOW --apply
    ```
 
@@ -136,9 +91,9 @@ All operational commands are dry-run unless `--apply` is supplied.
    transition; generated manufacturer keys, product identities, and curated
    origins must match the projection instead of being replaced. The operation
    has no provider client, is transactional, resets identity sequences, then
-   reloads the target through the same versioned catalog projection both before
-   commit and after reopening the database, requiring exact fingerprint, row,
-   and count parity. A second invocation is rejected because the target is no
+   reloads the target through the same catalog projection both before commit
+   and after reopening the database, requiring exact fingerprint, row, and
+   count parity. A second invocation is rejected because the target is no
    longer clean.
 
    SQLite takes `BEGIN IMMEDIATE` before the final scan. PostgreSQL first takes
@@ -150,7 +105,7 @@ All operational commands are dry-run unless `--apply` is supplied.
    the clean check or any materialization write; unlike `ACCESS EXCLUSIVE`, it
    does not unnecessarily block plain diagnostic reads. Sequence resets use
    transactional `ALTER SEQUENCE ... RESTART`, including both identity and
-   legacy serial-owned `id` sequences—never non-transactional `setval`.
+   serial-owned `id` sequences—never non-transactional `setval`.
 
 4. Create and inspect the extraction checkpoint:
 

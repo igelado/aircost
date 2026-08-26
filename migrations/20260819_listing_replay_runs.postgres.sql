@@ -24,7 +24,7 @@ BEGIN
     WHERE migration_name = '20260819_listing_replay_runs'
       AND contract_version = 1
       AND contract_fingerprint =
-        'ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1'
+        '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a'
   ) THEN
     RAISE EXCEPTION 'installed listing replay runs migration has a different contract';
   END IF;
@@ -36,17 +36,16 @@ BEGIN
                     ) AS (
                       VALUES
                         ('listing_replay_runs', 1, 'id', 'bigint', TRUE, 'd', ''),
-                        ('listing_replay_runs', 2, 'manifest_version', 'bigint', TRUE, '', ''),
-                        ('listing_replay_runs', 3, 'manifest_sha256', 'text', TRUE, '', ''),
-                        ('listing_replay_runs', 4, 'manifest_capture_count', 'bigint', TRUE, '', ''),
-                        ('listing_replay_runs', 5, 'status', 'text', TRUE, '', '''queued''::text'),
-                        ('listing_replay_runs', 6, 'active_phase', 'text', FALSE, '', ''),
-                        ('listing_replay_runs', 7, 'owner_token', 'text', FALSE, '', ''),
-                        ('listing_replay_runs', 8, 'heartbeat_at_epoch_seconds', 'bigint', FALSE, '', ''),
-                        ('listing_replay_runs', 9, 'started_at', 'text', FALSE, '', ''),
-                        ('listing_replay_runs', 10, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
-                        ('listing_replay_runs', 11, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
-                        ('listing_replay_runs', 12, 'completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 2, 'manifest_sha256', 'text', TRUE, '', ''),
+                        ('listing_replay_runs', 3, 'manifest_capture_count', 'bigint', TRUE, '', ''),
+                        ('listing_replay_runs', 4, 'status', 'text', TRUE, '', '''queued''::text'),
+                        ('listing_replay_runs', 5, 'active_phase', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 6, 'owner_token', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 7, 'heartbeat_at_epoch_seconds', 'bigint', FALSE, '', ''),
+                        ('listing_replay_runs', 8, 'started_at', 'text', FALSE, '', ''),
+                        ('listing_replay_runs', 9, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_runs', 10, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
+                        ('listing_replay_runs', 11, 'completed_at', 'text', FALSE, '', ''),
                         ('listing_replay_run_items', 1, 'id', 'bigint', TRUE, 'd', ''),
                         ('listing_replay_run_items', 2, 'run_id', 'bigint', TRUE, '', ''),
                         ('listing_replay_run_items', 3, 'plugin_submission_id', 'bigint', TRUE, '', ''),
@@ -418,7 +417,6 @@ BEGIN
                         AND constraint_definition.contype = 'f'
                     ), required_check_fragments(relation_name, fragment) AS (
                       VALUES
-                        ('listing_replay_runs', 'manifest_version > 0'),
                         ('listing_replay_runs', '^[0-9a-f]{64}$'),
                         ('listing_replay_runs', 'manifest_capture_count > 0'),
                         ('listing_replay_runs', 'status = ANY'),
@@ -464,7 +462,7 @@ BEGIN
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 40 FROM actual_columns)
+                      (SELECT COUNT(*) = 39 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
@@ -849,7 +847,7 @@ BEGIN
                           AND child_columns = 'aircraft_sale_listing_id' AND parent_columns = 'id'
                           AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
                           AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
-                      AND (SELECT COUNT(*) = 7 FROM replay_checks
+                      AND (SELECT COUNT(*) = 6 FROM replay_checks
                            WHERE relation_name = 'listing_replay_runs')
                       AND (SELECT COUNT(*) = 20 FROM replay_checks
                            WHERE relation_name = 'listing_replay_run_items')
@@ -901,7 +899,7 @@ BEGIN
       );
 
     IF NOT COALESCE(contract_is_exact, FALSE)
-       OR check_signature IS DISTINCT FROM 'b33af6b1c9969a333dbdb7d8a5910e92'
+       OR check_signature IS DISTINCT FROM '9a030ed4847f98cd98891f37e57cd516'
        OR function_signature IS DISTINCT FROM '7e885abd1d361c7c831c84e5e3a58e1d' THEN
       RAISE EXCEPTION
         'installed listing replay migration contract has noncanonical objects';
@@ -945,7 +943,6 @@ $migration_guard$;
 
 CREATE TABLE IF NOT EXISTS public.listing_replay_runs (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-  manifest_version BIGINT NOT NULL CHECK (manifest_version > 0),
   manifest_sha256 TEXT NOT NULL UNIQUE CHECK (manifest_sha256 ~ '^[0-9a-f]{64}$'),
   manifest_capture_count BIGINT NOT NULL CHECK (manifest_capture_count > 0),
   status TEXT NOT NULL DEFAULT 'queued'
@@ -1326,7 +1323,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  'ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1',
+  '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 

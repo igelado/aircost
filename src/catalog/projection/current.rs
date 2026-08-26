@@ -1,10 +1,7 @@
-//! Read-only, versioned projection of verified catalog truth in a current
-//! schema.
+//! Read-only projection of verified catalog truth in a current schema.
 //!
-//! This module deliberately knows nothing about legacy FAA hash domains or
-//! replay-source remapping. Evidence, observation, case, decision, and claim
-//! rows have already crossed that boundary and are fingerprinted byte-for-byte
-//! as stored.
+//! Evidence, observation, case, decision, and claim rows are fingerprinted
+//! byte-for-byte as stored in the current schema.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,9 +14,7 @@ use sqlx::{Acquire, Connection, PgConnection, SqliteConnection};
 use super::{canonical_row, ids, in_predicate, ProjectionRow, ROOT_TABLES};
 use crate::db::{AppDb, DatabaseBackend};
 
-pub(crate) const CURRENT_CATALOG_PROJECTION_VERSION: u32 = 1;
-pub(crate) const CURRENT_CATALOG_PROJECTION_DOMAIN: &str =
-    "aircost:current-verified-catalog-projection:v1";
+const CURRENT_CATALOG_PROJECTION_DOMAIN: &[u8] = b"aircost:current-verified-catalog-projection\0";
 
 const CURRENT_TABLES: &[&str] = &[
     "curation_evidence_sources",
@@ -66,7 +61,6 @@ const CURRENT_TABLES: &[&str] = &[
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct CurrentCatalogProjectionSummary {
-    pub version: u32,
     pub fingerprint_sha256: String,
     pub table_counts: BTreeMap<String, usize>,
     pub required_users: Vec<RequiredCatalogUser>,
@@ -82,8 +76,8 @@ pub(crate) struct RequiredCatalogUser {
 }
 
 /// Opaque current-schema catalog snapshot. Consumers compare or report it; the
-/// sibling seed writer consumes this boundary without teaching the bridge how
-/// current rows are selected or canonicalized.
+/// sibling seed writer consumes this boundary without coupling the writer to
+/// current row selection or canonicalization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CurrentCatalogProjection {
     summary: CurrentCatalogProjectionSummary,
@@ -98,8 +92,6 @@ enum ProjectionReader<'connection> {
 
 #[derive(Serialize)]
 struct FingerprintEnvelope<'rows> {
-    domain: &'static str,
-    version: u32,
     table_counts: Vec<FingerprintTableCount<'rows>>,
     rows: &'rows [String],
 }
@@ -163,7 +155,7 @@ impl CurrentCatalogProjection {
     pub(super) fn require_exact_match(&self, reloaded: Self, scope: &str) -> Result<()> {
         if reloaded != *self {
             bail!(
-                "{scope} current catalog fingerprint {} differs from prepared fingerprint {}",
+                "{scope} current catalog fingerprint {} differs from source fingerprint {}",
                 reloaded.fingerprint_sha256(),
                 self.fingerprint_sha256()
             );
@@ -521,15 +513,15 @@ fn assemble(
         })
         .collect();
     let envelope = FingerprintEnvelope {
-        domain: CURRENT_CATALOG_PROJECTION_DOMAIN,
-        version: CURRENT_CATALOG_PROJECTION_VERSION,
         table_counts: fingerprint_table_counts,
         rows: &canonical_rows,
     };
-    let fingerprint_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&envelope)?));
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(CURRENT_CATALOG_PROJECTION_DOMAIN);
+    fingerprint.update(serde_json::to_vec(&envelope)?);
+    let fingerprint_sha256 = format!("{:x}", fingerprint.finalize());
     Ok(CurrentCatalogProjection {
         summary: CurrentCatalogProjectionSummary {
-            version: CURRENT_CATALOG_PROJECTION_VERSION,
             fingerprint_sha256,
             table_counts,
             required_users,
@@ -1082,9 +1074,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, reordered);
-        assert_eq!(first.summary.version, CURRENT_CATALOG_PROJECTION_VERSION);
         assert_eq!(first.summary.table_counts["faa_registry_coverage"], 2);
         assert_eq!(first.summary.table_counts["avionics_models"], 0);
+        assert!(
+            serde_json::to_value(&first.summary)
+                .unwrap()
+                .get("version")
+                .is_none(),
+            "current catalog summaries must remain unversioned"
+        );
+        let envelope = FingerprintEnvelope {
+            table_counts: CURRENT_TABLES
+                .iter()
+                .map(|table| FingerprintTableCount {
+                    table,
+                    count: first.summary.table_counts[*table],
+                })
+                .collect(),
+            rows: &first.canonical_rows,
+        };
+        let mut expected = Sha256::new();
+        expected.update(b"aircost:current-verified-catalog-projection\0");
+        expected.update(serde_json::to_vec(&envelope).unwrap());
+        assert_eq!(
+            first.fingerprint_sha256(),
+            format!("{:x}", expected.finalize())
+        );
 
         let changed = assemble(
             vec![vec![

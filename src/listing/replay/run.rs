@@ -28,6 +28,8 @@ use crate::plugin::{
 
 const STALE_RECOVERY_THRESHOLD: Duration = Duration::from_secs(60 * 60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const REPLAY_USAGE_HASH_DOMAIN: &[u8] = b"aircost:listing-replay-usage\0";
+const REPLAY_OWNER_HASH_DOMAIN: &[u8] = b"aircost:listing-replay-owner\0";
 static TOKEN_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -229,7 +231,6 @@ impl CaptureRow {
 #[derive(Debug, FromRow)]
 struct ExistingRunRow {
     id: i64,
-    manifest_version: i64,
     manifest_capture_count: i64,
     status: String,
     active_phase: Option<String>,
@@ -1170,7 +1171,7 @@ fn append_exact_manifest_binds<'a>(
 
 async fn find_run(db: &AppDb, manifest_sha256: &str) -> ReplayRunResult<Option<ExistingRunRow>> {
     let sql = db.sql(
-        r#"SELECT id, manifest_version, manifest_capture_count, status, active_phase,
+        r#"SELECT id, manifest_capture_count, status, active_phase,
                   heartbeat_at_epoch_seconds
            FROM listing_replay_runs WHERE manifest_sha256 = ?"#,
     );
@@ -1192,8 +1193,8 @@ async fn ensure_run(
 ) -> ReplayRunResult<ExistingRunRow> {
     let insert_run = db.sql(
         r#"INSERT INTO listing_replay_runs
-             (manifest_version, manifest_sha256, manifest_capture_count)
-           VALUES (?, ?, ?) ON CONFLICT (manifest_sha256) DO NOTHING RETURNING id"#,
+             (manifest_sha256, manifest_capture_count)
+           VALUES (?, ?) ON CONFLICT (manifest_sha256) DO NOTHING RETURNING id"#,
     );
     let insert_item = db.sql(
         r#"INSERT INTO listing_replay_run_items
@@ -1204,7 +1205,6 @@ async fn ensure_run(
         ($pool:expr) => {{
             let mut transaction = $pool.begin().await?;
             let inserted = sqlx::query_scalar::<_, i64>(&insert_run)
-                .bind(manifest.version as i64)
                 .bind(&manifest.manifest_sha256)
                 .bind(manifest.captures.len() as i64)
                 .fetch_optional(&mut *transaction)
@@ -1239,9 +1239,7 @@ async fn validate_run_membership(
     run: &ExistingRunRow,
     manifest: &TrustedCaptureManifest,
 ) -> ReplayRunResult<()> {
-    if run.manifest_version != manifest.version as i64
-        || run.manifest_capture_count != manifest.captures.len() as i64
-    {
+    if run.manifest_capture_count != manifest.captures.len() as i64 {
         return Err(ReplayRunError::Conflict(
             "stored replay run does not match the manifest header".to_string(),
         ));
@@ -1328,7 +1326,7 @@ async fn acquire_run(
 
 async fn current_running_run(db: &AppDb) -> ReplayRunResult<Option<ExistingRunRow>> {
     let sql = db.sql(
-        r#"SELECT id, manifest_version, manifest_capture_count, status, active_phase,
+        r#"SELECT id, manifest_capture_count, status, active_phase,
                   heartbeat_at_epoch_seconds
            FROM listing_replay_runs WHERE status = 'running' LIMIT 1"#,
     );
@@ -2193,7 +2191,7 @@ fn selected_item_reason_code(
 
 fn replay_usage_correlation(manifest: &TrustedCaptureManifest, phase: ReplayPhase) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"aircost:listing-replay-usage:v1\0");
+    hasher.update(REPLAY_USAGE_HASH_DOMAIN);
     hasher.update(manifest.manifest_sha256.as_bytes());
     hasher.update(phase.label().as_bytes());
     format!("listing-replay:{:x}", hasher.finalize())
@@ -2307,7 +2305,7 @@ fn new_owner_token(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| ReplayRunError::Database(error.to_string()))?;
     let mut hasher = Sha256::new();
-    hasher.update(b"aircost:listing-replay-owner:v1\0");
+    hasher.update(REPLAY_OWNER_HASH_DOMAIN);
     hasher.update(manifest.manifest_sha256.as_bytes());
     hasher.update(phase.label().as_bytes());
     hasher.update(std::process::id().to_le_bytes());
@@ -2384,8 +2382,17 @@ mod tests {
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
         };
+        sqlx::query(
+            "UPDATE users SET created_at = '2026-08-18 00:00:00', \
+             updated_at = '2026-08-18 00:00:00' WHERE id = ?",
+        )
+        .bind(user.id)
+        .execute(pool)
+        .await
+        .unwrap();
         let install_id: i64 = sqlx::query_scalar(
-            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, ?) RETURNING id",
+            "INSERT INTO plugin_installs (user_id, public_key_base64, created_at) \
+             VALUES (?, ?, '2026-08-19 00:00:00') RETURNING id",
         )
         .bind(user.id)
         .bind(BASE64_STANDARD.encode(keys.public_key().as_ref()))
@@ -2493,6 +2500,20 @@ mod tests {
         assert!(ReplayItemState::parse("rejected").unwrap().is_terminal());
         assert!(ReplayItemState::parse("succeeded").unwrap().is_terminal());
         assert!(ReplayItemState::parse("pending").is_err());
+    }
+
+    #[test]
+    fn replay_hash_domains_and_usage_fingerprint_are_unversioned() {
+        assert_eq!(REPLAY_USAGE_HASH_DOMAIN, b"aircost:listing-replay-usage\0");
+        assert_eq!(REPLAY_OWNER_HASH_DOMAIN, b"aircost:listing-replay-owner\0");
+        let manifest = TrustedCaptureManifest {
+            captures: Vec::new(),
+            manifest_sha256: "a".repeat(64),
+        };
+        assert_eq!(
+            replay_usage_correlation(&manifest, ReplayPhase::Extraction),
+            "listing-replay:a57b9db93ef654527c78dbd290f3ea39273b2b9e504ee40e1979e6429a3d5073"
+        );
     }
 
     #[test]
@@ -3359,7 +3380,6 @@ mod tests {
         ];
         captures.sort_by_key(|entry| entry.submission_id);
         let manifest = TrustedCaptureManifest {
-            version: first_manifest.version,
             manifest_sha256: super::super::manifest_fingerprint(&captures).unwrap(),
             captures,
         };
@@ -3956,7 +3976,7 @@ mod tests {
         };
         for fingerprint in ["a".repeat(64), "b".repeat(64)] {
             sqlx::query(
-                "INSERT INTO listing_replay_runs (manifest_version, manifest_sha256, manifest_capture_count) VALUES (1, ?, 1)",
+                "INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count) VALUES (?, 1)",
             )
             .bind(fingerprint)
             .execute(pool)

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::path::PathBuf;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use aircost_rs::aircraft::curation::application::{
     apply_aircraft_hierarchy_curation_report, AircraftHierarchyApplicationReport,
@@ -46,12 +48,10 @@ use aircost_rs::listing::replay::catalog::{
     seed_replay_verified_catalog, SeedVerifiedCatalogRequest,
 };
 use aircost_rs::listing::replay::run::{replay_captures, ReplayCapturesRequest, ReplayPhase};
-use aircost_rs::listing::replay::source::{
-    prepare_legacy_replay_source, PrepareLegacyReplaySourceRequest,
-};
 use aircost_rs::listing::replay::{
-    build_trusted_capture_manifest, import_trusted_capture_manifest,
-    reconcile_replay_occurrence_dispositions, trusted_bound_capture_ids, TrustedCaptureManifest,
+    export_replay_manifest, import_trusted_capture_manifest,
+    reconcile_replay_occurrence_dispositions, ReplayCaptureSelection, ReplayManifestExportRequest,
+    TrustedCaptureManifest,
 };
 use aircost_rs::listing::verification::{
     verify_listings, ListingVerificationMode, ListingVerificationScope, ListingVerificationServices,
@@ -71,6 +71,8 @@ use aircost_rs::valuation::dnn::{
 };
 use aircost_rs::valuation::store::{activate_model_version, validate_model_version};
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use tempfile::NamedTempFile;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -112,35 +114,91 @@ async fn main() -> Result<()> {
         AdminCommand::ExportReplayManifest {
             database,
             output,
+            readiness_output,
             submission_ids,
             all_bound,
+            expected_capture_count,
             apply,
         } => {
+            if apply {
+                require_distinct_output_paths(&output, readiness_output.as_deref())?;
+                require_output_absent(&output)?;
+                if let Some(path) = readiness_output.as_deref() {
+                    require_output_absent(path)?;
+                }
+            }
             let db = aircost_rs::db::AppDb::connect_diagnostic(&database).await?;
-            let selected = if all_bound {
-                trusted_bound_capture_ids(&db)
-                    .await
-                    .map_err(anyhow::Error::msg)?
+            let selection = if all_bound {
+                ReplayCaptureSelection::AllBound {
+                    expected_capture_count,
+                }
             } else {
-                submission_ids
+                ReplayCaptureSelection::SubmissionIds(submission_ids)
             };
-            let manifest = build_trusted_capture_manifest(&db, &selected)
+            let export = export_replay_manifest(&db, ReplayManifestExportRequest { selection })
                 .await
                 .map_err(anyhow::Error::msg)?;
-            if apply {
-                let bytes = serde_json::to_vec_pretty(&manifest)?;
-                fs::write(&output, bytes).with_context(|| {
-                    format!("could not write replay manifest {}", output.display())
-                })?;
+
+            if !apply {
+                println!("{}", serde_json::to_string_pretty(&export.readiness)?);
+                return Ok(());
             }
+
+            if !export.readiness.ready {
+                if let Some(path) = readiness_output.as_deref() {
+                    require_output_absent(path)?;
+                    let staged = stage_private_json(path, &export.readiness)?;
+                    publish_private_json(staged, path)?;
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": false,
+                        "ready": false,
+                        "manifest_output": output,
+                        "manifest_published": false,
+                        "readiness_output": &readiness_output,
+                        "readiness_published": readiness_output.is_some(),
+                        "blocking_issue_count": export.readiness.blocking_issue_count,
+                        "warning_issue_count": export.readiness.warning_issue_count,
+                        "omitted_issue_count": export.readiness.omitted_issue_count,
+                        "manifest_sha256": &export.readiness.manifest_sha256,
+                    }))?
+                );
+                bail!(
+                    "replay source is not ready; no capture manifest was published{}",
+                    readiness_output
+                        .as_ref()
+                        .map(|path| format!("; readiness report written to {}", path.display()))
+                        .unwrap_or_default()
+                );
+            }
+            let manifest = export.manifest.as_ref().context(
+                "replay export reported ready without producing a trusted capture manifest",
+            )?;
+            require_output_absent(&output)?;
+            if let Some(path) = readiness_output.as_deref() {
+                require_output_absent(path)?;
+            }
+            let staged_manifest = stage_private_json(&output, manifest)?;
+            let staged_readiness = readiness_output
+                .as_deref()
+                .map(|path| stage_private_json(path, &export.readiness))
+                .transpose()?;
+            if let (Some(staged), Some(path)) = (staged_readiness, readiness_output.as_deref()) {
+                publish_private_json(staged, path)?;
+            }
+            publish_private_json(staged_manifest, &output)?;
+            let readiness_published = readiness_output.is_some();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "dry_run": !apply,
-                    "output": output,
-                    "capture_count": manifest.captures.len(),
-                    "manifest_sha256": manifest.manifest_sha256,
-                    "submission_ids": manifest.captures.iter().map(|row| row.submission_id).collect::<Vec<_>>(),
+                    "dry_run": false,
+                    "manifest_output": output,
+                    "readiness_output": readiness_output,
+                    "manifest_published": true,
+                    "readiness_published": readiness_published,
+                    "readiness": export.readiness,
                 }))?
             );
         }
@@ -166,33 +224,6 @@ async fn main() -> Result<()> {
             let report = import_trusted_capture_manifest(&source, &target, &manifest, apply)
                 .await
                 .map_err(anyhow::Error::msg)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-        AdminCommand::PrepareLegacyReplaySource {
-            source_database,
-            source_database_sha256,
-            manifest,
-            manifest_sha256,
-            faa_archive,
-            faa_archive_sha256,
-            output,
-            apply,
-        } => {
-            let manifest: TrustedCaptureManifest =
-                serde_json::from_slice(&fs::read(&manifest).with_context(|| {
-                    format!("could not read replay manifest {}", manifest.display())
-                })?)?;
-            let report = prepare_legacy_replay_source(PrepareLegacyReplaySourceRequest {
-                source_database: &source_database,
-                expected_source_database_sha256: &source_database_sha256,
-                manifest: &manifest,
-                expected_manifest_sha256: &manifest_sha256,
-                faa_archive: &faa_archive,
-                expected_faa_archive_sha256: &faa_archive_sha256,
-                output: &output,
-                apply,
-            })
-            .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         AdminCommand::SeedVerifiedCatalog {
@@ -752,6 +783,108 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn stage_private_json<T: Serialize>(output: &Path, value: &T) -> Result<NamedTempFile> {
+    let parent = output_parent(output)?;
+    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create private temporary file for {}",
+            output.display()
+        )
+    })?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "could not restrict temporary file permissions for {}",
+                output.display()
+            )
+        })?;
+    serde_json::to_writer_pretty(&mut temporary, value)
+        .with_context(|| format!("could not serialize JSON for {}", output.display()))?;
+    temporary
+        .write_all(b"\n")
+        .with_context(|| format!("could not terminate JSON in {}", output.display()))?;
+    temporary
+        .flush()
+        .with_context(|| format!("could not flush temporary file for {}", output.display()))?;
+    temporary.as_file().sync_all().with_context(|| {
+        format!(
+            "could not synchronize temporary file for {}",
+            output.display()
+        )
+    })?;
+    Ok(temporary)
+}
+
+fn publish_private_json(temporary: NamedTempFile, output: &Path) -> Result<()> {
+    let published = temporary.persist_noclobber(output).with_context(|| {
+        format!(
+            "could not atomically publish JSON output {} without replacing an existing path",
+            output.display()
+        )
+    })?;
+    published
+        .sync_all()
+        .with_context(|| format!("could not synchronize JSON output {}", output.display()))?;
+    drop(published);
+    File::open(output_parent(output)?)
+        .with_context(|| format!("could not open JSON output parent for {}", output.display()))?
+        .sync_all()
+        .with_context(|| {
+            format!(
+                "could not synchronize JSON output parent for {}",
+                output.display()
+            )
+        })
+}
+
+fn require_output_absent(output: &Path) -> Result<()> {
+    match fs::symlink_metadata(output) {
+        Ok(_) => bail!("JSON output already exists: {}", output.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("could not inspect JSON output {}", output.display())),
+    }
+}
+
+fn require_distinct_output_paths(output: &Path, readiness_output: Option<&Path>) -> Result<()> {
+    let Some(readiness_output) = readiness_output else {
+        return Ok(());
+    };
+    let output = resolved_output_path(output)?;
+    let readiness_output = resolved_output_path(readiness_output)?;
+    if output == readiness_output {
+        bail!("--output and --readiness-output must identify different files");
+    }
+    Ok(())
+}
+
+fn resolved_output_path(output: &Path) -> Result<PathBuf> {
+    let file_name = output
+        .file_name()
+        .context("JSON output path must have a file name")?;
+    Ok(output_parent(output)?
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "could not resolve JSON output parent for {}",
+                output.display()
+            )
+        })?
+        .join(file_name))
+}
+
+fn output_parent(output: &Path) -> Result<&Path> {
+    if output.file_name().is_none() {
+        bail!("JSON output path must have a file name");
+    }
+    Ok(output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(".")))
+}
+
 async fn import_faa_registry(
     database: String,
     archive: PathBuf,
@@ -814,24 +947,16 @@ enum AdminCommand {
     ExportReplayManifest {
         database: String,
         output: PathBuf,
+        readiness_output: Option<PathBuf>,
         submission_ids: Vec<i64>,
         all_bound: bool,
+        expected_capture_count: Option<usize>,
         apply: bool,
     },
     ImportReplayManifest {
         source_database: String,
         database: String,
         manifest: PathBuf,
-        apply: bool,
-    },
-    PrepareLegacyReplaySource {
-        source_database: String,
-        source_database_sha256: String,
-        manifest: PathBuf,
-        manifest_sha256: String,
-        faa_archive: PathBuf,
-        faa_archive_sha256: String,
-        output: PathBuf,
         apply: bool,
     },
     SeedVerifiedCatalog {
@@ -1038,7 +1163,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AdminCommand> {
         "publish-aircraft-reference" => parse_publish_aircraft_reference_args(args),
         "export-replay-manifest" => parse_export_replay_manifest_args(args),
         "import-replay-manifest" => parse_import_replay_manifest_args(args),
-        "prepare-legacy-replay-source" => parse_prepare_legacy_replay_source_args(args),
         "seed-verified-catalog" => parse_seed_verified_catalog_args(args),
         "replay-captures" => parse_replay_captures_args(args),
         "replay-extraction" => parse_replay_extraction_args(args),
@@ -1104,8 +1228,10 @@ fn parse_export_replay_manifest_args(
 ) -> Result<AdminCommand> {
     let mut database = None;
     let mut output = None;
+    let mut readiness_output = None;
     let mut submission_ids = Vec::new();
     let mut all_bound = false;
+    let mut expected_capture_count = None;
     let mut apply = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -1117,6 +1243,23 @@ fn parse_export_replay_manifest_args(
                 output = Some(PathBuf::from(
                     args.next().context("--output requires a value")?,
                 ));
+            }
+            "--readiness-output" => {
+                readiness_output = Some(PathBuf::from(
+                    args.next().context("--readiness-output requires a value")?,
+                ));
+            }
+            "--expected-capture-count" => {
+                let value = args
+                    .next()
+                    .context("--expected-capture-count requires a value")?;
+                let parsed = value
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid --expected-capture-count value: {value}"))?;
+                if parsed == 0 {
+                    bail!("--expected-capture-count must be positive");
+                }
+                expected_capture_count = Some(parsed);
             }
             "--submission-id" => {
                 let value = args.next().context("--submission-id requires a value")?;
@@ -1139,11 +1282,20 @@ fn parse_export_replay_manifest_args(
     if all_bound == !submission_ids.is_empty() {
         bail!("choose exactly one of --all-bound or one or more --submission-id values");
     }
+    if expected_capture_count.is_some() && !all_bound {
+        bail!("--expected-capture-count requires --all-bound");
+    }
+    let output = output.context("--output is required")?;
+    if readiness_output.as_ref() == Some(&output) {
+        bail!("--output and --readiness-output must identify different files");
+    }
     Ok(AdminCommand::ExportReplayManifest {
         database: database_url_from_arg(database),
-        output: output.context("--output is required")?,
+        output,
+        readiness_output,
         submission_ids,
         all_bound,
+        expected_capture_count,
         apply,
     })
 }
@@ -1184,65 +1336,6 @@ fn parse_import_replay_manifest_args(
         )),
         database: database_url_from_arg(database),
         manifest: manifest.context("--manifest is required")?,
-        apply,
-    })
-}
-
-fn parse_prepare_legacy_replay_source_args(
-    args: impl IntoIterator<Item = String>,
-) -> Result<AdminCommand> {
-    let mut source_database = None;
-    let mut source_database_sha256 = None;
-    let mut manifest = None;
-    let mut manifest_sha256 = None;
-    let mut faa_archive = None;
-    let mut faa_archive_sha256 = None;
-    let mut output = None;
-    let mut apply = false;
-    let mut apply_seen = false;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        let (slot, option_name): (&mut Option<String>, &str) = match arg.as_str() {
-            "--source-database" => (&mut source_database, "--source-database"),
-            "--source-database-sha256" => (&mut source_database_sha256, "--source-database-sha256"),
-            "--manifest" => (&mut manifest, "--manifest"),
-            "--manifest-sha256" => (&mut manifest_sha256, "--manifest-sha256"),
-            "--faa-archive" => (&mut faa_archive, "--faa-archive"),
-            "--faa-archive-sha256" => (&mut faa_archive_sha256, "--faa-archive-sha256"),
-            "--output" => (&mut output, "--output"),
-            "--apply" => {
-                if apply_seen {
-                    bail!("--apply may be supplied only once");
-                }
-                apply_seen = true;
-                apply = true;
-                continue;
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            _ => bail!("unknown prepare-legacy-replay-source argument: {arg}"),
-        };
-        if slot.is_some() {
-            bail!("{option_name} may be supplied only once");
-        }
-        *slot = Some(
-            args.next()
-                .with_context(|| format!("{option_name} requires a value"))?,
-        );
-    }
-
-    Ok(AdminCommand::PrepareLegacyReplaySource {
-        source_database: source_database.context("--source-database is required")?,
-        source_database_sha256: source_database_sha256
-            .context("--source-database-sha256 is required")?,
-        manifest: PathBuf::from(manifest.context("--manifest is required")?),
-        manifest_sha256: manifest_sha256.context("--manifest-sha256 is required")?,
-        faa_archive: PathBuf::from(faa_archive.context("--faa-archive is required")?),
-        faa_archive_sha256: faa_archive_sha256.context("--faa-archive-sha256 is required")?,
-        output: PathBuf::from(output.context("--output is required")?),
         apply,
     })
 }
@@ -2276,7 +2369,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound | --submission-id ID...) --output FILE [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Verifies exact capture bytes, install ownership, and P-256 signatures. Dry-run prints the selection; --apply writes the credential-free manifest.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin prepare-legacy-replay-source --source-database SOURCE --source-database-sha256 HEX --manifest FILE --manifest-sha256 HEX --faa-archive ReleasableAircraft.zip --faa-archive-sha256 HEX --output FILE [--apply]\n    One-purpose, provider-free conversion of the exact frozen legacy SQLite source into a new current-schema replay source. It authenticates a private source snapshot and the exact reviewed manifest, rebuilds the FAA projection from the exact retained archive, and projects only the reusable verified catalog closure. Dry-run creates no file.\n  aircost-admin seed-verified-catalog --source-database PREPARED --catalog-fingerprint-sha256 HEX --database TARGET [--apply]\n    Installs exactly the fingerprinted current verified catalog closure into a clean replay target while preserving imported signed captures. It is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound [--expected-capture-count COUNT] | --submission-id ID...) --output FILE [--readiness-output FILE] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Evaluates capture inventory and authenticity from one database snapshot. Dry-run prints readiness and writes nothing; --apply publishes a manifest only when ready and can publish the readiness report separately.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin seed-verified-catalog --source-database SOURCE --catalog-fingerprint-sha256 HEX --database TARGET [--apply]\n    Installs exactly the fingerprinted current verified catalog closure into a clean replay target while preserving imported signed captures. It is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -3122,17 +3215,34 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
             [
                 "export-replay-manifest",
                 "--all-bound",
+                "--expected-capture-count",
+                "70",
                 "--output",
                 "/tmp/captures.json",
+                "--readiness-output",
+                "/tmp/captures-readiness.json",
             ]
             .into_iter()
             .map(str::to_string),
         )
         .unwrap();
-        assert!(matches!(
-            export,
-            AdminCommand::ExportReplayManifest { apply: false, .. }
-        ));
+        let AdminCommand::ExportReplayManifest {
+            apply,
+            all_bound,
+            expected_capture_count,
+            readiness_output,
+            ..
+        } = export
+        else {
+            panic!("expected export-replay-manifest command")
+        };
+        assert!(!apply);
+        assert!(all_bound);
+        assert_eq!(expected_capture_count, Some(70));
+        assert_eq!(
+            readiness_output,
+            Some(PathBuf::from("/tmp/captures-readiness.json"))
+        );
         let import = parse_args(
             [
                 "import-replay-manifest",
@@ -3225,59 +3335,76 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
     }
 
     #[test]
-    fn legacy_replay_source_cli_is_explicit_and_dry_run_by_default() {
-        let command = parse_args(
-            [
-                "prepare-legacy-replay-source",
-                "--source-database",
-                "/tmp/frozen.sqlite3",
-                "--source-database-sha256",
-                "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc",
-                "--manifest",
-                "/tmp/captures.json",
-                "--manifest-sha256",
-                "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00",
-                "--faa-archive",
-                "/tmp/ReleasableAircraft.zip",
-                "--faa-archive-sha256",
-                "14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724",
+    fn replay_manifest_export_rejects_invalid_readiness_contract() {
+        for arguments in [
+            vec![
+                "export-replay-manifest",
+                "--submission-id",
+                "7",
+                "--expected-capture-count",
+                "1",
                 "--output",
-                "/tmp/prepared.sqlite3",
-            ]
-            .into_iter()
-            .map(str::to_string),
+                "/tmp/captures.json",
+            ],
+            vec![
+                "export-replay-manifest",
+                "--all-bound",
+                "--expected-capture-count",
+                "0",
+                "--output",
+                "/tmp/captures.json",
+            ],
+            vec![
+                "export-replay-manifest",
+                "--all-bound",
+                "--output",
+                "/tmp/captures.json",
+                "--readiness-output",
+                "/tmp/captures.json",
+            ],
+        ] {
+            assert!(parse_args(arguments.into_iter().map(str::to_string)).is_err());
+        }
+    }
+
+    #[test]
+    fn replay_manifest_json_publication_is_private_durable_and_no_clobber() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("captures.json");
+        let temporary = stage_private_json(
+            &output,
+            &serde_json::json!({"ready": true, "capture_count": 2}),
         )
         .unwrap();
-        let AdminCommand::PrepareLegacyReplaySource {
-            source_database,
-            source_database_sha256,
-            manifest,
-            manifest_sha256,
-            faa_archive,
-            faa_archive_sha256,
-            output,
-            apply,
-        } = command
-        else {
-            panic!("expected prepare-legacy-replay-source command")
-        };
-        assert_eq!(source_database, "/tmp/frozen.sqlite3");
+        assert!(!output.exists());
         assert_eq!(
-            source_database_sha256,
-            "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc"
+            temporary.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
         );
-        assert_eq!(manifest, PathBuf::from("/tmp/captures.json"));
+        publish_private_json(temporary, &output).unwrap();
+        let published = fs::read(&output).unwrap();
+        assert!(published.ends_with(b"\n"));
         assert_eq!(
-            manifest_sha256,
-            "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00"
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
         );
-        assert_eq!(faa_archive, PathBuf::from("/tmp/ReleasableAircraft.zip"));
-        assert_eq!(
-            faa_archive_sha256,
-            "14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724"
-        );
-        assert_eq!(output, PathBuf::from("/tmp/prepared.sqlite3"));
-        assert!(!apply);
+
+        let replacement =
+            stage_private_json(&output, &serde_json::json!({"ready": false})).unwrap();
+        assert!(publish_private_json(replacement, &output).is_err());
+        assert_eq!(fs::read(&output).unwrap(), published);
+    }
+
+    #[test]
+    fn replay_manifest_outputs_cannot_alias_through_parent_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let actual_parent = directory.path().join("actual");
+        let alias_parent = directory.path().join("alias");
+        fs::create_dir(&actual_parent).unwrap();
+        std::os::unix::fs::symlink(&actual_parent, &alias_parent).unwrap();
+        let output = actual_parent.join("captures.json");
+        let readiness_output = alias_parent.join("captures.json");
+        assert!(require_distinct_output_paths(&output, Some(&readiness_output)).is_err());
     }
 
     #[test]
@@ -3337,62 +3464,5 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
                 .to_string()
                 .contains("unknown")
         );
-    }
-
-    #[test]
-    fn legacy_replay_source_cli_requires_each_explicit_boundary_once() {
-        let required = [
-            ("--source-database", "/tmp/frozen.sqlite3"),
-            (
-                "--source-database-sha256",
-                "3468cd90ff2799d3640764ed0097dd07aa28164b249a4a9134e646e98158f8fc",
-            ),
-            ("--manifest", "/tmp/captures.json"),
-            (
-                "--manifest-sha256",
-                "345b1566ec491488d3ba4d1db2855eb9ea8e9b1258a7fc799418c581581b5d00",
-            ),
-            ("--faa-archive", "/tmp/ReleasableAircraft.zip"),
-            (
-                "--faa-archive-sha256",
-                "14885735825e5f46babdac8bf851c77c7ce7b104ae0f86395ef594e6e467c724",
-            ),
-            ("--output", "/tmp/prepared.sqlite3"),
-        ];
-        for omitted in required.iter().map(|(name, _)| *name) {
-            let mut arguments = vec!["prepare-legacy-replay-source".to_string()];
-            for (name, value) in required {
-                if name != omitted {
-                    arguments.extend([name.to_string(), value.to_string()]);
-                }
-            }
-            let error = parse_args(arguments).expect_err("missing boundary must fail");
-            assert!(error.to_string().contains("is required"));
-        }
-
-        let mut duplicate = vec!["prepare-legacy-replay-source".to_string()];
-        for (name, value) in required {
-            duplicate.extend([name.to_string(), value.to_string()]);
-        }
-        duplicate.extend(["--output".to_string(), "/tmp/other.sqlite3".to_string()]);
-        let error = parse_args(duplicate).expect_err("duplicate output must fail");
-        assert!(error.to_string().contains("only once"));
-
-        let mut duplicate_apply = vec!["prepare-legacy-replay-source".to_string()];
-        for (name, value) in required {
-            duplicate_apply.extend([name.to_string(), value.to_string()]);
-        }
-        duplicate_apply.extend(["--apply".to_string(), "--apply".to_string()]);
-        let error = parse_args(duplicate_apply).expect_err("duplicate apply must fail");
-        assert!(error.to_string().contains("only once"));
-
-        for unsupported in ["--source-database-url", "--dry-run"] {
-            let error = parse_args([
-                "prepare-legacy-replay-source".to_string(),
-                unsupported.to_string(),
-            ])
-            .expect_err("the one-purpose bridge must not accept compatibility flags");
-            assert!(error.to_string().contains("unknown"));
-        }
     }
 }

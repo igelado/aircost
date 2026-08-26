@@ -3039,7 +3039,6 @@ CREATE INDEX IF NOT EXISTS idx_listing_verification_run_items_claim
 -- their authoritative stores.
 CREATE TABLE IF NOT EXISTS listing_replay_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  manifest_version INTEGER NOT NULL CHECK (manifest_version > 0),
   manifest_sha256 TEXT NOT NULL UNIQUE,
   manifest_capture_count INTEGER NOT NULL CHECK (manifest_capture_count > 0),
   status TEXT NOT NULL DEFAULT 'queued'
@@ -3372,7 +3371,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  'ef344cdb9cf9a7ffcd0ae66e1c9cb3979afa07c1155377cee5dc1031dd0d47c1',
+  '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 
