@@ -2268,6 +2268,12 @@ pub fn validate_source_url(source_url: &str) -> Result<()> {
     }
 }
 
+const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
+- Treat each avionics manufacturer/model as a literal listing observation, not a canonical catalog identity. The selected source_evidence_text must support the returned manufacturer and model spelling. Do not add, expand, correct, or normalize a familiar series prefix, product family, or manufacturer name from memory or from another source span.\n\
+- A source-authored shared prefix inside one evidence span may support multiple rows, but keep each right-hand shorthand model literal. From Garmin GTN 750 & 650, return manufacturer Garmin with model GTN 750 for the first row and model 650 for the second row; do not invent GTN 650.\n\
+- Preserve source-authored labels and typography. From Garmin G3X Touchscreen PFD/MFD use model G3X Touchscreen, not G3X Touch; from Garmin 255 Nav/Com use model 255, not GNC 255; from JPI 830 engine monitor use model 830, not EDM 830; and from Garmin GFC500 Autopilot use model GFC500, not GFC 500.\n\
+- Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation. If the selected evidence cannot support a useful literal manufacturer/model identity, omit that occurrence instead of inventing one.\n";
+
 fn build_extraction_prompt(listing_text: &str) -> String {
     format!(
         "Extract one complete aircraft sale listing object from the listing text. Return one JSON object that satisfies the enforced response schema.\n\
@@ -2296,6 +2302,7 @@ Rules:\n\
 - model and variant are allowed to be identical only when the listing gives no more specific designation than the family name.\n\
 - Do not convert model names to ICAO type designators.\n\
 - avionics must come from the listing text and should include fixed installed avionics only.\n\
+{LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
 - Each physical avionics product must appear once. Its types array may contain multiple independently supported atomic capabilities; do not emit duplicate product rows merely to represent GPS, transponder, navigation, communications, or other functions separately. Represent a combined NAV/COM unit with both NAV and COM, never a composite NAV/COM type. Use [Unknown] only when the listing gives no usable capability.\n\
 - An Integrated Flight Deck identity may establish that one core category. Every additional type on that suite row must be explicitly named in the same source_evidence_text, and a capability assigned to a separately extracted component must not also be assigned to the suite.\n\
 - When the listing explicitly enumerates multiple installed units of the exact same product (for example unit #1 and unit #2, dual identical radios, or Garmin G5 attitude plus Garmin G5 HSI), emit one avionics row with quantity equal to the supported installed count. Copy one exact source_evidence_text span that covers every counted list item. Do not emit one row per serial position. Distinct complementary attitude and HSI installation roles in adjacent comma- or semicolon-delimited equipment items prove separate physical units; repeated mentions in narrative text, repeated copies of the same role, or different model suffixes do not.\n\
@@ -2305,10 +2312,9 @@ Rules:\n\
 - For replaces/removes, replaces must identify the concrete displaced unit. For removes with no new unit, use the removed unit as both the item identity and replaces identity. For installed, replaces must be null.\n\
 - valuation_facts contains only source-backed facts material to value. Allowed kinds are restoration, damage_history, log_completeness, paint_condition, interior_condition, engine_conversion, airframe_conversion, and major_modification.\n\
 - For each valuation fact, value is a concise normalized description, evidence_text is a short exact span copied from the listing, and confidence is high, medium, or low. Omit facts that are not explicitly supported; do not infer that an unmentioned damage history means no damage.\n\
-- For avionics model labels, preserve the full identifiable unit or suite code from the listing. Do not return bare numbers or generic labels such as 50, 60, 300, 440, 540, GPS, NAV/COM, Autopilot, or Transponder unless that exact bare label is the only supported identifier in the source text.\n\
+- For avionics model labels, use the fullest useful literal unit or suite token present in the selected evidence. Do not return bare numbers or generic labels such as 50, 60, 300, 440, 540, GPS, NAV/COM, Autopilot, or Transponder unless that exact bare label is the only supported identifier in the source text.\n\
 - Preserve an ambiguous attached trailing letter exactly as written in the listing. In particular, when quantity wording attaches s or S to a product token (for example, 3 Garmin GI275s), return the source token GI275s rather than singularizing it to GI275 or deciding it is model GI275S. Later catalog curation, not listing extraction, resolves that ambiguity.\n\
 - Keep generic certification, approval, and feature annotations outside the model label. Extract KMA 20 rather than KMA 20 TSO and KT 75 rather than KT 75 TSO. A standalone WAAS immediately before a slash-delimited capability list is an annotation, not automatically part of the model: from Garmin GTN 750 WAAS GPS/NAV/COM return manufacturer Garmin, model GTN 750, types [GPS, NAV, COM], and source_evidence_text Garmin GTN 750 WAAS GPS/NAV/COM. For an identity that already has an attached W designator, IFR between the redundant WAAS label and that capability list is also an annotation, never a type: from Garmin GNS 530W WAAS IFR GPS/NAV/COM preserve model GNS 530W and return types [GPS, NAV, COM]. Preserve actual attached or marketed designators such as W, Xi, NXi, R, and ES exactly.\n\
-- When a listing gives enough surrounding context to identify a common avionics unit, return that unit label, for example IFD 540 instead of 540, IFD 440 instead of 440, S-TEC 55X instead of System 55X, and Century 2000 instead of Autopilot.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
 Listing text:\n{listing_text}"
     )
@@ -2327,6 +2333,7 @@ fn build_listing_avionics_correction_prompt(
         "Correct only the avionics extraction from one aircraft sale listing.\n\
 Return exactly one JSON object with one member named avionics. The avionics value must be the complete replacement array in the current occurrence schema; do not return a patch, aircraft fields, price, hours, valuation facts, visual results, explanations, or extra keys.\n\n\
 Correction rules:\n\
+{LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
 - Use only fixed installed avionics explicitly supported by the listing text.\n\
 - Emit each physical product exactly once with all and only its intrinsic capabilities and the supported installed quantity.\n\
 - Keep distinct products separate. Never assign an external autopilot, display, sensor, servo, indicator, or receiver capability to another product.\n\
@@ -3121,8 +3128,14 @@ fn gemini_listing_avionics_item_schema() -> Value {
         "type": "object",
         "nullable": true,
         "properties": {
-            "manufacturer": {"type": "string"},
-            "model": {"type": "string"},
+            "manufacturer": {
+                "type": "string",
+                "description": "Literal manufacturer spelling supported by this occurrence's source_evidence_text; never expand or canonicalize it from product knowledge."
+            },
+            "model": {
+                "type": "string",
+                "description": "Literal model spelling supported by this occurrence's source_evidence_text, preserving source prefixes, spacing, punctuation, and suffixes without familiar-name expansion."
+            },
             "types": types_schema.clone()
         },
         "required": ["manufacturer", "model", "types"],
@@ -3131,8 +3144,14 @@ fn gemini_listing_avionics_item_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "manufacturer": {"type": "string"},
-            "model": {"type": "string"},
+            "manufacturer": {
+                "type": "string",
+                "description": "Literal manufacturer spelling supported by source_evidence_text; never expand or canonicalize it from product knowledge."
+            },
+            "model": {
+                "type": "string",
+                "description": "Literal model spelling supported by source_evidence_text, preserving source prefixes, spacing, punctuation, and suffixes without familiar-name expansion."
+            },
             "types": types_schema,
             "quantity": {"type": "integer"},
             "configuration_action": {
@@ -4241,7 +4260,8 @@ mod tests {
         build_avionics_metadata_prompt, build_avionics_unit_concreteness_prompt,
         build_avionics_unit_resolution_correction_prompt, build_avionics_unit_resolution_prompt,
         build_avionics_unit_resolution_research_prompt, build_extraction_prompt,
-        configure_avionics_authoritative_direct_sources, effective_avionics_publisher_anchors,
+        build_listing_avionics_correction_prompt, configure_avionics_authoritative_direct_sources,
+        effective_avionics_publisher_anchors,
         gemini_avionics_approved_candidate_adjudication_response_schema,
         gemini_avionics_candidate_triage_response_schema,
         gemini_avionics_catalog_collision_review_response_schema,
@@ -4757,6 +4777,58 @@ mod tests {
         assert!(prompt.contains("Later catalog curation, not listing extraction"));
         assert!(prompt.contains("Aircraft Condition values such as New or Used never establish"));
         assert!(prompt.contains("offer availability of InStock establishes active"));
+    }
+
+    #[test]
+    fn listing_avionics_prompts_and_schema_require_literal_source_identities() {
+        let listing_text = "Garmin GTN 750 & 650; Garmin G3X Touchscreen PFD/MFD; Garmin 255 Nav/Com; JPI 830 engine monitor; Garmin GFC500 Autopilot";
+        let primary = build_extraction_prompt(listing_text);
+        let correction = build_listing_avionics_correction_prompt(
+            listing_text,
+            &json!([]),
+            "source_evidence_text is not one exact bounded source excerpt containing the candidate identity",
+        );
+
+        for prompt in [&primary, &correction] {
+            for required in [
+                "literal listing observation, not a canonical catalog identity",
+                "model GTN 750 for the first row and model 650 for the second row",
+                "do not invent GTN 650",
+                "model G3X Touchscreen, not G3X Touch",
+                "model 255, not GNC 255",
+                "model 830, not EDM 830",
+                "model GFC500, not GFC 500",
+                "Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation",
+                "omit that occurrence instead of inventing one",
+            ] {
+                assert!(prompt.contains(required), "missing {required:?}");
+            }
+            assert!(!prompt.contains("IFD 540 instead of 540"));
+            assert!(!prompt.contains("S-TEC 55X instead of System 55X"));
+            assert!(!prompt.contains("Century 2000 instead of Autopilot"));
+        }
+
+        let schema = gemini_listing_avionics_item_schema();
+        let manufacturer_description = schema["properties"]["manufacturer"]["description"]
+            .as_str()
+            .expect("manufacturer description");
+        let model_description = schema["properties"]["model"]["description"]
+            .as_str()
+            .expect("model description");
+        assert!(manufacturer_description.contains("Literal manufacturer spelling"));
+        assert!(manufacturer_description.contains("never expand or canonicalize"));
+        assert!(model_description.contains("Literal model spelling"));
+        assert!(model_description.contains("without familiar-name expansion"));
+        assert_eq!(
+            schema["properties"]["replaces"]["properties"]["manufacturer"]["description"],
+            "Literal manufacturer spelling supported by this occurrence's source_evidence_text; never expand or canonicalize it from product knowledge."
+        );
+        assert!(
+            schema["properties"]["replaces"]["properties"]["model"]["description"]
+                .as_str()
+                .expect("replacement model description")
+                .contains("without familiar-name expansion")
+        );
     }
 
     #[test]
