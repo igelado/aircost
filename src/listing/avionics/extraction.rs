@@ -192,7 +192,7 @@ impl AvionicsValidationRule {
                 "ambiguous Controller quantity evidence cannot have high source confidence"
             }
             Self::QuantityMismatch => {
-                "one normalized product must appear once, and quantity greater than one cannot have high source confidence"
+                "occurrence duplicates an earlier normalized manufacturer/model identity, or quantity greater than one cannot have high source confidence"
             }
             Self::QuantityEvidenceIncomplete => {
                 "source_evidence_text does not cover the complete bounded Controller quantity ambiguity"
@@ -2745,6 +2745,7 @@ Advisory System)";
         let mut payload = installed("Garmin", "GIA-63W", evidence);
         payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
 
         let parsed = validate_unbound_current_avionics_extraction(
             &payload.to_string(),
