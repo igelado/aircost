@@ -27,6 +27,7 @@ const CLEAN_TARGET_NONEMPTY_TABLES: &[&str] = &[
     "users",
     "plugin_installs",
     "plugin_submissions",
+    "listing_replay_submission_inventory_lock",
     "aircraft_markets",
     "aircraft_manufacturers",
     "aircraft_models",
@@ -524,6 +525,23 @@ async fn validate_capture_domain(
     if orphan_installs != 0 {
         bail!("clean catalog target contains plugin installs without retained captures");
     }
+    require_exact_count(
+        target,
+        "listing_replay_submission_inventory_lock",
+        r#"SELECT COUNT(*)
+           FROM listing_replay_submission_inventory_lock inventory
+           WHERE inventory.singleton_id = 1
+             AND inventory.active_run_id IS NULL
+             AND inventory.concurrency_token >= (
+               SELECT COUNT(*) FROM plugin_submissions
+             )
+             AND (
+               (SELECT COUNT(*) FROM plugin_submissions) <> 0
+               OR inventory.concurrency_token = 0
+             )"#,
+        1,
+    )
+    .await?;
     Ok(count_rows(target, "plugin_submissions").await? as usize)
 }
 
@@ -1014,8 +1032,20 @@ mod tests {
         capture
     }
 
+    async fn reset_sqlite_inventory_token(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "UPDATE listing_replay_submission_inventory_lock \
+             SET concurrency_token = (SELECT COUNT(*) FROM plugin_submissions) \
+             WHERE singleton_id = 1 AND active_run_id IS NULL",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct SqliteReplayBoundary {
+        inventory: (i64, Option<i64>, i64),
         users: Vec<(i64, String, String, String, String, String, String)>,
         installs: Vec<(i64, i64, String, String, Option<String>)>,
         submissions: Vec<(
@@ -1035,6 +1065,13 @@ mod tests {
 
     async fn sqlite_replay_boundary(pool: &sqlx::SqlitePool) -> SqliteReplayBoundary {
         SqliteReplayBoundary {
+            inventory: sqlx::query_as(
+                "SELECT singleton_id, active_run_id, concurrency_token \
+                 FROM listing_replay_submission_inventory_lock",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
             users: sqlx::query_as(
                 "SELECT id, email, display_name, auth_provider, auth_subject, created_at, updated_at FROM users ORDER BY id",
             )
@@ -1056,7 +1093,9 @@ mod tests {
         }
     }
 
-    async fn postgres_replay_boundary(pool: &sqlx::PgPool) -> (String, String, String) {
+    async fn postgres_replay_boundary(
+        pool: &sqlx::PgPool,
+    ) -> (String, String, String, (i64, Option<i64>, i64)) {
         let users = sqlx::query_scalar(
             r#"SELECT COALESCE(
                  pg_catalog.json_agg(pg_catalog.row_to_json(boundary) ORDER BY boundary.id),
@@ -1099,7 +1138,14 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        (users, installs, submissions)
+        let inventory = sqlx::query_as(
+            "SELECT singleton_id, active_run_id, concurrency_token \
+             FROM listing_replay_submission_inventory_lock",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (users, installs, submissions, inventory)
     }
 
     #[test]
@@ -1109,6 +1155,7 @@ mod tests {
             .copied()
             .collect::<BTreeSet<_>>();
         assert!(allowlist.contains("plugin_submissions"));
+        assert!(allowlist.contains("listing_replay_submission_inventory_lock"));
         assert!(allowlist.contains("schema_migration_contracts"));
         assert!(!allowlist.contains("aircraft_sale_listings"));
         assert!(!allowlist.contains("avionics_models"));
@@ -1404,6 +1451,7 @@ mod tests {
                 .unwrap();
         insert_sqlite_signed_capture(pool, developer_id).await;
         let replay_before = sqlite_replay_boundary(pool).await;
+        assert_eq!(replay_before.inventory, (1, None, 1));
         let report = seed_verified_catalog(
             &source,
             &target,
@@ -1560,6 +1608,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        reset_sqlite_inventory_token(pool).await;
 
         sqlx::query(
             r#"CREATE TRIGGER reject_catalog_seed
@@ -1683,6 +1732,7 @@ mod tests {
             .await
             .unwrap();
 
+        reset_sqlite_inventory_token(pool).await;
         assert_eq!(sqlite_replay_boundary(pool).await, valid_boundary);
         materialize(&target, &projection).await.unwrap();
         assert_eq!(sqlite_replay_boundary(pool).await, valid_boundary);
@@ -1838,6 +1888,7 @@ mod tests {
         .await
         .unwrap();
         let replay_before = postgres_replay_boundary(pool).await;
+        assert_eq!(replay_before.3, (1, None, 1));
 
         // The same deterministic lock set used by apply conflicts with the
         // ROW EXCLUSIVE lock taken by ordinary INSERT/UPDATE/DELETE traffic.

@@ -242,12 +242,12 @@ const AIRCRAFT_VISUAL_SOURCE_CORRECTIONS_CONTRACT_FINGERPRINT: &str =
 const LISTING_REPLAY_RUNS_MIGRATION: &str = "20260819_listing_replay_runs";
 const LISTING_REPLAY_RUNS_CONTRACT_VERSION: i64 = 1;
 // SHA-256 of
-// `20260819_listing_replay_runs:unversioned-manifest-identity:exact-replay-ledger-contract`.
+// `20260819_listing_replay_runs:unversioned-manifest-identity:submission-inventory-arbiter`.
 const LISTING_REPLAY_RUNS_CONTRACT_FINGERPRINT: &str =
-    "41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a";
+    "3e7c0b39b66e681be397bddbc943c75793b18bac71eacc7324b08a067ef3ff01";
 const POSTGRES_LISTING_REPLAY_CHECKS_FINGERPRINT: &str =
-    "a80c28cfeeeecd8bf83e130603fd8d81bd3e7c2354b486daa8123a4b084d6791";
-const POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT: &str = "7e885abd1d361c7c831c84e5e3a58e1d";
+    "2b39e2e07524d1bdeac1a4de426ba0191345aef0eb2727fe7d19f6797f088614";
+const POSTGRES_LISTING_REPLAY_FUNCTIONS_FINGERPRINT: &str = "85113e4bdd9f91dd37f4263de4f9f618";
 const SQLITE_CORRECTION_DECISION_UPDATE_TRIGGER: &str = r#"
 CREATE TRIGGER aircraft_listing_identity_corrections_immutable_update
 BEFORE UPDATE ON aircraft_listing_identity_correction_decisions
@@ -4595,6 +4595,10 @@ impl AppDb {
                   ) OR NOT EXISTS (
                     SELECT 1 FROM sqlite_schema
                     WHERE type = 'table'
+                      AND name = 'listing_replay_submission_inventory_lock'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'table'
                       AND name = 'plugin_submission_materialization_receipts'
                   ) OR NOT EXISTS (
                     SELECT 1 FROM sqlite_schema
@@ -4637,6 +4641,45 @@ impl AppDb {
                   ) OR NOT EXISTS (
                     SELECT 1 FROM sqlite_schema
                     WHERE type = 'trigger'
+                      AND name = 'plugin_submissions_active_replay_membership_frozen_insert'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'plugin_submissions_active_replay_membership_frozen_delete'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
+                      AND name = 'plugin_submissions_active_replay_membership_frozen_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'listing_replay_submission_inventory_lock_no_insert'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'listing_replay_submission_inventory_lock_no_delete'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'listing_replay_submission_inventory_lock_no_identity_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'users_active_replay_capture_identity_frozen_insert'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'users_active_replay_capture_identity_frozen_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'users_active_replay_capture_identity_frozen_delete'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'plugin_installs_active_replay_capture_identity_frozen_insert'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'plugin_installs_active_replay_capture_identity_frozen_update'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+                      AND name = 'plugin_installs_active_replay_capture_identity_frozen_delete'
+                  ) OR NOT EXISTS (
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type = 'trigger'
                       AND name = 'plugin_installs_replay_identity_immutable'
                   ) OR (
                     SELECT COUNT(*) FROM pragma_table_info('listing_replay_runs')
@@ -4667,6 +4710,9 @@ impl AppDb {
                     pg_catalog.to_regclass('public.listing_replay_runs') IS NULL
                     OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NULL
                     OR pg_catalog.to_regclass(
+                      'public.listing_replay_submission_inventory_lock'
+                    ) IS NULL
+                    OR pg_catalog.to_regclass(
                       'public.plugin_submission_materialization_receipts'
                     ) IS NULL
                     OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NULL
@@ -4682,9 +4728,15 @@ impl AppDb {
                           'listing_replay_run_items_completed_immutable',
                           'plugin_submission_materialization_receipts_immutable',
                           'plugin_submissions_replay_checkpoint_immutable',
-                          'plugin_installs_replay_identity_immutable'
+                          'plugin_submissions_active_replay_membership_frozen',
+                          'plugin_submissions_active_replay_membership_frozen_truncate',
+                          'plugin_installs_replay_identity_immutable',
+                          'listing_replay_submission_inventory_lock_protected',
+                          'listing_replay_submission_inventory_lock_truncate_protected',
+                          'users_active_replay_capture_identity_frozen',
+                          'plugin_installs_active_replay_capture_identity_frozen'
                         )
-                      HAVING COUNT(*) = 5
+                      HAVING COUNT(*) = 11
                     )
                     OR (
                       SELECT COUNT(*) FROM pg_catalog.pg_attribute
@@ -4723,6 +4775,7 @@ impl AppDb {
                   SELECT 1 FROM sqlite_schema
                   WHERE name IN (
                     'listing_replay_runs', 'listing_replay_run_items',
+                    'listing_replay_submission_inventory_lock',
                     'plugin_submission_materialization_receipts',
                     'idx_listing_replay_runs_one_running',
                     'idx_listing_replay_run_items_phase',
@@ -4734,6 +4787,18 @@ impl AppDb {
                     'plugin_submission_materialization_receipts_immutable_update',
                     'plugin_submission_materialization_receipts_immutable_delete',
                     'plugin_submissions_replay_checkpoint_immutable',
+                    'plugin_submissions_active_replay_membership_frozen_insert',
+                    'plugin_submissions_active_replay_membership_frozen_delete',
+                    'plugin_submissions_active_replay_membership_frozen_update',
+                    'listing_replay_submission_inventory_lock_no_insert',
+                    'listing_replay_submission_inventory_lock_no_delete',
+                    'listing_replay_submission_inventory_lock_no_identity_update',
+                    'users_active_replay_capture_identity_frozen_insert',
+                    'users_active_replay_capture_identity_frozen_update',
+                    'users_active_replay_capture_identity_frozen_delete',
+                    'plugin_installs_active_replay_capture_identity_frozen_insert',
+                    'plugin_installs_active_replay_capture_identity_frozen_update',
+                    'plugin_installs_active_replay_capture_identity_frozen_delete',
                     'plugin_installs_replay_identity_immutable'
                   )
                 )
@@ -4748,6 +4813,9 @@ impl AppDb {
                     r#"
                 SELECT pg_catalog.to_regclass('public.listing_replay_runs') IS NOT NULL
                   OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NOT NULL
+                  OR pg_catalog.to_regclass(
+                    'public.listing_replay_submission_inventory_lock'
+                  ) IS NOT NULL
                   OR pg_catalog.to_regclass(
                     'public.plugin_submission_materialization_receipts'
                   ) IS NOT NULL
@@ -4767,7 +4835,13 @@ impl AppDb {
                       'listing_replay_run_items_completed_immutable',
                       'plugin_submission_materialization_receipts_immutable',
                       'plugin_submissions_replay_checkpoint_immutable',
-                      'plugin_installs_replay_identity_immutable'
+                      'plugin_submissions_active_replay_membership_frozen',
+                      'plugin_submissions_active_replay_membership_frozen_truncate',
+                      'plugin_installs_replay_identity_immutable',
+                      'listing_replay_submission_inventory_lock_protected',
+                      'listing_replay_submission_inventory_lock_truncate_protected',
+                      'users_active_replay_capture_identity_frozen',
+                      'plugin_installs_active_replay_capture_identity_frozen'
                     )
                   )
                 "#,
@@ -6220,6 +6294,7 @@ impl AppDb {
                     WHERE type = 'table'
                       AND name IN (
                         'listing_replay_runs', 'listing_replay_run_items',
+                        'listing_replay_submission_inventory_lock',
                         'plugin_submission_materialization_receipts'
                       )
                     ORDER BY name
@@ -6240,6 +6315,14 @@ impl AppDb {
                         "listing_replay_runs",
                         canonical_sqlite_table_definition(SQLITE_SCHEMA_SQL, "listing_replay_runs")
                             .expect("canonical replay run table must exist"),
+                    ),
+                    (
+                        "listing_replay_submission_inventory_lock",
+                        canonical_sqlite_table_definition(
+                            SQLITE_SCHEMA_SQL,
+                            "listing_replay_submission_inventory_lock",
+                        )
+                        .expect("canonical replay inventory lock table must exist"),
                     ),
                     (
                         "plugin_submission_materialization_receipts",
@@ -6320,6 +6403,7 @@ impl AppDb {
                       SELECT 1 FROM sqlite_schema
                       WHERE tbl_name IN (
                         'listing_replay_runs', 'listing_replay_run_items',
+                        'listing_replay_submission_inventory_lock',
                         'plugin_submission_materialization_receipts'
                       )
                         AND (
@@ -6331,7 +6415,10 @@ impl AppDb {
                               'listing_replay_run_items_completed_immutable_update',
                               'listing_replay_run_items_completed_immutable_delete',
                               'plugin_submission_materialization_receipts_immutable_update',
-                              'plugin_submission_materialization_receipts_immutable_delete'
+                              'plugin_submission_materialization_receipts_immutable_delete',
+                              'listing_replay_submission_inventory_lock_no_insert',
+                              'listing_replay_submission_inventory_lock_no_delete',
+                              'listing_replay_submission_inventory_lock_no_identity_update'
                             )
                           )
                           OR (
@@ -6342,6 +6429,7 @@ impl AppDb {
                               'sqlite_autoindex_listing_replay_runs_1',
                               'sqlite_autoindex_listing_replay_run_items_1',
                               'sqlite_autoindex_listing_replay_run_items_2',
+                              'sqlite_autoindex_listing_replay_submission_inventory_lock_1',
                               'sqlite_autoindex_plugin_submission_materialization_receipts_1'
                             )
                           )
@@ -6350,9 +6438,10 @@ impl AppDb {
                       SELECT COUNT(*) FROM sqlite_schema
                       WHERE type = 'index' AND tbl_name IN (
                         'listing_replay_runs', 'listing_replay_run_items',
+                        'listing_replay_submission_inventory_lock',
                         'plugin_submission_materialization_receipts'
                       )
-                    ) = 6
+                    ) = 7
                     "#,
                 )
                 .fetch_one(&mut **pool)
@@ -6363,11 +6452,14 @@ impl AppDb {
                     SELECT NOT EXISTS (
                       SELECT 1 FROM sqlite_schema
                       WHERE type = 'trigger'
-                        AND tbl_name IN ('plugin_submissions', 'plugin_installs')
+                        AND tbl_name IN ('plugin_submissions', 'plugin_installs', 'users')
                         AND NOT (
                           (
                             tbl_name = 'plugin_submissions'
                             AND name IN (
+                              'plugin_submissions_active_replay_membership_frozen_delete',
+                              'plugin_submissions_active_replay_membership_frozen_insert',
+                              'plugin_submissions_active_replay_membership_frozen_update',
                               'plugin_submissions_replay_checkpoint_immutable',
                               'listing_avionics_authorizations_invalidate_capture_delete',
                               'listing_avionics_authorizations_invalidate_capture_update'
@@ -6375,7 +6467,20 @@ impl AppDb {
                           )
                           OR (
                             tbl_name = 'plugin_installs'
-                            AND name = 'plugin_installs_replay_identity_immutable'
+                            AND name IN (
+                              'plugin_installs_replay_identity_immutable',
+                              'plugin_installs_active_replay_capture_identity_frozen_insert',
+                              'plugin_installs_active_replay_capture_identity_frozen_update',
+                              'plugin_installs_active_replay_capture_identity_frozen_delete'
+                            )
+                          )
+                          OR (
+                            tbl_name = 'users'
+                            AND name IN (
+                              'users_active_replay_capture_identity_frozen_insert',
+                              'users_active_replay_capture_identity_frozen_update',
+                              'users_active_replay_capture_identity_frozen_delete'
+                            )
                           )
                         )
                     )
@@ -6417,11 +6522,23 @@ impl AppDb {
                     "listing_replay_run_items_checkpoint_exact_update",
                     "listing_replay_run_items_completed_immutable_delete",
                     "listing_replay_run_items_completed_immutable_update",
+                    "listing_replay_submission_inventory_lock_no_delete",
+                    "listing_replay_submission_inventory_lock_no_identity_update",
+                    "listing_replay_submission_inventory_lock_no_insert",
+                    "plugin_installs_active_replay_capture_identity_frozen_delete",
+                    "plugin_installs_active_replay_capture_identity_frozen_insert",
+                    "plugin_installs_active_replay_capture_identity_frozen_update",
                     "plugin_installs_replay_identity_immutable",
                     "plugin_submission_materialization_receipts_immutable_delete",
                     "plugin_submission_materialization_receipts_immutable_update",
+                    "plugin_submissions_active_replay_membership_frozen_delete",
+                    "plugin_submissions_active_replay_membership_frozen_insert",
+                    "plugin_submissions_active_replay_membership_frozen_update",
                     "plugin_submissions_replay_checkpoint_immutable",
                     "uq_aircraft_sale_listings_owner_source",
+                    "users_active_replay_capture_identity_frozen_delete",
+                    "users_active_replay_capture_identity_frozen_insert",
+                    "users_active_replay_capture_identity_frozen_update",
                 ];
                 let exact_guard_definitions = sqlx::query_as::<_, (String, Option<String>)>(
                     r#"
@@ -6431,11 +6548,23 @@ impl AppDb {
                       'listing_replay_run_items_checkpoint_exact_update',
                       'listing_replay_run_items_completed_immutable_delete',
                       'listing_replay_run_items_completed_immutable_update',
+                      'listing_replay_submission_inventory_lock_no_delete',
+                      'listing_replay_submission_inventory_lock_no_identity_update',
+                      'listing_replay_submission_inventory_lock_no_insert',
+                      'plugin_installs_active_replay_capture_identity_frozen_delete',
+                      'plugin_installs_active_replay_capture_identity_frozen_insert',
+                      'plugin_installs_active_replay_capture_identity_frozen_update',
                       'plugin_installs_replay_identity_immutable',
                       'plugin_submission_materialization_receipts_immutable_delete',
                       'plugin_submission_materialization_receipts_immutable_update',
+                      'plugin_submissions_active_replay_membership_frozen_delete',
+                      'plugin_submissions_active_replay_membership_frozen_insert',
+                      'plugin_submissions_active_replay_membership_frozen_update',
                       'plugin_submissions_replay_checkpoint_immutable',
-                      'uq_aircraft_sale_listings_owner_source'
+                      'uq_aircraft_sale_listings_owner_source',
+                      'users_active_replay_capture_identity_frozen_delete',
+                      'users_active_replay_capture_identity_frozen_insert',
+                      'users_active_replay_capture_identity_frozen_update'
                     )
                     ORDER BY name
                     "#,
@@ -6457,6 +6586,30 @@ impl AppDb {
                                 })
                         },
                     );
+                let inventory_is_exact = sqlx::query_scalar::<_, i64>(
+                    r#"SELECT (SELECT COUNT(*)
+                               FROM listing_replay_submission_inventory_lock) = 1
+                         AND EXISTS (
+                           SELECT 1 FROM listing_replay_submission_inventory_lock inventory
+                           WHERE inventory.singleton_id = 1
+                             AND inventory.concurrency_token >= 0
+                             AND (
+                               (inventory.active_run_id IS NULL AND NOT EXISTS (
+                                 SELECT 1 FROM listing_replay_runs WHERE status = 'running'
+                               )) OR (
+                                 inventory.active_run_id IS NOT NULL
+                                 AND (SELECT COUNT(*) FROM listing_replay_runs
+                                      WHERE status = 'running') = 1
+                                 AND EXISTS (SELECT 1 FROM listing_replay_runs
+                                             WHERE id = inventory.active_run_id
+                                               AND status = 'running')
+                               )
+                             )
+                         )"#,
+                )
+                .fetch_one(&mut **pool)
+                .await?
+                    != 0;
 
                 let running_predicate_is_exact = running_index
                     .as_ref()
@@ -6480,6 +6633,7 @@ impl AppDb {
                     && attached_objects_are_closed
                     && plugin_attached_triggers_are_closed
                     && exact_guards_are_canonical
+                    && inventory_is_exact
                     && unique_column_sets == ["run_id,plugin_submission_id", "run_id,position"])
             }
             GateConnection::Postgres(pool) => {
@@ -6501,6 +6655,9 @@ impl AppDb {
                         ('listing_replay_runs', 9, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
                         ('listing_replay_runs', 10, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
                         ('listing_replay_runs', 11, 'completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_submission_inventory_lock', 1, 'singleton_id', 'bigint', TRUE, '', ''),
+                        ('listing_replay_submission_inventory_lock', 2, 'active_run_id', 'bigint', FALSE, '', ''),
+                        ('listing_replay_submission_inventory_lock', 3, 'concurrency_token', 'bigint', TRUE, '', '0'),
                         ('listing_replay_run_items', 1, 'id', 'bigint', TRUE, 'd', ''),
                         ('listing_replay_run_items', 2, 'run_id', 'bigint', TRUE, '', ''),
                         ('listing_replay_run_items', 3, 'plugin_submission_id', 'bigint', TRUE, '', ''),
@@ -6551,6 +6708,7 @@ impl AppDb {
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND attribute.attnum > 0 AND NOT attribute.attisdropped
@@ -6571,6 +6729,7 @@ impl AppDb {
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                     ), replay_indexes AS (
@@ -6657,6 +6816,9 @@ impl AppDb {
                         pg_catalog.to_regclass('public.listing_replay_runs'),
                         pg_catalog.to_regclass('public.listing_replay_run_items'),
                         pg_catalog.to_regclass(
+                          'public.listing_replay_submission_inventory_lock'
+                        ),
+                        pg_catalog.to_regclass(
                           'public.plugin_submission_materialization_receipts'
                         )
                       )
@@ -6740,6 +6902,7 @@ impl AppDb {
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'u'
@@ -6823,6 +6986,7 @@ impl AppDb {
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'p'
@@ -6867,6 +7031,7 @@ impl AppDb {
                       WHERE child_namespace.nspname = 'public'
                         AND child.relname IN (
                           'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'f'
@@ -6878,6 +7043,8 @@ impl AppDb {
                         ('listing_replay_runs', 'active_phase = ANY'),
                         ('listing_replay_runs', 'length(btrim(owner_token))'),
                         ('listing_replay_runs', 'heartbeat_at_epoch_seconds IS NOT NULL'),
+                        ('listing_replay_submission_inventory_lock', 'singleton_id = 1'),
+                        ('listing_replay_submission_inventory_lock', 'concurrency_token >= 0'),
                         ('listing_replay_run_items', '"position" >= 0'),
                         ('listing_replay_run_items', 'expected_rendered_html_sha256'),
                         ('listing_replay_run_items', 'extracted_listing_sha256'),
@@ -6912,12 +7079,13 @@ impl AppDb {
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 39 FROM actual_columns)
+                      (SELECT COUNT(*) = 42 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
@@ -6931,7 +7099,7 @@ impl AppDb {
                             AND actual.default_expression = expected.default_expression
                         )
                       )
-                      AND (SELECT COUNT(*) = 3 FROM replay_relations)
+                      AND (SELECT COUNT(*) = 4 FROM replay_relations)
                       AND NOT EXISTS (
                         SELECT 1 FROM replay_relations
                         WHERE relation_oid IS DISTINCT FROM pg_catalog.to_regclass(
@@ -6948,21 +7116,50 @@ impl AppDb {
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         ) AND NOT trigger_definition.tgisinternal
-                          AND trigger_definition.tgname NOT IN (
-                            'listing_replay_run_items_checkpoint_exact',
-                            'listing_replay_run_items_completed_immutable',
-                            'plugin_submission_materialization_receipts_immutable'
+                          AND NOT (
+                            (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.listing_replay_run_items'
+                              )
+                              AND trigger_definition.tgname IN (
+                                'listing_replay_run_items_checkpoint_exact',
+                                'listing_replay_run_items_completed_immutable'
+                              )
+                            ) OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.listing_replay_submission_inventory_lock'
+                              )
+                              AND trigger_definition.tgname IN (
+                                'listing_replay_submission_inventory_lock_protected',
+                                'listing_replay_submission_inventory_lock_truncate_protected'
+                              )
+                            ) OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.plugin_submission_materialization_receipts'
+                              )
+                              AND trigger_definition.tgname =
+                                'plugin_submission_materialization_receipts_immutable'
+                            )
                           )
                       )
+                      AND (SELECT COUNT(*) = 0
+                        FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE trigger_definition.tgrelid = pg_catalog.to_regclass(
+                          'public.listing_replay_runs'
+                        ) AND NOT trigger_definition.tgisinternal)
                       AND NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_trigger trigger_definition
                         WHERE NOT trigger_definition.tgisinternal
                           AND trigger_definition.tgrelid IN (
                             pg_catalog.to_regclass('public.plugin_submissions'),
-                            pg_catalog.to_regclass('public.plugin_installs')
+                            pg_catalog.to_regclass('public.plugin_installs'),
+                            pg_catalog.to_regclass('public.users')
                           )
                           AND NOT (
                             (
@@ -6970,6 +7167,8 @@ impl AppDb {
                                 'public.plugin_submissions'
                               )
                               AND trigger_definition.tgname IN (
+                                'plugin_submissions_active_replay_membership_frozen',
+                                'plugin_submissions_active_replay_membership_frozen_truncate',
                                 'plugin_submissions_replay_checkpoint_immutable',
                                 'listing_avionics_authorizations_invalidate_capture_delete',
                                 'listing_avionics_authorizations_invalidate_capture_update'
@@ -6979,8 +7178,17 @@ impl AppDb {
                               trigger_definition.tgrelid = pg_catalog.to_regclass(
                                 'public.plugin_installs'
                               )
-                              AND trigger_definition.tgname =
+                              AND trigger_definition.tgname IN (
+                                'plugin_installs_active_replay_capture_identity_frozen',
                                 'plugin_installs_replay_identity_immutable'
+                              )
+                            )
+                            OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.users'
+                              )
+                              AND trigger_definition.tgname =
+                                'users_active_replay_capture_identity_frozen'
                             )
                           )
                       )
@@ -6989,6 +7197,9 @@ impl AppDb {
                         WHERE policy_definition.polrelid IN (
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
                           pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
@@ -7000,6 +7211,9 @@ impl AppDb {
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         )
@@ -7010,20 +7224,29 @@ impl AppDb {
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         ) OR inheritance.inhparent IN (
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         )
                       )
-                      AND (SELECT COUNT(*) = 9 FROM replay_attached_indexes)
-                      AND (SELECT COUNT(*) = 3 FROM pg_catalog.pg_trigger trigger_definition
+                      AND (SELECT COUNT(*) = 11 FROM replay_attached_indexes)
+                      AND (SELECT COUNT(*) = 5 FROM pg_catalog.pg_trigger trigger_definition
                         WHERE trigger_definition.tgrelid IN (
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
                           pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
@@ -7096,7 +7319,7 @@ impl AppDb {
                            'source_urlisnotnullandlengthbtrimsource_url>0',
                            'source_urlisnotnullandlengthbtrimsource_url>0::integer'
                          ))
-                      AND (SELECT COUNT(*) = 5
+                      AND (SELECT COUNT(*) = 11
                         FROM pg_catalog.pg_trigger replay_trigger
                         JOIN pg_catalog.pg_proc routine
                           ON routine.oid = replay_trigger.tgfoid
@@ -7105,6 +7328,7 @@ impl AppDb {
                         WHERE NOT replay_trigger.tgisinternal
                           AND replay_trigger.tgenabled = 'O'
                           AND replay_trigger.tgqual IS NULL
+                          AND replay_trigger.tgattr::text = ''
                           AND replay_trigger.tgnargs = 0
                           AND routine_namespace.nspname = 'public'
                           AND routine.proconfig = ARRAY['search_path=pg_catalog']::text[]
@@ -7122,6 +7346,22 @@ impl AppDb {
                             WHERE language.lanname = 'plpgsql'
                           )
                           AND (
+                            (replay_trigger.tgname =
+                               'listing_replay_submission_inventory_lock_protected'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_submission_inventory_lock'
+                             ) AND replay_trigger.tgtype = 31
+                             AND routine.proname =
+                               'protect_replay_submission_inventory_lock')
+                            OR
+                            (replay_trigger.tgname =
+                               'listing_replay_submission_inventory_lock_truncate_protected'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_submission_inventory_lock'
+                             ) AND replay_trigger.tgtype = 34
+                             AND routine.proname =
+                               'protect_replay_submission_inventory_lock_truncate')
+                            OR
                             (replay_trigger.tgname =
                                'listing_replay_run_items_checkpoint_exact'
                              AND replay_trigger.tgrelid = pg_catalog.to_regclass(
@@ -7146,6 +7386,22 @@ impl AppDb {
                                'preserve_replay_materialization_receipt')
                             OR
                             (replay_trigger.tgname =
+                               'plugin_submissions_active_replay_membership_frozen'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submissions'
+                             ) AND replay_trigger.tgtype = 31
+                             AND routine.proname =
+                               'enforce_active_replay_submission_membership')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_submissions_active_replay_membership_frozen_truncate'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submissions'
+                             ) AND replay_trigger.tgtype = 34
+                             AND routine.proname =
+                               'enforce_active_replay_submission_membership')
+                            OR
+                            (replay_trigger.tgname =
                                'plugin_submissions_replay_checkpoint_immutable'
                              AND replay_trigger.tgrelid = pg_catalog.to_regclass(
                                'public.plugin_submissions'
@@ -7154,15 +7410,31 @@ impl AppDb {
                                'enforce_replay_checkpoint_capture_immutability')
                             OR
                             (replay_trigger.tgname =
+                               'plugin_installs_active_replay_capture_identity_frozen'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_installs'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname =
+                               'enforce_active_replay_plugin_install_identity')
+                            OR
+                            (replay_trigger.tgname =
                                'plugin_installs_replay_identity_immutable'
                              AND replay_trigger.tgrelid = pg_catalog.to_regclass(
                                'public.plugin_installs'
                              ) AND replay_trigger.tgtype = 19
                              AND routine.proname =
                                'enforce_replay_plugin_identity_immutability')
+                            OR
+                            (replay_trigger.tgname =
+                               'users_active_replay_capture_identity_frozen'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.users'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname =
+                               'enforce_active_replay_user_identity')
                           ))
                       AND
-                      (SELECT COUNT(*) = 4 FROM replay_unique_constraints)
+                      (SELECT COUNT(*) = 5 FROM replay_unique_constraints)
                       AND NOT EXISTS (
                         SELECT 1 FROM replay_unique_constraints
                         WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
@@ -7201,6 +7473,10 @@ impl AppDb {
                          AND columns = ARRAY['manifest_sha256']::text[])
                       AND
                       (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE relation_name = 'listing_replay_submission_inventory_lock'
+                         AND columns = ARRAY['active_run_id']::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
                        WHERE relation_name = 'listing_replay_run_items'
                          AND columns = ARRAY['run_id', 'position']::text[])
                       AND
@@ -7213,7 +7489,7 @@ impl AppDb {
                       (SELECT COUNT(*) = 1 FROM replay_unique_constraints
                        WHERE relation_name = 'plugin_submission_materialization_receipts'
                          AND columns = ARRAY['aircraft_sale_listing_id']::text[])
-                      AND (SELECT COUNT(*) = 3 FROM replay_primary_keys)
+                      AND (SELECT COUNT(*) = 4 FROM replay_primary_keys)
                       AND NOT EXISTS (
                         SELECT 1 FROM replay_primary_keys
                         WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
@@ -7247,9 +7523,24 @@ impl AppDb {
                            WHERE relation_name = 'listing_replay_run_items'
                              AND columns = ARRAY['id']::text[])
                       AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
+                           WHERE relation_name = 'listing_replay_submission_inventory_lock'
+                             AND columns = ARRAY['singleton_id']::text[])
+                      AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
                            WHERE relation_name = 'plugin_submission_materialization_receipts'
                              AND columns = ARRAY['plugin_submission_id']::text[])
-                      AND (SELECT COUNT(*) = 5 FROM replay_foreign_keys)
+                      AND (SELECT COUNT(*) = 6 FROM replay_foreign_keys)
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'listing_replay_submission_inventory_lock'
+                          AND child_oid = pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          )
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'listing_replay_runs'
+                          AND parent_oid = pg_catalog.to_regclass('public.listing_replay_runs')
+                          AND child_columns = 'active_run_id' AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
                       AND EXISTS (SELECT 1 FROM replay_foreign_keys
                         WHERE child_namespace = 'public'
                           AND child_relation = 'listing_replay_run_items'
@@ -7307,6 +7598,8 @@ impl AppDb {
                       AND (SELECT COUNT(*) = 20 FROM replay_checks
                            WHERE relation_name = 'listing_replay_run_items')
                       AND (SELECT COUNT(*) = 2 FROM replay_checks
+                           WHERE relation_name = 'listing_replay_submission_inventory_lock')
+                      AND (SELECT COUNT(*) = 2 FROM replay_checks
                            WHERE relation_name = 'plugin_submission_materialization_receipts')
                       AND NOT EXISTS (
                         SELECT 1 FROM required_check_fragments required
@@ -7315,6 +7608,27 @@ impl AppDb {
                           WHERE actual.relation_name = required.relation_name
                             AND position(required.fragment IN actual.definition) > 0
                         )
+                      )
+                      AND (SELECT COUNT(*)
+                           FROM public.listing_replay_submission_inventory_lock) = 1
+                      AND EXISTS (
+                        SELECT 1
+                        FROM public.listing_replay_submission_inventory_lock inventory
+                        WHERE inventory.singleton_id = 1
+                          AND inventory.concurrency_token >= 0
+                          AND (
+                            (inventory.active_run_id IS NULL AND NOT EXISTS (
+                              SELECT 1 FROM public.listing_replay_runs
+                              WHERE status = 'running'
+                            )) OR (
+                              inventory.active_run_id IS NOT NULL
+                              AND (SELECT COUNT(*) FROM public.listing_replay_runs
+                                   WHERE status = 'running') = 1
+                              AND EXISTS (SELECT 1 FROM public.listing_replay_runs
+                                          WHERE id = inventory.active_run_id
+                                            AND status = 'running')
+                            )
+                          )
                       )
                     "#,
                 )
@@ -7335,6 +7649,11 @@ impl AppDb {
                     WHERE namespace.nspname = 'public'
                       AND routine.pronargs = 0
                       AND routine.proname IN (
+                        'enforce_active_replay_submission_membership',
+                        'enforce_active_replay_user_identity',
+                        'enforce_active_replay_plugin_install_identity',
+                        'protect_replay_submission_inventory_lock',
+                        'protect_replay_submission_inventory_lock_truncate',
                         'enforce_replay_extraction_checkpoint_exactness',
                         'preserve_completed_replay_item',
                         'preserve_replay_materialization_receipt',
@@ -7362,6 +7681,7 @@ impl AppDb {
                     WHERE namespace.nspname = 'public'
                       AND relation.relname IN (
                         'listing_replay_runs', 'listing_replay_run_items',
+                        'listing_replay_submission_inventory_lock',
                         'plugin_submission_materialization_receipts'
                       )
                       AND constraint_definition.contype = 'c'
@@ -7871,7 +8191,10 @@ impl AppDb {
                     AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
                     AND schema_row.name NOT IN (
                       'avionics_models_approved_concrete_model_insert',
-                      'avionics_models_approved_concrete_model_update'
+                      'avionics_models_approved_concrete_model_update',
+                      'plugin_submissions_active_replay_membership_frozen_delete',
+                      'plugin_submissions_active_replay_membership_frozen_insert',
+                      'plugin_submissions_active_replay_membership_frozen_update'
                     )
                   )
                   UNION ALL
@@ -7968,8 +8291,11 @@ impl AppDb {
             "SELECT count(*), pg_catalog.md5(pg_catalog.string_agg(\
              object_key || '=' || definition, E'\\n' ORDER BY object_key)) \
              FROM ({owned_objects_query}) owned_object(object_key, definition) \
-             WHERE object_key <> \
-               'trigger:avionics_models:avionics_models_approved_concrete_model'"
+             WHERE object_key NOT IN (\
+               'trigger:avionics_models:avionics_models_approved_concrete_model', \
+               'trigger:plugin_submissions:plugin_submissions_active_replay_membership_frozen', \
+               'trigger:plugin_submissions:plugin_submissions_active_replay_membership_frozen_truncate'\
+             )"
         );
         let (object_count, definition_digest) =
             sqlx::query_as::<_, (i64, Option<String>)>(&contract_query)
@@ -11647,7 +11973,10 @@ mod tests {
               contract_fingerprint TEXT NOT NULL,
               installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE users (id INTEGER PRIMARY KEY);
+            CREATE TABLE users (
+              id INTEGER PRIMARY KEY, email TEXT, display_name TEXT,
+              auth_provider TEXT, auth_subject TEXT
+            );
             CREATE TABLE plugin_installs (
               id INTEGER PRIMARY KEY, user_id INTEGER, public_key_base64 TEXT,
               created_at TEXT, revoked_at TEXT
@@ -12205,6 +12534,57 @@ mod tests {
         .unwrap();
         assert!(retained_definition.ends_with("BEGIN SELECT 1; END"));
         assert!(!db.listing_replay_definitions_valid().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_missing_or_weakened_active_replay_membership_freeze() {
+        for (label, trigger_name, replacement) in [
+            (
+                "missing-freeze-insert",
+                "plugin_submissions_active_replay_membership_frozen_insert",
+                None,
+            ),
+            (
+                "missing-freeze-delete",
+                "plugin_submissions_active_replay_membership_frozen_delete",
+                None,
+            ),
+            (
+                "missing-freeze-id-update",
+                "plugin_submissions_active_replay_membership_frozen_update",
+                None,
+            ),
+            (
+                "weakened-freeze-insert",
+                "plugin_submissions_active_replay_membership_frozen_insert",
+                Some(
+                    "CREATE TRIGGER plugin_submissions_active_replay_membership_frozen_insert \
+                     BEFORE INSERT ON plugin_submissions BEGIN SELECT 1; END",
+                ),
+            ),
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let drop_sql = format!("DROP TRIGGER {trigger_name}");
+            sqlx::query(&drop_sql).execute(pool).await.unwrap();
+            if let Some(replacement) = replacement {
+                sqlx::query(replacement).execute(pool).await.unwrap();
+            }
+
+            assert_sqlite_replay_migration_rerun_rejected_without_changes(&db, label).await;
+            assert!(
+                !db.listing_replay_definitions_valid().await.unwrap(),
+                "{label}"
+            );
+            let error = db
+                .ensure_required_migrations()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("20260819_listing_replay_runs.sqlite.sql"));
+        }
     }
 
     #[tokio::test]
@@ -15427,6 +15807,7 @@ mod tests {
                 WHERE namespace.nspname = 'public'
                   AND routine.pronargs = 0
                   AND routine.proname IN (
+                    'enforce_active_replay_submission_membership',
                     'enforce_replay_extraction_checkpoint_exactness',
                     'preserve_completed_replay_item',
                     'preserve_replay_materialization_receipt',
@@ -15565,8 +15946,32 @@ mod tests {
         .await
         .unwrap();
         pool.execute(
+            "DROP TRIGGER plugin_submissions_active_replay_membership_frozen \
+             ON public.plugin_submissions",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "DROP TRIGGER plugin_submissions_active_replay_membership_frozen_truncate \
+             ON public.plugin_submissions",
+        )
+        .await
+        .unwrap();
+        pool.execute(
             "DROP TRIGGER plugin_installs_replay_identity_immutable \
              ON public.plugin_installs",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "DROP TRIGGER plugin_installs_active_replay_capture_identity_frozen \
+             ON public.plugin_installs",
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "DROP TRIGGER users_active_replay_capture_identity_frozen \
+             ON public.users",
         )
         .await
         .unwrap();
@@ -15579,6 +15984,9 @@ mod tests {
         pool.execute("DROP TABLE public.listing_replay_run_items")
             .await
             .unwrap();
+        pool.execute("DROP TABLE public.listing_replay_submission_inventory_lock")
+            .await
+            .unwrap();
         pool.execute("DROP TABLE public.listing_replay_runs")
             .await
             .unwrap();
@@ -15587,6 +15995,11 @@ mod tests {
             DROP FUNCTION public.enforce_replay_extraction_checkpoint_exactness();
             DROP FUNCTION public.preserve_completed_replay_item();
             DROP FUNCTION public.preserve_replay_materialization_receipt();
+            DROP FUNCTION public.enforce_active_replay_submission_membership();
+            DROP FUNCTION public.enforce_active_replay_user_identity();
+            DROP FUNCTION public.enforce_active_replay_plugin_install_identity();
+            DROP FUNCTION public.protect_replay_submission_inventory_lock();
+            DROP FUNCTION public.protect_replay_submission_inventory_lock_truncate();
             DROP FUNCTION public.enforce_replay_checkpoint_capture_immutability();
             DROP FUNCTION public.enforce_replay_plugin_identity_immutability();
             "#,
@@ -15606,6 +16019,382 @@ mod tests {
             .await
             .unwrap());
         initialized.ensure_required_migrations().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_active_replay_freeze_rejects_truncate_cascade() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO public.plugin_installs (user_id, public_key_base64) \
+             VALUES ($1, 'truncate-test-key') RETURNING id",
+        )
+        .bind(user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO public.plugin_submissions (
+                 user_id, plugin_install_id, source_url, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES ($1, $2, 'https://example.test/truncate-freeze', '<html/>',
+                         $3, 'signature') RETURNING id"#,
+        )
+        .bind(user.id)
+        .bind(install_id)
+        .bind("a".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let run_id: i64 = sqlx::query_scalar(
+            "INSERT INTO public.listing_replay_runs \
+             (manifest_sha256, manifest_capture_count) VALUES ($1, 1) RETURNING id",
+        )
+        .bind("b".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO public.listing_replay_run_items (
+                 run_id, plugin_submission_id, position, expected_rendered_html_sha256
+               ) VALUES ($1, $2, 0, $3)"#,
+        )
+        .bind(run_id)
+        .bind(submission_id)
+        .bind("a".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE public.listing_replay_runs
+               SET status = 'running', active_phase = 'extraction', owner_token = 'truncate-owner',
+                   heartbeat_at_epoch_seconds = 1, started_at = CURRENT_TIMESTAMP
+               WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE public.listing_replay_submission_inventory_lock \
+             SET active_run_id = $1, concurrency_token = concurrency_token + 1 \
+             WHERE singleton_id = 1",
+        )
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = pool
+            .execute("TRUNCATE TABLE public.plugin_submissions CASCADE")
+            .await
+            .expect_err("active replay must reject TRUNCATE CASCADE");
+        assert!(
+            error
+                .to_string()
+                .contains("plugin submission membership is frozen by active replay"),
+            "{error}"
+        );
+        let retained: (i64, i64, String) = sqlx::query_as(
+            r#"SELECT
+                 (SELECT COUNT(*) FROM public.plugin_submissions),
+                 (SELECT COUNT(*) FROM public.listing_replay_run_items), status
+               FROM public.listing_replay_runs WHERE id = $1"#,
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, 1, "running".to_string()));
+        pool.execute(
+            "DROP TRIGGER plugin_submissions_active_replay_membership_frozen_truncate \
+             ON public.plugin_submissions",
+        )
+        .await
+        .unwrap();
+        assert!(!db.listing_replay_definitions_valid().await.unwrap());
+        drop(db);
+        assert_postgres_replay_startup_rejected(&database_url).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_replay_inventory_orders_repeatable_read_and_read_committed_writers() {
+        async fn setup_case(database_url: &str, label: &str) -> (AppDb, i64, i64, i64, i64) {
+            let reset = reset_isolated_postgres(database_url).await;
+            reset.close().await;
+            let db = AppDb::connect(database_url).await.unwrap();
+            let user = db.current_user(None).await.unwrap();
+            let DatabaseBackend::Postgres(pool) = db.backend() else {
+                unreachable!()
+            };
+            let install_id: i64 = sqlx::query_scalar(
+                "INSERT INTO public.plugin_installs (user_id, public_key_base64) \
+                 VALUES ($1, $2) RETURNING id",
+            )
+            .bind(user.id)
+            .bind(format!("{label}-key"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let submission_id: i64 = sqlx::query_scalar(
+                r#"INSERT INTO public.plugin_submissions (
+                     user_id, plugin_install_id, source_url, rendered_html,
+                     rendered_html_sha256, signature_base64
+                   ) VALUES ($1, $2, $3, '<html/>', $4, 'signature') RETURNING id"#,
+            )
+            .bind(user.id)
+            .bind(install_id)
+            .bind(format!("https://example.test/{label}"))
+            .bind("a".repeat(64))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let run_id: i64 = sqlx::query_scalar(
+                "INSERT INTO public.listing_replay_runs \
+                 (manifest_sha256, manifest_capture_count) VALUES ($1, 1) RETURNING id",
+            )
+            .bind("b".repeat(64))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"INSERT INTO public.listing_replay_run_items (
+                     run_id, plugin_submission_id, position, expected_rendered_html_sha256
+                   ) VALUES ($1, $2, 0, $3)"#,
+            )
+            .bind(run_id)
+            .bind(submission_id)
+            .bind("a".repeat(64))
+            .execute(pool)
+            .await
+            .unwrap();
+            (db, user.id, install_id, submission_id, run_id)
+        }
+
+        async fn activate(pool: &sqlx::PgPool, run_id: i64) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut activation = pool.begin().await.unwrap();
+                sqlx::query(
+                    "UPDATE public.listing_replay_submission_inventory_lock \
+                     SET active_run_id = $1, concurrency_token = concurrency_token + 1 \
+                     WHERE singleton_id = 1 AND active_run_id IS NULL",
+                )
+                .bind(run_id)
+                .execute(&mut *activation)
+                .await
+                .unwrap();
+                sqlx::query(
+                    r#"UPDATE public.listing_replay_runs
+                       SET status = 'running', active_phase = 'extraction',
+                           owner_token = 'concurrency-owner', heartbeat_at_epoch_seconds = 1,
+                           started_at = CURRENT_TIMESTAMP
+                       WHERE id = $1 AND status = 'queued'"#,
+                )
+                .bind(run_id)
+                .execute(&mut *activation)
+                .await
+                .unwrap();
+                activation.commit().await.unwrap();
+            })
+            .await
+            .expect("activation-first writer timed out");
+        }
+
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+
+        for target in ["submission", "user", "install"] {
+            let (db, user_id, install_id, _, run_id) =
+                setup_case(&database_url, &format!("rr-{target}")).await;
+            let DatabaseBackend::Postgres(pool) = db.backend() else {
+                unreachable!()
+            };
+            let mut stale_connection = pool.acquire().await.unwrap();
+            let mut stale = stale_connection
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                .await
+                .unwrap();
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public.plugin_submissions")
+                .fetch_one(&mut *stale)
+                .await
+                .unwrap();
+
+            activate(pool, run_id).await;
+            let stale_error = tokio::time::timeout(Duration::from_secs(10), async {
+                match target {
+                    "submission" => sqlx::query(
+                        r#"INSERT INTO public.plugin_submissions (
+                         user_id, plugin_install_id, source_url, rendered_html,
+                         rendered_html_sha256, signature_base64
+                       ) VALUES ($1, $2, $3, '<html/>', $4, 'signature')"#,
+                    )
+                    .bind(user_id)
+                    .bind(install_id)
+                    .bind("https://example.test/rr-extra")
+                    .bind("c".repeat(64))
+                    .execute(&mut *stale)
+                    .await
+                    .unwrap_err(),
+                    "user" => sqlx::query(
+                        "UPDATE public.users SET display_name = 'stale drift' WHERE id = $1",
+                    )
+                    .bind(user_id)
+                    .execute(&mut *stale)
+                    .await
+                    .unwrap_err(),
+                    "install" => sqlx::query(
+                        "UPDATE public.plugin_installs SET public_key_base64 = 'stale drift' \
+                     WHERE id = $1",
+                    )
+                    .bind(install_id)
+                    .execute(&mut *stale)
+                    .await
+                    .unwrap_err(),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{target}: stale-snapshot writer timed out"));
+            let code = stale_error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .map(|code| code.into_owned());
+            assert_eq!(code.as_deref(), Some("40001"), "{target}: {stale_error}");
+            stale.rollback().await.unwrap();
+
+            let activation_first_error = tokio::time::timeout(Duration::from_secs(10), async {
+                match target {
+                    "submission" => sqlx::query(
+                        r#"INSERT INTO public.plugin_submissions (
+                         user_id, plugin_install_id, source_url, rendered_html,
+                         rendered_html_sha256, signature_base64
+                       ) VALUES ($1, $2, $3, '<html/>', $4, 'signature')"#,
+                    )
+                    .bind(user_id)
+                    .bind(install_id)
+                    .bind("https://example.test/active-extra")
+                    .bind("d".repeat(64))
+                    .execute(pool)
+                    .await
+                    .unwrap_err(),
+                    "user" => sqlx::query(
+                        "UPDATE public.users SET display_name = 'active drift' WHERE id = $1",
+                    )
+                    .bind(user_id)
+                    .execute(pool)
+                    .await
+                    .unwrap_err(),
+                    "install" => sqlx::query(
+                        "UPDATE public.plugin_installs SET public_key_base64 = 'active drift' \
+                     WHERE id = $1",
+                    )
+                    .bind(install_id)
+                    .execute(pool)
+                    .await
+                    .unwrap_err(),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{target}: active-run rejection timed out"));
+            assert!(
+                activation_first_error
+                    .to_string()
+                    .contains("frozen by active replay"),
+                "{target}: {activation_first_error}"
+            );
+            drop(stale_connection);
+            tokio::time::timeout(Duration::from_secs(10), db.close())
+                .await
+                .expect("closing repeatable-read test pool timed out");
+        }
+
+        let (db, user_id, install_id, _, run_id) =
+            setup_case(&database_url, "read-committed-mutation-first").await;
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let mut mutation = pool.begin().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sqlx::query(
+                r#"INSERT INTO public.plugin_submissions (
+                     user_id, plugin_install_id, source_url, rendered_html,
+                     rendered_html_sha256, signature_base64
+                   ) VALUES ($1, $2, 'https://example.test/rc-extra', '<html/>', $3, 'signature')"#,
+            )
+            .bind(user_id)
+            .bind(install_id)
+            .bind("e".repeat(64))
+            .execute(&mut *mutation),
+        )
+        .await
+        .expect("mutation-first writer timed out")
+        .unwrap();
+
+        let activation_pool = pool.clone();
+        let mut activation = tokio::spawn(async move {
+            let mut transaction = activation_pool.begin().await.unwrap();
+            sqlx::query(
+                "UPDATE public.listing_replay_submission_inventory_lock \
+                 SET active_run_id = $1, concurrency_token = concurrency_token + 1 \
+                 WHERE singleton_id = 1 AND active_run_id IS NULL",
+            )
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+            let membership_matches: bool = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM public.plugin_submissions) = \
+                        (SELECT COUNT(*) FROM public.listing_replay_run_items WHERE run_id = $1)",
+            )
+            .bind(run_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+            transaction.rollback().await.unwrap();
+            membership_matches
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut activation)
+                .await
+                .is_err(),
+            "activation must wait behind a membership mutation holding the inventory row"
+        );
+        tokio::time::timeout(Duration::from_secs(10), mutation.commit())
+            .await
+            .expect("mutation-first commit timed out")
+            .unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(10), activation)
+                .await
+                .unwrap()
+                .unwrap(),
+            "activation must observe and reject membership committed before its inventory write"
+        );
+        let state: (Option<i64>, String) = sqlx::query_as(
+            "SELECT inventory.active_run_id, run.status \
+             FROM public.listing_replay_submission_inventory_lock inventory \
+             JOIN public.listing_replay_runs run ON run.id = $1 \
+             WHERE inventory.singleton_id = 1",
+        )
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(state, (None, "queued".to_string()));
+        tokio::time::timeout(Duration::from_secs(10), db.close())
+            .await
+            .expect("closing read-committed test pool timed out");
     }
 
     #[tokio::test]
@@ -15860,6 +16649,52 @@ mod tests {
         assert_postgres_replay_migration_rerun_rejected_without_changes(
             pool,
             "unexpected-attached-trigger",
+        )
+        .await;
+        drop(db);
+        assert_postgres_replay_startup_rejected(&database_url).await;
+
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        pool.execute(
+            "CREATE TRIGGER listing_replay_submission_inventory_lock_protected \
+             BEFORE UPDATE ON public.listing_replay_runs FOR EACH ROW \
+             EXECUTE FUNCTION public.protect_replay_submission_inventory_lock()",
+        )
+        .await
+        .unwrap();
+        assert_postgres_replay_migration_rerun_rejected_without_changes(
+            pool,
+            "allowed-name-trigger-on-wrong-relation",
+        )
+        .await;
+        drop(db);
+        assert_postgres_replay_startup_rejected(&database_url).await;
+
+        let reset = reset_isolated_postgres(&database_url).await;
+        reset.close().await;
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::raw_sql(
+            r#"
+            DROP TRIGGER users_active_replay_capture_identity_frozen ON public.users;
+            CREATE TRIGGER users_active_replay_capture_identity_frozen
+            BEFORE DELETE OR UPDATE OF email ON public.users
+            FOR EACH ROW EXECUTE FUNCTION public.enforce_active_replay_user_identity();
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_postgres_replay_migration_rerun_rejected_without_changes(
+            pool,
+            "same-name-trigger-with-update-column-filter",
         )
         .await;
         drop(db);

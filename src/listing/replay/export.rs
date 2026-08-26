@@ -15,7 +15,8 @@ use sqlx::{Connection, FromRow, Postgres, QueryBuilder, Row, Sqlite};
 use url::Url;
 
 use super::{
-    database_error, entry_from_row, manifest_fingerprint, validated_selection, SourceCaptureRow,
+    database_error, entry_from_row, manifest_fingerprint, parse_replay_timestamp,
+    retained_capture_timestamp_chronology_valid, validated_selection, SourceCaptureRow,
     TrustedCaptureManifest, MAX_CAPTURE_BYTES,
 };
 use crate::aircraft::faa::normalize_n_number;
@@ -1076,143 +1077,34 @@ fn canonical_source_url(value: &str) -> Option<String> {
 }
 
 fn capture_timestamp_chronology_valid(row: &RawCaptureRow) -> bool {
-    let Some(user_created_at) = row.owner_created_at.as_deref().and_then(parse_timestamp) else {
-        return false;
-    };
-    let Some(user_updated_at) = row.owner_updated_at.as_deref().and_then(parse_timestamp) else {
-        return false;
-    };
-    let Some(install_created_at) = row.install_created_at.as_deref().and_then(parse_timestamp)
+    let Some(user_created_at) = row
+        .owner_created_at
+        .as_deref()
+        .and_then(parse_replay_timestamp)
     else {
         return false;
     };
-    let Some(submitted_at) = parse_timestamp(&row.submitted_at) else {
+    let Some(user_updated_at) = row
+        .owner_updated_at
+        .as_deref()
+        .and_then(parse_replay_timestamp)
+    else {
         return false;
     };
-    let revoked_at = match row.install_revoked_at.as_deref() {
-        Some(value) => match parse_timestamp(value) {
-            Some(parsed) => Some(parsed),
-            None => return false,
-        },
-        None => None,
+    let Some(install_created_at) = row
+        .install_created_at
+        .as_deref()
+        .and_then(parse_replay_timestamp)
+    else {
+        return false;
     };
     user_updated_at >= user_created_at
         && install_created_at >= user_created_at
-        && submitted_at >= install_created_at
-        && revoked_at
-            .map(|revoked| revoked >= install_created_at && submitted_at <= revoked)
-            .unwrap_or(true)
-}
-
-/// Parses the timestamp shapes emitted by SQLite, PostgreSQL, and the plugin
-/// API without allowing a malformed text timestamp to abort a PostgreSQL
-/// query. Naive timestamps are interpreted as UTC, matching application
-/// storage. The result is nanoseconds from the Unix epoch.
-fn parse_timestamp(value: &str) -> Option<i128> {
-    let value = value.trim();
-    if value.len() < 19 {
-        return None;
-    }
-    let bytes = value.as_bytes();
-    if bytes.get(4) != Some(&b'-')
-        || bytes.get(7) != Some(&b'-')
-        || !matches!(bytes.get(10), Some(b' ' | b'T'))
-        || bytes.get(13) != Some(&b':')
-        || bytes.get(16) != Some(&b':')
-    {
-        return None;
-    }
-    let year = parse_digits(bytes.get(0..4)?)? as i64;
-    let month = parse_digits(bytes.get(5..7)?)? as u32;
-    let day = parse_digits(bytes.get(8..10)?)? as u32;
-    let hour = parse_digits(bytes.get(11..13)?)? as u32;
-    let minute = parse_digits(bytes.get(14..16)?)? as u32;
-    let second = parse_digits(bytes.get(17..19)?)? as u32;
-    if year == 0
-        || !(1..=12).contains(&month)
-        || day == 0
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-
-    let mut cursor = 19;
-    let mut nanos = 0_i128;
-    if bytes.get(cursor) == Some(&b'.') {
-        cursor += 1;
-        let fraction_start = cursor;
-        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
-            cursor += 1;
-        }
-        let fraction = bytes.get(fraction_start..cursor)?;
-        if fraction.is_empty() || fraction.len() > 9 {
-            return None;
-        }
-        nanos = parse_digits(fraction)? as i128 * 10_i128.pow((9 - fraction.len()) as u32);
-    }
-
-    let offset_seconds = match bytes.get(cursor..) {
-        Some([]) | Some([b'Z']) | Some([b'z']) => 0_i64,
-        Some(zone) if matches!(zone.first(), Some(b'+' | b'-')) => {
-            let sign = if zone[0] == b'+' { 1_i64 } else { -1_i64 };
-            let (hours, minutes) = match zone {
-                [_, h1, h2] => (parse_digits(&[*h1, *h2])?, 0),
-                [_, h1, h2, m1, m2] => (parse_digits(&[*h1, *h2])?, parse_digits(&[*m1, *m2])?),
-                [_, h1, h2, b':', m1, m2] => {
-                    (parse_digits(&[*h1, *h2])?, parse_digits(&[*m1, *m2])?)
-                }
-                _ => return None,
-            };
-            if hours > 23 || minutes > 59 {
-                return None;
-            }
-            sign * i64::from(hours * 3_600 + minutes * 60)
-        }
-        _ => return None,
-    };
-
-    let days = days_from_civil(year, month, day);
-    let seconds = days
-        .checked_mul(86_400)?
-        .checked_add(i64::from(hour * 3_600 + minute * 60 + second))?
-        .checked_sub(offset_seconds)?;
-    Some(i128::from(seconds) * 1_000_000_000 + nanos)
-}
-
-fn parse_digits(bytes: &[u8]) -> Option<u32> {
-    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    bytes.iter().try_fold(0_u32, |value, digit| {
-        value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
-    })
-}
-
-fn days_in_month(year: i64, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let adjusted_year = year - i64::from(month <= 2);
-    let era = if adjusted_year >= 0 {
-        adjusted_year
-    } else {
-        adjusted_year - 399
-    } / 400;
-    let year_of_era = adjusted_year - era * 400;
-    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+        && retained_capture_timestamp_chronology_valid(
+            row.install_created_at.as_deref().unwrap_or_default(),
+            &row.submitted_at,
+            row.install_revoked_at.as_deref(),
+        )
 }
 
 fn count_to_usize(count: i64, label: &str) -> Result<usize, String> {
@@ -1304,6 +1196,8 @@ mod tests {
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
     use super::*;
+    use crate::listing::replay::import_trusted_capture_manifest;
+    use crate::listing::replay::run::{replay_captures, ReplayCapturesRequest, ReplayPhase};
     use crate::plugin::signature_message;
 
     struct Fixture {
@@ -1517,6 +1411,53 @@ mod tests {
         assert!(!serialized.contains("developer@localhost"));
         assert!(!serialized.contains(&manifest.captures[0].plugin_public_key_base64));
         assert!(!serialized.contains(&manifest.captures[0].signature_base64));
+    }
+
+    #[tokio::test]
+    async fn all_bound_import_keeps_the_seven_unbound_exclusions_out_of_the_target() {
+        let fixture = fixture(3, 7).await;
+        let export = all_bound(&fixture.db, 3).await;
+        let manifest = export.manifest.as_ref().expect("ready manifest");
+        let target = AppDb::connect("sqlite::memory:").await.unwrap();
+
+        let import = import_trusted_capture_manifest(&fixture.db, &target, manifest, true)
+            .await
+            .unwrap();
+        assert_eq!(import.imported_capture_count, 3);
+        let DatabaseBackend::Sqlite(pool) = target.backend() else {
+            unreachable!()
+        };
+        let target_inventory: (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*), COUNT(canonical_listing_id) FROM plugin_submissions")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(target_inventory, (3, 0));
+        for excluded_id in &export.readiness.excluded_unbound_submission_ids {
+            let retained: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM plugin_submissions WHERE id = ?")
+                    .bind(excluded_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(retained, 0, "excluded source submission {excluded_id}");
+        }
+
+        let replay = replay_captures(
+            &target,
+            None,
+            &ReplayCapturesRequest {
+                manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: false,
+                recover_stale: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(replay.dry_run);
+        assert_eq!(replay.counts.selected, 3);
     }
 
     #[tokio::test]
@@ -1886,14 +1827,14 @@ mod tests {
     #[test]
     fn timestamp_parser_accepts_supported_offsets_and_rejects_invalid_dates() {
         assert_eq!(
-            parse_timestamp("2026-01-02 03:04:05"),
-            parse_timestamp("2026-01-02T03:04:05Z")
+            parse_replay_timestamp("2026-01-02 03:04:05"),
+            parse_replay_timestamp("2026-01-02T03:04:05Z")
         );
         assert_eq!(
-            parse_timestamp("2026-01-02T04:04:05+01:00"),
-            parse_timestamp("2026-01-02T03:04:05Z")
+            parse_replay_timestamp("2026-01-02T04:04:05+01:00"),
+            parse_replay_timestamp("2026-01-02T03:04:05Z")
         );
-        assert!(parse_timestamp("2026-02-29 00:00:00").is_none());
-        assert!(parse_timestamp("not-a-timestamp").is_none());
+        assert!(parse_replay_timestamp("2026-02-29 00:00:00").is_none());
+        assert!(parse_replay_timestamp("not-a-timestamp").is_none());
     }
 }

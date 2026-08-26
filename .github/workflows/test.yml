@@ -61,6 +61,9 @@ jobs:
           cargo test postgres_listing_replay_installed_at_survives_two_normal_startups -- --ignored --nocapture --test-threads=1
           cargo test postgres_listing_replay_startup_rejects_weakened_column_constraint_and_index -- --ignored --nocapture --test-threads=1
           cargo test postgres_listing_replay_rerun_rejects_unexpected_indexes_and_triggers -- --ignored --nocapture --test-threads=1
+          cargo test postgres_active_replay_freeze_rejects_truncate_cascade -- --ignored --nocapture --test-threads=1
+          cargo test postgres_replay_inventory_orders_repeatable_read_and_read_committed_writers -- --ignored --nocapture --test-threads=1
+          cargo test postgres_production_acquire_and_release_uses_backend_placeholders -- --ignored --nocapture --test-threads=1
           cargo test postgres_replay_ledger_rejects_invalid_state_outcome_pairings -- --ignored --nocapture --test-threads=1
 
       - name: Check PostgreSQL grounded avionics capability contract
@@ -68,6 +71,11 @@ jobs:
           cargo test postgres_grounded_capability_functions_resist_hostile_search_path_and_tampering -- --ignored --nocapture --test-threads=1
           cargo test postgres_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly -- --ignored --nocapture --test-threads=1
           cargo test postgres_grounded_capability_migration_rerun_rejects_contract_drift_without_changes -- --ignored --nocapture --test-threads=1
+
+      - name: Check PostgreSQL catalog seed contract
+        run: |
+          cargo test postgres_round_trip_fences_writers_preserves_replay_and_rejects_rerun -- --ignored --nocapture --test-threads=1
+          cargo test postgres_sequence_reset_covers_identity_and_serial_owned_ids -- --ignored --nocapture --test-threads=1
 
       - name: Check historical migration provenance
         run: bash tests/schema/test_historical_migration_provenance.sh

@@ -69,7 +69,12 @@ All operational commands are dry-run unless `--apply` is supplied.
    Import revalidates the live source against the manifest, imports only the
    selected users, installs, and capture bytes, preserves original IDs and
    submission timestamps, and resets extraction, error, and canonical-listing
-   fields.
+   fields. The replay target must then contain exactly the manifest submission
+   IDs. Replay rejects additional submissions, including malformed rows whose
+   owner or plugin install is missing or mismatched. Unbound submissions
+   reported as source exclusions are not imported; resetting selected
+   captures' derived canonical-listing IDs does not change that manifest
+   membership boundary.
 
 3. Seed the exact reviewed catalog closure from the current verified source:
 
@@ -205,6 +210,17 @@ transition or replace the first committed extraction checkpoint. Loss of the
 heartbeat/owner lease cancels the in-flight provider operation promptly; resume
 then reconciles any authoritative checkpoint or completion receipt before
 retrying.
+
+Activation atomically proves that `plugin_submissions` contains exactly the
+manifest inventory, then freezes capture membership until the run is released.
+During that interval, capture insert, delete, identifier update, and PostgreSQL
+truncate operations fail closed; derived checkpoint and listing-binding columns
+remain writable. This database invariant spans provider calls and every
+materialization child transaction without holding a database transaction open.
+An abandoned `running` ledger therefore also blocks new capture admission until
+the operator confirms the worker stopped and performs explicit stale recovery.
+Final release holds the same membership lock and rechecks the exact inventory
+before and after removing the freeze.
 
 Each report includes `gemini_usage` with the explicit
 `manifest_phase_cumulative` scope. A stable correlation ID is derived from the

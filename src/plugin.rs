@@ -2811,6 +2811,7 @@ mod tests {
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
     use serde_json::{json, Value};
     use sha2::{Digest as Sha2Digest, Sha256};
+    use sqlx::Connection;
     use tokio::net::TcpListener;
 
     use super::{
@@ -3014,6 +3015,275 @@ mod tests {
             "registration_number":"N482TW","serial_number":"1823006","status":"active",
             "avionics":[],"valuation_facts":[]
         })
+    }
+
+    async fn activate_test_replay_inventory_freeze(
+        db: &AppDb,
+        submission_id: i64,
+        rendered_html_sha256: &str,
+        phase: &str,
+    ) -> i64 {
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let run_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count)
+               VALUES (?, 1) RETURNING id"#,
+        )
+        .bind("d".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO listing_replay_run_items (
+                 run_id, plugin_submission_id, position, expected_rendered_html_sha256
+               ) VALUES (?, ?, 0, ?)"#,
+        )
+        .bind(run_id)
+        .bind(submission_id)
+        .bind(rendered_html_sha256)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query(
+            r#"UPDATE listing_replay_submission_inventory_lock
+               SET active_run_id = ?, concurrency_token = concurrency_token + 1
+               WHERE singleton_id = 1 AND active_run_id IS NULL"#,
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE listing_replay_runs
+               SET status = 'running', active_phase = ?, owner_token = 'test-owner',
+                   heartbeat_at_epoch_seconds = 1, started_at = CURRENT_TIMESTAMP
+               WHERE id = ?"#,
+        )
+        .bind(phase)
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        run_id
+    }
+
+    async fn replay_materialization_freeze_fixture(source_url: &str) -> (AppDb, User, i64, String) {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        store_release(&db, &replay_release("N482TW", "18283006"))
+            .await
+            .unwrap();
+        seed_replay_curated_aircraft(&db, user.id).await;
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, ?) RETURNING id",
+        )
+        .bind(user.id)
+        .bind(BASE64_STANDARD.encode(key_pair.public_key().as_ref()))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let html = "<html><body><p>N482TW serial 1823006</p></body></html>";
+        let rendered_html_sha256 = sha256_hex(html.as_bytes());
+        let signature = BASE64_STANDARD.encode(
+            key_pair
+                .sign(
+                    &rng,
+                    signature_message(install_id, source_url, &rendered_html_sha256).as_bytes(),
+                )
+                .unwrap()
+                .as_ref(),
+        );
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at, rendered_html,
+                 rendered_html_sha256, signature_base64, extracted_listing_json
+               ) VALUES (?, ?, ?, '2026-07-20 12:34:56', ?, ?, ?, ?) RETURNING id"#,
+        )
+        .bind(user.id)
+        .bind(install_id)
+        .bind(source_url)
+        .bind(html)
+        .bind(&rendered_html_sha256)
+        .bind(signature)
+        .bind(serial_correction_extraction().to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        activate_test_replay_inventory_freeze(
+            &db,
+            submission_id,
+            &rendered_html_sha256,
+            "materialization",
+        )
+        .await;
+        (db, user, submission_id, rendered_html_sha256)
+    }
+
+    #[tokio::test]
+    async fn active_replay_freeze_rolls_back_checkpoint_commit_on_membership_injection() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'test-key') RETURNING id",
+        )
+        .bind(user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let rendered_html_sha256 = "a".repeat(64);
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES (?, ?, 'https://example.test/frozen-checkpoint', '<html></html>', ?, 'signature')
+               RETURNING id"#,
+        )
+        .bind(user.id)
+        .bind(install_id)
+        .bind(&rendered_html_sha256)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let stored = load_checkpoint_capture(&db, user.id, submission_id)
+            .await
+            .unwrap();
+        activate_test_replay_inventory_freeze(
+            &db,
+            submission_id,
+            &rendered_html_sha256,
+            "extraction",
+        )
+        .await;
+        sqlx::query(
+            r#"CREATE TRIGGER inject_membership_during_checkpoint
+               BEFORE UPDATE OF extracted_listing_json ON plugin_submissions
+               WHEN OLD.id = NEW.id AND OLD.extracted_listing_json IS NULL
+               BEGIN
+                 INSERT INTO plugin_submissions (
+                   user_id, plugin_install_id, source_url, rendered_html,
+                   rendered_html_sha256, signature_base64
+                 ) VALUES (
+                   OLD.user_id, OLD.plugin_install_id, OLD.source_url || '/extra',
+                   OLD.rendered_html, OLD.rendered_html_sha256, OLD.signature_base64
+                 );
+               END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = store_plugin_extraction_checkpoint(&db, &stored, "{\"checkpoint\":true}")
+            .await
+            .expect_err("active replay must reject checkpoint-time membership injection");
+        assert!(matches!(error, PluginStoreError::Database(_)));
+        assert!(error
+            .to_string()
+            .contains("plugin submission membership is frozen by active replay"));
+        let retained: (i64, Option<String>) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM plugin_submissions), extracted_listing_json \
+             FROM plugin_submissions WHERE id = ?",
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, None));
+    }
+
+    #[tokio::test]
+    async fn active_replay_freeze_covers_initial_mid_child_and_receipt_materialization_writes() {
+        for injection_point in ["listing", "identity_child", "receipt"] {
+            let source_url = format!("https://example.test/frozen-{injection_point}");
+            let (db, user, submission_id, _) =
+                replay_materialization_freeze_fixture(&source_url).await;
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let (trigger_name, relation) = match injection_point {
+                "listing" => ("inject_membership_during_listing", "aircraft_sale_listings"),
+                "identity_child" => (
+                    "inject_membership_during_identity_child",
+                    "aircraft_listing_identity_input_observations",
+                ),
+                "receipt" => (
+                    "inject_membership_during_receipt",
+                    "plugin_submission_materialization_receipts",
+                ),
+                _ => unreachable!(),
+            };
+            let trigger = format!(
+                r#"CREATE TRIGGER {trigger_name}
+                   BEFORE INSERT ON {relation}
+                   BEGIN
+                     INSERT INTO plugin_submissions (
+                       user_id, plugin_install_id, source_url, rendered_html,
+                       rendered_html_sha256, signature_base64
+                     )
+                     SELECT user_id, plugin_install_id, source_url || '/extra', rendered_html,
+                            rendered_html_sha256, signature_base64
+                     FROM plugin_submissions WHERE id = {submission_id};
+                   END"#,
+            );
+            sqlx::query(&trigger).execute(pool).await.unwrap();
+            let extractor =
+                crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+            let error =
+                materialize_plugin_submission_checkpoint(&db, &user, submission_id, &extractor)
+                    .await
+                    .expect_err("membership injection must abort its materialization transaction");
+            assert!(
+                error
+                    .to_string()
+                    .contains("plugin submission membership is frozen by active replay"),
+                "{injection_point}: {error}"
+            );
+            let retained: (i64, i64, i64, i64, Option<i64>) = sqlx::query_as(
+                r#"SELECT
+                     (SELECT COUNT(*) FROM plugin_submissions),
+                     (SELECT COUNT(*) FROM aircraft_sale_listings WHERE source_url = ?),
+                     (SELECT COUNT(*)
+                        FROM aircraft_listing_identity_input_observations observation
+                        JOIN aircraft_sale_listings listing
+                          ON listing.id = observation.aircraft_sale_listing_id
+                       WHERE listing.source_url = ?),
+                     (SELECT COUNT(*) FROM plugin_submission_materialization_receipts),
+                     canonical_listing_id
+                   FROM plugin_submissions WHERE id = ?"#,
+            )
+            .bind(&source_url)
+            .bind(&source_url)
+            .bind(submission_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(retained.0, 1, "{injection_point}");
+            assert_eq!(retained.3, 0, "{injection_point}");
+            if injection_point == "listing" {
+                assert_eq!((retained.1, retained.2, retained.4), (0, 0, None));
+            } else {
+                assert_eq!(retained.1, 1, "{injection_point}");
+                assert!(retained.4.is_some(), "{injection_point}");
+            }
+            if injection_point == "identity_child" {
+                assert_eq!(retained.2, 0);
+            }
+        }
     }
 
     async fn extraction_handler(State(extraction): State<Value>) -> Json<Value> {

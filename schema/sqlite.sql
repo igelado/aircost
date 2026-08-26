@@ -339,7 +339,10 @@ WHERE (
   AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
   AND schema_row.name NOT IN (
     'avionics_models_approved_concrete_model_insert',
-    'avionics_models_approved_concrete_model_update'
+    'avionics_models_approved_concrete_model_update',
+    'plugin_submissions_active_replay_membership_frozen_insert',
+    'plugin_submissions_active_replay_membership_frozen_delete',
+    'plugin_submissions_active_replay_membership_frozen_update'
   )
 )
 UNION ALL
@@ -3067,6 +3070,27 @@ CREATE TABLE IF NOT EXISTS listing_replay_runs (
   )
 );
 
+-- The single inventory arbiter row serializes every retained-capture
+-- membership change with replay activation and release. The token makes even
+-- an otherwise admissible membership mutation take the same write boundary.
+CREATE TABLE IF NOT EXISTS listing_replay_submission_inventory_lock (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  active_run_id INTEGER UNIQUE
+    REFERENCES listing_replay_runs(id) ON DELETE RESTRICT,
+  concurrency_token INTEGER NOT NULL DEFAULT 0 CHECK (concurrency_token >= 0)
+);
+
+INSERT INTO listing_replay_submission_inventory_lock (
+  singleton_id, active_run_id, concurrency_token
+) SELECT 1, NULL, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM listing_replay_submission_inventory_lock
+)
+AND NOT EXISTS (
+  SELECT 1 FROM schema_migration_contracts
+  WHERE migration_name = '20260819_listing_replay_runs'
+);
+
 -- Only one batch owns replay mutations at a time. A stale owner is never
 -- displaced implicitly; the command requires explicit conservative recovery.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_listing_replay_runs_one_running
@@ -3371,7 +3395,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a',
+  '3e7c0b39b66e681be397bddbc943c75793b18bac71eacc7324b08a067ef3ff01',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 
@@ -9968,7 +9992,10 @@ WHERE (
   AND schema_row.tbl_name IN (SELECT name FROM owned_relations)
   AND schema_row.name NOT IN (
     'avionics_models_approved_concrete_model_insert',
-    'avionics_models_approved_concrete_model_update'
+    'avionics_models_approved_concrete_model_update',
+    'plugin_submissions_active_replay_membership_frozen_insert',
+    'plugin_submissions_active_replay_membership_frozen_delete',
+    'plugin_submissions_active_replay_membership_frozen_update'
   )
 )
 UNION ALL
@@ -10140,3 +10167,202 @@ INSERT INTO schema_migration_contracts (
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
+
+-- The singleton inventory row is structural: application transactions may
+-- change its lease/token, but no transaction may add, remove, or rename it.
+CREATE TRIGGER IF NOT EXISTS listing_replay_submission_inventory_lock_no_insert
+BEFORE INSERT ON listing_replay_submission_inventory_lock
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is a protected singleton');
+END;
+
+CREATE TRIGGER IF NOT EXISTS listing_replay_submission_inventory_lock_no_delete
+BEFORE DELETE ON listing_replay_submission_inventory_lock
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is a protected singleton');
+END;
+
+CREATE TRIGGER IF NOT EXISTS listing_replay_submission_inventory_lock_no_identity_update
+BEFORE UPDATE ON listing_replay_submission_inventory_lock
+WHEN NOT (NEW.singleton_id IS OLD.singleton_id)
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is a protected singleton');
+END;
+
+-- Every retained-capture membership mutation writes the singleton. This
+-- serializes it with replay activation/release; derived updates do not touch it.
+CREATE TRIGGER IF NOT EXISTS plugin_submissions_active_replay_membership_frozen_insert
+BEFORE INSERT ON plugin_submissions
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission membership is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL;
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS plugin_submissions_active_replay_membership_frozen_delete
+BEFORE DELETE ON plugin_submissions
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission membership is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL;
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS plugin_submissions_active_replay_membership_frozen_update
+BEFORE UPDATE ON plugin_submissions
+WHEN NOT (NEW.id IS OLD.id)
+  OR NOT (NEW.user_id IS OLD.user_id)
+  OR NOT (NEW.plugin_install_id IS OLD.plugin_install_id)
+  OR NOT (NEW.source_url IS OLD.source_url)
+  OR NOT (NEW.submitted_at IS OLD.submitted_at)
+  OR NOT (NEW.rendered_html IS OLD.rendered_html)
+  OR NOT (NEW.rendered_html_sha256 IS OLD.rendered_html_sha256)
+  OR NOT (NEW.signature_base64 IS OLD.signature_base64)
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission membership is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL;
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS users_active_replay_capture_identity_frozen_update
+BEFORE UPDATE ON users
+WHEN (
+  NOT (NEW.id IS OLD.id)
+  OR NOT (NEW.email IS OLD.email)
+  OR NOT (NEW.display_name IS OLD.display_name)
+  OR NOT (NEW.auth_provider IS OLD.auth_provider)
+  OR NOT (NEW.auth_subject IS OLD.auth_subject)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission capture identity is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL AND (
+    EXISTS (SELECT 1 FROM plugin_submissions WHERE user_id = OLD.id)
+    OR EXISTS (
+      SELECT 1
+      FROM users existing
+      JOIN plugin_submissions submission ON submission.user_id = existing.id
+      WHERE existing.id = NEW.id
+         OR existing.email = NEW.email
+         OR existing.auth_subject = NEW.auth_subject
+    )
+  );
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS users_active_replay_capture_identity_frozen_insert
+BEFORE INSERT ON users
+WHEN EXISTS (
+  SELECT 1 FROM users existing
+  JOIN plugin_submissions submission ON submission.user_id = existing.id
+  WHERE existing.id = NEW.id
+     OR existing.email = NEW.email
+     OR existing.auth_subject = NEW.auth_subject
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission capture identity is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL;
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS users_active_replay_capture_identity_frozen_delete
+BEFORE DELETE ON users
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission capture identity is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL AND EXISTS (
+    SELECT 1 FROM plugin_submissions WHERE user_id = OLD.id
+  );
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS plugin_installs_active_replay_capture_identity_frozen_update
+BEFORE UPDATE ON plugin_installs
+WHEN (
+  NOT (NEW.id IS OLD.id)
+  OR NOT (NEW.user_id IS OLD.user_id)
+  OR NOT (NEW.public_key_base64 IS OLD.public_key_base64)
+  OR NOT (NEW.created_at IS OLD.created_at)
+  OR NOT (NEW.revoked_at IS OLD.revoked_at)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission capture identity is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL AND EXISTS (
+    SELECT 1 FROM plugin_submissions
+    WHERE plugin_install_id IN (OLD.id, NEW.id)
+  );
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS plugin_installs_active_replay_capture_identity_frozen_insert
+BEFORE INSERT ON plugin_installs
+WHEN EXISTS (
+  SELECT 1 FROM plugin_submissions submission
+  WHERE submission.plugin_install_id = NEW.id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission capture identity is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL;
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS plugin_installs_active_replay_capture_identity_frozen_delete
+BEFORE DELETE ON plugin_installs
+BEGIN
+  SELECT RAISE(ABORT, 'replay submission inventory lock is invalid')
+  WHERE (SELECT COUNT(*) FROM listing_replay_submission_inventory_lock) <> 1;
+  SELECT RAISE(ABORT, 'plugin submission capture identity is frozen by active replay')
+  WHERE (
+    SELECT active_run_id FROM listing_replay_submission_inventory_lock
+    WHERE singleton_id = 1
+  ) IS NOT NULL AND EXISTS (
+    SELECT 1 FROM plugin_submissions WHERE plugin_install_id = OLD.id
+  );
+  UPDATE listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1 WHERE singleton_id = 1;
+END;

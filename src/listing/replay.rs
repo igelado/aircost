@@ -15,6 +15,7 @@ use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::validate_source_url;
 use crate::plugin::{sha256_hex, verify_submission_signature};
 
+pub(crate) mod admission;
 pub mod catalog;
 pub mod export;
 pub mod run;
@@ -143,6 +144,145 @@ pub(crate) fn authenticate_retained_capture(
         capture.rendered_html_sha256,
         capture.signature_base64,
     )
+}
+
+pub(crate) fn retained_capture_timestamp_chronology_valid(
+    install_created_at: &str,
+    submitted_at: &str,
+    revoked_at: Option<&str>,
+) -> bool {
+    let Some(install_created_at) = parse_replay_timestamp(install_created_at) else {
+        return false;
+    };
+    let Some(submitted_at) = parse_replay_timestamp(submitted_at) else {
+        return false;
+    };
+    let revoked_at = match revoked_at {
+        Some(value) => match parse_replay_timestamp(value) {
+            Some(parsed) => Some(parsed),
+            None => return false,
+        },
+        None => None,
+    };
+    submitted_at >= install_created_at
+        && revoked_at
+            .map(|revoked| revoked >= install_created_at && submitted_at <= revoked)
+            .unwrap_or(true)
+}
+
+/// Parses the timestamp shapes emitted by SQLite, PostgreSQL, and the plugin
+/// API without allowing malformed text to abort a PostgreSQL query. Naive
+/// timestamps are interpreted as UTC, matching application storage.
+pub(crate) fn parse_replay_timestamp(value: &str) -> Option<i128> {
+    let value = value.trim();
+    if value.len() < 19 {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b' ' | b'T'))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let year = parse_timestamp_digits(bytes.get(0..4)?)? as i64;
+    let month = parse_timestamp_digits(bytes.get(5..7)?)? as u32;
+    let day = parse_timestamp_digits(bytes.get(8..10)?)? as u32;
+    let hour = parse_timestamp_digits(bytes.get(11..13)?)? as u32;
+    let minute = parse_timestamp_digits(bytes.get(14..16)?)? as u32;
+    let second = parse_timestamp_digits(bytes.get(17..19)?)? as u32;
+    if year == 0
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > timestamp_days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let mut cursor = 19;
+    let mut nanos = 0_i128;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let fraction_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        let fraction = bytes.get(fraction_start..cursor)?;
+        if fraction.is_empty() || fraction.len() > 9 {
+            return None;
+        }
+        nanos =
+            parse_timestamp_digits(fraction)? as i128 * 10_i128.pow((9 - fraction.len()) as u32);
+    }
+
+    let offset_seconds = match bytes.get(cursor..) {
+        Some([]) | Some([b'Z']) | Some([b'z']) => 0_i64,
+        Some(zone) if matches!(zone.first(), Some(b'+' | b'-')) => {
+            let sign = if zone[0] == b'+' { 1_i64 } else { -1_i64 };
+            let (hours, minutes) = match zone {
+                [_, h1, h2] => (parse_timestamp_digits(&[*h1, *h2])?, 0),
+                [_, h1, h2, m1, m2] => (
+                    parse_timestamp_digits(&[*h1, *h2])?,
+                    parse_timestamp_digits(&[*m1, *m2])?,
+                ),
+                [_, h1, h2, b':', m1, m2] => (
+                    parse_timestamp_digits(&[*h1, *h2])?,
+                    parse_timestamp_digits(&[*m1, *m2])?,
+                ),
+                _ => return None,
+            };
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
+            sign * i64::from(hours * 3_600 + minutes * 60)
+        }
+        _ => return None,
+    };
+
+    let days = timestamp_days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour * 3_600 + minute * 60 + second))?
+        .checked_sub(offset_seconds)?;
+    Some(i128::from(seconds) * 1_000_000_000 + nanos)
+}
+
+fn parse_timestamp_digits(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    bytes.iter().try_fold(0_u32, |value, digit| {
+        value.checked_mul(10)?.checked_add(u32::from(*digit - b'0'))
+    })
+}
+
+fn timestamp_days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn timestamp_days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 pub async fn build_trusted_capture_manifest(
