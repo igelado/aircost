@@ -12,10 +12,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::extract::CURATED_AVIONICS_TYPES;
-use crate::html::clean::{
-    clean_publisher_source_html, listing_body_contains_exact_structurally_visible_text_span,
-    normalize_source_evidence_span,
-};
+#[cfg(test)]
+use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
+use crate::html::clean::normalize_source_evidence_span;
 use crate::html::listing::source::listing_evidence_units;
 use crate::listing::evidence::{
     controller_avionics_evidence, identity_span_has_boundaries, ListingEvidenceContext,
@@ -190,13 +189,13 @@ impl AvionicsValidationRule {
                 "integrated suite assigns a capability to a separate product"
             }
             Self::QuantityProofAmbiguous => {
-                "multiple distinct role-separated quantity proofs exist"
+                "ambiguous Controller quantity evidence cannot have high source confidence"
             }
             Self::QuantityMismatch => {
-                "occurrence does not preserve the exact quantity of two proved by complementary role-separated source items"
+                "occurrence duplicates an earlier normalized manufacturer/model identity, or quantity greater than one cannot have high source confidence"
             }
             Self::QuantityEvidenceIncomplete => {
-                "source_evidence_text does not cover both exact role-separated source items"
+                "source_evidence_text does not cover the complete bounded Controller quantity ambiguity"
             }
             Self::InvalidBindingIdentifiers => {
                 "listing and retained submission IDs must be positive"
@@ -401,118 +400,33 @@ pub(crate) fn validate_current_avionics_observations(
     validate_current_avionics_quantity_completeness(observations, source_url, rendered_html)
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ControllerAvionicsExtractionRecovery {
-    pub quantity_recovered: bool,
-    pub evidence_recovered: bool,
-}
-
-/// Apply every deterministic Controller extraction repair as one atomic
-/// mutation. A payload that needs more than one scoped repair is validated
-/// only after all qualifying mutations have been applied. Any scoped error or
-/// final extraction-contract failure restores the byte-for-byte input value.
+/// Apply the narrow Controller evidence-typography repair atomically. Quantity
+/// remains model-produced and is validated without mutation.
 pub(crate) fn recover_controller_avionics_extraction(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
-) -> Result<ControllerAvionicsExtractionRecovery, AvionicsValidationFailure> {
+) -> Result<bool, AvionicsValidationFailure> {
     let original = extracted_listing.clone();
     let recovery = (|| {
-        let quantity_recovered = apply_exact_role_separated_avionics_quantity(
-            extracted_listing,
-            source_url,
-            rendered_html,
-        )?;
         let evidence_recovered = apply_controller_avionics_evidence_typography(
             extracted_listing,
             source_url,
             rendered_html,
         )?;
-        let recovery = ControllerAvionicsExtractionRecovery {
-            quantity_recovered,
-            evidence_recovered,
-        };
-        if quantity_recovered || evidence_recovered {
+        if evidence_recovered {
             validate_unbound_current_avionics_extraction(
                 &extracted_listing.to_string(),
                 source_url,
                 rendered_html,
             )?;
         }
-        Ok(recovery)
+        Ok(evidence_recovered)
     })();
     if recovery.is_err() {
         *extracted_listing = original;
     }
     recovery
-}
-
-/// Recover one under-counted display product from an exact role-separated
-/// equipment enumeration.
-///
-/// This is deliberately not general mention counting. One structurally valid
-/// Controller `Avionics/Radios` field must contain one unambiguous, comma- or
-/// semicolon-delimited pair of the same complete manufacturer/model identity,
-/// and the two list items must name complementary physical installation roles
-/// such as `attitude` and `HSI`. Qualifying prose and arbitrary prefixes are
-/// rejected. The model must already have emitted exactly one ordinary
-/// installed occurrence with quantity one and evidence equal to one of those
-/// two list items. Only its quantity and exact evidence locator are replaced.
-fn apply_exact_role_separated_avionics_quantity(
-    extracted_listing: &mut Value,
-    source_url: &str,
-    rendered_html: &str,
-) -> Result<bool, AvionicsValidationFailure> {
-    let observations = parse_current_avionics_extraction_value(extracted_listing)?;
-    let Some(installed_equipment) = controller_avionics_evidence(source_url, rendered_html) else {
-        return Ok(false);
-    };
-    let mut repairs = Vec::new();
-    for (index, observation) in observations.iter().enumerate() {
-        if observation.quantity != 1
-            || observation.configuration_action != "installed"
-            || observation.replaces.is_some()
-            || observations.iter().enumerate().any(|(other_index, other)| {
-                other_index != index && same_product_identity(observation, other)
-            })
-        {
-            continue;
-        }
-        let RoleSeparatedQuantityEvidence::Unique(proof) = role_separated_quantity_evidence(
-            &installed_equipment,
-            rendered_html,
-            &observation.manufacturer,
-            &observation.model,
-        ) else {
-            continue;
-        };
-        let evidence = observation
-            .source_evidence_text
-            .as_deref()
-            .expect("the canonical parser requires occurrence evidence")
-            .trim();
-        if !proof.items.iter().any(|item| item == evidence) {
-            continue;
-        }
-        repairs.push((index, proof.evidence));
-    }
-
-    if repairs.is_empty() {
-        return Ok(false);
-    }
-    let avionics = extracted_listing
-        .get_mut("avionics")
-        .and_then(Value::as_array_mut)
-        .expect("the canonical parser requires a top-level avionics array");
-    for (index, evidence) in repairs {
-        let occurrence = avionics[index]
-            .as_object_mut()
-            .expect("the canonical parser requires avionics objects");
-        occurrence.insert("quantity".to_string(), Value::from(2));
-        occurrence.insert("source_evidence_text".to_string(), Value::String(evidence));
-    }
-
-    Ok(true)
 }
 
 /// Replace only typography-drifted occurrence evidence with an exact visible
@@ -683,7 +597,7 @@ fn controller_multiline_candidate_matches_observation(
     if observation.configuration_action != "installed"
         || observation.replaces.is_some()
         || observation.quantity < 1
-        || normalized_identity_occurrence_count(candidate, &observation.model)
+        || normalized_identity_occurrence_ranges(candidate, &observation.model).len()
             != observation.quantity as usize
     {
         return false;
@@ -1033,48 +947,51 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
     source_url: &str,
     rendered_html: &str,
 ) -> Result<(), AvionicsValidationFailure> {
-    let Some(installed_equipment) = controller_avionics_evidence(source_url, rendered_html) else {
-        return Ok(());
-    };
     for (index, observation) in observations.iter().enumerate() {
-        let proof = match role_separated_quantity_evidence(
-            &installed_equipment,
-            rendered_html,
-            &observation.manufacturer,
-            &observation.model,
-        ) {
-            RoleSeparatedQuantityEvidence::None => continue,
-            RoleSeparatedQuantityEvidence::Unique(proof) => proof,
-            RoleSeparatedQuantityEvidence::Ambiguous => {
-                return Err(AvionicsValidationFailure::occurrence(
-                    AvionicsValidationRule::QuantityProofAmbiguous,
-                    index,
-                    AvionicsValidationField::Quantity,
-                ));
-            }
-        };
-        let matching = observations
+        if let Some(related_index) = observations[..index]
             .iter()
-            .enumerate()
-            .filter(|(_, candidate)| same_product_identity(observation, candidate))
-            .collect::<Vec<_>>();
-        if matching.len() != 1
-            || observation.configuration_action != "installed"
-            || observation.replaces.is_some()
-            || observation.quantity != 2
+            .position(|candidate| same_product_identity(observation, candidate))
         {
+            return Err(AvionicsValidationFailure::related(
+                AvionicsValidationRule::QuantityMismatch,
+                index,
+                AvionicsValidationField::Quantity,
+                related_index,
+            ));
+        }
+        if observation.quantity > 1 && observation.source_confidence.as_deref() == Some("high") {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::QuantityMismatch,
                 index,
                 AvionicsValidationField::Quantity,
             ));
         }
+    }
+    let Some(installed_equipment) = controller_avionics_evidence(source_url, rendered_html) else {
+        return Ok(());
+    };
+    for (index, observation) in observations.iter().enumerate() {
         let evidence = observation
             .source_evidence_text
             .as_deref()
             .expect("the canonical parser requires occurrence evidence")
             .trim();
-        if !evidence.contains(&proof.evidence) {
+        let Some(signal) = controller_quantity_ambiguity_signal(
+            &installed_equipment,
+            &observation.manufacturer,
+            &observation.model,
+            evidence,
+        ) else {
+            continue;
+        };
+        if observation.source_confidence.as_deref() == Some("high") {
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::QuantityProofAmbiguous,
+                index,
+                AvionicsValidationField::SourceConfidence,
+            ));
+        }
+        if !evidence.contains(&installed_equipment[signal.start..signal.end]) {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::QuantityEvidenceIncomplete,
                 index,
@@ -1100,117 +1017,120 @@ fn punctuation_insensitive_identity_key(value: &str) -> String {
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DisplayInstallationRole {
-    Attitude,
-    Hsi,
-}
-
-impl DisplayInstallationRole {
-    fn is_complementary_to(self, other: Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Attitude, Self::Hsi) | (Self::Hsi, Self::Attitude)
-        )
-    }
-}
-
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct RoleSeparatedQuantityProof {
-    evidence: String,
-    items: [String; 2],
-}
-
-#[derive(Debug)]
-enum RoleSeparatedQuantityEvidence {
-    None,
-    Unique(RoleSeparatedQuantityProof),
-    Ambiguous,
-}
-
 #[derive(Clone, Copy, Debug)]
-struct EnumeratedItem<'a> {
-    text: &'a str,
+struct IdentityRange {
     start: usize,
     end: usize,
-    separator_after: Option<char>,
 }
 
-fn role_separated_quantity_evidence(
-    visible_source: &str,
-    rendered_html: &str,
+fn controller_quantity_ambiguity_signal(
+    source: &str,
     manufacturer: &str,
     model: &str,
-) -> RoleSeparatedQuantityEvidence {
-    let mut proofs = BTreeSet::new();
-    let mut disqualified_proof = false;
-    let exact_product_occurrences =
-        normalized_identity_occurrence_count(visible_source, &format!("{manufacturer} {model}"));
-    let exact_model_occurrences = normalized_identity_occurrence_count(visible_source, model);
-    for line in visible_source.lines() {
-        let items = enumerated_items(line);
-        for pair in items.windows(2) {
-            if !matches!(pair[0].separator_after, Some(',' | ';')) {
-                continue;
-            }
-            let Some((first_role, first_identity_start)) = exact_display_installation_role(
-                pair[0].text,
-                manufacturer,
-                model,
-                false,
-                rendered_html,
-            ) else {
-                continue;
-            };
-            let Some((second_role, second_identity_start)) = exact_display_installation_role(
-                pair[1].text,
-                manufacturer,
-                model,
-                true,
-                rendered_html,
-            ) else {
-                continue;
-            };
-            if !first_role.is_complementary_to(second_role) {
-                continue;
-            }
-            if exact_product_occurrences != 2 || exact_model_occurrences != 2 {
-                disqualified_proof = true;
-                continue;
-            }
-            let evidence_start = pair[0].start + first_identity_start;
-            let evidence_end = pair[1].end;
-            let evidence = line[evidence_start..evidence_end].trim();
-            if evidence.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES
-                || !listing_body_contains_exact_structurally_visible_text_span(
-                    rendered_html,
-                    evidence,
-                )
-            {
-                continue;
-            }
-            proofs.insert(RoleSeparatedQuantityProof {
-                evidence: evidence.to_string(),
-                items: [
-                    pair[0].text[first_identity_start..].trim().to_string(),
-                    pair[1].text[second_identity_start..].trim().to_string(),
-                ],
-            });
+    evidence: &str,
+) -> Option<IdentityRange> {
+    let ranges = normalized_identity_occurrence_ranges(source, model);
+    let mut ambiguity = (ranges.len() > 1).then(|| IdentityRange {
+        start: ranges.first().expect("two ranges have a first").start,
+        end: ranges.last().expect("two ranges have a last").end,
+    });
+    if let Some(run_on_dual) = controller_run_on_dual_evidence_range(source, evidence, model) {
+        include_ambiguity_range(&mut ambiguity, run_on_dual);
+    }
+    for range in &ranges {
+        if let Some(marker) = quantity_marker_in_identity_item(source, *range, manufacturer) {
+            include_ambiguity_range(&mut ambiguity, marker);
         }
     }
-    match (disqualified_proof, proofs.len()) {
-        (false, 0) => RoleSeparatedQuantityEvidence::None,
-        (false, 1) => RoleSeparatedQuantityEvidence::Unique(
-            proofs.into_iter().next().expect("one proof exists"),
-        ),
-        _ => RoleSeparatedQuantityEvidence::Ambiguous,
+    ambiguity
+}
+
+fn include_ambiguity_range(ambiguity: &mut Option<IdentityRange>, range: IdentityRange) {
+    if let Some(ambiguity) = ambiguity {
+        ambiguity.start = ambiguity.start.min(range.start);
+        ambiguity.end = ambiguity.end.max(range.end);
+    } else {
+        *ambiguity = Some(range);
     }
 }
 
-fn normalized_identity_occurrence_count(source: &str, identity: &str) -> usize {
+fn controller_run_on_dual_evidence_range(
+    source: &str,
+    evidence: &str,
+    model: &str,
+) -> Option<IdentityRange> {
+    if !controller_field_has_exact_evidence_line(source, evidence) {
+        return None;
+    }
+    let Some(identity_end) = normalized_left_bounded_identity_end(evidence, model) else {
+        return None;
+    };
+    let suffix = &evidence[identity_end..];
+    let Some(capabilities) = suffix
+        .get(..suffix.len().saturating_sub("(Dual)".len()))
+        .filter(|_| suffix.to_ascii_lowercase().ends_with("(dual)"))
+    else {
+        return None;
+    };
+    let parts = capabilities.split('/').collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    let matches = source.match_indices(evidence).collect::<Vec<_>>();
+    let (first, _) = *matches.first()?;
+    let (last, _) = *matches.last()?;
+    Some(IdentityRange {
+        start: first,
+        end: last + evidence.len(),
+    })
+}
+
+fn normalized_left_bounded_identity_end(source: &str, identity: &str) -> Option<usize> {
     let normalized_identity = punctuation_insensitive_identity_key(identity);
     if normalized_identity.is_empty() {
-        return 0;
+        return None;
+    }
+    let mut normalized_source = String::new();
+    let mut source_offsets = Vec::new();
+    for (offset, character) in source.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            normalized_source.push(character.to_ascii_lowercase());
+            source_offsets.push(offset);
+        }
+    }
+    let spans = normalized_source
+        .match_indices(&normalized_identity)
+        .filter_map(|(offset, _)| {
+            let source_start = source_offsets.get(offset).copied()?;
+            let last_offset = offset.checked_add(normalized_identity.len() - 1)?;
+            let source_last = source_offsets.get(last_offset).copied()?;
+            source[..source_start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_ascii_alphanumeric())
+                .then(|| {
+                    source_last
+                        + source[source_last..]
+                            .chars()
+                            .next()
+                            .expect("a recorded source offset has one character")
+                            .len_utf8()
+                })
+        })
+        .collect::<Vec<_>>();
+    let [end] = spans.as_slice() else {
+        return None;
+    };
+    Some(*end)
+}
+
+fn normalized_identity_occurrence_ranges(source: &str, identity: &str) -> Vec<IdentityRange> {
+    let normalized_identity = punctuation_insensitive_identity_key(identity);
+    if normalized_identity.is_empty() {
+        return Vec::new();
     }
     let mut normalized_source = String::new();
     let mut source_offsets = Vec::new();
@@ -1222,112 +1142,140 @@ fn normalized_identity_occurrence_count(source: &str, identity: &str) -> usize {
     }
     normalized_source
         .match_indices(&normalized_identity)
-        .filter(|(offset, _)| {
-            let Some(source_start) = source_offsets.get(*offset).copied() else {
-                return false;
-            };
-            let Some(last_offset) = offset.checked_add(normalized_identity.len() - 1) else {
-                return false;
-            };
-            let Some(source_last) = source_offsets.get(last_offset).copied() else {
-                return false;
-            };
+        .filter_map(|(offset, _)| {
+            let source_start = source_offsets.get(offset).copied()?;
+            let last_offset = offset.checked_add(normalized_identity.len() - 1)?;
+            let source_last = source_offsets.get(last_offset).copied()?;
             let source_end = source_last
                 + source[source_last..]
                     .chars()
                     .next()
                     .expect("a recorded source offset has one character")
                     .len_utf8();
-            identity_span_has_boundaries(source, source_start, source_end)
-        })
-        .count()
-}
-
-fn enumerated_items(line: &str) -> Vec<EnumeratedItem<'_>> {
-    let mut items = Vec::new();
-    let mut start = 0;
-    for (offset, character) in line.char_indices() {
-        if !matches!(character, ',' | ';') {
-            continue;
-        }
-        let end = offset;
-        items.push(EnumeratedItem {
-            text: &line[start..end],
-            start,
-            end,
-            separator_after: Some(character),
-        });
-        start = offset + character.len_utf8();
-    }
-    items.push(EnumeratedItem {
-        text: &line[start..],
-        start,
-        end: line.len(),
-        separator_after: None,
-    });
-    items
-}
-
-fn exact_display_installation_role(
-    item: &str,
-    manufacturer: &str,
-    model: &str,
-    require_identity_at_start: bool,
-    rendered_html: &str,
-) -> Option<(DisplayInstallationRole, usize)> {
-    let identity = ListingEvidenceContext::from_cleaned_text(item)
-        .unique_exact_product_slice(manufacturer, model)?;
-    let identity_start = item.find(&identity)?;
-    let prefix = item[..identity_start].trim();
-    if (require_identity_at_start && !prefix.is_empty())
-        || (!require_identity_at_start && !exact_installed_equipment_prefix(prefix, rendered_html))
-    {
-        return None;
-    }
-    let role = item[identity_start + identity.len()..]
-        .split_ascii_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    let role = match role.as_str() {
-        "attitude" | "attitude display" | "attitude indicator" | "adi" => {
-            DisplayInstallationRole::Attitude
-        }
-        "hsi" | "horizontal situation indicator" => DisplayInstallationRole::Hsi,
-        _ => return None,
-    };
-    Some((role, identity_start))
-}
-
-fn exact_installed_equipment_prefix(prefix: &str, rendered_html: &str) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-    if prefix.len() != 4
-        || !prefix.starts_with('K')
-        || !prefix.bytes().all(|byte| byte.is_ascii_uppercase())
-    {
-        return false;
-    }
-    let source = clean_publisher_source_html(rendered_html);
-    let lowercase_source = source.to_ascii_lowercase();
-    let needle = format!("hangared at {}", prefix.to_ascii_lowercase());
-    lowercase_source.match_indices(&needle).any(|(start, _)| {
-        let end = start + needle.len();
-        let has_boundaries = source[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|character| !character.is_ascii_alphanumeric())
-            && source[end..]
-                .chars()
-                .next()
-                .is_none_or(|character| !character.is_ascii_alphanumeric());
-        has_boundaries
-            && listing_body_contains_exact_structurally_visible_text_span(
-                rendered_html,
-                &source[start..end],
+            identity_span_has_boundaries(source, source_start, source_end).then_some(
+                IdentityRange {
+                    start: source_start,
+                    end: source_end,
+                },
             )
-    })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct SourceWord {
+    value: String,
+    start: usize,
+    end: usize,
+}
+
+fn source_words(source: &str, start: usize, end: usize) -> Vec<SourceWord> {
+    let mut words = Vec::new();
+    let mut word_start = None;
+    for (relative, character) in source[start..end].char_indices() {
+        let offset = start + relative;
+        if character.is_ascii_alphanumeric() {
+            word_start.get_or_insert(offset);
+        } else if let Some(word_start) = word_start.take() {
+            words.push(SourceWord {
+                value: source[word_start..offset].to_ascii_lowercase(),
+                start: word_start,
+                end: offset,
+            });
+        }
+    }
+    if let Some(word_start) = word_start {
+        words.push(SourceWord {
+            value: source[word_start..end].to_ascii_lowercase(),
+            start: word_start,
+            end,
+        });
+    }
+    words
+}
+
+fn quantity_marker_in_identity_item(
+    source: &str,
+    identity: IdentityRange,
+    manufacturer: &str,
+) -> Option<IdentityRange> {
+    let (item_start, item_end) = item_bounds(source, identity.start);
+    let item_words = source_words(source, item_start, item_end);
+    let item_range = || {
+        let start = item_words.first().map_or(identity.start, |word| word.start);
+        let end = item_words.last().map_or(identity.end, |word| word.end);
+        IdentityRange { start, end }
+    };
+    if item_words.iter().any(|word| word.value == "dual")
+        || item_words
+            .iter()
+            .any(|word| decimal_quantity_is_multiplier(&word.value))
+        || source[item_start..item_end]
+            .match_indices('#')
+            .any(|(offset, _)| {
+                source[item_start + offset + 1..item_end]
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_digit())
+            })
+    {
+        return Some(item_range());
+    }
+
+    let words = source_words(source, item_start, identity.start);
+    let manufacturer_words = source_words(manufacturer, 0, manufacturer.len());
+    let mut end = words.len();
+    if !manufacturer_words.is_empty()
+        && words
+            .get(end.saturating_sub(manufacturer_words.len())..end)
+            .is_some_and(|tail| {
+                tail.iter()
+                    .map(|word| &word.value)
+                    .eq(manufacturer_words.iter().map(|word| &word.value))
+            })
+    {
+        end -= manufacturer_words.len();
+    }
+    let plain_decimal_prefix = end.checked_sub(1).is_some_and(|last_word| {
+        let word = &words[last_word];
+        let prefix = source[item_start..word.start].trim_end();
+        decimal_quantity_word(&word.value)
+            && !prefix.ends_with('#')
+            && prefix
+                .chars()
+                .next_back()
+                .is_none_or(|character| matches!(character, ':' | '('))
+    });
+    let after_words = source_words(source, identity.end, item_end);
+    let labeled_decimal_suffix = after_words
+        .first()
+        .is_some_and(|word| decimal_quantity_word(&word.value))
+        && after_words
+            .get(1)
+            .is_some_and(|word| matches!(word.value.as_str(), "unit" | "units" | "each" | "ea"));
+    (plain_decimal_prefix || labeled_decimal_suffix).then(item_range)
+}
+
+fn decimal_quantity_word(value: &str) -> bool {
+    let digits = value
+        .strip_prefix('x')
+        .or_else(|| value.strip_suffix('x'))
+        .unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn decimal_quantity_is_multiplier(value: &str) -> bool {
+    (value.starts_with('x') || value.ends_with('x')) && decimal_quantity_word(value)
+}
+
+fn item_bounds(source: &str, offset: usize) -> (usize, usize) {
+    let start = source[..offset]
+        .rfind([',', ';', '\r', '\n'])
+        .map_or(0, |index| index + 1);
+    let end = source[offset..]
+        .find([',', ';', '\r', '\n'])
+        .map_or(source.len(), |index| offset + index);
+    (start, end)
 }
 
 fn validate_current_avionics_identity_evidence_occurrence(
@@ -1354,7 +1302,7 @@ fn validate_current_avionics_identity_evidence_occurrence(
                 evidence,
                 &observation.model,
                 &observation.avionics_types,
-                observation.quantity == 2,
+                true,
             ) || exact_controller_waas_capability_annotation(
                 evidence,
                 &observation.manufacturer,
@@ -1458,8 +1406,8 @@ fn extraction_occurrence_has_exact_identity(
 /// remains an identity only when its sole normalized occurrence is followed
 /// immediately by an exact slash-delimited set of the same curated
 /// capabilities declared for that occurrence. The suffix must end there,
-/// apart from Controller's exact `(Dual)` annotation on a quantity-two
-/// occurrence.
+/// apart from Controller's exact `(Dual)` ambiguity annotation. This grammar
+/// proves identity only; it never establishes a physical count.
 pub(crate) fn exact_controller_run_on_capability_annotation(
     evidence: &str,
     model: &str,
@@ -2090,22 +2038,12 @@ mod tests {
         include_str!("../../../tests/fixtures/controller/id25_like_listing.html").to_string()
     }
 
-    fn recover_exact_role_separated_avionics_quantity(
-        payload: &mut Value,
-        source_url: &str,
-        rendered_html: &str,
-    ) -> Result<bool, AvionicsValidationFailure> {
-        recover_controller_avionics_extraction(payload, source_url, rendered_html)
-            .map(|recovery| recovery.quantity_recovered)
-    }
-
     fn recover_controller_avionics_evidence_typography(
         payload: &mut Value,
         source_url: &str,
         rendered_html: &str,
     ) -> Result<bool, AvionicsValidationFailure> {
         recover_controller_avionics_extraction(payload, source_url, rendered_html)
-            .map(|recovery| recovery.evidence_recovered)
     }
 
     fn installed(manufacturer: &str, model: &str, evidence: &str) -> Value {
@@ -2198,259 +2136,174 @@ mod tests {
     }
 
     #[test]
-    fn repairs_retained_submission_20_complementary_role_enumeration_to_two_units() {
-        let html =
-            controller_html("KSAR Garmin G5 attitude, Garmin G5 HSI, Garmin GFC500 auto pilot");
-        let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-        let original = payload.clone();
+    fn controller_quantity_ambiguity_never_authorizes_high_confidence() {
+        for (manufacturer, model, field) in [
+            ("Garmin", "G1000", "Garmin G1000 PFD\nGarmin G1000 MFD"),
+            (
+                "Garmin",
+                "G5",
+                "Garmin G5 was installed previously. Later the Garmin G5 was serviced.",
+            ),
+            ("Garmin", "G5", "Garmin G5 PFD\nDynon G5 backup"),
+            ("Garmin", "G5", "Dual Garmin G5"),
+            ("Garmin", "G5", "Not Dual Garmin G5"),
+            ("Garmin", "G5", "Optional Dual Garmin G5"),
+            ("Garmin", "G5", "Garmin G5 dual screen"),
+            ("Garmin", "G5", "Garmin G5 #3"),
+            ("Garmin", "G5", "Garmin G5 2 units"),
+            ("Garmin", "GIA63W", "GIA63WNAV/COM/GPS(Dual)"),
+            (
+                "Garmin",
+                "G5",
+                "Garmin G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5 attitude",
+            ),
+        ] {
+            let mut payload = installed(manufacturer, model, field);
+            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+            let result = validate_current_avionics_quantity_completeness(
+                &observations,
+                CONTROLLER_URL,
+                &controller_html(field),
+            );
+            assert!(result.is_err(), "{field:?} was admitted as high confidence");
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("ambiguous Controller quantity evidence"),
+                "{field:?}: {error}"
+            );
 
-        assert!(recover_exact_role_separated_avionics_quantity(
-            &mut payload,
-            CONTROLLER_URL,
-            &html
-        )
-        .unwrap());
-        assert_eq!(payload["avionics"][0]["quantity"], 2);
-        assert_eq!(evidence(&payload), "Garmin G5 attitude, Garmin G5 HSI");
-        assert_eq!(
-            payload["avionics"][0]["manufacturer"],
-            original["avionics"][0]["manufacturer"]
+            payload["avionics"][0]["source_confidence"] = serde_json::json!("low");
+            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+            validate_current_avionics_quantity_completeness(
+                &observations,
+                CONTROLLER_URL,
+                &controller_html(field),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn controller_quantity_ambiguity_requires_complete_exact_evidence() {
+        for (field, evidence) in [
+            ("Garmin G1000 PFD\nGarmin G1000 MFD", "Garmin G1000 PFD"),
+            ("Optional Dual Garmin G5", "Dual Garmin G5"),
+            ("Garmin G5 dual screen", "Garmin G5 dual"),
+            ("Garmin G5 2 units", "Garmin G5 2"),
+        ] {
+            let model = if field.contains("G1000") {
+                "G1000"
+            } else {
+                "G5"
+            };
+            let mut payload = installed("Garmin", model, evidence);
+            payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
+            let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+            let result = validate_current_avionics_quantity_completeness(
+                &observations,
+                CONTROLLER_URL,
+                &controller_html(field),
+            );
+            assert!(
+                result.is_err(),
+                "{field:?} admitted incomplete evidence {evidence:?}"
+            );
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("complete bounded Controller quantity ambiguity"),
+                "{field:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_normalized_products_are_rejected_globally_without_source_signals() {
+        let html = "<html><body><p>Garmin G5 installed</p></body></html>";
+        let mut duplicate = installed("Garmin", "G5", "Garmin G5 installed");
+        let second = installed("Gar-min", "G-5", "Garmin G5 installed")["avionics"][0].clone();
+        duplicate["avionics"].as_array_mut().unwrap().push(second);
+        let observations = parse_current_avionics_extraction_value(&duplicate).unwrap();
+        assert!(
+            validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html,)
+                .unwrap_err()
+                .contains("duplicates an earlier normalized manufacturer/model identity")
         );
-        assert_eq!(
-            payload["avionics"][0]["model"],
-            original["avionics"][0]["model"]
+
+        let mut different_manufacturers = installed("Garmin", "G5", "Garmin G5 installed");
+        let dynon = installed("Dynon", "G5", "Dynon G5 installed")["avionics"][0].clone();
+        different_manufacturers["avionics"]
+            .as_array_mut()
+            .unwrap()
+            .push(dynon);
+        let observations =
+            parse_current_avionics_extraction_value(&different_manufacturers).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html).unwrap();
+    }
+
+    #[test]
+    fn unsupported_high_confidence_quantity_is_rejected_without_a_controller_adapter() {
+        let html = "<html><body><p>Garmin G5 installed</p></body></html>";
+        let mut payload = installed("Garmin", "G5", "Garmin G5 installed");
+        payload["avionics"][0]["quantity"] = serde_json::json!(99);
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        assert!(
+            validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html,)
+                .unwrap_err()
+                .contains("quantity greater than one cannot have high source confidence")
         );
-        assert_eq!(
-            payload["avionics"][0]["types"],
-            original["avionics"][0]["types"]
-        );
+
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("low");
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html).unwrap();
+
+        payload["avionics"][0]["quantity"] = serde_json::json!(1);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("high");
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html).unwrap();
+    }
+
+    #[test]
+    fn controller_run_on_dual_marker_is_bounded_to_its_immediate_item() {
+        let field = "GIA63WNAV/COM/GPS(Dual)";
+        let html = controller_html(field);
+        let mut payload = installed("Garmin", "GIA63W", field);
+        payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
         validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
             .unwrap();
-    }
-
-    #[test]
-    fn complementary_role_quantity_is_a_fail_closed_completeness_contract() {
-        let html = controller_html("Garmin G5 attitude, Garmin G5 HSI");
-        let quantity_one = installed("Garmin", "G5", "Garmin G5 attitude");
-        assert!(validate_unbound_current_avionics_extraction(
-            &quantity_one.to_string(),
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap_err()
-        .contains("exact quantity of two"));
-
-        let mut incomplete_evidence = quantity_one.clone();
-        incomplete_evidence["avionics"][0]["quantity"] = serde_json::json!(2);
-        assert!(validate_unbound_current_avionics_extraction(
-            &incomplete_evidence.to_string(),
-            CONTROLLER_URL,
-            &html
-        )
-        .unwrap_err()
-        .contains("does not cover both exact role-separated"));
-
-        let mut complete = incomplete_evidence;
-        complete["avionics"][0]["source_evidence_text"] =
-            serde_json::json!("Garmin G5 attitude, Garmin G5 HSI");
-        validate_unbound_current_avionics_extraction(&complete.to_string(), CONTROLLER_URL, &html)
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
             .unwrap();
+
+        let unrelated = "GIA63WNAV/COM/GPS; Garmin GFC500 (Dual)";
+        let unrelated_payload = installed("Garmin", "GIA63W", unrelated);
+        let observations = parse_current_avionics_extraction_value(&unrelated_payload).unwrap();
+        validate_current_avionics_quantity_completeness(
+            &observations,
+            CONTROLLER_URL,
+            &controller_html(unrelated),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn role_quantity_recovery_rejects_narrative_repetition_and_identity_ambiguity() {
-        for field in [
-            "Garmin G5 attitude. Later, Garmin G5 HSI",
-            "Garmin G5 attitude, Garmin G5 attitude",
-            "Garmin G5 attitude, Garmin G5X HSI",
-            "Garmin G5 attitude, Garmin GTX 345 transponder, Garmin G5 HSI",
-            "Garmin G5 attitude and HSI",
-        ] {
-            let html = controller_html(field);
-            let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-            let original = payload.clone();
-
-            assert!(
-                !recover_exact_role_separated_avionics_quantity(
-                    &mut payload,
-                    CONTROLLER_URL,
-                    &html,
-                )
-                .unwrap(),
-                "{field:?} must not prove two physical units"
-            );
-            assert_eq!(payload, original);
-            validate_unbound_current_avionics_extraction(
-                &payload.to_string(),
-                CONTROLLER_URL,
-                &html,
-            )
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn extra_same_product_occurrences_make_role_quantity_proof_ambiguous() {
-        for field in [
-            "Garmin G5 attitude, Garmin G5 HSI, Garmin G5 HSI",
-            "Garmin G5 attitude, Garmin G5 HSI, Garmin G5 attitude",
-            "Garmin G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5 standby display",
-        ] {
-            let html = controller_html(field);
-            let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-            let original = payload.clone();
-
-            assert!(!recover_exact_role_separated_avionics_quantity(
-                &mut payload,
-                CONTROLLER_URL,
-                &html,
-            )
-            .unwrap());
-            assert_eq!(payload, original);
-            assert!(validate_unbound_current_avionics_extraction(
-                &payload.to_string(),
-                CONTROLLER_URL,
-                &html,
-            )
-            .unwrap_err()
-            .contains("multiple distinct role-separated quantity proofs"));
-        }
-    }
-
-    #[test]
-    fn optional_or_untrusted_role_pairs_never_prove_installed_quantity() {
-        let cases = [
-            (
-                CONTROLLER_URL,
-                controller_html("Optional configurations: Garmin G5 attitude, Garmin G5 HSI"),
-            ),
-            (
-                CONTROLLER_URL,
-                controller_html("NEW Garmin G5 attitude, Garmin G5 HSI"),
-            ),
-            (
-                CONTROLLER_URL,
-                controller_html("KEEP Garmin G5 attitude, Garmin G5 HSI"),
-            ),
-            (
-                CONTROLLER_URL,
-                controller_html("KING Garmin G5 attitude, Garmin G5 HSI"),
-            ),
-            (
-                GENERIC_URL,
-                r#"<html><body>
-                    <p>Garmin G5 attitude, Garmin G5 HSI</p>
-                    <div class="detail__specs-wrapper">
-                      <div class="detail__specs-label">Avionics/Radios</div>
-                      <div class="detail__specs-value">Garmin GTX 345 transponder</div>
-                    </div>
-                    </body></html>"#
-                    .to_string(),
-            ),
-            (
-                "https://example.test/listing/1",
-                controller_html("Garmin G5 attitude, Garmin G5 HSI"),
-            ),
-        ];
-        for (source_url, html) in cases {
-            let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-            let original = payload.clone();
-
-            assert!(!recover_exact_role_separated_avionics_quantity(
-                &mut payload,
-                source_url,
-                &html,
-            )
-            .unwrap());
-            assert_eq!(payload, original);
-            validate_unbound_current_avionics_extraction(&payload.to_string(), source_url, &html)
-                .unwrap();
-        }
-    }
-
-    #[test]
-    fn punctuation_equivalent_output_rows_block_every_quantity_repair() {
-        let html = controller_html("Garmin G5 attitude, Garmin G5 HSI");
-        for (second_manufacturer, second_model) in [("Garmin", "G-5"), ("Gar-min", "G5")] {
-            let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-            let second = installed(second_manufacturer, second_model, "Garmin G5 HSI")["avionics"]
-                [0]
-            .clone();
-            payload["avionics"].as_array_mut().unwrap().push(second);
-            let original = payload.clone();
-
-            assert!(!recover_exact_role_separated_avionics_quantity(
-                &mut payload,
-                CONTROLLER_URL,
-                &html,
-            )
-            .unwrap());
-            assert_eq!(payload, original);
-            assert!(validate_unbound_current_avionics_extraction(
-                &payload.to_string(),
-                CONTROLLER_URL,
-                &html,
-            )
-            .unwrap_err()
-            .contains("exact quantity of two"));
-        }
-    }
-
-    #[test]
-    fn role_quantity_recovery_accepts_only_one_ordinary_installed_output_row() {
-        let html = controller_html("Garmin G5 attitude; Garmin G5 HSI");
-        for mutation in ["replacement", "duplicate"] {
-            let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-            if mutation == "replacement" {
-                payload["avionics"][0]["configuration_action"] = serde_json::json!("replaces");
-                payload["avionics"][0]["replaces"] = serde_json::json!({
-                    "manufacturer": "Garmin",
-                    "model": "G3X",
-                    "types": ["Flight Display"]
-                });
-            } else {
-                let duplicate = payload["avionics"][0].clone();
-                payload["avionics"].as_array_mut().unwrap().push(duplicate);
-            }
-            let original = payload.clone();
-
-            assert!(!recover_exact_role_separated_avionics_quantity(
-                &mut payload,
-                CONTROLLER_URL,
-                &html,
-            )
-            .unwrap());
-            assert_eq!(payload, original);
-            assert!(validate_unbound_current_avionics_extraction(
-                &payload.to_string(),
-                CONTROLLER_URL,
-                &html,
-            )
-            .is_err());
-        }
-    }
-
-    #[test]
-    fn multiple_distinct_role_quantity_proofs_fail_closed() {
-        let html =
-            controller_html("Garmin G5 attitude, Garmin G5 HSI; Garmin G5 attitude, Garmin G5 HSI");
-        let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
+    fn nonadjacent_repeated_identity_is_rejected_without_mutating_model_output() {
+        let field = "Garmin G5 HSI\nGarmin 430W GPS/NAV/COM\nGarmin G5 attitude";
+        let html = controller_html(field);
+        let mut payload = installed("Garmin", "G5", "Garmin G5 HSI");
         let original = payload.clone();
 
-        assert!(!recover_exact_role_separated_avionics_quantity(
-            &mut payload,
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap());
+        assert!(
+            !recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap()
+        );
         assert_eq!(payload, original);
         assert!(validate_unbound_current_avionics_extraction(
             &payload.to_string(),
             CONTROLLER_URL,
             &html,
         )
-        .unwrap_err()
-        .contains("multiple distinct role-separated"));
+        .is_err());
+        assert_eq!(payload, original);
     }
 
     #[test]
@@ -2632,6 +2485,9 @@ mod tests {
             let mut payload = installed("Garmin", model, source_evidence);
             payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
             payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
+            if quantity > 1 {
+                payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
+            }
             let original = payload.clone();
 
             let observations = validate_unbound_current_avionics_extraction(
@@ -2648,7 +2504,7 @@ mod tests {
             assert_eq!(
                 recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
                     .unwrap(),
-                ControllerAvionicsExtractionRecovery::default()
+                false
             );
             assert_eq!(payload, original);
         }
@@ -2683,7 +2539,7 @@ Advisory System)";
                     "configuration_action": "installed",
                     "replaces": null,
                     "source_evidence_text": "GIA63WNAV/COM/GPS(Dual)",
-                    "source_confidence": "high"
+                    "source_confidence": "medium"
                 },
                 {
                     "manufacturer": "Garmin",
@@ -2716,7 +2572,7 @@ Advisory System)";
         );
         assert_eq!(
             recover_controller_avionics_extraction(&mut payload, SUBMISSION_26_URL, &html).unwrap(),
-            ControllerAvionicsExtractionRecovery::default()
+            false
         );
         assert_eq!(payload, original);
     }
@@ -2731,7 +2587,6 @@ Advisory System)";
             ("GIA63WNAVX", vec!["NAV"], 1),
             ("GIA63WNAV extra", vec!["NAV"], 1),
             ("GIA63WNAV/COM/GPS", vec!["NAV", "COM"], 1),
-            ("GIA63WNAV(Dual)", vec!["NAV"], 1),
         ] {
             let html = controller_html(source_evidence);
             let mut payload = installed("Garmin", "GIA63W", source_evidence);
@@ -2756,6 +2611,7 @@ Advisory System)";
         let mut payload = installed("Garmin", "GIA63W", source_evidence);
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
         assert!(validate_unbound_current_avionics_extraction(
             &payload.to_string(),
             GENERIC_URL,
@@ -2889,6 +2745,7 @@ Advisory System)";
         let mut payload = installed("Garmin", "GIA-63W", evidence);
         payload["avionics"][0]["types"] = serde_json::json!(["GPS", "NAV", "COM"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
 
         let parsed = validate_unbound_current_avionics_extraction(
             &payload.to_string(),
@@ -3192,6 +3049,7 @@ Advisory System)";
         let mut payload = installed("Garmin", "GIA-63W", flattened);
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
         payload["aircraft_marker"] = serde_json::json!({
             "serial": "unchanged",
             "nested": [1, 2, 3]
@@ -3226,82 +3084,29 @@ Advisory System)";
     }
 
     #[test]
-    fn controller_quantity_and_multiline_evidence_repairs_compose_atomically() {
+    fn controller_evidence_recovery_rolls_back_when_quantity_remains_ambiguous() {
         let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
         let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
-        let html = controller_html(&format!("Garmin G5 attitude, Garmin G5 HSI\n{exact}"));
+        let html = controller_html(&format!("Garmin G5 attitude\nGarmin G5 HSI\n{exact}"));
         let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
         let mut gia = installed("Garmin", "GIA-63W", flattened)["avionics"][0].clone();
         gia["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         gia["quantity"] = serde_json::json!(2);
+        gia["source_confidence"] = serde_json::json!("medium");
         payload["avionics"].as_array_mut().unwrap().push(gia);
         payload["aircraft_marker"] = serde_json::json!({
             "serial": "unchanged",
             "nested": [1, 2, 3]
         });
-        let mut expected = payload.clone();
-        expected["avionics"][0]["quantity"] = serde_json::json!(2);
-        expected["avionics"][0]["source_evidence_text"] =
-            serde_json::json!("Garmin G5 attitude, Garmin G5 HSI");
-        expected["avionics"][1]["source_evidence_text"] = Value::String(exact.to_string());
-
-        assert!(validate_unbound_current_avionics_extraction(
-            &payload.to_string(),
-            CONTROLLER_URL,
-            &html,
-        )
-        .is_err());
-
-        let recovery =
-            recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap();
-
-        assert_eq!(
-            recovery,
-            ControllerAvionicsExtractionRecovery {
-                quantity_recovered: true,
-                evidence_recovered: true,
-            }
-        );
-        assert_eq!(payload, expected);
-        validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
-            .unwrap();
-    }
-
-    #[test]
-    fn controller_combined_repair_rolls_back_every_mutation_on_final_validation_failure() {
-        let flattened = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W NAV/COM/GPS/WAAS with GS #2";
-        let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
-        let html = controller_html(&format!(
-            "Garmin G5 attitude, Garmin G5 HSI\n{exact}\nGarmin GI 275 attitude, Garmin GI 275 HSI"
-        ));
-        let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
-        let mut gia = installed("Garmin", "GIA-63W", flattened)["avionics"][0].clone();
-        gia["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
-        gia["quantity"] = serde_json::json!(2);
-        payload["avionics"].as_array_mut().unwrap().push(gia);
-        for evidence in ["Garmin GI 275 attitude", "Garmin GI 275 HSI"] {
-            let gi_275 = installed("Garmin", "GI 275", evidence)["avionics"][0].clone();
-            payload["avionics"].as_array_mut().unwrap().push(gi_275);
-        }
         let original = payload.clone();
-        let mut mutations = payload.clone();
-        assert!(apply_exact_role_separated_avionics_quantity(
-            &mut mutations,
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap());
-        assert!(apply_controller_avionics_evidence_typography(
-            &mut mutations,
-            CONTROLLER_URL,
-            &html,
-        )
-        .unwrap());
 
         let error = recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
             .unwrap_err();
 
-        assert!(error.contains("exact quantity of two"), "{error}");
+        assert!(
+            error.contains("ambiguous Controller quantity evidence"),
+            "{error}"
+        );
         assert_eq!(payload, original);
     }
 
@@ -3381,7 +3186,7 @@ Advisory System)";
     }
 
     #[test]
-    fn distinct_spellings_are_ambiguous_but_repeated_exact_spans_are_safe() {
+    fn distinct_or_repeated_controller_spellings_fail_closed() {
         let html = controller_html("Garmin GMA-1347\nGarmin GMA 1347");
         let mut ambiguous = installed("Garmin", "GMA 1347", "garmin gma1347");
         let original = ambiguous.clone();
@@ -3395,13 +3200,14 @@ Advisory System)";
 
         let html = controller_html("Garmin GMA-1347\nGarmin GMA-1347");
         let mut repeated = installed("Garmin", "GMA 1347", "garmin gma1347");
+        let original = repeated.clone();
         assert!(recover_controller_avionics_evidence_typography(
             &mut repeated,
             CONTROLLER_URL,
             &html,
         )
-        .unwrap());
-        assert_eq!(evidence(&repeated), "Garmin GMA-1347");
+        .is_err());
+        assert_eq!(repeated, original);
     }
 
     #[test]

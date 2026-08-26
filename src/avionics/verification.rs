@@ -6464,11 +6464,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_reextraction_repairs_one_trusted_role_pair_without_another_provider_call() {
+    async fn durable_reextraction_checkpoints_ambiguous_quantity_below_high_confidence() {
         let html = trusted_controller_role_html(
             "KSAR Garmin G5 attitude, Garmin G5 HSI, Garmin GFC500 auto pilot",
         );
-        let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
+        let primary = json!([{
             "manufacturer": "Garmin",
             "model": "G5",
             "types": ["Flight Display", "AHRS"],
@@ -6477,8 +6477,19 @@ mod tests {
             "replaces": null,
             "source_evidence_text": "Garmin G5 attitude",
             "source_confidence": "high"
-        }]))
-        .await;
+        }]);
+        let corrected = json!([{
+            "manufacturer": "Garmin",
+            "model": "G5",
+            "types": ["Flight Display", "AHRS"],
+            "quantity": 2,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "Garmin G5 attitude, Garmin G5 HSI",
+            "source_confidence": "medium"
+        }]);
+        let (endpoint, request_count, server) =
+            spawn_listing_extraction_sequence_endpoint(vec![primary, corrected]).await;
         let extractor = GeminiListingExtractor::with_test_endpoint(endpoint);
         let prior = retained_legacy_listing_extraction().to_string();
 
@@ -6497,9 +6508,13 @@ mod tests {
         .unwrap();
         server.abort();
 
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(reextracted.avionics.len(), 1);
         assert_eq!(reextracted.avionics[0].quantity, 2);
+        assert_eq!(
+            reextracted.avionics[0].source_confidence.as_deref(),
+            Some("medium")
+        );
         assert_eq!(
             reextracted.avionics[0].source_evidence_text.as_deref(),
             Some("Garmin G5 attitude, Garmin G5 HSI")
@@ -6578,7 +6593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_reextraction_rejects_an_extra_role_occurrence_after_one_correction() {
+    async fn durable_reextraction_rejects_an_unresolved_repeated_identity_after_one_correction() {
         let html = trusted_controller_role_html(
             "Garmin G5 attitude, Garmin G5 HSI, Garmin GTX 345 transponder, Garmin G5 standby display",
         );
@@ -6612,7 +6627,7 @@ mod tests {
         server.abort();
 
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        assert!(error.contains("multiple distinct role-separated quantity proofs"));
+        assert!(error.contains("ambiguous Controller quantity evidence"));
     }
 
     #[test]
