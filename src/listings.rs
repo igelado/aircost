@@ -55,8 +55,9 @@ use crate::listing::review::{
     StableIdentifier, POSTGRES_LISTING_CHILD_LOCK_SQL, POSTGRES_RESTAGE_CATALOG_LOCK_SQL,
 };
 use crate::models::{
-    is_plausible_asking_price_usd, AircraftSummary, ListingPreview, ListingValuationFact,
-    ParsedAvionics, ParsedAvionicsReference, ParsedInstalledComponent, SaleListing,
+    is_plausible_asking_price_usd, is_top_overhaul_time_evidence, AircraftSummary, ListingPreview,
+    ListingValuationFact, ParsedAvionics, ParsedAvionicsReference, ParsedInstalledComponent,
+    SaleListing,
 };
 use crate::normalize::{
     is_usable_avionics_label, normalize_avionics_manufacturer_name, normalize_avionics_model_name,
@@ -4722,14 +4723,27 @@ fn valuation_facts_from_value(value: &Value) -> StoreResult<Vec<ListingValuation
 
 fn component_time_basis_from_value(value: &Value, field_name: &str) -> StoreResult<String> {
     let value = optional_string(Some(value)).unwrap_or_else(|| "unknown".to_string());
-    if matches!(
-        value.as_str(),
-        "SNEW" | "SMOH" | "SFOH" | "SPOH" | "unknown"
-    ) {
+    let is_valid = match field_name {
+        "engine_time_basis" => matches!(
+            value.as_str(),
+            "SNEW" | "SMOH" | "SFOH" | "SFRM" | "unknown"
+        ),
+        "propeller_time_basis" => matches!(
+            value.as_str(),
+            "SNEW" | "SMOH" | "SFOH" | "SPOH" | "unknown"
+        ),
+        _ => false,
+    };
+    if is_valid {
         Ok(value)
     } else {
+        let expected = if field_name == "engine_time_basis" {
+            "SNEW, SMOH, SFOH, SFRM, or unknown"
+        } else {
+            "SNEW, SMOH, SFOH, SPOH, or unknown"
+        };
         Err(ListingStoreError::Validation(format!(
-            "{field_name} must be SNEW, SMOH, SFOH, SPOH, or unknown"
+            "{field_name} must be {expected}"
         )))
     }
 }
@@ -4911,10 +4925,20 @@ fn validate_component_time(
             "{component}_hours must be null or between 0 and 100000"
         )));
     }
-    if !matches!(basis, "SNEW" | "SMOH" | "SFOH" | "SPOH" | "unknown") {
+    let basis_is_valid = if component == "engine" {
+        matches!(basis, "SNEW" | "SMOH" | "SFOH" | "SFRM" | "unknown")
+    } else {
+        matches!(basis, "SNEW" | "SMOH" | "SFOH" | "SPOH" | "unknown")
+    };
+    if !basis_is_valid {
         return Err(ListingStoreError::Validation(format!(
             "{component}_time_basis is invalid"
         )));
+    }
+    if component == "engine" && evidence.is_some_and(is_top_overhaul_time_evidence) {
+        return Err(ListingStoreError::Validation(
+            "engine top-overhaul time (STOH/TSTOH) cannot be stored as engine_hours".to_string(),
+        ));
     }
     if hours.is_none() && basis != "unknown" {
         return Err(ListingStoreError::Validation(format!(
@@ -7231,11 +7255,12 @@ mod tests {
     use crate::models::{ParsedAvionics, ParsedAvionicsReference};
 
     use super::{
-        coalesce_resolved_listing_avionics, exact_occurrence_evidence_from_source_units,
-        listing_avionics_identity_request, listing_avionics_identity_resolution,
-        listing_avionics_value_from_catalog, replace_listing_avionics,
-        resolve_listing_avionics_values, ListingAvionicsIdentityResolution, ListingAvionicsValue,
-        ListingValues, AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
+        coalesce_resolved_listing_avionics, component_time_basis_from_value,
+        exact_occurrence_evidence_from_source_units, listing_avionics_identity_request,
+        listing_avionics_identity_resolution, listing_avionics_value_from_catalog,
+        replace_listing_avionics, resolve_listing_avionics_values, validate_component_time,
+        ListingAvionicsIdentityResolution, ListingAvionicsValue, ListingValues,
+        AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
         AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON,
     };
 
@@ -10629,6 +10654,76 @@ mod tests {
             avionics: Vec::new(),
             valuation_facts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn listing_storage_accepts_sfrm_but_rejects_top_overhaul_as_engine_time() {
+        assert_eq!(
+            component_time_basis_from_value(&json!("SFRM"), "engine_time_basis").unwrap(),
+            "SFRM"
+        );
+        assert!(component_time_basis_from_value(&json!("SFRM"), "propeller_time_basis").is_err());
+        assert!(component_time_basis_from_value(&json!("SPOH"), "engine_time_basis").is_err());
+
+        validate_component_time(
+            "engine",
+            Some(315.0),
+            "SFRM",
+            Some("315 SFRM"),
+            Some("high"),
+        )
+        .expect("factory-remanufacture engine time should persist");
+        let error = validate_component_time(
+            "engine",
+            Some(1_180.0),
+            "SFOH",
+            Some("1,180 TSTOH"),
+            Some("high"),
+        )
+        .expect_err("top-overhaul time must fail closed");
+        assert!(error.to_string().contains("top-overhaul time"));
+    }
+
+    #[tokio::test]
+    async fn current_sqlite_schema_persists_only_supported_engine_time_bases() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("current schema should initialize");
+        let user = db
+            .current_user(None)
+            .await
+            .expect("developer user should exist");
+        let variant_id = super::pending_aircraft_compatibility_variant_id(&db)
+            .await
+            .expect("pending compatibility variant should exist");
+        let insert = |basis: &'static str, source_url: &'static str| {
+            let db = db.clone();
+            async move {
+                execute_query!(
+                    &db,
+                    r#"
+                    INSERT INTO aircraft_sale_listings (
+                      aircraft_model_variant_id, created_by_user_id, source_url,
+                      model_year, asking_price_usd, airframe_hours,
+                      engine_hours, engine_time_basis,
+                      engine_time_evidence, engine_time_confidence
+                    ) VALUES (?, ?, ?, 2020, 450000, 900, 315, ?, '315 SFRM', 'high')
+                    "#,
+                    variant_id,
+                    user.id,
+                    source_url,
+                    basis
+                )
+            }
+        };
+
+        insert("SFRM", "https://example.test/sfrm")
+            .await
+            .expect("current schema should persist SFRM");
+        assert!(
+            insert("SPOH", "https://example.test/spoh").await.is_err(),
+            "propeller-overhaul basis must not enter the engine field"
+        );
     }
 
     #[tokio::test]

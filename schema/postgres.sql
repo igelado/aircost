@@ -3070,7 +3070,7 @@ CREATE TABLE IF NOT EXISTS aircraft_sale_listings (
   airframe_hours DOUBLE PRECISION NOT NULL,
   engine_hours DOUBLE PRECISION,
   engine_time_basis TEXT NOT NULL DEFAULT 'unknown'
-    CHECK (engine_time_basis IN ('SNEW', 'SMOH', 'SFOH', 'SPOH', 'unknown')),
+    CHECK (engine_time_basis IN ('SNEW', 'SMOH', 'SFOH', 'SFRM', 'unknown')),
   engine_time_evidence TEXT,
   engine_time_confidence TEXT
     CHECK (engine_time_confidence IS NULL OR engine_time_confidence IN ('high', 'medium', 'low')),

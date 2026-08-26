@@ -222,11 +222,17 @@ pub fn default_unknown_time_basis() -> String {
     "unknown".to_string()
 }
 
+pub fn is_top_overhaul_time_evidence(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| token.eq_ignore_ascii_case("STOH") || token.eq_ignore_ascii_case("TSTOH"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_plausible_asking_price_usd, MAX_PLAUSIBLE_ASKING_PRICE_USD,
-        MIN_PLAUSIBLE_ASKING_PRICE_USD,
+        is_plausible_asking_price_usd, is_top_overhaul_time_evidence,
+        MAX_PLAUSIBLE_ASKING_PRICE_USD, MIN_PLAUSIBLE_ASKING_PRICE_USD,
     };
 
     #[test]
@@ -244,5 +250,13 @@ mod tests {
             MAX_PLAUSIBLE_ASKING_PRICE_USD + 0.01
         ));
         assert!(!is_plausible_asking_price_usd(f64::NAN));
+    }
+
+    #[test]
+    fn top_overhaul_time_detection_requires_a_complete_stoh_or_tstoh_token() {
+        assert!(is_top_overhaul_time_evidence("1,180 TSTOH"));
+        assert!(is_top_overhaul_time_evidence("Engine: 620 stoh"));
+        assert!(!is_top_overhaul_time_evidence("315 SFRM"));
+        assert!(!is_top_overhaul_time_evidence("custom STOHLM installation"));
     }
 }

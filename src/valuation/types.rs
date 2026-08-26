@@ -27,6 +27,7 @@ pub fn source_backed_component_observation(
     let parsed_basis = match source_basis {
         "SNEW" => ComponentTimeBasis::SinceNew,
         "SMOH" | "SFOH" | "SPOH" => ComponentTimeBasis::SinceOverhaul,
+        "SFRM" => ComponentTimeBasis::SinceFactoryRemanufacture,
         _ => ComponentTimeBasis::Unknown,
     };
     let is_source_backed = parsed_basis != ComponentTimeBasis::Unknown
@@ -90,6 +91,7 @@ fn one_component() -> i64 {
 pub enum ComponentTimeBasis {
     SinceNew,
     SinceOverhaul,
+    SinceFactoryRemanufacture,
     SinceInspection,
     TimeRemaining,
     #[default]
@@ -111,6 +113,19 @@ mod tests {
         );
         assert_eq!(trusted.time_hours, Some(420.0));
         assert_eq!(trusted.basis, ComponentTimeBasis::SinceOverhaul);
+
+        let factory_remanufactured = source_backed_component_observation(
+            Some(315.0),
+            "SFRM",
+            Some("315 SFRM"),
+            Some("high"),
+            1,
+        );
+        assert_eq!(factory_remanufactured.time_hours, Some(315.0));
+        assert_eq!(
+            factory_remanufactured.basis,
+            ComponentTimeBasis::SinceFactoryRemanufacture
+        );
 
         for source_basis in ["SFOH", "SPOH"] {
             let overhaul = source_backed_component_observation(
@@ -137,6 +152,13 @@ mod tests {
                 "SMOH",
                 Some("possibly 420 SMOH"),
                 Some("low"),
+                1,
+            ),
+            source_backed_component_observation(
+                Some(1_180.0),
+                "TSTOH",
+                Some("1,180 TSTOH"),
+                Some("high"),
                 1,
             ),
         ] {

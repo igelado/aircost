@@ -210,6 +210,7 @@ impl FeatureEncoderV1 {
                 ComponentTimeBasis::Unknown,
                 ComponentTimeBasis::SinceNew,
                 ComponentTimeBasis::SinceOverhaul,
+                ComponentTimeBasis::SinceFactoryRemanufacture,
                 ComponentTimeBasis::SinceInspection,
                 ComponentTimeBasis::TimeRemaining,
             ],
@@ -464,5 +465,34 @@ mod tests {
         assert_eq!(first.equipment_indices, second.equipment_indices);
         assert_eq!(first.equipment_mask[0], 1.0);
         assert!(first.equipment_mask[1..].iter().all(|mask| *mask == 0.0));
+    }
+
+    #[test]
+    fn factory_remanufacture_has_an_explicit_component_basis_feature() {
+        let mut row = listing();
+        row.engine_times = vec![crate::valuation::source_backed_component_observation(
+            Some(884.0),
+            "SFRM",
+            Some("884 SFRM"),
+            Some("high"),
+            1,
+        )];
+        let encoder = FeatureEncoderV1::fit(&[row.clone()], DnnCapacity::Full, 91).unwrap();
+        let encoded = encoder.encode(&row.query()).unwrap();
+        let expected_index = encoder
+            .component_time_basis_vocabulary
+            .iter()
+            .position(|basis| *basis == ComponentTimeBasis::SinceFactoryRemanufacture)
+            .expect("factory remanufacture belongs to the valuation vocabulary");
+
+        assert_eq!(encoded.engine_components[0].basis_index, expected_index);
+        assert_ne!(
+            encoded.engine_components[0].basis_index,
+            encoder
+                .component_time_basis_vocabulary
+                .iter()
+                .position(|basis| *basis == ComponentTimeBasis::SinceOverhaul)
+                .unwrap()
+        );
     }
 }

@@ -37,7 +37,8 @@ use crate::html::listing::download::{download_identity_image, download_identity_
 use crate::html::listing::media::{discover as discover_listing_media, MediaDiscoveryError};
 use crate::html::listing::source::{listing_evidence_units, listing_extraction_source};
 use crate::models::{
-    ListingPreview, ListingValuationFact, ParsedAvionics, ParsedInstalledComponent, ParsedListing,
+    is_top_overhaul_time_evidence, ListingPreview, ListingValuationFact, ParsedAvionics,
+    ParsedInstalledComponent, ParsedListing,
 };
 use crate::normalize::{canonical_manufacturer_name, normalize_name};
 
@@ -2286,10 +2287,11 @@ Rules:\n\
 - model_year must be the aircraft model year, not an inspection or warranty date.\n\
 - status is the sale lifecycle: active, sold, pending, or unknown. Aircraft Condition values such as New or Used never establish sale lifecycle. A Controller listing offer availability of InStock establishes active; any other or missing offer availability remains unknown unless the listing explicitly states sold or pending.\n\
 - airframe_hours is total time, TTAF, TT, TTSN, or flight hours since new.\n\
-- engine_hours is engine TTSN/SNEW/SMOH/SFRM time, not horsepower, TBO, or engine model.\n\
+- engine_hours is engine TTSN/SNEW/SMOH/SFOH/SFRM time, not horsepower, TBO, or engine model. SFRM means since factory remanufacture and must remain SFRM.\n\
 - propeller_hours is propeller TTSN/SNEW/SMOH/SPOH time, not blade count or model.\n\
 - Never copy airframe time into engine_hours or propeller_hours merely because a component time is absent. Only return a component time when the text explicitly applies that time to the component.\n\
-- engine_time_basis and propeller_time_basis must be one of SNEW, SMOH, SFOH, SPOH, or unknown and must match the label in the listing. Do not turn an unknown basis into SMOH.\n\
+- engine_time_basis must be one of SNEW, SMOH, SFOH, SFRM, or unknown. propeller_time_basis must be one of SNEW, SMOH, SFOH, SPOH, or unknown. Each basis must match the label in the listing; do not turn an unknown basis into SMOH.\n\
+- STOH and TSTOH mean time since top overhaul, not SFOH, SMOH, or SPOH. A top-overhaul-only time is outside this listing field: return null engine_hours, unknown engine_time_basis, null engine_time_evidence, and null engine_time_confidence unless a separate supported engine time is explicitly stated.\n\
 - *_time_evidence must be a short exact span copied from the listing text that states both the component and its time/basis. Confidence must be high, medium, or low when evidence exists.\n\
 - installed_engine and installed_propeller identify listing-specific installed component makes/models only when explicitly stated. Return null rather than inferring a factory component. Each evidence_text must be a short exact source span and confidence must be high, medium, or low.\n\
 - registration_number may be an N-number or another registration value from Registration No/Reg/RN.\n\
@@ -2361,7 +2363,7 @@ fn extraction_schema_description() -> Value {
         "currency": "three-letter currency code, usually USD; string",
         "airframe_hours": "number",
         "engine_hours": "number or null",
-        "engine_time_basis": "SNEW, SMOH, SFOH, SPOH, or unknown",
+        "engine_time_basis": "SNEW, SMOH, SFOH, SFRM, or unknown; STOH/TSTOH must be omitted",
         "engine_time_evidence": "exact source text or null",
         "engine_time_confidence": "high, medium, low, or null",
         "propeller_hours": "number or null",
@@ -3213,7 +3215,7 @@ fn gemini_response_schema() -> Value {
             "engine_hours": {"type": "number", "nullable": true},
             "engine_time_basis": {
                 "type": "string",
-                "enum": ["SNEW", "SMOH", "SFOH", "SPOH", "unknown"]
+                "enum": ["SNEW", "SMOH", "SFOH", "SFRM", "unknown"]
             },
             "engine_time_evidence": {"type": "string", "nullable": true},
             "engine_time_confidence": {
@@ -3949,6 +3951,8 @@ pub fn parsed_listing_from_model_output(value: &Value) -> ParsedListing {
             registration_number = None;
         }
     }
+    let (engine_hours, engine_time_basis, engine_time_evidence, engine_time_confidence) =
+        parsed_engine_time(data);
 
     ParsedListing {
         manufacturer,
@@ -3960,12 +3964,12 @@ pub fn parsed_listing_from_model_output(value: &Value) -> ParsedListing {
             .unwrap_or_else(|| "USD".to_string())
             .to_uppercase(),
         airframe_hours: optional_nonnegative_f64(data.get("airframe_hours")),
-        engine_hours: optional_nonnegative_f64(data.get("engine_hours")),
-        engine_time_basis: component_time_basis(data.get("engine_time_basis")),
-        engine_time_evidence: optional_string(data.get("engine_time_evidence")),
-        engine_time_confidence: source_confidence(data.get("engine_time_confidence")),
+        engine_hours,
+        engine_time_basis,
+        engine_time_evidence,
+        engine_time_confidence,
         propeller_hours: optional_nonnegative_f64(data.get("propeller_hours")),
-        propeller_time_basis: component_time_basis(data.get("propeller_time_basis")),
+        propeller_time_basis: propeller_time_basis(data.get("propeller_time_basis")),
         propeller_time_evidence: optional_string(data.get("propeller_time_evidence")),
         propeller_time_confidence: source_confidence(data.get("propeller_time_confidence")),
         installed_engine: parsed_installed_component(data.get("installed_engine")),
@@ -3993,13 +3997,42 @@ fn parsed_installed_component(value: Option<&Value>) -> Option<ParsedInstalledCo
     })
 }
 
-fn component_time_basis(value: Option<&Value>) -> String {
+fn propeller_time_basis(value: Option<&Value>) -> String {
     match optional_string(value).as_deref() {
         Some("SNEW" | "SMOH" | "SFOH" | "SPOH") => {
             optional_string(value).unwrap_or_else(|| "unknown".to_string())
         }
         _ => "unknown".to_string(),
     }
+}
+
+fn parsed_engine_time(
+    data: &Map<String, Value>,
+) -> (Option<f64>, String, Option<String>, Option<String>) {
+    let hours = optional_nonnegative_f64(data.get("engine_hours"));
+    let source_basis = optional_string(data.get("engine_time_basis"));
+    let evidence = optional_string(data.get("engine_time_evidence"));
+    if source_basis
+        .as_deref()
+        .is_some_and(is_top_overhaul_time_evidence)
+        || evidence
+            .as_deref()
+            .is_some_and(is_top_overhaul_time_evidence)
+    {
+        return (None, "unknown".to_string(), None, None);
+    }
+    let basis = match source_basis.as_deref() {
+        Some("SNEW" | "SMOH" | "SFOH" | "SFRM") => {
+            source_basis.expect("matched engine time basis is present")
+        }
+        _ => "unknown".to_string(),
+    };
+    (
+        hours,
+        basis,
+        evidence,
+        source_confidence(data.get("engine_time_confidence")),
+    )
 }
 
 fn source_confidence(value: Option<&Value>) -> Option<String> {
@@ -4332,6 +4365,74 @@ mod tests {
         assert_eq!(
             parsed.avionics[0].avionics_types,
             vec!["Integrated Flight Deck".to_string(), "GPS".to_string()]
+        );
+    }
+
+    #[test]
+    fn preserves_real_sfrm_engine_times_as_factory_remanufacture_observations() {
+        for (submission_id, hours, evidence) in [
+            (31, 315.0, "315 SFRM"),
+            (54, 884.0, "884 SFRM"),
+            (58, 1_275.0, "1,275 SFRM"),
+        ] {
+            let parsed = parsed_listing_from_model_output(&json!({
+                "engine_hours": hours,
+                "engine_time_basis": "SFRM",
+                "engine_time_evidence": evidence,
+                "engine_time_confidence": "high"
+            }));
+            assert_eq!(
+                parsed.engine_hours,
+                Some(hours),
+                "submission {submission_id}"
+            );
+            assert_eq!(
+                parsed.engine_time_basis, "SFRM",
+                "submission {submission_id}"
+            );
+            assert_eq!(
+                parsed.engine_time_evidence.as_deref(),
+                Some(evidence),
+                "submission {submission_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn omits_real_top_overhaul_time_instead_of_coercing_its_basis() {
+        for (returned_basis, evidence) in [
+            ("SPOH", Some("1,180 TSTOH")),
+            ("SFOH", Some("620 STOH")),
+            ("TSTOH", None),
+        ] {
+            let parsed = parsed_listing_from_model_output(&json!({
+                "engine_hours": 1_180,
+                "engine_time_basis": returned_basis,
+                "engine_time_evidence": evidence,
+                "engine_time_confidence": "high"
+            }));
+            assert_eq!(parsed.engine_hours, None);
+            assert_eq!(parsed.engine_time_basis, "unknown");
+            assert_eq!(parsed.engine_time_evidence, None);
+            assert_eq!(parsed.engine_time_confidence, None);
+        }
+    }
+
+    #[test]
+    fn engine_time_prompt_and_schema_distinguish_sfrm_from_top_overhaul() {
+        let prompt = build_extraction_prompt("Engine 1 Time: 315 SFRM; 1,180 TSTOH");
+        assert!(prompt.contains("SFRM means since factory remanufacture and must remain SFRM"));
+        assert!(prompt.contains("STOH and TSTOH mean time since top overhaul"));
+        assert!(prompt.contains("return null engine_hours"));
+
+        let schema = gemini_response_schema();
+        assert_eq!(
+            schema["properties"]["engine_time_basis"]["enum"],
+            json!(["SNEW", "SMOH", "SFOH", "SFRM", "unknown"])
+        );
+        assert_eq!(
+            schema["properties"]["propeller_time_basis"]["enum"],
+            json!(["SNEW", "SMOH", "SFOH", "SPOH", "unknown"])
         );
     }
 
