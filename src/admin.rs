@@ -42,7 +42,7 @@ use aircost_rs::gemini::benchmark::{
 use aircost_rs::gemini::config::{GeminiRuntimeConfig, GeminiTask};
 use aircost_rs::gemini::interactions::GeminiInteractionsClient;
 use aircost_rs::gemini::live_benchmark::LiveBenchmarkRunner;
-use aircost_rs::gemini::usage::Store as GeminiUsageStore;
+use aircost_rs::gemini::usage::{SourceCorrelation, Store as GeminiUsageStore};
 use aircost_rs::listing::backfill::{default_stage_limit, stage_legacy_listing_reviews};
 use aircost_rs::listing::replay::catalog::{
     seed_replay_verified_catalog, SeedVerifiedCatalogRequest,
@@ -288,7 +288,9 @@ async fn main() -> Result<()> {
             };
             let user = plugin_submission_owner(&db, submission_id).await?;
             if apply {
-                let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?;
+                let (correlation_id, source) = replay_extraction_usage_scope(submission_id);
+                let extractor = GeminiListingExtractor::from_environment_with_usage(&db)?
+                    .with_usage_scope(correlation_id, None, Some(source));
                 let checkpoint =
                     checkpoint_plugin_submission_extraction(&db, &user, submission_id, &extractor)
                         .await?;
@@ -766,6 +768,18 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Give the direct extraction diagnostic the same per-submission source
+/// attribution as manifest-backed replay while retaining its own job scope.
+fn replay_extraction_usage_scope(submission_id: i64) -> (String, SourceCorrelation) {
+    (
+        format!("plugin-submission:{submission_id}:replay-extraction"),
+        SourceCorrelation {
+            kind: "plugin_submission".to_string(),
+            id: submission_id.to_string(),
+        },
+    )
 }
 
 fn stage_private_json<T: Serialize>(output: &Path, value: &T) -> Result<NamedTempFile> {
@@ -3332,6 +3346,14 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn direct_replay_extraction_usage_is_attributed_to_its_submission() {
+        let (correlation_id, source) = replay_extraction_usage_scope(41);
+        assert_eq!(correlation_id, "plugin-submission:41:replay-extraction");
+        assert_eq!(source.kind, "plugin_submission");
+        assert_eq!(source.id, "41");
     }
 
     #[test]
