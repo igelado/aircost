@@ -72,6 +72,11 @@ jobs:
           cargo test postgres_grounded_capability_migration_rerun_preserves_nonempty_rows_exactly -- --ignored --nocapture --test-threads=1
           cargo test postgres_grounded_capability_migration_rerun_rejects_contract_drift_without_changes -- --ignored --nocapture --test-threads=1
 
+      - name: Check PostgreSQL catalog seed contract
+        run: |
+          cargo test postgres_round_trip_fences_writers_preserves_replay_and_rejects_rerun -- --ignored --nocapture --test-threads=1
+          cargo test postgres_sequence_reset_covers_identity_and_serial_owned_ids -- --ignored --nocapture --test-threads=1
+
       - name: Check historical migration provenance
         run: bash tests/schema/test_historical_migration_provenance.sh
 
