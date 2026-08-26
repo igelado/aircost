@@ -129,8 +129,11 @@ All operational commands are dry-run unless `--apply` is supplied.
    Dry-run is provider-free and fails closed on corrupt signatures or invalid
    existing checkpoints. Apply performs only current-schema listing extraction.
    It stops before FAA admission, catalog resolution, listing insertion, and
-   finalization. The checkpoint retains the pinned visual-identity report when
-   visual recovery was used.
+   finalization. Every apply-mode provider request is accounted with
+   `source_kind=plugin_submission`, `source_id=ID`, and the stable direct-job
+   correlation `plugin-submission:ID:replay-extraction`, including an
+   avionics-only correction. The checkpoint retains the pinned visual-identity
+   report when visual recovery was used.
 
 5. Materialize the exact checkpoint:
 
