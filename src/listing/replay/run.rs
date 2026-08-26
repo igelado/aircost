@@ -27,6 +27,7 @@ use crate::extract::GeminiListingExtractor;
 use crate::gemini::usage::{
     Record as GeminiUsageRecord, SourceCorrelation, Store as GeminiUsageStore,
 };
+use crate::listing::avionics::extraction::AvionicsValidationClass;
 use crate::plugin::{
     checkpoint_plugin_submission_extraction, inspect_plugin_replay_capture_state,
     materialize_plugin_submission_checkpoint, plugin_submission_owner, PluginListingReplayOutcome,
@@ -148,6 +149,18 @@ pub struct ReplayTransientOperationError {
     pub category: ReplayTransientErrorCategory,
     pub code: &'static str,
     pub message: &'static str,
+    /// At most one fail-fast rule from each of the primary and correction
+    /// stages. Only selected applied replay responses receive this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deterministic_validation: Option<Vec<ReplayDeterministicValidationFailure>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReplayDeterministicValidationFailure {
+    pub stage: &'static str,
+    pub rule: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -375,7 +388,10 @@ pub async fn replay_captures(
                             match error {
                                 PluginStoreError::Permission(_) => "capture_authentication_failed",
                                 PluginStoreError::NotFound(_) => "capture_not_found",
-                                PluginStoreError::Validation(_) => "capture_validation_failed",
+                                PluginStoreError::Validation(_)
+                                | PluginStoreError::DeterministicValidation(_) => {
+                                    "capture_validation_failed"
+                                }
                                 PluginStoreError::Database(_) => unreachable!(),
                                 PluginStoreError::AircraftAdmission(error) => {
                                     return Err(ReplayRunError::Validation(error.to_string()));
@@ -2078,7 +2094,7 @@ async fn finish_capture_admission_error(
             )
             .await
         }
-        PluginStoreError::Validation(_) => {
+        PluginStoreError::Validation(_) | PluginStoreError::DeterministicValidation(_) => {
             finish_rejected(
                 db,
                 run_id,
@@ -2139,6 +2155,9 @@ fn plugin_error_is_target_membership_freeze(error: &PluginStoreError) -> bool {
 fn sanitized_transient_operation_error(error: &PluginStoreError) -> ReplayTransientOperationError {
     match error {
         PluginStoreError::Database(_) => database_transient_error(),
+        PluginStoreError::DeterministicValidation(error) => {
+            deterministic_validation_transient_error(error)
+        }
         PluginStoreError::AdmissionBlocked(_)
         | PluginStoreError::AircraftAdmission(_)
         | PluginStoreError::Permission(_)
@@ -2174,11 +2193,40 @@ fn sanitized_transient_operation_error(error: &PluginStoreError) -> ReplayTransi
     }
 }
 
+fn deterministic_validation_transient_error(
+    error: &crate::listing::avionics::correction::ListingAvionicsDeterministicFailure,
+) -> ReplayTransientOperationError {
+    let terminal = error.corrected.as_ref().unwrap_or(&error.initial);
+    let mut failures = vec![ReplayDeterministicValidationFailure {
+        stage: "primary_avionics_validation",
+        rule: error.initial.rule().code(),
+        path: error.initial.path(),
+    }];
+    if let Some(corrected) = error.corrected.as_ref() {
+        failures.push(ReplayDeterministicValidationFailure {
+            stage: "corrected_avionics_validation",
+            rule: corrected.rule().code(),
+            path: corrected.path(),
+        });
+    }
+    let category = match terminal.rule().class() {
+        AvionicsValidationClass::Schema => ReplayTransientErrorCategory::Schema,
+        AvionicsValidationClass::Evidence => ReplayTransientErrorCategory::Evidence,
+    };
+    ReplayTransientOperationError {
+        category,
+        code: "deterministic_validation_failed",
+        message: "provider output failed bounded deterministic avionics validation",
+        deterministic_validation: Some(failures),
+    }
+}
+
 fn schema_transient_error() -> ReplayTransientOperationError {
     ReplayTransientOperationError {
         category: ReplayTransientErrorCategory::Schema,
         code: "schema_validation_failed",
         message: "provider output did not satisfy the current replay schema",
+        deterministic_validation: None,
     }
 }
 
@@ -2187,6 +2235,7 @@ fn evidence_transient_error() -> ReplayTransientOperationError {
         category: ReplayTransientErrorCategory::Evidence,
         code: "evidence_validation_failed",
         message: "provider output failed retained-source evidence validation",
+        deterministic_validation: None,
     }
 }
 
@@ -2195,6 +2244,7 @@ fn provider_transient_error() -> ReplayTransientOperationError {
         category: ReplayTransientErrorCategory::Provider,
         code: "provider_operation_failed",
         message: "provider request or response transport failed during replay",
+        deterministic_validation: None,
     }
 }
 
@@ -2203,6 +2253,7 @@ fn database_transient_error() -> ReplayTransientOperationError {
         category: ReplayTransientErrorCategory::Database,
         code: "database_operation_failed",
         message: "database or usage-accounting operation failed during replay",
+        deterministic_validation: None,
     }
 }
 
@@ -2220,6 +2271,7 @@ async fn finish_operation_error(
         PluginStoreError::Database(_) => "database_error",
         PluginStoreError::AdmissionBlocked(reason) => reason.code(),
         PluginStoreError::Validation(_)
+        | PluginStoreError::DeterministicValidation(_)
         | PluginStoreError::Permission(_)
         | PluginStoreError::NotFound(_)
         | PluginStoreError::AircraftAdmission(_) => "operation_failed",
@@ -3264,8 +3316,28 @@ mod tests {
             selected.transient_error.as_ref().unwrap().category,
             ReplayTransientErrorCategory::Evidence
         );
+        let transient = selected.transient_error.as_ref().unwrap();
+        assert_eq!(transient.code, "deterministic_validation_failed");
+        assert_eq!(
+            transient.deterministic_validation,
+            Some(vec![
+                ReplayDeterministicValidationFailure {
+                    stage: "primary_avionics_validation",
+                    rule: "source_evidence_not_visible",
+                    path: Some("avionics[0].source_evidence_text".to_string()),
+                },
+                ReplayDeterministicValidationFailure {
+                    stage: "corrected_avionics_validation",
+                    rule: "source_evidence_not_visible",
+                    path: Some("avionics[0].source_evidence_text".to_string()),
+                },
+            ])
+        );
         let serialized = serde_json::to_string(&report).unwrap();
         assert!(!serialized.contains(SENSITIVE_PROVIDER_TEXT));
+        assert!(serialized.contains("corrected_avionics_validation"));
+        assert!(serialized.contains("source_evidence_not_visible"));
+        assert!(serialized.contains("avionics[0].source_evidence_text"));
 
         let persisted: (
             Option<String>,
@@ -3291,6 +3363,75 @@ mod tests {
         assert_eq!(persisted.1, None);
         assert_eq!(persisted.2.as_deref(), Some("operation_failed"));
         assert_eq!(persisted.3, None);
+    }
+
+    #[tokio::test]
+    async fn batch_extraction_validation_failure_retains_no_diagnostic_detail() {
+        const SENSITIVE_PROVIDER_TEXT: &str =
+            "SENSITIVE_BATCH_PROVIDER_ONLY Garmin G1000 fabricated evidence";
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query("UPDATE plugin_submissions SET extracted_listing_json = NULL WHERE id = ?")
+            .bind(submission_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let extraction = json!({
+            "manufacturer": "Cessna", "model": "182", "variant": "182T",
+            "model_year": 2020, "asking_price_usd": 200000.0, "currency": "USD",
+            "airframe_hours": 500.0, "engine_hours": null,
+            "engine_time_basis": "unknown", "engine_time_evidence": null,
+            "engine_time_confidence": null, "propeller_hours": null,
+            "propeller_time_basis": "unknown", "propeller_time_evidence": null,
+            "propeller_time_confidence": null, "installed_engine": null,
+            "installed_propeller": null, "registration_number": "N182PF",
+            "serial_number": "182TEST", "status": "active",
+            "avionics": [{
+                "manufacturer": "Garmin", "model": "G1000", "types": ["Flight Display"],
+                "quantity": 1, "configuration_action": "installed", "replaces": null,
+                "source_evidence_text": SENSITIVE_PROVIDER_TEXT, "source_confidence": "high"
+            }],
+            "valuation_facts": []
+        });
+        let endpoint = extraction_endpoint(extraction).await;
+        let extractor = GeminiListingExtractor::with_test_endpoint(endpoint)
+            .with_usage_store(GeminiUsageStore::new(&db));
+        let report = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: true,
+                recover_stale: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.counts.failed, 1);
+        assert_eq!(report.selected_item, None);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains(SENSITIVE_PROVIDER_TEXT));
+        assert!(!serialized.contains("deterministic_validation"));
+        assert!(!serialized.contains("source_evidence_not_visible"));
+        let persisted: (Option<String>, Option<String>) = sqlx::query_as(
+            r#"SELECT item.last_failure_reason_code, submission.extracted_listing_json
+               FROM listing_replay_run_items item
+               JOIN plugin_submissions submission
+                 ON submission.id = item.plugin_submission_id
+               WHERE item.plugin_submission_id = ?"#,
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted.0.as_deref(), Some("operation_failed"));
+        assert_eq!(persisted.1, None);
     }
 
     #[tokio::test]

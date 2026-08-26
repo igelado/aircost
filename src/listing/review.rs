@@ -2145,7 +2145,7 @@ async fn restage_pending_review_if_current_with_commit(
                         let provenance = validate_listing_evidence_capture_provenance(
                             &row, &capture, None,
                         )
-                        .map_err(ReviewError::Stale)?;
+                        .map_err(|error| ReviewError::Stale(error.to_string()))?;
                         Some((capture, provenance))
                     }
                     _ => None,
@@ -9331,7 +9331,7 @@ pub async fn resolve_listing_review(
             {
                 let extracted_occurrences =
                     parse_current_avionics_extraction_json(extracted_listing_json)
-                        .map_err(ReviewError::Stale)?;
+                        .map_err(|error| ReviewError::Stale(error.to_string()))?;
                 let extraction_sha256 = extraction_sha256(extracted_listing_json);
                 for aspect in payload
                     .aspects

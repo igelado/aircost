@@ -6,6 +6,7 @@
 //! capability fallback.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -21,6 +22,313 @@ use crate::listing::evidence::{
     MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES,
 };
 use crate::models::ParsedAvionics;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AvionicsValidationClass {
+    Schema,
+    Evidence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AvionicsValidationRule {
+    InvalidExtractionJson,
+    MissingAvionicsArray,
+    OccurrenceNotObject,
+    MissingManufacturer,
+    MissingModel,
+    InvalidTypes,
+    MissingQuantity,
+    InvalidQuantity,
+    MissingConfigurationAction,
+    InvalidConfigurationAction,
+    MissingReplacement,
+    UnexpectedReplacement,
+    MissingReplacementObject,
+    MissingSourceEvidence,
+    SourceEvidenceTooLong,
+    MissingSourceConfidence,
+    InvalidSourceConfidence,
+    InvalidOccurrenceSchema,
+    EvidenceSourceInvalid,
+    SourceEvidenceNotVisible,
+    CandidateIdentityNotInEvidence,
+    ReplacementIdentityNotInEvidence,
+    SuiteCapabilityNotExplicit,
+    SuiteCapabilityCollision,
+    QuantityProofAmbiguous,
+    QuantityMismatch,
+    QuantityEvidenceIncomplete,
+    InvalidBindingIdentifiers,
+    OwnerBindingMismatch,
+    CanonicalListingBindingMismatch,
+    MissingListingSourceUrl,
+    SourceUrlBindingMismatch,
+    MissingRenderedHtml,
+    RenderedHtmlDigestMismatch,
+    MissingExtractionJson,
+}
+
+impl AvionicsValidationRule {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidExtractionJson => "invalid_extraction_json",
+            Self::MissingAvionicsArray => "missing_avionics_array",
+            Self::OccurrenceNotObject => "occurrence_not_object",
+            Self::MissingManufacturer => "missing_manufacturer",
+            Self::MissingModel => "missing_model",
+            Self::InvalidTypes => "invalid_types",
+            Self::MissingQuantity => "missing_quantity",
+            Self::InvalidQuantity => "invalid_quantity",
+            Self::MissingConfigurationAction => "missing_configuration_action",
+            Self::InvalidConfigurationAction => "invalid_configuration_action",
+            Self::MissingReplacement => "missing_replacement",
+            Self::UnexpectedReplacement => "unexpected_replacement",
+            Self::MissingReplacementObject => "missing_replacement_object",
+            Self::MissingSourceEvidence => "missing_source_evidence",
+            Self::SourceEvidenceTooLong => "source_evidence_too_long",
+            Self::MissingSourceConfidence => "missing_source_confidence",
+            Self::InvalidSourceConfidence => "invalid_source_confidence",
+            Self::InvalidOccurrenceSchema => "invalid_occurrence_schema",
+            Self::EvidenceSourceInvalid => "evidence_source_invalid",
+            Self::SourceEvidenceNotVisible => "source_evidence_not_visible",
+            Self::CandidateIdentityNotInEvidence => "candidate_identity_not_in_evidence",
+            Self::ReplacementIdentityNotInEvidence => "replacement_identity_not_in_evidence",
+            Self::SuiteCapabilityNotExplicit => "suite_capability_not_explicit",
+            Self::SuiteCapabilityCollision => "suite_capability_collision",
+            Self::QuantityProofAmbiguous => "quantity_proof_ambiguous",
+            Self::QuantityMismatch => "quantity_mismatch",
+            Self::QuantityEvidenceIncomplete => "quantity_evidence_incomplete",
+            Self::InvalidBindingIdentifiers => "invalid_binding_identifiers",
+            Self::OwnerBindingMismatch => "owner_binding_mismatch",
+            Self::CanonicalListingBindingMismatch => "canonical_listing_binding_mismatch",
+            Self::MissingListingSourceUrl => "missing_listing_source_url",
+            Self::SourceUrlBindingMismatch => "source_url_binding_mismatch",
+            Self::MissingRenderedHtml => "missing_rendered_html",
+            Self::RenderedHtmlDigestMismatch => "rendered_html_digest_mismatch",
+            Self::MissingExtractionJson => "missing_extraction_json",
+        }
+    }
+
+    pub(crate) const fn class(self) -> AvionicsValidationClass {
+        match self {
+            Self::EvidenceSourceInvalid
+            | Self::SourceEvidenceNotVisible
+            | Self::CandidateIdentityNotInEvidence
+            | Self::ReplacementIdentityNotInEvidence
+            | Self::SuiteCapabilityNotExplicit
+            | Self::SuiteCapabilityCollision
+            | Self::QuantityProofAmbiguous
+            | Self::QuantityMismatch
+            | Self::QuantityEvidenceIncomplete
+            | Self::OwnerBindingMismatch
+            | Self::CanonicalListingBindingMismatch
+            | Self::MissingListingSourceUrl
+            | Self::SourceUrlBindingMismatch
+            | Self::MissingRenderedHtml
+            | Self::RenderedHtmlDigestMismatch
+            | Self::MissingExtractionJson => AvionicsValidationClass::Evidence,
+            _ => AvionicsValidationClass::Schema,
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::InvalidExtractionJson => "retained listing extraction is invalid JSON",
+            Self::MissingAvionicsArray => {
+                "retained listing extraction has no top-level avionics array"
+            }
+            Self::OccurrenceNotObject => "avionics occurrence must be an object",
+            Self::MissingManufacturer => "manufacturer must be a non-empty string",
+            Self::MissingModel => "model must be a non-empty string",
+            Self::InvalidTypes => {
+                "types must be a non-empty array of distinct current curated capabilities, or Unknown by itself; scalar type payloads are intentionally unsupported"
+            }
+            Self::MissingQuantity => "quantity must be an explicit integer",
+            Self::InvalidQuantity => "quantity must be at least 1",
+            Self::MissingConfigurationAction => {
+                "configuration_action must be an explicit installed, replaces, or removes value"
+            }
+            Self::InvalidConfigurationAction => {
+                "configuration_action must be installed, replaces, or removes"
+            }
+            Self::MissingReplacement => {
+                "replaces must be explicit null or one replacement object"
+            }
+            Self::UnexpectedReplacement => "installed occurrence must use replaces=null",
+            Self::MissingReplacementObject => {
+                "replaces or removes occurrence requires one replacement object"
+            }
+            Self::MissingSourceEvidence => {
+                "source_evidence_text must be one non-empty exact listing-source excerpt"
+            }
+            Self::SourceEvidenceTooLong => {
+                "source_evidence_text exceeds the bounded listing-evidence limit"
+            }
+            Self::MissingSourceConfidence => {
+                "source_confidence must be high, medium, or low"
+            }
+            Self::InvalidSourceConfidence => {
+                "source_confidence must be high, medium, or low"
+            }
+            Self::InvalidOccurrenceSchema => {
+                "avionics occurrence does not satisfy the current schema"
+            }
+            Self::EvidenceSourceInvalid => "listing evidence source is invalid",
+            Self::SourceEvidenceNotVisible => {
+                "source_evidence_text is not one exact structurally visible source unit in the retained capture"
+            }
+            Self::CandidateIdentityNotInEvidence => {
+                "source_evidence_text is not one exact bounded source excerpt containing the candidate identity"
+            }
+            Self::ReplacementIdentityNotInEvidence => {
+                "source_evidence_text does not contain the exact replacement identity"
+            }
+            Self::SuiteCapabilityNotExplicit => {
+                "integrated suite capability lacks explicit support in source_evidence_text"
+            }
+            Self::SuiteCapabilityCollision => {
+                "integrated suite assigns a capability to a separate product"
+            }
+            Self::QuantityProofAmbiguous => {
+                "multiple distinct role-separated quantity proofs exist"
+            }
+            Self::QuantityMismatch => {
+                "occurrence does not preserve the exact quantity of two proved by complementary role-separated source items"
+            }
+            Self::QuantityEvidenceIncomplete => {
+                "source_evidence_text does not cover both exact role-separated source items"
+            }
+            Self::InvalidBindingIdentifiers => {
+                "listing and retained submission IDs must be positive"
+            }
+            Self::OwnerBindingMismatch => {
+                "retained submission does not belong to the listing owner"
+            }
+            Self::CanonicalListingBindingMismatch => {
+                "retained submission is not bound to the exact canonical listing"
+            }
+            Self::MissingListingSourceUrl => {
+                "listing has no source URL for its retained extraction"
+            }
+            Self::SourceUrlBindingMismatch => {
+                "retained submission source URL does not exactly match the listing source URL"
+            }
+            Self::MissingRenderedHtml => "retained submission has no rendered HTML",
+            Self::RenderedHtmlDigestMismatch => {
+                "retained submission rendered HTML failed its SHA-256 binding"
+            }
+            Self::MissingExtractionJson => {
+                "retained submission has no extracted listing JSON"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AvionicsValidationField {
+    Occurrence,
+    Manufacturer,
+    Model,
+    Types,
+    Quantity,
+    ConfigurationAction,
+    Replaces,
+    ReplacementManufacturer,
+    ReplacementModel,
+    ReplacementTypes,
+    SourceEvidenceText,
+    SourceConfidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AvionicsValidationFailure {
+    rule: AvionicsValidationRule,
+    occurrence_index: Option<usize>,
+    field: Option<AvionicsValidationField>,
+    related_occurrence_index: Option<usize>,
+}
+
+impl AvionicsValidationFailure {
+    fn global(rule: AvionicsValidationRule) -> Self {
+        Self {
+            rule,
+            occurrence_index: None,
+            field: None,
+            related_occurrence_index: None,
+        }
+    }
+
+    fn occurrence(
+        rule: AvionicsValidationRule,
+        occurrence_index: usize,
+        field: AvionicsValidationField,
+    ) -> Self {
+        Self {
+            rule,
+            occurrence_index: Some(occurrence_index),
+            field: Some(field),
+            related_occurrence_index: None,
+        }
+    }
+
+    fn related(
+        rule: AvionicsValidationRule,
+        occurrence_index: usize,
+        field: AvionicsValidationField,
+        related_occurrence_index: usize,
+    ) -> Self {
+        Self {
+            rule,
+            occurrence_index: Some(occurrence_index),
+            field: Some(field),
+            related_occurrence_index: Some(related_occurrence_index),
+        }
+    }
+
+    pub(crate) const fn rule(&self) -> AvionicsValidationRule {
+        self.rule
+    }
+
+    pub(crate) fn path(&self) -> Option<String> {
+        let index = self.occurrence_index?;
+        let suffix = match self.field? {
+            AvionicsValidationField::Occurrence => "",
+            AvionicsValidationField::Manufacturer => ".manufacturer",
+            AvionicsValidationField::Model => ".model",
+            AvionicsValidationField::Types => ".types",
+            AvionicsValidationField::Quantity => ".quantity",
+            AvionicsValidationField::ConfigurationAction => ".configuration_action",
+            AvionicsValidationField::Replaces => ".replaces",
+            AvionicsValidationField::ReplacementManufacturer => ".replaces.manufacturer",
+            AvionicsValidationField::ReplacementModel => ".replaces.model",
+            AvionicsValidationField::ReplacementTypes => ".replaces.types",
+            AvionicsValidationField::SourceEvidenceText => ".source_evidence_text",
+            AvionicsValidationField::SourceConfidence => ".source_confidence",
+        };
+        Some(format!("avionics[{index}]{suffix}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl fmt::Display for AvionicsValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(path) = self.path() {
+            write!(formatter, "{path} {}", self.rule.description())?;
+        } else {
+            formatter.write_str(self.rule.description())?;
+        }
+        if let Some(index) = self.related_occurrence_index {
+            write!(formatter, "; related occurrence avionics[{index}]")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AvionicsValidationFailure {}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurrentAvionicsExtraction<'a> {
@@ -38,7 +346,7 @@ pub(crate) struct CurrentAvionicsExtraction<'a> {
 
 pub(crate) fn validate_current_avionics_extraction(
     extraction: CurrentAvionicsExtraction<'_>,
-) -> Result<Vec<ParsedAvionics>, String> {
+) -> Result<Vec<ParsedAvionics>, AvionicsValidationFailure> {
     validate_capture_binding(extraction)?;
     let observations = parse_current_avionics_extraction_json(extraction.extracted_listing_json)?;
     let listing_context =
@@ -60,7 +368,7 @@ pub(crate) fn validate_unbound_current_avionics_extraction(
     extracted_listing_json: &str,
     source_url: &str,
     rendered_html: &str,
-) -> Result<Vec<ParsedAvionics>, String> {
+) -> Result<Vec<ParsedAvionics>, AvionicsValidationFailure> {
     let observations = parse_current_avionics_extraction_json(extracted_listing_json)?;
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
     validate_current_avionics_observations(
@@ -82,7 +390,7 @@ pub(crate) fn validate_current_avionics_observations(
     listing_context: &ListingEvidenceContext,
     source_url: &str,
     rendered_html: &str,
-) -> Result<(), String> {
+) -> Result<(), AvionicsValidationFailure> {
     validate_current_avionics_identity_evidence(
         observations,
         listing_context,
@@ -107,7 +415,7 @@ pub(crate) fn recover_controller_avionics_extraction(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
-) -> Result<ControllerAvionicsExtractionRecovery, String> {
+) -> Result<ControllerAvionicsExtractionRecovery, AvionicsValidationFailure> {
     let original = extracted_listing.clone();
     let recovery = (|| {
         let quantity_recovered = apply_exact_role_separated_avionics_quantity(
@@ -154,7 +462,7 @@ fn apply_exact_role_separated_avionics_quantity(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
-) -> Result<bool, String> {
+) -> Result<bool, AvionicsValidationFailure> {
     let observations = parse_current_avionics_extraction_value(extracted_listing)?;
     let Some(installed_equipment) = controller_avionics_evidence(source_url, rendered_html) else {
         return Ok(false);
@@ -219,11 +527,12 @@ fn apply_controller_avionics_evidence_typography(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
-) -> Result<bool, String> {
+) -> Result<bool, AvionicsValidationFailure> {
     let observations = parse_current_avionics_extraction_value(extracted_listing)?;
     let listing_context = ListingEvidenceContext::from_rendered_html(Some(rendered_html));
-    let evidence_units = listing_evidence_units(source_url, rendered_html)
-        .map_err(|error| format!("listing evidence source is invalid: {error}"))?;
+    let evidence_units = listing_evidence_units(source_url, rendered_html).map_err(|_| {
+        AvionicsValidationFailure::global(AvionicsValidationRule::EvidenceSourceInvalid)
+    })?;
     let controller_field = controller_avionics_evidence(source_url, rendered_html);
     let invalid_occurrence = observations.iter().enumerate().any(|(index, observation)| {
         let evidence = observation
@@ -412,70 +721,100 @@ fn normalize_evidence_typography(value: &str) -> String {
 
 pub(crate) fn parse_current_avionics_extraction_json(
     extracted_listing_json: &str,
-) -> Result<Vec<ParsedAvionics>, String> {
-    let value: Value = serde_json::from_str(extracted_listing_json)
-        .map_err(|error| format!("retained listing extraction is invalid JSON: {error}"))?;
+) -> Result<Vec<ParsedAvionics>, AvionicsValidationFailure> {
+    let value: Value = serde_json::from_str(extracted_listing_json).map_err(|_| {
+        AvionicsValidationFailure::global(AvionicsValidationRule::InvalidExtractionJson)
+    })?;
     parse_current_avionics_extraction_value(&value)
 }
 
 pub(crate) fn parse_current_avionics_extraction_value(
     value: &Value,
-) -> Result<Vec<ParsedAvionics>, String> {
+) -> Result<Vec<ParsedAvionics>, AvionicsValidationFailure> {
     let observations = value
         .get("avionics")
         .and_then(Value::as_array)
-        .ok_or_else(|| "retained listing extraction has no top-level avionics array".to_string())?;
+        .ok_or_else(|| {
+            AvionicsValidationFailure::global(AvionicsValidationRule::MissingAvionicsArray)
+        })?;
     observations
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let path = format!("avionics[{index}]");
-            let object = value
-                .as_object()
-                .ok_or_else(|| format!("{path} must be an object"))?;
-            validate_required_identity(object, &path)?;
-            validate_capabilities(value, &path)?;
+            let object = value.as_object().ok_or_else(|| {
+                AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::OccurrenceNotObject,
+                    index,
+                    AvionicsValidationField::Occurrence,
+                )
+            })?;
+            validate_required_identity(object, index, false)?;
+            validate_capabilities(value, index, false)?;
             let quantity = object
                 .get("quantity")
                 .and_then(Value::as_i64)
-                .ok_or_else(|| format!("{path}.quantity must be an explicit integer"))?;
+                .ok_or_else(|| {
+                    AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::MissingQuantity,
+                        index,
+                        AvionicsValidationField::Quantity,
+                    )
+                })?;
             if quantity < 1 {
-                return Err(format!("{path}.quantity must be at least 1"));
+                return Err(AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::InvalidQuantity,
+                    index,
+                    AvionicsValidationField::Quantity,
+                ));
             }
             let action = object
                 .get("configuration_action")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    format!(
-                        "{path}.configuration_action must be an explicit installed, replaces, or removes value"
+                    AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::MissingConfigurationAction,
+                        index,
+                        AvionicsValidationField::ConfigurationAction,
                     )
                 })?;
             if !matches!(action, "installed" | "replaces" | "removes") {
-                return Err(format!(
-                    "{path}.configuration_action must be installed, replaces, or removes"
+                return Err(AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::InvalidConfigurationAction,
+                    index,
+                    AvionicsValidationField::ConfigurationAction,
                 ));
             }
             let replacement = object.get("replaces").ok_or_else(|| {
-                format!("{path}.replaces must be explicit null or one replacement object")
+                AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::MissingReplacement,
+                    index,
+                    AvionicsValidationField::Replaces,
+                )
             })?;
             match action {
                 "installed" if !replacement.is_null() => {
-                    return Err(format!("{path} installed occurrence must use replaces=null"));
+                    return Err(AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::UnexpectedReplacement,
+                        index,
+                        AvionicsValidationField::Replaces,
+                    ));
                 }
                 "replaces" | "removes" if !replacement.is_object() => {
-                    return Err(format!(
-                        "{path} {action} occurrence requires one replacement object"
+                    return Err(AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::MissingReplacementObject,
+                        index,
+                        AvionicsValidationField::Replaces,
                     ));
                 }
                 "replaces" | "removes" => {
-                    let replacement_path = format!("{path}.replaces");
                     validate_required_identity(
                         replacement
                             .as_object()
                             .expect("replacement object was checked"),
-                        &replacement_path,
+                        index,
+                        true,
                     )?;
-                    validate_capabilities(replacement, &replacement_path)?;
+                    validate_capabilities(replacement, index, true)?;
                 }
                 _ => {}
             }
@@ -486,27 +825,44 @@ pub(crate) fn parse_current_avionics_extraction_value(
                 .map(str::trim)
                 .filter(|evidence| !evidence.is_empty())
                 .ok_or_else(|| {
-                    format!(
-                        "{path}.source_evidence_text must be one non-empty exact listing-source excerpt"
+                    AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::MissingSourceEvidence,
+                        index,
+                        AvionicsValidationField::SourceEvidenceText,
                     )
                 })?;
             if evidence.len() > MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES {
-                return Err(format!(
-                    "{path}.source_evidence_text exceeds the bounded listing-evidence limit"
+                return Err(AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::SourceEvidenceTooLong,
+                    index,
+                    AvionicsValidationField::SourceEvidenceText,
                 ));
             }
             let confidence = object
                 .get("source_confidence")
                 .and_then(Value::as_str)
-                .ok_or_else(|| format!("{path}.source_confidence must be high, medium, or low"))?;
+                .ok_or_else(|| {
+                    AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::MissingSourceConfidence,
+                        index,
+                        AvionicsValidationField::SourceConfidence,
+                    )
+                })?;
             if !matches!(confidence, "high" | "medium" | "low") {
-                return Err(format!(
-                    "{path}.source_confidence must be high, medium, or low"
+                return Err(AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::InvalidSourceConfidence,
+                    index,
+                    AvionicsValidationField::SourceConfidence,
                 ));
             }
 
-            serde_json::from_value::<ParsedAvionics>(value.clone())
-                .map_err(|error| format!("{path} is invalid: {error}"))
+            serde_json::from_value::<ParsedAvionics>(value.clone()).map_err(|_| {
+                AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::InvalidOccurrenceSchema,
+                    index,
+                    AvionicsValidationField::Occurrence,
+                )
+            })
         })
         .collect()
 }
@@ -516,9 +872,10 @@ pub(crate) fn validate_current_avionics_identity_evidence(
     listing_context: &ListingEvidenceContext,
     source_url: &str,
     rendered_html: &str,
-) -> Result<(), String> {
-    let evidence_units = listing_evidence_units(source_url, rendered_html)
-        .map_err(|error| format!("listing evidence source is invalid: {error}"))?;
+) -> Result<(), AvionicsValidationFailure> {
+    let evidence_units = listing_evidence_units(source_url, rendered_html).map_err(|_| {
+        AvionicsValidationFailure::global(AvionicsValidationRule::EvidenceSourceInvalid)
+    })?;
     let controller_field = controller_avionics_evidence(source_url, rendered_html);
     for (index, observation) in observations.iter().enumerate() {
         let evidence = observation
@@ -527,8 +884,10 @@ pub(crate) fn validate_current_avionics_identity_evidence(
             .expect("the canonical parser requires occurrence evidence")
             .trim();
         if !evidence_units.contains_exact_span(evidence) {
-            return Err(format!(
-                "avionics[{index}].source_evidence_text is not one exact structurally visible source unit in the retained capture"
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::SourceEvidenceNotVisible,
+                index,
+                AvionicsValidationField::SourceEvidenceText,
             ));
         }
         validate_current_avionics_identity_evidence_occurrence(
@@ -542,20 +901,17 @@ pub(crate) fn validate_current_avionics_identity_evidence(
     Ok(())
 }
 
-fn validate_current_avionics_type_scope(observations: &[ParsedAvionics]) -> Result<(), String> {
+fn validate_current_avionics_type_scope(
+    observations: &[ParsedAvionics],
+) -> Result<(), AvionicsValidationFailure> {
     for (index, observation) in observations.iter().enumerate() {
         let evidence = observation
             .source_evidence_text
             .as_deref()
             .expect("the canonical parser requires occurrence evidence");
-        validate_occurrence_type_scope(index, "", &observation.avionics_types, evidence)?;
+        validate_occurrence_type_scope(index, false, &observation.avionics_types, evidence)?;
         if let Some(replacement) = observation.replaces.as_ref() {
-            validate_occurrence_type_scope(
-                index,
-                ".replaces",
-                &replacement.avionics_types,
-                evidence,
-            )?;
+            validate_occurrence_type_scope(index, true, &replacement.avionics_types, evidence)?;
         }
     }
 
@@ -574,9 +930,12 @@ fn validate_current_avionics_type_scope(observations: &[ParsedAvionics]) -> Resu
                 .iter()
                 .filter(|capability| capability.as_str() != "Integrated Flight Deck")
                 .find(|capability| component.avionics_types.contains(capability));
-            if let Some(capability) = duplicated {
-                return Err(format!(
-                    "avionics[{suite_index}].types assigns {capability} to an integrated suite even though avionics[{component_index}] identifies a separate product with that capability"
+            if duplicated.is_some() {
+                return Err(AvionicsValidationFailure::related(
+                    AvionicsValidationRule::SuiteCapabilityCollision,
+                    suite_index,
+                    AvionicsValidationField::Types,
+                    component_index,
                 ));
             }
         }
@@ -586,10 +945,10 @@ fn validate_current_avionics_type_scope(observations: &[ParsedAvionics]) -> Resu
 
 fn validate_occurrence_type_scope(
     index: usize,
-    path_suffix: &str,
+    replacement: bool,
     avionics_types: &[String],
     evidence: &str,
-) -> Result<(), String> {
+) -> Result<(), AvionicsValidationFailure> {
     let integrated_suite = avionics_types
         .iter()
         .any(|capability| capability == "Integrated Flight Deck");
@@ -599,8 +958,14 @@ fn validate_occurrence_type_scope(
                 && !evidence_explicitly_names_capability(evidence, capability)
         });
     if unsupported_suite_capability {
-        return Err(format!(
-            "avionics[{index}]{path_suffix}.types assigns a capability to an integrated suite without explicit support in the same source_evidence_text; the suite identity may establish Integrated Flight Deck, but every additional category requires exact listing evidence"
+        return Err(AvionicsValidationFailure::occurrence(
+            AvionicsValidationRule::SuiteCapabilityNotExplicit,
+            index,
+            if replacement {
+                AvionicsValidationField::ReplacementTypes
+            } else {
+                AvionicsValidationField::Types
+            },
         ));
     }
     Ok(())
@@ -667,7 +1032,7 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
     observations: &[ParsedAvionics],
     source_url: &str,
     rendered_html: &str,
-) -> Result<(), String> {
+) -> Result<(), AvionicsValidationFailure> {
     let Some(installed_equipment) = controller_avionics_evidence(source_url, rendered_html) else {
         return Ok(());
     };
@@ -681,8 +1046,10 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             RoleSeparatedQuantityEvidence::None => continue,
             RoleSeparatedQuantityEvidence::Unique(proof) => proof,
             RoleSeparatedQuantityEvidence::Ambiguous => {
-                return Err(format!(
-                    "avionics[{index}] has multiple distinct role-separated quantity proofs"
+                return Err(AvionicsValidationFailure::occurrence(
+                    AvionicsValidationRule::QuantityProofAmbiguous,
+                    index,
+                    AvionicsValidationField::Quantity,
                 ));
             }
         };
@@ -696,8 +1063,10 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             || observation.replaces.is_some()
             || observation.quantity != 2
         {
-            return Err(format!(
-                "avionics[{index}] does not preserve the exact quantity of two proved by complementary role-separated source items"
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::QuantityMismatch,
+                index,
+                AvionicsValidationField::Quantity,
             ));
         }
         let evidence = observation
@@ -706,8 +1075,10 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             .expect("the canonical parser requires occurrence evidence")
             .trim();
         if !evidence.contains(&proof.evidence) {
-            return Err(format!(
-                "avionics[{index}].source_evidence_text does not cover both exact role-separated source items"
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::QuantityEvidenceIncomplete,
+                index,
+                AvionicsValidationField::SourceEvidenceText,
             ));
         }
     }
@@ -965,7 +1336,7 @@ fn validate_current_avionics_identity_evidence_occurrence(
     listing_context: &ListingEvidenceContext,
     exact_visible_evidence_locator: &str,
     controller_field: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), AvionicsValidationFailure> {
     let evidence = observation
         .source_evidence_text
         .as_deref()
@@ -1001,8 +1372,10 @@ fn validate_current_avionics_identity_evidence_occurrence(
             evidence,
         ) || controller_annotation_identity)
     {
-        return Err(format!(
-            "avionics[{index}].source_evidence_text is not one exact bounded source excerpt containing the candidate identity"
+        return Err(AvionicsValidationFailure::occurrence(
+            AvionicsValidationRule::CandidateIdentityNotInEvidence,
+            index,
+            AvionicsValidationField::SourceEvidenceText,
         ));
     }
     if let Some(replacement) = observation.replaces.as_ref() {
@@ -1029,8 +1402,10 @@ fn validate_current_avionics_identity_evidence_occurrence(
             evidence,
         ) || replacement_annotation_identity)
         {
-            return Err(format!(
-                "avionics[{index}].source_evidence_text does not contain the exact replacement identity from avionics[{index}].replaces"
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::ReplacementIdentityNotInEvidence,
+                index,
+                AvionicsValidationField::SourceEvidenceText,
             ));
         }
     }
@@ -1539,66 +1914,111 @@ fn exact_rebuilt_date_annotation(value: &str) -> bool {
         && year.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn validate_capture_binding(extraction: CurrentAvionicsExtraction<'_>) -> Result<(), String> {
+fn validate_capture_binding(
+    extraction: CurrentAvionicsExtraction<'_>,
+) -> Result<(), AvionicsValidationFailure> {
     if extraction.listing_id <= 0 || extraction.submission_id <= 0 {
-        return Err("listing and retained submission IDs must be positive".to_string());
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::InvalidBindingIdentifiers,
+        ));
     }
     if extraction.listing_owner_user_id <= 0
         || extraction.submission_owner_user_id != extraction.listing_owner_user_id
     {
-        return Err("retained submission does not belong to the listing owner".to_string());
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::OwnerBindingMismatch,
+        ));
     }
     if extraction.submission_canonical_listing_id != Some(extraction.listing_id) {
-        return Err("retained submission is not bound to the exact canonical listing".to_string());
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::CanonicalListingBindingMismatch,
+        ));
     }
     let listing_source_url = extraction
         .listing_source_url
         .map(str::trim)
         .filter(|source| !source.is_empty())
-        .ok_or_else(|| "listing has no source URL for its retained extraction".to_string())?;
+        .ok_or_else(|| {
+            AvionicsValidationFailure::global(AvionicsValidationRule::MissingListingSourceUrl)
+        })?;
     if extraction.submission_source_url.trim().is_empty()
         || extraction.submission_source_url != listing_source_url
     {
-        return Err(
-            "retained submission source URL does not exactly match the listing source URL"
-                .to_string(),
-        );
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::SourceUrlBindingMismatch,
+        ));
     }
     if extraction.rendered_html.is_empty() {
-        return Err("retained submission has no rendered HTML".to_string());
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::MissingRenderedHtml,
+        ));
     }
     if !valid_sha256(extraction.rendered_html_sha256)
         || sha256_hex(extraction.rendered_html.as_bytes()) != extraction.rendered_html_sha256
     {
-        return Err("retained submission rendered HTML failed its SHA-256 binding".to_string());
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::RenderedHtmlDigestMismatch,
+        ));
     }
     if extraction.extracted_listing_json.trim().is_empty() {
-        return Err("retained submission has no extracted listing JSON".to_string());
+        return Err(AvionicsValidationFailure::global(
+            AvionicsValidationRule::MissingExtractionJson,
+        ));
     }
     Ok(())
 }
 
 fn validate_required_identity(
     object: &serde_json::Map<String, Value>,
-    path: &str,
-) -> Result<(), String> {
-    for field in ["manufacturer", "model"] {
+    index: usize,
+    replacement: bool,
+) -> Result<(), AvionicsValidationFailure> {
+    for (field, rule, location) in [
+        (
+            "manufacturer",
+            AvionicsValidationRule::MissingManufacturer,
+            if replacement {
+                AvionicsValidationField::ReplacementManufacturer
+            } else {
+                AvionicsValidationField::Manufacturer
+            },
+        ),
+        (
+            "model",
+            AvionicsValidationRule::MissingModel,
+            if replacement {
+                AvionicsValidationField::ReplacementModel
+            } else {
+                AvionicsValidationField::Model
+            },
+        ),
+    ] {
         if object
             .get(field)
             .and_then(Value::as_str)
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            return Err(format!("{path}.{field} must be a non-empty string"));
+            return Err(AvionicsValidationFailure::occurrence(rule, index, location));
         }
     }
     Ok(())
 }
 
-fn validate_capabilities(value: &Value, path: &str) -> Result<(), String> {
+fn validate_capabilities(
+    value: &Value,
+    index: usize,
+    replacement: bool,
+) -> Result<(), AvionicsValidationFailure> {
     let Some(types) = value.get("types").and_then(Value::as_array) else {
-        return Err(format!(
-            "{path}.types must be a non-empty array; scalar type payloads are intentionally unsupported"
+        return Err(AvionicsValidationFailure::occurrence(
+            AvionicsValidationRule::InvalidTypes,
+            index,
+            if replacement {
+                AvionicsValidationField::ReplacementTypes
+            } else {
+                AvionicsValidationField::Types
+            },
         ));
     };
     let mut seen = BTreeSet::new();
@@ -1612,8 +2032,14 @@ fn validate_capabilities(value: &Value, path: &str) -> Result<(), String> {
         })
         || (types.len() > 1 && seen.contains("Unknown"))
     {
-        return Err(format!(
-            "{path}.types must contain distinct current curated capabilities, or Unknown by itself"
+        return Err(AvionicsValidationFailure::occurrence(
+            AvionicsValidationRule::InvalidTypes,
+            index,
+            if replacement {
+                AvionicsValidationField::ReplacementTypes
+            } else {
+                AvionicsValidationField::Types
+            },
         ));
     }
     Ok(())
@@ -1668,7 +2094,7 @@ mod tests {
         payload: &mut Value,
         source_url: &str,
         rendered_html: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AvionicsValidationFailure> {
         recover_controller_avionics_extraction(payload, source_url, rendered_html)
             .map(|recovery| recovery.quantity_recovered)
     }
@@ -1677,7 +2103,7 @@ mod tests {
         payload: &mut Value,
         source_url: &str,
         rendered_html: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, AvionicsValidationFailure> {
         recover_controller_avionics_extraction(payload, source_url, rendered_html)
             .map(|recovery| recovery.evidence_recovered)
     }
