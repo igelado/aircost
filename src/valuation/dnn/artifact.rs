@@ -95,6 +95,9 @@ impl DnnArtifactV1 {
                 crate::valuation::FEATURE_SCHEMA_VERSION
             )));
         }
+        self.metadata
+            .encoder
+            .validate_artifact_component_basis_vocabulary()?;
         self.metadata.architecture.validate()?;
         if self.metadata.capacity != self.metadata.architecture.capacity {
             return Err(ValuationError::InvalidArtifact(

@@ -13,6 +13,15 @@ pub const FEATURE_SCHEMA_VERSION: u32 = crate::valuation::FEATURE_SCHEMA_VERSION
 pub const DEFAULT_EQUIPMENT_BUCKETS: usize = 128;
 pub const DEFAULT_MAX_EQUIPMENT_ITEMS: usize = 16;
 pub const RESIDUAL_NUMERIC_FEATURES: usize = 7;
+pub const COMPONENT_TIME_BASIS_VOCABULARY: [ComponentTimeBasis; 6] = [
+    ComponentTimeBasis::Unknown,
+    ComponentTimeBasis::SinceNew,
+    ComponentTimeBasis::SinceOverhaul,
+    ComponentTimeBasis::SinceFactoryRemanufacture,
+    ComponentTimeBasis::SinceInspection,
+    ComponentTimeBasis::TimeRemaining,
+];
+pub const COMPONENT_TIME_BASIS_COUNT: usize = COMPONENT_TIME_BASIS_VOCABULARY.len();
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct IdentityVocabulary {
@@ -206,14 +215,7 @@ impl FeatureEncoderV1 {
             equipment_hash_seed,
             equipment_bucket_count: DEFAULT_EQUIPMENT_BUCKETS,
             maximum_equipment_items: DEFAULT_MAX_EQUIPMENT_ITEMS,
-            component_time_basis_vocabulary: vec![
-                ComponentTimeBasis::Unknown,
-                ComponentTimeBasis::SinceNew,
-                ComponentTimeBasis::SinceOverhaul,
-                ComponentTimeBasis::SinceFactoryRemanufacture,
-                ComponentTimeBasis::SinceInspection,
-                ComponentTimeBasis::TimeRemaining,
-            ],
+            component_time_basis_vocabulary: COMPONENT_TIME_BASIS_VOCABULARY.to_vec(),
             expected_log_hours_intercept,
             expected_log_hours_age_slope,
         })
@@ -287,6 +289,19 @@ impl FeatureEncoderV1 {
             equipment_indices,
             equipment_mask,
         })
+    }
+
+    pub(crate) fn validate_artifact_component_basis_vocabulary(
+        &self,
+    ) -> Result<(), ValuationError> {
+        if self.component_time_basis_vocabulary.as_slice() != COMPONENT_TIME_BASIS_VOCABULARY {
+            return Err(ValuationError::InvalidArtifact(format!(
+                "DNN component-time vocabulary has {} slots; expected the exact current {}-slot vocabulary",
+                self.component_time_basis_vocabulary.len(),
+                COMPONENT_TIME_BASIS_COUNT
+            )));
+        }
+        Ok(())
     }
 
     pub fn encoded_source_features(&self) -> Vec<&'static str> {
@@ -494,5 +509,18 @@ mod tests {
                 .position(|basis| *basis == ComponentTimeBasis::SinceOverhaul)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn stale_five_slot_artifact_vocabulary_is_rejected() {
+        let row = listing();
+        let mut encoder = FeatureEncoderV1::fit(&[row], DnnCapacity::PriorOnly, 7).unwrap();
+        encoder.component_time_basis_vocabulary.pop();
+
+        let error = encoder
+            .validate_artifact_component_basis_vocabulary()
+            .expect_err("a five-slot artifact must not load under the six-slot network");
+        assert!(error.to_string().contains("has 5 slots"));
+        assert!(error.to_string().contains("current 6-slot vocabulary"));
     }
 }

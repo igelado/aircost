@@ -10686,6 +10686,31 @@ mod tests {
 
     #[tokio::test]
     async fn current_sqlite_schema_persists_only_supported_engine_time_bases() {
+        let preview = preview_manual_listing(&json!({
+            "manufacturer": "Cessna",
+            "model": "182",
+            "variant": "182T",
+            "model_year": 2020,
+            "asking_price_usd": 450000,
+            "currency": "USD",
+            "airframe_hours": 900,
+            "engine_hours": 292,
+            "engine_time_basis": "SPOH",
+            "engine_time_evidence": "Engine time: 292 hours",
+            "engine_time_confidence": "high",
+            "propeller_hours": null,
+            "propeller_time_basis": "unknown",
+            "status": "active",
+            "avionics": [],
+            "valuation_facts": []
+        }));
+        let parsed_values = super::values_from_preview(&preview, None)
+            .expect("parser output should cross the storage boundary");
+        assert_eq!(parsed_values.engine_hours, None);
+        assert_eq!(parsed_values.engine_time_basis, "unknown");
+        assert_eq!(parsed_values.engine_time_evidence, None);
+        assert_eq!(parsed_values.engine_time_confidence, None);
+
         let db = AppDb::connect("sqlite::memory:")
             .await
             .expect("current schema should initialize");
@@ -10724,6 +10749,53 @@ mod tests {
             insert("SPOH", "https://example.test/spoh").await.is_err(),
             "propeller-overhaul basis must not enter the engine field"
         );
+
+        let listing_id = query_scalar_one!(
+            &db,
+            i64,
+            "SELECT id FROM aircraft_sale_listings WHERE source_url = 'https://example.test/sfrm'"
+        )
+        .expect("stored SFRM listing should be queryable");
+        let before = query_as_optional!(
+            &db,
+            (Option<f64>, String, Option<String>, Option<String>),
+            r#"
+            SELECT engine_hours, engine_time_basis,
+                   engine_time_evidence, engine_time_confidence
+            FROM aircraft_sale_listings WHERE id = ?
+            "#,
+            listing_id
+        )
+        .expect("engine state should load")
+        .expect("listing should exist");
+        let error = super::update_listing(
+            &db,
+            user.id,
+            listing_id,
+            &json!({
+                "engine_hours": 292,
+                "engine_time_basis": "SPOH",
+                "engine_time_evidence": "Engine time: 292 hours",
+                "engine_time_confidence": "high"
+            }),
+            None,
+        )
+        .await
+        .expect_err("bare engine SPOH update must fail before persistence");
+        assert!(error.to_string().contains("engine_time_basis must be"));
+        let after = query_as_optional!(
+            &db,
+            (Option<f64>, String, Option<String>, Option<String>),
+            r#"
+            SELECT engine_hours, engine_time_basis,
+                   engine_time_evidence, engine_time_confidence
+            FROM aircraft_sale_listings WHERE id = ?
+            "#,
+            listing_id
+        )
+        .expect("engine state should reload")
+        .expect("listing should remain");
+        assert_eq!(after, before, "rejected update must not mutate the listing");
     }
 
     #[tokio::test]

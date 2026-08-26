@@ -4015,6 +4015,7 @@ fn parsed_engine_time(
     if source_basis
         .as_deref()
         .is_some_and(is_top_overhaul_time_evidence)
+        || source_basis.as_deref() == Some("SPOH")
         || evidence
             .as_deref()
             .is_some_and(is_top_overhaul_time_evidence)
@@ -4416,6 +4417,21 @@ mod tests {
             assert_eq!(parsed.engine_time_evidence, None);
             assert_eq!(parsed.engine_time_confidence, None);
         }
+    }
+
+    #[test]
+    fn omits_bare_propeller_overhaul_basis_from_engine_time() {
+        let parsed = parsed_listing_from_model_output(&json!({
+            "engine_hours": 292,
+            "engine_time_basis": "SPOH",
+            "engine_time_evidence": "Engine time: 292 hours",
+            "engine_time_confidence": "high"
+        }));
+
+        assert_eq!(parsed.engine_hours, None);
+        assert_eq!(parsed.engine_time_basis, "unknown");
+        assert_eq!(parsed.engine_time_evidence, None);
+        assert_eq!(parsed.engine_time_confidence, None);
     }
 
     #[test]
