@@ -229,8 +229,11 @@ JOIN pg_catalog.pg_proc routine ON routine.oid = trigger_row.tgfoid
 LEFT JOIN owned_relations expected_relation ON expected_relation.name = relation.relname
 LEFT JOIN owned_routines expected_routine ON expected_routine.name = routine.proname
 WHERE NOT trigger_row.tgisinternal
-  AND trigger_row.tgname <>
-    'avionics_models_approved_concrete_model'
+  AND trigger_row.tgname NOT IN (
+    'avionics_models_approved_concrete_model',
+    'plugin_submissions_active_replay_membership_frozen',
+    'plugin_submissions_active_replay_membership_frozen_truncate'
+  )
   AND namespace.nspname = 'public'
   AND (expected_relation.name IS NOT NULL OR expected_routine.name IS NOT NULL)
 UNION ALL
@@ -3379,6 +3382,28 @@ CREATE TABLE IF NOT EXISTS listing_replay_runs (
   )
 );
 
+-- The single inventory arbiter row serializes every retained-capture
+-- membership change with replay activation and release. The token forces a
+-- write/write conflict even for an older REPEATABLE READ snapshot.
+CREATE TABLE IF NOT EXISTS listing_replay_submission_inventory_lock (
+  singleton_id BIGINT PRIMARY KEY CHECK (singleton_id = 1),
+  active_run_id BIGINT UNIQUE
+    REFERENCES listing_replay_runs(id) ON DELETE RESTRICT,
+  concurrency_token BIGINT NOT NULL DEFAULT 0 CHECK (concurrency_token >= 0)
+);
+
+INSERT INTO listing_replay_submission_inventory_lock (
+  singleton_id, active_run_id, concurrency_token
+) SELECT 1, NULL, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM listing_replay_submission_inventory_lock
+)
+AND NOT EXISTS (
+  SELECT 1 FROM schema_migration_contracts
+  WHERE migration_name = '20260819_listing_replay_runs'
+)
+ON CONFLICT (singleton_id) DO NOTHING;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_listing_replay_runs_one_running
   ON listing_replay_runs (status) WHERE status = 'running';
 
@@ -3682,7 +3707,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a',
+  '3e7c0b39b66e681be397bddbc943c75793b18bac71eacc7324b08a067ef3ff01',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 
@@ -10752,3 +10777,179 @@ INSERT INTO public.schema_migration_contracts (
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION protect_replay_submission_inventory_lock()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'DELETE'
+     OR NEW.singleton_id IS DISTINCT FROM OLD.singleton_id THEN
+    RAISE EXCEPTION 'replay submission inventory lock is a protected singleton';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DROP TRIGGER IF EXISTS listing_replay_submission_inventory_lock_protected
+  ON listing_replay_submission_inventory_lock;
+CREATE TRIGGER listing_replay_submission_inventory_lock_protected
+BEFORE INSERT OR UPDATE OR DELETE ON listing_replay_submission_inventory_lock
+FOR EACH ROW EXECUTE FUNCTION protect_replay_submission_inventory_lock();
+
+CREATE OR REPLACE FUNCTION protect_replay_submission_inventory_lock_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'replay submission inventory lock is a protected singleton';
+END
+$function$;
+
+DROP TRIGGER IF EXISTS listing_replay_submission_inventory_lock_truncate_protected
+  ON listing_replay_submission_inventory_lock;
+CREATE TRIGGER listing_replay_submission_inventory_lock_truncate_protected
+BEFORE TRUNCATE ON listing_replay_submission_inventory_lock
+FOR EACH STATEMENT
+EXECUTE FUNCTION protect_replay_submission_inventory_lock_truncate();
+
+-- Every retained-capture membership mutation writes the singleton. PostgreSQL
+-- therefore reports a serialization failure when an old repeatable-read
+-- snapshot races replay activation. Derived updates return without writing it.
+CREATE OR REPLACE FUNCTION enforce_active_replay_submission_membership()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  inventory_active_run_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND NEW.id IS NOT DISTINCT FROM OLD.id
+     AND NEW.user_id IS NOT DISTINCT FROM OLD.user_id
+     AND NEW.plugin_install_id IS NOT DISTINCT FROM OLD.plugin_install_id
+     AND NEW.source_url IS NOT DISTINCT FROM OLD.source_url
+     AND NEW.submitted_at IS NOT DISTINCT FROM OLD.submitted_at
+     AND NEW.rendered_html IS NOT DISTINCT FROM OLD.rendered_html
+     AND NEW.rendered_html_sha256 IS NOT DISTINCT FROM OLD.rendered_html_sha256
+     AND NEW.signature_base64 IS NOT DISTINCT FROM OLD.signature_base64 THEN
+    RETURN NEW;
+  END IF;
+
+  UPDATE public.listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1
+  WHERE singleton_id = 1
+  RETURNING active_run_id INTO inventory_active_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'replay submission inventory lock is invalid';
+  END IF;
+  IF inventory_active_run_id IS NOT NULL THEN
+    RAISE EXCEPTION 'plugin submission membership is frozen by active replay';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION enforce_active_replay_user_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  inventory_active_run_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND NEW.id IS NOT DISTINCT FROM OLD.id
+    AND NEW.email IS NOT DISTINCT FROM OLD.email
+    AND NEW.display_name IS NOT DISTINCT FROM OLD.display_name
+    AND NEW.auth_provider IS NOT DISTINCT FROM OLD.auth_provider
+    AND NEW.auth_subject IS NOT DISTINCT FROM OLD.auth_subject THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NEW;
+  END IF;
+  UPDATE public.listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1
+  WHERE singleton_id = 1
+  RETURNING active_run_id INTO inventory_active_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'replay submission inventory lock is invalid';
+  END IF;
+  IF inventory_active_run_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.plugin_submissions WHERE user_id = OLD.id
+  ) THEN
+    RAISE EXCEPTION 'plugin submission capture identity is frozen by active replay';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION enforce_active_replay_plugin_install_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  inventory_active_run_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND NEW.id IS NOT DISTINCT FROM OLD.id
+    AND NEW.user_id IS NOT DISTINCT FROM OLD.user_id
+    AND NEW.public_key_base64 IS NOT DISTINCT FROM OLD.public_key_base64
+    AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at
+    AND NEW.revoked_at IS NOT DISTINCT FROM OLD.revoked_at THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NEW;
+  END IF;
+  UPDATE public.listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1
+  WHERE singleton_id = 1
+  RETURNING active_run_id INTO inventory_active_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'replay submission inventory lock is invalid';
+  END IF;
+  IF inventory_active_run_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.plugin_submissions WHERE plugin_install_id = OLD.id
+  ) THEN
+    RAISE EXCEPTION 'plugin submission capture identity is frozen by active replay';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DROP TRIGGER IF EXISTS plugin_submissions_active_replay_membership_frozen
+  ON plugin_submissions;
+CREATE TRIGGER plugin_submissions_active_replay_membership_frozen
+BEFORE INSERT OR DELETE OR UPDATE ON plugin_submissions
+FOR EACH ROW EXECUTE FUNCTION enforce_active_replay_submission_membership();
+
+DROP TRIGGER IF EXISTS plugin_submissions_active_replay_membership_frozen_truncate
+  ON plugin_submissions;
+CREATE TRIGGER plugin_submissions_active_replay_membership_frozen_truncate
+BEFORE TRUNCATE ON plugin_submissions
+FOR EACH STATEMENT EXECUTE FUNCTION enforce_active_replay_submission_membership();
+
+DROP TRIGGER IF EXISTS users_active_replay_capture_identity_frozen ON users;
+CREATE TRIGGER users_active_replay_capture_identity_frozen
+BEFORE UPDATE OR DELETE ON users
+FOR EACH ROW EXECUTE FUNCTION enforce_active_replay_user_identity();
+
+DROP TRIGGER IF EXISTS plugin_installs_active_replay_capture_identity_frozen
+  ON plugin_installs;
+CREATE TRIGGER plugin_installs_active_replay_capture_identity_frozen
+BEFORE UPDATE OR DELETE ON plugin_installs
+FOR EACH ROW EXECUTE FUNCTION enforce_active_replay_plugin_install_identity();

@@ -24,7 +24,7 @@ BEGIN
     WHERE migration_name = '20260819_listing_replay_runs'
       AND contract_version = 1
       AND contract_fingerprint =
-        '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a'
+        '3e7c0b39b66e681be397bddbc943c75793b18bac71eacc7324b08a067ef3ff01'
   ) THEN
     RAISE EXCEPTION 'installed listing replay runs migration has a different contract';
   END IF;
@@ -46,6 +46,9 @@ BEGIN
                         ('listing_replay_runs', 9, 'created_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
                         ('listing_replay_runs', 10, 'updated_at', 'text', TRUE, '', 'CURRENT_TIMESTAMP'),
                         ('listing_replay_runs', 11, 'completed_at', 'text', FALSE, '', ''),
+                        ('listing_replay_submission_inventory_lock', 1, 'singleton_id', 'bigint', TRUE, '', ''),
+                        ('listing_replay_submission_inventory_lock', 2, 'active_run_id', 'bigint', FALSE, '', ''),
+                        ('listing_replay_submission_inventory_lock', 3, 'concurrency_token', 'bigint', TRUE, '', '0'),
                         ('listing_replay_run_items', 1, 'id', 'bigint', TRUE, 'd', ''),
                         ('listing_replay_run_items', 2, 'run_id', 'bigint', TRUE, '', ''),
                         ('listing_replay_run_items', 3, 'plugin_submission_id', 'bigint', TRUE, '', ''),
@@ -96,6 +99,7 @@ BEGIN
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND attribute.attnum > 0 AND NOT attribute.attisdropped
@@ -116,6 +120,7 @@ BEGIN
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                     ), replay_indexes AS (
@@ -202,6 +207,9 @@ BEGIN
                         pg_catalog.to_regclass('public.listing_replay_runs'),
                         pg_catalog.to_regclass('public.listing_replay_run_items'),
                         pg_catalog.to_regclass(
+                          'public.listing_replay_submission_inventory_lock'
+                        ),
+                        pg_catalog.to_regclass(
                           'public.plugin_submission_materialization_receipts'
                         )
                       )
@@ -285,6 +293,7 @@ BEGIN
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'u'
@@ -368,6 +377,7 @@ BEGIN
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'p'
@@ -412,6 +422,7 @@ BEGIN
                       WHERE child_namespace.nspname = 'public'
                         AND child.relname IN (
                           'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'f'
@@ -423,6 +434,8 @@ BEGIN
                         ('listing_replay_runs', 'active_phase = ANY'),
                         ('listing_replay_runs', 'length(btrim(owner_token))'),
                         ('listing_replay_runs', 'heartbeat_at_epoch_seconds IS NOT NULL'),
+                        ('listing_replay_submission_inventory_lock', 'singleton_id = 1'),
+                        ('listing_replay_submission_inventory_lock', 'concurrency_token >= 0'),
                         ('listing_replay_run_items', '"position" >= 0'),
                         ('listing_replay_run_items', 'expected_rendered_html_sha256'),
                         ('listing_replay_run_items', 'extracted_listing_sha256'),
@@ -457,12 +470,13 @@ BEGIN
                       WHERE namespace.nspname = 'public'
                         AND relation.relname IN (
                           'listing_replay_runs', 'listing_replay_run_items',
+                          'listing_replay_submission_inventory_lock',
                           'plugin_submission_materialization_receipts'
                         )
                         AND constraint_definition.contype = 'c'
                     )
                     SELECT
-                      (SELECT COUNT(*) = 39 FROM actual_columns)
+                      (SELECT COUNT(*) = 42 FROM actual_columns)
                       AND NOT EXISTS (
                         SELECT 1 FROM expected_columns expected
                         WHERE NOT EXISTS (
@@ -476,7 +490,7 @@ BEGIN
                             AND actual.default_expression = expected.default_expression
                         )
                       )
-                      AND (SELECT COUNT(*) = 3 FROM replay_relations)
+                      AND (SELECT COUNT(*) = 4 FROM replay_relations)
                       AND NOT EXISTS (
                         SELECT 1 FROM replay_relations
                         WHERE relation_oid IS DISTINCT FROM pg_catalog.to_regclass(
@@ -493,21 +507,50 @@ BEGIN
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         ) AND NOT trigger_definition.tgisinternal
-                          AND trigger_definition.tgname NOT IN (
-                            'listing_replay_run_items_checkpoint_exact',
-                            'listing_replay_run_items_completed_immutable',
-                            'plugin_submission_materialization_receipts_immutable'
+                          AND NOT (
+                            (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.listing_replay_run_items'
+                              )
+                              AND trigger_definition.tgname IN (
+                                'listing_replay_run_items_checkpoint_exact',
+                                'listing_replay_run_items_completed_immutable'
+                              )
+                            ) OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.listing_replay_submission_inventory_lock'
+                              )
+                              AND trigger_definition.tgname IN (
+                                'listing_replay_submission_inventory_lock_protected',
+                                'listing_replay_submission_inventory_lock_truncate_protected'
+                              )
+                            ) OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.plugin_submission_materialization_receipts'
+                              )
+                              AND trigger_definition.tgname =
+                                'plugin_submission_materialization_receipts_immutable'
+                            )
                           )
                       )
+                      AND (SELECT COUNT(*) = 0
+                        FROM pg_catalog.pg_trigger trigger_definition
+                        WHERE trigger_definition.tgrelid = pg_catalog.to_regclass(
+                          'public.listing_replay_runs'
+                        ) AND NOT trigger_definition.tgisinternal)
                       AND NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_trigger trigger_definition
                         WHERE NOT trigger_definition.tgisinternal
                           AND trigger_definition.tgrelid IN (
                             pg_catalog.to_regclass('public.plugin_submissions'),
-                            pg_catalog.to_regclass('public.plugin_installs')
+                            pg_catalog.to_regclass('public.plugin_installs'),
+                            pg_catalog.to_regclass('public.users')
                           )
                           AND NOT (
                             (
@@ -515,6 +558,8 @@ BEGIN
                                 'public.plugin_submissions'
                               )
                               AND trigger_definition.tgname IN (
+                                'plugin_submissions_active_replay_membership_frozen',
+                                'plugin_submissions_active_replay_membership_frozen_truncate',
                                 'plugin_submissions_replay_checkpoint_immutable',
                                 'listing_avionics_authorizations_invalidate_capture_delete',
                                 'listing_avionics_authorizations_invalidate_capture_update'
@@ -524,8 +569,17 @@ BEGIN
                               trigger_definition.tgrelid = pg_catalog.to_regclass(
                                 'public.plugin_installs'
                               )
-                              AND trigger_definition.tgname =
+                              AND trigger_definition.tgname IN (
+                                'plugin_installs_active_replay_capture_identity_frozen',
                                 'plugin_installs_replay_identity_immutable'
+                              )
+                            )
+                            OR (
+                              trigger_definition.tgrelid = pg_catalog.to_regclass(
+                                'public.users'
+                              )
+                              AND trigger_definition.tgname =
+                                'users_active_replay_capture_identity_frozen'
                             )
                           )
                       )
@@ -534,6 +588,9 @@ BEGIN
                         WHERE policy_definition.polrelid IN (
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
                           pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
@@ -545,6 +602,9 @@ BEGIN
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         )
@@ -555,20 +615,29 @@ BEGIN
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         ) OR inheritance.inhparent IN (
                           pg_catalog.to_regclass('public.listing_replay_runs'),
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
                           pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
+                          pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
                         )
                       )
-                      AND (SELECT COUNT(*) = 9 FROM replay_attached_indexes)
-                      AND (SELECT COUNT(*) = 3 FROM pg_catalog.pg_trigger trigger_definition
+                      AND (SELECT COUNT(*) = 11 FROM replay_attached_indexes)
+                      AND (SELECT COUNT(*) = 5 FROM pg_catalog.pg_trigger trigger_definition
                         WHERE trigger_definition.tgrelid IN (
                           pg_catalog.to_regclass('public.listing_replay_run_items'),
+                          pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          ),
                           pg_catalog.to_regclass(
                             'public.plugin_submission_materialization_receipts'
                           )
@@ -641,7 +710,7 @@ BEGIN
                            'source_urlisnotnullandlengthbtrimsource_url>0',
                            'source_urlisnotnullandlengthbtrimsource_url>0::integer'
                          ))
-                      AND (SELECT COUNT(*) = 5
+                      AND (SELECT COUNT(*) = 11
                         FROM pg_catalog.pg_trigger replay_trigger
                         JOIN pg_catalog.pg_proc routine
                           ON routine.oid = replay_trigger.tgfoid
@@ -650,6 +719,7 @@ BEGIN
                         WHERE NOT replay_trigger.tgisinternal
                           AND replay_trigger.tgenabled = 'O'
                           AND replay_trigger.tgqual IS NULL
+                          AND replay_trigger.tgattr::text = ''
                           AND replay_trigger.tgnargs = 0
                           AND routine_namespace.nspname = 'public'
                           AND routine.proconfig = ARRAY['search_path=pg_catalog']::text[]
@@ -667,6 +737,22 @@ BEGIN
                             WHERE language.lanname = 'plpgsql'
                           )
                           AND (
+                            (replay_trigger.tgname =
+                               'listing_replay_submission_inventory_lock_protected'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_submission_inventory_lock'
+                             ) AND replay_trigger.tgtype = 31
+                             AND routine.proname =
+                               'protect_replay_submission_inventory_lock')
+                            OR
+                            (replay_trigger.tgname =
+                               'listing_replay_submission_inventory_lock_truncate_protected'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.listing_replay_submission_inventory_lock'
+                             ) AND replay_trigger.tgtype = 34
+                             AND routine.proname =
+                               'protect_replay_submission_inventory_lock_truncate')
+                            OR
                             (replay_trigger.tgname =
                                'listing_replay_run_items_checkpoint_exact'
                              AND replay_trigger.tgrelid = pg_catalog.to_regclass(
@@ -691,6 +777,22 @@ BEGIN
                                'preserve_replay_materialization_receipt')
                             OR
                             (replay_trigger.tgname =
+                               'plugin_submissions_active_replay_membership_frozen'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submissions'
+                             ) AND replay_trigger.tgtype = 31
+                             AND routine.proname =
+                               'enforce_active_replay_submission_membership')
+                            OR
+                            (replay_trigger.tgname =
+                               'plugin_submissions_active_replay_membership_frozen_truncate'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_submissions'
+                             ) AND replay_trigger.tgtype = 34
+                             AND routine.proname =
+                               'enforce_active_replay_submission_membership')
+                            OR
+                            (replay_trigger.tgname =
                                'plugin_submissions_replay_checkpoint_immutable'
                              AND replay_trigger.tgrelid = pg_catalog.to_regclass(
                                'public.plugin_submissions'
@@ -699,15 +801,31 @@ BEGIN
                                'enforce_replay_checkpoint_capture_immutability')
                             OR
                             (replay_trigger.tgname =
+                               'plugin_installs_active_replay_capture_identity_frozen'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.plugin_installs'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname =
+                               'enforce_active_replay_plugin_install_identity')
+                            OR
+                            (replay_trigger.tgname =
                                'plugin_installs_replay_identity_immutable'
                              AND replay_trigger.tgrelid = pg_catalog.to_regclass(
                                'public.plugin_installs'
                              ) AND replay_trigger.tgtype = 19
                              AND routine.proname =
                                'enforce_replay_plugin_identity_immutability')
+                            OR
+                            (replay_trigger.tgname =
+                               'users_active_replay_capture_identity_frozen'
+                             AND replay_trigger.tgrelid = pg_catalog.to_regclass(
+                               'public.users'
+                             ) AND replay_trigger.tgtype = 27
+                             AND routine.proname =
+                               'enforce_active_replay_user_identity')
                           ))
                       AND
-                      (SELECT COUNT(*) = 4 FROM replay_unique_constraints)
+                      (SELECT COUNT(*) = 5 FROM replay_unique_constraints)
                       AND NOT EXISTS (
                         SELECT 1 FROM replay_unique_constraints
                         WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
@@ -746,6 +864,10 @@ BEGIN
                          AND columns = ARRAY['manifest_sha256']::text[])
                       AND
                       (SELECT COUNT(*) = 1 FROM replay_unique_constraints
+                       WHERE relation_name = 'listing_replay_submission_inventory_lock'
+                         AND columns = ARRAY['active_run_id']::text[])
+                      AND
+                      (SELECT COUNT(*) = 1 FROM replay_unique_constraints
                        WHERE relation_name = 'listing_replay_run_items'
                          AND columns = ARRAY['run_id', 'position']::text[])
                       AND
@@ -758,7 +880,7 @@ BEGIN
                       (SELECT COUNT(*) = 1 FROM replay_unique_constraints
                        WHERE relation_name = 'plugin_submission_materialization_receipts'
                          AND columns = ARRAY['aircraft_sale_listing_id']::text[])
-                      AND (SELECT COUNT(*) = 3 FROM replay_primary_keys)
+                      AND (SELECT COUNT(*) = 4 FROM replay_primary_keys)
                       AND NOT EXISTS (
                         SELECT 1 FROM replay_primary_keys
                         WHERE NOT is_validated OR is_deferrable OR is_initially_deferred
@@ -792,9 +914,24 @@ BEGIN
                            WHERE relation_name = 'listing_replay_run_items'
                              AND columns = ARRAY['id']::text[])
                       AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
+                           WHERE relation_name = 'listing_replay_submission_inventory_lock'
+                             AND columns = ARRAY['singleton_id']::text[])
+                      AND (SELECT COUNT(*) = 1 FROM replay_primary_keys
                            WHERE relation_name = 'plugin_submission_materialization_receipts'
                              AND columns = ARRAY['plugin_submission_id']::text[])
-                      AND (SELECT COUNT(*) = 5 FROM replay_foreign_keys)
+                      AND (SELECT COUNT(*) = 6 FROM replay_foreign_keys)
+                      AND EXISTS (SELECT 1 FROM replay_foreign_keys
+                        WHERE child_namespace = 'public'
+                          AND child_relation = 'listing_replay_submission_inventory_lock'
+                          AND child_oid = pg_catalog.to_regclass(
+                            'public.listing_replay_submission_inventory_lock'
+                          )
+                          AND parent_namespace = 'public'
+                          AND parent_relation = 'listing_replay_runs'
+                          AND parent_oid = pg_catalog.to_regclass('public.listing_replay_runs')
+                          AND child_columns = 'active_run_id' AND parent_columns = 'id'
+                          AND is_validated AND NOT is_deferrable AND NOT is_initially_deferred
+                          AND match_type = 's' AND update_action = 'a' AND delete_action = 'r')
                       AND EXISTS (SELECT 1 FROM replay_foreign_keys
                         WHERE child_namespace = 'public'
                           AND child_relation = 'listing_replay_run_items'
@@ -852,6 +989,8 @@ BEGIN
                       AND (SELECT COUNT(*) = 20 FROM replay_checks
                            WHERE relation_name = 'listing_replay_run_items')
                       AND (SELECT COUNT(*) = 2 FROM replay_checks
+                           WHERE relation_name = 'listing_replay_submission_inventory_lock')
+                      AND (SELECT COUNT(*) = 2 FROM replay_checks
                            WHERE relation_name = 'plugin_submission_materialization_receipts')
                       AND NOT EXISTS (
                         SELECT 1 FROM required_check_fragments required
@@ -860,6 +999,27 @@ BEGIN
                           WHERE actual.relation_name = required.relation_name
                             AND position(required.fragment IN actual.definition) > 0
                         )
+                      )
+                      AND (SELECT COUNT(*)
+                           FROM public.listing_replay_submission_inventory_lock) = 1
+                      AND EXISTS (
+                        SELECT 1
+                        FROM public.listing_replay_submission_inventory_lock inventory
+                        WHERE inventory.singleton_id = 1
+                          AND inventory.concurrency_token >= 0
+                          AND (
+                            (inventory.active_run_id IS NULL AND NOT EXISTS (
+                              SELECT 1 FROM public.listing_replay_runs
+                              WHERE status = 'running'
+                            )) OR (
+                              inventory.active_run_id IS NOT NULL
+                              AND (SELECT COUNT(*) FROM public.listing_replay_runs
+                                   WHERE status = 'running') = 1
+                              AND EXISTS (SELECT 1 FROM public.listing_replay_runs
+                                          WHERE id = inventory.active_run_id
+                                            AND status = 'running')
+                            )
+                          )
                       )
                       INTO contract_is_exact;
     SELECT pg_catalog.md5(pg_catalog.string_agg(
@@ -876,6 +1036,7 @@ BEGIN
     WHERE namespace.nspname = 'public'
       AND relation.relname IN (
         'listing_replay_runs', 'listing_replay_run_items',
+        'listing_replay_submission_inventory_lock',
         'plugin_submission_materialization_receipts'
       )
       AND constraint_definition.contype = 'c';
@@ -891,6 +1052,11 @@ BEGIN
     WHERE namespace.nspname = 'public'
       AND routine.pronargs = 0
       AND routine.proname IN (
+        'enforce_active_replay_submission_membership',
+        'enforce_active_replay_user_identity',
+        'enforce_active_replay_plugin_install_identity',
+        'protect_replay_submission_inventory_lock',
+        'protect_replay_submission_inventory_lock_truncate',
         'enforce_replay_extraction_checkpoint_exactness',
         'preserve_completed_replay_item',
         'preserve_replay_materialization_receipt',
@@ -899,18 +1065,36 @@ BEGIN
       );
 
     IF NOT COALESCE(contract_is_exact, FALSE)
-       OR check_signature IS DISTINCT FROM '9a030ed4847f98cd98891f37e57cd516'
-       OR function_signature IS DISTINCT FROM '7e885abd1d361c7c831c84e5e3a58e1d' THEN
+       OR check_signature IS DISTINCT FROM 'e8ae866a042e2924929b433375d0d912'
+       OR function_signature IS DISTINCT FROM '85113e4bdd9f91dd37f4263de4f9f618' THEN
       RAISE EXCEPTION
         'installed listing replay migration contract has noncanonical objects';
     END IF;
   ELSIF (
     pg_catalog.to_regclass('public.listing_replay_runs') IS NOT NULL
     OR pg_catalog.to_regclass('public.listing_replay_run_items') IS NOT NULL
+    OR pg_catalog.to_regclass(
+      'public.listing_replay_submission_inventory_lock'
+    ) IS NOT NULL
     OR pg_catalog.to_regclass('public.plugin_submission_materialization_receipts') IS NOT NULL
     OR pg_catalog.to_regclass('public.idx_listing_replay_runs_one_running') IS NOT NULL
     OR pg_catalog.to_regclass('public.idx_listing_replay_run_items_phase') IS NOT NULL
     OR pg_catalog.to_regclass('public.uq_aircraft_sale_listings_owner_source') IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.enforce_active_replay_submission_membership()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.enforce_active_replay_user_identity()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.enforce_active_replay_plugin_install_identity()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.protect_replay_submission_inventory_lock()'
+    ) IS NOT NULL
+    OR pg_catalog.to_regprocedure(
+      'public.protect_replay_submission_inventory_lock_truncate()'
+    ) IS NOT NULL
     OR pg_catalog.to_regprocedure(
       'public.enforce_replay_extraction_checkpoint_exactness()'
     ) IS NOT NULL
@@ -927,6 +1111,12 @@ BEGIN
     OR EXISTS (
       SELECT 1 FROM pg_catalog.pg_trigger
       WHERE NOT tgisinternal AND tgname IN (
+        'plugin_submissions_active_replay_membership_frozen',
+        'plugin_submissions_active_replay_membership_frozen_truncate',
+        'users_active_replay_capture_identity_frozen',
+        'plugin_installs_active_replay_capture_identity_frozen',
+        'listing_replay_submission_inventory_lock_protected',
+        'listing_replay_submission_inventory_lock_truncate_protected',
         'listing_replay_run_items_checkpoint_exact',
         'listing_replay_run_items_completed_immutable',
         'plugin_submission_materialization_receipts_immutable',
@@ -968,8 +1158,261 @@ CREATE TABLE IF NOT EXISTS public.listing_replay_runs (
   )
 );
 
+CREATE TABLE IF NOT EXISTS public.listing_replay_submission_inventory_lock (
+  singleton_id BIGINT PRIMARY KEY CHECK (singleton_id = 1),
+  active_run_id BIGINT UNIQUE
+    REFERENCES public.listing_replay_runs(id) ON DELETE RESTRICT,
+  concurrency_token BIGINT NOT NULL DEFAULT 0 CHECK (concurrency_token >= 0)
+);
+
+INSERT INTO public.listing_replay_submission_inventory_lock (
+  singleton_id, active_run_id, concurrency_token
+) SELECT 1, NULL, 0
+WHERE NOT EXISTS (
+  SELECT 1 FROM public.listing_replay_submission_inventory_lock
+)
+AND NOT EXISTS (
+  SELECT 1 FROM ONLY public.schema_migration_contracts
+  WHERE migration_name = '20260819_listing_replay_runs'
+)
+ON CONFLICT (singleton_id) DO NOTHING;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_listing_replay_runs_one_running
   ON public.listing_replay_runs (status) WHERE status = 'running';
+
+CREATE OR REPLACE FUNCTION public.protect_replay_submission_inventory_lock()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  IF TG_OP = 'INSERT' OR TG_OP = 'DELETE'
+     OR NEW.singleton_id IS DISTINCT FROM OLD.singleton_id THEN
+    RAISE EXCEPTION 'replay submission inventory lock is a protected singleton';
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'listing_replay_submission_inventory_lock_protected'
+      AND tgrelid = pg_catalog.to_regclass(
+        'public.listing_replay_submission_inventory_lock'
+      )
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER listing_replay_submission_inventory_lock_protected
+    BEFORE INSERT OR UPDATE OR DELETE
+    ON public.listing_replay_submission_inventory_lock
+    FOR EACH ROW EXECUTE FUNCTION public.protect_replay_submission_inventory_lock();
+  END IF;
+END
+$trigger_install$;
+
+CREATE OR REPLACE FUNCTION public.protect_replay_submission_inventory_lock_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'replay submission inventory lock is a protected singleton';
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'listing_replay_submission_inventory_lock_truncate_protected'
+      AND tgrelid = pg_catalog.to_regclass(
+        'public.listing_replay_submission_inventory_lock'
+      )
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER listing_replay_submission_inventory_lock_truncate_protected
+    BEFORE TRUNCATE ON public.listing_replay_submission_inventory_lock
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION public.protect_replay_submission_inventory_lock_truncate();
+  END IF;
+END
+$trigger_install$;
+
+CREATE OR REPLACE FUNCTION public.enforce_active_replay_submission_membership()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  inventory_active_run_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND NEW.id IS NOT DISTINCT FROM OLD.id
+     AND NEW.user_id IS NOT DISTINCT FROM OLD.user_id
+     AND NEW.plugin_install_id IS NOT DISTINCT FROM OLD.plugin_install_id
+     AND NEW.source_url IS NOT DISTINCT FROM OLD.source_url
+     AND NEW.submitted_at IS NOT DISTINCT FROM OLD.submitted_at
+     AND NEW.rendered_html IS NOT DISTINCT FROM OLD.rendered_html
+     AND NEW.rendered_html_sha256 IS NOT DISTINCT FROM OLD.rendered_html_sha256
+     AND NEW.signature_base64 IS NOT DISTINCT FROM OLD.signature_base64 THEN
+    RETURN NEW;
+  END IF;
+
+  UPDATE public.listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1
+  WHERE singleton_id = 1
+  RETURNING active_run_id INTO inventory_active_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'replay submission inventory lock is invalid';
+  END IF;
+  IF inventory_active_run_id IS NOT NULL THEN
+    RAISE EXCEPTION 'plugin submission membership is frozen by active replay';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION public.enforce_active_replay_user_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  inventory_active_run_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND NEW.id IS NOT DISTINCT FROM OLD.id
+    AND NEW.email IS NOT DISTINCT FROM OLD.email
+    AND NEW.display_name IS NOT DISTINCT FROM OLD.display_name
+    AND NEW.auth_provider IS NOT DISTINCT FROM OLD.auth_provider
+    AND NEW.auth_subject IS NOT DISTINCT FROM OLD.auth_subject THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NEW;
+  END IF;
+  UPDATE public.listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1
+  WHERE singleton_id = 1
+  RETURNING active_run_id INTO inventory_active_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'replay submission inventory lock is invalid';
+  END IF;
+  IF inventory_active_run_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.plugin_submissions WHERE user_id = OLD.id
+  ) THEN
+    RAISE EXCEPTION 'plugin submission capture identity is frozen by active replay';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION public.enforce_active_replay_plugin_install_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  inventory_active_run_id BIGINT;
+BEGIN
+  IF TG_OP = 'UPDATE'
+    AND NEW.id IS NOT DISTINCT FROM OLD.id
+    AND NEW.user_id IS NOT DISTINCT FROM OLD.user_id
+    AND NEW.public_key_base64 IS NOT DISTINCT FROM OLD.public_key_base64
+    AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at
+    AND NEW.revoked_at IS NOT DISTINCT FROM OLD.revoked_at THEN
+    IF TG_OP = 'DELETE' THEN
+      RETURN OLD;
+    END IF;
+    RETURN NEW;
+  END IF;
+  UPDATE public.listing_replay_submission_inventory_lock
+  SET concurrency_token = concurrency_token + 1
+  WHERE singleton_id = 1
+  RETURNING active_run_id INTO inventory_active_run_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'replay submission inventory lock is invalid';
+  END IF;
+  IF inventory_active_run_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM public.plugin_submissions WHERE plugin_install_id = OLD.id
+  ) THEN
+    RAISE EXCEPTION 'plugin submission capture identity is frozen by active replay';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+$function$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'plugin_submissions_active_replay_membership_frozen'
+      AND tgrelid = pg_catalog.to_regclass('public.plugin_submissions')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER plugin_submissions_active_replay_membership_frozen
+    BEFORE INSERT OR DELETE OR UPDATE ON public.plugin_submissions
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_active_replay_submission_membership();
+  END IF;
+END
+$trigger_install$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'users_active_replay_capture_identity_frozen'
+      AND tgrelid = pg_catalog.to_regclass('public.users')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER users_active_replay_capture_identity_frozen
+    BEFORE UPDATE OR DELETE ON public.users
+    FOR EACH ROW EXECUTE FUNCTION public.enforce_active_replay_user_identity();
+  END IF;
+END
+$trigger_install$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'plugin_installs_active_replay_capture_identity_frozen'
+      AND tgrelid = pg_catalog.to_regclass('public.plugin_installs')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER plugin_installs_active_replay_capture_identity_frozen
+    BEFORE UPDATE OR DELETE ON public.plugin_installs
+    FOR EACH ROW
+    EXECUTE FUNCTION public.enforce_active_replay_plugin_install_identity();
+  END IF;
+END
+$trigger_install$;
+
+DO $trigger_install$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_trigger
+    WHERE tgname = 'plugin_submissions_active_replay_membership_frozen_truncate'
+      AND tgrelid = pg_catalog.to_regclass('public.plugin_submissions')
+      AND NOT tgisinternal
+  ) THEN
+    CREATE TRIGGER plugin_submissions_active_replay_membership_frozen_truncate
+    BEFORE TRUNCATE ON public.plugin_submissions
+    FOR EACH STATEMENT EXECUTE FUNCTION public.enforce_active_replay_submission_membership();
+  END IF;
+END
+$trigger_install$;
 
 CREATE TABLE IF NOT EXISTS public.listing_replay_run_items (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -1323,7 +1766,7 @@ INSERT INTO public.schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260819_listing_replay_runs', 1,
-  '41a65e4b6ea6fbcfe42ef09e7e433ed96cca83449436ad1ee63212ff32fc663a',
+  '3e7c0b39b66e681be397bddbc943c75793b18bac71eacc7324b08a067ef3ff01',
   CURRENT_TIMESTAMP
 ) ON CONFLICT (migration_name) DO NOTHING;
 

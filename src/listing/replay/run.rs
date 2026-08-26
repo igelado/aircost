@@ -12,9 +12,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::FromRow;
+use sqlx::{Connection, FromRow, Postgres, Sqlite, Transaction};
 
-use super::{validate_trusted_capture_manifest, TrustedCaptureEntry, TrustedCaptureManifest};
+use super::admission::{
+    database_error_is_membership_freeze, TargetMembership, MEMBERSHIP_FROZEN_MESSAGE,
+};
+use super::{
+    authenticate_retained_capture, retained_capture_timestamp_chronology_valid,
+    validate_trusted_capture_manifest, RetainedCaptureAuthentication, TrustedCaptureEntry,
+    TrustedCaptureManifest,
+};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
 use crate::gemini::usage::{
@@ -22,8 +29,8 @@ use crate::gemini::usage::{
 };
 use crate::plugin::{
     checkpoint_plugin_submission_extraction, inspect_plugin_replay_capture_state,
-    materialize_plugin_submission_checkpoint, plugin_submission_owner, sha256_hex,
-    verify_submission_signature, PluginListingReplayOutcome, PluginStoreError,
+    materialize_plugin_submission_checkpoint, plugin_submission_owner, PluginListingReplayOutcome,
+    PluginStoreError,
 };
 
 const STALE_RECOVERY_THRESHOLD: Duration = Duration::from_secs(60 * 60);
@@ -182,49 +189,62 @@ impl std::error::Error for ReplayRunError {}
 
 impl From<sqlx::Error> for ReplayRunError {
     fn from(error: sqlx::Error) -> Self {
-        Self::Database(error.to_string())
+        if database_error_is_membership_freeze(&error) {
+            target_membership_changed()
+        } else {
+            Self::Database(error.to_string())
+        }
     }
 }
 
 pub type ReplayRunResult<T> = Result<T, ReplayRunError>;
 
 #[derive(Debug, FromRow)]
-struct CaptureRow {
+struct TargetCaptureRow {
     submission_id: i64,
-    user_id: i64,
-    user_email: String,
-    user_display_name: String,
-    user_auth_provider: String,
-    user_auth_subject: String,
-    plugin_install_id: i64,
-    plugin_public_key_base64: String,
-    plugin_install_created_at: String,
-    plugin_install_revoked_at: Option<String>,
+    submission_user_id: i64,
+    submission_plugin_install_id: i64,
     source_url: String,
     submitted_at: String,
     rendered_html: String,
     rendered_html_sha256: String,
     signature_base64: String,
+    owner_id: Option<i64>,
+    owner_email: Option<String>,
+    owner_display_name: Option<String>,
+    owner_auth_provider: Option<String>,
+    owner_auth_subject: Option<String>,
+    install_id: Option<i64>,
+    install_user_id: Option<i64>,
+    install_public_key_base64: Option<String>,
+    install_created_at: Option<String>,
+    install_revoked_at: Option<String>,
 }
 
-impl CaptureRow {
-    fn manifest_entry(&self) -> TrustedCaptureEntry {
-        TrustedCaptureEntry {
+impl TargetCaptureRow {
+    fn manifest_entry(&self) -> Option<TrustedCaptureEntry> {
+        if self.owner_id != Some(self.submission_user_id)
+            || self.install_id != Some(self.submission_plugin_install_id)
+            || self.install_user_id != Some(self.submission_user_id)
+        {
+            return None;
+        }
+        Some(TrustedCaptureEntry {
             submission_id: self.submission_id,
-            user_id: self.user_id,
-            user_email: self.user_email.clone(),
-            user_display_name: self.user_display_name.clone(),
-            user_auth_provider: self.user_auth_provider.clone(),
-            user_auth_subject: self.user_auth_subject.clone(),
-            plugin_install_id: self.plugin_install_id,
-            plugin_public_key_base64: self.plugin_public_key_base64.clone(),
-            plugin_install_created_at: self.plugin_install_created_at.clone(),
-            plugin_install_revoked_at: self.plugin_install_revoked_at.clone(),
+            user_id: self.submission_user_id,
+            user_email: self.owner_email.clone()?,
+            user_display_name: self.owner_display_name.clone()?,
+            user_auth_provider: self.owner_auth_provider.clone()?,
+            user_auth_subject: self.owner_auth_subject.clone()?,
+            plugin_install_id: self.submission_plugin_install_id,
+            plugin_public_key_base64: self.install_public_key_base64.clone()?,
+            plugin_install_created_at: self.install_created_at.clone()?,
+            plugin_install_revoked_at: self.install_revoked_at.clone(),
             source_url: self.source_url.clone(),
             submitted_at: self.submitted_at.clone(),
             rendered_html_sha256: self.rendered_html_sha256.clone(),
             signature_base64: self.signature_base64.clone(),
-        }
+        })
     }
 }
 
@@ -288,6 +308,7 @@ pub async fn replay_captures(
     acquire_run(
         db,
         run.id,
+        request.manifest,
         request.phase,
         &owner_token,
         request.recover_stale,
@@ -495,6 +516,9 @@ pub async fn replay_captures(
                                 .await
                             }
                             Err(error) => {
+                                if plugin_error_is_target_membership_freeze(&error) {
+                                    return Err(target_membership_changed());
+                                }
                                 record_selected_transient_error(
                                     request,
                                     submission_id,
@@ -603,6 +627,9 @@ pub async fn replay_captures(
                                 .await
                             }
                             Err(error) => {
+                                if plugin_error_is_target_membership_freeze(&error) {
+                                    return Err(target_membership_changed());
+                                }
                                 record_selected_transient_error(
                                     request,
                                     submission_id,
@@ -998,77 +1025,109 @@ async fn validate_target_captures(
     db: &AppDb,
     manifest: &TrustedCaptureManifest,
 ) -> ReplayRunResult<BTreeMap<i64, String>> {
+    let sql = target_capture_rows_sql(db);
+    let rows = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_as::<_, TargetCaptureRow>(&sql)
+                .fetch_all(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_as::<_, TargetCaptureRow>(&sql)
+                .fetch_all(pool)
+                .await?
+        }
+    };
+    validate_target_capture_rows(manifest, rows)
+}
+
+fn target_capture_rows_sql(db: &AppDb) -> std::borrow::Cow<'_, str> {
+    db.sql(
+        r#"SELECT submission.id AS submission_id,
+                  submission.user_id AS submission_user_id,
+                  submission.plugin_install_id AS submission_plugin_install_id,
+                  submission.source_url, submission.submitted_at,
+                  submission.rendered_html, submission.rendered_html_sha256,
+                  submission.signature_base64,
+                  owner.id AS owner_id, owner.email AS owner_email,
+                  owner.display_name AS owner_display_name,
+                  owner.auth_provider AS owner_auth_provider,
+                  owner.auth_subject AS owner_auth_subject,
+                  install.id AS install_id, install.user_id AS install_user_id,
+                  install.public_key_base64 AS install_public_key_base64,
+                  install.created_at AS install_created_at,
+                  install.revoked_at AS install_revoked_at
+           FROM plugin_submissions submission
+           LEFT JOIN users owner ON owner.id = submission.user_id
+           LEFT JOIN plugin_installs install
+             ON install.id = submission.plugin_install_id
+           ORDER BY submission.id"#,
+    )
+}
+
+fn validate_target_capture_rows(
+    manifest: &TrustedCaptureManifest,
+    rows: Vec<TargetCaptureRow>,
+) -> ReplayRunResult<BTreeMap<i64, String>> {
     let expected = manifest
         .captures
         .iter()
         .map(|entry| (entry.submission_id, entry))
         .collect::<BTreeMap<_, _>>();
-    let sql = db.sql(
-        r#"SELECT submission.id AS submission_id,
-                  owner.id AS user_id, owner.email AS user_email,
-                  owner.display_name AS user_display_name,
-                  owner.auth_provider AS user_auth_provider,
-                  owner.auth_subject AS user_auth_subject,
-                  install.id AS plugin_install_id,
-                  install.public_key_base64 AS plugin_public_key_base64,
-                  install.created_at AS plugin_install_created_at,
-                  install.revoked_at AS plugin_install_revoked_at,
-                  submission.source_url, submission.submitted_at,
-                  submission.rendered_html, submission.rendered_html_sha256,
-                  submission.signature_base64
-           FROM plugin_submissions submission
-           JOIN users owner ON owner.id = submission.user_id
-           JOIN plugin_installs install
-             ON install.id = submission.plugin_install_id
-            AND install.user_id = submission.user_id
-           ORDER BY submission.id"#,
-    );
-    let rows = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => {
-            sqlx::query_as::<_, CaptureRow>(&sql)
-                .fetch_all(pool)
-                .await?
-        }
-        DatabaseBackend::Postgres(pool) => {
-            sqlx::query_as::<_, CaptureRow>(&sql)
-                .fetch_all(pool)
-                .await?
-        }
-    };
-    let actual = rows
-        .into_iter()
-        .filter(|row| expected.contains_key(&row.submission_id))
-        .map(|row| (row.submission_id, row))
-        .collect::<BTreeMap<_, _>>();
+    // The manifest is the complete retained-capture boundary for this target,
+    // even when the caller asks to process only one manifest member.
+    let expected_ids = expected.keys().copied().collect::<BTreeSet<_>>();
+    let actual_ids = rows
+        .iter()
+        .map(|row| row.submission_id)
+        .collect::<BTreeSet<_>>();
+    if rows.len() != expected.len() || actual_ids != expected_ids {
+        let first_unexpected = actual_ids.difference(&expected_ids).next().copied();
+        let first_missing = expected_ids.difference(&actual_ids).next().copied();
+        return Err(ReplayRunError::Validation(format!(
+            "replay target submission membership differs from the manifest \
+             (expected {}, found {}, first unexpected ID {}, first missing ID {})",
+            expected.len(),
+            rows.len(),
+            first_unexpected.map_or_else(|| "none".to_string(), |id| id.to_string()),
+            first_missing.map_or_else(|| "none".to_string(), |id| id.to_string()),
+        )));
+    }
     let mut exact_rendered_html = BTreeMap::new();
-    for (submission_id, expected_entry) in expected {
-        match actual.get(&submission_id) {
-            None => {
-                return Err(ReplayRunError::Validation(format!(
-                    "manifest submission {submission_id} is not present in the replay target"
-                )))
-            }
-            Some(actual_row)
-                if actual_row.manifest_entry() != *expected_entry
-                    || sha256_hex(actual_row.rendered_html.as_bytes())
-                        != actual_row.rendered_html_sha256
-                    || verify_submission_signature(
-                        &actual_row.plugin_public_key_base64,
-                        actual_row.plugin_install_id,
-                        &actual_row.source_url,
-                        &actual_row.rendered_html_sha256,
-                        &actual_row.signature_base64,
-                    )
-                    .is_err() =>
-            {
-                return Err(ReplayRunError::Validation(format!(
-                    "manifest submission {submission_id} exact capture identity drifted in the replay target"
-                )))
-            }
-            Some(actual_row) => {
-                exact_rendered_html.insert(submission_id, actual_row.rendered_html.clone());
-            }
+    for actual_row in rows {
+        let submission_id = actual_row.submission_id;
+        let expected_entry = expected
+            .get(&submission_id)
+            .expect("exact target membership checked above");
+        let Some(actual_entry) = actual_row.manifest_entry() else {
+            return Err(ReplayRunError::Validation(format!(
+                "manifest submission {submission_id} has malformed owner or plugin install relationships in the replay target"
+            )));
+        };
+        if actual_entry != **expected_entry
+            || authenticate_retained_capture(RetainedCaptureAuthentication {
+                submission_id: actual_row.submission_id,
+                submission_user_id: actual_row.submission_user_id,
+                plugin_install_id: actual_row.submission_plugin_install_id,
+                plugin_install_user_id: actual_row.install_user_id.unwrap_or_default(),
+                plugin_public_key_base64: &actual_entry.plugin_public_key_base64,
+                source_url: &actual_row.source_url,
+                rendered_html: &actual_row.rendered_html,
+                rendered_html_sha256: &actual_row.rendered_html_sha256,
+                signature_base64: &actual_row.signature_base64,
+                timestamp_chronology_valid: retained_capture_timestamp_chronology_valid(
+                    &actual_entry.plugin_install_created_at,
+                    &actual_entry.submitted_at,
+                    actual_entry.plugin_install_revoked_at.as_deref(),
+                ),
+            })
+            .is_err()
+        {
+            return Err(ReplayRunError::Validation(format!(
+                "manifest submission {submission_id} exact capture identity drifted in the replay target"
+            )));
         }
+        exact_rendered_html.insert(submission_id, actual_row.rendered_html);
     }
     Ok(exact_rendered_html)
 }
@@ -1272,119 +1331,170 @@ async fn validate_run_membership(
 async fn acquire_run(
     db: &AppDb,
     run_id: i64,
+    manifest: &TrustedCaptureManifest,
     phase: ReplayPhase,
     owner_token: &str,
     recover_stale: bool,
 ) -> ReplayRunResult<()> {
     let now = epoch_seconds()?;
     let stale_before = now - STALE_RECOVERY_THRESHOLD.as_secs() as i64;
-    let running = current_running_run(db).await?;
-    if let Some(active) = running {
-        if !recover_stale {
-            return Err(ReplayRunError::Conflict(format!(
-                "replay run {} is active in phase {}; use --recover-stale only after confirming its worker stopped",
-                active.id,
-                active.active_phase.as_deref().unwrap_or("unknown")
-            )));
-        }
-        if active
-            .heartbeat_at_epoch_seconds
-            .is_none_or(|heartbeat| heartbeat > stale_before)
-        {
-            return Err(ReplayRunError::Conflict(format!(
-                "replay run {} has a recent heartbeat and cannot be recovered",
-                active.id
-            )));
-        }
-        recover_stale_run(db, active.id, now).await?;
-    }
-    let sql = db.sql(
+    let activate_sql = db.sql(
         r#"UPDATE listing_replay_runs
            SET status = 'running', active_phase = ?, owner_token = ?,
                heartbeat_at_epoch_seconds = ?, started_at = CURRENT_TIMESTAMP,
                completed_at = NULL, updated_at = CURRENT_TIMESTAMP
            WHERE id = ? AND status = 'queued'"#,
     );
-    let changed = execute(
-        db,
-        &sql,
-        &[
-            Bind::Text(phase.label()),
-            Bind::Text(owner_token),
-            Bind::I64(now),
-            Bind::I64(run_id),
-        ],
-    )
-    .await?;
-    if changed != 1 {
-        return Err(ReplayRunError::Conflict(
-            "replay run is not available for execution".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-async fn current_running_run(db: &AppDb) -> ReplayRunResult<Option<ExistingRunRow>> {
-    let sql = db.sql(
+    let active_run_sql = db.sql(
         r#"SELECT id, manifest_capture_count, status, active_phase,
                   heartbeat_at_epoch_seconds
-           FROM listing_replay_runs WHERE status = 'running' LIMIT 1"#,
+           FROM listing_replay_runs WHERE id = ? AND status = 'running'"#,
     );
-    match db.backend() {
-        DatabaseBackend::Sqlite(pool) => Ok(sqlx::query_as(&sql).fetch_optional(pool).await?),
-        DatabaseBackend::Postgres(pool) => Ok(sqlx::query_as(&sql).fetch_optional(pool).await?),
-    }
-}
-
-async fn recover_stale_run(db: &AppDb, run_id: i64, now: i64) -> ReplayRunResult<()> {
-    let extraction = db.sql(
+    let recover_extraction_sql = db.sql(
         r#"UPDATE listing_replay_run_items SET extraction_state = 'failed',
              materialization_state = 'blocked', last_failure_phase = 'extraction',
-             last_failure_reason_code = 'operation_failed', extraction_completed_at = CURRENT_TIMESTAMP,
-             updated_at = CURRENT_TIMESTAMP
+             last_failure_reason_code = 'operation_failed',
+             extraction_completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ? AND extraction_state = 'running'"#,
     );
-    let materialization = db.sql(
+    let recover_materialization_sql = db.sql(
         r#"UPDATE listing_replay_run_items SET materialization_state = 'failed',
-             last_failure_phase = 'materialization', last_failure_reason_code = 'operation_failed',
+             last_failure_phase = 'materialization',
+             last_failure_reason_code = 'operation_failed',
              materialization_completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
            WHERE run_id = ? AND materialization_state = 'running'"#,
     );
-    let run = db.sql(
+    let recover_run_sql = db.sql(
         r#"UPDATE listing_replay_runs SET status = 'queued', active_phase = NULL,
              owner_token = NULL, heartbeat_at_epoch_seconds = NULL, completed_at = NULL,
              updated_at = CURRENT_TIMESTAMP
            WHERE id = ? AND status = 'running' AND heartbeat_at_epoch_seconds <= ?"#,
     );
-    macro_rules! recover_in_transaction {
-        ($pool:expr) => {{
-            let mut transaction = $pool.begin().await?;
-            sqlx::query(&extraction)
-                .bind(run_id)
-                .execute(&mut *transaction)
+    let lease_inventory_sql = db.sql(
+        r#"UPDATE listing_replay_submission_inventory_lock
+           SET active_run_id = ?, concurrency_token = concurrency_token + 1
+           WHERE singleton_id = 1
+             AND ((? IS NULL AND active_run_id IS NULL) OR active_run_id = ?)"#,
+    );
+    let membership = TargetMembership::new(run_id);
+    macro_rules! acquire_locked {
+        ($transaction:ident, $write_inventory:ident, $matches:ident) => {{
+            let active_run_id = TargetMembership::$write_inventory(&mut $transaction).await?;
+            if let Some(active_run_id) = active_run_id {
+                let active: ExistingRunRow = sqlx::query_as(&active_run_sql)
+                    .bind(active_run_id)
+                    .fetch_optional(&mut *$transaction)
+                    .await?
+                    .ok_or_else(|| ReplayRunError::Conflict(
+                        "replay submission inventory lock does not identify a running run"
+                            .to_string(),
+                    ))?;
+                let active_membership = TargetMembership::new(active.id);
+                if !active_membership.$matches(db, &mut $transaction).await? {
+                    return Err(target_membership_changed());
+                }
+                if !recover_stale {
+                    return Err(ReplayRunError::Conflict(format!(
+                        "replay run {} is active in phase {}; use --recover-stale only after confirming its worker stopped",
+                        active.id,
+                        active.active_phase.as_deref().unwrap_or("unknown")
+                    )));
+                }
+                if active
+                    .heartbeat_at_epoch_seconds
+                    .is_none_or(|heartbeat| heartbeat > stale_before)
+                {
+                    return Err(ReplayRunError::Conflict(format!(
+                        "replay run {} has a recent heartbeat and cannot be recovered",
+                        active.id
+                    )));
+                }
+                sqlx::query(&recover_extraction_sql)
+                    .bind(active.id)
+                    .execute(&mut *$transaction)
+                    .await?;
+                sqlx::query(&recover_materialization_sql)
+                    .bind(active.id)
+                    .execute(&mut *$transaction)
+                    .await?;
+                let recovered = sqlx::query(&recover_run_sql)
+                    .bind(active.id)
+                    .bind(stale_before)
+                    .execute(&mut *$transaction)
+                    .await?
+                    .rows_affected();
+                if recovered != 1 {
+                    return Err(ReplayRunError::Conflict(
+                        "stale replay ownership changed before recovery".to_string(),
+                    ));
+                }
+                if !active_membership.$matches(db, &mut $transaction).await? {
+                    return Err(target_membership_changed());
+                }
+            } else {
+                let running_count = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM listing_replay_runs WHERE status = 'running'",
+                )
+                .fetch_one(&mut *$transaction)
                 .await?;
-            sqlx::query(&materialization)
-                .bind(run_id)
-                .execute(&mut *transaction)
+                if running_count != 0 {
+                    return Err(ReplayRunError::Conflict(
+                        "replay submission inventory lock is inconsistent with running runs"
+                            .to_string(),
+                    ));
+                }
+            }
+            if !membership.$matches(db, &mut $transaction).await? {
+                return Err(target_membership_changed());
+            }
+            let capture_rows = sqlx::query_as::<_, TargetCaptureRow>(&target_capture_rows_sql(db))
+                .fetch_all(&mut *$transaction)
                 .await?;
-            let changed = sqlx::query(&run)
+            validate_target_capture_rows(manifest, capture_rows)?;
+            let leased = sqlx::query(&lease_inventory_sql)
                 .bind(run_id)
-                .bind(now - STALE_RECOVERY_THRESHOLD.as_secs() as i64)
-                .execute(&mut *transaction)
+                .bind(active_run_id)
+                .bind(active_run_id)
+                .execute(&mut *$transaction)
+                .await?
+                .rows_affected();
+            if leased != 1 {
+                return Err(ReplayRunError::Conflict(
+                    "replay submission inventory ownership changed before activation".to_string(),
+                ));
+            }
+            let changed = sqlx::query(&activate_sql)
+                .bind(phase.label())
+                .bind(owner_token)
+                .bind(now)
+                .bind(run_id)
+                .execute(&mut *$transaction)
                 .await?
                 .rows_affected();
             if changed != 1 {
                 return Err(ReplayRunError::Conflict(
-                    "stale replay ownership changed before recovery".to_string(),
+                    "replay run is not available for execution".to_string(),
                 ));
             }
-            transaction.commit().await?;
+            if !membership.$matches(db, &mut $transaction).await? {
+                return Err(target_membership_changed());
+            }
+            $transaction.commit().await?;
+            changed
         }};
     }
-    match db.backend() {
-        DatabaseBackend::Sqlite(pool) => recover_in_transaction!(pool),
-        DatabaseBackend::Postgres(pool) => recover_in_transaction!(pool),
-    }
+    let changed = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let mut connection = pool.acquire().await?;
+            let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+            acquire_locked!(transaction, write_inventory_sqlite, matches_sqlite)
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let mut transaction = pool.begin().await?;
+            acquire_locked!(transaction, write_inventory_postgres, matches_postgres)
+        }
+    };
+    debug_assert_eq!(changed, 1);
     Ok(())
 }
 
@@ -1404,6 +1514,66 @@ async fn heartbeat_run(db: &AppDb, run_id: i64, owner_token: &str) -> ReplayRunR
         ],
     )
     .await
+}
+
+fn exact_run_target_membership_sql(db: &AppDb) -> String {
+    db.sql(
+        r#"SELECT CASE WHEN
+             (SELECT COUNT(*) FROM plugin_submissions) =
+               (SELECT COUNT(*) FROM listing_replay_run_items WHERE run_id = ?)
+             AND NOT EXISTS (
+               SELECT 1 FROM plugin_submissions target_submission
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM listing_replay_run_items manifest_item
+                 WHERE manifest_item.run_id = ?
+                   AND manifest_item.plugin_submission_id = target_submission.id
+               )
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM listing_replay_run_items manifest_item
+               WHERE manifest_item.run_id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM plugin_submissions target_submission
+                   WHERE target_submission.id = manifest_item.plugin_submission_id
+                 )
+             )
+           THEN CAST(1 AS BIGINT) ELSE CAST(0 AS BIGINT) END"#,
+    )
+    .into_owned()
+}
+
+async fn sqlite_run_target_membership_matches(
+    transaction: &mut Transaction<'_, Sqlite>,
+    sql: &str,
+    run_id: i64,
+) -> ReplayRunResult<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(sql)
+        .bind(run_id)
+        .bind(run_id)
+        .bind(run_id)
+        .fetch_one(&mut **transaction)
+        .await?
+        == 1)
+}
+
+async fn postgres_run_target_membership_matches(
+    transaction: &mut Transaction<'_, Postgres>,
+    sql: &str,
+    run_id: i64,
+) -> ReplayRunResult<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(sql)
+        .bind(run_id)
+        .bind(run_id)
+        .bind(run_id)
+        .fetch_one(&mut **transaction)
+        .await?
+        == 1)
+}
+
+fn target_membership_changed() -> ReplayRunError {
+    ReplayRunError::Conflict(
+        "replay target submission membership changed during item admission".to_string(),
+    )
 }
 
 async fn claim_item(
@@ -1454,7 +1624,7 @@ async fn claim_item(
     };
     let sql = db.sql(&statement);
     macro_rules! fetch_claim {
-        ($pool:expr) => {{
+        ($transaction:expr) => {{
             sqlx::query_as(&sql)
                 .bind(run_id)
                 .bind(submission_id)
@@ -1475,15 +1645,82 @@ async fn claim_item(
                 .bind(expected_rendered_html)
                 .bind(&expected.rendered_html_sha256)
                 .bind(&expected.signature_base64)
-                .fetch_optional($pool)
+                .fetch_optional(&mut *$transaction)
                 .await?
         }};
     }
-    let item = match db.backend() {
-        DatabaseBackend::Sqlite(pool) => fetch_claim!(pool),
-        DatabaseBackend::Postgres(pool) => fetch_claim!(pool),
-    };
-    Ok(item)
+    let membership_sql = exact_run_target_membership_sql(db);
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let mut connection = pool.acquire().await?;
+            let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+            let result = async {
+                if !sqlite_run_target_membership_matches(&mut transaction, &membership_sql, run_id)
+                    .await?
+                {
+                    return Err(target_membership_changed());
+                }
+                let item = fetch_claim!(transaction);
+                if !sqlite_run_target_membership_matches(&mut transaction, &membership_sql, run_id)
+                    .await?
+                {
+                    return Err(target_membership_changed());
+                }
+                Ok(item)
+            }
+            .await;
+            match result {
+                Ok(item) => {
+                    transaction.commit().await?;
+                    Ok(item)
+                }
+                Err(error) => {
+                    transaction.rollback().await?;
+                    Err(error)
+                }
+            }
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let mut connection = pool.acquire().await?;
+            let mut transaction = connection.begin().await?;
+            let result = async {
+                sqlx::query("LOCK TABLE public.plugin_submissions IN SHARE ROW EXCLUSIVE MODE")
+                    .execute(&mut *transaction)
+                    .await?;
+                if !postgres_run_target_membership_matches(
+                    &mut transaction,
+                    &membership_sql,
+                    run_id,
+                )
+                .await?
+                {
+                    return Err(target_membership_changed());
+                }
+                let item = fetch_claim!(transaction);
+                if !postgres_run_target_membership_matches(
+                    &mut transaction,
+                    &membership_sql,
+                    run_id,
+                )
+                .await?
+                {
+                    return Err(target_membership_changed());
+                }
+                Ok(item)
+            }
+            .await;
+            match result {
+                Ok(item) => {
+                    transaction.commit().await?;
+                    Ok(item)
+                }
+                Err(error) => {
+                    transaction.rollback().await?;
+                    Err(error)
+                }
+            }
+        }
+    }
 }
 
 async fn finish_succeeded(
@@ -1578,6 +1815,7 @@ async fn finish_succeeded(
         }
     });
     let manifest_lock_sql = exact_manifest_target_lock_sql(db);
+    let membership_sql = exact_run_target_membership_sql(db);
     macro_rules! lock_manifest_target {
         ($transaction:expr) => {{
             let locked = sqlx::query_scalar::<_, i64>(&manifest_lock_sql)
@@ -1607,14 +1845,23 @@ async fn finish_succeeded(
         }};
     }
     macro_rules! finish_exact_extraction {
-        ($pool:expr) => {{
+        ($pool:expr, $begin:literal, $membership:ident, $lock_target:literal) => {{
             let checkpoint = checkpoint.ok_or_else(|| {
                 ReplayRunError::Validation(
                     "successful extraction requires an exact capture checkpoint".to_string(),
                 )
             })?;
             let capture = &checkpoint.exact_capture;
-            let mut transaction = $pool.begin().await?;
+            let mut connection = $pool.acquire().await?;
+            let mut transaction = connection.begin_with($begin).await?;
+            if $lock_target {
+                sqlx::query("LOCK TABLE public.plugin_submissions IN SHARE ROW EXCLUSIVE MODE")
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if !$membership(&mut transaction, &membership_sql, run_id).await? {
+                return Err(target_membership_changed());
+            }
             lock_manifest_target!(transaction);
             let locked = sqlx::query_scalar::<_, i64>(&lock_capture_sql)
                 .bind(capture.submission_id)
@@ -1657,13 +1904,25 @@ async fn finish_succeeded(
                     "replay ownership or state changed during its owned transition".to_string(),
                 ));
             }
+            if !$membership(&mut transaction, &membership_sql, run_id).await? {
+                return Err(target_membership_changed());
+            }
             transaction.commit().await?;
             Ok::<u64, ReplayRunError>(changed)
         }};
     }
     macro_rules! finish_exact_materialization {
-        ($pool:expr) => {{
-            let mut transaction = $pool.begin().await?;
+        ($pool:expr, $begin:literal, $membership:ident, $lock_target:literal) => {{
+            let mut connection = $pool.acquire().await?;
+            let mut transaction = connection.begin_with($begin).await?;
+            if $lock_target {
+                sqlx::query("LOCK TABLE public.plugin_submissions IN SHARE ROW EXCLUSIVE MODE")
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            if !$membership(&mut transaction, &membership_sql, run_id).await? {
+                return Err(target_membership_changed());
+            }
             lock_manifest_target!(transaction);
             let changed = sqlx::query(&sql)
                 .bind(listing_id)
@@ -1680,20 +1939,38 @@ async fn finish_succeeded(
                     "replay ownership or state changed during its owned transition".to_string(),
                 ));
             }
+            if !$membership(&mut transaction, &membership_sql, run_id).await? {
+                return Err(target_membership_changed());
+            }
             transaction.commit().await?;
             Ok::<u64, ReplayRunError>(changed)
         }};
     }
     let changed = match (db.backend(), phase) {
-        (DatabaseBackend::Sqlite(pool), ReplayPhase::Extraction) => finish_exact_extraction!(pool)?,
+        (DatabaseBackend::Sqlite(pool), ReplayPhase::Extraction) => finish_exact_extraction!(
+            pool,
+            "BEGIN IMMEDIATE",
+            sqlite_run_target_membership_matches,
+            false
+        )?,
         (DatabaseBackend::Postgres(pool), ReplayPhase::Extraction) => {
-            finish_exact_extraction!(pool)?
+            finish_exact_extraction!(pool, "BEGIN", postgres_run_target_membership_matches, true)?
         }
         (DatabaseBackend::Sqlite(pool), ReplayPhase::Materialization) => {
-            finish_exact_materialization!(pool)?
+            finish_exact_materialization!(
+                pool,
+                "BEGIN IMMEDIATE",
+                sqlite_run_target_membership_matches,
+                false
+            )?
         }
         (DatabaseBackend::Postgres(pool), ReplayPhase::Materialization) => {
-            finish_exact_materialization!(pool)?
+            finish_exact_materialization!(
+                pool,
+                "BEGIN",
+                postgres_run_target_membership_matches,
+                true
+            )?
         }
     };
     require_owned_transition(changed)
@@ -1853,6 +2130,10 @@ fn record_selected_transient_error(
     if request.submission_id == Some(submission_id) {
         *selected_transient_error = Some(sanitized_transient_operation_error(error));
     }
+}
+
+fn plugin_error_is_target_membership_freeze(error: &PluginStoreError) -> bool {
+    matches!(error, PluginStoreError::Database(message) if message.contains(MEMBERSHIP_FROZEN_MESSAGE))
 }
 
 fn sanitized_transient_operation_error(error: &PluginStoreError) -> ReplayTransientOperationError {
@@ -2031,17 +2312,67 @@ async fn release_run(db: &AppDb, run_id: i64, owner_token: &str) -> ReplayRunRes
              updated_at = CURRENT_TIMESTAMP
            WHERE id = ? AND status = 'running' AND owner_token = ?"#,
     );
-    let changed = execute(
-        db,
-        &sql,
-        &[
-            Bind::I64(run_id),
-            Bind::I64(run_id),
-            Bind::I64(run_id),
-            Bind::Text(owner_token),
-        ],
-    )
-    .await?;
+    let clear_inventory_sql = db.sql(
+        r#"UPDATE listing_replay_submission_inventory_lock
+           SET active_run_id = NULL, concurrency_token = concurrency_token + 1
+           WHERE singleton_id = 1 AND active_run_id = ?"#,
+    );
+    let membership = TargetMembership::new(run_id);
+    macro_rules! release {
+        ($transaction:ident, $write_inventory:ident, $matches:ident) => {{
+            let active_run_id = TargetMembership::$write_inventory(&mut $transaction).await?;
+            if active_run_id != Some(run_id) {
+                return Err(ReplayRunError::Conflict(
+                    "replay submission inventory is not owned by this run".to_string(),
+                ));
+            }
+            if !membership.$matches(db, &mut $transaction).await? {
+                return Err(target_membership_changed());
+            }
+            let changed = sqlx::query(&sql)
+                .bind(run_id)
+                .bind(run_id)
+                .bind(run_id)
+                .bind(owner_token)
+                .execute(&mut *$transaction)
+                .await?
+                .rows_affected();
+            if changed != 1 {
+                return Err(ReplayRunError::Conflict(
+                    "replay ownership changed before the item transition committed".to_string(),
+                ));
+            }
+            if !membership.$matches(db, &mut $transaction).await? {
+                return Err(target_membership_changed());
+            }
+            let cleared = sqlx::query(&clear_inventory_sql)
+                .bind(run_id)
+                .execute(&mut *$transaction)
+                .await?
+                .rows_affected();
+            if cleared != 1 {
+                return Err(ReplayRunError::Conflict(
+                    "replay submission inventory ownership changed before release".to_string(),
+                ));
+            }
+            if !membership.$matches(db, &mut $transaction).await? {
+                return Err(target_membership_changed());
+            }
+            $transaction.commit().await?;
+            changed
+        }};
+    }
+    let changed = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let mut connection = pool.acquire().await?;
+            let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+            release!(transaction, write_inventory_sqlite, matches_sqlite)
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let mut transaction = pool.begin().await?;
+            release!(transaction, write_inventory_postgres, matches_postgres)
+        }
+    };
     require_owned_transition(changed)
 }
 
@@ -2442,6 +2773,286 @@ mod tests {
             .await
             .unwrap();
         (manifest, submission_id, user)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated PostgreSQL database in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_production_acquire_and_release_uses_backend_placeholders() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let reset = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::query("DROP SCHEMA public CASCADE")
+            .execute(&reset)
+            .await
+            .unwrap();
+        sqlx::query("CREATE SCHEMA public")
+            .execute(&reset)
+            .await
+            .unwrap();
+        reset.close().await;
+
+        let db = AppDb::connect(&database_url).await.unwrap();
+        let user = db.current_user(None).await.unwrap();
+        let DatabaseBackend::Postgres(pool) = db.backend() else {
+            unreachable!()
+        };
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let keys = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) \
+             VALUES ($1, $2) RETURNING id",
+        )
+        .bind(user.id)
+        .bind(BASE64_STANDARD.encode(keys.public_key().as_ref()))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let source_url = "https://example.test/postgres-production-lifecycle";
+        let html = "<html><body>2020 Cessna 182T N182PF</body></html>";
+        let rendered_sha = sha256_hex(html.as_bytes());
+        let signature = BASE64_STANDARD.encode(
+            keys.sign(
+                &rng,
+                signature_message(install_id, source_url, &rendered_sha).as_bytes(),
+            )
+            .unwrap()
+            .as_ref(),
+        );
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"#,
+        )
+        .bind(user.id)
+        .bind(install_id)
+        .bind(source_url)
+        .bind(html)
+        .bind(&rendered_sha)
+        .bind(signature)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let manifest = build_trusted_capture_manifest(&db, &[submission_id])
+            .await
+            .unwrap();
+        let run = ensure_run(&db, &manifest).await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            acquire_run(
+                &db,
+                run.id,
+                &manifest,
+                ReplayPhase::Extraction,
+                "postgres-lifecycle-owner",
+                false,
+            ),
+        )
+        .await
+        .expect("production acquire timed out")
+        .unwrap();
+        let acquired: (Option<i64>, i64, String) = sqlx::query_as(
+            r#"SELECT inventory.active_run_id, inventory.concurrency_token, run.status
+               FROM listing_replay_submission_inventory_lock inventory
+               JOIN listing_replay_runs run ON run.id = $1
+               WHERE inventory.singleton_id = 1"#,
+        )
+        .bind(run.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(acquired, (Some(run.id), 3, "running".to_string()));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            release_run(&db, run.id, "postgres-lifecycle-owner"),
+        )
+        .await
+        .expect("production release timed out")
+        .unwrap();
+        let released: (Option<i64>, i64, String) = sqlx::query_as(
+            r#"SELECT inventory.active_run_id, inventory.concurrency_token, run.status
+               FROM listing_replay_submission_inventory_lock inventory
+               JOIN listing_replay_runs run ON run.id = $1
+               WHERE inventory.singleton_id = 1"#,
+        )
+        .bind(run.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(released, (None, 5, "queued".to_string()));
+        db.close().await;
+
+        for target in ["submission", "user", "install"] {
+            let reset = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .unwrap();
+            sqlx::query("DROP SCHEMA public CASCADE")
+                .execute(&reset)
+                .await
+                .unwrap();
+            sqlx::query("CREATE SCHEMA public")
+                .execute(&reset)
+                .await
+                .unwrap();
+            reset.close().await;
+
+            let db = AppDb::connect(&database_url).await.unwrap();
+            let user = db.current_user(None).await.unwrap();
+            let DatabaseBackend::Postgres(pool) = db.backend() else {
+                unreachable!()
+            };
+            let rng = SystemRandom::new();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+            let keys =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
+            let install_id: i64 = sqlx::query_scalar(
+                "INSERT INTO plugin_installs (user_id, public_key_base64) \
+                 VALUES ($1, $2) RETURNING id",
+            )
+            .bind(user.id)
+            .bind(BASE64_STANDARD.encode(keys.public_key().as_ref()))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let source_url = format!("https://example.test/postgres-mutation-first-{target}");
+            let html = "<html><body>2020 Cessna 182T N182PF</body></html>";
+            let rendered_sha = sha256_hex(html.as_bytes());
+            let signature = BASE64_STANDARD.encode(
+                keys.sign(
+                    &rng,
+                    signature_message(install_id, &source_url, &rendered_sha).as_bytes(),
+                )
+                .unwrap()
+                .as_ref(),
+            );
+            let submission_id: i64 = sqlx::query_scalar(
+                r#"INSERT INTO plugin_submissions (
+                     user_id, plugin_install_id, source_url, rendered_html,
+                     rendered_html_sha256, signature_base64
+                   ) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id"#,
+            )
+            .bind(user.id)
+            .bind(install_id)
+            .bind(&source_url)
+            .bind(html)
+            .bind(&rendered_sha)
+            .bind(signature)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let manifest = build_trusted_capture_manifest(&db, &[submission_id])
+                .await
+                .unwrap();
+            let run = ensure_run(&db, &manifest).await.unwrap();
+
+            let mut mutation_connection = pool.acquire().await.unwrap();
+            let mut mutation = mutation_connection
+                .begin_with("BEGIN ISOLATION LEVEL READ COMMITTED")
+                .await
+                .unwrap();
+            match target {
+                "submission" => {
+                    sqlx::query(
+                        r#"INSERT INTO plugin_submissions (
+                             user_id, plugin_install_id, source_url, rendered_html,
+                             rendered_html_sha256, signature_base64
+                           ) VALUES ($1, $2, $3, $4, $5, 'extra-signature')"#,
+                    )
+                    .bind(user.id)
+                    .bind(install_id)
+                    .bind(format!("{source_url}/extra"))
+                    .bind(html)
+                    .bind(&rendered_sha)
+                    .execute(&mut *mutation)
+                    .await
+                    .unwrap();
+                }
+                "user" => {
+                    sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+                        .bind("Mutation First Owner")
+                        .bind(user.id)
+                        .execute(&mut *mutation)
+                        .await
+                        .unwrap();
+                }
+                "install" => {
+                    sqlx::query("UPDATE plugin_installs SET public_key_base64 = $1 WHERE id = $2")
+                        .bind("mutation-first-key")
+                        .bind(install_id)
+                        .execute(&mut *mutation)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let activation_db = db.clone();
+            let activation_manifest = manifest.clone();
+            let mut activation = tokio::spawn(async move {
+                acquire_run(
+                    &activation_db,
+                    run.id,
+                    &activation_manifest,
+                    ReplayPhase::Extraction,
+                    "postgres-mutation-first-owner",
+                    false,
+                )
+                .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut activation)
+                    .await
+                    .is_err(),
+                "{target}: production acquisition must wait behind the identity writer"
+            );
+            tokio::time::timeout(Duration::from_secs(10), mutation.commit())
+                .await
+                .unwrap_or_else(|_| panic!("{target}: mutation commit timed out"))
+                .unwrap();
+            drop(mutation_connection);
+            let activation_error = tokio::time::timeout(Duration::from_secs(10), activation)
+                .await
+                .unwrap_or_else(|_| panic!("{target}: production acquisition timed out"))
+                .unwrap()
+                .expect_err("committed target drift must reject production acquisition");
+            match (target, activation_error) {
+                ("submission", ReplayRunError::Conflict(message)) => assert_eq!(
+                    message,
+                    "replay target submission membership changed during item admission"
+                ),
+                ("user" | "install", ReplayRunError::Validation(message)) => assert_eq!(
+                    message,
+                    format!(
+                        "manifest submission {submission_id} exact capture identity drifted in the replay target"
+                    )
+                ),
+                (_, error) => panic!("{target}: unexpected acquisition error: {error}"),
+            }
+            let state: (Option<i64>, String) = sqlx::query_as(
+                r#"SELECT inventory.active_run_id, run.status
+                   FROM listing_replay_submission_inventory_lock inventory
+                   JOIN listing_replay_runs run ON run.id = $1
+                   WHERE inventory.singleton_id = 1"#,
+            )
+            .bind(run.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(state, (None, "queued".to_string()), "{target}");
+            db.close().await;
+        }
     }
 
     async fn extraction_endpoint(extraction: serde_json::Value) -> String {
@@ -2868,6 +3479,760 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_replay_rejects_a_valid_submission_outside_the_manifest() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, selected_submission_id, _) =
+            signed_checkpoint_at(&db, "https://example.test/selected-capture").await;
+        let (extra_manifest, extra_submission_id, _) =
+            signed_checkpoint_at(&db, "https://example.test/extra-capture").await;
+
+        let error = replay_captures(
+            &db,
+            None,
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: Some(selected_submission_id),
+                apply: false,
+                recover_stale: false,
+            },
+        )
+        .await
+        .expect_err("single-item selection must not weaken full-manifest target membership");
+        let message = error.to_string();
+        assert!(matches!(error, ReplayRunError::Validation(_)));
+        assert!(message.contains("membership differs from the manifest"));
+        assert!(message.contains(&extra_submission_id.to_string()));
+        assert!(!message.contains(&extra_manifest.captures[0].signature_base64));
+        assert!(!message.contains(&extra_manifest.captures[0].plugin_public_key_base64));
+
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_replay_runs")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    #[tokio::test]
+    async fn target_inventory_exposes_an_extra_submission_with_a_mismatched_install_owner() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, _, manifest_owner) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let other_user_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO users (
+                 email, display_name, auth_provider, auth_subject
+               ) VALUES (
+                 'other@example.test', 'Other Owner', 'local', 'other-owner'
+               ) RETURNING id"#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let secret_key = "SECRET_EXTRA_PUBLIC_KEY";
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, ?) RETURNING id",
+        )
+        .bind(other_user_id)
+        .bind(secret_key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let secret_html = "<html>SECRET EXTRA CAPTURE</html>";
+        let secret_signature = "SECRET_EXTRA_SIGNATURE";
+        let extra_submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES (?, ?, 'https://example.test/malformed-extra', ?, ?, ?)
+               RETURNING id"#,
+        )
+        .bind(manifest_owner.id)
+        .bind(install_id)
+        .bind(secret_html)
+        .bind("f".repeat(64))
+        .bind(secret_signature)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let error = replay_captures(
+            &db,
+            None,
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: false,
+                recover_stale: false,
+            },
+        )
+        .await
+        .expect_err("an owner/install-mismatched extra submission must be visible and rejected");
+        let message = error.to_string();
+        assert!(matches!(error, ReplayRunError::Validation(_)));
+        assert!(message.contains("membership differs from the manifest"));
+        assert!(message.contains(&extra_submission_id.to_string()));
+        for secret in [secret_key, secret_html, secret_signature] {
+            assert!(!message.contains(secret));
+        }
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_replay_runs")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    #[tokio::test]
+    async fn target_inventory_rejects_a_manifest_submission_with_a_mismatched_install_owner() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let other_user_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO users (
+                 email, display_name, auth_provider, auth_subject
+               ) VALUES (
+                 'mismatch@example.test', 'Mismatch Owner', 'local', 'mismatch-owner'
+               ) RETURNING id"#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE plugin_installs SET user_id = ?
+               WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"#,
+        )
+        .bind(other_user_id)
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = replay_captures(
+            &db,
+            None,
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: None,
+                apply: false,
+                recover_stale: false,
+            },
+        )
+        .await
+        .expect_err("a manifest capture with mismatched ownership must be rejected");
+        let message = error.to_string();
+        assert!(matches!(error, ReplayRunError::Validation(_)));
+        assert!(message.contains(&format!("manifest submission {submission_id}")));
+        assert!(message.contains("malformed owner or plugin install relationships"));
+        assert!(!message.contains(&manifest.captures[0].signature_base64));
+        assert!(!message.contains(&manifest.captures[0].plugin_public_key_base64));
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_replay_runs")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    #[tokio::test]
+    async fn selected_replay_authenticates_unselected_manifest_timestamp_chronology() {
+        for drift in [
+            "install_after_submission",
+            "malformed_submission_timestamp",
+            "revoked_before_submission",
+        ] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let (first_manifest, selected_submission_id, _) =
+                signed_checkpoint_at(&db, "https://example.test/chronology-selected").await;
+            let (second_manifest, unselected_submission_id, _) =
+                signed_checkpoint_at(&db, "https://example.test/chronology-unselected").await;
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
+            let mut unselected = second_manifest.captures[0].clone();
+            match drift {
+                "install_after_submission" => {
+                    let changed = "2026-08-20 00:00:00";
+                    sqlx::query(
+                        r#"UPDATE plugin_installs SET created_at = ?
+                           WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"#,
+                    )
+                    .bind(changed)
+                    .bind(unselected_submission_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                    unselected.plugin_install_created_at = changed.to_string();
+                }
+                "malformed_submission_timestamp" => {
+                    let changed = "not-a-timestamp";
+                    sqlx::query("UPDATE plugin_submissions SET submitted_at = ? WHERE id = ?")
+                        .bind(changed)
+                        .bind(unselected_submission_id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    unselected.submitted_at = changed.to_string();
+                }
+                "revoked_before_submission" => {
+                    let changed = "2026-08-19 11:59:59Z";
+                    sqlx::query(
+                        r#"UPDATE plugin_installs SET revoked_at = ?
+                           WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"#,
+                    )
+                    .bind(changed)
+                    .bind(unselected_submission_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                    unselected.plugin_install_revoked_at = Some(changed.to_string());
+                }
+                _ => unreachable!(),
+            }
+            let mut captures = vec![first_manifest.captures[0].clone(), unselected];
+            captures.sort_by_key(|entry| entry.submission_id);
+            let manifest = TrustedCaptureManifest {
+                manifest_sha256: super::super::manifest_fingerprint(&captures).unwrap(),
+                captures,
+            };
+
+            let error = replay_captures(
+                &db,
+                None,
+                &ReplayCapturesRequest {
+                    manifest: &manifest,
+                    phase: ReplayPhase::Extraction,
+                    submission_id: Some(selected_submission_id),
+                    apply: false,
+                    recover_stale: false,
+                },
+            )
+            .await
+            .expect_err("unselected manifest chronology must be authenticated");
+            let message = error.to_string();
+            assert!(matches!(error, ReplayRunError::Validation(_)), "{drift}");
+            assert!(
+                message.contains(&format!("manifest submission {unselected_submission_id}")),
+                "{drift}: {message}"
+            );
+            assert!(
+                message.contains("exact capture identity drifted"),
+                "{drift}"
+            );
+            assert!(!message.contains("not-a-timestamp"), "{drift}");
+            let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_replay_runs")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_eq!(runs, 0, "{drift}");
+        }
+    }
+
+    #[tokio::test]
+    async fn item_claim_rolls_back_an_extra_submission_injected_during_admission() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER inject_extra_submission_during_claim
+               BEFORE UPDATE OF extraction_state ON listing_replay_run_items
+               WHEN OLD.extraction_state = 'queued' AND NEW.extraction_state = 'running'
+               BEGIN
+                 INSERT INTO plugin_submissions (
+                   user_id, plugin_install_id, source_url, submitted_at,
+                   rendered_html, rendered_html_sha256, signature_base64
+                 )
+                 SELECT submission.user_id, submission.plugin_install_id,
+                        submission.source_url || '/concurrent-extra',
+                        submission.submitted_at, submission.rendered_html,
+                        submission.rendered_html_sha256, submission.signature_base64
+                 FROM plugin_submissions submission
+                 WHERE submission.id = NEW.plugin_submission_id;
+               END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+
+        let error = replay_captures(
+            &db,
+            Some(&extractor),
+            &ReplayCapturesRequest {
+                manifest: &manifest,
+                phase: ReplayPhase::Extraction,
+                submission_id: Some(submission_id),
+                apply: true,
+                recover_stale: false,
+            },
+        )
+        .await
+        .expect_err("membership injected inside the claim transaction must roll back the claim");
+        assert!(matches!(error, ReplayRunError::Conflict(_)));
+        assert!(error
+            .to_string()
+            .contains("submission membership changed during item admission"));
+        let retained: (i64, String, i64, i64) = sqlx::query_as(
+            r#"SELECT
+                 (SELECT COUNT(*) FROM plugin_submissions),
+                 item.extraction_state, item.extraction_attempt_count,
+                 (SELECT COUNT(*) FROM gemini_api_usage
+                  WHERE source_kind = 'plugin_submission' AND source_id = CAST(? AS TEXT))
+               FROM listing_replay_run_items item
+               WHERE item.plugin_submission_id = ?"#,
+        )
+        .bind(submission_id)
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, "queued".to_string(), 0, 0));
+    }
+
+    #[tokio::test]
+    async fn item_completion_rolls_back_an_extra_submission_injected_during_admission() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, user) = signed_checkpoint(&db).await;
+        let exact_html = validate_target_captures(&db, &manifest).await.unwrap();
+        let expected = &manifest.captures[0];
+        let expected_html = exact_html.get(&submission_id).unwrap();
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "completion-owner",
+            false,
+        )
+        .await
+        .unwrap();
+        let claimed = claim_item(
+            &db,
+            run.id,
+            submission_id,
+            ReplayPhase::Extraction,
+            "completion-owner",
+            expected,
+            expected_html,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let checkpoint = inspect_plugin_replay_capture_state(&db, user.id, submission_id)
+            .await
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER inject_extra_submission_during_completion
+               BEFORE UPDATE OF extraction_state ON listing_replay_run_items
+               WHEN OLD.extraction_state = 'running' AND NEW.extraction_state = 'succeeded'
+               BEGIN
+                 INSERT INTO plugin_submissions (
+                   user_id, plugin_install_id, source_url, submitted_at,
+                   rendered_html, rendered_html_sha256, signature_base64
+                 )
+                 SELECT submission.user_id, submission.plugin_install_id,
+                        submission.source_url || '/completion-extra',
+                        submission.submitted_at, submission.rendered_html,
+                        submission.rendered_html_sha256, submission.signature_base64
+                 FROM plugin_submissions submission
+                 WHERE submission.id = NEW.plugin_submission_id;
+               END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = finish_succeeded(
+            &db,
+            run.id,
+            claimed,
+            ReplayPhase::Extraction,
+            "completion-owner",
+            expected,
+            expected_html,
+            Some(&checkpoint),
+            None,
+        )
+        .await
+        .expect_err("membership injected inside completion must roll back domain admission");
+        assert!(matches!(error, ReplayRunError::Conflict(_)));
+        assert!(error
+            .to_string()
+            .contains("submission membership changed during item admission"));
+        let retained: (i64, String) = sqlx::query_as(
+            r#"SELECT (SELECT COUNT(*) FROM plugin_submissions), extraction_state
+               FROM listing_replay_run_items WHERE plugin_submission_id = ?"#,
+        )
+        .bind(submission_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, "running".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_activation_rolls_back_membership_injected_before_the_freeze_activates() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER inject_membership_during_run_activation
+               BEFORE UPDATE OF status ON listing_replay_runs
+               WHEN OLD.status = 'queued' AND NEW.status = 'running'
+               BEGIN
+                 INSERT INTO plugin_submissions (
+                   user_id, plugin_install_id, source_url, submitted_at,
+                   rendered_html, rendered_html_sha256, signature_base64
+                 )
+                 SELECT user_id, plugin_install_id, source_url || '/activation-extra',
+                        submitted_at, rendered_html, rendered_html_sha256, signature_base64
+                 FROM plugin_submissions WHERE id = 1;
+               END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "activation-owner",
+            false,
+        )
+        .await
+        .expect_err(
+            "activation must roll back membership inserted before the freeze becomes active",
+        );
+        assert!(matches!(error, ReplayRunError::Conflict(_)));
+        let retained: (i64, String) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM plugin_submissions), status \
+             FROM listing_replay_runs WHERE id = ?",
+        )
+        .bind(run.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, "queued".to_string()));
+        assert_eq!(submission_id, manifest.captures[0].submission_id);
+    }
+
+    #[tokio::test]
+    async fn active_run_freezes_submission_membership_but_allows_derived_updates() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "freeze-owner",
+            false,
+        )
+        .await
+        .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+
+        for mutation in [
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at,
+                 rendered_html, rendered_html_sha256, signature_base64
+               ) SELECT user_id, plugin_install_id, source_url || '/extra', submitted_at,
+                        rendered_html, rendered_html_sha256, signature_base64
+                 FROM plugin_submissions WHERE id = ?"#,
+            "DELETE FROM plugin_submissions WHERE id = ?",
+            "UPDATE plugin_submissions SET id = id + 1000 WHERE id = ?",
+        ] {
+            let error = sqlx::query(mutation)
+                .bind(submission_id)
+                .execute(pool)
+                .await
+                .expect_err("active replay must freeze submission membership");
+            assert!(
+                error.to_string().contains(MEMBERSHIP_FROZEN_MESSAGE),
+                "{error}"
+            );
+        }
+        sqlx::query("UPDATE plugin_submissions SET extraction_error = 'derived-test' WHERE id = ?")
+            .bind(submission_id)
+            .execute(pool)
+            .await
+            .expect("derived checkpoint columns must remain mutable");
+        release_run(&db, run.id, "freeze-owner").await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at,
+                 rendered_html, rendered_html_sha256, signature_base64
+               ) SELECT user_id, plugin_install_id, source_url || '/after-release', submitted_at,
+                        rendered_html, rendered_html_sha256, signature_base64
+                 FROM plugin_submissions WHERE id = ?"#,
+        )
+        .bind(submission_id)
+        .execute(pool)
+        .await
+        .expect("released replay must no longer freeze membership");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plugin_submissions")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn active_run_rejects_rowid_alias_change_and_rolls_back_deferred_child_change() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "rowid-owner",
+            false,
+        )
+        .await
+        .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let replacement_id = submission_id + 10_000;
+        let mut connection = pool.acquire().await.unwrap();
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE listing_replay_run_items SET plugin_submission_id = ? \
+             WHERE run_id = ? AND plugin_submission_id = ?",
+        )
+        .bind(replacement_id)
+        .bind(run.id)
+        .bind(submission_id)
+        .execute(&mut *transaction)
+        .await
+        .expect("the child half of the deferred identity move must be attempted");
+        let error = sqlx::query("UPDATE plugin_submissions SET rowid = ? WHERE id = ?")
+            .bind(replacement_id)
+            .bind(submission_id)
+            .execute(&mut *transaction)
+            .await
+            .expect_err("rowid aliases must not bypass the active inventory fence");
+        assert!(error.to_string().contains(MEMBERSHIP_FROZEN_MESSAGE));
+        transaction.rollback().await.unwrap();
+        let retained: (i64, i64) = sqlx::query_as(
+            r#"SELECT submission.id, item.plugin_submission_id
+               FROM plugin_submissions submission
+               JOIN listing_replay_run_items item
+                 ON item.plugin_submission_id = submission.id
+               WHERE item.run_id = ?"#,
+        )
+        .bind(run.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (submission_id, submission_id));
+        release_run(&db, run.id, "rowid-owner").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_run_freezes_authenticated_identity_and_sqlite_replace_paths() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, submission_id, user) = signed_checkpoint(&db).await;
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "identity-owner",
+            false,
+        )
+        .await
+        .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let install_id: i64 =
+            sqlx::query_scalar("SELECT plugin_install_id FROM plugin_submissions WHERE id = ?")
+                .bind(submission_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        for (statement, identifier) in [
+            (
+                "UPDATE plugin_submissions SET source_url = source_url || '/drift' WHERE id = ?",
+                submission_id,
+            ),
+            (
+                "UPDATE users SET display_name = display_name || ' drift' WHERE id = ?",
+                user.id,
+            ),
+            (
+                "UPDATE plugin_installs SET public_key_base64 = 'drift' WHERE id = ?",
+                install_id,
+            ),
+        ] {
+            let error = sqlx::query(statement)
+                .bind(identifier)
+                .execute(pool)
+                .await
+                .expect_err("authenticated capture identity must be frozen");
+            assert!(error.to_string().contains("frozen by active replay"));
+        }
+        let (email, auth_subject): (String, String) =
+            sqlx::query_as("SELECT email, auth_subject FROM users WHERE id = ?")
+                .bind(user.id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        for replacement_id in [user.id, user.id + 10_000] {
+            let error = sqlx::query(
+                r#"INSERT OR REPLACE INTO users (
+                     id, email, display_name, auth_provider, auth_subject
+                   ) VALUES (?, ?, 'replacement', 'local', ?)"#,
+            )
+            .bind(replacement_id)
+            .bind(&email)
+            .bind(&auth_subject)
+            .execute(pool)
+            .await
+            .expect_err("same-id and alternate-id unique replacement must both be fenced");
+            assert!(error.to_string().contains("frozen by active replay"));
+        }
+        let error = sqlx::query(
+            r#"INSERT OR REPLACE INTO plugin_installs (
+                 id, user_id, public_key_base64, created_at
+               ) SELECT id, user_id, 'replacement', created_at
+                 FROM plugin_installs WHERE id = ?"#,
+        )
+        .bind(install_id)
+        .execute(pool)
+        .await
+        .expect_err("plugin-install replacement must be fenced");
+        assert!(error.to_string().contains("frozen by active replay"));
+
+        let uncaptured_user_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO users (
+                 email, display_name, auth_provider, auth_subject
+               ) VALUES (
+                 'uncaptured-replace@example.test', 'Uncaptured', 'local',
+                 'uncaptured-replace-subject'
+               ) RETURNING id"#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let uncaptured_install_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_installs (user_id, public_key_base64)
+               VALUES (?, 'uncaptured-replace-key') RETURNING id"#,
+        )
+        .bind(uncaptured_user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let mut replacement = pool.begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *replacement)
+            .await
+            .unwrap();
+        let error = sqlx::query(
+            r#"UPDATE OR REPLACE users
+               SET email = ?, auth_subject = ? WHERE id = ?"#,
+        )
+        .bind(&email)
+        .bind(&auth_subject)
+        .bind(uncaptured_user_id)
+        .execute(&mut *replacement)
+        .await
+        .expect_err("an uncaptured user must not displace captured identity keys");
+        assert!(error.to_string().contains("frozen by active replay"));
+        let error = sqlx::query("UPDATE OR REPLACE plugin_installs SET id = ? WHERE id = ?")
+            .bind(install_id)
+            .bind(uncaptured_install_id)
+            .execute(&mut *replacement)
+            .await
+            .expect_err("an uncaptured install must not displace a captured install id");
+        assert!(error.to_string().contains("frozen by active replay"));
+        replacement.rollback().await.unwrap();
+        release_run(&db, run.id, "identity-owner").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_release_rolls_back_membership_injected_as_the_freeze_is_removed() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, _, _) = signed_checkpoint(&db).await;
+        let run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "release-owner",
+            false,
+        )
+        .await
+        .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            r#"CREATE TRIGGER inject_membership_during_run_release
+               AFTER UPDATE OF active_run_id
+               ON listing_replay_submission_inventory_lock
+               WHEN OLD.active_run_id IS NOT NULL AND NEW.active_run_id IS NULL
+               BEGIN
+                 INSERT INTO plugin_submissions (
+                   user_id, plugin_install_id, source_url, submitted_at,
+                   rendered_html, rendered_html_sha256, signature_base64
+                 )
+                 SELECT user_id, plugin_install_id, source_url || '/release-extra',
+                        submitted_at, rendered_html, rendered_html_sha256, signature_base64
+                 FROM plugin_submissions WHERE id = 1;
+               END"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let error = release_run(&db, run.id, "release-owner")
+            .await
+            .expect_err("release must roll back membership inserted as the freeze is removed");
+        assert!(matches!(error, ReplayRunError::Conflict(_)));
+        let retained: (i64, String) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM plugin_submissions), status \
+             FROM listing_replay_runs WHERE id = ?",
+        )
+        .bind(run.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, "running".to_string()));
+    }
+
+    #[tokio::test]
     async fn pre_checkpoint_replay_rejects_every_manifest_and_raw_capture_drift() {
         for drift in [
             "user_email",
@@ -3049,14 +4414,21 @@ mod tests {
             ("failed", "rendered_html"),
         ] {
             let db = AppDb::connect("sqlite::memory:").await.unwrap();
-            let (manifest, submission_id, user) = signed_checkpoint(&db).await;
+            let (manifest, submission_id, _) = signed_checkpoint(&db).await;
             let exact_html = validate_target_captures(&db, &manifest).await.unwrap();
             let expected = &manifest.captures[0];
             let expected_html = exact_html.get(&submission_id).unwrap();
             let run = ensure_run(&db, &manifest).await.unwrap();
-            acquire_run(&db, run.id, ReplayPhase::Extraction, "exact-owner", false)
-                .await
-                .unwrap();
+            acquire_run(
+                &db,
+                run.id,
+                &manifest,
+                ReplayPhase::Extraction,
+                "exact-owner",
+                false,
+            )
+            .await
+            .unwrap();
             let claimed = claim_item(
                 &db,
                 run.id,
@@ -3069,25 +4441,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            let DatabaseBackend::Sqlite(pool) = db.backend() else {
-                unreachable!()
-            };
+            let mut stale_expected = expected.clone();
+            let mut stale_expected_html = expected_html.clone();
             match drift {
                 "user_display_name" => {
-                    sqlx::query("UPDATE users SET display_name = 'Interleaved Drift' WHERE id = ?")
-                        .bind(user.id)
-                        .execute(pool)
-                        .await
-                        .unwrap();
+                    stale_expected.user_display_name = "Interleaved Drift".to_string();
                 }
                 "rendered_html" => {
-                    sqlx::query(
-                        "UPDATE plugin_submissions SET rendered_html = rendered_html || ' drift' WHERE id = ?",
-                    )
-                    .bind(submission_id)
-                    .execute(pool)
-                    .await
-                    .unwrap();
+                    stale_expected_html.push_str(" drift");
                 }
                 _ => unreachable!(),
             }
@@ -3099,8 +4460,8 @@ mod tests {
                         claimed,
                         ReplayPhase::Extraction,
                         "exact-owner",
-                        expected,
-                        expected_html,
+                        &stale_expected,
+                        &stale_expected_html,
                         "capture_admission",
                         "capture_validation_failed",
                     )
@@ -3113,8 +4474,8 @@ mod tests {
                         claimed,
                         ReplayPhase::Extraction,
                         "exact-owner",
-                        expected,
-                        expected_html,
+                        &stale_expected,
+                        &stale_expected_html,
                         "operation_failed",
                     )
                     .await
@@ -3125,6 +4486,10 @@ mod tests {
                 matches!(result, Err(ReplayRunError::Conflict(_))),
                 "{outcome}/{drift}"
             );
+            validate_target_captures(&db, &manifest).await.unwrap();
+            let DatabaseBackend::Sqlite(pool) = db.backend() else {
+                unreachable!()
+            };
             let state: String = sqlx::query_scalar(
                 "SELECT extraction_state FROM listing_replay_run_items WHERE run_id = ? AND plugin_submission_id = ?",
             )
@@ -3146,9 +4511,16 @@ mod tests {
             let expected = &manifest.captures[0];
             let expected_html = exact_html.get(&submission_id).unwrap();
             let run = ensure_run(&db, &manifest).await.unwrap();
-            acquire_run(&db, run.id, ReplayPhase::Extraction, "reject-owner", false)
-                .await
-                .unwrap();
+            acquire_run(
+                &db,
+                run.id,
+                &manifest,
+                ReplayPhase::Extraction,
+                "reject-owner",
+                false,
+            )
+            .await
+            .unwrap();
             let claimed = claim_item(
                 &db,
                 run.id,
@@ -3434,6 +4806,7 @@ mod tests {
         acquire_run(
             &db,
             run.id,
+            &manifest,
             ReplayPhase::Materialization,
             "partial-owner",
             false,
@@ -3575,9 +4948,16 @@ mod tests {
         let expected = &manifest.captures[0];
         let expected_html = exact_html.get(&submission_id).unwrap();
         let run = ensure_run(&db, &manifest).await.unwrap();
-        acquire_run(&db, run.id, ReplayPhase::Extraction, "owner-one", false)
-            .await
-            .unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "owner-one",
+            false,
+        )
+        .await
+        .unwrap();
         let first = claim_item(
             &db,
             run.id,
@@ -3591,7 +4971,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(
-            acquire_run(&db, run.id, ReplayPhase::Extraction, "owner-two", false).await,
+            acquire_run(
+                &db,
+                run.id,
+                &manifest,
+                ReplayPhase::Extraction,
+                "owner-two",
+                false,
+            )
+            .await,
             Err(ReplayRunError::Conflict(_))
         ));
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
@@ -3603,9 +4991,16 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        acquire_run(&db, run.id, ReplayPhase::Extraction, "owner-two", true)
-            .await
-            .unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "owner-two",
+            true,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             finish_succeeded(
                 &db,
@@ -3667,9 +5062,16 @@ mod tests {
             let expected = &manifest.captures[0];
             let expected_html = exact_html.get(&submission_id).unwrap();
             let run = ensure_run(&db, &manifest).await.unwrap();
-            acquire_run(&db, run.id, ReplayPhase::Extraction, "exact-owner", false)
-                .await
-                .unwrap();
+            acquire_run(
+                &db,
+                run.id,
+                &manifest,
+                ReplayPhase::Extraction,
+                "exact-owner",
+                false,
+            )
+            .await
+            .unwrap();
             let claimed = claim_item(
                 &db,
                 run.id,
@@ -3685,57 +5087,55 @@ mod tests {
             let state = inspect_plugin_replay_capture_state(&db, user.id, submission_id)
                 .await
                 .unwrap();
-            let checkpoint = state.checkpoint.as_ref().unwrap();
+            let mut checkpoint = state.checkpoint.unwrap();
+            let mut stale_expected = expected.clone();
+            let mut stale_expected_html = expected_html.clone();
             let DatabaseBackend::Sqlite(pool) = db.backend() else {
                 unreachable!()
             };
-            let mutation = match drift {
+            match drift {
                 "rendered_html" => {
-                    "UPDATE plugin_submissions SET rendered_html = rendered_html || ' changed' WHERE id = ?"
+                    stale_expected_html.push_str(" changed");
                 }
                 "rendered_html_sha256" => {
-                    "UPDATE plugin_submissions SET rendered_html_sha256 = printf('%064d', 1) WHERE id = ?"
+                    stale_expected.rendered_html_sha256 = "1".repeat(64);
                 }
                 "source_url" => {
-                    "UPDATE plugin_submissions SET source_url = source_url || '/changed' WHERE id = ?"
+                    stale_expected.source_url.push_str("/changed");
                 }
                 "submitted_at" => {
-                    "UPDATE plugin_submissions SET submitted_at = '2026-08-19 12:00:01' WHERE id = ?"
+                    stale_expected.submitted_at = "2026-08-19 12:00:01".to_string();
                 }
                 "signature_base64" => {
-                    "UPDATE plugin_submissions SET signature_base64 = signature_base64 || 'changed' WHERE id = ?"
+                    stale_expected.signature_base64.push_str("changed");
                 }
                 "extracted_listing_json" => {
-                    "UPDATE plugin_submissions SET extracted_listing_json = extracted_listing_json || ' ' WHERE id = ?"
+                    checkpoint.exact_capture.extracted_listing_json.push(' ');
                 }
                 "user_email" => {
-                    "UPDATE users SET email = 'interleaved@example.test' WHERE id = (SELECT user_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.user_email = "interleaved@example.test".to_string();
                 }
                 "user_display_name" => {
-                    "UPDATE users SET display_name = 'Interleaved Owner' WHERE id = (SELECT user_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.user_display_name = "Interleaved Owner".to_string();
                 }
                 "user_auth_provider" => {
-                    "UPDATE users SET auth_provider = 'interleaved' WHERE id = (SELECT user_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.user_auth_provider = "interleaved".to_string();
                 }
                 "user_auth_subject" => {
-                    "UPDATE users SET auth_subject = 'interleaved-subject' WHERE id = (SELECT user_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.user_auth_subject = "interleaved-subject".to_string();
                 }
                 "public_key_base64" => {
-                    "UPDATE plugin_installs SET public_key_base64 = public_key_base64 || 'changed' WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.plugin_public_key_base64.push_str("changed");
                 }
                 "install_created_at" => {
-                    "UPDATE plugin_installs SET created_at = '2026-08-19 11:59:59' WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.plugin_install_created_at = "2026-08-19 11:59:59".to_string();
                 }
                 "revoked_at" => {
-                    "UPDATE plugin_installs SET revoked_at = '2026-08-19 12:00:01Z' WHERE id = (SELECT plugin_install_id FROM plugin_submissions WHERE id = ?)"
+                    stale_expected.plugin_install_revoked_at =
+                        Some("2026-08-19 12:00:01Z".to_string());
                 }
                 _ => unreachable!(),
-            };
-            sqlx::query(mutation)
-                .bind(submission_id)
-                .execute(pool)
-                .await
-                .unwrap();
+            }
 
             let error = finish_succeeded(
                 &db,
@@ -3743,9 +5143,9 @@ mod tests {
                 claimed,
                 ReplayPhase::Extraction,
                 "exact-owner",
-                expected,
-                expected_html,
-                Some(checkpoint),
+                &stale_expected,
+                &stale_expected_html,
+                Some(&checkpoint),
                 None,
             )
             .await
@@ -3754,6 +5154,7 @@ mod tests {
                 matches!(error, ReplayRunError::Conflict(_)),
                 "{drift}: {error}"
             );
+            validate_target_captures(&db, &manifest).await.unwrap();
             let extraction_state: String = sqlx::query_scalar(
                 "SELECT extraction_state FROM listing_replay_run_items WHERE run_id = ? AND plugin_submission_id = ?",
             )
@@ -3933,9 +5334,16 @@ mod tests {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let (manifest, _, _) = signed_checkpoint(&db).await;
         let run = ensure_run(&db, &manifest).await.unwrap();
-        acquire_run(&db, run.id, ReplayPhase::Extraction, "owner-one", false)
-            .await
-            .unwrap();
+        acquire_run(
+            &db,
+            run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "owner-one",
+            false,
+        )
+        .await
+        .unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
         };
@@ -3971,25 +5379,139 @@ mod tests {
     #[tokio::test]
     async fn a_live_run_excludes_a_competing_manifest() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (manifest, _, _) = signed_checkpoint(&db).await;
+        let active_run = ensure_run(&db, &manifest).await.unwrap();
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
         };
-        for fingerprint in ["a".repeat(64), "b".repeat(64)] {
-            sqlx::query(
-                "INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count) VALUES (?, 1)",
+        let competing_run_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count) \
+             VALUES (?, 1) RETURNING id",
+        )
+        .bind("b".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        acquire_run(
+            &db,
+            active_run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "owner-one",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            acquire_run(
+                &db,
+                competing_run_id,
+                &manifest,
+                ReplayPhase::Extraction,
+                "owner-two",
+                false,
             )
-            .bind(fingerprint)
+            .await,
+            Err(ReplayRunError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_rejects_corrupt_active_membership_before_switching_runs() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let (_, first_submission_id, _) =
+            signed_checkpoint_at(&db, "https://example.test/stale-active-a").await;
+        let (_, second_submission_id, _) =
+            signed_checkpoint_at(&db, "https://example.test/stale-active-b").await;
+        let manifest =
+            build_trusted_capture_manifest(&db, &[first_submission_id, second_submission_id])
+                .await
+                .unwrap();
+        let active_run = ensure_run(&db, &manifest).await.unwrap();
+        acquire_run(
+            &db,
+            active_run.id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "stale-a-owner",
+            false,
+        )
+        .await
+        .unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "DELETE FROM listing_replay_run_items \
+             WHERE run_id = ? AND plugin_submission_id = ?",
+        )
+        .bind(active_run.id)
+        .bind(second_submission_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE listing_replay_runs SET heartbeat_at_epoch_seconds = 0 WHERE id = ?")
+            .bind(active_run.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let competing_run_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO listing_replay_runs (manifest_sha256, manifest_capture_count)
+               VALUES (?, 2) RETURNING id"#,
+        )
+        .bind("c".repeat(64))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for (position, entry) in manifest.captures.iter().enumerate() {
+            sqlx::query(
+                r#"INSERT INTO listing_replay_run_items (
+                     run_id, plugin_submission_id, position,
+                     expected_rendered_html_sha256
+                   ) VALUES (?, ?, ?, ?)"#,
+            )
+            .bind(competing_run_id)
+            .bind(entry.submission_id)
+            .bind(position as i64)
+            .bind(&entry.rendered_html_sha256)
             .execute(pool)
             .await
             .unwrap();
         }
-        acquire_run(&db, 1, ReplayPhase::Extraction, "owner-one", false)
-            .await
-            .unwrap();
-        assert!(matches!(
-            acquire_run(&db, 2, ReplayPhase::Extraction, "owner-two", false).await,
-            Err(ReplayRunError::Conflict(_))
-        ));
+
+        let error = acquire_run(
+            &db,
+            competing_run_id,
+            &manifest,
+            ReplayPhase::Extraction,
+            "stale-b-owner",
+            true,
+        )
+        .await
+        .expect_err("corrupt active-run membership must stop stale recovery before transfer");
+        assert!(matches!(error, ReplayRunError::Conflict(_)));
+        let retained: (String, i64, String, Option<i64>) = sqlx::query_as(
+            r#"SELECT active.status, active.heartbeat_at_epoch_seconds,
+                      competing.status, inventory.active_run_id
+               FROM listing_replay_runs active
+               JOIN listing_replay_runs competing ON competing.id = ?
+               CROSS JOIN listing_replay_submission_inventory_lock inventory
+               WHERE active.id = ? AND inventory.singleton_id = 1"#,
+        )
+        .bind(competing_run_id)
+        .bind(active_run.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "running".to_string(),
+                0,
+                "queued".to_string(),
+                Some(active_run.id),
+            )
+        );
     }
 
     #[tokio::test]
