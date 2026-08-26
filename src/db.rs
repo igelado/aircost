@@ -707,6 +707,12 @@ pub(crate) enum DatabaseKind {
     Postgres,
 }
 
+#[derive(Debug, Eq, PartialEq, sqlx::FromRow)]
+struct PostgresDatabaseIdentity {
+    system_identifier: String,
+    database_oid: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MigrationContractState {
     Fresh,
@@ -9920,13 +9926,20 @@ pub fn database_url_from_arg(value: Option<String>) -> String {
 pub fn sqlite_database_urls_equal(left: &str, right: &str) -> Result<bool> {
     fn identity(value: &str) -> Result<PathBuf> {
         let value = normalize_database_url(value);
-        if value == "sqlite::memory:" || is_postgres_url(&value) {
+        let uses_memory_mode = value == "sqlite::memory:"
+            || value.split_once('?').is_some_and(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == "mode" && value == "memory")
+            });
+        if uses_memory_mode || is_postgres_url(&value) {
             bail!("clean replay requires two distinct file-backed SQLite databases");
         }
-        let path = value
-            .strip_prefix("sqlite://")
+        let options = SqliteConnectOptions::from_str(&value)
             .context("clean replay database URL must be a file-backed SQLite URL")?;
-        let path = PathBuf::from(path);
+        // Resolve the filename exactly as SQLx will open it. Query options are
+        // connection settings rather than path bytes, and percent-encoded path
+        // bytes are decoded by SqliteConnectOptions.
+        let path = options.get_filename();
         if path.exists() {
             return path.canonicalize().with_context(|| {
                 format!("could not canonicalize database path {}", path.display())
@@ -9946,7 +9959,67 @@ pub fn sqlite_database_urls_equal(left: &str, right: &str) -> Result<bool> {
             })?
             .join(file_name))
     }
-    Ok(identity(left)? == identity(right)?)
+    let left = identity(left)?;
+    let right = identity(right)?;
+    if left.exists() && right.exists() {
+        return same_file::is_same_file(&left, &right).with_context(|| {
+            format!(
+                "could not compare SQLite database paths {} and {}",
+                left.display(),
+                right.display()
+            )
+        });
+    }
+    Ok(left == right)
+}
+
+/// Returns whether two database URLs identify the same physical database.
+///
+/// File-backed SQLite URLs retain their canonical-path identity. PostgreSQL
+/// URLs are resolved against the live servers because textual aliases can
+/// address the same database; the cluster system identifier and database OID
+/// together form the identity. Mixed backends are always distinct.
+///
+/// PostgreSQL identity queries run with read-only transactions. This check
+/// does not initialize schemas or create missing SQLite files.
+pub async fn database_urls_equal(left: &str, right: &str) -> Result<bool> {
+    let left = normalize_database_url(left);
+    let right = normalize_database_url(right);
+    match (is_postgres_url(&left), is_postgres_url(&right)) {
+        (false, false) => sqlite_database_urls_equal(&left, &right),
+        (true, true) => {
+            let (left_identity, right_identity) = tokio::try_join!(
+                postgres_database_identity(&left),
+                postgres_database_identity(&right),
+            )?;
+            Ok(left_identity == right_identity)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn postgres_database_identity(database_url: &str) -> Result<PostgresDatabaseIdentity> {
+    let options = PgConnectOptions::from_str(database_url)
+        .context("invalid PostgreSQL database URL while resolving database identity")?;
+    let mut connection = PgConnection::connect_with(&options)
+        .await
+        .context("could not connect to PostgreSQL while resolving database identity")?;
+    sqlx::query("SET default_transaction_read_only = on")
+        .execute(&mut connection)
+        .await
+        .context("could not make PostgreSQL database identity connection read-only")?;
+    sqlx::query_as::<_, PostgresDatabaseIdentity>(
+        r#"
+        SELECT control_system.system_identifier::text AS system_identifier,
+               database.oid::bigint AS database_oid
+        FROM pg_catalog.pg_control_system() AS control_system
+        JOIN pg_catalog.pg_database AS database
+          ON database.datname = pg_catalog.current_database()
+        "#,
+    )
+    .fetch_one(&mut connection)
+    .await
+    .context("could not resolve PostgreSQL cluster and database identity")
 }
 
 fn normalize_database_url(value: &str) -> String {
@@ -10512,8 +10585,8 @@ mod tests {
         avionics_product_reuse_attestations_migration_required_message,
         canonical_postgres_named_trigger_definition, canonical_sql_definition,
         canonical_sqlite_named_definition, canonical_startup_migration_contract_receipts,
-        canonical_table_definition, faa_record_hash_domain_migration_required_message,
-        faa_registry_contract_required_message,
+        canonical_table_definition, database_urls_equal,
+        faa_record_hash_domain_migration_required_message, faa_registry_contract_required_message,
         identity_deduplication_postconditions_migration_required_message,
         listing_aircraft_compatibility_projection_migration_required_message,
         listing_aircraft_identity_migration_required_message,
@@ -10672,6 +10745,168 @@ mod tests {
         ));
         let url = format!("sqlite://{}", path.display());
         (path, url)
+    }
+
+    #[tokio::test]
+    async fn database_identity_keeps_sqlite_canonical_paths_without_creating_files() {
+        let (database_path, database_url) = unique_sqlite_test_database("database-identity");
+        assert!(!database_path.exists());
+
+        for alias in [
+            database_url.clone(),
+            format!("{database_url}?mode=ro"),
+            format!("{database_url}?mode=ro&immutable=true"),
+        ] {
+            assert!(
+                database_urls_equal(database_path.to_string_lossy().as_ref(), &alias)
+                    .await
+                    .unwrap(),
+                "SQLite query options must not change file identity: {alias}"
+            );
+            assert!(!database_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn database_identity_decodes_sqlite_filename_bytes_without_creating_files() {
+        let (database_path, database_url) =
+            unique_sqlite_test_database("database identity encoded");
+        assert!(!database_path.exists());
+        let encoded_url = database_url.replace(' ', "%20");
+        assert_ne!(encoded_url, database_url);
+
+        assert!(
+            database_urls_equal(database_path.to_string_lossy().as_ref(), &encoded_url)
+                .await
+                .unwrap()
+        );
+        assert!(!database_path.exists());
+    }
+
+    #[tokio::test]
+    async fn database_identity_recognizes_existing_sqlite_hardlinks_without_creating_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("database.sqlite3");
+        let hardlink_path = directory.path().join("database-hardlink.sqlite3");
+        std::fs::write(&database_path, b"identity fixture").unwrap();
+        std::fs::hard_link(&database_path, &hardlink_path).unwrap();
+        let entries_before = std::fs::read_dir(directory.path()).unwrap().count();
+
+        assert!(database_urls_equal(
+            database_path.to_string_lossy().as_ref(),
+            hardlink_path.to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap());
+        assert_eq!(std::fs::read(&database_path).unwrap(), b"identity fixture");
+        assert_eq!(std::fs::read(&hardlink_path).unwrap(), b"identity fixture");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            entries_before
+        );
+    }
+
+    #[tokio::test]
+    async fn database_identity_treats_mixed_backends_as_distinct_without_connecting() {
+        let (database_path, database_url) = unique_sqlite_test_database("mixed-identity");
+        assert!(!database_urls_equal(
+            "postgresql://must-not-connect.invalid/aircost",
+            &database_url,
+        )
+        .await
+        .unwrap());
+        assert!(!database_path.exists());
+    }
+
+    #[tokio::test]
+    async fn database_identity_rejects_every_sqlite_memory_url() {
+        for database_url in ["sqlite::memory:", "sqlite://named?mode=memory"] {
+            assert!(database_urls_equal(database_url, database_url)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("file-backed SQLite databases"));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL 17 in AIRCOST_TEST_POSTGRES_URL"]
+    async fn postgres_database_identity_recognizes_aliases_for_ordinary_role() {
+        let database_url = std::env::var("AIRCOST_TEST_POSTGRES_URL")
+            .expect("AIRCOST_TEST_POSTGRES_URL must identify a PostgreSQL 17 database");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let role = format!("aircost_identity_probe_{}_{}", std::process::id(), nonce);
+        let password = "aircost-identity-probe";
+        sqlx::query(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD '{password}' \
+             NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
+
+        let verification = async {
+            let mut ordinary_url = url::Url::parse(&database_url)?;
+            ordinary_url
+                .set_username(&role)
+                .map_err(|()| anyhow::anyhow!("could not set PostgreSQL test role"))?;
+            ordinary_url
+                .set_password(Some(password))
+                .map_err(|()| anyhow::anyhow!("could not set PostgreSQL test password"))?;
+            let ordinary_url = ordinary_url.to_string();
+            let aliased_url = if let Some(remainder) = ordinary_url.strip_prefix("postgresql://") {
+                format!("postgres://{remainder}")
+            } else if let Some(remainder) = ordinary_url.strip_prefix("postgres://") {
+                format!("postgresql://{remainder}")
+            } else {
+                anyhow::bail!("AIRCOST_TEST_POSTGRES_URL must use a PostgreSQL URL scheme");
+            };
+            let ordinary = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&ordinary_url)
+                .await?;
+            let privileges: (bool, bool, bool) = sqlx::query_as(
+                r#"
+                SELECT role.rolsuper,
+                       pg_catalog.pg_has_role(
+                         CURRENT_USER, 'pg_monitor', 'MEMBER'
+                       ),
+                       pg_catalog.has_function_privilege(
+                         CURRENT_USER,
+                         'pg_catalog.pg_control_system()', 'EXECUTE'
+                       )
+                FROM pg_catalog.pg_roles AS role
+                WHERE role.rolname = CURRENT_USER
+                "#,
+            )
+            .fetch_one(&ordinary)
+            .await?;
+            ordinary.close().await;
+            Ok::<_, anyhow::Error>((
+                privileges,
+                database_urls_equal(&ordinary_url, &aliased_url).await?,
+            ))
+        }
+        .await;
+
+        sqlx::query(&format!("DROP ROLE {role}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let ((is_superuser, has_pg_monitor, can_execute_control_probe), aliases) =
+            verification.unwrap();
+        assert!(!is_superuser);
+        assert!(!has_pg_monitor);
+        assert!(can_execute_control_probe);
+        assert!(aliases);
     }
 
     fn connect_error(result: anyhow::Result<AppDb>) -> String {

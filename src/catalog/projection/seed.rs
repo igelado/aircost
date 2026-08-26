@@ -120,46 +120,75 @@ struct RetainedCaptureRow {
     timestamp_chronology_valid: i64,
 }
 
-pub(crate) async fn seed_verified_catalog(
-    source: &AppDb,
-    target: &AppDb,
-    expected_fingerprint_sha256: &str,
+pub(crate) struct PreparedCatalogSeed {
+    projection: CurrentCatalogProjection,
     apply: bool,
-) -> Result<CatalogSeedReport> {
-    require_lower_sha256(expected_fingerprint_sha256)?;
+}
+
+pub(crate) async fn prepare_verified_catalog(
+    source: &AppDb,
+    expected_fingerprint_sha256: Option<&str>,
+    apply: bool,
+) -> Result<PreparedCatalogSeed> {
+    if apply && expected_fingerprint_sha256.is_none() {
+        bail!("catalog seed --apply requires one reviewed catalog fingerprint");
+    }
+    if let Some(expected_fingerprint_sha256) = expected_fingerprint_sha256 {
+        require_lower_sha256(expected_fingerprint_sha256)?;
+    }
     let projection = CurrentCatalogProjection::load(source).await?;
-    if projection.fingerprint_sha256() != expected_fingerprint_sha256 {
-        bail!(
-            "source catalog fingerprint {} differs from required fingerprint {}",
-            projection.fingerprint_sha256(),
-            expected_fingerprint_sha256
-        );
+    if let Some(expected_fingerprint_sha256) = expected_fingerprint_sha256 {
+        if projection.fingerprint_sha256() != expected_fingerprint_sha256 {
+            bail!(
+                "source catalog fingerprint {} differs from required fingerprint {}",
+                projection.fingerprint_sha256(),
+                expected_fingerprint_sha256
+            );
+        }
     }
 
-    let retained_capture_count = if apply {
-        materialize(target, &projection).await?
+    Ok(PreparedCatalogSeed { projection, apply })
+}
+
+pub(crate) async fn seed_prepared_verified_catalog(
+    prepared: &PreparedCatalogSeed,
+    target: &AppDb,
+) -> Result<CatalogSeedReport> {
+    let retained_capture_count = if prepared.apply {
+        materialize(target, &prepared.projection).await?
     } else {
-        inspect_clean_target(target, &projection).await?
+        inspect_clean_target(target, &prepared.projection).await?
     };
 
-    if apply {
-        projection.require_reloaded_match(target).await?;
+    if prepared.apply {
+        prepared.projection.require_reloaded_match(target).await?;
     }
 
-    let summary = projection.summary();
+    let summary = prepared.projection.summary();
     Ok(CatalogSeedReport {
-        dry_run: !apply,
+        dry_run: !prepared.apply,
         provider_calls: 0,
         projection_fingerprint_sha256: summary.fingerprint_sha256.clone(),
         projection_table_counts: summary.table_counts.clone(),
         required_user_count: summary.required_users.len(),
         retained_capture_count,
-        materialized_rows: if apply {
+        materialized_rows: if prepared.apply {
             summary.table_counts.values().sum()
         } else {
             0
         },
     })
+}
+
+#[cfg(test)]
+async fn seed_verified_catalog(
+    source: &AppDb,
+    target: &AppDb,
+    expected_fingerprint_sha256: Option<&str>,
+    apply: bool,
+) -> Result<CatalogSeedReport> {
+    let prepared = prepare_verified_catalog(source, expected_fingerprint_sha256, apply).await?;
+    seed_prepared_verified_catalog(&prepared, target).await
 }
 
 async fn inspect_clean_target(
@@ -1248,6 +1277,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_dry_run_without_fingerprint_reports_projection_and_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_url = format!(
+            "sqlite://{}",
+            directory.path().join("source.sqlite3").display()
+        );
+        let target_url = format!(
+            "sqlite://{}",
+            directory.path().join("target.sqlite3").display()
+        );
+        let source = minimal_current_source(&source_url).await;
+        let target = AppDb::connect(&target_url).await.unwrap();
+        let projection = CurrentCatalogProjection::load(&source).await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = target.backend() else {
+            panic!("catalog seed target must be SQLite")
+        };
+        let replay_before = sqlite_replay_boundary(pool).await;
+
+        let report = seed_verified_catalog(&source, &target, None, false)
+            .await
+            .unwrap();
+
+        assert!(report.dry_run);
+        assert_eq!(report.provider_calls, 0);
+        assert_eq!(
+            report.projection_fingerprint_sha256,
+            projection.fingerprint_sha256()
+        );
+        assert_eq!(
+            report.projection_table_counts,
+            projection.summary().table_counts
+        );
+        assert_eq!(report.materialized_rows, 0);
+        assert_eq!(sqlite_replay_boundary(pool).await, replay_before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM faa_registry_snapshots")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM avionics_models")
+                .fetch_one(pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_apply_fingerprint_does_not_initialize_absent_sqlite_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let target_path = directory.path().join("target.sqlite3");
+        let source_url = format!("sqlite://{}", source_path.display());
+        let target_url = format!("sqlite://{}", target_path.display());
+        let source = minimal_current_source(&source_url).await;
+        let projection = CurrentCatalogProjection::load(&source).await.unwrap();
+        let stale_fingerprint = if projection.fingerprint_sha256().starts_with('a') {
+            "b".repeat(64)
+        } else {
+            "a".repeat(64)
+        };
+        drop(source);
+
+        let error = crate::listing::replay::catalog::seed_replay_verified_catalog(
+            crate::listing::replay::catalog::SeedVerifiedCatalogRequest {
+                source_database_url: &source_url,
+                target_database_url: &target_url,
+                expected_fingerprint_sha256: Some(&stale_fingerprint),
+                apply: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("differs from required fingerprint"));
+        assert!(!target_path.exists());
+    }
+
+    #[tokio::test]
+    async fn catalog_seed_apply_without_fingerprint_fails_before_database_work() {
+        let source = AppDb::connect("sqlite::memory:").await.unwrap();
+        let target = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = target.backend() else {
+            panic!("catalog seed target must be SQLite")
+        };
+        let replay_before = sqlite_replay_boundary(pool).await;
+
+        let error = seed_verified_catalog(&source, &target, None, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "catalog seed --apply requires one reviewed catalog fingerprint"
+        );
+        assert_eq!(sqlite_replay_boundary(pool).await, replay_before);
+    }
+
+    #[tokio::test]
     async fn sqlite_round_trip_reloads_exact_projection_and_rejects_rerun() {
         let directory = tempfile::tempdir().unwrap();
         let source_url = format!(
@@ -1271,9 +1404,14 @@ mod tests {
                 .unwrap();
         insert_sqlite_signed_capture(pool, developer_id).await;
         let replay_before = sqlite_replay_boundary(pool).await;
-        let report = seed_verified_catalog(&source, &target, projection.fingerprint_sha256(), true)
-            .await
-            .unwrap();
+        let report = seed_verified_catalog(
+            &source,
+            &target,
+            Some(projection.fingerprint_sha256()),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(!report.dry_run);
         assert_eq!(report.provider_calls, 0);
         assert_eq!(report.retained_capture_count, 1);
@@ -1282,9 +1420,14 @@ mod tests {
         assert!(serialized_report.get("projection_version").is_none());
         assert_eq!(sqlite_replay_boundary(pool).await, replay_before);
         projection.require_reloaded_match(&target).await.unwrap();
-        let error = seed_verified_catalog(&source, &target, projection.fingerprint_sha256(), true)
-            .await
-            .unwrap_err();
+        let error = seed_verified_catalog(
+            &source,
+            &target,
+            Some(projection.fingerprint_sha256()),
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("non-bootstrap table"));
 
         let next_model_id: i64 = sqlx::query_scalar(
@@ -1717,7 +1860,7 @@ mod tests {
         let report = seed_verified_catalog(
             &source,
             &target,
-            source_projection.fingerprint_sha256(),
+            Some(source_projection.fingerprint_sha256()),
             true,
         )
         .await
@@ -1736,7 +1879,7 @@ mod tests {
         let rerun = seed_verified_catalog(
             &source,
             &target,
-            source_projection.fingerprint_sha256(),
+            Some(source_projection.fingerprint_sha256()),
             true,
         )
         .await

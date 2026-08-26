@@ -75,15 +75,22 @@ All operational commands are dry-run unless `--apply` is supplied.
 
    ```text
    aircost-admin seed-verified-catalog --source-database SOURCE \
-     --catalog-fingerprint-sha256 REVIEWED_SHA256 --database SHADOW
+     --database SHADOW --dry-run
+   # Review and pin projection_fingerprint_sha256 from the dry-run report.
    aircost-admin seed-verified-catalog --source-database SOURCE \
      --catalog-fingerprint-sha256 REVIEWED_SHA256 --database SHADOW --apply
    ```
 
-   The source is opened diagnostically. Apply takes the target writer lock
-   before its final exhaustive base-table scan, admits only exact schema
-   bootstrap rows plus immutable imported users, installs, and captures, and
-   installs only the approved aircraft/FAA/reference and avionics closure. The
+   The provider-free dry run discovers and reports the source's current catalog
+   fingerprint without requiring a preselected digest. Review that report, then
+   supply its exact pinned `projection_fingerprint_sha256` value through
+   `--catalog-fingerprint-sha256` to `--apply`; apply is rejected without it.
+   The source is opened diagnostically and its projected catalog must match the
+   reviewed pin before the writable target is opened or initialized. Apply then
+   takes the target writer lock before its final exhaustive base-table scan,
+   admits only exact schema bootstrap rows plus immutable imported users,
+   installs, and captures, and installs only the approved
+   aircraft/FAA/reference and avionics closure. The
    locked validation requires the exact startup migration-receipt inventory and
    reauthenticates every retained capture's owner, HTML digest, P-256 signature,
    and install/submission/revocation chronology.
