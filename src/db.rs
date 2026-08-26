@@ -9926,13 +9926,20 @@ pub fn database_url_from_arg(value: Option<String>) -> String {
 pub fn sqlite_database_urls_equal(left: &str, right: &str) -> Result<bool> {
     fn identity(value: &str) -> Result<PathBuf> {
         let value = normalize_database_url(value);
-        if value == "sqlite::memory:" || is_postgres_url(&value) {
+        let uses_memory_mode = value == "sqlite::memory:"
+            || value.split_once('?').is_some_and(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == "mode" && value == "memory")
+            });
+        if uses_memory_mode || is_postgres_url(&value) {
             bail!("clean replay requires two distinct file-backed SQLite databases");
         }
-        let path = value
-            .strip_prefix("sqlite://")
+        let options = SqliteConnectOptions::from_str(&value)
             .context("clean replay database URL must be a file-backed SQLite URL")?;
-        let path = PathBuf::from(path);
+        // Resolve the filename exactly as SQLx will open it. Query options are
+        // connection settings rather than path bytes, and percent-encoded path
+        // bytes are decoded by SqliteConnectOptions.
+        let path = options.get_filename();
         if path.exists() {
             return path.canonicalize().with_context(|| {
                 format!("could not canonicalize database path {}", path.display())
@@ -9952,7 +9959,18 @@ pub fn sqlite_database_urls_equal(left: &str, right: &str) -> Result<bool> {
             })?
             .join(file_name))
     }
-    Ok(identity(left)? == identity(right)?)
+    let left = identity(left)?;
+    let right = identity(right)?;
+    if left.exists() && right.exists() {
+        return same_file::is_same_file(&left, &right).with_context(|| {
+            format!(
+                "could not compare SQLite database paths {} and {}",
+                left.display(),
+                right.display()
+            )
+        });
+    }
+    Ok(left == right)
 }
 
 /// Returns whether two database URLs identify the same physical database.
@@ -10734,12 +10752,58 @@ mod tests {
         let (database_path, database_url) = unique_sqlite_test_database("database-identity");
         assert!(!database_path.exists());
 
+        for alias in [
+            database_url.clone(),
+            format!("{database_url}?mode=ro"),
+            format!("{database_url}?mode=ro&immutable=true"),
+        ] {
+            assert!(
+                database_urls_equal(database_path.to_string_lossy().as_ref(), &alias)
+                    .await
+                    .unwrap(),
+                "SQLite query options must not change file identity: {alias}"
+            );
+            assert!(!database_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn database_identity_decodes_sqlite_filename_bytes_without_creating_files() {
+        let (database_path, database_url) =
+            unique_sqlite_test_database("database identity encoded");
+        assert!(!database_path.exists());
+        let encoded_url = database_url.replace(' ', "%20");
+        assert_ne!(encoded_url, database_url);
+
         assert!(
-            database_urls_equal(database_path.to_string_lossy().as_ref(), &database_url)
+            database_urls_equal(database_path.to_string_lossy().as_ref(), &encoded_url)
                 .await
                 .unwrap()
         );
         assert!(!database_path.exists());
+    }
+
+    #[tokio::test]
+    async fn database_identity_recognizes_existing_sqlite_hardlinks_without_creating_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("database.sqlite3");
+        let hardlink_path = directory.path().join("database-hardlink.sqlite3");
+        std::fs::write(&database_path, b"identity fixture").unwrap();
+        std::fs::hard_link(&database_path, &hardlink_path).unwrap();
+        let entries_before = std::fs::read_dir(directory.path()).unwrap().count();
+
+        assert!(database_urls_equal(
+            database_path.to_string_lossy().as_ref(),
+            hardlink_path.to_string_lossy().as_ref(),
+        )
+        .await
+        .unwrap());
+        assert_eq!(std::fs::read(&database_path).unwrap(), b"identity fixture");
+        assert_eq!(std::fs::read(&hardlink_path).unwrap(), b"identity fixture");
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            entries_before
+        );
     }
 
     #[tokio::test]
@@ -10752,6 +10816,17 @@ mod tests {
         .await
         .unwrap());
         assert!(!database_path.exists());
+    }
+
+    #[tokio::test]
+    async fn database_identity_rejects_every_sqlite_memory_url() {
+        for database_url in ["sqlite::memory:", "sqlite://named?mode=memory"] {
+            assert!(database_urls_equal(database_url, database_url)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("file-backed SQLite databases"));
+        }
     }
 
     #[tokio::test]
