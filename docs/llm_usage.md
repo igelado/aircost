@@ -311,43 +311,32 @@ model count, with every continuation splitting the repeated model from one of
 its declared capabilities; competing line layouts fail closed. Already valid
 bounded evidence is never rewritten. Other line joins, distinct spellings,
 hidden text, variant suffixes, malformed fields, and non-Controller sources
-fail closed. Typography and quantity repairs are staged in one atomic
-Controller extraction boundary, so a payload that needs both can be repaired
-without either repair depending on the other's already-valid state. The
-complete current extraction validator runs once after all qualifying mutations;
-any failure restores the entire original payload before the checkpoint can be
-stored.
+fail closed. The complete current extraction validator runs after a typography
+mutation; any failure restores the entire original payload before the
+checkpoint can be stored.
 
-The extraction boundary may also repair one narrowly proved quantity omission
-from a structurally valid Controller `Avionics/Radios` field. Two adjacent
-comma- or semicolon-delimited equipment items must repeat the same complete
-manufacturer/model identity and assign complementary attitude and HSI roles.
-The first item must start with the identity or one four-letter US ICAO-shaped
-token (`K` plus three uppercase letters) that the same retained listing also
-uses in an exact, structurally visible `hangared at CODE` phrase. Shape alone
-does not establish a location: arbitrary prefixes such as `NEW`, `KEEP`,
-`KING`, or `Optional configurations:` are not installed-equipment proof. The
-entire trusted equipment field must contain exactly two bounded occurrences of
-both the complete product identity and its model, so a third role or a
-non-adjacent repeated product makes the proof ambiguous. The model must already
-have returned one ordinary installed occurrence with quantity one and exact
-evidence equal to one of those items. The server then changes only quantity to
-two and replaces the evidence locator with the complete exact two-item source
-span. A completeness gate independently requires that shape for current
-Controller payloads. Initial plugin checkpoint extraction and later automated
-verification re-extraction run the same atomic deterministic repair boundary
-before that gate; the repair does not make another provider request.
-Narrative repetition, whole-page prose outside the trusted field, repeated
-copies of one role, non-adjacent mentions, ambiguous proof spans, replacement
-actions, punctuation-equivalent duplicate output rows, and distinct product
-suffixes fail closed. Other publishers receive only the prompt contract until
-they have an equally explicit installed-equipment provenance adapter.
+Quantity remains explicitly model-produced and is never inferred or mutated
+locally. A completeness gate examines only the authoritative Controller
+`Avionics/Radios` field. Punctuation-insensitive, token-bounded repeated exact
+candidate model mentions and direct `Dual`, `#N`, or decimal quantity markers
+form quantity signals. The exact Controller run-on form with a unique
+left-bounded model, slash-delimited alphanumeric suffix, and terminal `(Dual)`
+in the same evidence line is also a quantity-two signal. Those signals must
+agree with each other, with exactly one emitted occurrence of the normalized
+manufacturer/model identity, and with that occurrence's explicit `quantity`.
+Its exact `source_evidence_text` must cover the entire source span that
+established the signal. Conflicting signals, duplicate output rows, an under-
+or over-count, and incomplete evidence all fail closed into the existing
+avionics correction path. A typography repair that exposes a quantity failure
+is rolled back atomically. Other publishers rely on the extraction prompt
+until they have an equally explicit authoritative equipment-field adapter.
 
-The same atomic Controller repair and complete current extraction validator run
-after an avionics-only correction. On success, only the transient `avionics`
-member is replaced; aircraft identity, visual recovery, price, hours, valuation
-facts, and all other primary values remain byte-for-value unchanged. On failure,
-the original transient extraction is restored and no checkpoint is written.
+The same atomic Controller typography repair and complete current extraction
+validator run after an avionics-only correction. On success, only the transient
+`avionics` member is replaced; aircraft identity, visual recovery, price,
+hours, valuation facts, and all other primary values remain byte-for-value
+unchanged. On failure, the original transient extraction is restored and no
+checkpoint is written.
 
 ## Evidence Retention And Reuse
 

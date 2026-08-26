@@ -3723,7 +3723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrected_response_still_receives_atomic_controller_quantity_repair() {
+    async fn corrected_response_must_explicitly_preserve_controller_quantity() {
         let primary = listing_extraction_with_avionics(json!([installed_avionics(
             "Garmin",
             "G5",
@@ -3736,8 +3736,8 @@ mod tests {
                 "Garmin",
                 "G5",
                 &["Flight Display"],
-                1,
-                "Garmin G5 attitude",
+                2,
+                "Garmin G5 attitude, Garmin G5 HSI",
             )]
         });
         let (endpoint, request_count, _) =
