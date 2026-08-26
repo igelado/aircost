@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
-use crate::db::{AppDb, DatabaseBackend};
+use crate::db::{AppDb, DatabaseBackend, DEVELOPER_EMAIL};
 use crate::extract::validate_source_url;
 use crate::plugin::{sha256_hex, verify_submission_signature};
 
@@ -48,6 +48,10 @@ pub async fn reconcile_replay_occurrence_dispositions(
 
 const MANIFEST_HASH_DOMAIN: &[u8] = b"aircost:trusted-capture-manifest\0";
 const MAX_CAPTURE_BYTES: usize = 5 * 1024 * 1024;
+const BOOTSTRAP_USER_ID: i64 = 1;
+const BOOTSTRAP_USER_DISPLAY_NAME: &str = "Developer";
+const BOOTSTRAP_USER_AUTH_PROVIDER: &str = "local";
+const BOOTSTRAP_USER_AUTH_SUBJECT: &str = "developer";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +69,8 @@ pub struct TrustedCaptureEntry {
     pub user_display_name: String,
     pub user_auth_provider: String,
     pub user_auth_subject: String,
+    pub user_created_at: String,
+    pub user_updated_at: String,
     pub plugin_install_id: i64,
     pub plugin_public_key_base64: String,
     pub plugin_install_created_at: String,
@@ -317,7 +323,54 @@ pub fn validate_trusted_capture_manifest(manifest: &TrustedCaptureManifest) -> R
     if manifest.manifest_sha256 != manifest_fingerprint(&manifest.captures)? {
         return Err("trusted capture manifest fingerprint does not match its entries".to_string());
     }
+    let mut owners = std::collections::BTreeMap::<i64, &TrustedCaptureEntry>::new();
+    for entry in &manifest.captures {
+        if !trusted_capture_entry_timestamp_chronology_valid(entry) {
+            return Err(format!(
+                "trusted capture manifest submission {} has invalid owner/install/submission/revocation timestamp chronology",
+                entry.submission_id
+            ));
+        }
+        if let Some(existing) = owners.insert(entry.user_id, entry) {
+            if !same_manifest_owner(existing, entry) {
+                return Err(format!(
+                    "trusted capture manifest has inconsistent owner metadata for user {}",
+                    entry.user_id
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+fn same_manifest_owner(left: &TrustedCaptureEntry, right: &TrustedCaptureEntry) -> bool {
+    left.user_email == right.user_email
+        && left.user_display_name == right.user_display_name
+        && left.user_auth_provider == right.user_auth_provider
+        && left.user_auth_subject == right.user_auth_subject
+        && left.user_created_at == right.user_created_at
+        && left.user_updated_at == right.user_updated_at
+}
+
+pub(crate) fn trusted_capture_entry_timestamp_chronology_valid(
+    entry: &TrustedCaptureEntry,
+) -> bool {
+    let Some(user_created_at) = parse_replay_timestamp(&entry.user_created_at) else {
+        return false;
+    };
+    let Some(user_updated_at) = parse_replay_timestamp(&entry.user_updated_at) else {
+        return false;
+    };
+    let Some(install_created_at) = parse_replay_timestamp(&entry.plugin_install_created_at) else {
+        return false;
+    };
+    user_updated_at >= user_created_at
+        && install_created_at >= user_created_at
+        && retained_capture_timestamp_chronology_valid(
+            &entry.plugin_install_created_at,
+            &entry.submitted_at,
+            entry.plugin_install_revoked_at.as_deref(),
+        )
 }
 
 pub async fn import_trusted_capture_manifest(
@@ -361,56 +414,124 @@ pub async fn import_trusted_capture_manifest(
         });
     }
 
-    let existing = count_target_captures(target).await?;
-    if existing != 0 {
-        return Err(format!(
-            "clean replay target already contains {existing} plugin submissions"
-        ));
-    }
-
     macro_rules! insert_rows {
         ($transaction:expr) => {{
-            for row in &rows {
-                let insert_user = target.sql(
-                    r#"
-                    INSERT INTO users (
-                      id, email, display_name, auth_provider, auth_subject, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (id) DO NOTHING
-                    "#,
+            let existing: i64 = sqlx::query_scalar(&target.sql(
+                "SELECT COUNT(*) FROM plugin_submissions",
+            ))
+            .fetch_one(&mut **$transaction)
+            .await
+            .map_err(database_error)?;
+            if existing != 0 {
+                return Err(format!(
+                    "clean replay target already contains {existing} plugin submissions"
+                ));
+            }
+
+            let selected_bootstrap_owner = rows
+                .iter()
+                .find(|row| row.user_id == BOOTSTRAP_USER_ID);
+            if let Some(owner) = selected_bootstrap_owner {
+                let exact_bootstrap = (
+                    DEVELOPER_EMAIL.to_string(),
+                    BOOTSTRAP_USER_DISPLAY_NAME.to_string(),
+                    BOOTSTRAP_USER_AUTH_PROVIDER.to_string(),
+                    BOOTSTRAP_USER_AUTH_SUBJECT.to_string(),
                 );
-                sqlx::query(&insert_user)
+                let selected_identity = (
+                    owner.user_email.clone(),
+                    owner.user_display_name.clone(),
+                    owner.user_auth_provider.clone(),
+                    owner.user_auth_subject.clone(),
+                );
+                if selected_identity != exact_bootstrap {
+                    return Err(
+                        "target user id 1 is not the exact startup bootstrap owner selected by the manifest"
+                            .to_string(),
+                    );
+                }
+                let changed = sqlx::query(&target.sql(
+                    "UPDATE users SET created_at = ?, updated_at = ? \
+                     WHERE id = ? AND email = ? AND display_name = ? \
+                       AND auth_provider = ? AND auth_subject = ?",
+                ))
+                .bind(&owner.user_created_at)
+                .bind(&owner.user_updated_at)
+                .bind(BOOTSTRAP_USER_ID)
+                .bind(DEVELOPER_EMAIL)
+                .bind(BOOTSTRAP_USER_DISPLAY_NAME)
+                .bind(BOOTSTRAP_USER_AUTH_PROVIDER)
+                .bind(BOOTSTRAP_USER_AUTH_SUBJECT)
+                .execute(&mut **$transaction)
+                .await
+                .map_err(database_error)?
+                .rows_affected();
+                if changed != 1 {
+                    return Err(
+                        "target user id 1 is not the exact startup bootstrap owner selected by the manifest"
+                            .to_string(),
+                    );
+                }
+            }
+
+            let mut processed_user_ids = BTreeSet::new();
+            for row in &rows {
+                if processed_user_ids.insert(row.user_id) {
+                    let preexisting_user: Option<i64> = sqlx::query_scalar(&target.sql(
+                        "SELECT id FROM users WHERE id = ?",
+                    ))
                     .bind(row.user_id)
-                    .bind(&row.user_email)
-                    .bind(&row.user_display_name)
-                    .bind(&row.user_auth_provider)
-                    .bind(&row.user_auth_subject)
-                    .bind(&row.user_created_at)
-                    .bind(&row.user_updated_at)
-                    .execute(&mut **$transaction)
+                    .fetch_optional(&mut **$transaction)
                     .await
                     .map_err(database_error)?;
-                let stored_user: (String, String, String, String) = sqlx::query_as(
-                    &target.sql(
-                        "SELECT email, display_name, auth_provider, auth_subject FROM users WHERE id = ?",
-                    ),
-                )
-                .bind(row.user_id)
-                .fetch_one(&mut **$transaction)
-                .await
-                .map_err(database_error)?;
-                if stored_user
-                    != (
-                        row.user_email.clone(),
-                        row.user_display_name.clone(),
-                        row.user_auth_provider.clone(),
-                        row.user_auth_subject.clone(),
-                    )
-                {
-                    return Err(format!(
-                        "target user id {} conflicts with the selected capture owner",
-                        row.user_id
-                    ));
+                    if preexisting_user.is_some() && row.user_id != BOOTSTRAP_USER_ID {
+                        return Err(format!(
+                            "target user id {} is a preexisting non-bootstrap owner",
+                            row.user_id
+                        ));
+                    }
+                    let insert_user = target.sql(
+                        r#"
+                        INSERT INTO users (
+                          id, email, display_name, auth_provider, auth_subject, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (id) DO NOTHING
+                        "#,
+                    );
+                    sqlx::query(&insert_user)
+                        .bind(row.user_id)
+                        .bind(&row.user_email)
+                        .bind(&row.user_display_name)
+                        .bind(&row.user_auth_provider)
+                        .bind(&row.user_auth_subject)
+                        .bind(&row.user_created_at)
+                        .bind(&row.user_updated_at)
+                        .execute(&mut **$transaction)
+                        .await
+                        .map_err(database_error)?;
+                    let stored_user: (String, String, String, String, String, String) =
+                        sqlx::query_as(&target.sql(
+                            "SELECT email, display_name, auth_provider, auth_subject, created_at, updated_at FROM users WHERE id = ?",
+                        ))
+                        .bind(row.user_id)
+                        .fetch_one(&mut **$transaction)
+                        .await
+                        .map_err(database_error)?;
+                    if stored_user
+                        != (
+                            row.user_email.clone(),
+                            row.user_display_name.clone(),
+                            row.user_auth_provider.clone(),
+                            row.user_auth_subject.clone(),
+                            row.user_created_at.clone(),
+                            row.user_updated_at.clone(),
+                        )
+                    {
+                        return Err(format!(
+                            "target user id {} conflicts with the selected capture owner",
+                            row.user_id
+                        ));
+                    }
                 }
 
                 sqlx::query(&target.sql(
@@ -428,9 +549,9 @@ pub async fn import_trusted_capture_manifest(
                 .execute(&mut **$transaction)
                 .await
                 .map_err(database_error)?;
-                let stored_install: (i64, String, Option<String>) = sqlx::query_as(
+                let stored_install: (i64, String, String, Option<String>) = sqlx::query_as(
                     &target.sql(
-                        "SELECT user_id, public_key_base64, revoked_at FROM plugin_installs WHERE id = ?",
+                        "SELECT user_id, public_key_base64, created_at, revoked_at FROM plugin_installs WHERE id = ?",
                     ),
                 )
                 .bind(row.plugin_install_id)
@@ -441,6 +562,7 @@ pub async fn import_trusted_capture_manifest(
                     != (
                         row.user_id,
                         row.plugin_public_key_base64.clone(),
+                        row.plugin_install_created_at.clone(),
                         row.plugin_install_revoked_at.clone(),
                     )
                 {
@@ -528,6 +650,8 @@ fn entry_from_row(row: &SourceCaptureRow) -> TrustedCaptureEntry {
         user_display_name: row.user_display_name.clone(),
         user_auth_provider: row.user_auth_provider.clone(),
         user_auth_subject: row.user_auth_subject.clone(),
+        user_created_at: row.user_created_at.clone(),
+        user_updated_at: row.user_updated_at.clone(),
         plugin_install_id: row.plugin_install_id,
         plugin_public_key_base64: row.plugin_public_key_base64.clone(),
         plugin_install_created_at: row.plugin_install_created_at.clone(),
@@ -540,6 +664,13 @@ fn entry_from_row(row: &SourceCaptureRow) -> TrustedCaptureEntry {
 }
 
 fn validate_source_capture(row: &SourceCaptureRow) -> Result<(), String> {
+    let entry = entry_from_row(row);
+    if !trusted_capture_entry_timestamp_chronology_valid(&entry) {
+        return Err(format!(
+            "capture {} has invalid owner/install/submission/revocation timestamp chronology",
+            row.submission_id
+        ));
+    }
     validate_capture_authenticity(
         row.submission_id,
         row.user_id,
@@ -648,15 +779,6 @@ async fn load_source_capture(
     row.ok_or_else(|| format!("selected plugin submission {submission_id} does not exist"))
 }
 
-async fn count_target_captures(target: &AppDb) -> Result<i64, String> {
-    let sql = target.sql("SELECT COUNT(*) FROM plugin_submissions");
-    match target.backend() {
-        DatabaseBackend::Sqlite(pool) => sqlx::query_scalar(&sql).fetch_one(pool).await,
-        DatabaseBackend::Postgres(pool) => sqlx::query_scalar(&sql).fetch_one(pool).await,
-    }
-    .map_err(database_error)
-}
-
 fn database_error(error: sqlx::Error) -> String {
     error.to_string()
 }
@@ -679,12 +801,14 @@ mod tests {
             user_display_name: "Owner".to_string(),
             user_auth_provider: "local".to_string(),
             user_auth_subject: "owner".to_string(),
+            user_created_at: "2026-01-01 00:00:00".to_string(),
+            user_updated_at: "2026-01-01 01:00:00".to_string(),
             plugin_install_id: 7,
             plugin_public_key_base64: "key".to_string(),
-            plugin_install_created_at: "2026-01-01".to_string(),
+            plugin_install_created_at: "2026-01-01 02:00:00".to_string(),
             plugin_install_revoked_at: None,
             source_url: "https://example.test/listing".to_string(),
-            submitted_at: "2026-01-02".to_string(),
+            submitted_at: "2026-01-02 00:00:00".to_string(),
             rendered_html_sha256: "a".repeat(64),
             signature_base64: "signature".to_string(),
         }
@@ -699,10 +823,29 @@ mod tests {
 
     #[test]
     fn manifest_fingerprint_detects_metadata_changes() {
-        let mut entry = fixture_manifest_entry();
-        let before = manifest_fingerprint(&[entry.clone()]).unwrap();
-        entry.submitted_at = "2026-01-03".to_string();
-        assert_ne!(before, manifest_fingerprint(&[entry]).unwrap());
+        for field in ["user_created_at", "user_updated_at"] {
+            let original = fixture_manifest_entry();
+            let original_fingerprint = manifest_fingerprint(&[original.clone()]).unwrap();
+            let mut changed = original;
+            match field {
+                "user_created_at" => changed.user_created_at = "2025-12-31 23:59:59".to_string(),
+                "user_updated_at" => changed.user_updated_at = "2026-01-01 01:00:01".to_string(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                original_fingerprint,
+                manifest_fingerprint(&[changed.clone()]).unwrap()
+            );
+            let tampered = TrustedCaptureManifest {
+                captures: vec![changed],
+                manifest_sha256: original_fingerprint,
+            };
+            let error = validate_trusted_capture_manifest(&tampered).unwrap_err();
+            assert!(
+                error.contains("fingerprint does not match"),
+                "{field}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -738,6 +881,59 @@ mod tests {
         let mut unknown_entry = value;
         unknown_entry["captures"][0]["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<TrustedCaptureManifest>(unknown_entry).is_err());
+
+        for required in ["user_created_at", "user_updated_at"] {
+            let mut missing = serde_json::to_value(&manifest).unwrap();
+            missing["captures"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(required);
+            assert!(
+                serde_json::from_value::<TrustedCaptureManifest>(missing).is_err(),
+                "missing {required} must not deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_rejects_inconsistent_repeated_owner_timestamps() {
+        let first = fixture_manifest_entry();
+        let mut second = first.clone();
+        second.submission_id = 2;
+        second.user_updated_at = "2026-01-01 01:00:01".to_string();
+        let captures = vec![first, second];
+        let manifest = TrustedCaptureManifest {
+            manifest_sha256: manifest_fingerprint(&captures).unwrap(),
+            captures,
+        };
+        let error = validate_trusted_capture_manifest(&manifest).unwrap_err();
+        assert!(error.contains("inconsistent owner metadata for user 1"));
+    }
+
+    #[test]
+    fn source_capture_validation_rejects_owner_chronology_even_with_matching_metadata() {
+        let entry = fixture_manifest_entry();
+        let row = SourceCaptureRow {
+            submission_id: entry.submission_id,
+            user_id: entry.user_id,
+            user_email: entry.user_email,
+            user_display_name: entry.user_display_name,
+            user_auth_provider: entry.user_auth_provider,
+            user_auth_subject: entry.user_auth_subject,
+            user_created_at: "2026-01-01 03:00:00".to_string(),
+            user_updated_at: entry.user_updated_at,
+            plugin_install_id: entry.plugin_install_id,
+            plugin_public_key_base64: entry.plugin_public_key_base64,
+            plugin_install_created_at: entry.plugin_install_created_at,
+            plugin_install_revoked_at: entry.plugin_install_revoked_at,
+            source_url: entry.source_url,
+            submitted_at: entry.submitted_at,
+            rendered_html: "<html>capture</html>".to_string(),
+            rendered_html_sha256: entry.rendered_html_sha256,
+            signature_base64: entry.signature_base64,
+        };
+        let error = validate_source_capture(&row).unwrap_err();
+        assert!(error.contains("invalid owner/install/submission/revocation timestamp chronology"));
     }
 
     #[tokio::test]
@@ -818,5 +1014,209 @@ mod tests {
         assert_eq!(row.1, ids[1]);
         assert_eq!(row.2, "2026-07-22 10:00:00");
         assert_eq!((row.3, row.4, row.5), (None, None, None));
+        let owner_timestamps: (String, String) =
+            sqlx::query_as("SELECT created_at, updated_at FROM users WHERE id = ?")
+                .bind(user.id)
+                .fetch_one(target_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            owner_timestamps,
+            (
+                "2026-07-01 00:00:00".to_string(),
+                "2026-07-02 00:00:00".to_string()
+            )
+        );
+        let reexported = build_trusted_capture_manifest(&target, &[ids[1]])
+            .await
+            .unwrap();
+        assert_eq!(reexported, manifest);
+    }
+
+    #[tokio::test]
+    async fn import_rejects_and_rolls_back_a_preexisting_non_bootstrap_owner() {
+        let source = AppDb::connect("sqlite::memory:").await.unwrap();
+        let target = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(source_pool) = source.backend() else {
+            unreachable!()
+        };
+        let DatabaseBackend::Sqlite(target_pool) = target.backend() else {
+            unreachable!()
+        };
+        for pool in [source_pool, target_pool] {
+            sqlx::query(
+                r#"INSERT INTO users (
+                     id, email, display_name, auth_provider, auth_subject,
+                     created_at, updated_at
+                   ) VALUES (
+                     7, 'owner-seven@example.test', 'Owner Seven', 'local', 'owner-seven',
+                     '2026-07-01 00:00:00', '2026-07-02 00:00:00'
+                   )"#,
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let keys = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let public_key = BASE64_STANDARD.encode(keys.public_key().as_ref());
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64, created_at) \
+             VALUES (7, ?, '2026-07-03 00:00:00') RETURNING id",
+        )
+        .bind(public_key)
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        let source_url = "https://example.test/non-bootstrap-owner";
+        let html = "<html>non-bootstrap owner</html>";
+        let hash = sha256_hex(html.as_bytes());
+        let signature = BASE64_STANDARD.encode(
+            keys.sign(
+                &rng,
+                signature_message(install_id, source_url, &hash).as_bytes(),
+            )
+            .unwrap()
+            .as_ref(),
+        );
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES (7, ?, ?, '2026-07-04 00:00:00', ?, ?, ?) RETURNING id"#,
+        )
+        .bind(install_id)
+        .bind(source_url)
+        .bind(html)
+        .bind(hash)
+        .bind(signature)
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        let manifest = build_trusted_capture_manifest(&source, &[submission_id])
+            .await
+            .unwrap();
+
+        let error = import_trusted_capture_manifest(&source, &target, &manifest, true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("preexisting non-bootstrap owner"));
+        let target_counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM plugin_submissions), \
+                    (SELECT COUNT(*) FROM plugin_installs)",
+        )
+        .fetch_one(target_pool)
+        .await
+        .unwrap();
+        assert_eq!(target_counts, (0, 0));
+        let retained_owner: (String, String) =
+            sqlx::query_as("SELECT created_at, updated_at FROM users WHERE id = 7")
+                .fetch_one(target_pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            retained_owner,
+            (
+                "2026-07-01 00:00:00".to_string(),
+                "2026-07-02 00:00:00".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn import_does_not_replace_a_conflicting_bootstrap_owner() {
+        let source = AppDb::connect("sqlite::memory:").await.unwrap();
+        let target = AppDb::connect("sqlite::memory:").await.unwrap();
+        let user = source.current_user(None).await.unwrap();
+        let DatabaseBackend::Sqlite(source_pool) = source.backend() else {
+            unreachable!()
+        };
+        let DatabaseBackend::Sqlite(target_pool) = target.backend() else {
+            unreachable!()
+        };
+        sqlx::query(
+            "UPDATE users SET created_at = '2026-07-01 00:00:00', \
+             updated_at = '2026-07-02 00:00:00' WHERE id = ?",
+        )
+        .bind(user.id)
+        .execute(source_pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE users SET display_name = 'Conflicting Bootstrap', \
+             created_at = '2026-08-01 00:00:00', updated_at = '2026-08-02 00:00:00' \
+             WHERE id = 1",
+        )
+        .execute(target_pool)
+        .await
+        .unwrap();
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let keys = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let public_key = BASE64_STANDARD.encode(keys.public_key().as_ref());
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64, created_at) \
+             VALUES (?, ?, '2026-07-03 00:00:00') RETURNING id",
+        )
+        .bind(user.id)
+        .bind(public_key)
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        let source_url = "https://example.test/bootstrap-conflict";
+        let html = "<html>bootstrap conflict</html>";
+        let hash = sha256_hex(html.as_bytes());
+        let signature = BASE64_STANDARD.encode(
+            keys.sign(
+                &rng,
+                signature_message(install_id, source_url, &hash).as_bytes(),
+            )
+            .unwrap()
+            .as_ref(),
+        );
+        let submission_id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO plugin_submissions (
+                 user_id, plugin_install_id, source_url, submitted_at, rendered_html,
+                 rendered_html_sha256, signature_base64
+               ) VALUES (?, ?, ?, '2026-07-04 00:00:00', ?, ?, ?) RETURNING id"#,
+        )
+        .bind(user.id)
+        .bind(install_id)
+        .bind(source_url)
+        .bind(html)
+        .bind(hash)
+        .bind(signature)
+        .fetch_one(source_pool)
+        .await
+        .unwrap();
+        let manifest = build_trusted_capture_manifest(&source, &[submission_id])
+            .await
+            .unwrap();
+
+        let error = import_trusted_capture_manifest(&source, &target, &manifest, true)
+            .await
+            .unwrap_err();
+        assert!(error.contains("not the exact startup bootstrap owner"));
+        let retained: (String, String, String, i64) = sqlx::query_as(
+            "SELECT display_name, created_at, updated_at, \
+                    (SELECT COUNT(*) FROM plugin_submissions) FROM users WHERE id = 1",
+        )
+        .fetch_one(target_pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "Conflicting Bootstrap".to_string(),
+                "2026-08-01 00:00:00".to_string(),
+                "2026-08-02 00:00:00".to_string(),
+                0
+            )
+        );
     }
 }
