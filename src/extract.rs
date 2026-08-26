@@ -2275,6 +2275,11 @@ const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
 - Preserve source-authored labels and typography. From Garmin G3X Touchscreen PFD/MFD use model G3X Touchscreen, not G3X Touch; from Garmin 255 Nav/Com use model 255, not GNC 255; from JPI 830 engine monitor use model 830, not EDM 830; and from Garmin GFC500 Autopilot use model GFC500, not GFC 500.\n\
 - Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation. If the selected evidence cannot support a useful literal manufacturer/model identity, omit that occurrence instead of inventing one.\n";
 
+const LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE: &str = "\
+- Emit each normalized manufacturer/model product exactly once. Repeated exact product mentions and Dual, #N, or decimal quantity wording are quantity ambiguity, not proof of a physical count.\n\
+- For any such ambiguity, return one explicit candidate quantity with source_confidence medium or low, never high. Copy one exact contiguous source_evidence_text span covering every repeated identity and every count-context token, including qualifiers such as units or each. Omit the occurrence if one bounded exact span cannot support the candidate.\n\
+- Without quantity ambiguity, high source confidence is allowed only for one exact product identity with quantity one.\n";
+
 fn build_extraction_prompt(listing_text: &str) -> String {
     format!(
         "Extract one complete aircraft sale listing object from the listing text. Return one JSON object that satisfies the enforced response schema.\n\
@@ -2305,9 +2310,9 @@ Rules:\n\
 - Do not convert model names to ICAO type designators.\n\
 - avionics must come from the listing text and should include fixed installed avionics only.\n\
 {LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
+{LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE}\
 - Each physical avionics product must appear once. Its types array may contain multiple independently supported atomic capabilities; do not emit duplicate product rows merely to represent GPS, transponder, navigation, communications, or other functions separately. Represent a combined NAV/COM unit with both NAV and COM, never a composite NAV/COM type. Use [Unknown] only when the listing gives no usable capability.\n\
 - An Integrated Flight Deck identity may establish that one core category. Every additional type on that suite row must be explicitly named in the same source_evidence_text, and a capability assigned to a separately extracted component must not also be assigned to the suite.\n\
-- When the listing explicitly enumerates multiple installed units of the exact same product (for example unit #1 and unit #2, dual identical radios, or Garmin G5 attitude plus Garmin G5 HSI), emit one avionics row with quantity equal to the supported installed count. Copy one exact source_evidence_text span that covers every counted list item. Do not emit one row per serial position. Distinct complementary attitude and HSI installation roles in adjacent comma- or semicolon-delimited equipment items prove separate physical units; repeated mentions in narrative text, repeated copies of the same role, or different model suffixes do not.\n\
 - Assign only capabilities intrinsic to the identified physical product. Do not copy capabilities of a compatible external display, sensor, antenna, servo, or indicator into the product. In particular, VOR/localizer/glideslope support on a NAV/COM radio establishes NAV, not a separate Navigation Indicator capability; use Navigation Indicator only when the listing identifies an installed CDI, HSI, or indicator product.\n\
 - Weather delivered by satellite, ADS-B/FIS-B, SiriusXM, or another receiver/datalink is a Datalink capability, not Weather Radar. Assign Weather Radar only to an installed airborne radar sensor/system; the word weather by itself never establishes Weather Radar.\n\
 - Each avionics item must include configuration_action installed, replaces, or removes; a short exact source_evidence_text; and high/medium/low source_confidence. Use replaces/removes only when the listing explicitly states the delta from prior/factory equipment.\n\
@@ -2336,6 +2341,7 @@ fn build_listing_avionics_correction_prompt(
 Return exactly one JSON object with one member named avionics. The avionics value must be the complete replacement array in the current occurrence schema; do not return a patch, aircraft fields, price, hours, valuation facts, visual results, explanations, or extra keys.\n\n\
 Correction rules:\n\
 {LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
+{LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE}\
 - Use only fixed installed avionics explicitly supported by the listing text.\n\
 - Emit each physical product exactly once with all and only its intrinsic capabilities and the supported installed quantity.\n\
 - Keep distinct products separate. Never assign an external autopilot, display, sensor, servo, indicator, or receiver capability to another product.\n\
@@ -4875,12 +4881,10 @@ mod tests {
         assert!(types.iter().any(|value| value == "COM"));
         assert!(!types.iter().any(|value| value == "NAV/COM"));
         let prompt = build_extraction_prompt("Dual KX-170B NAV/COM radios installed.");
-        assert!(prompt.contains("unit #1 and unit #2"));
-        assert!(prompt.contains("one avionics row with quantity"));
-        assert!(prompt.contains("Garmin G5 attitude plus Garmin G5 HSI"));
-        assert!(prompt.contains("covers every counted list item"));
-        assert!(prompt.contains("complementary attitude and HSI installation roles"));
-        assert!(prompt.contains("repeated mentions in narrative text"));
+        assert!(prompt.contains("quantity ambiguity, not proof of a physical count"));
+        assert!(prompt.contains("source_confidence medium or low, never high"));
+        assert!(prompt.contains("every repeated identity and every count-context token"));
+        assert!(prompt.contains("high source confidence is allowed only"));
         assert!(prompt.contains("not a separate Navigation Indicator capability"));
         assert!(prompt.contains("receiver/datalink is a Datalink capability, not Weather Radar"));
         assert!(prompt.contains("word weather by itself never establishes Weather Radar"));
@@ -4917,6 +4921,8 @@ mod tests {
                 "model GFC500, not GFC 500",
                 "Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation",
                 "omit that occurrence instead of inventing one",
+                "quantity ambiguity, not proof of a physical count",
+                "source_confidence medium or low, never high",
             ] {
                 assert!(prompt.contains(required), "missing {required:?}");
             }

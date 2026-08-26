@@ -3723,7 +3723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrected_response_still_receives_atomic_controller_quantity_repair() {
+    async fn corrected_ambiguous_quantity_stays_below_automatic_confidence() {
         let primary = listing_extraction_with_avionics(json!([installed_avionics(
             "Garmin",
             "G5",
@@ -3732,13 +3732,16 @@ mod tests {
             "Garmin G5 attitude SVT Yes",
         )]));
         let corrected = json!({
-            "avionics": [installed_avionics(
-                "Garmin",
-                "G5",
-                &["Flight Display"],
-                1,
-                "Garmin G5 attitude",
-            )]
+            "avionics": [{
+                "manufacturer": "Garmin",
+                "model": "G5",
+                "types": ["Flight Display"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin G5 attitude, Garmin G5 HSI",
+                "source_confidence": "medium"
+            }]
         });
         let (endpoint, request_count, _) =
             extraction_sequence_endpoint(vec![primary.to_string(), corrected.to_string()]).await;
@@ -3756,6 +3759,7 @@ mod tests {
             payload["avionics"][0]["source_evidence_text"],
             "Garmin G5 attitude, Garmin G5 HSI"
         );
+        assert_eq!(payload["avionics"][0]["source_confidence"], "medium");
         assert_eq!(preview.parsed_listing.avionics[0].quantity, 2);
     }
 
