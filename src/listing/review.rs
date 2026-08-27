@@ -110,6 +110,7 @@ pub(crate) const POSTGRES_RESTAGE_CATALOG_LOCK_SQL: &str = r#"
                avionics_manufacturer_identity_memberships,
                avionics_manufacturer_identity_merges,
                avionics_approved_product_identities,
+               avionics_suite_components,
                avionics_product_reuse_attestations,
                avionics_authoritative_source_origins,
                avionics_authoritative_source_origin_revocations
@@ -13416,6 +13417,7 @@ Garmin GTX 33 Transponder ADS-B Compliant</div>
                 "avionics_manufacturer_identity_memberships",
                 "avionics_manufacturer_identity_merges",
                 "avionics_approved_product_identities",
+                "avionics_suite_components",
                 "avionics_product_reuse_attestations",
                 "avionics_authoritative_source_origins",
                 "avionics_authoritative_source_origin_revocations",

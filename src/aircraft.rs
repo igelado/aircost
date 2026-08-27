@@ -12,14 +12,26 @@ use std::fmt;
 use std::sync::Arc;
 
 use serde::Serialize;
-use sqlx::FromRow;
+use sha2::{Digest, Sha256};
+use sqlx::{Connection, FromRow, Postgres, Sqlite, Transaction};
 
 use self::faa::{audit_listing_admission, require_listing_admission, AircraftAdmissionError};
 use self::reference::persistence::{
     listing_reference_status, normalized_reference_price, PublishedReferenceConfiguration,
     ReferenceGap,
 };
+#[cfg(test)]
+use crate::avionics::fingerprint::active_collision_closure_revision_sha256;
+use crate::avionics::fingerprint::{
+    active_collision_closure_revision_sha256_postgres,
+    active_collision_closure_revision_sha256_sqlite, AvionicsFingerprintError,
+};
+use crate::avionics::reuse::{
+    countable_unit_reuse_attestation_is_current_postgres,
+    countable_unit_reuse_attestation_is_current_sqlite,
+};
 use crate::db::{AppDb, DatabaseBackend};
+use crate::listing::review::{association_observation_sha256_from_values, ListingAssociationRole};
 use crate::valuation::dataset::{require_snapshot_faa_admission, technical_field_count};
 use crate::valuation::{
     source_backed_component_observation, FactoryReferenceFeature, SupportGrade, ValuationBreakdown,
@@ -147,6 +159,44 @@ struct AvionicsEstimateRow {
     configuration_action: String,
     replaces_avionics_model_id: Option<i64>,
     source_confidence: Option<String>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct ListingAvionicsEstimateRow {
+    listing_link_id: i64,
+    avionics_model_id: i64,
+    quantity: i64,
+    valuation_scope: String,
+    configuration_action: String,
+    replaces_avionics_model_id: Option<i64>,
+    source: String,
+    source_notes: Option<String>,
+    source_confidence: Option<String>,
+    authorization_avionics_model_id: Option<i64>,
+    authorization_kind: Option<String>,
+    authorization_observation_sha256: Option<String>,
+    authorization_product_fingerprint: Option<String>,
+    current_reuse_product_fingerprint: Option<String>,
+    authorization_evidence_capture_sha256: Option<String>,
+    authorization_collision_closure_sha256: Option<String>,
+}
+
+impl From<ListingAvionicsEstimateRow> for AvionicsEstimateRow {
+    fn from(row: ListingAvionicsEstimateRow) -> Self {
+        Self {
+            avionics_model_id: row.avionics_model_id,
+            quantity: row.quantity,
+            valuation_scope: row.valuation_scope,
+            configuration_action: row.configuration_action,
+            replaces_avionics_model_id: row.replaces_avionics_model_id,
+            source_confidence: row.source_confidence,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct RetainedListingAvionicsCaptureRow {
+    rendered_html: String,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -820,22 +870,41 @@ async fn listing_avionics_estimates(
     db: &AppDb,
     listing_id: i64,
 ) -> StoreResult<Vec<AvionicsEstimateRow>> {
-    Ok(query_as_all!(
-        db,
-        AvionicsEstimateRow,
-        r#"
+    const LISTING_AVIONICS_ESTIMATES_SQL: &str = r#"
         SELECT
+          link.id AS listing_link_id,
           model.id AS avionics_model_id,
           link.quantity,
           model.valuation_scope,
           link.configuration_action,
           link.replaces_avionics_model_id,
-          link.source_confidence
+          link.source,
+          link.source_notes,
+          link.source_confidence,
+          authorization.avionics_model_id AS authorization_avionics_model_id,
+          authorization.authorization_kind,
+          authorization.observation_sha256
+            AS authorization_observation_sha256,
+          authorization.product_fingerprint
+            AS authorization_product_fingerprint,
+          current_attestation.product_fingerprint
+            AS current_reuse_product_fingerprint,
+          authorization.evidence_capture_sha256
+            AS authorization_evidence_capture_sha256,
+          authorization.collision_closure_sha256
+            AS authorization_collision_closure_sha256
         FROM aircraft_sale_listing_avionics link
         JOIN avionics_models model
           ON model.id = link.avionics_model_id
+        LEFT JOIN aircraft_sale_listing_avionics_link_authorizations authorization
+          ON authorization.listing_link_id = link.id
+         AND authorization.association_role = 'installed'
+        LEFT JOIN avionics_product_reuse_attestations current_attestation
+          ON current_attestation.avionics_model_id = model.id
         WHERE link.aircraft_sale_listing_id = ?
-          AND link.source IN ('listing', 'listing_review')
+          AND link.source IN (
+            'listing', 'listing_explicit_count', 'listing_review'
+          )
           AND model.catalog_status = 'approved'
           AND (
             link.replaces_avionics_model_id IS NULL
@@ -847,9 +916,172 @@ async fn listing_avionics_estimates(
             )
           )
         ORDER BY link.id
-        "#,
-        listing_id
-    )?)
+    "#;
+    macro_rules! load_in_transaction {
+        ($transaction:ident, $explicit_count_is_current:path) => {{
+            let sql = db.sql(LISTING_AVIONICS_ESTIMATES_SQL);
+            let rows = sqlx::query_as::<_, ListingAvionicsEstimateRow>(&sql)
+                .bind(listing_id)
+                .fetch_all(&mut *$transaction)
+                .await?;
+            let mut estimates = Vec::with_capacity(rows.len());
+            for row in rows {
+                if row.source != "listing_explicit_count"
+                    || $explicit_count_is_current(db, &mut $transaction, listing_id, &row).await?
+                {
+                    estimates.push(row.into());
+                }
+            }
+            estimates
+        }};
+    }
+
+    match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            let mut transaction = pool.begin().await?;
+            let estimates = load_in_transaction!(
+                transaction,
+                explicit_count_listing_avionics_is_current_sqlite
+            );
+            transaction.commit().await?;
+            Ok(estimates)
+        }
+        DatabaseBackend::Postgres(pool) => {
+            let mut connection = pool.acquire().await?;
+            let mut transaction = connection
+                .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .await?;
+            let estimates = load_in_transaction!(
+                transaction,
+                explicit_count_listing_avionics_is_current_postgres
+            );
+            transaction.commit().await?;
+            Ok(estimates)
+        }
+    }
+}
+
+macro_rules! explicit_count_listing_avionics_is_current {
+    (
+        $db:expr,
+        $transaction:expr,
+        $listing_id:expr,
+        $row:expr,
+        $countable_reuse_is_current:path,
+        $active_collision_revision:path
+    ) => {{
+        let row = $row;
+        let (
+            Some(source_notes),
+            Some(authorization_model_id),
+            Some(authorization_kind),
+            Some(authorization_observation_sha256),
+            Some(authorization_product_fingerprint),
+            Some(current_reuse_product_fingerprint),
+            Some(authorization_evidence_capture_sha256),
+            Some(authorization_collision_closure_sha256),
+        ) = (
+            row.source_notes.as_deref(),
+            row.authorization_avionics_model_id,
+            row.authorization_kind.as_deref(),
+            row.authorization_observation_sha256.as_deref(),
+            row.authorization_product_fingerprint.as_deref(),
+            row.current_reuse_product_fingerprint.as_deref(),
+            row.authorization_evidence_capture_sha256.as_deref(),
+            row.authorization_collision_closure_sha256.as_deref(),
+        )
+        else {
+            return Ok(false);
+        };
+        if row.quantity != 2
+            || row.configuration_action != "installed"
+            || row.replaces_avionics_model_id.is_some()
+            || row.source_confidence.as_deref() != Some("high")
+            || source_notes.trim().is_empty()
+            || authorization_model_id != row.avionics_model_id
+            || authorization_kind != "manufacturer_reuse"
+            || authorization_product_fingerprint != current_reuse_product_fingerprint
+            || !$countable_reuse_is_current($db, $transaction, row.avionics_model_id).await?
+        {
+            return Ok(false);
+        }
+        let expected_observation_sha256 = association_observation_sha256_from_values(
+            $listing_id,
+            row.listing_link_id,
+            ListingAssociationRole::Installed,
+            row.avionics_model_id,
+            row.avionics_model_id,
+            row.replaces_avionics_model_id,
+            row.quantity,
+            &row.configuration_action,
+            source_notes,
+        );
+        if authorization_observation_sha256 != expected_observation_sha256 {
+            return Ok(false);
+        }
+        let capture_sql = $db.sql(
+            r#"
+            SELECT rendered_html
+            FROM plugin_submissions
+            WHERE canonical_listing_id = ?
+              AND rendered_html_sha256 = ?
+            "#,
+        );
+        let captures = sqlx::query_as::<_, RetainedListingAvionicsCaptureRow>(&capture_sql)
+            .bind($listing_id)
+            .bind(authorization_evidence_capture_sha256)
+            .fetch_all(&mut **$transaction)
+            .await?;
+        let capture_is_current = captures.iter().any(|capture| {
+            format!("{:x}", Sha256::digest(capture.rendered_html.as_bytes()))
+                == authorization_evidence_capture_sha256
+                && capture.rendered_html.contains(source_notes)
+        });
+        if !capture_is_current {
+            return Ok(false);
+        }
+        match $active_collision_revision($db, $transaction, row.avionics_model_id).await {
+            Ok(current_collision) => {
+                Ok(current_collision == authorization_collision_closure_sha256)
+            }
+            Err(AvionicsFingerprintError::Conflict(_)) => Ok(false),
+            Err(AvionicsFingerprintError::Database(message)) => {
+                Err(AircraftStoreError::Database(message))
+            }
+        }
+    }};
+}
+
+async fn explicit_count_listing_avionics_is_current_sqlite(
+    db: &AppDb,
+    transaction: &mut Transaction<'_, Sqlite>,
+    listing_id: i64,
+    row: &ListingAvionicsEstimateRow,
+) -> StoreResult<bool> {
+    explicit_count_listing_avionics_is_current!(
+        db,
+        transaction,
+        listing_id,
+        row,
+        countable_unit_reuse_attestation_is_current_sqlite,
+        active_collision_closure_revision_sha256_sqlite
+    )
+}
+
+async fn explicit_count_listing_avionics_is_current_postgres(
+    db: &AppDb,
+    transaction: &mut Transaction<'_, Postgres>,
+    listing_id: i64,
+    row: &ListingAvionicsEstimateRow,
+) -> StoreResult<bool> {
+    explicit_count_listing_avionics_is_current!(
+        db,
+        transaction,
+        listing_id,
+        row,
+        countable_unit_reuse_attestation_is_current_postgres,
+        active_collision_closure_revision_sha256_postgres
+    )
 }
 
 async fn reference_avionics_estimates(
@@ -1059,18 +1291,21 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        aircraft_listing_value_with_model, aircraft_option_for_variant, aircraft_options,
+        active_collision_closure_revision_sha256, aircraft_listing_value_with_model,
+        aircraft_option_for_variant, aircraft_options, association_observation_sha256_from_values,
         avionics_suite_memberships, ground_estimate_to_reference, listing_avionics_estimates,
         listing_value_point, require_valuation_model_faa_admission, resolve_avionics_configuration,
         AircraftListingPointRow, AircraftReferenceValuationBasis, AvionicsConfigurationLink,
-        AvionicsSuiteMembership,
+        AvionicsSuiteMembership, ListingAssociationRole,
     };
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
+    use crate::avionics::reuse::refresh_reuse_attestation_sqlite;
     use crate::db::{AppDb, DatabaseBackend};
     use crate::valuation::{
         DepreciationPoint, SupportGrade, ValuationBreakdown, ValuationError, ValuationEstimate,
         ValuationModel, ValuationQuery,
     };
+    use sha2::{Digest, Sha256};
 
     fn link(
         model_id: i64,
@@ -1729,6 +1964,239 @@ mod tests {
                 component_model_id: approved_component_id,
                 quantity: 1,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_count_listing_estimate_requires_its_complete_current_proof() {
+        const EVIDENCE: &str = "Dual Garmin GIA63W COM/NAV/GPS/WAAS";
+        const INSERT_AUTHORIZATION_SQL: &str = r#"
+            INSERT INTO aircraft_sale_listing_avionics_link_authorizations (
+              listing_link_id, association_role, avionics_model_id,
+              authorization_kind, observation_sha256, product_fingerprint,
+              evidence_capture_sha256, collision_closure_sha256
+            )
+            SELECT ?, 'installed', ?, 'manufacturer_reuse', ?,
+                   product_fingerprint, ?, ?
+            FROM avionics_product_reuse_attestations
+            WHERE avionics_model_id = ?
+        "#;
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            panic!("test expects SQLite")
+        };
+        let listing_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, model_year,
+              asking_price_usd, airframe_hours
+            ) VALUES (
+              (
+                SELECT aircraft_model_variant_id
+                FROM aircraft_sale_listing_pending_compatibility_placeholder
+                WHERE singleton_id = 1
+              ),
+              1, 2020, 100000, 1000
+            )
+            RETURNING id
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let manufacturer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_manufacturers (name, normalized_name) VALUES ('Garmin', 'garmin') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let type_id: i64 = sqlx::query_scalar(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('COM', 'com') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let model_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO avionics_models (
+              avionics_manufacturer_id, name, normalized_name,
+              manufacturer_identifier_kind, manufacturer_identifier,
+              normalized_manufacturer_identifier, identity_source_url,
+              identity_source_title, identity_evidence_text,
+              identity_evidence_kind, identity_confidence, catalog_reviewed_at,
+              valuation_scope
+            ) VALUES (
+              ?, 'GIA63W', 'gia63w',
+              'manufacturer_part_number', '011-01105-00', '0110110500',
+              'https://manufacturer.example/aviation/gia63w',
+              'GIA63W installation manual',
+              'The manufacturer manual identifies the GIA63W and its part number.',
+              'authoritative_reference', 'very_high', CURRENT_TIMESTAMP,
+              'unit'
+            ) RETURNING id
+            "#,
+        )
+        .bind(manufacturer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id) VALUES (?, ?)",
+        )
+        .bind(model_id)
+        .bind(type_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        ensure_test_manufacturer_identity(&db, manufacturer_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE avionics_models SET catalog_status = 'approved' WHERE id = ?")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_authoritative_source_origins (
+              authority_kind, avionics_manufacturer_identity_id, https_origin,
+              evidence_source_url, evidence_source_title, evidence_text,
+              approval_basis, approval_reason
+            )
+            SELECT 'manufacturer_primary', avionics_manufacturer_identity_id,
+                   'https://manufacturer.example',
+                   'https://manufacturer.example/aviation/gia63w',
+                   'Manufacturer avionics catalog',
+                   'The manufacturer publishes the exact GIA63W product.',
+                   'curated_bootstrap', 'aircraft valuation test fixture'
+            FROM avionics_approved_product_identities
+            WHERE avionics_model_id = ?
+            "#,
+        )
+        .bind(model_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(refresh_reuse_attestation_sqlite(
+            &db,
+            &mut transaction,
+            model_id,
+            "https://manufacturer.example/aviation/gia63w",
+        )
+        .await
+        .unwrap());
+        transaction.commit().await.unwrap();
+
+        let rendered_html = format!("<html><body>{EVIDENCE}</body></html>");
+        let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let install_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (1, 'aircraft-explicit-count-key') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, canonical_listing_id
+            ) VALUES (1, ?, 'https://example.test/listing', ?, ?,
+                      'aircraft-explicit-count-signature', ?)
+            "#,
+        )
+        .bind(install_id)
+        .bind(&rendered_html)
+        .bind(&rendered_html_sha256)
+        .bind(listing_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let link_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO aircraft_sale_listing_avionics (
+              aircraft_sale_listing_id, avionics_model_id, quantity, source,
+              source_notes, source_confidence, configuration_action
+            ) VALUES (?, ?, 2, 'listing_explicit_count', ?, 'high', 'installed')
+            RETURNING id
+            "#,
+        )
+        .bind(listing_id)
+        .bind(model_id)
+        .bind(EVIDENCE)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let collision_closure_sha256 = active_collision_closure_revision_sha256(&db, model_id)
+            .await
+            .unwrap();
+        let observation_sha256 = association_observation_sha256_from_values(
+            listing_id,
+            link_id,
+            ListingAssociationRole::Installed,
+            model_id,
+            model_id,
+            None,
+            2,
+            "installed",
+            EVIDENCE,
+        );
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(model_id)
+            .bind(&observation_sha256)
+            .bind(&rendered_html_sha256)
+            .bind(&collision_closure_sha256)
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let current = listing_avionics_estimates(&db, listing_id).await.unwrap();
+        assert_eq!(
+            current
+                .iter()
+                .map(|row| (row.avionics_model_id, row.quantity))
+                .collect::<Vec<_>>(),
+            vec![(model_id, 2)]
+        );
+
+        sqlx::query(
+            "DELETE FROM aircraft_sale_listing_avionics_link_authorizations WHERE listing_link_id = ?",
+        )
+        .bind(link_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(INSERT_AUTHORIZATION_SQL)
+            .bind(link_id)
+            .bind(model_id)
+            .bind("0".repeat(64))
+            .bind(&rendered_html_sha256)
+            .bind(&collision_closure_sha256)
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(listing_avionics_estimates(&db, listing_id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query("UPDATE aircraft_sale_listing_avionics SET source = 'listing' WHERE id = ?")
+            .bind(link_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            listing_avionics_estimates(&db, listing_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| (row.avionics_model_id, row.quantity))
+                .collect::<Vec<_>>(),
+            vec![(model_id, 2)],
+            "ordinary listing behavior must not inherit the explicit-count gate"
         );
     }
 
