@@ -348,9 +348,12 @@ on the extraction prompt until they have an equally explicit authoritative
 equipment-field adapter.
 
 Deterministic feedback reports the first detected defect. The single correction
-request is therefore instructed to re-audit the complete replacement array,
-including duplicate normalized identities that may occur after adjacent `#2`
-equipment lines, rather than editing only the named occurrence.
+request receives that primary defect plus the first independently detectable
+type-scope and quantity defect from the same parseable transient array. It is
+also instructed to re-audit the complete replacement array, including duplicate
+normalized identities that may occur after adjacent `#2` equipment lines,
+rather than editing only the named occurrence. Admission itself remains
+fail-fast and unchanged.
 
 The same unified atomic repair and complete current extraction validator run
 after an avionics-only correction. On success, only the transient `avionics`

@@ -6,8 +6,8 @@ use std::fmt;
 
 use crate::extract::{GeminiListingExtractor, ListingAvionicsCorrectionToken};
 use crate::listing::avionics::extraction::{
-    repair_listing_avionics_extraction, validate_unbound_current_avionics_extraction,
-    AvionicsValidationFailure,
+    independent_current_avionics_validation_failures, repair_listing_avionics_extraction,
+    validate_unbound_current_avionics_extraction, AvionicsValidationFailure,
 };
 use crate::models::ParsedAvionics;
 
@@ -91,12 +91,18 @@ pub(crate) async fn validate_or_correct_listing_avionics(
                 .and_then(|object| object.get("avionics"))
                 .cloned()
                 .unwrap_or(Value::Null);
+            let validation_feedback = complete_correction_feedback(
+                extracted_listing,
+                source_url,
+                rendered_html,
+                &primary_error,
+            );
             let correction = extractor
                 .correct_listing_avionics(
                     correction_token,
                     listing_text,
                     &previous_avionics,
-                    &primary_error.to_string(),
+                    &validation_feedback,
                 )
                 .await
                 .map_err(|error| {
@@ -133,6 +139,29 @@ pub(crate) async fn validate_or_correct_listing_avionics(
     }
 }
 
+fn complete_correction_feedback(
+    extracted_listing: &Value,
+    source_url: &str,
+    rendered_html: &str,
+    primary_error: &AvionicsValidationFailure,
+) -> String {
+    let primary = primary_error.to_string();
+    let mut feedback = vec![primary.clone()];
+    for failure in independent_current_avionics_validation_failures(
+        extracted_listing,
+        source_url,
+        rendered_html,
+    ) {
+        let diagnostic = failure.to_string();
+        if diagnostic != primary && !feedback.contains(&diagnostic) {
+            feedback.push(format!(
+                "additional independent deterministic defect: {diagnostic}"
+            ));
+        }
+    }
+    feedback.join("\n")
+}
+
 fn validate_listing_avionics(
     source_url: &str,
     rendered_html: &str,
@@ -145,4 +174,65 @@ fn validate_listing_avionics(
         rendered_html,
     )?;
     Ok(occurrences)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{complete_correction_feedback, validate_listing_avionics};
+
+    const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/123/test-aircraft";
+
+    fn controller_html(field: &str) -> String {
+        format!(
+            r#"<html><body><main id="main-content" class="detail__main-content">
+            <h1 class="detail__title">Test Aircraft</h1>
+            <div class="listing-prices__retail-price">$100,000</div>
+            <div class="detail__specs"><h3 class="detail__specs-heading">Avionics</h3>
+            <div class="detail__specs-wrapper">
+            <div class="detail__specs-label">Avionics/Radios</div>
+            <div class="detail__specs-value">{field}</div>
+            </div></div></main></body></html>"#
+        )
+    }
+
+    #[test]
+    fn correction_feedback_includes_an_independent_duplicate_after_identity_failure() {
+        let field = "King KX-170B Nav-Com w/ VOR, Localizer &amp; Glideslope\n\
+King KX-170B Nav-Com #2 w/ VOR &amp; Localizer\n\
+Uavionix Wingtip Beacons with ADS-B IN &amp; OUT";
+        let html = controller_html(field);
+        let mut payload = json!({
+            "avionics": [
+                {
+                    "manufacturer": "King", "model": "KX-170B", "types": ["NAV", "COM"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "King KX-170B Nav-Com w/ VOR, Localizer & Glideslope",
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "King", "model": "KX-170B", "types": ["NAV", "COM"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "King KX-170B Nav-Com #2 w/ VOR & Localizer",
+                    "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Uavionix", "model": "skyBeacon", "types": ["Transponder"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "Uavionix Wingtip Beacons with ADS-B IN & OUT",
+                    "source_confidence": "high"
+                }
+            ]
+        });
+
+        let primary = validate_listing_avionics(CONTROLLER_URL, &html, &mut payload)
+            .expect_err("the invented model must fail before quantity validation");
+        let feedback = complete_correction_feedback(&payload, CONTROLLER_URL, &html, &primary);
+
+        assert!(feedback.contains("candidate identity"), "{feedback}");
+        assert!(feedback.contains("additional independent deterministic defect"));
+        assert!(feedback.contains("duplicates an earlier normalized manufacturer/model identity"));
+        assert!(feedback.contains("avionics[1].quantity"), "{feedback}");
+    }
 }
