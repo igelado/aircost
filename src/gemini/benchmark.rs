@@ -379,8 +379,13 @@ fn build_suite(
             } else {
                 literal_observations
             };
+            let provider_groundable_avionics = observed_avionics
+                .iter()
+                .filter(|candidate| candidate.manufacturer.is_some())
+                .cloned()
+                .collect::<Vec<_>>();
             let avionics = deterministic_avionics_sample(
-                &observed_avionics,
+                &provider_groundable_avionics,
                 &selection.seed,
                 row.submission_id,
                 selection.max_avionics_per_listing,
@@ -533,7 +538,7 @@ fn literal_legacy_avionics(reference: &Value) -> Vec<ParsedAvionics> {
                         .map(|value| vec![value.to_string()])
                 })?;
             Some(ParsedAvionics {
-                manufacturer,
+                manufacturer: Some(manufacturer),
                 model,
                 avionics_types,
                 quantity: value.get("quantity").and_then(Value::as_i64).unwrap_or(1),
@@ -654,7 +659,11 @@ fn deterministic_avionics_sample(
 fn avionics_identity(candidate: &ParsedAvionics) -> String {
     format!(
         "{}|{}|{}|{}",
-        comparable_text(&candidate.manufacturer),
+        candidate
+            .manufacturer
+            .as_deref()
+            .map(comparable_text)
+            .unwrap_or_default(),
         comparable_text(&candidate.model),
         candidate
             .avionics_types
@@ -671,7 +680,10 @@ fn closest_catalog_candidates(
     catalog: &[BenchmarkCatalogCandidate],
     limit: usize,
 ) -> Vec<BenchmarkCatalogCandidate> {
-    let query = format!("{} {}", candidate.manufacturer, candidate.model);
+    let query = candidate.manufacturer.as_deref().map_or_else(
+        || candidate.model.clone(),
+        |manufacturer| format!("{manufacturer} {}", candidate.model),
+    );
     let query_tokens = comparable_tokens(&query);
     let mut scored = catalog
         .iter()
@@ -687,8 +699,14 @@ fn closest_catalog_candidates(
             );
             let candidate_tokens = comparable_tokens(&candidate_text);
             let overlap = query_tokens.intersection(&candidate_tokens).count();
-            let exact_manufacturer = comparable_text(&candidate.manufacturer)
-                == comparable_text(&catalog_candidate.manufacturer);
+            let exact_manufacturer =
+                candidate
+                    .manufacturer
+                    .as_deref()
+                    .is_some_and(|manufacturer| {
+                        comparable_text(manufacturer)
+                            == comparable_text(&catalog_candidate.manufacturer)
+                    });
             let exact_model =
                 comparable_text(&candidate.model) == comparable_text(&catalog_candidate.model);
             (
@@ -1157,10 +1175,17 @@ fn validate_listing_output(output: Option<&Value>) -> BenchmarkValidation {
         }
     }
     for (index, avionics) in parsed.avionics.iter().enumerate() {
-        if avionics.manufacturer.trim().is_empty() || avionics.model.trim().is_empty() {
+        if avionics
+            .manufacturer
+            .as_deref()
+            .is_some_and(|manufacturer| manufacturer.trim().is_empty())
+        {
             errors.push(format!(
-                "avionics[{index}] must have nonblank manufacturer and model"
+                "avionics[{index}] manufacturer must be nonblank when present"
             ));
+        }
+        if avionics.model.trim().is_empty() {
+            errors.push(format!("avionics[{index}] must have a nonblank model"));
         }
         if avionics.avionics_types.is_empty() {
             errors.push(format!("avionics[{index}] has no capability types"));
@@ -1997,13 +2022,61 @@ mod tests {
         else {
             panic!("grounded metadata case has the wrong input kind")
         };
-        assert_eq!(candidate.manufacturer, "Garmin");
+        assert_eq!(candidate.manufacturer.as_deref(), Some("Garmin"));
         assert!(matches!(candidate.model.as_str(), "G1000 NXi" | "GTX 345R"));
         assert_eq!(*value_reference_year, 2026);
         assert!(suite
             .cases
             .iter()
             .all(|case| !case.reference_is_ground_truth));
+    }
+
+    #[test]
+    fn suite_builder_keeps_model_only_observations_out_of_provider_tasks() {
+        let html = gallery_html();
+        let mut reference = parsed_listing_value();
+        reference["avionics"] = json!([
+            {
+                "manufacturer": null,
+                "model": "650",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin GTN 750 & 650",
+                "source_confidence": "high"
+            },
+            {
+                "manufacturer": "Garmin",
+                "model": "GTN 750",
+                "types": ["GPS"],
+                "quantity": 1,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": "Garmin GTN 750 & 650",
+                "source_confidence": "high"
+            }
+        ]);
+        let suite = build_suite(
+            vec![source_row(8, &html, Some(reference))],
+            Vec::new(),
+            &BenchmarkSelection {
+                listing_limit: 1,
+                max_avionics_per_listing: 1,
+                ..BenchmarkSelection::default()
+            },
+        )
+        .unwrap();
+
+        let grounded_candidates = suite.cases.iter().filter_map(|case| match &case.input {
+            BenchmarkInput::GroundedMetadata { candidate, .. }
+            | BenchmarkInput::AvionicsGroundingReview { candidate, .. } => Some(candidate),
+            _ => None,
+        });
+        assert!(grounded_candidates
+            .clone()
+            .all(|candidate| candidate.manufacturer.as_deref() == Some("Garmin")));
+        assert_eq!(grounded_candidates.count(), 2);
     }
 
     #[test]

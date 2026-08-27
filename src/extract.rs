@@ -2270,10 +2270,11 @@ pub fn validate_source_url(source_url: &str) -> Result<()> {
 }
 
 const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
-- Treat each avionics manufacturer/model as a literal listing observation, not a canonical catalog identity. The selected source_evidence_text must support the returned manufacturer and model spelling. Do not add, expand, correct, or normalize a familiar series prefix, product family, or manufacturer name from memory or from another source span.\n\
-- A source-authored shared prefix inside one evidence span may support multiple rows, but keep each right-hand shorthand model literal. From Garmin GTN 750 & 650, return manufacturer Garmin with model GTN 750 for the first row and model 650 for the second row; do not invent GTN 650.\n\
+- Treat each avionics manufacturer/model as a literal listing observation, not a canonical catalog identity. The selected source_evidence_text must support every returned manufacturer and model spelling. Do not add, expand, correct, or normalize a familiar series prefix, product family, or manufacturer name from memory or from another source span.\n\
+- When one concrete model is literal in the occurrence but its manufacturer is not, retain the occurrence with manufacturer null. Never omit a useful exact model or invent its manufacturer. Catalog resolution supplies canonical identity later.\n\
+- A source-authored shared prefix inside one evidence span may support multiple rows, but keep each right-hand shorthand model literal and do not carry the prefix or manufacturer across rows. From Garmin GTN 750 & 650, return manufacturer Garmin with model GTN 750 for the first row, then manufacturer null with model 650 for the second row; do not invent Garmin or GTN for that shorthand row.\n\
 - Preserve source-authored labels and typography. From Garmin G3X Touchscreen PFD/MFD use model G3X Touchscreen, not G3X Touch; from Garmin 255 Nav/Com use model 255, not GNC 255; from JPI 830 engine monitor use model 830, not EDM 830; and from Garmin GFC500 Autopilot use model GFC500, not GFC 500.\n\
-- Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation. If the selected evidence cannot support a useful literal manufacturer/model identity, omit that occurrence instead of inventing one.\n";
+- Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation. If the selected evidence cannot support a useful literal model identity, omit that occurrence instead of inventing one.\n";
 
 const LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE: &str = "\
 - Emit each normalized manufacturer/model product exactly once. Repeated exact product mentions and Dual, #N, or decimal quantity wording are quantity ambiguity, not proof of a physical count.\n\
@@ -2312,6 +2313,7 @@ Rules:\n\
 {LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
 {LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE}\
 - Each physical avionics product must appear once. Its types array may contain multiple independently supported atomic capabilities; do not emit duplicate product rows merely to represent GPS, transponder, navigation, communications, or other functions separately. Represent a combined NAV/COM unit with both NAV and COM, never a composite NAV/COM type. Use [Unknown] only when the listing gives no usable capability.\n\
+- Each types array must contain distinct capabilities. PFD and MFD both map to the single Flight Display capability; never emit Flight Display twice. Unknown must be the only member when used.\n\
 - An Integrated Flight Deck identity may establish that one core category. Every additional type on that suite row must be explicitly named in the same source_evidence_text, and a capability assigned to a separately extracted component must not also be assigned to the suite.\n\
 - Assign only capabilities intrinsic to the identified physical product. Do not copy capabilities of a compatible external display, sensor, antenna, servo, or indicator into the product. In particular, VOR/localizer/glideslope support on a NAV/COM radio establishes NAV, not a separate Navigation Indicator capability; use Navigation Indicator only when the listing identifies an installed CDI, HSI, or indicator product.\n\
 - Weather delivered by satellite, ADS-B/FIS-B, SiriusXM, or another receiver/datalink is a Datalink capability, not Weather Radar. Assign Weather Radar only to an installed airborne radar sensor/system; the word weather by itself never establishes Weather Radar.\n\
@@ -3138,7 +3140,8 @@ fn gemini_listing_avionics_item_schema() -> Value {
         "properties": {
             "manufacturer": {
                 "type": "string",
-                "description": "Literal manufacturer spelling supported by this occurrence's source_evidence_text; never expand or canonicalize it from product knowledge."
+                "nullable": true,
+                "description": "Literal manufacturer spelling supported by this occurrence's source_evidence_text, or null when the exact model is present without a manufacturer; never expand or canonicalize it from product knowledge."
             },
             "model": {
                 "type": "string",
@@ -3154,7 +3157,8 @@ fn gemini_listing_avionics_item_schema() -> Value {
         "properties": {
             "manufacturer": {
                 "type": "string",
-                "description": "Literal manufacturer spelling supported by source_evidence_text; never expand or canonicalize it from product knowledge."
+                "nullable": true,
+                "description": "Literal manufacturer spelling supported by source_evidence_text, or null when the exact model is present without a manufacturer; never expand or canonicalize it from product knowledge."
             },
             "model": {
                 "type": "string",
@@ -4095,7 +4099,7 @@ fn model_avionics(value: Option<&Value>) -> Vec<ParsedAvionics> {
         let Some(object) = item.as_object() else {
             continue;
         };
-        let Some(manufacturer) = optional_string(object.get("manufacturer")) else {
+        let Some(manufacturer) = literal_avionics_manufacturer(object.get("manufacturer")) else {
             continue;
         };
         let Some(model) = optional_string(object.get("model")) else {
@@ -4111,7 +4115,10 @@ fn model_avionics(value: Option<&Value>) -> Vec<ParsedAvionics> {
             .collect::<Vec<_>>();
         capability_key.sort();
         let key = (
-            normalize_name(&manufacturer),
+            manufacturer
+                .as_deref()
+                .map(normalize_name)
+                .unwrap_or_default(),
             normalize_name(&model),
             capability_key.join("|"),
         );
@@ -4119,7 +4126,7 @@ fn model_avionics(value: Option<&Value>) -> Vec<ParsedAvionics> {
             continue;
         }
         avionics.push(ParsedAvionics {
-            manufacturer: canonical_manufacturer_name(&manufacturer),
+            manufacturer,
             model,
             avionics_types,
             quantity: optional_i64_min(object.get("quantity"), 1).unwrap_or(1),
@@ -4156,10 +4163,27 @@ fn parsed_avionics_reference(
         return None;
     }
     Some(crate::models::ParsedAvionicsReference {
-        manufacturer: optional_string(object.get("manufacturer"))?,
+        manufacturer: literal_avionics_manufacturer(object.get("manufacturer"))?,
         model: optional_string(object.get("model"))?,
         avionics_types,
     })
+}
+
+fn literal_avionics_manufacturer(value: Option<&Value>) -> Option<Option<String>> {
+    match value? {
+        Value::Null => Some(None),
+        Value::String(value) => {
+            let trimmed = value.trim();
+            let normalized = normalize_name(trimmed);
+            (!trimmed.is_empty()
+                && !matches!(
+                    normalized.as_str(),
+                    "unknown" | "none" | "na" | "n/a" | "notavailable" | "null"
+                ))
+            .then(|| Some(trimmed.to_string()))
+        }
+        _ => None,
+    }
 }
 
 fn missing_field_warnings(parsed: &ParsedListing) -> Vec<String> {
@@ -4890,6 +4914,8 @@ mod tests {
         assert!(prompt.contains("word weather by itself never establishes Weather Radar"));
         assert!(prompt.contains("Every additional type on that suite row must be explicitly named"));
         assert!(prompt.contains("separately extracted component"));
+        assert!(prompt.contains("PFD and MFD both map to the single Flight Display"));
+        assert!(prompt.contains("Unknown must be the only member when used"));
         assert!(prompt.contains("KMA 20 rather than KMA 20 TSO"));
         assert!(prompt.contains("standalone WAAS immediately before a slash-delimited"));
         assert!(prompt.contains("model GTN 750, types [GPS, NAV, COM]"));
@@ -4913,13 +4939,16 @@ mod tests {
         for prompt in [&primary, &correction] {
             for required in [
                 "literal listing observation, not a canonical catalog identity",
-                "model GTN 750 for the first row and model 650 for the second row",
-                "do not invent GTN 650",
+                "manufacturer Garmin with model GTN 750 for the first row",
+                "manufacturer null with model 650 for the second row",
+                "do not invent Garmin or GTN for that shorthand row",
                 "model G3X Touchscreen, not G3X Touch",
                 "model 255, not GNC 255",
                 "model 830, not EDM 830",
                 "model GFC500, not GFC 500",
                 "Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation",
+                "retain the occurrence with manufacturer null",
+                "Never omit a useful exact model or invent its manufacturer",
                 "omit that occurrence instead of inventing one",
                 "quantity ambiguity, not proof of a physical count",
                 "source_confidence medium or low, never high",
@@ -4939,12 +4968,18 @@ mod tests {
             .as_str()
             .expect("model description");
         assert!(manufacturer_description.contains("Literal manufacturer spelling"));
+        assert!(manufacturer_description.contains("or null"));
         assert!(manufacturer_description.contains("never expand or canonicalize"));
         assert!(model_description.contains("Literal model spelling"));
         assert!(model_description.contains("without familiar-name expansion"));
         assert_eq!(
             schema["properties"]["replaces"]["properties"]["manufacturer"]["description"],
-            "Literal manufacturer spelling supported by this occurrence's source_evidence_text; never expand or canonicalize it from product knowledge."
+            "Literal manufacturer spelling supported by this occurrence's source_evidence_text, or null when the exact model is present without a manufacturer; never expand or canonicalize it from product knowledge."
+        );
+        assert_eq!(schema["properties"]["manufacturer"]["nullable"], true);
+        assert_eq!(
+            schema["properties"]["replaces"]["properties"]["manufacturer"]["nullable"],
+            true
         );
         assert!(
             schema["properties"]["replaces"]["properties"]["model"]["description"]

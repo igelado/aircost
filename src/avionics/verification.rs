@@ -9,10 +9,11 @@ use crate::aircraft::faa::require_listing_faa_admission;
 use crate::avionics::catalog::{
     deterministic_generic_avionics_rejection_reason, plan_avionics_identity_verification_route,
     preview_avionics_identity, resolve_avionics_identity_for_automated_review,
-    resolve_verified_local_avionics_identity, unique_exact_avionics_review_candidate,
-    ApprovedAvionicsIdentity, AvionicsExistingCatalogScope, AvionicsIdentityOutcome,
-    AvionicsIdentityRequest, AvionicsIdentityVerificationPlan, AvionicsIdentityVerificationRoute,
-    VerifiedLocalReuseProof,
+    resolve_verified_local_avionics_identity, resolve_verified_local_avionics_model_observation,
+    unique_exact_avionics_model_observation_review_candidate,
+    unique_exact_avionics_review_candidate, ApprovedAvionicsIdentity, AvionicsExistingCatalogScope,
+    AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsIdentityVerificationPlan,
+    AvionicsIdentityVerificationRoute, VerifiedLocalReuseProof,
 };
 use crate::avionics::consolidation::PendingReviewRevisionReceipt;
 use crate::avionics::fingerprint::{
@@ -444,6 +445,13 @@ struct IdentityInput<'a> {
     quantity: i64,
 }
 
+fn literal_observation_manufacturer(manufacturer: &Option<String>) -> Option<&str> {
+    manufacturer
+        .as_deref()
+        .map(str::trim)
+        .filter(|manufacturer| !manufacturer.is_empty())
+}
+
 struct IdentityAttempt {
     report: AvionicsVerificationCandidateReport,
     approved_id: Option<i64>,
@@ -807,37 +815,12 @@ async fn preflight_listing(
             report.invalid_retained_observations += 1;
             continue;
         }
-        let primary_identity = IdentityInput {
-            manufacturer: &raw.manufacturer,
-            model: &raw.model,
-            avionics_types: &raw.avionics_types,
-            quantity: raw.quantity,
-        };
-        let primary_request = identity_request(
-            row,
-            row.submission_source_url.as_deref(),
-            &listing_context,
-            &primary_identity,
-            raw.source_evidence_text.as_deref(),
-        );
-        let primary_is_generic =
-            deterministic_generic_avionics_rejection_reason(&primary_request).is_some();
-        let replacement_is_generic = raw.replaces.as_ref().is_some_and(|replacement| {
-            let replacement_identity = IdentityInput {
-                manufacturer: &replacement.manufacturer,
-                model: &replacement.model,
-                avionics_types: &replacement.avionics_types,
-                quantity: 1,
-            };
-            let replacement_request = identity_request(
-                row,
-                row.submission_source_url.as_deref(),
-                &listing_context,
-                &replacement_identity,
-                raw.source_evidence_text.as_deref(),
-            );
-            deterministic_generic_avionics_rejection_reason(&replacement_request).is_some()
-        });
+        let primary_manufacturer = literal_observation_manufacturer(&raw.manufacturer);
+        let primary_is_generic = is_generic_avionics_model_name(&raw.model);
+        let replacement_is_generic = raw
+            .replaces
+            .as_ref()
+            .is_some_and(|replacement| is_generic_avionics_model_name(&replacement.model));
         if primary_is_generic || replacement_is_generic {
             report.invalid_retained_observations += 1;
             report.generic_invalid_identity_components +=
@@ -845,7 +828,13 @@ async fn preflight_listing(
         }
         let primary_plan = if primary_is_generic {
             None
-        } else {
+        } else if let Some(primary_manufacturer) = primary_manufacturer {
+            let primary_identity = IdentityInput {
+                manufacturer: primary_manufacturer,
+                model: &raw.model,
+                avionics_types: &raw.avionics_types,
+                quantity: raw.quantity,
+            };
             match preflight_identity_component(
                 db,
                 row,
@@ -872,6 +861,31 @@ async fn preflight_listing(
                     return report;
                 }
             }
+        } else {
+            report.retained_identity_components += 1;
+            match preflight_model_only_identity_component(
+                db,
+                &raw.model,
+                &raw.avionics_types,
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(verified_local) => {
+                    if verified_local {
+                        add_preflight_identity_route(
+                            &mut report,
+                            AvionicsIdentityVerificationRoute::VerifiedLocal,
+                            false,
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.note = format!("model-only identity preflight failed: {error}");
+                    return report;
+                }
+            }
+            None
         };
 
         let Some(replacement) = raw.replaces.as_ref() else {
@@ -880,42 +894,69 @@ async fn preflight_listing(
         if replacement_is_generic {
             continue;
         }
-        let replacement_plan = match preflight_identity_component(
-            db,
-            row,
-            row.submission_source_url.as_deref(),
-            &listing_context,
-            IdentityInput {
-                manufacturer: &replacement.manufacturer,
-                model: &replacement.model,
-                avionics_types: &replacement.avionics_types,
-                quantity: 1,
-            },
-            raw.source_evidence_text.as_deref(),
-        )
-        .await
-        {
-            Ok(plan) => plan,
-            Err(error) => {
-                report.note = format!("verified-local replacement preflight failed: {error}");
-                return report;
-            }
-        };
-        if replacement_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal {
-            extend_existing_catalog_scope(
-                &mut paid_candidate_scope,
-                &replacement_plan.existing_catalog_scope,
-            );
-        }
         report.retained_identity_components += 1;
         let replacement_is_conditional = primary_plan
             .as_ref()
             .is_some_and(|plan| plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal);
-        add_preflight_identity_route(
-            &mut report,
-            replacement_plan.route,
-            replacement_is_conditional,
-        );
+        if let Some(replacement_manufacturer) =
+            literal_observation_manufacturer(&replacement.manufacturer)
+        {
+            let replacement_plan = match preflight_identity_component(
+                db,
+                row,
+                row.submission_source_url.as_deref(),
+                &listing_context,
+                IdentityInput {
+                    manufacturer: replacement_manufacturer,
+                    model: &replacement.model,
+                    avionics_types: &replacement.avionics_types,
+                    quantity: 1,
+                },
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    report.note = format!("verified-local replacement preflight failed: {error}");
+                    return report;
+                }
+            };
+            if replacement_plan.route != AvionicsIdentityVerificationRoute::VerifiedLocal {
+                extend_existing_catalog_scope(
+                    &mut paid_candidate_scope,
+                    &replacement_plan.existing_catalog_scope,
+                );
+            }
+            add_preflight_identity_route(
+                &mut report,
+                replacement_plan.route,
+                replacement_is_conditional,
+            );
+        } else {
+            match preflight_model_only_identity_component(
+                db,
+                &replacement.model,
+                &replacement.avionics_types,
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(verified_local) => {
+                    if verified_local {
+                        add_preflight_identity_route(
+                            &mut report,
+                            AvionicsIdentityVerificationRoute::VerifiedLocal,
+                            replacement_is_conditional,
+                        );
+                    }
+                }
+                Err(error) => {
+                    report.note = format!("model-only replacement preflight failed: {error}");
+                    return report;
+                }
+            }
+        }
     }
     if require_commit_readiness
         && (report.candidate_adjudication_identity_components > 0
@@ -1024,6 +1065,23 @@ async fn preflight_identity_component(
     plan_avionics_identity_verification_route(db, &request)
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn preflight_model_only_identity_component(
+    db: &AppDb,
+    model: &str,
+    avionics_types: &[String],
+    source_evidence_text: Option<&str>,
+) -> Result<bool, String> {
+    resolve_verified_local_avionics_model_observation(
+        db,
+        model,
+        avionics_types,
+        source_evidence_text.unwrap_or_default(),
+    )
+    .await
+    .map(|identity| identity.is_some())
+    .map_err(|error| error.to_string())
 }
 
 fn extend_existing_catalog_scope(
@@ -1401,28 +1459,35 @@ async fn process_listing(
         if raw_candidate_structure_issue(raw).is_some() {
             continue;
         }
-        let identity = IdentityInput {
-            manufacturer: &raw.manufacturer,
-            model: &raw.model,
-            avionics_types: &raw.avionics_types,
-            quantity: raw.quantity,
-        };
-        let primary_request = identity_request(
-            row,
-            source_url.as_deref(),
-            &listing_context,
-            &identity,
-            raw.source_evidence_text.as_deref(),
-        );
-        if deterministic_generic_avionics_rejection_reason(&primary_request).is_some() {
-            occurrence_dispositions.push(AutomaticOccurrenceDisposition::discarded(
-                occurrence_index,
-                OccurrenceRole::Primary,
-            ));
+        if let Some(primary_manufacturer) = literal_observation_manufacturer(&raw.manufacturer) {
+            let identity = IdentityInput {
+                manufacturer: primary_manufacturer,
+                model: &raw.model,
+                avionics_types: &raw.avionics_types,
+                quantity: raw.quantity,
+            };
+            let primary_request = identity_request(
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                &identity,
+                raw.source_evidence_text.as_deref(),
+            );
+            if deterministic_generic_avionics_rejection_reason(&primary_request).is_some() {
+                occurrence_dispositions.push(AutomaticOccurrenceDisposition::discarded(
+                    occurrence_index,
+                    OccurrenceRole::Primary,
+                ));
+            }
         }
         if let Some(replacement) = raw.replaces.as_ref() {
+            let Some(replacement_manufacturer) =
+                literal_observation_manufacturer(&replacement.manufacturer)
+            else {
+                continue;
+            };
             let replacement_identity = IdentityInput {
-                manufacturer: &replacement.manufacturer,
+                manufacturer: replacement_manufacturer,
                 model: &replacement.model,
                 avionics_types: &replacement.avionics_types,
                 quantity: 1,
@@ -1463,8 +1528,14 @@ async fn process_listing(
                 provider_free_candidate_indices.push(candidate_index);
                 continue;
             };
+            let Some(replacement_manufacturer) =
+                literal_observation_manufacturer(&replacement.manufacturer)
+            else {
+                provider_free_candidate_indices.push(candidate_index);
+                continue;
+            };
             let replacement_identity = IdentityInput {
-                manufacturer: &replacement.manufacturer,
+                manufacturer: replacement_manufacturer,
                 model: &replacement.model,
                 avionics_types: &replacement.avionics_types,
                 quantity: 1,
@@ -1509,33 +1580,57 @@ async fn process_listing(
             }
             continue;
         }
-        let primary_plan = match preflight_identity_component(
-            db,
-            row,
-            source_url.as_deref(),
-            &listing_context,
-            IdentityInput {
-                manufacturer: &raw.manufacturer,
-                model: &raw.model,
-                avionics_types: &raw.avionics_types,
-                quantity: raw.quantity,
-            },
-            raw.source_evidence_text.as_deref(),
-        )
-        .await
+        let primary_plan = if let Some(primary_manufacturer) =
+            literal_observation_manufacturer(&raw.manufacturer)
         {
-            Ok(plan) => plan,
-            Err(error) => {
-                blocking_reasons.push(format!(
-                    "candidate {candidate_index}: provider-free primary identity preflight failed: {error}"
-                ));
-                continue;
+            match preflight_identity_component(
+                db,
+                row,
+                source_url.as_deref(),
+                &listing_context,
+                IdentityInput {
+                    manufacturer: primary_manufacturer,
+                    model: &raw.model,
+                    avionics_types: &raw.avionics_types,
+                    quantity: raw.quantity,
+                },
+                raw.source_evidence_text.as_deref(),
+            )
+            .await
+            {
+                Ok(plan) => {
+                    extend_existing_catalog_scope(
+                        &mut candidate_scope,
+                        &plan.existing_catalog_scope,
+                    );
+                    Some(plan)
+                }
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: provider-free primary identity preflight failed: {error}"
+                    ));
+                    continue;
+                }
             }
+        } else {
+            None
         };
-        extend_existing_catalog_scope(&mut candidate_scope, &primary_plan.existing_catalog_scope);
         let replacement_plan = if let Some(replacement) = raw.replaces.as_ref() {
+            let Some(replacement_manufacturer) =
+                literal_observation_manufacturer(&replacement.manufacturer)
+            else {
+                let fully_local = primary_plan.as_ref().is_none_or(|plan| {
+                    plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal
+                });
+                if fully_local {
+                    provider_free_candidate_indices.push(candidate_index);
+                } else {
+                    provider_candidate_indices.push(candidate_index);
+                }
+                continue;
+            };
             let replacement_identity = IdentityInput {
-                manufacturer: &replacement.manufacturer,
+                manufacturer: replacement_manufacturer,
                 model: &replacement.model,
                 avionics_types: &replacement.avionics_types,
                 quantity: 1,
@@ -1578,7 +1673,9 @@ async fn process_listing(
                 &replacement_plan.existing_catalog_scope,
             );
         }
-        let fully_local = primary_plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal
+        let fully_local = primary_plan
+            .as_ref()
+            .is_none_or(|plan| plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal)
             && replacement_plan
                 .as_ref()
                 .is_none_or(|plan| plan.route == AvionicsIdentityVerificationRoute::VerifiedLocal);
@@ -1672,7 +1769,7 @@ async fn process_listing(
             listing_report.candidates.push(input_error_report(
                 candidate_index,
                 "primary",
-                &raw.manufacturer,
+                literal_observation_manufacturer(&raw.manufacturer).unwrap_or_default(),
                 &raw.model,
                 &raw.avionics_types,
                 raw.quantity,
@@ -1686,7 +1783,8 @@ async fn process_listing(
         }
         if let Some(issue) = generic_model_issue(raw) {
             let identity = IdentityInput {
-                manufacturer: &raw.manufacturer,
+                manufacturer: literal_observation_manufacturer(&raw.manufacturer)
+                    .unwrap_or_default(),
                 model: &raw.model,
                 avionics_types: &raw.avionics_types,
                 quantity: raw.quantity,
@@ -1718,7 +1816,8 @@ async fn process_listing(
                     continue;
                 };
                 let replacement_identity = IdentityInput {
-                    manufacturer: &replacement.manufacturer,
+                    manufacturer: literal_observation_manufacturer(&replacement.manufacturer)
+                        .unwrap_or_default(),
                     model: &replacement.model,
                     avionics_types: &replacement.avionics_types,
                     quantity: 1,
@@ -1750,7 +1849,29 @@ async fn process_listing(
                     listing_report.safely_discarded += 1;
                     continue;
                 }
-                let mut replacement_attempt = if requires_provider {
+                let mut replacement_attempt = if replacement_identity.manufacturer.is_empty() {
+                    match resolve_model_only_identity_attempt(
+                        db,
+                        apply,
+                        candidate_index,
+                        "replacement",
+                        replacement_identity,
+                        &raw.configuration_action,
+                        raw.source_evidence_text.as_deref(),
+                        raw.source_confidence.as_deref(),
+                        catalog_statuses,
+                    )
+                    .await
+                    {
+                        Ok(attempt) => attempt,
+                        Err(error) => {
+                            blocking_reasons.push(format!(
+                                "candidate {candidate_index}: model-only replacement identity resolution failed: {error}"
+                            ));
+                            continue;
+                        }
+                    }
+                } else if requires_provider {
                     resolve_identity_attempt(
                         db,
                         &scoped_extractor,
@@ -1836,9 +1957,10 @@ async fn process_listing(
                     match attach_unique_exact_review_candidate(
                         db,
                         aspect,
-                        &replacement.manufacturer,
+                        literal_observation_manufacturer(&replacement.manufacturer),
                         &replacement.model,
                         &replacement.avionics_types,
+                        raw.source_evidence_text.as_deref(),
                     )
                     .await
                     {
@@ -1854,7 +1976,7 @@ async fn process_listing(
             listing_report.candidates.push(input_error_report(
                 candidate_index,
                 "primary",
-                &raw.manufacturer,
+                literal_observation_manufacturer(&raw.manufacturer).unwrap_or_default(),
                 &raw.model,
                 &raw.avionics_types,
                 raw.quantity,
@@ -1868,12 +1990,34 @@ async fn process_listing(
         }
 
         let primary_identity = IdentityInput {
-            manufacturer: &raw.manufacturer,
+            manufacturer: literal_observation_manufacturer(&raw.manufacturer).unwrap_or_default(),
             model: &raw.model,
             avionics_types: &raw.avionics_types,
             quantity: raw.quantity,
         };
-        let mut primary = if requires_provider {
+        let mut primary = if primary_identity.manufacturer.is_empty() {
+            match resolve_model_only_identity_attempt(
+                db,
+                apply,
+                candidate_index,
+                "primary",
+                primary_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                catalog_statuses,
+            )
+            .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: model-only primary identity resolution failed: {error}"
+                    ));
+                    continue;
+                }
+            }
+        } else if requires_provider {
             resolve_identity_attempt(
                 db,
                 &scoped_extractor,
@@ -1973,9 +2117,10 @@ async fn process_listing(
                 match attach_unique_exact_review_candidate(
                     db,
                     aspect,
-                    &raw.manufacturer,
+                    literal_observation_manufacturer(&raw.manufacturer),
                     &raw.model,
                     &raw.avionics_types,
+                    raw.source_evidence_text.as_deref(),
                 )
                 .await
                 {
@@ -1994,7 +2139,8 @@ async fn process_listing(
             .as_ref()
             .expect("raw_candidate_issue requires replacement identity");
         let replacement_identity = IdentityInput {
-            manufacturer: &replacement.manufacturer,
+            manufacturer: literal_observation_manufacturer(&replacement.manufacturer)
+                .unwrap_or_default(),
             model: &replacement.model,
             avionics_types: &replacement.avionics_types,
             quantity: 1,
@@ -2075,9 +2221,10 @@ async fn process_listing(
                 match attach_unique_exact_review_candidate(
                     db,
                     aspect,
-                    &raw.manufacturer,
+                    literal_observation_manufacturer(&raw.manufacturer),
                     &raw.model,
                     &raw.avionics_types,
+                    raw.source_evidence_text.as_deref(),
                 )
                 .await
                 {
@@ -2120,7 +2267,29 @@ async fn process_listing(
             listing_report.safely_discarded += 1;
             continue;
         }
-        let mut replacement_attempt = if requires_provider {
+        let mut replacement_attempt = if replacement_identity.manufacturer.is_empty() {
+            match resolve_model_only_identity_attempt(
+                db,
+                apply,
+                candidate_index,
+                "replacement",
+                replacement_identity,
+                &raw.configuration_action,
+                raw.source_evidence_text.as_deref(),
+                raw.source_confidence.as_deref(),
+                catalog_statuses,
+            )
+            .await
+            {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    blocking_reasons.push(format!(
+                        "candidate {candidate_index}: model-only replacement identity resolution failed: {error}"
+                    ));
+                    continue;
+                }
+            }
+        } else if requires_provider {
             resolve_identity_attempt(
                 db,
                 &scoped_extractor,
@@ -2208,9 +2377,10 @@ async fn process_listing(
             match attach_unique_exact_review_candidate(
                 db,
                 primary_aspect,
-                &raw.manufacturer,
+                literal_observation_manufacturer(&raw.manufacturer),
                 &raw.model,
                 &raw.avionics_types,
+                raw.source_evidence_text.as_deref(),
             )
             .await
             {
@@ -2225,9 +2395,10 @@ async fn process_listing(
             match attach_unique_exact_review_candidate(
                 db,
                 replacement_aspect,
-                &replacement.manufacturer,
+                literal_observation_manufacturer(&replacement.manufacturer),
                 &replacement.model,
                 &replacement.avionics_types,
+                raw.source_evidence_text.as_deref(),
             )
             .await
             {
@@ -2501,9 +2672,10 @@ fn can_automatically_accept(attempt: &IdentityAttempt, source_confidence: Option
 async fn attach_unique_exact_review_candidate(
     db: &AppDb,
     mut aspect: PendingReviewAspect,
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
     avionics_types: &[String],
+    listing_evidence_text: Option<&str>,
 ) -> Result<PendingReviewAspect, String> {
     if aspect
         .suggested_product
@@ -2518,11 +2690,22 @@ async fn attach_unique_exact_review_candidate(
     {
         return Ok(aspect);
     }
-    let Some(candidate) =
-        unique_exact_avionics_review_candidate(db, manufacturer, model, avionics_types)
+    let candidate = match manufacturer {
+        Some(manufacturer) => {
+            unique_exact_avionics_review_candidate(db, manufacturer, model, avionics_types).await
+        }
+        None => {
+            unique_exact_avionics_model_observation_review_candidate(
+                db,
+                model,
+                avionics_types,
+                listing_evidence_text.unwrap_or_default(),
+            )
             .await
-            .map_err(|error| error.to_string())?
-    else {
+        }
+    }
+    .map_err(|error| error.to_string())?;
+    let Some(candidate) = candidate else {
         return Ok(aspect);
     };
     let mut product = if candidate.catalog_status == "approved" {
@@ -2581,7 +2764,7 @@ fn input_error_aspects(
         && safe.replaces.is_none()
     {
         safe.replaces = Some(crate::models::ParsedAvionicsReference {
-            manufacturer: "Unknown".to_string(),
+            manufacturer: None,
             model: format!(
                 "{} target",
                 if safe.configuration_action == "removes" {
@@ -2648,12 +2831,13 @@ fn primary_residual_aspect(
     suggested_product: Option<ReviewProduct>,
     replacement_aspect_id: Option<ReviewAspectId>,
 ) -> PendingReviewAspect {
+    let manufacturer = literal_observation_manufacturer(&raw.manufacturer);
     PendingReviewAspect {
         id: ReviewAspectId::String(format!("avionics:{candidate_index}:primary")),
         kind: "avionics".to_string(),
-        label: observation_label(&raw.manufacturer, &raw.model),
+        label: observation_label(manufacturer, &raw.model),
         observed_text: observation_text(
-            &raw.manufacturer,
+            manufacturer,
             &raw.model,
             &raw.avionics_types,
             raw.quantity,
@@ -2662,16 +2846,14 @@ fn primary_residual_aspect(
         required: true,
         reason,
         suggested_product,
-        proposed_product: Some(ReviewProduct::proposed(
-            observation_component(&raw.manufacturer, "Unknown manufacturer"),
-            observation_component(&raw.model, "Unknown model"),
-            raw.avionics_types.clone(),
-        )),
-        allowed_actions: vec![
-            ReviewAction::UseVerifiedProduct,
-            ReviewAction::CreateVerifiedProduct,
-            ReviewAction::Discard,
-        ],
+        proposed_product: manufacturer.map(|manufacturer| {
+            ReviewProduct::proposed(
+                observation_component(manufacturer, "Unknown manufacturer"),
+                observation_component(&raw.model, "Unknown model"),
+                raw.avionics_types.clone(),
+            )
+        }),
+        allowed_actions: residual_review_actions(manufacturer.is_some()),
         quantity: raw.quantity.max(1),
         configuration_action: raw.configuration_action.clone(),
         source_evidence_text: raw.source_evidence_text.clone(),
@@ -2694,12 +2876,13 @@ fn replacement_residual_aspect(
         .replaces
         .as_ref()
         .expect("dependent residual requires a replacement observation");
+    let manufacturer = literal_observation_manufacturer(&replacement.manufacturer);
     PendingReviewAspect {
         id: ReviewAspectId::String(format!("avionics:{candidate_index}:replacement")),
         kind: "avionics".to_string(),
-        label: observation_label(&replacement.manufacturer, &replacement.model),
+        label: observation_label(manufacturer, &replacement.model),
         observed_text: observation_text(
-            &replacement.manufacturer,
+            manufacturer,
             &replacement.model,
             &replacement.avionics_types,
             1,
@@ -2708,16 +2891,14 @@ fn replacement_residual_aspect(
         required: true,
         reason,
         suggested_product,
-        proposed_product: Some(ReviewProduct::proposed(
-            observation_component(&replacement.manufacturer, "Unknown manufacturer"),
-            observation_component(&replacement.model, "Unknown model"),
-            replacement.avionics_types.clone(),
-        )),
-        allowed_actions: vec![
-            ReviewAction::UseVerifiedProduct,
-            ReviewAction::CreateVerifiedProduct,
-            ReviewAction::Discard,
-        ],
+        proposed_product: manufacturer.map(|manufacturer| {
+            ReviewProduct::proposed(
+                observation_component(manufacturer, "Unknown manufacturer"),
+                observation_component(&replacement.model, "Unknown model"),
+                replacement.avionics_types.clone(),
+            )
+        }),
+        allowed_actions: residual_review_actions(manufacturer.is_some()),
         quantity: 1,
         configuration_action: "installed".to_string(),
         source_evidence_text: raw.source_evidence_text.clone(),
@@ -2730,10 +2911,23 @@ fn replacement_residual_aspect(
     }
 }
 
-fn observation_label(manufacturer: &str, model: &str) -> String {
-    let label = format!("{} {}", manufacturer.trim(), model.trim())
-        .trim()
-        .to_string();
+fn residual_review_actions(has_literal_manufacturer: bool) -> Vec<ReviewAction> {
+    let mut actions = vec![ReviewAction::UseVerifiedProduct];
+    if has_literal_manufacturer {
+        actions.push(ReviewAction::CreateVerifiedProduct);
+    }
+    actions.push(ReviewAction::Discard);
+    actions
+}
+
+fn observation_label(manufacturer: Option<&str>, model: &str) -> String {
+    let label = format!(
+        "{} {}",
+        manufacturer.unwrap_or_default().trim(),
+        model.trim()
+    )
+    .trim()
+    .to_string();
     if label.is_empty() {
         "Unknown avionics observation".to_string()
     } else {
@@ -2751,7 +2945,7 @@ fn observation_component(value: &str, fallback: &str) -> String {
 }
 
 fn observation_text(
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
     capabilities: &[String],
     quantity: i64,
@@ -2937,7 +3131,8 @@ fn explicit_numbered_instance_group(
         if evidence.is_empty()
             || !listing_context
                 .for_candidate(
-                    &observation.manufacturer,
+                    literal_observation_manufacturer(&observation.manufacturer)
+                        .expect("numbered-instance coalescing requires a literal manufacturer"),
                     &observation.model,
                     Some(evidence),
                 )
@@ -2986,7 +3181,7 @@ fn eligible_installed_observation(observation: &ParsedAvionics) -> bool {
     observation.configuration_action == "installed"
         && observation.replaces.is_none()
         && observation.quantity > 0
-        && !observation.manufacturer.is_empty()
+        && literal_observation_manufacturer(&observation.manufacturer).is_some()
         && !observation.model.is_empty()
         && !observation.avionics_types.is_empty()
 }
@@ -3087,6 +3282,120 @@ fn current_manufacturer_reuse_authorization(
     reuse_is_current: bool,
 ) -> Option<AutomatedAssociationAuthorization> {
     reuse_is_current.then(|| verified_local_reuse_authorization(approved))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_model_only_identity_attempt(
+    db: &AppDb,
+    apply: bool,
+    candidate_index: usize,
+    role: &str,
+    identity: IdentityInput<'_>,
+    configuration_action: &str,
+    source_evidence_text: Option<&str>,
+    source_confidence: Option<&str>,
+    catalog_statuses: &mut HashMap<i64, String>,
+) -> Result<IdentityAttempt, String> {
+    let listing_evidence_text = source_evidence_text.unwrap_or_default();
+    let approved = resolve_verified_local_avionics_model_observation(
+        db,
+        identity.model,
+        identity.avionics_types,
+        listing_evidence_text,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Some(approved) = approved {
+        let reuse_is_current = !apply
+            || product_reuse_attestation_is_current(db, approved.id)
+                .await
+                .map_err(|error| error.to_string())?;
+        if reuse_is_current {
+            let identity_key = load_approved_graph_identity_key(db, approved.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let approved_id = approved.id;
+            let authorization = verified_local_reuse_authorization(&approved);
+            let mut attempt = approved_attempt(
+                apply,
+                candidate_index,
+                role,
+                &identity,
+                configuration_action,
+                source_evidence_text,
+                source_confidence,
+                approved,
+                Some(identity_key),
+                catalog_statuses,
+            );
+            if apply {
+                attempt.authorization = Some(authorization);
+                attempt.collision_closure_sha256 = Some(
+                    active_collision_closure_revision_sha256(db, approved_id)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            return Ok(attempt);
+        }
+    }
+
+    let candidate = unique_exact_avionics_model_observation_review_candidate(
+        db,
+        identity.model,
+        identity.avionics_types,
+        listing_evidence_text,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let suggested_product = candidate.as_ref().map(|candidate| {
+        let mut product = ReviewProduct::verified(
+            candidate.id,
+            candidate.manufacturer.clone(),
+            candidate.model.clone(),
+            candidate.avionics_types.clone(),
+        );
+        if !candidate.manufacturer_identifier_kind.trim().is_empty()
+            && !candidate.manufacturer_identifier.trim().is_empty()
+        {
+            product = product.with_stable_identifier(
+                candidate.manufacturer_identifier_kind.clone(),
+                candidate.manufacturer_identifier.clone(),
+            );
+        }
+        product
+    });
+    let reason = if candidate.is_some() {
+        "the listing names an exact collision-safe approved avionics model, but that catalog product has no current reuse attestation; corroborate the suggested product or discard the observation"
+    } else {
+        "the listing names an avionics model without its manufacturer and no collision-safe approved local product can be authorized; select an existing verified product or discard the observation"
+    };
+    Ok(IdentityAttempt {
+        report: outcome_report(
+            candidate_index,
+            role,
+            &identity,
+            configuration_action,
+            source_evidence_text,
+            source_confidence,
+            "unresolved",
+            candidate.as_ref().map(|candidate| candidate.id),
+            candidate
+                .as_ref()
+                .map(|candidate| candidate.manufacturer.clone()),
+            candidate.as_ref().map(|candidate| candidate.model.clone()),
+            candidate
+                .as_ref()
+                .map(|candidate| candidate.avionics_types.clone())
+                .unwrap_or_default(),
+            reason.to_string(),
+        ),
+        approved_id: None,
+        identity_key: None,
+        collision_closure_sha256: None,
+        authorization: None,
+        suggested_product,
+    })
 }
 
 /// Resolve one preflight-local identity without any provider or catalog write.
@@ -3678,8 +3987,15 @@ fn generic_model_issue(raw: &ParsedAvionics) -> Option<String> {
 }
 
 fn raw_candidate_structure_issue(raw: &ParsedAvionics) -> Option<String> {
-    if raw.manufacturer.trim().is_empty() || raw.model.trim().is_empty() {
-        return Some("manufacturer and model must both be non-empty identity labels".to_string());
+    if raw.model.trim().is_empty()
+        || raw
+            .manufacturer
+            .as_deref()
+            .is_some_and(|manufacturer| manufacturer.trim().is_empty())
+    {
+        return Some(
+            "model must be non-empty and a present manufacturer must be non-empty".to_string(),
+        );
     }
     if raw.avionics_types.is_empty()
         || raw
@@ -3718,11 +4034,16 @@ fn raw_candidate_structure_issue(raw: &ParsedAvionics) -> Option<String> {
         )),
         "replaces" | "removes"
             if raw.replaces.as_ref().is_some_and(|replacement| {
-                replacement.manufacturer.trim().is_empty() || replacement.model.trim().is_empty()
+                replacement.model.trim().is_empty()
+                    || replacement
+                        .manufacturer
+                        .as_deref()
+                        .is_some_and(|manufacturer| manufacturer.trim().is_empty())
             }) =>
         {
             Some(
-                "replacement identity requires non-empty manufacturer and model labels".to_string(),
+                "replacement identity requires a non-empty model and any present manufacturer must be non-empty"
+                    .to_string(),
             )
         }
         "replaces" | "removes"
@@ -3865,7 +4186,7 @@ async fn retained_review_observations(
             product
         };
         avionics.push(ParsedAvionics {
-            manufacturer: product.manufacturer,
+            manufacturer: Some(product.manufacturer),
             model: product.model,
             avionics_types: product.capabilities,
             quantity: aspect.quantity,
@@ -5437,7 +5758,7 @@ mod tests {
         assert_eq!(
             parsed[1].replaces,
             Some(crate::models::ParsedAvionicsReference {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: "GNS 530W".to_string(),
                 avionics_types: vec!["GPS".to_string(), "NAV".to_string(), "COM".to_string()],
             })
@@ -5451,7 +5772,7 @@ mod tests {
         evidence: &str,
     ) -> ParsedAvionics {
         ParsedAvionics {
-            manufacturer: "King".to_string(),
+            manufacturer: Some("King".to_string()),
             model: "KX-170B".to_string(),
             avionics_types: capabilities
                 .iter()
@@ -5533,7 +5854,7 @@ mod tests {
         let mut replacement_observation = installed_observation(&["NAV", "COM"], 1, replacement);
         replacement_observation.configuration_action = "replaces".to_string();
         replacement_observation.replaces = Some(crate::models::ParsedAvionicsReference {
-            manufacturer: "King".to_string(),
+            manufacturer: Some("King".to_string()),
             model: "KX-165".to_string(),
             avionics_types: vec!["NAV".to_string(), "COM".to_string()],
         });
@@ -5574,7 +5895,7 @@ mod tests {
         let context = ListingEvidenceContext::from_cleaned_text(format!("{first}\n{second}"));
         let observations = vec![
             ParsedAvionics {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: "G5".to_string(),
                 avionics_types: vec!["PFD".to_string()],
                 quantity: 1,
@@ -5584,7 +5905,7 @@ mod tests {
                 source_confidence: Some("high".to_string()),
             },
             ParsedAvionics {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: "G5".to_string(),
                 avionics_types: vec!["PFD".to_string()],
                 quantity: 1,
@@ -5695,13 +6016,13 @@ mod tests {
     #[test]
     fn unresolved_relationship_keeps_subject_and_replacement_together() {
         let raw = ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GTN 750Xi".to_string(),
             avionics_types: vec!["GPS".to_string(), "NAV".to_string(), "COM".to_string()],
             quantity: 1,
             configuration_action: "replaces".to_string(),
             replaces: Some(crate::models::ParsedAvionicsReference {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: "GNS 530W".to_string(),
                 avionics_types: vec!["GPS".to_string(), "NAV".to_string(), "COM".to_string()],
             }),
@@ -5732,9 +6053,136 @@ mod tests {
     }
 
     #[test]
+    fn model_only_observation_is_reviewable_without_a_creation_proposal() {
+        let raw = ParsedAvionics {
+            manufacturer: None,
+            model: "WX500".to_string(),
+            avionics_types: vec!["Lightning Detection".to_string()],
+            quantity: 1,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some("WX500 Stormscope".to_string()),
+            source_confidence: Some("high".to_string()),
+        };
+
+        assert!(raw_candidate_structure_issue(&raw).is_none());
+        assert!(literal_observation_manufacturer(&raw.manufacturer).is_none());
+        let aspect = primary_residual_aspect(
+            8,
+            &raw,
+            "manufacturer is absent from the listing".to_string(),
+            None,
+            None,
+        );
+
+        assert_eq!(aspect.label, "WX500");
+        assert!(aspect
+            .observed_text
+            .starts_with("WX500 · Lightning Detection"));
+        assert!(aspect.proposed_product.is_none());
+        assert_eq!(
+            aspect.allowed_actions,
+            vec![ReviewAction::UseVerifiedProduct, ReviewAction::Discard]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_only_attempt_authorizes_only_a_current_attested_local_product() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_named_product_for_manufacturer(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "G5 MODEL ONLY TEST",
+            "G5-MODEL-ONLY-TEST",
+            "Flight Display",
+        )
+        .await;
+        let mut catalog_statuses = HashMap::from([(product_id, "approved".to_string())]);
+
+        let attempt = resolve_model_only_identity_attempt(
+            &db,
+            true,
+            3,
+            "primary",
+            IdentityInput {
+                manufacturer: "",
+                model: "G5 MODEL ONLY TEST",
+                avionics_types: &["Flight Display".to_string()],
+                quantity: 1,
+            },
+            "installed",
+            Some("G5 MODEL ONLY TEST installed"),
+            Some("high"),
+            &mut catalog_statuses,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempt.approved_id, Some(product_id));
+        assert_eq!(
+            attempt.authorization,
+            Some(AutomatedAssociationAuthorization::GlobalExactModelReuse)
+        );
+        assert!(attempt.collision_closure_sha256.is_some());
+        assert_eq!(
+            attempt.report.canonical_manufacturer.as_deref(),
+            Some("Garmin")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_only_attempt_suggests_but_never_authorizes_an_unattested_product() {
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_named_product_for_manufacturer(
+            &db,
+            false,
+            "L3",
+            "https://www.l3harris.com",
+            "WX-500 MODEL ONLY TEST",
+            "WX-500-MODEL-ONLY-TEST",
+            "Lightning Detection",
+        )
+        .await;
+        let mut catalog_statuses = HashMap::from([(product_id, "approved".to_string())]);
+
+        let attempt = resolve_model_only_identity_attempt(
+            &db,
+            true,
+            4,
+            "replacement",
+            IdentityInput {
+                manufacturer: "",
+                model: "WX500 MODEL ONLY TEST",
+                avionics_types: &["Lightning Detection".to_string()],
+                quantity: 1,
+            },
+            "replaces",
+            Some("WX500 MODEL ONLY TEST Stormscope"),
+            Some("high"),
+            &mut catalog_statuses,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempt.approved_id, None);
+        assert_eq!(attempt.authorization, None);
+        assert_eq!(attempt.collision_closure_sha256, None);
+        assert_eq!(attempt.report.status, "unresolved");
+        assert_eq!(
+            attempt
+                .suggested_product
+                .as_ref()
+                .and_then(|product| product.id),
+            Some(product_id)
+        );
+    }
+
+    #[test]
     fn malformed_candidate_becomes_residual_review_instead_of_blocking_listing() {
         let raw = ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GTN 750Xi".to_string(),
             avionics_types: vec!["GPS".to_string()],
             quantity: 0,
@@ -5764,7 +6212,7 @@ mod tests {
     fn only_exact_structurally_valid_generic_labels_are_deterministic_discards() {
         for model in ["TAWS", "XM Weather & Radio", "Active Traffic", "AHRS"] {
             let raw = ParsedAvionics {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: model.to_string(),
                 avionics_types: vec!["Terrain Awareness".to_string()],
                 quantity: 1,
@@ -5788,7 +6236,7 @@ mod tests {
             "TAWS-B",
         ] {
             let raw = ParsedAvionics {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: model.to_string(),
                 avionics_types: vec!["Navigation".to_string()],
                 quantity: 1,
@@ -5809,7 +6257,7 @@ mod tests {
     #[test]
     fn malformed_generic_labels_bypass_deterministic_discard_and_remain_for_review() {
         let raw = ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GPS".to_string(),
             avionics_types: vec!["GPS".to_string()],
             quantity: 0,
@@ -5828,7 +6276,7 @@ mod tests {
         let malformed_target = ParsedAvionics {
             quantity: 1,
             replaces: Some(crate::models::ParsedAvionicsReference {
-                manufacturer: "".to_string(),
+                manufacturer: Some("".to_string()),
                 model: "".to_string(),
                 avionics_types: vec!["GPS".to_string()],
             }),
@@ -5836,7 +6284,9 @@ mod tests {
         };
         assert_eq!(
             raw_candidate_structure_issue(&malformed_target).as_deref(),
-            Some("replacement identity requires non-empty manufacturer and model labels")
+            Some(
+                "replacement identity requires a non-empty model and any present manufacturer must be non-empty"
+            )
         );
     }
 
@@ -6313,7 +6763,7 @@ mod tests {
     #[test]
     fn durable_avionics_repair_preserves_every_current_prior_non_avionics_value() {
         let avionics = vec![ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "G5".to_string(),
             avionics_types: vec!["Flight Display".to_string()],
             quantity: 2,
@@ -7430,7 +7880,7 @@ mod tests {
         else {
             panic!("a stale attached extraction must not select review observations")
         };
-        assert!(reason.contains("complete current avionics contract"));
+        assert!(reason.contains("not an exact current checkpoint"));
         assert!(preserved_aspects.is_empty());
 
         let (endpoint, request_count, server) = spawn_listing_extraction_endpoint(json!([{
@@ -8895,7 +9345,7 @@ mod tests {
         let rendered_html =
             format!("{rendered_html}<p>{ineligible_evidence}</p><p>{ordinary_evidence}</p>");
         let extracted_listing_json = current_listing_extraction_with_avionics(json!([{
-            "manufacturer": "Unknown",
+            "manufacturer": null,
             "model": "Replacement Package",
             "types": ["GPS"],
             "quantity": 1,

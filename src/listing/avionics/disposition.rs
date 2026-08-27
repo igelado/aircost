@@ -18,6 +18,7 @@ use crate::listing::avionics::extraction::{
     validate_current_avionics_extraction, CurrentAvionicsExtraction,
 };
 use crate::listing::review::ReviewAspectId;
+use crate::normalize::normalize_avionics_identifier;
 
 pub(crate) const DISPOSITION_POLICY_VERSION: &str = "avionics_occurrence_v1";
 const EXTRACTION_HASH_DOMAIN: &[u8] = b"aircost:listing-avionics-extraction:v1\0";
@@ -601,12 +602,15 @@ fn link_matches_occurrence_component(
     occurrence: &crate::models::ParsedAvionics,
     role: OccurrenceRole,
 ) -> bool {
-    let primary_matches = avionics_identities_are_typography_exact(
-        &link.manufacturer,
-        &link.model,
-        &occurrence.manufacturer,
-        &occurrence.model,
-    ) && link.quantity == occurrence.quantity
+    let primary_matches = match occurrence.manufacturer.as_deref() {
+        Some(manufacturer) => avionics_identities_are_typography_exact(
+            &link.manufacturer,
+            &link.model,
+            manufacturer,
+            &occurrence.model,
+        ),
+        None => avionics_models_are_typography_exact(&link.model, &occurrence.model),
+    } && link.quantity == occurrence.quantity
         && link.configuration_action == occurrence.configuration_action
         && link.source_notes.as_deref() == occurrence.source_evidence_text.as_deref();
     if !primary_matches {
@@ -618,14 +622,26 @@ fn link_matches_occurrence_component(
         }
         OccurrenceRole::Replacement => occurrence.replaces.as_ref().is_some_and(|replacement| {
             link.replaces_avionics_model_id.is_some()
-                && avionics_identities_are_typography_exact(
-                    link.replacement_manufacturer.as_deref().unwrap_or_default(),
-                    link.replacement_model.as_deref().unwrap_or_default(),
-                    &replacement.manufacturer,
-                    &replacement.model,
-                )
+                && match replacement.manufacturer.as_deref() {
+                    Some(manufacturer) => avionics_identities_are_typography_exact(
+                        link.replacement_manufacturer.as_deref().unwrap_or_default(),
+                        link.replacement_model.as_deref().unwrap_or_default(),
+                        manufacturer,
+                        &replacement.model,
+                    ),
+                    None => avionics_models_are_typography_exact(
+                        link.replacement_model.as_deref().unwrap_or_default(),
+                        &replacement.model,
+                    ),
+                }
         }),
     }
+}
+
+fn avionics_models_are_typography_exact(left: &str, right: &str) -> bool {
+    let left = normalize_avionics_identifier(left);
+    let right = normalize_avionics_identifier(right);
+    !left.is_empty() && left == right
 }
 
 async fn load_existing_dispositions(
@@ -752,6 +768,54 @@ mod tests {
             coordinates_from_aspect_id(&"avionics:12:primary:x".into()),
             None
         );
+    }
+
+    #[test]
+    fn model_only_reconciliation_matches_exact_models_without_inventing_a_maker() {
+        let occurrence = crate::models::ParsedAvionics {
+            manufacturer: None,
+            model: "WX500".to_string(),
+            avionics_types: vec!["Lightning Detection".to_string()],
+            quantity: 1,
+            configuration_action: "replaces".to_string(),
+            replaces: Some(crate::models::ParsedAvionicsReference {
+                manufacturer: None,
+                model: "KX 155".to_string(),
+                avionics_types: vec!["NAV".to_string(), "COM".to_string()],
+            }),
+            source_evidence_text: Some("WX500 replaces KX 155".to_string()),
+            source_confidence: Some("high".to_string()),
+        };
+        let link = ReconciliationLinkRow {
+            avionics_model_id: 10,
+            manufacturer: "L3".to_string(),
+            model: "WX-500".to_string(),
+            quantity: 1,
+            source_notes: occurrence.source_evidence_text.clone(),
+            configuration_action: "replaces".to_string(),
+            replaces_avionics_model_id: Some(11),
+            replacement_manufacturer: Some("BendixKing".to_string()),
+            replacement_model: Some("KX-155".to_string()),
+        };
+
+        assert!(link_matches_occurrence_component(
+            &link,
+            &occurrence,
+            OccurrenceRole::Primary
+        ));
+        assert!(link_matches_occurrence_component(
+            &link,
+            &occurrence,
+            OccurrenceRole::Replacement
+        ));
+
+        let mut meaningful_variant = occurrence.clone();
+        meaningful_variant.model = "WX500W".to_string();
+        assert!(!link_matches_occurrence_component(
+            &link,
+            &meaningful_variant,
+            OccurrenceRole::Primary
+        ));
     }
 
     #[tokio::test]

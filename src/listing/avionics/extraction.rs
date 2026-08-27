@@ -137,7 +137,9 @@ impl AvionicsValidationRule {
                 "retained listing extraction has no top-level avionics array"
             }
             Self::OccurrenceNotObject => "avionics occurrence must be an object",
-            Self::MissingManufacturer => "manufacturer must be a non-empty string",
+            Self::MissingManufacturer => {
+                "manufacturer must be an explicit null or a non-empty literal string"
+            }
             Self::MissingModel => "model must be a non-empty string",
             Self::InvalidTypes => {
                 "types must be a non-empty array of distinct current curated capabilities, or Unknown by itself; scalar type payloads are intentionally unsupported"
@@ -489,15 +491,17 @@ fn apply_controller_avionics_evidence_typography(
         {
             continue;
         }
-        if !context_has_exact_identity(&full_source, &observation.manufacturer, &observation.model)
-            || observation.replaces.as_ref().is_some_and(|replacement| {
-                !context_has_exact_identity(
-                    &full_source,
-                    &replacement.manufacturer,
-                    &replacement.model,
-                )
-            })
-        {
+        if !context_has_exact_identity(
+            &full_source,
+            observation.manufacturer.as_deref(),
+            &observation.model,
+        ) || observation.replaces.as_ref().is_some_and(|replacement| {
+            !context_has_exact_identity(
+                &full_source,
+                replacement.manufacturer.as_deref(),
+                &replacement.model,
+            )
+        }) {
             return Ok(false);
         }
 
@@ -508,12 +512,12 @@ fn apply_controller_avionics_evidence_typography(
                 let candidate_context = ListingEvidenceContext::from_cleaned_text(*candidate);
                 context_has_exact_identity(
                     &candidate_context,
-                    &observation.manufacturer,
+                    observation.manufacturer.as_deref(),
                     &observation.model,
                 ) && observation.replaces.as_ref().is_none_or(|replacement| {
                     context_has_exact_identity(
                         &candidate_context,
-                        &replacement.manufacturer,
+                        replacement.manufacturer.as_deref(),
                         &replacement.model,
                     )
                 }) && controller_multiline_candidate_matches_observation(candidate, observation)
@@ -978,7 +982,7 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
             .trim();
         let Some(signal) = controller_quantity_ambiguity_signal(
             &installed_equipment,
-            &observation.manufacturer,
+            observation.manufacturer.as_deref().unwrap_or_default(),
             &observation.model,
             evidence,
         ) else {
@@ -1003,8 +1007,14 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
 }
 
 fn same_product_identity(left: &ParsedAvionics, right: &ParsedAvionics) -> bool {
-    punctuation_insensitive_identity_key(&left.manufacturer)
-        == punctuation_insensitive_identity_key(&right.manufacturer)
+    let manufacturer_matches = match (left.manufacturer.as_deref(), right.manufacturer.as_deref()) {
+        (Some(left), Some(right)) => {
+            punctuation_insensitive_identity_key(left)
+                == punctuation_insensitive_identity_key(right)
+        }
+        _ => true,
+    };
+    manufacturer_matches
         && punctuation_insensitive_identity_key(&left.model)
             == punctuation_insensitive_identity_key(&right.model)
 }
@@ -1290,31 +1300,33 @@ fn validate_current_avionics_identity_evidence_occurrence(
         .as_deref()
         .expect("the canonical parser requires occurrence evidence")
         .trim();
+    let observed_manufacturer = observation.manufacturer.as_deref().unwrap_or_default();
     let bounded_source = listing_context.for_candidate(
-        &observation.manufacturer,
+        observed_manufacturer,
         &observation.model,
         Some(exact_visible_evidence_locator),
     );
     let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
-    let controller_annotation_identity = controller_field.is_some_and(|field| {
-        controller_field_has_exact_evidence_line(field, evidence)
-            && (exact_controller_run_on_capability_annotation(
-                evidence,
-                &observation.model,
-                &observation.avionics_types,
-                true,
-            ) || exact_controller_waas_capability_annotation(
-                evidence,
-                &observation.manufacturer,
-                &observation.model,
-                &observation.avionics_types,
-                Some(observation.quantity),
-            ))
-    });
+    let controller_annotation_identity = observation.manufacturer.is_some()
+        && controller_field.is_some_and(|field| {
+            controller_field_has_exact_evidence_line(field, evidence)
+                && (exact_controller_run_on_capability_annotation(
+                    evidence,
+                    &observation.model,
+                    &observation.avionics_types,
+                    true,
+                ) || exact_controller_waas_capability_annotation(
+                    evidence,
+                    observed_manufacturer,
+                    &observation.model,
+                    &observation.avionics_types,
+                    Some(observation.quantity),
+                ))
+        });
     if (!bounded_source.contains(evidence) && !controller_annotation_identity)
         || !(extraction_occurrence_has_exact_identity(
             &evidence_context,
-            &observation.manufacturer,
+            observation.manufacturer.as_deref(),
             &observation.model,
             &observation.avionics_types,
             evidence,
@@ -1327,24 +1339,26 @@ fn validate_current_avionics_identity_evidence_occurrence(
         ));
     }
     if let Some(replacement) = observation.replaces.as_ref() {
-        let replacement_annotation_identity = controller_field.is_some_and(|field| {
-            controller_field_has_exact_evidence_line(field, evidence)
-                && (exact_controller_run_on_capability_annotation(
-                    evidence,
-                    &replacement.model,
-                    &replacement.avionics_types,
-                    false,
-                ) || exact_controller_waas_capability_annotation(
-                    evidence,
-                    &replacement.manufacturer,
-                    &replacement.model,
-                    &replacement.avionics_types,
-                    None,
-                ))
-        });
+        let replacement_manufacturer = replacement.manufacturer.as_deref().unwrap_or_default();
+        let replacement_annotation_identity = replacement.manufacturer.is_some()
+            && controller_field.is_some_and(|field| {
+                controller_field_has_exact_evidence_line(field, evidence)
+                    && (exact_controller_run_on_capability_annotation(
+                        evidence,
+                        &replacement.model,
+                        &replacement.avionics_types,
+                        false,
+                    ) || exact_controller_waas_capability_annotation(
+                        evidence,
+                        replacement_manufacturer,
+                        &replacement.model,
+                        &replacement.avionics_types,
+                        None,
+                    ))
+            });
         if !(extraction_occurrence_has_exact_identity(
             &evidence_context,
-            &replacement.manufacturer,
+            replacement.manufacturer.as_deref(),
             &replacement.model,
             &replacement.avionics_types,
             evidence,
@@ -1362,13 +1376,15 @@ fn validate_current_avionics_identity_evidence_occurrence(
 
 fn context_has_exact_identity(
     context: &ListingEvidenceContext,
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
 ) -> bool {
-    context
-        .unique_exact_product_slice(manufacturer, model)
-        .is_some()
-        || context.unique_exact_model_slice(model).is_some()
+    match manufacturer {
+        Some(manufacturer) => context
+            .unique_exact_product_slice(manufacturer, model)
+            .is_some(),
+        None => context.unique_exact_model_slice(model).is_some(),
+    }
 }
 
 /// Admit one source annotation grammar only at the extraction boundary.
@@ -1381,18 +1397,20 @@ fn context_has_exact_identity(
 /// and a bounded rebuilt-date note used by Controller listings.
 fn extraction_occurrence_has_exact_identity(
     context: &ListingEvidenceContext,
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
     avionics_types: &[String],
     evidence: &str,
 ) -> bool {
     context_has_exact_identity(context, manufacturer, model)
-        || exact_standalone_waas_capability_annotation(
-            evidence,
-            manufacturer,
-            model,
-            avionics_types,
-        )
+        || manufacturer.is_some_and(|manufacturer| {
+            exact_standalone_waas_capability_annotation(
+                evidence,
+                manufacturer,
+                model,
+                avionics_types,
+            )
+        })
 }
 
 /// Recognize one Controller-specific publisher run-on grammar.
@@ -1921,36 +1939,55 @@ fn validate_required_identity(
     index: usize,
     replacement: bool,
 ) -> Result<(), AvionicsValidationFailure> {
-    for (field, rule, location) in [
-        (
-            "manufacturer",
+    if object
+        .get("manufacturer")
+        .is_none_or(|manufacturer| !literal_manufacturer_or_null(manufacturer))
+    {
+        return Err(AvionicsValidationFailure::occurrence(
             AvionicsValidationRule::MissingManufacturer,
+            index,
             if replacement {
                 AvionicsValidationField::ReplacementManufacturer
             } else {
                 AvionicsValidationField::Manufacturer
             },
-        ),
-        (
-            "model",
+        ));
+    }
+    if object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(AvionicsValidationFailure::occurrence(
             AvionicsValidationRule::MissingModel,
+            index,
             if replacement {
                 AvionicsValidationField::ReplacementModel
             } else {
                 AvionicsValidationField::Model
             },
-        ),
-    ] {
-        if object
-            .get(field)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            return Err(AvionicsValidationFailure::occurrence(rule, index, location));
-        }
+        ));
     }
     Ok(())
+}
+
+fn literal_manufacturer_or_null(value: &Value) -> bool {
+    if value.is_null() {
+        return true;
+    }
+    value.as_str().map(str::trim).is_some_and(|value| {
+        let normalized = value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>();
+        !value.is_empty()
+            && !matches!(
+                normalized.as_str(),
+                "unknown" | "none" | "na" | "notavailable" | "null"
+            )
+    })
 }
 
 fn validate_capabilities(
@@ -2112,13 +2149,62 @@ mod tests {
     }
 
     #[test]
-    fn accepts_bounded_model_only_evidence_for_short_letter_digit_models() {
+    fn rejects_manufacturer_invention_over_model_only_evidence() {
         let html = "<html><body><p>G5 installed</p><p>Garmin G5X spare</p></body></html>";
         let hash = sha256_hex(html.as_bytes());
         let json = r#"{"avionics":[{"manufacturer":"Garmin","model":"G5","types":["Flight Display"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"G5 installed","source_confidence":"high"}]}"#;
 
+        let failure = validate_current_avionics_extraction(bound(html, &hash, json))
+            .expect_err("an unstated manufacturer must not ride on model-only evidence");
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::CandidateIdentityNotInEvidence
+        );
+    }
+
+    #[test]
+    fn accepts_explicitly_unstated_manufacturer_for_exact_model_evidence() {
+        let html = "<html><body><p>WX500 Stormscope</p></body></html>";
+        let hash = sha256_hex(html.as_bytes());
+        let json = r#"{"avionics":[{"manufacturer":null,"model":"WX500","types":["Lightning Detection"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"WX500 Stormscope","source_confidence":"high"}]}"#;
+
         let parsed = validate_current_avionics_extraction(bound(html, &hash, json)).unwrap();
-        assert_eq!(parsed[0].model, "G5");
+
+        assert_eq!(parsed[0].manufacturer, None);
+        assert_eq!(parsed[0].model, "WX500");
+        assert_eq!(
+            parsed[0].source_evidence_text.as_deref(),
+            Some("WX500 Stormscope")
+        );
+    }
+
+    #[test]
+    fn shared_prefix_shorthand_is_a_model_only_literal_observation() {
+        let html = "<html><body><p>Garmin GTN 750 &amp; 650</p></body></html>";
+        let hash = sha256_hex(html.as_bytes());
+        let json = r#"{"avionics":[{"manufacturer":"Garmin","model":"GTN 750","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin GTN 750 & 650","source_confidence":"high"},{"manufacturer":null,"model":"650","types":["GPS"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"Garmin GTN 750 & 650","source_confidence":"high"}]}"#;
+
+        let parsed = validate_current_avionics_extraction(bound(html, &hash, json)).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].manufacturer.as_deref(), Some("Garmin"));
+        assert_eq!(parsed[0].model, "GTN 750");
+        assert_eq!(parsed[1].manufacturer, None);
+        assert_eq!(parsed[1].model, "650");
+    }
+
+    #[test]
+    fn rejects_missing_or_blank_manufacturer_but_accepts_only_explicit_null() {
+        let html = "<html><body><p>WX500 Stormscope</p></body></html>";
+        let hash = sha256_hex(html.as_bytes());
+        for manufacturer_member in ["", r#""manufacturer":"","#, r#""manufacturer":"Unknown","#] {
+            let json = format!(
+                r#"{{"avionics":[{{{manufacturer_member}"model":"WX500","types":["Lightning Detection"],"quantity":1,"configuration_action":"installed","replaces":null,"source_evidence_text":"WX500 Stormscope","source_confidence":"high"}}]}}"#
+            );
+            let failure = validate_current_avionics_extraction(bound(html, &hash, &json))
+                .expect_err("missing or blank manufacturer must remain malformed");
+            assert_eq!(failure.rule(), AvionicsValidationRule::MissingManufacturer);
+        }
     }
 
     #[test]
@@ -2353,7 +2439,7 @@ mod tests {
                 "source_confidence": "high"
             },
             {
-                "manufacturer": "GARMIN",
+                "manufacturer": null,
                 "model": "GFC 700",
                 "types": ["Autopilot"],
                 "quantity": 1,
@@ -2408,7 +2494,7 @@ mod tests {
                 "source_confidence": "high"
             },
             {
-                "manufacturer": "Garmin", "model": "GFC 700",
+                "manufacturer": null, "model": "GFC 700",
                 "types": ["Autopilot"], "quantity": 1,
                 "configuration_action": "installed", "replaces": null,
                 "source_evidence_text": "GFC 700 autopilot", "source_confidence": "high"
@@ -3047,6 +3133,7 @@ Advisory System)";
         let exact = "GIA-63W NAV/COM/GPS/WAAS with GS #1 GIA-63W\nNAV/COM/GPS/WAAS with GS #2";
         let html = controller_html(exact);
         let mut payload = installed("Garmin", "GIA-63W", flattened);
+        payload["avionics"][0]["manufacturer"] = Value::Null;
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         payload["avionics"][0]["quantity"] = serde_json::json!(2);
         payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
@@ -3090,6 +3177,7 @@ Advisory System)";
         let html = controller_html(&format!("Garmin G5 attitude\nGarmin G5 HSI\n{exact}"));
         let mut payload = installed("Garmin", "G5", "Garmin G5 attitude");
         let mut gia = installed("Garmin", "GIA-63W", flattened)["avionics"][0].clone();
+        gia["manufacturer"] = Value::Null;
         gia["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         gia["quantity"] = serde_json::json!(2);
         gia["source_confidence"] = serde_json::json!("medium");

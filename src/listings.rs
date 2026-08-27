@@ -24,9 +24,10 @@ use crate::avionics::catalog::{
     approved_avionics_identity_for_grounded_replay, authoritative_source_revocation_count,
     deterministic_generic_avionics_rejection_reason, grounded_resolution_receipt_basis_for_replay,
     grounded_resolution_request_sha256, resolve_avionics_identity_for_listing_materialization,
-    resolve_verified_local_avionics_identity,
-    resolve_verified_local_controller_run_on_avionics_identity, ApprovedAvionicsIdentity,
-    AvionicsIdentityOutcome, AvionicsIdentityRequest, CatalogError,
+    resolve_verified_local_avionics_identity, resolve_verified_local_avionics_model_observation,
+    resolve_verified_local_controller_run_on_avionics_identity,
+    unique_exact_avionics_model_observation_review_candidate, ApprovedAvionicsIdentity,
+    AvionicsIdentityOutcome, AvionicsIdentityRequest, AvionicsReviewCatalogCandidate, CatalogError,
     GroundedAvionicsResolutionReceiptSeed,
 };
 use crate::avionics::fingerprint::{
@@ -715,6 +716,8 @@ const AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON: &str =
     "Automated product verification could not complete safely. Confirm or discard this observation manually.";
 const AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON: &str =
     "The product identity was verified automatically, but the listing does not provide high-confidence evidence that this unit is installed.";
+const AVIONICS_MANUFACTURER_REVIEW_REQUIRED_REASON: &str =
+    "The listing names a concrete avionics model without a manufacturer, and the current verified catalog does not identify one unique reusable product. Select an existing verified product or discard this observation.";
 pub(crate) const SOURCE_IDENTITY_RECEIPT_PENDING: &str =
     "source_identity_correction_receipt_pending";
 
@@ -754,7 +757,7 @@ struct ListingValues {
 #[derive(Clone, Debug)]
 struct ListingAvionicsValue {
     avionics_model_id: Option<i64>,
-    manufacturer: String,
+    manufacturer: Option<String>,
     model: String,
     avionics_types: Vec<String>,
     quantity: i64,
@@ -3327,19 +3330,16 @@ async fn resolve_listing_avionics_values(
                 occurrence_evidence,
             )
         });
-        let identity_request = listing_avionics_identity_request(
+        let primary = resolve_listing_avionics_observation(
+            db,
             values,
+            extractor,
             source_url,
             occurrence_evidence,
-            &item.manufacturer,
+            item.manufacturer.as_deref(),
             &item.model,
             &item.avionics_types,
             item.quantity,
-        );
-        let primary = resolve_listing_avionics_identity(
-            db,
-            extractor,
-            &identity_request,
             item.source_confidence.as_deref(),
             item.source_notes.as_deref(),
             replay_scope,
@@ -3351,7 +3351,8 @@ async fn resolve_listing_avionics_values(
         .await;
 
         match primary {
-            ListingAvionicsIdentityResolution::Rejected { .. } => {
+            ListingAvionicsIdentityResolution::DeterministicGenericRejected
+            | ListingAvionicsIdentityResolution::GroundedRejected { .. } => {
                 // High-confidence garbage never enters either the canonical
                 // catalog or the review queue.
                 dispositions.push(AutomaticOccurrenceDisposition::discarded(
@@ -3567,7 +3568,7 @@ async fn resolve_listing_avionics_values(
                                 });
                         }
                         resolved_item.replaces = Some(ParsedAvionicsReference {
-                            manufacturer: replaced.manufacturer,
+                            manufacturer: Some(replaced.manufacturer),
                             model: replaced.model,
                             avionics_types: replaced.avionics_types,
                         });
@@ -3618,7 +3619,8 @@ enum ListingAvionicsIdentityResolution {
         identity: ApprovedAvionicsIdentity,
         grounded_receipt_seed: Option<GroundedAvionicsResolutionReceiptSeed>,
     },
-    Rejected {
+    DeterministicGenericRejected,
+    GroundedRejected {
         reason: String,
     },
     Pending {
@@ -3848,8 +3850,8 @@ async fn resolve_listing_avionics_identity(
             suggested_product: None,
         };
     }
-    if let Some(reason) = deterministic_generic_avionics_rejection_reason(request) {
-        return ListingAvionicsIdentityResolution::Rejected { reason };
+    if deterministic_generic_avionics_rejection_reason(request).is_some() {
+        return ListingAvionicsIdentityResolution::DeterministicGenericRejected;
     }
     if let Some(scope) = replay_scope {
         match replay_grounded_listing_avionics_identity(
@@ -3939,6 +3941,97 @@ async fn resolve_listing_avionics_identity(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn resolve_listing_avionics_observation(
+    db: &AppDb,
+    values: &ListingValues,
+    extractor: Option<&GeminiListingExtractor>,
+    source_url: Option<&str>,
+    listing_context: &str,
+    manufacturer: Option<&str>,
+    model: &str,
+    avionics_types: &[String],
+    quantity: i64,
+    source_confidence: Option<&str>,
+    source_notes: Option<&str>,
+    replay_scope: Option<&GroundedCapabilityReplayScope>,
+    occurrence_index: usize,
+    occurrence_role: OccurrenceRole,
+    configuration_action: &str,
+    controller_run_on_line: bool,
+) -> ListingAvionicsIdentityResolution {
+    let Some(manufacturer) = manufacturer else {
+        if model.trim().is_empty()
+            || avionics_types.iter().all(|value| value.trim().is_empty())
+            || quantity < 1
+            || listing_context.trim().is_empty()
+        {
+            return ListingAvionicsIdentityResolution::Pending {
+                reason: AVIONICS_MANUFACTURER_REVIEW_REQUIRED_REASON.to_string(),
+                suggested_product: None,
+            };
+        }
+        return match resolve_verified_local_avionics_model_observation(
+            db,
+            model,
+            avionics_types,
+            listing_context,
+        )
+        .await
+        {
+            Ok(Some(identity)) => listing_avionics_identity_resolution::<CatalogError>(
+                Ok(AvionicsIdentityOutcome::Approved(identity)),
+                source_confidence,
+                None,
+            ),
+            Ok(None) => match unique_exact_avionics_model_observation_review_candidate(
+                db,
+                model,
+                avionics_types,
+                listing_context,
+            )
+            .await
+            {
+                Ok(candidate) => ListingAvionicsIdentityResolution::Pending {
+                    reason: AVIONICS_MANUFACTURER_REVIEW_REQUIRED_REASON.to_string(),
+                    suggested_product: candidate.as_ref().map(review_product_from_candidate),
+                },
+                Err(error) => {
+                    return listing_avionics_identity_resolution(
+                        Err(error),
+                        source_confidence,
+                        None,
+                    )
+                }
+            },
+            Err(error) => listing_avionics_identity_resolution(Err(error), source_confidence, None),
+        };
+    };
+
+    let request = listing_avionics_identity_request(
+        values,
+        source_url,
+        listing_context,
+        manufacturer,
+        model,
+        avionics_types,
+        quantity,
+    );
+    resolve_listing_avionics_identity(
+        db,
+        extractor,
+        &request,
+        source_confidence,
+        source_notes,
+        replay_scope,
+        occurrence_index,
+        occurrence_role,
+        configuration_action,
+        controller_run_on_line,
+    )
+    .await
+}
+
 fn listing_avionics_identity_resolution<E>(
     outcome: Result<AvionicsIdentityOutcome, E>,
     source_confidence: Option<&str>,
@@ -3958,7 +4051,7 @@ fn listing_avionics_identity_resolution<E>(
             }
         }
         Ok(AvionicsIdentityOutcome::Rejected { reason }) => {
-            ListingAvionicsIdentityResolution::Rejected { reason }
+            ListingAvionicsIdentityResolution::GroundedRejected { reason }
         }
         Ok(AvionicsIdentityOutcome::Unresolved { reason }) => {
             ListingAvionicsIdentityResolution::Pending {
@@ -4012,6 +4105,42 @@ enum ListingAvionicsReplacementResolution {
     Pending(Box<PendingReviewAspect>),
 }
 
+fn listing_avionics_replacement_resolution(
+    index: usize,
+    replaced: &ParsedAvionicsReference,
+    item: &ListingAvionicsValue,
+    resolution: ListingAvionicsIdentityResolution,
+) -> ListingAvionicsReplacementResolution {
+    match resolution {
+        ListingAvionicsIdentityResolution::Approved {
+            identity,
+            grounded_receipt_seed,
+        } => ListingAvionicsReplacementResolution::Approved {
+            identity: Box::new(identity),
+            grounded_receipt_seed,
+        },
+        ListingAvionicsIdentityResolution::DeterministicGenericRejected => {
+            ListingAvionicsReplacementResolution::Rejected
+        }
+        ListingAvionicsIdentityResolution::GroundedRejected { reason } => {
+            ListingAvionicsReplacementResolution::Pending(Box::new(pending_replacement_aspect(
+                index,
+                replaced,
+                item,
+                format!("grounded classification rejected this replacement target: {reason}"),
+            )))
+        }
+        ListingAvionicsIdentityResolution::Pending {
+            reason,
+            suggested_product,
+        } => {
+            let mut aspect = pending_replacement_aspect(index, replaced, item, reason);
+            aspect.suggested_product = suggested_product;
+            ListingAvionicsReplacementResolution::Pending(Box::new(aspect))
+        }
+    }
+}
+
 async fn resolve_listing_avionics_replacement(
     db: &AppDb,
     values: &ListingValues,
@@ -4026,34 +4155,29 @@ async fn resolve_listing_avionics_replacement(
     if item.configuration_action == "installed" {
         if item.replaces.is_some() || item.replaces_avionics_model_id.is_some() {
             return Err(ListingStoreError::Validation(format!(
-                "installed avionics cannot also declare a replacement target: {} {}",
-                item.manufacturer, item.model
+                "installed avionics cannot also declare a replacement target: {}",
+                avionics_observation_label(item.manufacturer.as_deref(), &item.model)
             )));
         }
         return Ok(ListingAvionicsReplacementResolution::None);
     }
     let Some(replaced) = item.replaces.as_ref() else {
         return Err(ListingStoreError::Validation(format!(
-            "avionics action {} requires a concrete replacement target: {} {}",
-            item.configuration_action, item.manufacturer, item.model
+            "avionics action {} requires a concrete replacement target: {}",
+            item.configuration_action,
+            avionics_observation_label(item.manufacturer.as_deref(), &item.model)
         )));
     };
-    let request = listing_avionics_identity_request(
+    let resolution = resolve_listing_avionics_observation(
+        db,
         values,
+        extractor,
         source_url,
         listing_context,
-        &replaced.manufacturer,
+        replaced.manufacturer.as_deref(),
         &replaced.model,
         &replaced.avionics_types,
         1,
-    );
-    if deterministic_generic_avionics_rejection_reason(&request).is_some() {
-        return Ok(ListingAvionicsReplacementResolution::Rejected);
-    }
-    match resolve_listing_avionics_identity(
-        db,
-        extractor,
-        &request,
         item.source_confidence.as_deref(),
         item.source_notes.as_deref(),
         replay_scope,
@@ -4062,34 +4186,10 @@ async fn resolve_listing_avionics_replacement(
         item.configuration_action.as_str(),
         controller_run_on_line,
     )
-    .await
-    {
-        ListingAvionicsIdentityResolution::Approved {
-            identity,
-            grounded_receipt_seed,
-        } => Ok(ListingAvionicsReplacementResolution::Approved {
-            identity: Box::new(identity),
-            grounded_receipt_seed,
-        }),
-        ListingAvionicsIdentityResolution::Rejected { reason } => Ok(
-            ListingAvionicsReplacementResolution::Pending(Box::new(pending_replacement_aspect(
-                index,
-                replaced,
-                item,
-                format!("grounded classification rejected this replacement target: {reason}"),
-            ))),
-        ),
-        ListingAvionicsIdentityResolution::Pending {
-            reason,
-            suggested_product,
-        } => {
-            let mut aspect = pending_replacement_aspect(index, replaced, item, reason);
-            aspect.suggested_product = suggested_product;
-            Ok(ListingAvionicsReplacementResolution::Pending(Box::new(
-                aspect,
-            )))
-        }
-    }
+    .await;
+    Ok(listing_avionics_replacement_resolution(
+        index, replaced, item, resolution,
+    ))
 }
 
 fn pending_avionics_aspect(
@@ -4100,12 +4200,20 @@ fn pending_avionics_aspect(
     replaces_product_id: Option<i64>,
     replacement_aspect_id: Option<ReviewAspectId>,
 ) -> PendingReviewAspect {
+    let proposed_product = item.manufacturer.as_deref().map(|manufacturer| {
+        review_product_from_observation(manufacturer, &item.model, &item.avionics_types)
+    });
+    let mut allowed_actions = vec![ReviewAction::UseVerifiedProduct];
+    if proposed_product.is_some() {
+        allowed_actions.push(ReviewAction::CreateVerifiedProduct);
+    }
+    allowed_actions.push(ReviewAction::Discard);
     PendingReviewAspect {
         id,
         kind: "avionics".to_string(),
-        label: format!("{} {}", item.manufacturer, item.model),
+        label: avionics_observation_label(item.manufacturer.as_deref(), &item.model),
         observed_text: avionics_observation_text(
-            &item.manufacturer,
+            item.manufacturer.as_deref(),
             &item.model,
             &item.avionics_types,
             item.quantity,
@@ -4114,16 +4222,8 @@ fn pending_avionics_aspect(
         required: true,
         reason,
         suggested_product,
-        proposed_product: Some(review_product_from_observation(
-            &item.manufacturer,
-            &item.model,
-            &item.avionics_types,
-        )),
-        allowed_actions: vec![
-            ReviewAction::UseVerifiedProduct,
-            ReviewAction::CreateVerifiedProduct,
-            ReviewAction::Discard,
-        ],
+        proposed_product,
+        allowed_actions,
         quantity: item.quantity.max(1),
         configuration_action: item.configuration_action.clone(),
         source_evidence_text: item.source_notes.clone(),
@@ -4142,12 +4242,20 @@ fn pending_replacement_aspect(
     parent: &ListingAvionicsValue,
     reason: String,
 ) -> PendingReviewAspect {
+    let proposed_product = replaced.manufacturer.as_deref().map(|manufacturer| {
+        review_product_from_observation(manufacturer, &replaced.model, &replaced.avionics_types)
+    });
+    let mut allowed_actions = vec![ReviewAction::UseVerifiedProduct];
+    if proposed_product.is_some() {
+        allowed_actions.push(ReviewAction::CreateVerifiedProduct);
+    }
+    allowed_actions.push(ReviewAction::Discard);
     PendingReviewAspect {
         id: ReviewAspectId::String(format!("avionics:{index}:replacement")),
         kind: "avionics".to_string(),
-        label: format!("{} {}", replaced.manufacturer, replaced.model),
+        label: avionics_observation_label(replaced.manufacturer.as_deref(), &replaced.model),
         observed_text: avionics_observation_text(
-            &replaced.manufacturer,
+            replaced.manufacturer.as_deref(),
             &replaced.model,
             &replaced.avionics_types,
             1,
@@ -4156,16 +4264,8 @@ fn pending_replacement_aspect(
         required: true,
         reason,
         suggested_product: None,
-        proposed_product: Some(review_product_from_observation(
-            &replaced.manufacturer,
-            &replaced.model,
-            &replaced.avionics_types,
-        )),
-        allowed_actions: vec![
-            ReviewAction::UseVerifiedProduct,
-            ReviewAction::CreateVerifiedProduct,
-            ReviewAction::Discard,
-        ],
+        proposed_product,
+        allowed_actions,
         quantity: 1,
         // This aspect supplies another link's target; it is not independently
         // installed as an additional listing row.
@@ -4213,21 +4313,51 @@ fn review_product_from_identity(identity: &ApprovedAvionicsIdentity) -> ReviewPr
     }
 }
 
+fn review_product_from_candidate(candidate: &AvionicsReviewCatalogCandidate) -> ReviewProduct {
+    let stable_identifier = if candidate.manufacturer_identifier_kind.trim().is_empty()
+        || candidate.manufacturer_identifier.trim().is_empty()
+    {
+        None
+    } else {
+        Some(StableIdentifier {
+            kind: candidate.manufacturer_identifier_kind.clone(),
+            value: candidate.manufacturer_identifier.clone(),
+        })
+    };
+    ReviewProduct {
+        id: Some(candidate.id),
+        manufacturer: candidate.manufacturer.clone(),
+        model: candidate.model.clone(),
+        capabilities: candidate.avionics_types.clone(),
+        stable_identifier,
+        identity_source_url: None,
+        identity_source_title: None,
+        identity_evidence_text: None,
+    }
+}
+
 fn avionics_observation_text(
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
     capabilities: &[String],
     quantity: i64,
     configuration_action: &str,
 ) -> String {
     format!(
-        "{} {} · {} · quantity {} · {}",
-        manufacturer,
-        model,
+        "{} · {} · quantity {} · {}",
+        avionics_observation_label(manufacturer, model),
         capabilities.join(", "),
         quantity.max(1),
         configuration_action
     )
+}
+
+fn avionics_observation_label(manufacturer: Option<&str>, model: &str) -> String {
+    manufacturer
+        .map(|manufacturer| format!("{} {}", manufacturer.trim(), model.trim()))
+        .unwrap_or_else(|| model.trim().to_string())
+        .trim()
+        .to_string()
 }
 
 fn listing_avionics_value_from_catalog(
@@ -4236,7 +4366,7 @@ fn listing_avionics_value_from_catalog(
 ) -> ListingAvionicsValue {
     ListingAvionicsValue {
         avionics_model_id: Some(identity.id),
-        manufacturer: identity.manufacturer.clone(),
+        manufacturer: Some(identity.manufacturer.clone()),
         model: identity.model.clone(),
         avionics_types: identity.avionics_types.clone(),
         quantity: original.quantity.max(1),
@@ -4274,7 +4404,7 @@ fn listing_avionics_after_generic_target_rejection(
 
     let mut removal = listing_avionics_value_from_catalog(original, identity);
     removal.replaces = Some(ParsedAvionicsReference {
-        manufacturer: identity.manufacturer.clone(),
+        manufacturer: Some(identity.manufacturer.clone()),
         model: identity.model.clone(),
         avionics_types: identity.avionics_types.clone(),
     });
@@ -4307,8 +4437,14 @@ fn merge_duplicate_listing_avionics(
             "only rows for the same resolved avionics catalog product can be coalesced".to_string(),
         ));
     }
-    if normalize_avionics_manufacturer_name(&existing.manufacturer)
-        != normalize_avionics_manufacturer_name(&incoming.manufacturer)
+    if existing
+        .manufacturer
+        .as_deref()
+        .map(normalize_avionics_manufacturer_name)
+        != incoming
+            .manufacturer
+            .as_deref()
+            .map(normalize_avionics_manufacturer_name)
         || normalize_avionics_model_name(&existing.model)
             != normalize_avionics_model_name(&incoming.model)
     {
@@ -4380,8 +4516,13 @@ fn matching_avionics_reference(
     let (Some(left), Some(right)) = (left, right) else {
         return false;
     };
-    normalize_avionics_manufacturer_name(&left.manufacturer)
-        == normalize_avionics_manufacturer_name(&right.manufacturer)
+    left.manufacturer
+        .as_deref()
+        .map(normalize_avionics_manufacturer_name)
+        == right
+            .manufacturer
+            .as_deref()
+            .map(normalize_avionics_manufacturer_name)
         && normalize_avionics_model_name(&left.model) == normalize_avionics_model_name(&right.model)
         && canonical_avionics_types(&left.avionics_types)
             == canonical_avionics_types(&right.avionics_types)
@@ -4437,8 +4578,8 @@ fn coalesce_resolved_listing_avionics(
     for item in avionics {
         let avionics_model_id = item.avionics_model_id.filter(|id| *id > 0).ok_or_else(|| {
             ListingStoreError::Validation(format!(
-                "avionics must resolve to a catalog id before persistence: {} {}",
-                item.manufacturer, item.model
+                "avionics must resolve to a catalog id before persistence: {}",
+                avionics_observation_label(item.manufacturer.as_deref(), &item.model)
             ))
         })?;
         if let Some(index) = seen.get(&avionics_model_id).copied() {
@@ -4637,8 +4778,9 @@ fn avionics_from_value(value: &Value) -> StoreResult<Vec<ListingAvionicsValue>> 
             let object = item.as_object().ok_or_else(|| {
                 ListingStoreError::Validation(format!("avionics[{index}] must be an object"))
             })?;
-            let manufacturer = required_string_from_value(
-                object.get("manufacturer").unwrap_or(&Value::Null),
+            let manufacturer = explicit_nullable_string_member(
+                object,
+                "manufacturer",
                 &format!("avionics[{index}].manufacturer"),
             )?;
             let model = required_string_from_value(
@@ -4653,7 +4795,7 @@ fn avionics_from_value(value: &Value) -> StoreResult<Vec<ListingAvionicsValue>> 
                 quantity: optional_i64(object.get("quantity")).unwrap_or(1),
                 configuration_action: optional_string(object.get("configuration_action"))
                     .unwrap_or_else(|| "installed".to_string()),
-                replaces: parsed_avionics_reference(object.get("replaces")),
+                replaces: parsed_avionics_reference(object.get("replaces"), index)?,
                 source_evidence_text: optional_string(object.get("source_evidence_text")),
                 source_confidence: optional_string(object.get("source_confidence")),
             }))
@@ -4661,13 +4803,58 @@ fn avionics_from_value(value: &Value) -> StoreResult<Vec<ListingAvionicsValue>> 
         .collect()
 }
 
-fn parsed_avionics_reference(value: Option<&Value>) -> Option<ParsedAvionicsReference> {
-    let object = value?.as_object()?;
-    Some(ParsedAvionicsReference {
-        manufacturer: optional_string(object.get("manufacturer"))?,
-        model: optional_string(object.get("model"))?,
+fn parsed_avionics_reference(
+    value: Option<&Value>,
+    index: usize,
+) -> StoreResult<Option<ParsedAvionicsReference>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value.as_object().ok_or_else(|| {
+        ListingStoreError::Validation(format!(
+            "avionics[{index}].replaces must be an object or null"
+        ))
+    })?;
+    Ok(Some(ParsedAvionicsReference {
+        manufacturer: explicit_nullable_string_member(
+            object,
+            "manufacturer",
+            &format!("avionics[{index}].replaces.manufacturer"),
+        )?,
+        model: required_string_from_value(
+            object.get("model").unwrap_or(&Value::Null),
+            &format!("avionics[{index}].replaces.model"),
+        )?,
         avionics_types: avionics_types_from_object(object),
-    })
+    }))
+}
+
+fn explicit_nullable_string_member(
+    object: &serde_json::Map<String, Value>,
+    member: &str,
+    field_name: &str,
+) -> StoreResult<Option<String>> {
+    let value = object.get(member).ok_or_else(|| {
+        ListingStoreError::Validation(format!(
+            "{field_name} must be explicitly present as null or a non-empty string"
+        ))
+    })?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let value = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ListingStoreError::Validation(format!(
+                "{field_name} must be null or a non-empty string"
+            ))
+        })?;
+    Ok(Some(value.to_string()))
 }
 
 fn avionics_types_from_object(object: &serde_json::Map<String, Value>) -> Vec<String> {
@@ -4829,14 +5016,14 @@ fn validate_listing_values(values: &ListingValues) -> StoreResult<()> {
     for item in &values.avionics {
         if canonical_avionics_types(&item.avionics_types).is_empty() {
             return Err(ListingStoreError::Validation(format!(
-                "avionics capability types are required for {} {}",
-                item.manufacturer, item.model
+                "avionics capability types are required for {}",
+                avionics_observation_label(item.manufacturer.as_deref(), &item.model)
             )));
         }
         if item.quantity < 1 {
             return Err(ListingStoreError::Validation(format!(
-                "avionics quantity must be at least 1 for {} {}",
-                item.manufacturer, item.model
+                "avionics quantity must be at least 1 for {}",
+                avionics_observation_label(item.manufacturer.as_deref(), &item.model)
             )));
         }
         if !matches!(
@@ -5402,8 +5589,8 @@ async fn canonical_values_avionics_graph(
     for item in value {
         let model_id = item.avionics_model_id.ok_or_else(|| {
             ListingStoreError::Validation(format!(
-                "avionics must resolve to an approved product graph before verified-listing refresh: {} {}",
-                item.manufacturer, item.model
+                "avionics must resolve to an approved product graph before verified-listing refresh: {}",
+                avionics_observation_label(item.manufacturer.as_deref(), &item.model)
             ))
         })?;
         let subject_key = approved_catalog_avionics_graph_key(db, model_id).await?;
@@ -6388,7 +6575,11 @@ async fn replace_listing_avionics(
     let avionics = coalesce_resolved_listing_avionics(
         avionics
             .iter()
-            .filter(|item| is_usable_avionics_label(&item.manufacturer, &item.model))
+            .filter(|item| {
+                item.manufacturer
+                    .as_deref()
+                    .is_some_and(|manufacturer| is_usable_avionics_label(manufacturer, &item.model))
+            })
             .cloned(),
     )?;
 
@@ -6396,15 +6587,21 @@ async fn replace_listing_avionics(
     // The transaction below then makes trigger/race failures all-or-nothing.
     let mut prepared = Vec::new();
     for item in &avionics {
+        let manufacturer = item.manufacturer.as_deref().ok_or_else(|| {
+            ListingStoreError::Validation(
+                "manufacturer-less avionics observations cannot be persisted without a canonical catalog resolution"
+                    .to_string(),
+            )
+        })?;
         let avionics_model_id = validated_catalog_avionics_model_id(
             db,
             item.avionics_model_id.ok_or_else(|| {
                 ListingStoreError::Validation(format!(
-                    "avionics must resolve to a catalog id before persistence: {} {}",
-                    item.manufacturer, item.model
+                    "avionics must resolve to a catalog id before persistence: {}",
+                    avionics_observation_label(item.manufacturer.as_deref(), &item.model)
                 ))
             })?,
-            &item.manufacturer,
+            manufacturer,
             &item.model,
             &item.avionics_types,
         )
@@ -6425,6 +6622,12 @@ async fn replace_listing_avionics(
                             .to_string(),
                     )
                 })?;
+                let replaced_manufacturer = replaced.manufacturer.as_deref().ok_or_else(|| {
+                    ListingStoreError::Validation(
+                        "manufacturer-less replacement observations cannot be persisted without a canonical catalog resolution"
+                            .to_string(),
+                    )
+                })?;
                 let replaced_id = validated_catalog_avionics_model_id(
                     db,
                     item.replaces_avionics_model_id.ok_or_else(|| {
@@ -6432,7 +6635,7 @@ async fn replace_listing_avionics(
                             "replacement/removal avionics must resolve to a catalog id".to_string(),
                         )
                     })?,
-                    &replaced.manufacturer,
+                    replaced_manufacturer,
                     &replaced.model,
                     &replaced.avionics_types,
                 )
@@ -7089,7 +7292,7 @@ async fn listing_avionics(db: &AppDb, listing_id: i64) -> StoreResult<Vec<Parsed
     Ok(rows
         .into_iter()
         .map(|row| ParsedAvionics {
-            manufacturer: row.manufacturer,
+            manufacturer: Some(row.manufacturer),
             model: row.model,
             avionics_types: capabilities
                 .get(&row.avionics_model_id)
@@ -7104,7 +7307,7 @@ async fn listing_avionics(db: &AppDb, listing_id: i64) -> StoreResult<Vec<Parsed
             ) {
                 (Some(avionics_model_id), Some(manufacturer), Some(model)) => {
                     Some(ParsedAvionicsReference {
-                        manufacturer,
+                        manufacturer: Some(manufacturer),
                         model,
                         avionics_types: capabilities
                             .get(&avionics_model_id)
@@ -7250,17 +7453,19 @@ mod tests {
     use crate::extract::{preview_manual_listing, GeminiListingExtractor};
     use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, OccurrenceRole};
     use crate::listing::review::{
-        stage_pending_review, ListingAssociationRole, PendingReviewAspect, ReviewProduct,
+        stage_pending_review, ListingAssociationRole, PendingReviewAspect, ReviewAction,
+        ReviewProduct,
     };
     use crate::models::{ParsedAvionics, ParsedAvionicsReference};
 
     use super::{
-        coalesce_resolved_listing_avionics, component_time_basis_from_value,
+        avionics_from_value, coalesce_resolved_listing_avionics, component_time_basis_from_value,
         exact_occurrence_evidence_from_source_units, listing_avionics_identity_request,
-        listing_avionics_identity_resolution, listing_avionics_value_from_catalog,
-        replace_listing_avionics, resolve_listing_avionics_values, validate_component_time,
-        ListingAvionicsIdentityResolution, ListingAvionicsValue, ListingValues,
-        AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
+        listing_avionics_identity_resolution, listing_avionics_replacement_resolution,
+        listing_avionics_value_from_catalog, replace_listing_avionics,
+        resolve_listing_avionics_values, validate_component_time,
+        ListingAvionicsIdentityResolution, ListingAvionicsReplacementResolution,
+        ListingAvionicsValue, ListingValues, AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
         AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON,
     };
 
@@ -8491,6 +8696,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_only_observation_reuses_one_attested_catalog_product_without_gemini() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "G5", "Flight Display")
+                .await
+                .expect("approved graph identity should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let retained = "G5 installed";
+        let source_units = test_listing_evidence_units("https://example.com/listing", retained);
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: None,
+            model: "G5".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            quantity: 1,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some(retained.to_string()),
+            source_confidence: Some("high".to_string()),
+        })];
+
+        let outcome = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            Some(&unreachable),
+            Some("https://example.com/listing"),
+            Some(retained),
+            Some(&source_units),
+            None,
+        )
+        .await
+        .expect("one exact attested model should resolve locally");
+
+        assert!(outcome.pending_review_aspects.is_empty());
+        assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
+        assert_eq!(values.avionics[0].manufacturer.as_deref(), Some("Garmin"));
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_model_only_observation_stays_pending_without_gemini_or_fake_product() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id =
+            ensure_approved_test_avionics_model(&db, "L3", "WX-500", "Lightning Detection")
+                .await
+                .expect("approved but unattested catalog product should seed");
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let retained = "WX500 Stormscope";
+        let source_units = test_listing_evidence_units("https://example.com/listing", retained);
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: None,
+            model: "WX500".to_string(),
+            avionics_types: vec!["Lightning Detection".to_string()],
+            quantity: 1,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some(retained.to_string()),
+            source_confidence: Some("high".to_string()),
+        })];
+
+        let outcome = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            Some(&unreachable),
+            Some("https://example.com/listing"),
+            Some(retained),
+            Some(&source_units),
+            None,
+        )
+        .await
+        .expect("unmatched model-only evidence should remain reviewable");
+
+        assert!(values.avionics.is_empty());
+        assert_eq!(outcome.pending_review_aspects.len(), 1);
+        let aspect = &outcome.pending_review_aspects[0];
+        assert_eq!(aspect.label, "WX500");
+        assert!(aspect.proposed_product.is_none());
+        let suggestion = aspect
+            .suggested_product
+            .as_ref()
+            .expect("the sole collision-safe approved row should be suggested for review");
+        assert_eq!(suggestion.id, Some(approved_id));
+        assert_eq!(suggestion.manufacturer, "L3");
+        assert_eq!(suggestion.model, "WX-500");
+        assert!(!aspect
+            .allowed_actions
+            .contains(&ReviewAction::CreateVerifiedProduct));
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn unrebindable_occurrence_never_reaches_the_configured_provider() {
         let db = AppDb::connect("sqlite::memory:")
             .await
@@ -8619,7 +8929,7 @@ mod tests {
         let source_units = test_listing_evidence_units(CONTROLLER_URL, &html);
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GIA63W".to_string(),
             avionics_types: vec!["NAV".to_string(), "COM".to_string(), "GPS".to_string()],
             quantity: 2,
@@ -8675,7 +8985,7 @@ mod tests {
         let source_units = test_listing_evidence_units(CONTROLLER_URL, html);
         let mut values = listing_values_with_variant("182T SKYLANE");
         values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "G1000 NXi".to_string(),
             avionics_types: vec!["Integrated Flight Deck".to_string()],
             quantity: 1,
@@ -8780,7 +9090,7 @@ mod tests {
             };
             let mut values = listing_values_with_variant("182T SKYLANE");
             values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: model.to_string(),
                 avionics_types: capabilities.into_iter().map(str::to_string).collect(),
                 quantity,
@@ -8818,7 +9128,7 @@ mod tests {
                 .expect("approved graph identity should seed");
         attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
         let parsed = ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GDU 1044B".to_string(),
             avionics_types: vec!["Flight Display".to_string()],
             quantity: 1,
@@ -8939,9 +9249,83 @@ mod tests {
         );
         assert!(matches!(
             rejection,
-            ListingAvionicsIdentityResolution::Rejected { reason }
+            ListingAvionicsIdentityResolution::GroundedRejected { reason }
                 if reason == "grounded rejection"
         ));
+    }
+
+    #[test]
+    fn listing_avionics_json_requires_explicit_nullable_manufacturer_members() {
+        let current = json!([{
+            "manufacturer": null,
+            "model": "WX500",
+            "types": ["Lightning Detection"],
+            "quantity": 1,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": "WX500 Stormscope",
+            "source_confidence": "high"
+        }]);
+        let parsed = avionics_from_value(&current).unwrap();
+        assert_eq!(parsed[0].manufacturer, None);
+
+        let mut missing_primary = current.clone();
+        missing_primary[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("manufacturer");
+        assert!(avionics_from_value(&missing_primary)
+            .unwrap_err()
+            .to_string()
+            .contains("explicitly present"));
+
+        let missing_replacement = json!([{
+            "manufacturer": "Garmin",
+            "model": "GTN 750Xi",
+            "types": ["GPS"],
+            "quantity": 1,
+            "configuration_action": "replaces",
+            "replaces": {"model": "GNS 530W", "types": ["GPS"]},
+            "source_evidence_text": "Garmin GTN 750Xi replaces GNS 530W",
+            "source_confidence": "high"
+        }]);
+        assert!(avionics_from_value(&missing_replacement)
+            .unwrap_err()
+            .to_string()
+            .contains("replaces.manufacturer"));
+    }
+
+    #[test]
+    fn replacement_discards_only_deterministic_generic_rejections() {
+        let mut item = ListingAvionicsValue::from_parsed(parsed_avionics("GTN 750Xi"));
+        item.configuration_action = "replaces".to_string();
+        let replaced = ParsedAvionicsReference {
+            manufacturer: Some("Garmin".to_string()),
+            model: "GNS 530W".to_string(),
+            avionics_types: vec!["GPS".to_string()],
+        };
+
+        assert!(matches!(
+            listing_avionics_replacement_resolution(
+                0,
+                &replaced,
+                &item,
+                ListingAvionicsIdentityResolution::DeterministicGenericRejected,
+            ),
+            ListingAvionicsReplacementResolution::Rejected
+        ));
+        let grounded = listing_avionics_replacement_resolution(
+            0,
+            &replaced,
+            &item,
+            ListingAvionicsIdentityResolution::GroundedRejected {
+                reason: "grounded rejection".to_string(),
+            },
+        );
+        let ListingAvionicsReplacementResolution::Pending(aspect) = grounded else {
+            panic!("grounded replacement rejection must remain reviewable")
+        };
+        assert!(aspect.reason.contains("grounded rejection"));
     }
 
     #[tokio::test]
@@ -9037,7 +9421,7 @@ mod tests {
             generic.configuration_action = "replaces".to_string();
             generic.source_evidence_text = Some("Garmin GPS replaces Garmin GNS 430W".to_string());
             generic.replaces = Some(ParsedAvionicsReference {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: Some("Garmin".to_string()),
                 model: "GNS 430W".to_string(),
                 avionics_types: vec!["GPS".to_string()],
             });
@@ -9102,7 +9486,7 @@ mod tests {
                 concrete.source_evidence_text =
                     Some("Garmin GNS 430W changes Garmin GPS".to_string());
                 concrete.replaces = Some(ParsedAvionicsReference {
-                    manufacturer: "Garmin".to_string(),
+                    manufacturer: Some("Garmin".to_string()),
                     model: "GPS".to_string(),
                     avionics_types: vec!["GPS".to_string()],
                 });
@@ -9170,7 +9554,7 @@ mod tests {
         );
         item.configuration_action = "replaces".to_string();
         item.replaces = Some(crate::models::ParsedAvionicsReference {
-            manufacturer: "Unknown Maker".to_string(),
+            manufacturer: Some("Unknown Maker".to_string()),
             model: "Imaginary 999".to_string(),
             avionics_types: vec!["Transponder".to_string()],
         });
@@ -9713,7 +10097,7 @@ mod tests {
             &values,
             values.source_url.as_deref(),
             context,
-            &parsed.manufacturer,
+            parsed.manufacturer.as_deref().unwrap(),
             &parsed.model,
             &parsed.avionics_types,
             parsed.quantity,
@@ -10576,7 +10960,7 @@ mod tests {
 
     fn parsed_avionics(model: &str) -> ParsedAvionics {
         ParsedAvionics {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: model.to_string(),
             avionics_types: vec!["Transponder".to_string()],
             quantity: 1,
@@ -10598,7 +10982,7 @@ mod tests {
     ) -> ListingAvionicsValue {
         ListingAvionicsValue {
             avionics_model_id: Some(avionics_model_id),
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GNX 375".to_string(),
             avionics_types: avionics_types
                 .iter()
@@ -10611,7 +10995,7 @@ mod tests {
             configuration_action: configuration_action.to_string(),
             replaces: replaces_avionics_model_id.map(|target| {
                 crate::models::ParsedAvionicsReference {
-                    manufacturer: "Garmin".to_string(),
+                    manufacturer: Some("Garmin".to_string()),
                     model: format!("GTX {target}"),
                     avionics_types: vec!["Transponder".to_string()],
                 }

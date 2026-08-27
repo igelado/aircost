@@ -166,9 +166,12 @@ impl LiveBenchmarkRunner {
     ) -> Result<TaskExecution> {
         let config = self.config_for_model(model, AVIONICS_PIPELINE_TASKS)?;
         let extractor = self.scoped_extractor(config, case, correlation_id)?;
+        let manufacturer = candidate.manufacturer.as_deref().context(
+            "grounded avionics metadata requires a manufacturer-bearing catalog candidate",
+        )?;
         let response = extractor
             .estimate_avionics_metadata(&AvionicsMetadataContext {
-                manufacturer: &candidate.manufacturer,
+                manufacturer,
                 model: &candidate.model,
                 avionics_types: &candidate.avionics_types,
                 value_reference_year,
@@ -193,6 +196,9 @@ impl LiveBenchmarkRunner {
     ) -> Result<TaskExecution> {
         let config = self.config_for_model(model, AVIONICS_PIPELINE_TASKS)?;
         let extractor = self.scoped_extractor(config, case, correlation_id)?;
+        let manufacturer = candidate.manufacturer.clone().context(
+            "grounded avionics review requires a manufacturer-bearing catalog candidate",
+        )?;
         let context = AvionicsUnitResolutionContext {
             aircraft_manufacturer: aircraft.manufacturer.clone().unwrap_or_default(),
             aircraft_model: aircraft.model.clone().unwrap_or_default(),
@@ -205,7 +211,7 @@ impl LiveBenchmarkRunner {
             authoritative_identity_anchors: Vec::new(),
             candidate_triage_hint: None,
             candidate: AvionicsUnitResolutionCandidate {
-                manufacturer: candidate.manufacturer.clone(),
+                manufacturer,
                 model: candidate.model.clone(),
                 avionics_types: candidate.avionics_types.clone(),
                 quantity: candidate.quantity,
