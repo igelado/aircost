@@ -4087,11 +4087,15 @@ async fn resolve_listing_avionics_observation(
         )
         .await
         {
-            Ok(Some(identity)) => listing_avionics_identity_resolution::<CatalogError>(
-                Ok(AvionicsIdentityOutcome::Approved(identity)),
-                source_confidence,
-                None,
-            ),
+            Ok(Some(identity)) => {
+                listing_avionics_local_identity_resolution(
+                    db,
+                    identity,
+                    source_confidence,
+                    exact_leading_dual_proof,
+                )
+                .await
+            }
             Ok(None) => match unique_exact_avionics_model_observation_review_candidate(
                 db,
                 model,
@@ -7866,7 +7870,7 @@ mod tests {
         listing_avionics_value_from_catalog, replace_listing_avionics,
         resolve_listing_avionics_values, validate_component_time, ExactListingSourceCaptureScope,
         ListingAvionicsIdentityResolution, ListingAvionicsReplacementResolution,
-        ListingAvionicsValue, ListingSourceConfidenceBasis, ListingValues,
+        ListingAvionicsValue, ListingSourceConfidenceBasis, ListingValues, ResolvedListingAvionics,
         AUTOMATED_AVIONICS_VERIFICATION_FAILED_REASON,
         AVIONICS_INSTALLATION_EVIDENCE_NOT_HIGH_REASON,
     };
@@ -9591,6 +9595,295 @@ mod tests {
             )
         );
         assert_ne!(persisted.5, decoy_html_sha256);
+    }
+
+    #[tokio::test]
+    async fn exact_controller_model_only_dual_display_reuses_unique_countable_unit() {
+        const CONTROLLER_URL: &str = "https://www.controller.com/listing/for-sale/256495649/2006-cessna-turbo-182t-skylane-piston-single-aircraft";
+        const EVIDENCE: &str = "Dual GDU-1040 PFD/MFD";
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let approved_id =
+            ensure_approved_test_avionics_model(&db, "Garmin", "GDU 1040", "Flight Display")
+                .await
+                .expect("approved graph identity should seed");
+        attest_approved_test_avionics_model_for_current_policy_reuse(&db, approved_id).await;
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let html = include_str!("../tests/fixtures/controller/id25_like_listing.html").replace(
+            "GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140",
+            EVIDENCE,
+        );
+        let source = crate::html::listing::source::listing_extraction_source(CONTROLLER_URL, &html)
+            .expect("Controller fixture should produce a bounded source envelope");
+        let source_units = test_listing_evidence_units(CONTROLLER_URL, &html);
+        let user = db.current_user(None).await.unwrap();
+        let variant_id = super::pending_aircraft_compatibility_variant_id(&db)
+            .await
+            .unwrap();
+        let listing_id: i64 = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO aircraft_sale_listings (
+              aircraft_model_variant_id, created_by_user_id, source_url,
+              model_year, asking_price_usd, airframe_hours, ingestion_state
+            ) VALUES (?, ?, ?, 2006, 319000, 1250, 'incomplete')
+            RETURNING id
+            "#,
+            variant_id,
+            user.id,
+            CONTROLLER_URL
+        )
+        .unwrap();
+        let install_id: i64 = query_scalar_one!(
+            &db,
+            i64,
+            "INSERT INTO plugin_installs (user_id, public_key_base64) VALUES (?, 'model-only-dual-key') RETURNING id",
+            user.id
+        )
+        .unwrap();
+        let rendered_html_sha256 = format!("{:x}", Sha256::digest(html.as_bytes()));
+        let proving_submission_id: i64 = query_scalar_one!(
+            &db,
+            i64,
+            r#"
+            INSERT INTO plugin_submissions (
+              user_id, plugin_install_id, source_url, rendered_html,
+              rendered_html_sha256, signature_base64, canonical_listing_id
+            ) VALUES (?, ?, ?, ?, ?, 'model-only-dual-signature', ?)
+            RETURNING id
+            "#,
+            user.id,
+            install_id,
+            CONTROLLER_URL,
+            html.as_str(),
+            rendered_html_sha256.as_str(),
+            listing_id
+        )
+        .unwrap();
+        let exact_source_capture_scope = ExactListingSourceCaptureScope {
+            plugin_submission_id: proving_submission_id,
+            rendered_html_sha256: rendered_html_sha256.clone(),
+        };
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: None,
+            model: "GDU-1040".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            quantity: 2,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some(EVIDENCE.to_string()),
+            source_confidence: Some("medium".to_string()),
+        })];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            Some(&unreachable),
+            Some(CONTROLLER_URL),
+            Some(&source),
+            Some(&source_units),
+            None,
+            Some(&exact_source_capture_scope),
+        )
+        .await
+        .expect("the exact model-only display count should resolve without Gemini");
+
+        assert!(resolved.pending_review_aspects.is_empty());
+        assert_eq!(values.avionics.len(), 1);
+        assert_eq!(values.avionics[0].avionics_model_id, Some(approved_id));
+        assert_eq!(values.avionics[0].manufacturer.as_deref(), Some("Garmin"));
+        assert_eq!(values.avionics[0].quantity, 2);
+        assert_eq!(
+            values.avionics[0].source_confidence.as_deref(),
+            Some("high")
+        );
+        assert_eq!(values.avionics[0].source, "listing_explicit_count");
+        assert_eq!(
+            query_scalar_one!(&db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+
+        replace_listing_avionics(&db, listing_id, &values.avionics)
+            .await
+            .expect("the model-only counted unit should persist with signed authorization");
+        let persisted: (i64, i64, String, String, String) = sqlx::query_as(
+            r#"
+            SELECT link.avionics_model_id, link.quantity, link.source,
+                   authorization.authorization_kind,
+                   authorization.evidence_capture_sha256
+            FROM aircraft_sale_listing_avionics link
+            JOIN aircraft_sale_listing_avionics_link_authorizations authorization
+              ON authorization.listing_link_id = link.id
+             AND authorization.association_role = 'installed'
+            WHERE link.aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(match db.backend() {
+            DatabaseBackend::Sqlite(pool) => pool,
+            DatabaseBackend::Postgres(_) => unreachable!("test uses SQLite"),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                approved_id,
+                2,
+                "listing_explicit_count".to_string(),
+                "manufacturer_reuse".to_string(),
+                rendered_html_sha256,
+            )
+        );
+    }
+
+    async fn resolve_test_model_only_dual_display(
+        db: &AppDb,
+    ) -> (ListingValues, ResolvedListingAvionics) {
+        const CONTROLLER_URL: &str =
+            "https://www.controller.com/listing/for-sale/256495649/example";
+        const EVIDENCE: &str = "Dual GDU-1040 PFD/MFD";
+        let unreachable = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let html = include_str!("../tests/fixtures/controller/id25_like_listing.html").replace(
+            "GARMIN GIA-63W #1\nGARMIN GIA-63W #2\nBENDIX/KING KAP 140",
+            EVIDENCE,
+        );
+        let source = crate::html::listing::source::listing_extraction_source(CONTROLLER_URL, &html)
+            .expect("Controller fixture should produce a bounded source envelope");
+        let source_units = test_listing_evidence_units(CONTROLLER_URL, &html);
+        let exact_source_capture_scope = ExactListingSourceCaptureScope {
+            plugin_submission_id: 1,
+            rendered_html_sha256: format!("{:x}", Sha256::digest(html.as_bytes())),
+        };
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ParsedAvionics {
+            manufacturer: None,
+            model: "GDU-1040".to_string(),
+            avionics_types: vec!["Flight Display".to_string()],
+            quantity: 2,
+            configuration_action: "installed".to_string(),
+            replaces: None,
+            source_evidence_text: Some(EVIDENCE.to_string()),
+            source_confidence: Some("medium".to_string()),
+        })];
+        let resolved = resolve_listing_avionics_values(
+            db,
+            &mut values,
+            Some(&unreachable),
+            Some(CONTROLLER_URL),
+            Some(&source),
+            Some(&source_units),
+            None,
+            Some(&exact_source_capture_scope),
+        )
+        .await
+        .expect("unsafe model-only display count should remain reviewable without Gemini");
+        (values, resolved)
+    }
+
+    async fn assert_model_only_dual_display_pending(
+        db: &AppDb,
+        values: &ListingValues,
+        resolved: &ResolvedListingAvionics,
+    ) {
+        assert!(values.avionics.is_empty());
+        assert_eq!(resolved.pending_review_aspects.len(), 1);
+        assert_eq!(
+            query_scalar_one!(db, i64, "SELECT COUNT(*) FROM gemini_api_usage")
+                .expect("usage count should load"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn model_only_dual_display_rejects_unattested_stale_ambiguous_and_suite_products() {
+        let unattested = AppDb::connect("sqlite::memory:").await.unwrap();
+        ensure_approved_test_avionics_model(&unattested, "Garmin", "GDU 1040", "Flight Display")
+            .await
+            .unwrap();
+        let (values, resolved) = resolve_test_model_only_dual_display(&unattested).await;
+        assert_model_only_dual_display_pending(&unattested, &values, &resolved).await;
+
+        let stale = AppDb::connect("sqlite::memory:").await.unwrap();
+        let stale_id =
+            ensure_approved_test_avionics_model(&stale, "Garmin", "GDU 1040", "Flight Display")
+                .await
+                .unwrap();
+        attest_approved_test_avionics_model_for_current_policy_reuse(&stale, stale_id).await;
+        let stale_origin_id = query_scalar_one!(
+            &stale,
+            i64,
+            "SELECT avionics_authoritative_source_origin_id FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+            stale_id,
+        )
+        .unwrap();
+        let stale_policy = query_scalar_one!(
+            &stale,
+            String,
+            "SELECT policy_version FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+            stale_id,
+        )
+        .unwrap();
+        execute_query!(
+            &stale,
+            "DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = ?",
+            stale_id,
+        )
+        .unwrap();
+        execute_query!(
+            &stale,
+            r#"
+            INSERT INTO avionics_product_reuse_attestations (
+              avionics_model_id, avionics_authoritative_source_origin_id,
+              policy_version, product_fingerprint
+            )
+            VALUES (?, ?, ?, ?)
+            "#,
+            stale_id,
+            stale_origin_id,
+            stale_policy,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let (values, resolved) = resolve_test_model_only_dual_display(&stale).await;
+        assert_model_only_dual_display_pending(&stale, &values, &resolved).await;
+
+        let ambiguous = AppDb::connect("sqlite::memory:").await.unwrap();
+        let canonical_id =
+            ensure_approved_test_avionics_model(&ambiguous, "Garmin", "GDU 1040", "Flight Display")
+                .await
+                .unwrap();
+        attest_approved_test_avionics_model_for_current_policy_reuse(&ambiguous, canonical_id)
+            .await;
+        super::ensure_avionics_model(
+            &ambiguous,
+            "Other Manufacturer",
+            "GDU-1040",
+            "Flight Display",
+        )
+        .await
+        .expect("an active cross-manufacturer collision should seed");
+        let (values, resolved) = resolve_test_model_only_dual_display(&ambiguous).await;
+        assert_model_only_dual_display_pending(&ambiguous, &values, &resolved).await;
+
+        let suite = AppDb::connect("sqlite::memory:").await.unwrap();
+        let suite_id =
+            ensure_approved_test_avionics_model(&suite, "Garmin", "GDU 1040", "Flight Display")
+                .await
+                .unwrap();
+        execute_query!(
+            &suite,
+            "UPDATE avionics_models SET valuation_scope = 'integrated_suite' WHERE id = ?",
+            suite_id,
+        )
+        .unwrap();
+        attest_approved_test_avionics_model_for_current_policy_reuse(&suite, suite_id).await;
+        let (values, resolved) = resolve_test_model_only_dual_display(&suite).await;
+        assert_model_only_dual_display_pending(&suite, &values, &resolved).await;
     }
 
     #[tokio::test]

@@ -2026,8 +2026,7 @@ async fn process_listing(
             avionics_types: &raw.avionics_types,
             quantity: raw.quantity,
         };
-        let primary_resolved_local_only =
-            !primary_identity.manufacturer.is_empty() && !requires_provider;
+        let primary_resolved_local_only = !requires_provider;
         let mut primary = if primary_identity.manufacturer.is_empty() {
             match resolve_model_only_identity_attempt(
                 db,
@@ -8417,6 +8416,165 @@ mod tests {
         .unwrap();
         assert_eq!(pending, 0);
         assert_eq!(usage, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_controller_model_only_dual_display_is_verified_provider_free() {
+        const EVIDENCE: &str = "Dual GDU-1040 PFD/MFD";
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_named_product_for_manufacturer_with_identifier_kind(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "GDU 1040",
+            "manufacturer_part_number",
+            "011-00972-00",
+            "Flight Display",
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(refresh_reuse_attestation_sqlite(
+            &db,
+            &mut transaction,
+            product_id,
+            "https://www.garmin.com/aviation/product",
+        )
+        .await
+        .unwrap());
+        transaction.commit().await.unwrap();
+
+        let listing_id = seed_listing(&db, CONTROLLER_ROLE_LISTING_URL).await;
+        seed_faa_admission(&db, listing_id).await;
+        let rendered_html = trusted_controller_role_html(EVIDENCE);
+        let extracted_listing_json = json!({"avionics": [{
+            "manufacturer": null,
+            "model": "GDU-1040",
+            "types": ["Flight Display"],
+            "quantity": 2,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": EVIDENCE,
+            "source_confidence": "medium"
+        }]})
+        .to_string();
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            CONTROLLER_ROLE_LISTING_URL,
+            &rendered_html,
+            Some(&extracted_listing_json),
+            Some(listing_id),
+            None,
+        )
+        .await;
+        let aspect = PendingReviewAspect::avionics(
+            "fixture:model-only-leading-dual:0",
+            "avionics",
+            "GDU-1040",
+            EVIDENCE,
+            "verified identity needs installation corroboration",
+            2,
+            "installed",
+            Some(EVIDENCE.to_string()),
+            Some("medium".to_string()),
+        )
+        .with_suggested_product(ReviewProduct::verified(
+            product_id,
+            "Garmin",
+            "GDU 1040",
+            vec!["Flight Display".to_string()],
+        ));
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[aspect],
+        )
+        .await
+        .unwrap();
+
+        let preflight =
+            preflight_listing_avionics(&db, listing_id, AvionicsVerificationExecutionMode::Apply)
+                .await
+                .expect("the exact model-only counted unit should preflight locally");
+        let ListingAvionicsVerificationPreflight::PendingReview { report } = preflight else {
+            panic!("the listing still has one pending review")
+        };
+        assert_eq!(report.verified_local_identity_components, 1);
+
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let applied = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("the model-only counted unit must not contact the unavailable provider");
+        let ListingAvionicsVerification::Processed { report } = applied else {
+            panic!("the pending review should be processed")
+        };
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.remaining_review_aspects, 0);
+        let link: (i64, String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, source, source_confidence, quantity
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            link,
+            (
+                product_id,
+                "listing_explicit_count".to_string(),
+                "high".to_string(),
+                2,
+            )
+        );
+        let authorization: String = sqlx::query_scalar(
+            r#"
+            SELECT authorization.authorization_kind
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
+            JOIN aircraft_sale_listing_avionics link
+              ON link.id = authorization.listing_link_id
+            WHERE link.aircraft_sale_listing_id = ?
+              AND authorization.association_role = 'installed'
+              AND authorization.avionics_model_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .bind(product_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(authorization, "manufacturer_reuse");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+            )
+            .bind(listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
