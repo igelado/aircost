@@ -3491,6 +3491,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn safe_literal_and_dual_repairs_avoid_flash_correction() {
+        let gma_evidence = "GMA-1347 Digital Audio Panel w/ Marker Beacons & Intercom";
+        let gdu_evidence = "Dual GDU-1040 PFD/MFD";
+        let kap_evidence = "KAP 140 Autopilot Dual Axis Autopilot coupled to the NAV/GPS";
+        let taws_evidence = "Terrain Avoidance System TAWS";
+        let mut gma = installed_avionics("Garmin", "GMA-1347", &["Audio Panel"], 1, gma_evidence);
+        let mut gdu =
+            installed_avionics("Garmin", "GDU-1040", &["Flight Display"], 2, gdu_evidence);
+        let mut kap = installed_avionics("Garmin", "KAP 140", &["Autopilot"], 1, kap_evidence);
+        kap["manufacturer"] = Value::Null;
+        let mut taws =
+            installed_avionics("Unknown", "TAWS", &["Terrain Awareness"], 1, taws_evidence);
+        let primary = listing_extraction_with_avionics(json!([
+            gma.clone(),
+            gdu.clone(),
+            kap.clone(),
+            taws.clone(),
+        ]));
+        let (endpoint, request_count, _) =
+            extraction_sequence_endpoint(vec![primary.to_string()]).await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html(
+            &format!("{gma_evidence}\n{gdu_evidence}\n{kap_evidence}\n{taws_evidence}"),
+            "GFC700",
+        );
+
+        let (preview, payload) =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(payload["avionics"][0]["manufacturer"], Value::Null);
+        assert_eq!(payload["avionics"][1]["manufacturer"], Value::Null);
+        assert_eq!(payload["avionics"][1]["quantity"], 2);
+        assert_eq!(payload["avionics"][1]["source_confidence"], "medium");
+        assert_eq!(payload["avionics"][2]["source_confidence"], "high");
+        assert_eq!(payload["avionics"][3]["manufacturer"], Value::Null);
+        assert_eq!(preview.parsed_listing.avionics.len(), 4);
+
+        gma["manufacturer"] = Value::Null;
+        gdu["manufacturer"] = Value::Null;
+        gdu["source_confidence"] = serde_json::json!("medium");
+        taws["manufacturer"] = Value::Null;
+        assert_eq!(payload["avionics"], json!([gma, gdu, kap, taws]));
+    }
+
+    #[tokio::test]
     async fn invalid_cross_field_avionics_uses_one_flash_correction_and_changes_only_avionics() {
         let primary_avionics = json!([installed_avionics(
             "Garmin",

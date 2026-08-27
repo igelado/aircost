@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::extract::{GeminiListingExtractor, ListingAvionicsCorrectionToken};
 use crate::listing::avionics::extraction::{
-    recover_controller_avionics_extraction, validate_unbound_current_avionics_extraction,
+    repair_listing_avionics_extraction, validate_unbound_current_avionics_extraction,
     AvionicsValidationFailure,
 };
 use crate::models::ParsedAvionics;
@@ -138,7 +138,7 @@ fn validate_listing_avionics(
     rendered_html: &str,
     extracted_listing: &mut Value,
 ) -> Result<Vec<ParsedAvionics>, AvionicsValidationFailure> {
-    recover_controller_avionics_extraction(extracted_listing, source_url, rendered_html)?;
+    repair_listing_avionics_extraction(extracted_listing, source_url, rendered_html)?;
     let occurrences = validate_unbound_current_avionics_extraction(
         &extracted_listing.to_string(),
         source_url,
