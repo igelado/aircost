@@ -116,7 +116,7 @@ const AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION: i64 = 2;
 const SQLITE_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
     "7de905a6bfbf89d5d0a9ed928982657035718b0278927d071ef99c31aa22a6fd";
 const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
-    "089d85331dcbf6e870539c750c687ec996eabaf9f61b95e6ff552bf550cb4293";
+    "86f85bef7b5a7659af6c8f8c80b6bb7f052f1121cf85b0fa93335870eebea653";
 const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE: &str = r#"
 BEGIN
   IF NEW.catalog_status = 'approved' AND (
@@ -134,14 +134,12 @@ BEGIN
     'flight director', 'transponder', 'ads b', 'ads b in', 'ads b out',
     'ads b in out', 'ads b in and out', 'weather radar', 'audio panel',
     'standard audio panel', 'audio controller', 'audio control panel',
-    'display', 'flight display', 'primary flight display', 'multifunction display',
-    'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
+    'display', 'flight display', 'pfd', 'mfd', 'pfd mfd', 'navigation indicator',
     'traffic', 'active traffic', 'traffic advisory system', 'datalink',
     'datalink weather', 'xm',
     'xm weather', 'xm radio', 'xm weather radio', 'lightning detection',
     'terrain awareness', 'terrain awareness system', 'terrain avoidance system',
-    'taws', 'synthetic vision', 'synthetic vision system',
-    'synthetic vision technology svt', 'svt',
+    'taws', 'synthetic vision', 'synthetic vision system', 'svt',
     'safetaxi', 'safe taxi',
     'flitecharts', 'flite charts', 'charts', 'electronic charts',
     'electronic stability and protection', 'electronic stability protection',
@@ -150,7 +148,8 @@ BEGIN
     'standby instrument', 'backup instruments', 'elt', 'adf', 'dme', 'ahrs',
     'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'waas',
     'waas gps', 'dual waas', 'remote transponder', 'transponder ads b',
-    'xm weather audio',
+    'primary flight display', 'multifunction display',
+    'synthetic vision technology svt', 'xm weather audio',
     '4 place voice activated intercom system',
     'digital egt cht outside air temp gauge', 'pilot s clock', 'remote elt',
     'stormscope', 'standard radio navigation', 'equipment'
