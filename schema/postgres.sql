@@ -3921,16 +3921,6 @@ CREATE TRIGGER listing_avionics_grounded_capabilities_immutable_update
 BEFORE UPDATE ON aircraft_sale_listing_avionics_grounded_capabilities
 FOR EACH ROW EXECUTE FUNCTION public.reject_listing_avionics_grounded_capability_update();
 
-INSERT INTO schema_migration_contracts (
-  migration_name, contract_version, contract_fingerprint, installed_at
-) VALUES (
-  '20260825_listing_avionics_grounded_capabilities',
-  1,
-  '461dcbde7146eb328b3a27c62e7effb1c893cf2768d96a3078b4bced80c0f7ef',
-  CURRENT_TIMESTAMP
-)
-ON CONFLICT (migration_name) DO NOTHING;
-
 -- Exact authorization for one listing-link component. Manufacturer-reuse
 -- authorizations bind the current global attestation; same-case authorizations
 -- bind the transient grounded resolution that approved this exact association.
