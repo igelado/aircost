@@ -68,13 +68,18 @@ All operational commands are dry-run unless `--apply` is supplied.
 
    Import revalidates the live source against the manifest, imports only the
    selected users, installs, and capture bytes, preserves original IDs and
-   submission timestamps, and resets extraction, error, and canonical-listing
-   fields. The replay target must then contain exactly the manifest submission
-   IDs. Replay rejects additional submissions, including malformed rows whose
-   owner or plugin install is missing or mismatched. Unbound submissions
-   reported as source exclusions are not imported; resetting selected
-   captures' derived canonical-listing IDs does not change that manifest
-   membership boundary.
+   owner/install/submission timestamps, and resets extraction, error, and
+   canonical-listing fields. Owner creation and update timestamps are required
+   authenticated manifest fields and must be identical for every capture owned
+   by the same user. On a newly initialized target, import may replace only the
+   canonical startup developer user's timestamps, and only when both source and
+   target retain that exact developer identity; every other preexisting or
+   conflicting owner fails closed. The replay target must then contain exactly
+   the manifest submission IDs. Replay rejects additional submissions,
+   including malformed rows whose owner or plugin install is missing or
+   mismatched. Unbound submissions reported as source exclusions are not
+   imported; resetting selected captures' derived canonical-listing IDs does
+   not change that manifest membership boundary.
 
 3. Seed the exact reviewed catalog closure from the current verified source:
 

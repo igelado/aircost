@@ -18,7 +18,7 @@ use super::admission::{
     database_error_is_membership_freeze, TargetMembership, MEMBERSHIP_FROZEN_MESSAGE,
 };
 use super::{
-    authenticate_retained_capture, retained_capture_timestamp_chronology_valid,
+    authenticate_retained_capture, trusted_capture_entry_timestamp_chronology_valid,
     validate_trusted_capture_manifest, RetainedCaptureAuthentication, TrustedCaptureEntry,
     TrustedCaptureManifest,
 };
@@ -227,6 +227,8 @@ struct TargetCaptureRow {
     owner_display_name: Option<String>,
     owner_auth_provider: Option<String>,
     owner_auth_subject: Option<String>,
+    owner_created_at: Option<String>,
+    owner_updated_at: Option<String>,
     install_id: Option<i64>,
     install_user_id: Option<i64>,
     install_public_key_base64: Option<String>,
@@ -249,6 +251,8 @@ impl TargetCaptureRow {
             user_display_name: self.owner_display_name.clone()?,
             user_auth_provider: self.owner_auth_provider.clone()?,
             user_auth_subject: self.owner_auth_subject.clone()?,
+            user_created_at: self.owner_created_at.clone()?,
+            user_updated_at: self.owner_updated_at.clone()?,
             plugin_install_id: self.submission_plugin_install_id,
             plugin_public_key_base64: self.install_public_key_base64.clone()?,
             plugin_install_created_at: self.install_created_at.clone()?,
@@ -846,6 +850,8 @@ async fn reconcile_exact_checkpoint(
                 .bind(&expected.user_display_name)
                 .bind(&expected.user_auth_provider)
                 .bind(&expected.user_auth_subject)
+                .bind(&expected.user_created_at)
+                .bind(&expected.user_updated_at)
                 .bind(expected.plugin_install_id)
                 .bind(&expected.plugin_public_key_base64)
                 .bind(&expected.plugin_install_created_at)
@@ -1069,6 +1075,8 @@ fn target_capture_rows_sql(db: &AppDb) -> std::borrow::Cow<'_, str> {
                   owner.display_name AS owner_display_name,
                   owner.auth_provider AS owner_auth_provider,
                   owner.auth_subject AS owner_auth_subject,
+                  owner.created_at AS owner_created_at,
+                  owner.updated_at AS owner_updated_at,
                   install.id AS install_id, install.user_id AS install_user_id,
                   install.public_key_base64 AS install_public_key_base64,
                   install.created_at AS install_created_at,
@@ -1131,10 +1139,8 @@ fn validate_target_capture_rows(
                 rendered_html: &actual_row.rendered_html,
                 rendered_html_sha256: &actual_row.rendered_html_sha256,
                 signature_base64: &actual_row.signature_base64,
-                timestamp_chronology_valid: retained_capture_timestamp_chronology_valid(
-                    &actual_entry.plugin_install_created_at,
-                    &actual_entry.submitted_at,
-                    actual_entry.plugin_install_revoked_at.as_deref(),
+                timestamp_chronology_valid: trusted_capture_entry_timestamp_chronology_valid(
+                    &actual_entry,
                 ),
             })
             .is_err()
@@ -1163,6 +1169,8 @@ fn exact_manifest_target_relation(db: &AppDb) -> &'static str {
                    AND manifest_owner.display_name = ?
                    AND manifest_owner.auth_provider = ?
                    AND manifest_owner.auth_subject = ?
+                   AND manifest_owner.created_at = ?
+                   AND manifest_owner.updated_at = ?
                    AND manifest_install.id = ?
                    AND manifest_install.public_key_base64 = ?
                    AND manifest_install.created_at = ?
@@ -1187,6 +1195,8 @@ fn exact_manifest_target_relation(db: &AppDb) -> &'static str {
                    AND manifest_owner.display_name = ?
                    AND manifest_owner.auth_provider = ?
                    AND manifest_owner.auth_subject = ?
+                   AND manifest_owner.created_at = ?
+                   AND manifest_owner.updated_at = ?
                    AND manifest_install.id = ?
                    AND manifest_install.public_key_base64 = ?
                    AND manifest_install.created_at = ?
@@ -1232,6 +1242,8 @@ fn append_exact_manifest_binds<'a>(
         Bind::Text(&expected.user_display_name),
         Bind::Text(&expected.user_auth_provider),
         Bind::Text(&expected.user_auth_subject),
+        Bind::Text(&expected.user_created_at),
+        Bind::Text(&expected.user_updated_at),
         Bind::I64(expected.plugin_install_id),
         Bind::Text(&expected.plugin_public_key_base64),
         Bind::Text(&expected.plugin_install_created_at),
@@ -1652,6 +1664,8 @@ async fn claim_item(
                 .bind(&expected.user_display_name)
                 .bind(&expected.user_auth_provider)
                 .bind(&expected.user_auth_subject)
+                .bind(&expected.user_created_at)
+                .bind(&expected.user_updated_at)
                 .bind(expected.plugin_install_id)
                 .bind(&expected.plugin_public_key_base64)
                 .bind(&expected.plugin_install_created_at)
@@ -1841,6 +1855,8 @@ async fn finish_succeeded(
                 .bind(&expected.user_display_name)
                 .bind(&expected.user_auth_provider)
                 .bind(&expected.user_auth_subject)
+                .bind(&expected.user_created_at)
+                .bind(&expected.user_updated_at)
                 .bind(expected.plugin_install_id)
                 .bind(&expected.plugin_public_key_base64)
                 .bind(&expected.plugin_install_created_at)
@@ -3863,7 +3879,8 @@ mod tests {
                 "{drift}: {message}"
             );
             assert!(
-                message.contains("exact capture identity drifted"),
+                message
+                    .contains("invalid owner/install/submission/revocation timestamp chronology"),
                 "{drift}"
             );
             assert!(!message.contains("not-a-timestamp"), "{drift}");
@@ -4380,6 +4397,8 @@ mod tests {
             "user_display_name",
             "user_auth_provider",
             "user_auth_subject",
+            "user_created_at",
+            "user_updated_at",
             "plugin_install_id",
             "plugin_public_key_base64",
             "plugin_install_created_at",
@@ -4424,6 +4443,20 @@ mod tests {
                 }
                 "user_auth_subject" => {
                     sqlx::query("UPDATE users SET auth_subject = 'drifted-subject' WHERE id = ?")
+                        .bind(user.id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                "user_created_at" => {
+                    sqlx::query("UPDATE users SET created_at = '2026-08-17 23:59:59' WHERE id = ?")
+                        .bind(user.id)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+                "user_updated_at" => {
+                    sqlx::query("UPDATE users SET updated_at = '2026-08-18 00:00:01' WHERE id = ?")
                         .bind(user.id)
                         .execute(pool)
                         .await
@@ -5193,6 +5226,8 @@ mod tests {
             "user_display_name",
             "user_auth_provider",
             "user_auth_subject",
+            "user_created_at",
+            "user_updated_at",
             "public_key_base64",
             "install_created_at",
             "revoked_at",
@@ -5264,6 +5299,12 @@ mod tests {
                 }
                 "user_auth_subject" => {
                     stale_expected.user_auth_subject = "interleaved-subject".to_string();
+                }
+                "user_created_at" => {
+                    stale_expected.user_created_at = "2026-08-17 23:59:59".to_string();
+                }
+                "user_updated_at" => {
+                    stale_expected.user_updated_at = "2026-08-18 00:00:01".to_string();
                 }
                 "public_key_base64" => {
                     stale_expected.plugin_public_key_base64.push_str("changed");
