@@ -117,15 +117,7 @@ pub(super) fn reset_requires_reextraction(
                     && aspect.source_evidence_text.as_deref()
                         == occurrence.source_evidence_text.as_deref()
                     && aspect.source_confidence.is_some()
-                    && aspect_matches_occurrence_semantics(aspect, occurrence, prior_aspects)
-                    && aspect.proposed_product.as_ref().is_some_and(|proposed| {
-                        avionics_identities_are_typography_exact(
-                            &proposed.manufacturer,
-                            &proposed.model,
-                            &occurrence.manufacturer,
-                            &occurrence.model,
-                        )
-                    })
+                    && aspect_claims_literal_observation(aspect, occurrence, prior_aspects)
             })
             .map(|(aspect_index, _)| aspect_index)
             .collect::<Vec<_>>();
@@ -139,9 +131,8 @@ pub(super) fn reset_requires_reextraction(
             continue;
         }
         return Ok(Some(format!(
-            "current extraction avionics[{index}] {} {} has no one-to-one current link or residual-review claim; validated re-extraction or a durable disposition receipt is required before reset",
-            occurrence.manufacturer.trim(),
-            occurrence.model.trim()
+            "current extraction avionics[{index}] {} has no one-to-one current link or residual-review claim; validated re-extraction or a durable disposition receipt is required before reset",
+            identity_label(occurrence.manufacturer.as_deref(), &occurrence.model),
         )));
     }
     Ok(None)
@@ -499,15 +490,7 @@ fn align_occurrence(
                 && aspect.source_evidence_text.as_deref()
                     == occurrence.source_evidence_text.as_deref()
                 && aspect.source_confidence.is_some()
-                && aspect_matches_occurrence_semantics(aspect, occurrence, prior_aspects)
-                && aspect.proposed_product.as_ref().is_some_and(|proposed| {
-                    avionics_identities_are_typography_exact(
-                        &proposed.manufacturer,
-                        &proposed.model,
-                        &occurrence.manufacturer,
-                        &occurrence.model,
-                    )
-                })
+                && aspect_claims_literal_observation(aspect, occurrence, prior_aspects)
         })
         .filter_map(|aspect| {
             let [association] = aspect.covered_associations.as_slice() else {
@@ -575,20 +558,25 @@ fn replacement_identity_is_exact(
     match replacement {
         None => assignment.replaces_avionics_model_id.is_none(),
         Some(replacement) => {
-            assignment
-                .replacement_manufacturer
+            replacement
+                .manufacturer
                 .as_deref()
-                .is_some_and(|manufacturer| {
+                .is_some_and(|observed_manufacturer| {
                     assignment
-                        .replacement_model
+                        .replacement_manufacturer
                         .as_deref()
-                        .is_some_and(|model| {
-                            avionics_identities_are_typography_exact(
-                                &replacement.manufacturer,
-                                &replacement.model,
-                                manufacturer,
-                                model,
-                            )
+                        .is_some_and(|manufacturer| {
+                            assignment
+                                .replacement_model
+                                .as_deref()
+                                .is_some_and(|model| {
+                                    avionics_identities_are_typography_exact(
+                                        observed_manufacturer,
+                                        &replacement.model,
+                                        manufacturer,
+                                        model,
+                                    )
+                                })
                         })
                 })
         }
@@ -599,18 +587,23 @@ fn occurrence_identity_is_exact(
     occurrence: &ParsedAvionics,
     assignment: &ExistingAssignmentRow,
 ) -> bool {
-    assignment
-        .installed_manufacturer
+    occurrence
+        .manufacturer
         .as_deref()
-        .is_some_and(|manufacturer| {
-            assignment.installed_model.as_deref().is_some_and(|model| {
-                avionics_identities_are_typography_exact(
-                    &occurrence.manufacturer,
-                    &occurrence.model,
-                    manufacturer,
-                    model,
-                )
-            })
+        .is_some_and(|observed_manufacturer| {
+            assignment
+                .installed_manufacturer
+                .as_deref()
+                .is_some_and(|manufacturer| {
+                    assignment.installed_model.as_deref().is_some_and(|model| {
+                        avionics_identities_are_typography_exact(
+                            observed_manufacturer,
+                            &occurrence.model,
+                            manufacturer,
+                            model,
+                        )
+                    })
+                })
         })
         && replacement_identity_is_exact(occurrence.replaces.as_ref(), assignment)
 }
@@ -645,6 +638,48 @@ fn aspect_matches_occurrence_semantics(
     }
 }
 
+/// Bind an ordinary machine-owned review card to the exact current extraction
+/// observation it represents.
+///
+/// Manufacturer-qualified observations retain a catalog-shaped proposal as
+/// their literal identity snapshot. A model-only observation deliberately has
+/// no proposal, because manufacturing a maker would turn a retrieval hint into
+/// listing evidence. Its exact current label and observation text therefore
+/// form the immutable identity/capability snapshot used by reset and restage.
+fn aspect_claims_literal_observation(
+    aspect: &PendingReviewAspect,
+    occurrence: &ParsedAvionics,
+    aspects: &[PendingReviewAspect],
+) -> bool {
+    if !aspect_matches_occurrence_semantics(aspect, occurrence, aspects) {
+        return false;
+    }
+    match occurrence.manufacturer.as_deref() {
+        Some(manufacturer) => aspect.proposed_product.as_ref().is_some_and(|proposed| {
+            avionics_identities_are_typography_exact(
+                &proposed.manufacturer,
+                &proposed.model,
+                manufacturer,
+                &occurrence.model,
+            )
+        }),
+        None => {
+            aspect.proposed_product.is_none()
+                && aspect.label == identity_label(None, &occurrence.model)
+                && aspect.observed_text
+                    == observation_text(
+                        None,
+                        &occurrence.model,
+                        &occurrence.avionics_types,
+                        occurrence.quantity,
+                        &occurrence.configuration_action,
+                    )
+                && aspect.allowed_actions
+                    == [ReviewAction::UseVerifiedProduct, ReviewAction::Discard]
+        }
+    }
+}
+
 fn is_machine_synthetic(aspect: &PendingReviewAspect) -> bool {
     aspect.kind == "avionics_reuse_attestation"
 }
@@ -652,7 +687,7 @@ fn is_machine_synthetic(aspect: &PendingReviewAspect) -> bool {
 fn ordinary_aspect(
     id: String,
     occurrence: &ParsedAvionics,
-    identity: (&str, &str, &[String]),
+    identity: (Option<&str>, &str, &[String]),
     assignment: Option<&ExistingAssignmentRow>,
     catalog: &[CatalogProjectionProduct],
     installed_authorized: bool,
@@ -675,7 +710,7 @@ fn ordinary_aspect(
     let mut aspect = PendingReviewAspect::avionics(
         id,
         "avionics",
-        format!("{} {}", identity.0.trim(), identity.1.trim()),
+        identity_label(identity.0, identity.1),
         observation_text(
             identity.0,
             identity.1,
@@ -689,7 +724,7 @@ fn ordinary_aspect(
         occurrence.source_evidence_text.clone(),
         occurrence.source_confidence.clone(),
     );
-    aspect.allowed_actions = review_actions();
+    aspect.allowed_actions = review_actions(identity.0.is_some());
     aspect.proposed_product = proposed_or_unreviewed(identity, &catalog_matches);
     if let Some(product) = matched_product.filter(|product| product.catalog_status == "approved") {
         aspect.suggested_product = Some(review_product(product));
@@ -707,20 +742,17 @@ fn replacement_aspect(
     assignment: Option<&ExistingAssignmentRow>,
     catalog: &[CatalogProjectionProduct],
 ) -> PendingReviewAspect {
-    let matches = exact_catalog_matches(&replacement.manufacturer, &replacement.model, catalog);
+    let manufacturer = replacement.manufacturer.as_deref();
+    let matches = exact_catalog_matches(manufacturer, &replacement.model, catalog);
     let matched_product = assignment
         .and_then(|assignment| assignment.replaces_avionics_model_id)
         .and_then(|id| catalog.iter().find(|product| product.id == id));
     let mut aspect = PendingReviewAspect::avionics(
         id,
         "avionics",
-        format!(
-            "{} {}",
-            replacement.manufacturer.trim(),
-            replacement.model.trim()
-        ),
+        identity_label(manufacturer, &replacement.model),
         observation_text(
-            &replacement.manufacturer,
+            manufacturer,
             &replacement.model,
             &replacement.avionics_types,
             1,
@@ -740,10 +772,10 @@ fn replacement_aspect(
         occurrence.source_evidence_text.clone(),
         occurrence.source_confidence.clone(),
     );
-    aspect.allowed_actions = review_actions();
+    aspect.allowed_actions = review_actions(manufacturer.is_some());
     aspect.proposed_product = proposed_or_unreviewed(
         (
-            &replacement.manufacturer,
+            manufacturer,
             &replacement.model,
             &replacement.avionics_types,
         ),
@@ -842,10 +874,13 @@ fn add_unmatched_preserved_components(
 }
 
 fn exact_catalog_matches<'a>(
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
     catalog: &'a [CatalogProjectionProduct],
 ) -> Vec<&'a CatalogProjectionProduct> {
+    let Some(manufacturer) = manufacturer else {
+        return Vec::new();
+    };
     catalog
         .iter()
         .filter(|product| {
@@ -857,9 +892,10 @@ fn exact_catalog_matches<'a>(
 }
 
 fn proposed_or_unreviewed(
-    identity: (&str, &str, &[String]),
+    identity: (Option<&str>, &str, &[String]),
     matches: &[&CatalogProjectionProduct],
 ) -> Option<ReviewProduct> {
+    let manufacturer = identity.0?;
     match matches {
         [product] if product.catalog_status == "unreviewed" => {
             Some(ReviewProduct::unreviewed_catalog_candidate(
@@ -870,7 +906,7 @@ fn proposed_or_unreviewed(
             ))
         }
         _ => Some(ReviewProduct::proposed(
-            identity.0.trim(),
+            manufacturer.trim(),
             identity.1.trim(),
             identity.2.to_vec(),
         )),
@@ -903,37 +939,47 @@ fn review_product(product: &CatalogProjectionProduct) -> ReviewProduct {
     )
 }
 
-fn review_actions() -> Vec<ReviewAction> {
-    vec![
-        ReviewAction::UseVerifiedProduct,
-        ReviewAction::CreateVerifiedProduct,
-        ReviewAction::Discard,
-    ]
+fn review_actions(can_create: bool) -> Vec<ReviewAction> {
+    let mut actions = vec![ReviewAction::UseVerifiedProduct];
+    if can_create {
+        actions.push(ReviewAction::CreateVerifiedProduct);
+    }
+    actions.push(ReviewAction::Discard);
+    actions
 }
 
-fn occurrence_identity(occurrence: &ParsedAvionics) -> (&str, &str, &[String]) {
+fn occurrence_identity(occurrence: &ParsedAvionics) -> (Option<&str>, &str, &[String]) {
     (
-        &occurrence.manufacturer,
+        occurrence.manufacturer.as_deref(),
         &occurrence.model,
         &occurrence.avionics_types,
     )
 }
 
 fn observation_text(
-    manufacturer: &str,
+    manufacturer: Option<&str>,
     model: &str,
     capabilities: &[String],
     quantity: i64,
     action: &str,
 ) -> String {
     format!(
-        "{} {} · {} · quantity {} · {}",
-        manufacturer.trim(),
-        model.trim(),
+        "{} · {} · quantity {} · {}",
+        identity_label(manufacturer, model),
         capabilities.join(", "),
         quantity,
         action
     )
+}
+
+fn identity_label(manufacturer: Option<&str>, model: &str) -> String {
+    manufacturer
+        .map(str::trim)
+        .filter(|manufacturer| !manufacturer.is_empty())
+        .map_or_else(
+            || model.trim().to_string(),
+            |manufacturer| format!("{manufacturer} {}", model.trim()),
+        )
 }
 
 fn stale_correction(aspect: &PendingReviewAspect, reason: &str) -> ReviewError {
@@ -952,7 +998,7 @@ mod tests {
 
     fn occurrence(manufacturer: &str, model: &str, evidence: &str) -> ParsedAvionics {
         ParsedAvionics {
-            manufacturer: manufacturer.to_string(),
+            manufacturer: Some(manufacturer.to_string()),
             model: model.to_string(),
             avionics_types: vec!["Flight Display".to_string()],
             quantity: 1,
@@ -990,6 +1036,71 @@ mod tests {
             installed_catalog_status: Some("approved".to_string()),
             replacement_catalog_status: None,
         }
+    }
+
+    #[test]
+    fn model_only_observation_has_no_fake_manufacturer_or_create_action() {
+        let mut observation = occurrence("L3", "WX500", "WX500 Stormscope");
+        observation.manufacturer = None;
+        observation.avionics_types = vec!["Lightning Detection".to_string()];
+
+        let projected = project_pending_review(PendingReviewProjection {
+            occurrences: &[observation],
+            assignments: &[],
+            catalog: &[],
+            authorized_associations: &HashSet::new(),
+            prior_aspects: &[],
+        })
+        .unwrap();
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].label, "WX500");
+        assert!(projected[0].observed_text.starts_with("WX500 ·"));
+        assert_eq!(projected[0].proposed_product, None);
+        assert_eq!(
+            projected[0].allowed_actions,
+            [ReviewAction::UseVerifiedProduct, ReviewAction::Discard]
+        );
+    }
+
+    #[test]
+    fn unchanged_model_only_card_is_a_durable_reset_and_restage_claim() {
+        let mut observation = occurrence("L3", "WX500", "WX500 Stormscope");
+        observation.manufacturer = None;
+        observation.avionics_types = vec!["Lightning Detection".to_string()];
+        let first = project_pending_review(PendingReviewProjection {
+            occurrences: std::slice::from_ref(&observation),
+            assignments: &[],
+            catalog: &[],
+            authorized_associations: &HashSet::new(),
+            prior_aspects: &[],
+        })
+        .unwrap();
+
+        assert_eq!(
+            reset_requires_reextraction(std::slice::from_ref(&observation), &[], first.as_slice(),)
+                .unwrap(),
+            None
+        );
+        let restaged = project_pending_review(PendingReviewProjection {
+            occurrences: std::slice::from_ref(&observation),
+            assignments: &[],
+            catalog: &[],
+            authorized_associations: &HashSet::new(),
+            prior_aspects: first.as_slice(),
+        })
+        .unwrap();
+        assert_eq!(restaged, first);
+
+        let mut invented = first;
+        invented[0].proposed_product = Some(ReviewProduct::proposed(
+            "L3",
+            "WX500",
+            vec!["Lightning Detection".to_string()],
+        ));
+        assert!(reset_requires_reextraction(&[observation], &[], &invented)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1145,7 +1256,7 @@ mod tests {
             .unwrap();
         assert_eq!(correction.label, "Garmin G5");
         assert_eq!(correction.reason, ORDINARY_UNRESOLVED_REASON);
-        assert_eq!(correction.allowed_actions, review_actions());
+        assert_eq!(correction.allowed_actions, review_actions(true));
         assert_eq!(
             correction.covered_associations,
             [CoveredListingAssociation {
@@ -1166,7 +1277,7 @@ mod tests {
 
         let validated = super::super::validated_aspects(&projected).unwrap();
         assert_eq!(validated.len(), 1);
-        assert_eq!(validated[0].allowed_actions, review_actions());
+        assert_eq!(validated[0].allowed_actions, review_actions(true));
         assert_eq!(validated[0].covered_associations.len(), 1);
 
         let mut maintained = projected.clone();
@@ -1185,7 +1296,7 @@ mod tests {
             &HashSet::new(),
         )
         .unwrap());
-        assert_eq!(maintained[0].allowed_actions, review_actions());
+        assert_eq!(maintained[0].allowed_actions, review_actions(true));
         assert_eq!(maintained[0].reuse_attestation_target_id, None);
 
         let mut cleared_assignment = assignments[0].clone();
@@ -1339,7 +1450,10 @@ mod tests {
                     occurrence.source_confidence.clone(),
                 )
                 .with_proposed_product(ReviewProduct::proposed(
-                    occurrence.manufacturer.clone(),
+                    occurrence
+                        .manufacturer
+                        .clone()
+                        .expect("fixture observations name Garmin"),
                     occurrence.model.clone(),
                     occurrence.avionics_types.clone(),
                 ))
@@ -1454,7 +1568,7 @@ mod tests {
         let mut observation = occurrence("Garmin", "GTN 750Xi", evidence);
         observation.configuration_action = "replaces".to_string();
         observation.replaces = Some(ParsedAvionicsReference {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GNS 530W".to_string(),
             avionics_types: vec!["GPS".to_string()],
         });
@@ -1634,7 +1748,7 @@ mod tests {
             "GTN 750Xi",
             vec!["Flight Display".to_string()],
         ));
-        parent.allowed_actions = review_actions();
+        parent.allowed_actions = review_actions(true);
         let mut child = PendingReviewAspect::avionics(
             child_id,
             "avionics",
@@ -1651,7 +1765,7 @@ mod tests {
             "GNS 530W",
             vec!["Flight Display".to_string()],
         ));
-        child.allowed_actions = review_actions();
+        child.allowed_actions = review_actions(true);
         let prior = [parent, child];
 
         assert_eq!(
@@ -1705,7 +1819,7 @@ mod tests {
         let mut observation = occurrence("Garmin", "GTN 750Xi", evidence);
         observation.configuration_action = "replaces".to_string();
         observation.replaces = Some(ParsedAvionicsReference {
-            manufacturer: "Garmin".to_string(),
+            manufacturer: Some("Garmin".to_string()),
             model: "GNS 530W".to_string(),
             avionics_types: vec!["GPS".to_string()],
         });

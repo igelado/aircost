@@ -29,7 +29,9 @@ use crate::listing::avionics::correction::{
 use crate::listing::avionics::disposition::{
     record_automatic_occurrence_dispositions, AutomaticOccurrenceDisposition,
 };
-use crate::listing::avionics::extraction::validate_unbound_current_avionics_extraction;
+use crate::listing::avionics::extraction::{
+    parse_current_avionics_extraction_value, validate_unbound_current_avionics_extraction,
+};
 use crate::listing::review::attach_pending_review_submission;
 use crate::listings::{
     create_listing_with_progress_and_occurrence_dispositions,
@@ -1364,7 +1366,7 @@ pub(crate) fn parse_current_checkpoint_payload(
             "replay extraction is not valid checkpoint JSON: {error}"
         ))
     })?;
-    let object = value.as_object_mut().ok_or_else(|| {
+    let object = value.as_object().ok_or_else(|| {
         PluginStoreError::Validation(
             "replay extraction checkpoint must be one top-level object".to_string(),
         )
@@ -1377,6 +1379,14 @@ pub(crate) fn parse_current_checkpoint_payload(
             "replay extraction checkpoint contains unsupported field {field:?}"
         )));
     }
+    parse_current_avionics_extraction_value(&value).map_err(|error| {
+        PluginStoreError::Validation(format!(
+            "replay extraction has invalid current avionics: {error}"
+        ))
+    })?;
+    let object = value
+        .as_object_mut()
+        .expect("the checkpoint top-level object was checked above");
     let identity_recovery = object
         .remove("visual_identity_recovery")
         .map(serde_json::from_value)
@@ -3490,6 +3500,9 @@ mod tests {
             "GARMIN G1000 NXI SVT Yes",
         )]);
         let primary = listing_extraction_with_avionics(primary_avionics);
+        let mut model_only_gfc =
+            installed_avionics("Garmin", "GFC700", &["Autopilot"], 1, "GFC700");
+        model_only_gfc["manufacturer"] = Value::Null;
         let corrected_avionics = json!([
             installed_avionics(
                 "Garmin",
@@ -3498,7 +3511,7 @@ mod tests {
                 1,
                 "GARMIN G1000 NXI",
             ),
-            installed_avionics("Garmin", "GFC700", &["Autopilot"], 1, "GFC700"),
+            model_only_gfc,
         ]);
         let (endpoint, request_count, requests) = extraction_sequence_endpoint(vec![
             primary.to_string(),
@@ -5697,5 +5710,34 @@ mod tests {
         let (listing, retained) = parse_current_checkpoint_payload(&payload.to_string()).unwrap();
         assert_eq!(listing.registration_number.as_deref(), Some("N182PF"));
         assert_eq!(retained, Some(recovery));
+    }
+
+    #[test]
+    fn checkpoint_requires_explicit_nullable_avionics_manufacturer_member() {
+        let mut payload = json!({
+            "manufacturer":"Cessna","model":"182","variant":"182T","model_year":2020,
+            "asking_price_usd":200000.0,"currency":"USD","airframe_hours":500.0,
+            "engine_hours":null,"engine_time_basis":"unknown","engine_time_evidence":null,
+            "engine_time_confidence":null,"propeller_hours":null,"propeller_time_basis":"unknown",
+            "propeller_time_evidence":null,"propeller_time_confidence":null,"installed_engine":null,
+            "installed_propeller":null,"registration_number":"N182PF","serial_number":null,
+            "status":"active",
+            "avionics":[{
+                "manufacturer":null,"model":"WX500","types":["Lightning Detection"],
+                "quantity":1,"configuration_action":"installed","replaces":null,
+                "source_evidence_text":"WX500 Stormscope","source_confidence":"high"
+            }],
+            "valuation_facts":[]
+        });
+        let (listing, _) = parse_current_checkpoint_payload(&payload.to_string()).unwrap();
+        assert_eq!(listing.avionics[0].manufacturer, None);
+
+        payload["avionics"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("manufacturer");
+        let error = parse_current_checkpoint_payload(&payload.to_string())
+            .expect_err("an omitted current manufacturer member must not deserialize as null");
+        assert!(error.to_string().contains("manufacturer"));
     }
 }

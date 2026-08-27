@@ -1683,6 +1683,91 @@ pub async fn resolve_verified_local_avionics_identity(
     ))
 }
 
+/// Resolve a listing observation whose exact model is present but whose
+/// manufacturer is not stated by the listing.
+///
+/// This boundary is deliberately local-only. It can reuse one globally
+/// unique, approved, currently attested catalog identity, but it never calls
+/// Gemini and cannot create, promote, or mutate a catalog product.
+pub(crate) async fn resolve_verified_local_avionics_model_observation(
+    db: &AppDb,
+    observed_model: &str,
+    observed_types: &[String],
+    listing_evidence_text: &str,
+) -> CatalogResult<Option<ApprovedAvionicsIdentity>> {
+    if observed_model.trim().is_empty()
+        || listing_evidence_text.trim().is_empty()
+        || observed_types.is_empty()
+        || observed_types.iter().any(|capability| {
+            let capability = capability.trim();
+            capability.is_empty() || !CURATED_AVIONICS_TYPES.contains(&capability)
+        })
+    {
+        return Ok(None);
+    }
+    let catalog = load_catalog_candidates(db).await?;
+    let approved_candidates = load_known_approved_candidates(db).await?;
+    let active_collision_catalog = load_active_collision_catalog_rows(db).await?;
+    Ok(globally_unique_exact_model_local_match_core(
+        observed_model,
+        observed_types,
+        listing_evidence_text,
+        &approved_candidates,
+        &catalog,
+        &active_collision_catalog,
+    ))
+}
+
+/// Retrieve the sole collision-safe approved catalog row for a model-only
+/// listing observation without authorizing its reuse.
+///
+/// Unlike `resolve_verified_local_avionics_model_observation`, this lookup
+/// does not require a current reuse attestation. Its result is review metadata
+/// only: callers may present it to a reviewer, but must not install it without
+/// the ordinary review and attestation boundary.
+pub(crate) async fn unique_exact_avionics_model_observation_review_candidate(
+    db: &AppDb,
+    observed_model: &str,
+    observed_types: &[String],
+    listing_evidence_text: &str,
+) -> CatalogResult<Option<AvionicsReviewCatalogCandidate>> {
+    let canonical_types = canonicalize_avionics_types(observed_types);
+    if observed_model.trim().is_empty()
+        || listing_evidence_text.trim().is_empty()
+        || observed_types.is_empty()
+        || canonical_types.len() != observed_types.len()
+    {
+        return Ok(None);
+    }
+    let active_collision_catalog = load_active_collision_catalog_rows(db).await?;
+    let Some(selected_id) = globally_unique_active_exact_model_id(
+        observed_model,
+        listing_evidence_text,
+        &active_collision_catalog,
+    ) else {
+        return Ok(None);
+    };
+    let catalog = load_catalog_candidates(db).await?;
+    let Some(selected) = catalog.iter().find(|candidate| candidate.id == selected_id) else {
+        return Ok(None);
+    };
+    if !canonical_types
+        .iter()
+        .all(|capability| selected.avionics_types.contains(capability))
+    {
+        return Ok(None);
+    }
+    Ok(Some(AvionicsReviewCatalogCandidate {
+        id: selected.id,
+        manufacturer: selected.manufacturer.clone(),
+        model: selected.model.clone(),
+        avionics_types: selected.avionics_types.clone(),
+        manufacturer_identifier_kind: selected.manufacturer_identifier_kind.clone(),
+        manufacturer_identifier: selected.manufacturer_identifier.clone(),
+        catalog_status: selected.catalog_status.clone(),
+    }))
+}
+
 /// Resolve one already-validated Controller run-on occurrence without Gemini.
 ///
 /// The caller remains responsible for proving that `listing_context` is the
@@ -7158,6 +7243,7 @@ mod tests {
         require_response_evidence_source_urls_not_revoked, resolution_issues,
         resolution_issues_with_direct_source_proofs, resolve_avionics_identity,
         resolve_verified_catalog_avionics_identity, resolve_verified_local_avionics_identity,
+        resolve_verified_local_avionics_model_observation,
         revalidate_direct_source_admission_state, review_preflight_outcome,
         select_opportunistic_authoritative_source_urls, select_unique_exact_review_candidate,
         shortlist_avionics_candidates, should_run_listing_only_approved_candidate_adjudication,
@@ -12375,6 +12461,21 @@ mod tests {
             .expect("global exact-model proof should supply the missing canonical maker");
         assert_eq!(missing_maker.id, stored.id);
         assert_eq!(missing_maker.manufacturer, "BendixKing");
+        let absent_maker = resolve_verified_local_avionics_model_observation(
+            &db,
+            "KAP-140",
+            &["Autopilot".to_string()],
+            "KAP-140 autopilot installed",
+        )
+        .await
+        .expect("a model-only observation should remain provider-free")
+        .expect("the unique attested exact model should supply canonical identity");
+        assert_eq!(absent_maker.id, stored.id);
+        assert_eq!(absent_maker.manufacturer, "BendixKing");
+        assert_eq!(
+            absent_maker.verified_local_reuse_proof,
+            Some(VerifiedLocalReuseProof::GlobalExactModel)
+        );
         assert_eq!(
             plan_avionics_identity_verification_route(&db, &request)
                 .await

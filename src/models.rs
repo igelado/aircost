@@ -22,7 +22,10 @@ pub struct User {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ParsedAvionics {
-    pub manufacturer: String,
+    /// Literal manufacturer named by the listing occurrence. Catalog
+    /// resolution supplies the canonical manufacturer later; model-only
+    /// listing evidence must not invent one.
+    pub manufacturer: Option<String>,
     pub model: String,
     /// Capabilities exposed by this physical product. Product identity is
     /// independent of capability, so there is intentionally no primary type.
@@ -42,7 +45,9 @@ pub struct ParsedAvionics {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ParsedAvionicsReference {
-    pub manufacturer: String,
+    /// Literal manufacturer named for the displaced unit, when present in the
+    /// listing occurrence.
+    pub manufacturer: Option<String>,
     pub model: String,
     #[serde(default, rename = "types")]
     pub avionics_types: Vec<String>,
