@@ -10106,6 +10106,10 @@ WHEN NEW.catalog_status = 'approved'
   'standby instrument', 'backup instruments', 'elt', 'adf', 'dme', 'ahrs',
   'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'waas',
   'waas gps', 'dual waas', 'remote transponder', 'transponder ads b',
+  'primary flight display', 'multifunction display',
+  'synthetic vision technology svt', 'xm weather audio',
+  '4 place voice activated intercom system',
+  'digital egt cht outside air temp gauge', 'pilot s clock', 'remote elt',
   'stormscope', 'standard radio navigation', 'equipment'
   )
  )
@@ -10143,6 +10147,10 @@ WHEN NEW.catalog_status = 'approved'
   'standby instrument', 'backup instruments', 'elt', 'adf', 'dme', 'ahrs',
   'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'waas',
   'waas gps', 'dual waas', 'remote transponder', 'transponder ads b',
+  'primary flight display', 'multifunction display',
+  'synthetic vision technology svt', 'xm weather audio',
+  '4 place voice activated intercom system',
+  'digital egt cht outside air temp gauge', 'pilot s clock', 'remote elt',
   'stormscope', 'standard radio navigation', 'equipment'
   )
  )
@@ -10163,7 +10171,7 @@ INSERT INTO schema_migration_contracts (
   migration_name, contract_version, contract_fingerprint, installed_at
 ) VALUES (
   '20260824_avionics_generic_feature_labels', 1,
-  '366cf90682d11e71293461aca169445a04f8b906d8c15dab6fde76e1dc2384c8',
+  '1b6d0765cbd192c594f28342e8f364118f49c8cb3396eab28b900716b9298435',
   CURRENT_TIMESTAMP
 )
 ON CONFLICT (migration_name) DO NOTHING;

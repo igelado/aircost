@@ -2275,6 +2275,7 @@ const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
 - A non-null manufacturer must be a separate whitespace-delimited source label, not a prefix split from one hyphenated or fused product code. From GDL-69A return manufacturer null and model GDL-69A; only Garmin GDL-69A supports manufacturer Garmin with model GDL-69A. Preserve the complete source-authored model token.\n\
 - A source-authored shared prefix inside one evidence span may support multiple rows, but keep each right-hand shorthand model literal and do not carry the prefix or manufacturer across rows. From Garmin GTN 750 & 650, return manufacturer Garmin with model GTN 750 for the first row, then manufacturer null with model 650 for the second row; do not invent Garmin or GTN for that shorthand row.\n\
 - Preserve source-authored labels and typography. From Garmin G3X Touchscreen PFD/MFD use model G3X Touchscreen, not G3X Touch; from Garmin 255 Nav/Com use model 255, not GNC 255; from JPI 830 engine monitor use model 830, not EDM 830; and from Garmin GFC500 Autopilot use model GFC500, not GFC 500.\n\
+- Omit descriptive equipment or feature labels that contain no product designator, even when a manufacturer is nearby. Primary Flight Display, Multifunction Display, Synthetic Vision Technology (SVT), XM Weather & Audio, 4-Place Voice-Activated Intercom System, Digital EGT/CHT/Outside Air Temp Gauge, Pilot's Clock, and Remote ELT are descriptions, not model identities; being the only source label does not turn a description into a product identity. If the same evidence names a concrete designator, return that literal designator instead.\n\
 - Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation. If the selected evidence cannot support a useful literal model identity, omit that occurrence instead of inventing one.\n";
 
 const LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE: &str = "\
@@ -2327,7 +2328,7 @@ Rules:\n\
 - For replaces/removes, replaces must identify the concrete displaced unit. For removes with no new unit, use the removed unit as both the item identity and replaces identity. For installed, replaces must be null.\n\
 - valuation_facts contains only source-backed facts material to value. Allowed kinds are restoration, damage_history, log_completeness, paint_condition, interior_condition, engine_conversion, airframe_conversion, and major_modification.\n\
 - For each valuation fact, value is a concise normalized description, evidence_text is a short exact span copied from the listing, and confidence is high, medium, or low. Omit facts that are not explicitly supported; do not infer that an unmentioned damage history means no damage.\n\
-- For avionics model labels, use the fullest useful literal unit or suite token present in the selected evidence. Do not return bare numbers or generic labels such as 50, 60, 300, 440, 540, GPS, NAV/COM, Autopilot, or Transponder unless that exact bare label is the only supported identifier in the source text.\n\
+- For avionics model labels, use the fullest useful literal unit or suite token present in the selected evidence. Omit unanchored numbers and generic labels such as GPS, NAV/COM, Autopilot, or Transponder. A source-literal numeric model anchored to its manufacturer in the same evidence is useful: preserve Garmin 255 and JPI 830 as required above.\n\
 - Preserve an ambiguous attached trailing letter exactly as written in the listing. In particular, when quantity wording attaches s or S to a product token (for example, 3 Garmin GI275s), return the source token GI275s rather than singularizing it to GI275 or deciding it is model GI275S. Later catalog curation, not listing extraction, resolves that ambiguity.\n\
 - Keep generic certification, approval, and feature annotations outside the model label. Extract KMA 20 rather than KMA 20 TSO and KT 75 rather than KT 75 TSO. A standalone WAAS immediately before a slash-delimited capability list is an annotation, not automatically part of the model: from Garmin GTN 750 WAAS GPS/NAV/COM return manufacturer Garmin, model GTN 750, types [GPS, NAV, COM], and source_evidence_text Garmin GTN 750 WAAS GPS/NAV/COM. For an identity that already has an attached W designator, IFR between the redundant WAAS label and that capability list is also an annotation, never a type: from Garmin GNS 530W WAAS IFR GPS/NAV/COM preserve model GNS 530W and return types [GPS, NAV, COM]. Preserve actual attached or marketed designators such as W, Xi, NXi, R, and ES exactly.\n\
 - Do not include explanations, markdown, comments, or extra keys.\n\n\
@@ -4956,6 +4957,12 @@ mod tests {
                 "model 255, not GNC 255",
                 "model 830, not EDM 830",
                 "model GFC500, not GFC 500",
+                "Omit descriptive equipment or feature labels that contain no product designator",
+                "Primary Flight Display, Multifunction Display, Synthetic Vision Technology (SVT), XM Weather & Audio",
+                "4-Place Voice-Activated Intercom System",
+                "Digital EGT/CHT/Outside Air Temp Gauge, Pilot's Clock, and Remote ELT",
+                "If the same evidence names a concrete designator, return that literal designator instead",
+                "being the only source label does not turn a description into a product identity",
                 "Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation",
                 "retain the occurrence with manufacturer null",
                 "Never omit a useful exact model or invent its manufacturer",
@@ -4976,10 +4983,18 @@ mod tests {
             assert!(!prompt.contains("IFD 540 instead of 540"));
             assert!(!prompt.contains("S-TEC 55X instead of System 55X"));
             assert!(!prompt.contains("Century 2000 instead of Autopilot"));
+            assert!(
+                !prompt.contains("unless that exact bare label is the only supported identifier")
+            );
         }
         assert!(correction.contains("feedback identifies the first detected error"));
         assert!(correction.contains("Re-audit the complete replacement array"));
         assert!(correction.contains("normalized-product uniqueness"));
+        assert!(primary.contains("Omit unanchored numbers and generic labels"));
+        assert!(primary.contains(
+            "A source-literal numeric model anchored to its manufacturer in the same evidence is useful"
+        ));
+        assert!(primary.contains("preserve Garmin 255 and JPI 830 as required above"));
 
         let schema = gemini_listing_avionics_item_schema();
         let manufacturer_description = schema["properties"]["manufacturer"]["description"]

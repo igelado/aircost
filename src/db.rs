@@ -111,12 +111,12 @@ const AVIONICS_APPROVED_CONCRETE_MODEL_CONTRACT_FINGERPRINT: &str =
 const AVIONICS_GENERIC_FEATURE_LABELS_MIGRATION: &str = "20260824_avionics_generic_feature_labels";
 const AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_VERSION: i64 = 1;
 const AVIONICS_GENERIC_FEATURE_LABELS_CONTRACT_FINGERPRINT: &str =
-    "366cf90682d11e71293461aca169445a04f8b906d8c15dab6fde76e1dc2384c8";
+    "1b6d0765cbd192c594f28342e8f364118f49c8cb3396eab28b900716b9298435";
 const AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_VERSION: i64 = 2;
 const SQLITE_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
-    "c544640fc9fd748d8601ac21f4510e0659f2039b162bd6ef54485e598ef95355";
+    "7de905a6bfbf89d5d0a9ed928982657035718b0278927d071ef99c31aa22a6fd";
 const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_OBJECT_CONTRACT_FINGERPRINT: &str =
-    "0d3f244fc0ac9324e2c16bb74c489f6aca97ae6ac6a900e98bc8640752b7e850";
+    "86f85bef7b5a7659af6c8f8c80b6bb7f052f1121cf85b0fa93335870eebea653";
 const POSTGRES_AVIONICS_APPROVED_CONCRETE_MODEL_FUNCTION_SOURCE: &str = r#"
 BEGIN
   IF NEW.catalog_status = 'approved' AND (
@@ -148,6 +148,10 @@ BEGIN
     'standby instrument', 'backup instruments', 'elt', 'adf', 'dme', 'ahrs',
     'air data computer', 'radar altimeter', 'magnetometer', 'clock timer', 'waas',
     'waas gps', 'dual waas', 'remote transponder', 'transponder ads b',
+    'primary flight display', 'multifunction display',
+    'synthetic vision technology svt', 'xm weather audio',
+    '4 place voice activated intercom system',
+    'digital egt cht outside air temp gauge', 'pilot s clock', 'remote elt',
     'stormscope', 'standard radio navigation', 'equipment'
   ) THEN
     RAISE EXCEPTION 'approved avionics model is a generic category; canonicalize, correct, or demote it before retrying migration';
@@ -17438,6 +17442,14 @@ mod tests {
             "electronic stability and protection",
             "wireless data loading",
             "ads b in out",
+            "primary flight display",
+            "multifunction display",
+            "synthetic vision technology svt",
+            "xm weather audio",
+            "4 place voice activated intercom system",
+            "digital egt cht outside air temp gauge",
+            "pilot s clock",
+            "remote elt",
         ] {
             let error = sqlx::query(
                 "INSERT INTO avionics_models (normalized_name, catalog_status) \
@@ -17456,10 +17468,20 @@ mod tests {
         clean
             .execute(
                 "INSERT INTO avionics_models (normalized_name, catalog_status) \
-                 VALUES ('gtx345 ads b in out', 'approved')",
+                 VALUES \
+                   ('gtx345 ads b in out', 'approved'), \
+                   ('gdu1044b primary flight display', 'approved'), \
+                   ('mfd1000 multifunction display', 'approved'), \
+                   ('g1000 nxi synthetic vision technology', 'approved'), \
+                   ('gdl69a xm weather audio', 'approved'), \
+                   ('skybeacon wingtip beacon', 'approved'), \
+                   ('pm1000ii 4 place voice activated intercom', 'approved'), \
+                   ('ubg16 digital egt cht oat gauge', 'approved'), \
+                   ('md93 pilot s clock', 'approved'), \
+                   ('me406 remote elt', 'approved')",
             )
             .await
-            .expect("a concrete product with a feature annotation remains admissible");
+            .expect("concrete products with descriptive annotations remain admissible");
     }
 
     #[tokio::test]
@@ -17765,6 +17787,8 @@ mod tests {
             "audio control panel",
             "display",
             "flight display",
+            "primary flight display",
+            "multifunction display",
             "pfd",
             "mfd",
             "pfd mfd",
@@ -17785,6 +17809,7 @@ mod tests {
             "taws",
             "synthetic vision",
             "synthetic vision system",
+            "synthetic vision technology svt",
             "svt",
             "safetaxi",
             "safe taxi",
@@ -17814,6 +17839,11 @@ mod tests {
             "dual waas",
             "remote transponder",
             "transponder ads b",
+            "xm weather audio",
+            "4 place voice activated intercom system",
+            "digital egt cht outside air temp gauge",
+            "pilot s clock",
+            "remote elt",
             "stormscope",
             "standard radio navigation",
             "equipment",

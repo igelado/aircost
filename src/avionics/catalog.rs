@@ -2340,9 +2340,9 @@ async fn resolve_avionics_identity_with_write_mode(
     request: &AvionicsIdentityRequest,
     execution: &mut IdentityResolutionExecution,
 ) -> CatalogResult<AvionicsIdentityOutcome> {
-    if request.manufacturer.trim().is_empty() || request.model.trim().is_empty() {
+    if request.model.trim().is_empty() {
         return Ok(AvionicsIdentityOutcome::Unresolved {
-            reason: "candidate is missing a manufacturer or model label".to_string(),
+            reason: "candidate is missing a model label".to_string(),
         });
     }
     let mut seen_types = HashSet::new();
@@ -2366,6 +2366,11 @@ async fn resolve_avionics_identity_with_write_mode(
     }
     if let Some(reason) = deterministic_generic_avionics_rejection_reason(request) {
         return Ok(AvionicsIdentityOutcome::Rejected { reason });
+    }
+    if request.manufacturer.trim().is_empty() {
+        return Ok(AvionicsIdentityOutcome::Unresolved {
+            reason: "concrete candidate is missing a manufacturer label".to_string(),
+        });
     }
     let explicit_direct_source_plan =
         explicit_authoritative_direct_source_plan(db, request).await?;
@@ -7534,6 +7539,15 @@ mod tests {
             "TAWS-B",
             "G1000 SVT",
             "SVT-100",
+            "GDU 1044B Primary Flight Display",
+            "MFD-1000 Multifunction Display",
+            "G1000 NXi Synthetic Vision Technology",
+            "GDL 69A XM Weather & Audio",
+            "skyBeacon Wingtip Beacon",
+            "PM1000II 4-Place Voice-Activated Intercom",
+            "UBG-16 Digital EGT/CHT/OAT Gauge",
+            "MD93 Pilot's Clock",
+            "ME406 Remote ELT",
         ] {
             request.model = concrete_model.to_string();
             assert!(
@@ -7548,6 +7562,31 @@ mod tests {
             deterministic_generic_avionics_rejection_reason(&request).is_none(),
             "a generic manufacturer label must not discard a concrete model"
         );
+
+        request.manufacturer = "Uavionix".to_string();
+        request.model = "Wingtip Beacons".to_string();
+        assert!(
+            deterministic_generic_avionics_rejection_reason(&request).is_none(),
+            "the uAvionix description maps to plausible products and must remain reviewable"
+        );
+
+        for generic_model in [
+            "Primary Flight Display",
+            "Multifunction Display",
+            "Synthetic Vision Technology (SVT)",
+            "XM Weather & Audio",
+            "4-Place Voice-Activated Intercom System",
+            "Digital EGT, CHT, & Outside Air Temp Gauge",
+            "Pilot's Clock",
+            "Remote ELT",
+        ] {
+            request.manufacturer = "Named Manufacturer".to_string();
+            request.model = generic_model.to_string();
+            assert!(
+                deterministic_generic_avionics_rejection_reason(&request).is_some(),
+                "{generic_model} is a complete productless description"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7571,12 +7610,40 @@ mod tests {
         .await
         .expect("catalog counts should load");
         let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
-        for (model, listing_context) in [
-            ("Synthetic Vision", "Synthetic Vision"),
-            ("SVT", "Garmin SVT Synthetic Vision"),
+        for (manufacturer, model, listing_context) in [
+            ("Garmin", "Synthetic Vision", "Synthetic Vision"),
+            ("Garmin", "SVT", "Garmin SVT Synthetic Vision"),
+            (
+                "Garmin",
+                "Primary Flight Display",
+                "Garmin Primary Flight Display",
+            ),
+            (
+                "Garmin",
+                "Multifunction Display",
+                "Garmin Multifunction Display",
+            ),
+            (
+                "",
+                "Synthetic Vision Technology (SVT)",
+                "Synthetic Vision Technology (SVT)",
+            ),
+            ("", "XM Weather & Audio", "XM Weather & Audio"),
+            (
+                "PS Engineering",
+                "4-Place Voice-Activated Intercom System",
+                "PS Engineering 4-Place Voice-Activated Intercom System",
+            ),
+            (
+                "Electronics International",
+                "Digital EGT, CHT, & Outside Air Temp Gauge",
+                "Electronics International Digital EGT, CHT, & Outside Air Temp Gauge",
+            ),
+            ("", "Pilot's Clock", "Pilot's Clock"),
+            ("", "Remote ELT", "Remote ELT"),
         ] {
             let request = AvionicsIdentityRequest {
-                manufacturer: "Garmin".to_string(),
+                manufacturer: manufacturer.to_string(),
                 model: model.to_string(),
                 avionics_types: vec!["Flight Display".to_string()],
                 listing_context: listing_context.to_string(),
@@ -7590,6 +7657,19 @@ mod tests {
                 "{model} must be discarded as a feature-only label"
             );
         }
+
+        let mut manufacturer_missing = local_request("GNS 430W");
+        manufacturer_missing.manufacturer.clear();
+        manufacturer_missing.model = "GNS 430W".to_string();
+        manufacturer_missing.avionics_types = vec!["GPS".to_string()];
+        let outcome = resolve_avionics_identity(&db, &extractor, &manufacturer_missing)
+            .await
+            .expect("a concrete manufacturer-less candidate must not contact the provider");
+        assert!(matches!(
+            outcome,
+            AvionicsIdentityOutcome::Unresolved { ref reason }
+                if reason == "concrete candidate is missing a manufacturer label"
+        ));
 
         let mut invalid_approved_identity = verified_identity();
         invalid_approved_identity.canonical_model = "Synthetic Vision".to_string();
