@@ -15,12 +15,120 @@ use crate::extract::CURATED_AVIONICS_TYPES;
 #[cfg(test)]
 use crate::html::clean::listing_body_contains_exact_structurally_visible_text_span;
 use crate::html::clean::normalize_source_evidence_span;
-use crate::html::listing::source::listing_evidence_units;
+use crate::html::listing::source::{
+    controller_extraction_source_has_exact_avionics_line, listing_evidence_units,
+};
 use crate::listing::evidence::{
     controller_avionics_evidence, identity_span_has_boundaries, ListingEvidenceContext,
     MAX_RECOVERED_ASSOCIATION_EVIDENCE_BYTES,
 };
 use crate::models::ParsedAvionics;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactControllerLeadingDualEvidenceProof {
+    plugin_submission_id: i64,
+    source_url: String,
+    rendered_html_sha256: String,
+    evidence_text: String,
+}
+
+impl ExactControllerLeadingDualEvidenceProof {
+    pub(crate) fn plugin_submission_id(&self) -> i64 {
+        self.plugin_submission_id
+    }
+
+    pub(crate) fn source_url(&self) -> &str {
+        &self.source_url
+    }
+
+    pub(crate) fn rendered_html_sha256(&self) -> &str {
+        &self.rendered_html_sha256
+    }
+
+    pub(crate) fn evidence_text(&self) -> &str {
+        &self.evidence_text
+    }
+}
+
+pub(crate) struct ListingAvionicsEvidenceObservation<'a> {
+    pub manufacturer: Option<&'a str>,
+    pub model: &'a str,
+    pub avionics_types: &'a [String],
+    pub quantity: i64,
+    pub configuration_action: &'a str,
+    pub source_confidence: Option<&'a str>,
+    pub source_evidence_text: Option<&'a str>,
+}
+
+/// Prove one deliberately narrow publisher grammar before catalog resolution.
+///
+/// This proves only what the signed listing says: one complete Controller
+/// `Avionics/Radios` line explicitly counts two literal product observations.
+/// It does not prove that the resolved catalog identity represents a countable
+/// physical unit; callers must independently require that product-side proof.
+pub(crate) fn exact_controller_leading_dual_evidence_proof(
+    source_url: &str,
+    extraction_source: &str,
+    plugin_submission_id: i64,
+    rendered_html_sha256: &str,
+    observation: &ListingAvionicsEvidenceObservation<'_>,
+) -> Option<ExactControllerLeadingDualEvidenceProof> {
+    let manufacturer = observation
+        .manufacturer
+        .map(str::trim)
+        .filter(|manufacturer| !manufacturer.is_empty())?;
+    let model = observation.model.trim();
+    let evidence = observation
+        .source_evidence_text
+        .map(str::trim)
+        .filter(|evidence| !evidence.is_empty())?;
+    if model.is_empty()
+        || plugin_submission_id <= 0
+        || !is_lowercase_sha256(rendered_html_sha256)
+        || observation.quantity != 2
+        || observation.configuration_action != "installed"
+        || observation.source_confidence != Some("medium")
+        || !controller_extraction_source_has_exact_avionics_line(
+            source_url,
+            extraction_source,
+            evidence,
+        )
+    {
+        return None;
+    }
+
+    let after_dual =
+        strip_ascii_case_prefix(evidence, "Dual").and_then(strip_required_whitespace_prefix)?;
+    let identity_end = exact_normalized_identity_prefix_end(after_dual, manufacturer, model)?;
+    let suffix = &after_dual[identity_end..];
+    let complete_identity_line = suffix.trim().is_empty();
+    let exact_slash_annotation = strip_required_whitespace_prefix(suffix).is_some_and(|suffix| {
+        exact_declared_slash_capabilities_with_waas(suffix, observation.avionics_types)
+    });
+    let exact_plural_waas_annotation = exact_controller_dual_plural_waas_annotation(
+        evidence,
+        manufacturer,
+        model,
+        observation.avionics_types,
+        Some(observation.quantity),
+    );
+    (complete_identity_line || exact_slash_annotation || exact_plural_waas_annotation).then(|| {
+        ExactControllerLeadingDualEvidenceProof {
+            plugin_submission_id,
+            source_url: source_url.to_string(),
+            rendered_html_sha256: rendered_html_sha256.to_string(),
+            evidence_text: evidence.to_string(),
+        }
+    })
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AvionicsValidationClass {
@@ -2116,6 +2224,23 @@ fn exact_declared_slash_capabilities(
     observed == declared
 }
 
+fn exact_declared_slash_capabilities_with_waas(source: &str, avionics_types: &[String]) -> bool {
+    let capabilities = source.split('/').map(str::trim).collect::<Vec<_>>();
+    let waas_count = capabilities
+        .iter()
+        .filter(|capability| capability.eq_ignore_ascii_case("WAAS"))
+        .count();
+    if waas_count != 1 {
+        return false;
+    }
+    let without_waas = capabilities
+        .into_iter()
+        .filter(|capability| !capability.eq_ignore_ascii_case("WAAS"))
+        .collect::<Vec<_>>()
+        .join("/");
+    exact_declared_slash_capabilities(&without_waas, avionics_types, false)
+}
+
 fn controller_field_has_exact_evidence_line(controller_field: &str, evidence: &str) -> bool {
     let evidence = evidence.trim();
     !evidence.is_empty()
@@ -2496,6 +2621,142 @@ mod tests {
             </main>
             </body></html>"#
         )
+    }
+
+    fn exact_dual_proof(
+        source_url: &str,
+        field: &str,
+        manufacturer: Option<&str>,
+        model: &str,
+        avionics_types: &[&str],
+        quantity: i64,
+        configuration_action: &str,
+        source_confidence: Option<&str>,
+        evidence: &str,
+    ) -> bool {
+        let rendered_html = controller_html(field);
+        let extraction_source =
+            crate::html::listing::source::listing_extraction_source(CONTROLLER_URL, &rendered_html)
+                .unwrap();
+        let rendered_html_sha256 = format!("{:x}", Sha256::digest(rendered_html.as_bytes()));
+        let avionics_types = avionics_types
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        exact_controller_leading_dual_evidence_proof(
+            source_url,
+            &extraction_source,
+            7,
+            &rendered_html_sha256,
+            &ListingAvionicsEvidenceObservation {
+                manufacturer,
+                model,
+                avionics_types: &avionics_types,
+                quantity,
+                configuration_action,
+                source_confidence,
+                source_evidence_text: Some(evidence),
+            },
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn exact_controller_leading_dual_proves_only_the_complete_unit_line() {
+        let evidence = "Dual Garmin GIA63W COM/NAV/GPS/WAAS";
+        assert!(exact_dual_proof(
+            CONTROLLER_URL,
+            evidence,
+            Some("Garmin"),
+            "GIA63W",
+            &["COM", "NAV", "GPS"],
+            2,
+            "installed",
+            Some("medium"),
+            evidence,
+        ));
+
+        let evidence = "Dual Garmin G5";
+        assert!(exact_dual_proof(
+            CONTROLLER_URL,
+            evidence,
+            Some("Garmin"),
+            "G5",
+            &["Flight Display"],
+            2,
+            "installed",
+            Some("medium"),
+            evidence,
+        ));
+
+        let evidence = "Dual Garmin GIA-63W WAAS GPS/NAV/COMs";
+        assert!(exact_dual_proof(
+            CONTROLLER_URL,
+            evidence,
+            Some("Garmin"),
+            "GIA-63W",
+            &["GPS", "NAV", "COM"],
+            2,
+            "installed",
+            Some("medium"),
+            evidence,
+        ));
+    }
+
+    #[test]
+    fn exact_controller_leading_dual_proof_fails_closed() {
+        let safe = "Dual Garmin GIA63W COM/NAV/GPS/WAAS";
+        for unsafe_line in [
+            "Optional Dual Garmin GIA63W COM/NAV/GPS/WAAS",
+            "Not Dual Garmin GIA63W COM/NAV/GPS/WAAS",
+            "Garmin GIA63W COM/NAV/GPS/WAAS (Dual)",
+            "Dual Axis Garmin GIA63W COM/NAV/GPS/WAAS",
+            "2 Garmin GIA63W COM/NAV/GPS/WAAS",
+            "Dual Garmin GIA63W and GIA64W COM/NAV/GPS/WAAS",
+        ] {
+            assert!(!exact_dual_proof(
+                CONTROLLER_URL,
+                unsafe_line,
+                Some("Garmin"),
+                "GIA63W",
+                &["COM", "NAV", "GPS"],
+                2,
+                "installed",
+                Some("medium"),
+                unsafe_line,
+            ));
+        }
+        for (source_url, manufacturer, quantity, action, confidence) in [
+            (GENERIC_URL, Some("Garmin"), 2, "installed", Some("medium")),
+            (CONTROLLER_URL, None, 2, "installed", Some("medium")),
+            (
+                CONTROLLER_URL,
+                Some("Garmin"),
+                1,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                Some("Garmin"),
+                2,
+                "replaces",
+                Some("medium"),
+            ),
+            (CONTROLLER_URL, Some("Garmin"), 2, "installed", Some("low")),
+        ] {
+            assert!(!exact_dual_proof(
+                source_url,
+                safe,
+                manufacturer,
+                "GIA63W",
+                &["COM", "NAV", "GPS"],
+                quantity,
+                action,
+                confidence,
+                safe,
+            ));
+        }
     }
 
     fn capture_25_html() -> String {

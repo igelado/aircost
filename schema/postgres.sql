@@ -4739,7 +4739,9 @@ BEGIN
         AND (
           link.quantity <= 0
           OR link.source_confidence IS DISTINCT FROM 'high'
-          OR link.source NOT IN ('listing', 'listing_review')
+          OR link.source NOT IN (
+            'listing', 'listing_explicit_count', 'listing_review'
+          )
         )
     )
   ) THEN

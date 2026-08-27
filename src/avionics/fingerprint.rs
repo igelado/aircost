@@ -9,9 +9,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use sha2::{Digest, Sha256};
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Sqlite, Transaction};
 
-use crate::avionics::reuse::current_reuse_attested_product_ids;
+use crate::avionics::reuse::{
+    current_reuse_attested_product_ids, reuse_attestation_is_current_postgres,
+    reuse_attestation_is_current_sqlite,
+};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::normalize::normalize_avionics_identifier;
 
@@ -442,6 +445,61 @@ pub(crate) async fn active_collision_closure_revision_sha256(
                 "catalog id {target_id} has no unique active collision-closure identity"
             ))
         },
+    )
+}
+
+macro_rules! active_collision_closure_revision_in_transaction {
+    ($db:expr, $transaction:expr, $target_id:expr, $reuse_is_current:path) => {{
+        let sql = $db.sql(ACTIVE_COLLISION_CATALOG_ROWS_SQL);
+        let rows = sqlx::query_as::<_, ActiveCollisionCatalogFingerprintRow>(&sql)
+            .fetch_all(&mut **$transaction)
+            .await?;
+        let member_ids =
+            active_collision_closure_member_ids(&rows, $target_id).ok_or_else(|| {
+                AvionicsFingerprintError::Conflict(format!(
+                    "catalog id {} has no unique active collision-closure identity",
+                    $target_id
+                ))
+            })?;
+        let mut current_reuse_eligible_ids = HashSet::new();
+        for member_id in member_ids {
+            if $reuse_is_current($db, $transaction, member_id).await? {
+                current_reuse_eligible_ids.insert(member_id);
+            }
+        }
+        fingerprint_active_collision_closure(&rows, &current_reuse_eligible_ids, $target_id)
+            .ok_or_else(|| {
+                AvionicsFingerprintError::Conflict(format!(
+                    "catalog id {} has no unique active collision-closure identity",
+                    $target_id
+                ))
+            })
+    }};
+}
+
+pub(crate) async fn active_collision_closure_revision_sha256_sqlite(
+    db: &AppDb,
+    transaction: &mut Transaction<'_, Sqlite>,
+    target_id: i64,
+) -> AvionicsFingerprintResult<String> {
+    active_collision_closure_revision_in_transaction!(
+        db,
+        transaction,
+        target_id,
+        reuse_attestation_is_current_sqlite
+    )
+}
+
+pub(crate) async fn active_collision_closure_revision_sha256_postgres(
+    db: &AppDb,
+    transaction: &mut Transaction<'_, Postgres>,
+    target_id: i64,
+) -> AvionicsFingerprintResult<String> {
+    active_collision_closure_revision_in_transaction!(
+        db,
+        transaction,
+        target_id,
+        reuse_attestation_is_current_postgres
     )
 }
 

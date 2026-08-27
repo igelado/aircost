@@ -37,6 +37,7 @@ struct ReuseFingerprintRow {
     manufacturer_identity_key: String,
     model_name: String,
     model_normalized_name: String,
+    valuation_scope: String,
     manufacturer_identifier_kind: Option<String>,
     manufacturer_identifier: Option<String>,
     normalized_manufacturer_identifier: Option<String>,
@@ -46,7 +47,9 @@ struct ReuseFingerprintRow {
     identity_evidence_kind: Option<String>,
     identity_confidence: Option<String>,
     canonical_product_key: String,
+    approved_identifier_kind: String,
     canonical_identifier_key: String,
+    outgoing_suite_component_count: i64,
     source_origin_id: i64,
     source_origin: String,
     capability_name: String,
@@ -64,6 +67,7 @@ const REUSE_FINGERPRINT_ROWS_SQL: &str = r#"
       manufacturer_identity.normalized_identity_key AS manufacturer_identity_key,
       model.name AS model_name,
       model.normalized_name AS model_normalized_name,
+      model.valuation_scope,
       model.manufacturer_identifier_kind,
       model.manufacturer_identifier,
       model.normalized_manufacturer_identifier,
@@ -73,7 +77,13 @@ const REUSE_FINGERPRINT_ROWS_SQL: &str = r#"
       model.identity_evidence_kind,
       model.identity_confidence,
       product_identity.canonical_product_key,
+      product_identity.manufacturer_identifier_kind AS approved_identifier_kind,
       product_identity.canonical_identifier_key,
+      (
+        SELECT COUNT(*)
+        FROM avionics_suite_components suite_component
+        WHERE suite_component.suite_model_id = model.id
+      ) AS outgoing_suite_component_count,
       source_origin.id AS source_origin_id,
       source_origin.https_origin AS source_origin,
       capability.name AS capability_name,
@@ -124,6 +134,7 @@ fn fingerprint_rows(rows: &[ReuseFingerprintRow]) -> Option<String> {
             && row.manufacturer_identity_key == first.manufacturer_identity_key
             && row.model_name == first.model_name
             && row.model_normalized_name == first.model_normalized_name
+            && row.valuation_scope == first.valuation_scope
             && row.manufacturer_identifier_kind == first.manufacturer_identifier_kind
             && row.manufacturer_identifier == first.manufacturer_identifier
             && row.normalized_manufacturer_identifier == first.normalized_manufacturer_identifier
@@ -133,7 +144,9 @@ fn fingerprint_rows(rows: &[ReuseFingerprintRow]) -> Option<String> {
             && row.identity_evidence_kind == first.identity_evidence_kind
             && row.identity_confidence == first.identity_confidence
             && row.canonical_product_key == first.canonical_product_key
+            && row.approved_identifier_kind == first.approved_identifier_kind
             && row.canonical_identifier_key == first.canonical_identifier_key
+            && row.outgoing_suite_component_count == first.outgoing_suite_component_count
             && row.source_origin_id == first.source_origin_id
             && row.source_origin == first.source_origin
     });
@@ -178,6 +191,7 @@ fn fingerprint_rows(rows: &[ReuseFingerprintRow]) -> Option<String> {
         first.model_name.clone(),
         first.model_normalized_name.clone(),
         "approved".to_string(),
+        first.valuation_scope.clone(),
         manufacturer_identifier_kind.to_string(),
         manufacturer_identifier.to_string(),
         normalized_manufacturer_identifier.to_string(),
@@ -187,7 +201,9 @@ fn fingerprint_rows(rows: &[ReuseFingerprintRow]) -> Option<String> {
         identity_evidence_kind.to_string(),
         identity_confidence.to_string(),
         first.canonical_product_key.clone(),
+        first.approved_identifier_kind.clone(),
         first.canonical_identifier_key.clone(),
+        first.outgoing_suite_component_count.to_string(),
         first.source_origin_id.to_string(),
         first.source_origin.clone(),
     ] {
@@ -342,6 +358,58 @@ pub(crate) async fn product_reuse_attestation_is_current(
     )
     .await?;
     Ok(fingerprint_rows(&rows).as_deref() == Some(attestation.product_fingerprint.as_str()))
+}
+
+/// Whether one current reuse-attested catalog identity is a separately
+/// countable physical unit.
+///
+/// Manufacturer model numbers may identify suites or marketing families. A
+/// manufacturer part number plus unit valuation scope is the narrow catalog
+/// proof used when publisher text explicitly counts two installed LRUs.
+pub(crate) async fn countable_unit_product_reuse_attestation_is_current(
+    db: &AppDb,
+    avionics_model_id: i64,
+) -> Result<bool, sqlx::Error> {
+    if avionics_model_id <= 0 {
+        return Ok(false);
+    }
+    let sql = db.sql(
+        r#"
+        SELECT COUNT(*)
+        FROM avionics_models model
+        JOIN avionics_approved_product_identities product_identity
+          ON product_identity.avionics_model_id = model.id
+        WHERE model.id = ?
+          AND model.catalog_status = 'approved'
+          AND model.valuation_scope = 'unit'
+          AND model.manufacturer_identifier_kind = 'manufacturer_part_number'
+          AND product_identity.manufacturer_identifier_kind =
+              'manufacturer_part_number'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM avionics_suite_components suite_component
+            WHERE suite_component.suite_model_id = model.id
+          )
+        "#,
+    );
+    let eligible = match db.backend() {
+        DatabaseBackend::Sqlite(pool) => {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .bind(avionics_model_id)
+                .fetch_one(pool)
+                .await?
+        }
+        DatabaseBackend::Postgres(pool) => {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .bind(avionics_model_id)
+                .fetch_one(pool)
+                .await?
+        }
+    } == 1;
+    if !eligible {
+        return Ok(false);
+    }
+    product_reuse_attestation_is_current(db, avionics_model_id).await
 }
 
 /// Whether this exact HTTPS origin is currently curated as a primary
@@ -656,6 +724,62 @@ pub(crate) async fn reuse_attestation_is_current_postgres(
     ))
 }
 
+macro_rules! countable_unit_reuse_attestation_is_current {
+    ($db:expr, $transaction:expr, $avionics_model_id:expr, $reuse_is_current:path) => {{
+        let countable_sql = $db.sql(
+            r#"
+            SELECT COUNT(*)
+            FROM avionics_models model
+            JOIN avionics_approved_product_identities product_identity
+              ON product_identity.avionics_model_id = model.id
+            WHERE model.id = ?
+              AND model.catalog_status = 'approved'
+              AND model.valuation_scope = 'unit'
+              AND model.manufacturer_identifier_kind =
+                  'manufacturer_part_number'
+              AND product_identity.manufacturer_identifier_kind =
+                  'manufacturer_part_number'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM avionics_suite_components suite_component
+                WHERE suite_component.suite_model_id = model.id
+              )
+            "#,
+        );
+        let countable: i64 = sqlx::query_scalar(&countable_sql)
+            .bind($avionics_model_id)
+            .fetch_one(&mut **$transaction)
+            .await?;
+        countable == 1 && $reuse_is_current($db, $transaction, $avionics_model_id).await?
+    }};
+}
+
+pub(crate) async fn countable_unit_reuse_attestation_is_current_sqlite(
+    db: &AppDb,
+    transaction: &mut Transaction<'_, Sqlite>,
+    avionics_model_id: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(countable_unit_reuse_attestation_is_current!(
+        db,
+        transaction,
+        avionics_model_id,
+        reuse_attestation_is_current_sqlite
+    ))
+}
+
+pub(crate) async fn countable_unit_reuse_attestation_is_current_postgres(
+    db: &AppDb,
+    transaction: &mut Transaction<'_, Postgres>,
+    avionics_model_id: i64,
+) -> Result<bool, sqlx::Error> {
+    Ok(countable_unit_reuse_attestation_is_current!(
+        db,
+        transaction,
+        avionics_model_id,
+        reuse_attestation_is_current_postgres
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -675,6 +799,7 @@ mod tests {
             manufacturer_identity_key: "garmin".to_string(),
             model_name: "GIA 63W".to_string(),
             model_normalized_name: "gia 63w".to_string(),
+            valuation_scope: "unit".to_string(),
             manufacturer_identifier_kind: Some("manufacturer_model_number".to_string()),
             manufacturer_identifier: Some("GIA 63W".to_string()),
             normalized_manufacturer_identifier: Some("gia63w".to_string()),
@@ -688,7 +813,9 @@ mod tests {
             identity_evidence_kind: Some("authoritative_reference".to_string()),
             identity_confidence: Some("very_high".to_string()),
             canonical_product_key: "gia63w".to_string(),
+            approved_identifier_kind: "manufacturer_model_number".to_string(),
             canonical_identifier_key: "gia63w".to_string(),
+            outgoing_suite_component_count: 0,
             source_origin_id: 5,
             source_origin: "https://static.garmin.com".to_string(),
             capability_name: capability.to_string(),
@@ -731,6 +858,33 @@ mod tests {
         let mut missing_evidence = row("COM");
         missing_evidence.identity_evidence_text = None;
         assert!(fingerprint_rows(&[missing_evidence]).is_none());
+    }
+
+    #[test]
+    fn fingerprint_is_bound_to_valuation_scope_graph_identifier_and_suite_membership() {
+        let expected = fingerprint_rows(&[row("COM")]).unwrap();
+        for changed in [
+            {
+                let mut changed = row("COM");
+                changed.valuation_scope = "integrated_suite".to_string();
+                changed
+            },
+            {
+                let mut changed = row("COM");
+                changed.approved_identifier_kind = "manufacturer_part_number".to_string();
+                changed
+            },
+            {
+                let mut changed = row("COM");
+                changed.outgoing_suite_component_count = 1;
+                changed
+            },
+        ] {
+            assert_ne!(
+                fingerprint_rows(&[changed]).as_deref(),
+                Some(expected.as_str())
+            );
+        }
     }
 
     #[tokio::test]

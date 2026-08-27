@@ -20,7 +20,9 @@ use crate::avionics::fingerprint::{
     active_collision_closure_revision_sha256, approved_catalog_revision_sha256,
     AvionicsFingerprintError,
 };
-use crate::avionics::reuse::product_reuse_attestation_is_current;
+use crate::avionics::reuse::{
+    countable_unit_product_reuse_attestation_is_current, product_reuse_attestation_is_current,
+};
 use crate::db::{AppDb, DatabaseBackend};
 use crate::extract::GeminiListingExtractor;
 use crate::gemini::interactions::RetryPolicy;
@@ -33,8 +35,9 @@ use crate::listing::avionics::disposition::{AutomaticOccurrenceDisposition, Occu
 #[cfg(test)]
 use crate::listing::avionics::extraction::parse_current_avionics_extraction_json;
 use crate::listing::avionics::extraction::{
-    parse_current_avionics_extraction_value, validate_current_avionics_observations,
-    validate_unbound_current_avionics_extraction,
+    exact_controller_leading_dual_evidence_proof, parse_current_avionics_extraction_value,
+    validate_current_avionics_observations, validate_unbound_current_avionics_extraction,
+    ListingAvionicsEvidenceObservation,
 };
 use crate::listing::avionics::{
     approved_avionics_product_key, preview_avionics_product_key,
@@ -1296,6 +1299,12 @@ async fn process_listing(
         }
     };
     let listing_context = ListingEvidenceContext::from_rendered_html(row.rendered_html.as_deref());
+    let retained_extraction_source = source_url
+        .as_deref()
+        .zip(row.rendered_html.as_deref())
+        .and_then(|(source_url, rendered_html)| {
+            listing_extraction_source(source_url, rendered_html).ok()
+        });
     let mut ordinary_review_forced_fallback = false;
     let (raw_avionics, mut residual_aspects) = match retained_observation_source(
         db,
@@ -1989,12 +1998,36 @@ async fn process_listing(
             continue;
         }
 
+        let exact_leading_dual_proof = source_url
+            .as_deref()
+            .zip(retained_extraction_source.as_deref())
+            .and_then(|(source_url, extraction_source)| {
+                exact_controller_leading_dual_evidence_proof(
+                    source_url,
+                    extraction_source,
+                    submission_id,
+                    row.rendered_html_sha256
+                        .as_deref()
+                        .expect("pending source binding validated the retained capture hash"),
+                    &ListingAvionicsEvidenceObservation {
+                        manufacturer: raw.manufacturer.as_deref(),
+                        model: &raw.model,
+                        avionics_types: &raw.avionics_types,
+                        quantity: raw.quantity,
+                        configuration_action: &raw.configuration_action,
+                        source_confidence: raw.source_confidence.as_deref(),
+                        source_evidence_text: raw.source_evidence_text.as_deref(),
+                    },
+                )
+            });
         let primary_identity = IdentityInput {
             manufacturer: literal_observation_manufacturer(&raw.manufacturer).unwrap_or_default(),
             model: &raw.model,
             avionics_types: &raw.avionics_types,
             quantity: raw.quantity,
         };
+        let primary_resolved_local_only =
+            !primary_identity.manufacturer.is_empty() && !requires_provider;
         let mut primary = if primary_identity.manufacturer.is_empty() {
             match resolve_model_only_identity_attempt(
                 db,
@@ -2071,14 +2104,32 @@ async fn process_listing(
             continue;
         }
 
+        let qualified_explicit_count = primary_resolved_local_only
+            && exact_leading_dual_proof.is_some()
+            && primary.approved_id.is_some()
+            && countable_unit_product_reuse_attestation_is_current(
+                db,
+                primary.approved_id.unwrap_or_default(),
+            )
+            .await
+            .unwrap_or(false);
+        if qualified_explicit_count {
+            primary.authorization =
+                Some(AutomatedAssociationAuthorization::CountableUnitManufacturerReuse);
+        }
+        let effective_source_confidence = if qualified_explicit_count {
+            Some("high")
+        } else {
+            raw.source_confidence.as_deref()
+        };
         let primary_is_approved = identity_is_approved(&primary);
-        let primary_has_high_evidence = raw.source_confidence.as_deref() == Some("high");
+        let primary_has_high_evidence = effective_source_confidence == Some("high");
         if primary_is_approved && !primary_has_high_evidence {
             mark_weak_listing_evidence(&mut primary.report);
         }
 
         if raw.configuration_action == "installed" {
-            if can_automatically_accept(&primary, raw.source_confidence.as_deref()) {
+            if can_automatically_accept(&primary, effective_source_confidence) {
                 let primary_id = primary
                     .approved_id
                     .expect("approved attempt has a catalog id");
@@ -3652,6 +3703,7 @@ async fn resolve_identity_attempt(
                     let collision_revision = match attempt.authorization.as_ref() {
                         Some(
                             AutomatedAssociationAuthorization::ManufacturerReuse
+                            | AutomatedAssociationAuthorization::CountableUnitManufacturerReuse
                             | AutomatedAssociationAuthorization::GlobalExactModelReuse,
                         ) => active_collision_closure_revision_sha256(db, model_id).await,
                         None => Err(AvionicsFingerprintError::Conflict(format!(
@@ -8199,6 +8251,339 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_controller_leading_dual_pending_unit_is_verified_provider_free() {
+        const EVIDENCE: &str = "Dual Garmin GIA63W GPS/NAV/WAAS";
+        let db = AppDb::connect("sqlite::memory:").await.unwrap();
+        let product_id = seed_approved_named_product_for_manufacturer_with_identifier_kind(
+            &db,
+            true,
+            "Garmin",
+            "https://www.garmin.com",
+            "GIA63W",
+            "manufacturer_part_number",
+            "011-01105-00",
+            "GPS",
+        )
+        .await;
+        let pool = sqlite_pool(&db);
+        sqlx::query(
+            "INSERT INTO avionics_types (name, normalized_name) VALUES ('NAV', 'nav') ON CONFLICT (normalized_name) DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
+            SELECT ?, id FROM avionics_types WHERE normalized_name = 'nav'
+            "#,
+        )
+        .bind(product_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(refresh_reuse_attestation_sqlite(
+            &db,
+            &mut transaction,
+            product_id,
+            "https://www.garmin.com/aviation/product",
+        )
+        .await
+        .unwrap());
+        transaction.commit().await.unwrap();
+
+        let listing_id = seed_listing(&db, CONTROLLER_ROLE_LISTING_URL).await;
+        seed_faa_admission(&db, listing_id).await;
+        let rendered_html = trusted_controller_role_html(EVIDENCE);
+        let extracted_listing_json = json!({"avionics": [{
+            "manufacturer": "Garmin",
+            "model": "GIA63W",
+            "types": ["GPS", "NAV"],
+            "quantity": 2,
+            "configuration_action": "installed",
+            "replaces": null,
+            "source_evidence_text": EVIDENCE,
+            "source_confidence": "medium"
+        }]})
+        .to_string();
+        let submission_id = seed_submission_and_review(
+            &db,
+            listing_id,
+            CONTROLLER_ROLE_LISTING_URL,
+            &rendered_html,
+            Some(&extracted_listing_json),
+            Some(listing_id),
+            None,
+        )
+        .await;
+        let aspect = PendingReviewAspect::avionics(
+            "fixture:leading-dual:0",
+            "avionics",
+            "Garmin GIA63W",
+            EVIDENCE,
+            "verified identity needs installation corroboration",
+            2,
+            "installed",
+            Some(EVIDENCE.to_string()),
+            Some("medium".to_string()),
+        )
+        .with_suggested_product(ReviewProduct::verified(
+            product_id,
+            "Garmin",
+            "GIA63W",
+            vec!["GPS".to_string(), "NAV".to_string()],
+        ));
+        crate::listing::review::stage_pending_review(
+            &db,
+            listing_id,
+            Some(submission_id),
+            &[aspect],
+        )
+        .await
+        .unwrap();
+
+        let preflight =
+            preflight_listing_avionics(&db, listing_id, AvionicsVerificationExecutionMode::Apply)
+                .await
+                .expect("the exact counted unit should preflight locally");
+        let ListingAvionicsVerificationPreflight::PendingReview { report } = preflight else {
+            panic!("the listing still has one pending review")
+        };
+        assert_eq!(report.verified_local_identity_components, 1);
+
+        let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+        let applied = verify_listing_avionics(
+            &db,
+            &extractor,
+            AvionicsVerificationExecutionMode::Apply,
+            listing_id,
+        )
+        .await
+        .expect("the counted unit must not contact the unavailable provider");
+        let ListingAvionicsVerification::Processed { report } = applied else {
+            panic!("the pending review should be processed")
+        };
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.remaining_review_aspects, 0);
+        let link: (i64, String, i64) = sqlx::query_as(
+            r#"
+            SELECT avionics_model_id, source_confidence, quantity
+            FROM aircraft_sale_listing_avionics
+            WHERE aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(link, (product_id, "high".to_string(), 2));
+        let authorization: (String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT authorization.authorization_kind,
+                   authorization.association_role,
+                   authorization.avionics_model_id
+            FROM aircraft_sale_listing_avionics_link_authorizations authorization
+            JOIN aircraft_sale_listing_avionics link
+              ON link.id = authorization.listing_link_id
+            WHERE link.aircraft_sale_listing_id = ?
+            "#,
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            authorization,
+            (
+                "manufacturer_reuse".to_string(),
+                "installed".to_string(),
+                product_id,
+            )
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews WHERE listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let usage: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM gemini_api_usage WHERE aircraft_sale_listing_id = ?",
+        )
+        .bind(listing_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(usage, 0);
+    }
+
+    #[tokio::test]
+    async fn exact_controller_leading_dual_rejects_non_countable_catalog_products_provider_free() {
+        const EVIDENCE: &str = "Dual Garmin GIA63W GPS/NAV/WAAS";
+        for invalid_product in ["model_number", "integrated_suite", "suite_membership"] {
+            let db = AppDb::connect("sqlite::memory:").await.unwrap();
+            let identifier_kind = if invalid_product == "model_number" {
+                "manufacturer_model_number"
+            } else {
+                "manufacturer_part_number"
+            };
+            let product_id = seed_approved_named_product_for_manufacturer_with_identifier_kind(
+                &db,
+                true,
+                "Garmin",
+                "https://www.garmin.com",
+                "GIA63W",
+                identifier_kind,
+                "011-01105-00",
+                "GPS",
+            )
+            .await;
+            let pool = sqlite_pool(&db);
+            sqlx::query(
+                "INSERT INTO avionics_types (name, normalized_name) VALUES ('NAV', 'nav') ON CONFLICT (normalized_name) DO NOTHING",
+            )
+            .execute(pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO avionics_model_types (avionics_model_id, avionics_type_id)
+                SELECT ?, id FROM avionics_types WHERE normalized_name = 'nav'
+                "#,
+            )
+            .bind(product_id)
+            .execute(pool)
+            .await
+            .unwrap();
+            if invalid_product == "integrated_suite" {
+                sqlx::query(
+                    "UPDATE avionics_models SET valuation_scope = 'integrated_suite' WHERE id = ?",
+                )
+                .bind(product_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            } else if invalid_product == "suite_membership" {
+                let component_id =
+                    seed_approved_named_product_for_manufacturer_with_identifier_kind(
+                        &db,
+                        true,
+                        "Garmin",
+                        "https://www.garmin.com",
+                        "GDU 1040",
+                        "manufacturer_part_number",
+                        "011-00820-10",
+                        "Flight Display",
+                    )
+                    .await;
+                sqlx::query(
+                    "INSERT INTO avionics_suite_components (suite_model_id, component_model_id, quantity) VALUES (?, ?, 1)",
+                )
+                .bind(product_id)
+                .bind(component_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            let mut transaction = pool.begin().await.unwrap();
+            assert!(refresh_reuse_attestation_sqlite(
+                &db,
+                &mut transaction,
+                product_id,
+                "https://www.garmin.com/aviation/product",
+            )
+            .await
+            .unwrap());
+            transaction.commit().await.unwrap();
+
+            let listing_id = seed_listing(&db, CONTROLLER_ROLE_LISTING_URL).await;
+            seed_faa_admission(&db, listing_id).await;
+            let rendered_html = trusted_controller_role_html(EVIDENCE);
+            let extracted_listing_json = json!({"avionics": [{
+                "manufacturer": "Garmin",
+                "model": "GIA63W",
+                "types": ["GPS", "NAV"],
+                "quantity": 2,
+                "configuration_action": "installed",
+                "replaces": null,
+                "source_evidence_text": EVIDENCE,
+                "source_confidence": "medium"
+            }]})
+            .to_string();
+            let submission_id = seed_submission_and_review(
+                &db,
+                listing_id,
+                CONTROLLER_ROLE_LISTING_URL,
+                &rendered_html,
+                Some(&extracted_listing_json),
+                Some(listing_id),
+                None,
+            )
+            .await;
+            let aspect = PendingReviewAspect::avionics(
+                format!("fixture:leading-dual:{invalid_product}"),
+                "avionics",
+                "Garmin GIA63W",
+                EVIDENCE,
+                "verified identity needs installation corroboration",
+                2,
+                "installed",
+                Some(EVIDENCE.to_string()),
+                Some("medium".to_string()),
+            )
+            .with_suggested_product(ReviewProduct::verified(
+                product_id,
+                "Garmin",
+                "GIA63W",
+                vec!["GPS".to_string(), "NAV".to_string()],
+            ));
+            crate::listing::review::stage_pending_review(
+                &db,
+                listing_id,
+                Some(submission_id),
+                &[aspect],
+            )
+            .await
+            .unwrap();
+
+            let extractor = GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
+            let applied = verify_listing_avionics(
+                &db,
+                &extractor,
+                AvionicsVerificationExecutionMode::Apply,
+                listing_id,
+            )
+            .await
+            .expect("a non-countable local product should remain pending without Gemini");
+            let ListingAvionicsVerification::Processed { report } = applied else {
+                panic!("the pending review should be processed")
+            };
+            assert_eq!(report.accepted, 0, "{invalid_product}");
+            assert_eq!(report.remaining_review_aspects, 1, "{invalid_product}");
+            let state: (i64, i64, i64) = sqlx::query_as(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM aircraft_sale_listing_avionics
+                   WHERE aircraft_sale_listing_id = ?),
+                  (SELECT COUNT(*) FROM aircraft_sale_listing_pending_reviews
+                   WHERE listing_id = ?),
+                  (SELECT COUNT(*) FROM gemini_api_usage
+                   WHERE aircraft_sale_listing_id = ?)
+                "#,
+            )
+            .bind(listing_id)
+            .bind(listing_id)
+            .bind(listing_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert_eq!(state, (0, 1, 0), "{invalid_product}");
+        }
+    }
+
+    #[tokio::test]
     async fn final_apply_rejection_reports_prepared_but_zero_accepted_links() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
         let product_id = seed_approved_suggestion_product(&db, true).await;
@@ -10530,6 +10915,30 @@ mod tests {
         identifier: &str,
         avionics_type: &str,
     ) -> i64 {
+        seed_approved_named_product_for_manufacturer_with_identifier_kind(
+            db,
+            attest,
+            manufacturer,
+            source_origin,
+            model,
+            "manufacturer_model_number",
+            identifier,
+            avionics_type,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_approved_named_product_for_manufacturer_with_identifier_kind(
+        db: &AppDb,
+        attest: bool,
+        manufacturer: &str,
+        source_origin: &str,
+        model: &str,
+        identifier_kind: &str,
+        identifier: &str,
+        avionics_type: &str,
+    ) -> i64 {
         let pool = sqlite_pool(db);
         let manufacturer_key = normalize_avionics_manufacturer_name(manufacturer);
         sqlx::query(
@@ -10567,7 +10976,7 @@ mod tests {
               normalized_manufacturer_identifier, identity_source_url,
               identity_source_title, identity_evidence_text,
               identity_evidence_kind, identity_confidence, catalog_reviewed_at
-            ) VALUES (?, ?, ?, 'manufacturer_model_number', ?, ?,
+            ) VALUES (?, ?, ?, ?, ?, ?,
                       ?, ?, ?,
                       'authoritative_reference', 'very_high', CURRENT_TIMESTAMP)
             RETURNING id
@@ -10576,6 +10985,7 @@ mod tests {
         .bind(manufacturer_id)
         .bind(model)
         .bind(normalize_avionics_model_name(model))
+        .bind(identifier_kind)
         .bind(identifier)
         .bind(normalize_avionics_identifier(identifier))
         .bind(&product_source_url)

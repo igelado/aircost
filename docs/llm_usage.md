@@ -343,9 +343,22 @@ ambiguity fails into the single avionics correction request. A corrected
 medium- or low-confidence candidate may checkpoint only when its exact
 `source_evidence_text` covers the complete bounded ambiguity, including count
 qualifiers such as `units` or `each`; downstream reuse and valuation continue
-to require high source confidence, so it remains pending. Other publishers rely
-on the extraction prompt until they have an equally explicit authoritative
-equipment-field adapter.
+to require high source confidence, so it normally remains pending. One narrow
+provider-free exception exists for a complete Controller `Avionics/Radios`
+line beginning with exact `Dual <manufacturer> <model>` identity text. The
+stored extraction remains medium confidence. Automatic materialization may
+derive high link confidence only after the literal identity resolves locally
+to a current manufacturer-reuse-attested, manufacturer-part-numbered physical
+unit with unit valuation scope and no outgoing suite membership. Both listing
+mutation boundaries recheck that countable-unit proof under the catalog lock;
+the persisted `listing_explicit_count` source distinguishes this exceptional
+derived count from ordinary high-confidence multi-unit listing evidence. The
+valuation dataset repeats the durable product, observation, capture,
+collision, and authorization guards for that source. Empty identity suffixes and
+the two already admitted exact Controller WAAS capability annotations are
+recognized; arbitrary suffixes and second-product lines fail closed. Other
+publishers rely on the extraction prompt until they have an equally explicit
+authoritative equipment-field adapter.
 
 Deterministic feedback reports the first detected defect. The single correction
 request receives that primary defect plus the first independently detectable
