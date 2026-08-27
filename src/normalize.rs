@@ -121,6 +121,8 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "audio control panel"
             | "display"
             | "flight display"
+            | "primary flight display"
+            | "multifunction display"
             | "pfd"
             | "mfd"
             | "pfd mfd"
@@ -134,6 +136,7 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "xm weather"
             | "xm radio"
             | "xm weather radio"
+            | "xm weather audio"
             | "lightning detection"
             | "terrain awareness"
             | "terrain awareness system"
@@ -141,6 +144,7 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "taws"
             | "synthetic vision"
             | "synthetic vision system"
+            | "synthetic vision technology svt"
             | "svt"
             | "safetaxi"
             | "safe taxi"
@@ -170,6 +174,10 @@ pub fn is_generic_avionics_model_name(value: &str) -> bool {
             | "dual waas"
             | "remote transponder"
             | "transponder ads b"
+            | "4 place voice activated intercom system"
+            | "digital egt cht outside air temp gauge"
+            | "pilot s clock"
+            | "remote elt"
             | "stormscope"
             | "standard radio navigation"
             | "equipment"
@@ -328,6 +336,14 @@ mod tests {
             "Standard Audio Panel",
             "Stormscope",
             "Backup Instruments",
+            "Primary Flight Display",
+            "Multifunction Display",
+            "Synthetic Vision Technology (SVT)",
+            "XM Weather & Audio",
+            "4-Place Voice-Activated Intercom System",
+            "Digital EGT, CHT, & Outside Air Temp Gauge",
+            "Pilot's Clock",
+            "Remote ELT",
         ] {
             assert!(
                 is_generic_avionics_model_name(label),
@@ -348,6 +364,16 @@ mod tests {
             "GDL 69A Wireless Data",
             "GFC 700 Electronic Stability & Protection",
             "GTN 750 WAAS GPS/NAV/COM",
+            "GDU 1044B Primary Flight Display",
+            "MFD-1000 Multifunction Display",
+            "G1000 NXi Synthetic Vision Technology",
+            "GDL 69A XM Weather & Audio",
+            "Wingtip Beacons",
+            "skyBeacon Wingtip Beacon",
+            "PM1000II 4-Place Voice-Activated Intercom",
+            "UBG-16 Digital EGT/CHT/OAT Gauge",
+            "MD93 Pilot's Clock",
+            "ME406 Remote ELT",
         ] {
             assert!(
                 !is_generic_avionics_model_name(label),

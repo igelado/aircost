@@ -3960,7 +3960,23 @@ async fn resolve_listing_avionics_observation(
     configuration_action: &str,
     controller_run_on_line: bool,
 ) -> ListingAvionicsIdentityResolution {
-    let Some(manufacturer) = manufacturer else {
+    let request = listing_avionics_identity_request(
+        values,
+        source_url,
+        listing_context,
+        manufacturer.unwrap_or_default(),
+        model,
+        avionics_types,
+        quantity,
+    );
+    if !model.trim().is_empty()
+        && avionics_types.iter().any(|value| !value.trim().is_empty())
+        && quantity >= 1
+        && deterministic_generic_avionics_rejection_reason(&request).is_some()
+    {
+        return ListingAvionicsIdentityResolution::DeterministicGenericRejected;
+    }
+    let Some(_) = manufacturer else {
         if model.trim().is_empty()
             || avionics_types.iter().all(|value| value.trim().is_empty())
             || quantity < 1
@@ -4008,15 +4024,6 @@ async fn resolve_listing_avionics_observation(
         };
     };
 
-    let request = listing_avionics_identity_request(
-        values,
-        source_url,
-        listing_context,
-        manufacturer,
-        model,
-        avionics_types,
-        quantity,
-    );
     resolve_listing_avionics_identity(
         db,
         extractor,
@@ -9372,31 +9379,82 @@ mod tests {
         let extractor =
             crate::extract::GeminiListingExtractor::with_test_endpoint("http://127.0.0.1:9");
         for configured_extractor in [None, Some(&extractor)] {
-            let mut values = listing_values_with_variant("182T SKYLANE");
-            let mut generic = parsed_avionics("XM Weather & Radio");
-            generic.avionics_types = vec!["Datalink".to_string()];
-            values.avionics = vec![ListingAvionicsValue::from_parsed(generic)];
+            for (manufacturer, model, capability) in [
+                (Some("Garmin"), "Primary Flight Display", "Flight Display"),
+                (Some("Garmin"), "Multifunction Display", "Flight Display"),
+                (None, "Synthetic Vision Technology (SVT)", "Flight Display"),
+                (None, "XM Weather & Audio", "Datalink"),
+                (
+                    Some("PS Engineering"),
+                    "4-Place Voice-Activated Intercom System",
+                    "Audio Panel",
+                ),
+                (
+                    Some("Electronics International"),
+                    "Digital EGT, CHT, & Outside Air Temp Gauge",
+                    "Engine Monitor",
+                ),
+                (None, "Pilot's Clock", "Clock/Timer"),
+                (None, "Remote ELT", "ELT"),
+            ] {
+                let mut values = listing_values_with_variant("182T SKYLANE");
+                let mut generic = parsed_avionics(model);
+                generic.manufacturer = manufacturer.map(str::to_string);
+                generic.avionics_types = vec![capability.to_string()];
+                values.avionics = vec![ListingAvionicsValue::from_parsed(generic)];
 
-            let resolved = resolve_listing_avionics_values(
-                &db,
-                &mut values,
-                configured_extractor,
-                Some("https://example.com/listing"),
-                Some("XM Weather & Radio"),
-                None,
-                None,
-            )
-            .await
-            .expect("exact generic discard must not depend on provider availability");
+                let resolved = resolve_listing_avionics_values(
+                    &db,
+                    &mut values,
+                    configured_extractor,
+                    Some("https://example.com/listing"),
+                    Some(model),
+                    None,
+                    None,
+                )
+                .await
+                .expect("exact generic discard must not depend on provider availability");
 
-            assert!(resolved.pending_review_aspects.is_empty());
-            assert!(values.avionics.is_empty());
-            assert_eq!(resolved.occurrence_dispositions.len(), 1);
-            let disposition = &resolved.occurrence_dispositions[0];
-            assert_eq!(disposition.outcome, "discarded");
-            assert_eq!(disposition.avionics_model_id, None);
-            assert_eq!(disposition.reason_code, "automatic_identity_rejected");
+                assert!(resolved.pending_review_aspects.is_empty(), "{model}");
+                assert!(values.avionics.is_empty(), "{model}");
+                assert_eq!(resolved.occurrence_dispositions.len(), 1, "{model}");
+                let disposition = &resolved.occurrence_dispositions[0];
+                assert_eq!(disposition.outcome, "discarded", "{model}");
+                assert_eq!(disposition.avionics_model_id, None, "{model}");
+                assert_eq!(
+                    disposition.reason_code, "automatic_identity_rejected",
+                    "{model}"
+                );
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_uavionix_wingtip_description_remains_pending() {
+        let db = AppDb::connect("sqlite::memory:")
+            .await
+            .expect("test database should initialize");
+        let mut values = listing_values_with_variant("182T SKYLANE");
+        let mut ambiguous = parsed_avionics("Wingtip Beacons");
+        ambiguous.manufacturer = Some("Uavionix".to_string());
+        ambiguous.avionics_types = vec!["Transponder".to_string()];
+        values.avionics = vec![ListingAvionicsValue::from_parsed(ambiguous)];
+
+        let resolved = resolve_listing_avionics_values(
+            &db,
+            &mut values,
+            None,
+            Some("https://example.com/listing"),
+            Some("Uavionix Wingtip Beacons with ADS-B IN & OUT"),
+            None,
+            None,
+        )
+        .await
+        .expect("an ambiguous product description should stage review work");
+
+        assert_eq!(resolved.pending_review_aspects.len(), 1);
+        assert!(resolved.occurrence_dispositions.is_empty());
+        assert!(values.avionics.is_empty());
     }
 
     #[tokio::test]
