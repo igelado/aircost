@@ -980,6 +980,7 @@ mod tests {
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
     use crate::avionics::manufacturer::ensure_test_manufacturer_identity;
+    use crate::avionics::reuse::{refresh_reuse_attestation_sqlite, AVIONICS_REUSE_POLICY_VERSION};
     use crate::plugin::{sha256_hex, signature_message};
     use sqlx::Executor;
 
@@ -1321,6 +1322,128 @@ mod tests {
             .await
             .unwrap();
         source
+    }
+
+    async fn attest_sqlite_fixture_product(source: &AppDb) -> String {
+        let DatabaseBackend::Sqlite(pool) = source.backend() else {
+            panic!("catalog seed fixture must be SQLite")
+        };
+        let mut transaction = pool.begin().await.unwrap();
+        assert!(refresh_reuse_attestation_sqlite(
+            source,
+            &mut transaction,
+            601,
+            "https://manufacturer.example/test-fixture",
+        )
+        .await
+        .unwrap());
+        transaction.commit().await.unwrap();
+        sqlx::query_scalar(
+            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = 601",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sqlite_current_reuse_attestation_is_seedable() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_url = format!(
+            "sqlite://{}",
+            directory.path().join("source.sqlite3").display()
+        );
+        let target_url = format!(
+            "sqlite://{}",
+            directory.path().join("target.sqlite3").display()
+        );
+        let source = minimal_current_source(&source_url).await;
+        let fingerprint = attest_sqlite_fixture_product(&source).await;
+        let projection = CurrentCatalogProjection::load(&source).await.unwrap();
+        let target = AppDb::connect(&target_url).await.unwrap();
+
+        let report = seed_verified_catalog(
+            &source,
+            &target,
+            Some(projection.fingerprint_sha256()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fingerprint.len(), 64);
+        assert!(!report.dry_run);
+        assert_eq!(
+            report
+                .projection_table_counts
+                .get("avionics_product_reuse_attestations"),
+            Some(&1)
+        );
+        assert!(report.materialized_rows > 0);
+        let DatabaseBackend::Sqlite(pool) = target.backend() else {
+            panic!("catalog seed target must be SQLite")
+        };
+        let target_fingerprint: String = sqlx::query_scalar(
+            "SELECT product_fingerprint FROM avionics_product_reuse_attestations WHERE avionics_model_id = 601",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(target_fingerprint, fingerprint);
+    }
+
+    #[tokio::test]
+    async fn stale_sqlite_reuse_attestation_rejects_seed_before_target_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let target_path = directory.path().join("target.sqlite3");
+        let source_url = format!("sqlite://{}", source_path.display());
+        let target_url = format!("sqlite://{}", target_path.display());
+        let source = minimal_current_source(&source_url).await;
+        let current_fingerprint = attest_sqlite_fixture_product(&source).await;
+        let stale_fingerprint = if current_fingerprint.starts_with('a') {
+            "b".repeat(64)
+        } else {
+            "a".repeat(64)
+        };
+        let DatabaseBackend::Sqlite(pool) = source.backend() else {
+            panic!("catalog seed fixture must be SQLite")
+        };
+        sqlx::query(
+            "DELETE FROM avionics_product_reuse_attestations WHERE avionics_model_id = 601",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO avionics_product_reuse_attestations (
+                 avionics_model_id, avionics_authoritative_source_origin_id,
+                 policy_version, product_fingerprint
+               ) VALUES (601, 401, ?, ?)"#,
+        )
+        .bind(AVIONICS_REUSE_POLICY_VERSION)
+        .bind(stale_fingerprint)
+        .execute(pool)
+        .await
+        .unwrap();
+        drop(source);
+
+        let error = crate::listing::replay::catalog::seed_replay_verified_catalog(
+            crate::listing::replay::catalog::SeedVerifiedCatalogRequest {
+                source_database_url: &source_url,
+                target_database_url: &target_url,
+                expected_fingerprint_sha256: Some(&"c".repeat(64)),
+                apply: true,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "source catalog contains stale avionics reuse-attestation fingerprints for model IDs: 601"
+        );
+        assert!(!target_path.exists());
     }
 
     #[tokio::test]
