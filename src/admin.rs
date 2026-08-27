@@ -59,7 +59,7 @@ use aircost_rs::listing::verification::{
 use aircost_rs::plugin::{
     checkpoint_plugin_submission_extraction, inspect_plugin_submission_extraction,
     materialize_plugin_submission_checkpoint, plugin_submission_owner,
-    preflight_plugin_submission_extraction,
+    preflight_plugin_submission_extraction, PluginExtractionCheckpoint,
 };
 #[cfg(feature = "dnn")]
 use aircost_rs::valuation::dataset::load_snapshot;
@@ -300,14 +300,11 @@ async fn main() -> Result<()> {
                     preflight_plugin_submission_extraction(&db, user.id, submission_id).await?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "dry_run": true,
-                        "submission_id": submission_id,
-                        "provider_calls": 0,
-                        "capture_valid": preflight.capture_valid,
-                        "current_checkpoint": preflight.current_checkpoint,
-                        "next_action": "rerun with --apply to perform extraction only; no aircraft, avionics catalog, listing, or finalization writes will run"
-                    }))?
+                    serde_json::to_string_pretty(&replay_extraction_inspection_report(
+                        submission_id,
+                        preflight.capture_valid,
+                        preflight.current_checkpoint.as_ref(),
+                    ))?
                 );
             }
         }
@@ -363,12 +360,7 @@ async fn main() -> Result<()> {
                     inspect_plugin_submission_extraction(&db, owner.id, submission_id).await?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "dry_run": true,
-                        "provider_calls": 0,
-                        "checkpoint": checkpoint,
-                        "next_action": "rerun with --apply to materialize this exact checkpoint through normal listing analysis without repeating extraction"
-                    }))?
+                    serde_json::to_string_pretty(&replay_listing_inspection_report(&checkpoint))?
                 );
             }
         }
@@ -780,6 +772,34 @@ fn replay_extraction_usage_scope(submission_id: i64) -> (String, SourceCorrelati
             id: submission_id.to_string(),
         },
     )
+}
+
+fn replay_extraction_inspection_report(
+    submission_id: i64,
+    capture_valid: bool,
+    current_checkpoint: Option<&PluginExtractionCheckpoint>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": true,
+        "inspection_scope": "capture_and_checkpoint_validation",
+        "provider_requests_performed": 0,
+        "apply_provider_requirements": "not_evaluated",
+        "submission_id": submission_id,
+        "capture_valid": capture_valid,
+        "current_checkpoint": current_checkpoint,
+        "next_action": "rerun with --apply to perform extraction only; apply may make provider requests when extraction is required, and no aircraft, avionics catalog, listing, or finalization writes will run"
+    })
+}
+
+fn replay_listing_inspection_report<T: Serialize>(checkpoint: &T) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": true,
+        "inspection_scope": "checkpoint_validation",
+        "provider_requests_performed": 0,
+        "apply_provider_requirements": "not_evaluated",
+        "checkpoint": checkpoint,
+        "next_action": "rerun with --apply to materialize this exact checkpoint through normal listing analysis without repeating extraction; apply may make provider requests during aircraft or avionics analysis"
+    })
 }
 
 fn stage_private_json<T: Serialize>(output: &Path, value: &T) -> Result<NamedTempFile> {
@@ -2383,7 +2403,7 @@ fn parse_enrich_avionics_args(args: impl IntoIterator<Item = String>) -> Result<
 
 fn print_usage() {
     println!(
-        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound [--expected-capture-count COUNT] | --submission-id ID...) --output FILE [--readiness-output FILE] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Evaluates capture inventory and authenticity from one database snapshot. Dry-run prints readiness and writes nothing; --apply publishes a manifest only when ready and can publish the readiness report separately.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin seed-verified-catalog --source-database SOURCE --database TARGET [--catalog-fingerprint-sha256 HEX] [--dry-run | --apply]\n    Dry-run discovers the current verified catalog fingerprint without requiring it. After review, --apply requires that exact pinned fingerprint and installs only its catalog closure into the clean replay target. The operation is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run is provider-free. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls. --apply uses create-only normal admission; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
+        "Usage:\n  aircost-admin publish-aircraft-reference --draft NORMALIZED.json [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin export-replay-manifest (--all-bound [--expected-capture-count COUNT] | --submission-id ID...) --output FILE [--readiness-output FILE] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Evaluates capture inventory and authenticity from one database snapshot. Dry-run prints readiness and writes nothing; --apply publishes a manifest only when ready and can publish the readiness report separately.\n  aircost-admin import-replay-manifest --source-database SOURCE --manifest FILE [--apply] [--database TARGET]\n    Re-verifies the manifest against SOURCE and imports exactly those signed captures into an empty target, preserving IDs/timestamps while resetting every derived field. Dry-run is the default.\n  aircost-admin seed-verified-catalog --source-database SOURCE --database TARGET [--catalog-fingerprint-sha256 HEX] [--dry-run | --apply]\n    Dry-run discovers the current verified catalog fingerprint without requiring it. After review, --apply requires that exact pinned fingerprint and installs only its catalog closure into the clean replay target. The operation is provider-free, serialized, transactional, and rejects a rerun.\n  aircost-admin replay-captures --manifest FILE --phase extraction|materialization [--submission-id ID] [--apply] [--recover-stale] [--database TARGET]\n    Resumes the manifest-backed batch ledger. Dry-run is provider-free; cumulative_gemini_usage reports historical phase usage rather than an apply forecast. Stale ownership requires explicit recovery after its conservative heartbeat threshold.\n  aircost-admin replay-extraction --submission-id ID [--apply] [--database TARGET]\n    Dry-run validates the capture and checkpoint without provider calls and does not forecast --apply provider requirements. --apply performs only current-schema extraction and stops before aircraft, avionics identity, listing insertion, or finalization.\n  aircost-admin replay-listing --submission-id ID [--apply] [--database TARGET]\n    Dry-run revalidates the signed checkpoint without provider calls and does not forecast --apply provider requirements. --apply uses create-only normal admission and may make provider requests during aircraft or avionics analysis; the listing insert and exact signed-capture bind share one transaction, and receipt-gated retries resume the bound row deterministically.\n  aircost-admin import-faa-registry --archive ReleasableAircraft.zip [--include-n-number N123AB]... [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Hashes and validates the official ZIP, derives its date from the required FAA members, then stores only target-scoped, non-PII FAA evidence. Explicit N-number targets are normalized, validated, and merged with listing and pending-submission targets; dry-run is the default.\n  aircost-admin curate-aircraft-hierarchy [--listing-limit 25] [--cluster-limit 5] [--listing-id LISTING_ID] [--faa-drs-pdf FILE --faa-drs-pdf-sha256 HEX --faa-drs-document-guid UUID --faa-drs-document-id ID --faa-drs-tcds-number NUMBER [--faa-drs-revision-number REV] [--faa-drs-revision-date DATE]] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Grounded Gemini hierarchy review is read-only by default. --apply atomically persists only independently verified, fully reviewable cases against their exact observation, FAA grounding, and catalog revision. Normal unknown-identity runs require FAA_DRS_API_KEY. The complete --faa-drs-* group is an explicit one-listing admin migration path for an already obtained current official PDF; it is digest-checked and never used by the web server.\n  aircost-admin benchmark-gemini [--task listing|metadata|avionics|visual]... [--model PINNED_MODEL]... [--listing-limit SAMPLE_SIZE] [--submission-id ID]... [--max-avionics-per-listing 1] [--max-visual-assets 8] [--seed TEXT] [--config FILE] [--execute] [--database {DEFAULT_DATABASE_PATH}]\n    Without --execute, exports a deterministic real-data suite using benchmark selection defaults from Gemini config. With --execute, makes paid calls and writes only gemini_api_usage accounting rows.\n  aircost-admin verify-listings [--limit 10] [--listing-id LISTING_ID | --after-listing-id LISTING_ID] [--preflight | --preview | --apply] [--database {DEFAULT_DATABASE_PATH}]\n    Runs the permanent aircraft, avionics, and listing-finalization verifier. Provider-free preflight is the default. --preview permits accounted Gemini requests without domain writes; --apply performs guarded, idempotent writes. FAA_DRS_API_KEY enables unknown-aircraft grounding; without it those aircraft remain pending while other safe work can continue.\n  aircost-admin cleanup-orphans [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin curate-avionics [--limit ROWS] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin enrich-avionics [--limit 10] [--listing-id LISTING_ID] [--value-reference-year 2026] [--refresh-existing] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin snapshot-valuations [--max-age-days 180] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin fit-valuation --kind structural|dnn --snapshot-id ID [--maximum-epochs 500] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin validate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]\n  aircost-admin activate-valuation --model-version-id ID [--database {DEFAULT_DATABASE_PATH}]"
     );
     println!(
         "  aircost-admin stage-listing-reviews [--limit 100] [--listing-id LISTING_ID] [--apply] [--database {DEFAULT_DATABASE_PATH}]\n    Prepares pending reviews from retained extraction data without Gemini, catalog writes, or listing-link writes; dry-run is the default."
@@ -3346,6 +3366,30 @@ models = ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn direct_replay_inspection_json_does_not_forecast_apply_provider_requests() {
+        let extraction = replay_extraction_inspection_report(7, true, None);
+        let listing = replay_listing_inspection_report(&serde_json::json!({
+            "submission_id": 7,
+            "extracted_listing_sha256": "checkpoint"
+        }));
+
+        for report in [&extraction, &listing] {
+            assert_eq!(report["dry_run"], true);
+            assert_eq!(report["provider_requests_performed"], 0);
+            assert_eq!(report["apply_provider_requirements"], "not_evaluated");
+            assert!(report.get("provider_calls").is_none());
+            assert!(report["next_action"]
+                .as_str()
+                .is_some_and(|message| message.contains("may make provider requests")));
+        }
+        assert_eq!(
+            extraction["inspection_scope"],
+            "capture_and_checkpoint_validation"
+        );
+        assert_eq!(listing["inspection_scope"], "checkpoint_validation");
     }
 
     #[test]

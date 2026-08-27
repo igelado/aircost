@@ -114,7 +114,7 @@ pub struct ReplayCapturesReport {
     pub manifest_sha256: String,
     pub run_id: Option<i64>,
     pub phase: ReplayPhase,
-    pub gemini_usage: ReplayGeminiUsage,
+    pub cumulative_gemini_usage: ReplayGeminiUsage,
     pub counts: ReplayCapturesCounts,
     /// Present for an applied `--submission-id` invocation. Batch and dry-run
     /// reports intentionally omit per-item diagnostics.
@@ -318,8 +318,16 @@ pub async fn replay_captures(
     let run = ensure_run(db, request.manifest).await?;
     let usage_correlation_id = replay_usage_correlation(request.manifest, request.phase);
     if run.status == "completed" {
-        let gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
-        return report_from_ledger(db, run.id, request, &selected, gemini_usage, None).await;
+        let cumulative_gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
+        return report_from_ledger(
+            db,
+            run.id,
+            request,
+            &selected,
+            cumulative_gemini_usage,
+            None,
+        )
+        .await;
     }
     let owner_token = new_owner_token(request.manifest, request.phase)?;
     acquire_run(
@@ -680,13 +688,13 @@ pub async fn replay_captures(
     processing?;
     validate_target_captures(db, request.manifest).await?;
     release_run(db, run.id, &owner_token).await?;
-    let gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
+    let cumulative_gemini_usage = gemini_usage_for_phase(db, usage_correlation_id).await?;
     report_from_ledger(
         db,
         run.id,
         request,
         &selected,
-        gemini_usage,
+        cumulative_gemini_usage,
         selected_transient_error,
     )
     .await
@@ -2475,7 +2483,7 @@ async fn dry_run_report(
             ReplayPhase::Materialization => counts.blocked += 1,
         }
     }
-    let gemini_usage = gemini_usage_for_phase(
+    let cumulative_gemini_usage = gemini_usage_for_phase(
         db,
         replay_usage_correlation(request.manifest, request.phase),
     )
@@ -2485,7 +2493,7 @@ async fn dry_run_report(
         manifest_sha256: request.manifest.manifest_sha256.clone(),
         run_id: run.map(|run| run.id),
         phase: request.phase,
-        gemini_usage,
+        cumulative_gemini_usage,
         counts,
         selected_item: None,
     })
@@ -2496,7 +2504,7 @@ async fn report_from_ledger(
     run_id: i64,
     request: &ReplayCapturesRequest<'_>,
     selected: &BTreeSet<i64>,
-    gemini_usage: ReplayGeminiUsage,
+    cumulative_gemini_usage: ReplayGeminiUsage,
     transient_error: Option<ReplayTransientOperationError>,
 ) -> ReplayRunResult<ReplayCapturesReport> {
     let sql = db.sql(
@@ -2557,7 +2565,7 @@ async fn report_from_ledger(
         manifest_sha256: request.manifest.manifest_sha256.clone(),
         run_id: Some(run_id),
         phase: request.phase,
-        gemini_usage,
+        cumulative_gemini_usage,
         counts,
         selected_item,
     })
@@ -3480,7 +3488,7 @@ mod tests {
                 transient_error: None,
             })
         );
-        assert_eq!(report.gemini_usage.logical_requests, 0);
+        assert_eq!(report.cumulative_gemini_usage.logical_requests, 0);
     }
 
     #[tokio::test]
@@ -3501,8 +3509,8 @@ mod tests {
         )
         .await
         .expect("the existing checkpoint must close the interrupted ledger transition");
-        assert_eq!(report.gemini_usage.logical_requests, 0);
-        assert_eq!(report.gemini_usage.transport_attempts, 0);
+        assert_eq!(report.cumulative_gemini_usage.logical_requests, 0);
+        assert_eq!(report.cumulative_gemini_usage.transport_attempts, 0);
         assert_eq!(report.counts.succeeded, 1);
         let DatabaseBackend::Sqlite(pool) = db.backend() else {
             unreachable!()
@@ -3553,7 +3561,7 @@ mod tests {
         .unwrap();
         assert_eq!(failed.counts.failed, 1);
         assert_eq!(failed.counts.rejected, 0);
-        assert_eq!(failed.gemini_usage.logical_requests, 1);
+        assert_eq!(failed.cumulative_gemini_usage.logical_requests, 1);
         let stored_failure: (String, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT extraction_state, last_failure_reason_code, terminal_rejection_reason_code FROM listing_replay_run_items WHERE plugin_submission_id = ?",
         )
@@ -3590,10 +3598,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resumed.counts.succeeded, 1);
-        assert_eq!(resumed.gemini_usage.logical_requests, 1);
+        assert_eq!(resumed.cumulative_gemini_usage.logical_requests, 1);
         assert_eq!(
-            resumed.gemini_usage.correlation_id,
-            failed.gemini_usage.correlation_id
+            resumed.cumulative_gemini_usage.correlation_id,
+            failed.cumulative_gemini_usage.correlation_id
         );
         let stored_success: (String, i64, Option<String>) = sqlx::query_as(
             "SELECT extraction_state, extraction_attempt_count, last_failure_reason_code FROM listing_replay_run_items WHERE plugin_submission_id = ?",
@@ -3606,9 +3614,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_is_provider_free_and_does_not_create_a_ledger() {
+    async fn dry_run_reports_cumulative_usage_without_calls_or_a_ledger() {
         let db = AppDb::connect("sqlite::memory:").await.unwrap();
-        let (manifest, _, _) = signed_checkpoint(&db).await;
+        let (manifest, submission_id, _) = signed_checkpoint(&db).await;
+        let DatabaseBackend::Sqlite(pool) = db.backend() else {
+            unreachable!()
+        };
+        let correlation_id = replay_usage_correlation(&manifest, ReplayPhase::Materialization);
+        sqlx::query(
+            r#"INSERT INTO gemini_api_usage (
+                 task, purpose, api_family, model, status, correlation_id,
+                 source_kind, source_id, attempt_count, retry_count, error_text,
+                 completed_at
+               ) VALUES (
+                 'avionics_identity', 'historical replay usage', 'interactions',
+                 'gemini-test', 'failed', ?, 'plugin_submission', ?, 2, 1,
+                 'historical provider failure',
+                 CURRENT_TIMESTAMP
+               )"#,
+        )
+        .bind(&correlation_id)
+        .bind(submission_id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
         let report = replay_captures(
             &db,
             None,
@@ -3623,16 +3652,30 @@ mod tests {
         .await
         .unwrap();
         assert!(report.dry_run);
-        assert_eq!(report.gemini_usage.logical_requests, 0);
-        assert_eq!(report.gemini_usage.estimated_cost_microusd, Some(0));
-        let DatabaseBackend::Sqlite(pool) = db.backend() else {
-            unreachable!()
-        };
+        assert_eq!(report.cumulative_gemini_usage.logical_requests, 1);
+        assert_eq!(report.cumulative_gemini_usage.transport_attempts, 2);
+        assert_eq!(report.cumulative_gemini_usage.retries, 1);
+        assert_eq!(
+            report.cumulative_gemini_usage.correlation_id.as_deref(),
+            Some(correlation_id.as_str())
+        );
+        assert_eq!(report.cumulative_gemini_usage.estimated_cost_microusd, None);
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert!(serialized.get("gemini_usage").is_none());
+        assert_eq!(
+            serialized["cumulative_gemini_usage"]["scope"],
+            "manifest_phase_cumulative"
+        );
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_replay_runs")
             .fetch_one(pool)
             .await
             .unwrap();
         assert_eq!(runs, 0);
+        let usage_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gemini_api_usage")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(usage_rows, 1);
     }
 
     #[tokio::test]
@@ -4892,8 +4935,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report.gemini_usage.logical_requests, 0);
-        assert_eq!(report.gemini_usage.transport_attempts, 0);
+        assert_eq!(report.cumulative_gemini_usage.logical_requests, 0);
+        assert_eq!(report.cumulative_gemini_usage.transport_attempts, 0);
         assert_eq!(report.counts.succeeded, 1);
         let stored: (String, String, Option<i64>, i64) = sqlx::query_as(
             "SELECT extraction_state, materialization_state, resulting_listing_id, materialization_attempt_count FROM listing_replay_run_items WHERE plugin_submission_id = ?",
@@ -5024,7 +5067,7 @@ mod tests {
         .await
         .expect("an exact completed item must be a no-update resume fast path");
         assert_eq!(report.counts.succeeded, 2);
-        assert_eq!(report.gemini_usage.logical_requests, 0);
+        assert_eq!(report.cumulative_gemini_usage.logical_requests, 0);
         let states: Vec<(i64, String, i64)> = sqlx::query_as(
             r#"SELECT plugin_submission_id, materialization_state,
                       materialization_attempt_count
@@ -5424,7 +5467,7 @@ mod tests {
         .await
         .expect("explicit stale recovery should resume the fenced item");
         assert_eq!(recovered.counts.succeeded, 1);
-        assert_eq!(recovered.gemini_usage.logical_requests, 0);
+        assert_eq!(recovered.cumulative_gemini_usage.logical_requests, 0);
     }
 
     #[tokio::test]
@@ -5489,7 +5532,7 @@ mod tests {
         .await
         .expect("stale recovery should close the already-succeeded ledger");
         assert_eq!(recovered.counts.succeeded, 1);
-        assert_eq!(recovered.gemini_usage.logical_requests, 0);
+        assert_eq!(recovered.cumulative_gemini_usage.logical_requests, 0);
     }
 
     #[tokio::test]
