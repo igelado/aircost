@@ -347,6 +347,11 @@ to require high source confidence, so it remains pending. Other publishers rely
 on the extraction prompt until they have an equally explicit authoritative
 equipment-field adapter.
 
+Deterministic feedback reports the first detected defect. The single correction
+request is therefore instructed to re-audit the complete replacement array,
+including duplicate normalized identities that may occur after adjacent `#2`
+equipment lines, rather than editing only the named occurrence.
+
 The same unified atomic repair and complete current extraction validator run
 after an avionics-only correction. On success, only the transient `avionics`
 member is replaced; aircraft identity, visual recovery, price, hours, valuation

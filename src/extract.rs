@@ -2280,6 +2280,7 @@ const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
 const LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE: &str = "\
 - Emit each normalized manufacturer/model product exactly once. Repeated exact product mentions and Dual, #N, or decimal quantity wording are quantity ambiguity, not proof of a physical count.\n\
 - For any such ambiguity, return one explicit candidate quantity with source_confidence medium or low, never high. Copy one exact contiguous source_evidence_text span covering every repeated identity and every count-context token, including qualifiers such as units or each. Omit the occurrence if one bounded exact span cannot support the candidate.\n\
+- For example, when one line names King KX-170B and the next contiguous line names King KX-170B #2, never return two KX-170B rows. Return one KX-170B occurrence with candidate quantity 2, medium or low confidence, and evidence covering both lines; otherwise omit it.\n\
 - Without quantity ambiguity, high source confidence is allowed only for one exact product identity with quantity one.\n";
 
 fn build_extraction_prompt(listing_text: &str) -> String {
@@ -2343,6 +2344,7 @@ fn build_listing_avionics_correction_prompt(
         "Correct only the avionics extraction from one aircraft sale listing.\n\
 Return exactly one JSON object with one member named avionics. The avionics value must be the complete replacement array in the current occurrence schema; do not return a patch, aircraft fields, price, hours, valuation facts, visual results, explanations, or extra keys.\n\n\
 Correction rules:\n\
+- Deterministic feedback identifies the first detected error, not necessarily the only error. Re-audit the complete replacement array before returning it: every primary and replacement identity, exact evidence span, normalized-product uniqueness, quantity/confidence pair, capability set, and configuration action must satisfy all rules even when feedback names only one row.\n\
 {LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
 {LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE}\
 - Use only fixed installed avionics explicitly supported by the listing text.\n\
@@ -4909,6 +4911,8 @@ mod tests {
         assert!(prompt.contains("quantity ambiguity, not proof of a physical count"));
         assert!(prompt.contains("source_confidence medium or low, never high"));
         assert!(prompt.contains("every repeated identity and every count-context token"));
+        assert!(prompt.contains("King KX-170B #2"));
+        assert!(prompt.contains("never return two KX-170B rows"));
         assert!(prompt.contains("high source confidence is allowed only"));
         assert!(prompt.contains("not a separate Navigation Indicator capability"));
         assert!(prompt.contains("receiver/datalink is a Datalink capability, not Weather Radar"));
@@ -4956,6 +4960,8 @@ mod tests {
                 "omit that occurrence instead of inventing one",
                 "quantity ambiguity, not proof of a physical count",
                 "source_confidence medium or low, never high",
+                "King KX-170B #2",
+                "never return two KX-170B rows",
             ] {
                 assert!(prompt.contains(required), "missing {required:?}");
             }
@@ -4963,6 +4969,9 @@ mod tests {
             assert!(!prompt.contains("S-TEC 55X instead of System 55X"));
             assert!(!prompt.contains("Century 2000 instead of Autopilot"));
         }
+        assert!(correction.contains("feedback identifies the first detected error"));
+        assert!(correction.contains("Re-audit the complete replacement array"));
+        assert!(correction.contains("normalized-product uniqueness"));
 
         let schema = gemini_listing_avionics_item_schema();
         let manufacturer_description = schema["properties"]["manufacturer"]["description"]
