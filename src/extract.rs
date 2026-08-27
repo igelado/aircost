@@ -2272,6 +2272,7 @@ pub fn validate_source_url(source_url: &str) -> Result<()> {
 const LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE: &str = "\
 - Treat each avionics manufacturer/model as a literal listing observation, not a canonical catalog identity. The selected source_evidence_text must support every returned manufacturer and model spelling. Do not add, expand, correct, or normalize a familiar series prefix, product family, or manufacturer name from memory or from another source span.\n\
 - When one concrete model is literal in the occurrence but its manufacturer is not, retain the occurrence with manufacturer null. Never omit a useful exact model or invent its manufacturer. Catalog resolution supplies canonical identity later.\n\
+- A non-null manufacturer must be a separate whitespace-delimited source label, not a prefix split from one hyphenated or fused product code. From GDL-69A return manufacturer null and model GDL-69A; only Garmin GDL-69A supports manufacturer Garmin with model GDL-69A. Preserve the complete source-authored model token.\n\
 - A source-authored shared prefix inside one evidence span may support multiple rows, but keep each right-hand shorthand model literal and do not carry the prefix or manufacturer across rows. From Garmin GTN 750 & 650, return manufacturer Garmin with model GTN 750 for the first row, then manufacturer null with model 650 for the second row; do not invent Garmin or GTN for that shorthand row.\n\
 - Preserve source-authored labels and typography. From Garmin G3X Touchscreen PFD/MFD use model G3X Touchscreen, not G3X Touch; from Garmin 255 Nav/Com use model 255, not GNC 255; from JPI 830 engine monitor use model 830, not EDM 830; and from Garmin GFC500 Autopilot use model GFC500, not GFC 500.\n\
 - Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation. If the selected evidence cannot support a useful literal model identity, omit that occurrence instead of inventing one.\n";
@@ -4949,6 +4950,9 @@ mod tests {
                 "Leave canonical prefix expansion, corrected OEM naming, aliases, and typography normalization to later catalog curation",
                 "retain the occurrence with manufacturer null",
                 "Never omit a useful exact model or invent its manufacturer",
+                "not a prefix split from one hyphenated or fused product code",
+                "From GDL-69A return manufacturer null and model GDL-69A",
+                "only Garmin GDL-69A supports manufacturer Garmin with model GDL-69A",
                 "omit that occurrence instead of inventing one",
                 "quantity ambiguity, not proof of a physical count",
                 "source_confidence medium or low, never high",
