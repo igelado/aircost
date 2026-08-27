@@ -414,6 +414,31 @@ pub(crate) fn validate_current_avionics_observations(
     validate_current_avionics_quantity_completeness(observations, source_url, rendered_html)
 }
 
+/// Collect the first failure from each validation category that can be checked
+/// independently after the current occurrence schema parses. The normal
+/// admission contract remains fail-fast; this bounded diagnostic is only used
+/// to keep one semantic correction from fixing the first category while
+/// leaving an already-present defect in another category.
+pub(crate) fn independent_current_avionics_validation_failures(
+    extracted_listing: &Value,
+    source_url: &str,
+    rendered_html: &str,
+) -> Vec<AvionicsValidationFailure> {
+    let Ok(observations) = parse_current_avionics_extraction_value(extracted_listing) else {
+        return Vec::new();
+    };
+    let mut failures = Vec::with_capacity(2);
+    if let Err(failure) = validate_current_avionics_type_scope(&observations) {
+        failures.push(failure);
+    }
+    if let Err(failure) =
+        validate_current_avionics_quantity_completeness(&observations, source_url, rendered_html)
+    {
+        failures.push(failure);
+    }
+    failures
+}
+
 /// Apply narrow, evidence-backed repairs to transient model output atomically.
 ///
 /// Repairs may discard an unsupported manufacturer assertion, copy exact
