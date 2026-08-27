@@ -64,8 +64,11 @@ pub(crate) struct ListingAvionicsEvidenceObservation<'a> {
 ///
 /// This proves only what the signed listing says: one complete Controller
 /// `Avionics/Radios` line explicitly counts two literal product observations.
-/// It does not prove that the resolved catalog identity represents a countable
-/// physical unit; callers must independently require that product-side proof.
+/// Besides the manufacturer-complete grammar, one model-only display grammar is
+/// recognized when the listing says exactly `Dual <model> PFD/MFD`. It does not
+/// infer the missing manufacturer or prove that the resolved catalog identity
+/// represents a countable physical unit; callers must independently require a
+/// globally unique local identity and the product-side proof.
 pub(crate) fn exact_controller_leading_dual_evidence_proof(
     source_url: &str,
     extraction_source: &str,
@@ -73,10 +76,16 @@ pub(crate) fn exact_controller_leading_dual_evidence_proof(
     rendered_html_sha256: &str,
     observation: &ListingAvionicsEvidenceObservation<'_>,
 ) -> Option<ExactControllerLeadingDualEvidenceProof> {
-    let manufacturer = observation
-        .manufacturer
-        .map(str::trim)
-        .filter(|manufacturer| !manufacturer.is_empty())?;
+    let manufacturer = match observation.manufacturer {
+        Some(manufacturer) => {
+            let manufacturer = manufacturer.trim();
+            if manufacturer.is_empty() {
+                return None;
+            }
+            Some(manufacturer)
+        }
+        None => None,
+    };
     let model = observation.model.trim();
     let evidence = observation
         .source_evidence_text
@@ -99,27 +108,50 @@ pub(crate) fn exact_controller_leading_dual_evidence_proof(
 
     let after_dual =
         strip_ascii_case_prefix(evidence, "Dual").and_then(strip_required_whitespace_prefix)?;
-    let identity_end = exact_normalized_identity_prefix_end(after_dual, manufacturer, model)?;
-    let suffix = &after_dual[identity_end..];
-    let complete_identity_line = suffix.trim().is_empty();
-    let exact_slash_annotation = strip_required_whitespace_prefix(suffix).is_some_and(|suffix| {
-        exact_declared_slash_capabilities_with_waas(suffix, observation.avionics_types)
-    });
-    let exact_plural_waas_annotation = exact_controller_dual_plural_waas_annotation(
-        evidence,
-        manufacturer,
-        model,
-        observation.avionics_types,
-        Some(observation.quantity),
-    );
-    (complete_identity_line || exact_slash_annotation || exact_plural_waas_annotation).then(|| {
-        ExactControllerLeadingDualEvidenceProof {
-            plugin_submission_id,
-            source_url: source_url.to_string(),
-            rendered_html_sha256: rendered_html_sha256.to_string(),
-            evidence_text: evidence.to_string(),
-        }
+    let exact_supported_line = if let Some(manufacturer) = manufacturer {
+        let identity_end = exact_normalized_identity_prefix_end(after_dual, manufacturer, model)?;
+        let suffix = &after_dual[identity_end..];
+        let complete_identity_line = suffix.trim().is_empty();
+        let exact_slash_annotation =
+            strip_required_whitespace_prefix(suffix).is_some_and(|suffix| {
+                exact_declared_slash_capabilities_with_waas(suffix, observation.avionics_types)
+            });
+        let exact_plural_waas_annotation = exact_controller_dual_plural_waas_annotation(
+            evidence,
+            manufacturer,
+            model,
+            observation.avionics_types,
+            Some(observation.quantity),
+        );
+        complete_identity_line || exact_slash_annotation || exact_plural_waas_annotation
+    } else {
+        exact_controller_model_only_dual_flight_display_annotation(
+            after_dual,
+            model,
+            observation.avionics_types,
+        )
+    };
+    exact_supported_line.then(|| ExactControllerLeadingDualEvidenceProof {
+        plugin_submission_id,
+        source_url: source_url.to_string(),
+        rendered_html_sha256: rendered_html_sha256.to_string(),
+        evidence_text: evidence.to_string(),
     })
+}
+
+fn exact_controller_model_only_dual_flight_display_annotation(
+    after_dual: &str,
+    model: &str,
+    avionics_types: &[String],
+) -> bool {
+    if avionics_types.len() != 1 || avionics_types[0] != "Flight Display" {
+        return false;
+    }
+    let Some(identity_end) = exact_normalized_identity_prefix_end(after_dual, "", model) else {
+        return false;
+    };
+    strip_required_whitespace_prefix(&after_dual[identity_end..])
+        .is_some_and(|annotation| annotation.eq_ignore_ascii_case("PFD/MFD"))
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -2701,6 +2733,19 @@ mod tests {
             Some("medium"),
             evidence,
         ));
+
+        let evidence = "Dual GDU-1040 PFD/MFD";
+        assert!(exact_dual_proof(
+            CONTROLLER_URL,
+            evidence,
+            None,
+            "GDU-1040",
+            &["Flight Display"],
+            2,
+            "installed",
+            Some("medium"),
+            evidence,
+        ));
     }
 
     #[test]
@@ -2751,6 +2796,112 @@ mod tests {
                 manufacturer,
                 "GIA63W",
                 &["COM", "NAV", "GPS"],
+                quantity,
+                action,
+                confidence,
+                safe,
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_controller_model_only_dual_display_proof_fails_closed() {
+        let safe = "Dual GDU-1040 PFD/MFD";
+        for unsafe_line in [
+            "Optional Dual GDU-1040 PFD/MFD",
+            "Not Dual GDU-1040 PFD/MFD",
+            "Dual Axis GDU-1040 PFD/MFD",
+            "Dual GDU-1040 PFD",
+            "Dual GDU-1040 MFD/PFD",
+            "Dual GDU-1040 PFD / MFD",
+            "Dual GDU-1040 PFD/MFD/WAAS",
+            "Dual GDU-1040 PFD/MFD displays",
+            "Dual GDU-1040 PFD/MFD and GDU-1050",
+        ] {
+            assert!(!exact_dual_proof(
+                CONTROLLER_URL,
+                unsafe_line,
+                None,
+                "GDU-1040",
+                &["Flight Display"],
+                2,
+                "installed",
+                Some("medium"),
+                unsafe_line,
+            ));
+        }
+        for (source_url, manufacturer, types, quantity, action, confidence) in [
+            (
+                GENERIC_URL,
+                None,
+                &["Flight Display"][..],
+                2,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                Some("Garmin"),
+                &["Flight Display"][..],
+                2,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                Some("   "),
+                &["Flight Display"][..],
+                2,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                None,
+                &["Flight Display", "GPS"][..],
+                2,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                None,
+                &["GPS"][..],
+                2,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                None,
+                &["Flight Display"][..],
+                1,
+                "installed",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                None,
+                &["Flight Display"][..],
+                2,
+                "replaces",
+                Some("medium"),
+            ),
+            (
+                CONTROLLER_URL,
+                None,
+                &["Flight Display"][..],
+                2,
+                "installed",
+                Some("high"),
+            ),
+        ] {
+            assert!(!exact_dual_proof(
+                source_url,
+                safe,
+                manufacturer,
+                "GDU-1040",
+                types,
                 quantity,
                 action,
                 confidence,
