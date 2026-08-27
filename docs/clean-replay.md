@@ -230,7 +230,7 @@ the operator confirms the worker stopped and performs explicit stale recovery.
 Final release holds the same membership lock and rechecks the exact inventory
 before and after removing the freeze.
 
-Each report includes `gemini_usage` with the explicit
+Each report includes `cumulative_gemini_usage` with the explicit
 `manifest_phase_cumulative` scope. A stable correlation ID is derived from the
 manifest fingerprint and phase, while each accounting row retains its exact
 submission source ID. The totals therefore include every request across
@@ -238,7 +238,8 @@ resumptions of that phase: logical requests, transport attempts, retries,
 provider token/search counters, and estimated cost when the provider supplied
 complete billable usage. A retry that only reconciles an already-committed
 checkpoint makes no new request, but still reports the phase's earlier cost
-instead of losing durable attribution.
+instead of losing durable attribution. Dry-run never treats these historical
+totals as a forecast of provider requests that a later apply will make.
 
 The ledger stores no HTML, raw provider response envelope, or raw rejection
 message. For a successful extraction, it intentionally stores the exact
