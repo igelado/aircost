@@ -303,7 +303,10 @@ manufacturer to `null` when the returned maker is absent from that occurrence's
 evidence or is a generic placeholder such as `Unknown`. This does not infer a
 maker, canonicalize an identity, or borrow a maker from a shared-prefix list;
 canonical maker resolution belongs to catalog matching. Primary and
-replacement identities are evaluated independently.
+replacement identities are evaluated independently. A non-null manufacturer
+must also be a separate whitespace-delimited source label; a prefix joined to
+the rest of one hyphenated or fused product code remains part of the literal
+model and cannot become a manufacturer.
 
 For one structurally valid Controller capture with one exact `Avionics/Radios`
 field, the same pass may copy one unique bounded visible span into

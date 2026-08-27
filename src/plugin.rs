@@ -3539,6 +3539,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fused_product_prefix_uses_the_single_correction_request() {
+        let evidence = "GDL-69A Datalink Weather";
+        let primary = listing_extraction_with_avionics(json!([installed_avionics(
+            "GDL",
+            "69A",
+            &["Datalink"],
+            1,
+            evidence,
+        )]));
+        let mut corrected = installed_avionics("GDL", "GDL-69A", &["Datalink"], 1, evidence);
+        corrected["manufacturer"] = Value::Null;
+        let (endpoint, request_count, requests) = extraction_sequence_endpoint(vec![
+            primary.to_string(),
+            json!({"avionics": [corrected.clone()]}).to_string(),
+        ])
+        .await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html(evidence, "GFC700");
+
+        let (preview, payload) =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(payload["avionics"], json!([corrected]));
+        assert_eq!(preview.parsed_listing.avionics[0].manufacturer, None);
+        assert_eq!(preview.parsed_listing.avionics[0].model, "GDL-69A");
+        let requests = requests.lock().unwrap();
+        let correction_prompt = requests[1]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(correction_prompt.contains("manufacturer is not stated separately"));
+        assert!(correction_prompt.contains("From GDL-69A return manufacturer null"));
+    }
+
+    #[tokio::test]
     async fn invalid_cross_field_avionics_uses_one_flash_correction_and_changes_only_avionics() {
         let primary_avionics = json!([installed_avionics(
             "Garmin",

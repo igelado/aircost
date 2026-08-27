@@ -50,6 +50,7 @@ pub(crate) enum AvionicsValidationRule {
     InvalidOccurrenceSchema,
     EvidenceSourceInvalid,
     SourceEvidenceNotVisible,
+    ManufacturerNotSeparatelyStated,
     CandidateIdentityNotInEvidence,
     ReplacementIdentityNotInEvidence,
     SuiteCapabilityNotExplicit,
@@ -91,6 +92,7 @@ impl AvionicsValidationRule {
             Self::InvalidOccurrenceSchema => "invalid_occurrence_schema",
             Self::EvidenceSourceInvalid => "evidence_source_invalid",
             Self::SourceEvidenceNotVisible => "source_evidence_not_visible",
+            Self::ManufacturerNotSeparatelyStated => "manufacturer_not_separately_stated",
             Self::CandidateIdentityNotInEvidence => "candidate_identity_not_in_evidence",
             Self::ReplacementIdentityNotInEvidence => "replacement_identity_not_in_evidence",
             Self::SuiteCapabilityNotExplicit => "suite_capability_not_explicit",
@@ -114,6 +116,7 @@ impl AvionicsValidationRule {
         match self {
             Self::EvidenceSourceInvalid
             | Self::SourceEvidenceNotVisible
+            | Self::ManufacturerNotSeparatelyStated
             | Self::CandidateIdentityNotInEvidence
             | Self::ReplacementIdentityNotInEvidence
             | Self::SuiteCapabilityNotExplicit
@@ -180,6 +183,9 @@ impl AvionicsValidationRule {
             Self::EvidenceSourceInvalid => "listing evidence source is invalid",
             Self::SourceEvidenceNotVisible => {
                 "source_evidence_text is not one exact structurally visible source unit in the retained capture"
+            }
+            Self::ManufacturerNotSeparatelyStated => {
+                "manufacturer is not stated separately from the source-authored model token; keep the complete token as model with manufacturer null"
             }
             Self::CandidateIdentityNotInEvidence => {
                 "source_evidence_text is not one exact bounded source excerpt containing the candidate identity"
@@ -1512,30 +1518,31 @@ fn validate_current_avionics_identity_evidence_occurrence(
         Some(exact_visible_evidence_locator),
     );
     let evidence_context = ListingEvidenceContext::from_cleaned_text(evidence);
-    let controller_annotation_identity = observation.manufacturer.is_some()
-        && controller_field.is_some_and(|field| {
-            controller_field_has_exact_evidence_line(field, evidence)
-                && (exact_controller_run_on_capability_annotation(
-                    evidence,
-                    &observation.model,
-                    &observation.avionics_types,
-                    true,
-                ) || exact_controller_waas_capability_annotation(
+    let controller_annotation_identity = controller_field.is_some_and(|field| {
+        controller_field_has_exact_evidence_line(field, evidence)
+            && (exact_controller_run_on_capability_annotation(
+                evidence,
+                &observation.model,
+                &observation.avionics_types,
+                true,
+            ) || observation.manufacturer.is_some()
+                && exact_controller_waas_capability_annotation(
                     evidence,
                     observed_manufacturer,
                     &observation.model,
                     &observation.avionics_types,
                     Some(observation.quantity),
                 ))
-        });
+    });
+    let candidate_identity_present = extraction_occurrence_has_exact_identity(
+        &evidence_context,
+        observation.manufacturer.as_deref(),
+        &observation.model,
+        &observation.avionics_types,
+        evidence,
+    );
     if (!bounded_source.contains(evidence) && !controller_annotation_identity)
-        || !(extraction_occurrence_has_exact_identity(
-            &evidence_context,
-            observation.manufacturer.as_deref(),
-            &observation.model,
-            &observation.avionics_types,
-            evidence,
-        ) || controller_annotation_identity)
+        || !(candidate_identity_present || controller_annotation_identity)
     {
         return Err(AvionicsValidationFailure::occurrence(
             AvionicsValidationRule::CandidateIdentityNotInEvidence,
@@ -1543,40 +1550,172 @@ fn validate_current_avionics_identity_evidence_occurrence(
             AvionicsValidationField::SourceEvidenceText,
         ));
     }
+    if observation
+        .manufacturer
+        .as_deref()
+        .is_some_and(|manufacturer| {
+            !manufacturer_has_separate_source_token(
+                evidence,
+                manufacturer,
+                &observation.model,
+                controller_annotation_identity,
+            )
+        })
+    {
+        return Err(AvionicsValidationFailure::occurrence(
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated,
+            index,
+            AvionicsValidationField::Manufacturer,
+        ));
+    }
     if let Some(replacement) = observation.replaces.as_ref() {
         let replacement_manufacturer = replacement.manufacturer.as_deref().unwrap_or_default();
-        let replacement_annotation_identity = replacement.manufacturer.is_some()
-            && controller_field.is_some_and(|field| {
-                controller_field_has_exact_evidence_line(field, evidence)
-                    && (exact_controller_run_on_capability_annotation(
-                        evidence,
-                        &replacement.model,
-                        &replacement.avionics_types,
-                        false,
-                    ) || exact_controller_waas_capability_annotation(
+        let replacement_annotation_identity = controller_field.is_some_and(|field| {
+            controller_field_has_exact_evidence_line(field, evidence)
+                && (exact_controller_run_on_capability_annotation(
+                    evidence,
+                    &replacement.model,
+                    &replacement.avionics_types,
+                    false,
+                ) || replacement.manufacturer.is_some()
+                    && exact_controller_waas_capability_annotation(
                         evidence,
                         replacement_manufacturer,
                         &replacement.model,
                         &replacement.avionics_types,
                         None,
                     ))
-            });
-        if !(extraction_occurrence_has_exact_identity(
+        });
+        let replacement_identity_present = extraction_occurrence_has_exact_identity(
             &evidence_context,
             replacement.manufacturer.as_deref(),
             &replacement.model,
             &replacement.avionics_types,
             evidence,
-        ) || replacement_annotation_identity)
-        {
+        );
+        if !(replacement_identity_present || replacement_annotation_identity) {
             return Err(AvionicsValidationFailure::occurrence(
                 AvionicsValidationRule::ReplacementIdentityNotInEvidence,
                 index,
                 AvionicsValidationField::SourceEvidenceText,
             ));
         }
+        if replacement
+            .manufacturer
+            .as_deref()
+            .is_some_and(|manufacturer| {
+                !manufacturer_has_separate_source_token(
+                    evidence,
+                    manufacturer,
+                    &replacement.model,
+                    replacement_annotation_identity,
+                )
+            })
+        {
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::ManufacturerNotSeparatelyStated,
+                index,
+                AvionicsValidationField::ReplacementManufacturer,
+            ));
+        }
     }
     Ok(())
+}
+
+/// Require a literal manufacturer to be a distinct source label rather than a
+/// prefix split out of one hyphenated or fused product code. Punctuation inside
+/// the model remains untouched; this gate only checks for source whitespace at
+/// the returned manufacturer/model boundary.
+fn manufacturer_has_separate_source_token(
+    evidence: &str,
+    manufacturer: &str,
+    model: &str,
+    allow_controller_capability_run_on: bool,
+) -> bool {
+    let manufacturer_len = punctuation_insensitive_identity_key(manufacturer).len();
+    let normalized_identity =
+        punctuation_insensitive_identity_key(&format!("{manufacturer}{model}"));
+    if manufacturer_len == 0 || normalized_identity.len() == manufacturer_len {
+        return false;
+    }
+
+    let mut normalized_evidence = String::new();
+    let mut source_offsets = Vec::new();
+    for (offset, character) in evidence.char_indices() {
+        if character.is_ascii_alphanumeric() {
+            normalized_evidence.push(character.to_ascii_lowercase());
+            source_offsets.push(offset);
+        }
+    }
+
+    normalized_evidence
+        .match_indices(&normalized_identity)
+        .any(|(normalized_start, _)| {
+            let Some(&source_start) = source_offsets.get(normalized_start) else {
+                return false;
+            };
+            if evidence[..source_start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+            {
+                return false;
+            }
+            let Some(&manufacturer_last) =
+                source_offsets.get(normalized_start + manufacturer_len - 1)
+            else {
+                return false;
+            };
+            let Some(&model_first) = source_offsets.get(normalized_start + manufacturer_len) else {
+                return false;
+            };
+            let Some(&identity_last) =
+                source_offsets.get(normalized_start + normalized_identity.len() - 1)
+            else {
+                return false;
+            };
+            let identity_end = identity_last
+                + evidence[identity_last..]
+                    .chars()
+                    .next()
+                    .expect("a recorded source offset has one character")
+                    .len_utf8();
+            if !allow_controller_capability_run_on
+                && evidence[identity_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric)
+            {
+                return false;
+            }
+            let manufacturer_end = manufacturer_last
+                + evidence[manufacturer_last..]
+                    .chars()
+                    .next()
+                    .expect("a recorded source offset has one character")
+                    .len_utf8();
+            let gap = &evidence[manufacturer_end..model_first];
+            gap.chars().any(char::is_whitespace) && !gap.chars().any(is_product_code_joiner)
+        })
+}
+
+fn is_product_code_joiner(character: char) -> bool {
+    matches!(
+        character,
+        '-' | '_'
+            | '/'
+            | '\\'
+            | '\u{00ad}'
+            | '\u{2010}'
+            | '\u{2011}'
+            | '\u{2012}'
+            | '\u{2013}'
+            | '\u{2014}'
+            | '\u{2015}'
+            | '\u{2212}'
+            | '\u{fe63}'
+            | '\u{ff0d}'
+    )
 }
 
 fn context_has_exact_identity(
@@ -2383,6 +2522,187 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_product_code_prefix_split_into_a_manufacturer() {
+        for fused in ["GDL-69A", "GDL- 69A", "GDL - 69A", "GDL-\n69A"] {
+            assert!(!manufacturer_has_separate_source_token(
+                fused, "GDL", "69A", false,
+            ));
+        }
+        for joiner in ['\u{00ad}', '\u{2212}', '\u{fe63}', '\u{ff0d}'] {
+            assert!(!manufacturer_has_separate_source_token(
+                &format!("GDL{joiner} 69A"),
+                "GDL",
+                "69A",
+                false,
+            ));
+        }
+        assert!(manufacturer_has_separate_source_token(
+            "Garmin (GDL-69A)",
+            "Garmin",
+            "GDL-69A",
+            false,
+        ));
+
+        let evidence = "GDL-69A Datalink Weather";
+        let html = controller_html(evidence);
+        let split = installed("GDL", "69A", evidence);
+
+        let failure =
+            validate_unbound_current_avionics_extraction(&split.to_string(), CONTROLLER_URL, &html)
+                .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated
+        );
+        assert_eq!(failure.path().as_deref(), Some("avionics[0].manufacturer"));
+
+        let mut literal_model = installed("GDL", "GDL-69A", evidence);
+        literal_model["avionics"][0]["manufacturer"] = Value::Null;
+        validate_unbound_current_avionics_extraction(
+            &literal_model.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap();
+
+        let explicit_evidence = "Garmin GDL-69A Datalink Weather";
+        let explicit_html = controller_html(explicit_evidence);
+        let explicit = installed("Garmin", "GDL-69A", explicit_evidence);
+        validate_unbound_current_avionics_extraction(
+            &explicit.to_string(),
+            CONTROLLER_URL,
+            &explicit_html,
+        )
+        .unwrap();
+
+        let replacement_evidence = "Garmin G5 replaces GDL-69A";
+        let replacement_html = controller_html(replacement_evidence);
+        let mut replacement = installed("Garmin", "G5", replacement_evidence);
+        replacement["avionics"][0]["configuration_action"] = Value::String("replaces".to_string());
+        replacement["avionics"][0]["replaces"] = serde_json::json!({
+            "manufacturer": "GDL",
+            "model": "69A",
+            "types": ["Datalink"]
+        });
+        let failure = validate_unbound_current_avionics_extraction(
+            &replacement.to_string(),
+            CONTROLLER_URL,
+            &replacement_html,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated
+        );
+        assert_eq!(
+            failure.path().as_deref(),
+            Some("avionics[0].replaces.manufacturer")
+        );
+
+        let wrong_model = installed("Garmin", "G5", evidence);
+        let failure = validate_unbound_current_avionics_extraction(
+            &wrong_model.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::CandidateIdentityNotInEvidence
+        );
+    }
+
+    #[test]
+    fn controller_run_on_identity_does_not_exempt_a_split_manufacturer() {
+        let evidence = "GDL-69ADatalink";
+        let html = controller_html(evidence);
+        let mut split = installed("GDL", "69A", evidence);
+        split["avionics"][0]["types"] = serde_json::json!(["Datalink"]);
+
+        let failure =
+            validate_unbound_current_avionics_extraction(&split.to_string(), CONTROLLER_URL, &html)
+                .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated
+        );
+        assert_eq!(failure.path().as_deref(), Some("avionics[0].manufacturer"));
+
+        let mut literal_model = installed("GDL", "GDL-69A", evidence);
+        literal_model["avionics"][0]["manufacturer"] = Value::Null;
+        literal_model["avionics"][0]["types"] = serde_json::json!(["Datalink"]);
+        validate_unbound_current_avionics_extraction(
+            &literal_model.to_string(),
+            CONTROLLER_URL,
+            &html,
+        )
+        .unwrap();
+
+        let replacement_evidence = "Garmin GTN 750Xi replaces GDL-69ADatalink";
+        let replacement_html = controller_html(replacement_evidence);
+        let mut replacement = replacement(replacement_evidence);
+        replacement["avionics"][0]["replaces"] = serde_json::json!({
+            "manufacturer": "GDL",
+            "model": "69A",
+            "types": ["Datalink"]
+        });
+        let failure = validate_unbound_current_avionics_extraction(
+            &replacement.to_string(),
+            CONTROLLER_URL,
+            &replacement_html,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated
+        );
+        assert_eq!(
+            failure.path().as_deref(),
+            Some("avionics[0].replaces.manufacturer")
+        );
+    }
+
+    #[test]
+    fn a_longer_neighbor_cannot_authorize_a_split_manufacturer() {
+        let evidence = "GDL-69A; GDL 69AX";
+        let html = controller_html(evidence);
+        let split = installed("GDL", "69A", evidence);
+
+        let failure =
+            validate_unbound_current_avionics_extraction(&split.to_string(), CONTROLLER_URL, &html)
+                .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated
+        );
+        assert_eq!(failure.path().as_deref(), Some("avionics[0].manufacturer"));
+
+        let replacement_evidence = "Garmin GTN 750Xi replaces GDL-69A; GDL 69AX remains available";
+        let replacement_html = controller_html(replacement_evidence);
+        let mut replacement = replacement(replacement_evidence);
+        replacement["avionics"][0]["replaces"] = serde_json::json!({
+            "manufacturer": "GDL",
+            "model": "69A",
+            "types": ["Datalink"]
+        });
+
+        let failure = validate_unbound_current_avionics_extraction(
+            &replacement.to_string(),
+            CONTROLLER_URL,
+            &replacement_html,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::ManufacturerNotSeparatelyStated
+        );
+        assert_eq!(
+            failure.path().as_deref(),
+            Some("avionics[0].replaces.manufacturer")
+        );
+    }
+
+    #[test]
     fn accepts_explicitly_unstated_manufacturer_for_exact_model_evidence() {
         let html = "<html><body><p>WX500 Stormscope</p></body></html>";
         let hash = sha256_hex(html.as_bytes());
@@ -2729,6 +3049,7 @@ mod tests {
         let field = "GIA63WNAV/COM/GPS(Dual)";
         let html = controller_html(field);
         let mut payload = installed("Garmin", "GIA63W", field);
+        payload["avionics"][0]["manufacturer"] = Value::Null;
         payload["avionics"][0]["types"] = serde_json::json!(["NAV", "COM", "GPS"]);
         payload["avionics"][0]["source_confidence"] = serde_json::json!("medium");
         validate_unbound_current_avionics_extraction(&payload.to_string(), CONTROLLER_URL, &html)
@@ -2943,6 +3264,7 @@ mod tests {
         ] {
             let html = controller_html(source_evidence);
             let mut payload = installed("Garmin", model, source_evidence);
+            payload["avionics"][0]["manufacturer"] = Value::Null;
             payload["avionics"][0]["types"] = serde_json::json!(avionics_types);
             payload["avionics"][0]["quantity"] = serde_json::json!(quantity);
             if quantity > 1 {
@@ -2991,7 +3313,7 @@ Advisory System)";
         let mut payload = serde_json::json!({
             "avionics": [
                 {
-                    "manufacturer": "Garmin",
+                    "manufacturer": null,
                     "model": "GIA63W",
                     "types": ["NAV", "COM", "GPS"],
                     "quantity": 2,
@@ -3001,7 +3323,7 @@ Advisory System)";
                     "source_confidence": "medium"
                 },
                 {
-                    "manufacturer": "Garmin",
+                    "manufacturer": null,
                     "model": "GDL690A",
                     "types": ["Datalink"],
                     "quantity": 1,
