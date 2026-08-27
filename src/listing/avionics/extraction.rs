@@ -59,6 +59,7 @@ pub(crate) enum AvionicsValidationRule {
     QuantityProofAmbiguous,
     QuantityMismatch,
     QuantityEvidenceIncomplete,
+    ExplicitlyInoperativeInstallation,
     InvalidBindingIdentifiers,
     OwnerBindingMismatch,
     CanonicalListingBindingMismatch,
@@ -101,6 +102,7 @@ impl AvionicsValidationRule {
             Self::QuantityProofAmbiguous => "quantity_proof_ambiguous",
             Self::QuantityMismatch => "quantity_mismatch",
             Self::QuantityEvidenceIncomplete => "quantity_evidence_incomplete",
+            Self::ExplicitlyInoperativeInstallation => "explicitly_inoperative_installation",
             Self::InvalidBindingIdentifiers => "invalid_binding_identifiers",
             Self::OwnerBindingMismatch => "owner_binding_mismatch",
             Self::CanonicalListingBindingMismatch => "canonical_listing_binding_mismatch",
@@ -125,6 +127,7 @@ impl AvionicsValidationRule {
             | Self::QuantityProofAmbiguous
             | Self::QuantityMismatch
             | Self::QuantityEvidenceIncomplete
+            | Self::ExplicitlyInoperativeInstallation
             | Self::OwnerBindingMismatch
             | Self::CanonicalListingBindingMismatch
             | Self::MissingListingSourceUrl
@@ -210,6 +213,9 @@ impl AvionicsValidationRule {
             }
             Self::QuantityEvidenceIncomplete => {
                 "source_evidence_text does not cover the complete bounded Controller quantity ambiguity"
+            }
+            Self::ExplicitlyInoperativeInstallation => {
+                "installed occurrence is explicitly marked inoperative and cannot represent working current-configuration avionics"
             }
             Self::InvalidBindingIdentifiers => {
                 "listing and retained submission IDs must be positive"
@@ -410,6 +416,7 @@ pub(crate) fn validate_current_avionics_observations(
         source_url,
         rendered_html,
     )?;
+    validate_current_avionics_operational_eligibility(observations)?;
     validate_current_avionics_type_scope(observations)?;
     validate_current_avionics_quantity_completeness(observations, source_url, rendered_html)
 }
@@ -427,7 +434,10 @@ pub(crate) fn independent_current_avionics_validation_failures(
     let Ok(observations) = parse_current_avionics_extraction_value(extracted_listing) else {
         return Vec::new();
     };
-    let mut failures = Vec::with_capacity(2);
+    let mut failures = Vec::with_capacity(3);
+    if let Err(failure) = validate_current_avionics_operational_eligibility(&observations) {
+        failures.push(failure);
+    }
     if let Err(failure) = validate_current_avionics_type_scope(&observations) {
         failures.push(failure);
     }
@@ -437,6 +447,55 @@ pub(crate) fn independent_current_avionics_validation_failures(
         failures.push(failure);
     }
     failures
+}
+
+fn validate_current_avionics_operational_eligibility(
+    observations: &[ParsedAvionics],
+) -> Result<(), AvionicsValidationFailure> {
+    for (index, observation) in observations.iter().enumerate() {
+        if observation.configuration_action == "installed"
+            && observation
+                .source_evidence_text
+                .as_deref()
+                .is_some_and(evidence_ends_with_explicit_inoperative_marker)
+        {
+            return Err(AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::ExplicitlyInoperativeInstallation,
+                index,
+                AvionicsValidationField::SourceEvidenceText,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn evidence_ends_with_explicit_inoperative_marker(evidence: &str) -> bool {
+    // A terminal status is unambiguous. A historical or repaired-status
+    // sentence may contain the same word earlier and must remain a semantic
+    // extraction decision rather than a mechanical rejection.
+    let normalized = normalize_source_evidence_span(evidence);
+    [
+        "inop",
+        "inoperative",
+        "non operational",
+        "not working",
+        "unserviceable",
+        "not serviceable",
+    ]
+    .iter()
+    .any(|marker| {
+        if normalized == *marker {
+            return true;
+        }
+        let Some(prefix) = normalized.strip_suffix(*marker) else {
+            return false;
+        };
+        if !prefix.ends_with(' ') {
+            return false;
+        }
+        let prefix = prefix.trim_end();
+        !prefix.ends_with("not") && !prefix.ends_with("no longer")
+    })
 }
 
 /// Apply narrow, evidence-backed repairs to transient model output atomically.
@@ -2530,6 +2589,78 @@ mod tests {
         let parsed = validate_current_avionics_extraction(bound(html, &hash, json)).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].avionics_types, ["Flight Display"]);
+    }
+
+    #[test]
+    fn rejects_only_installed_occurrences_with_terminal_inoperative_markers() {
+        for evidence in [
+            "Century I Wingleveler Autopilot (INOP)",
+            "Century I Wingleveler Autopilot [INOP].",
+            "Century I Wingleveler Autopilot inoperative",
+            "Century I Wingleveler Autopilot non-operational",
+            "Century I Wingleveler Autopilot not working",
+            "Century I Wingleveler Autopilot unserviceable",
+            "Century I Wingleveler Autopilot not serviceable",
+        ] {
+            let html = controller_html(evidence);
+            let mut inoperative = installed("Century", "I", evidence);
+            inoperative["avionics"][0]["types"] = serde_json::json!(["Autopilot"]);
+
+            let failure = validate_unbound_current_avionics_extraction(
+                &inoperative.to_string(),
+                CONTROLLER_URL,
+                &html,
+            )
+            .expect_err("an explicitly inoperative installed unit must not enter valuation");
+            assert_eq!(
+                failure.rule(),
+                AvionicsValidationRule::ExplicitlyInoperativeInstallation
+            );
+            assert_eq!(
+                failure.path().as_deref(),
+                Some("avionics[0].source_evidence_text")
+            );
+        }
+
+        let operational_evidence =
+            "Century I Wingleveler Autopilot previously INOP, repaired and now operational";
+        for operational_evidence in [
+            operational_evidence,
+            "Century I Wingleveler Autopilot not INOP",
+            "Century I Wingleveler Autopilot not inoperative",
+            "Century I Wingleveler Autopilot not non-operational",
+            "Century I Wingleveler Autopilot not unserviceable",
+            "Century I Wingleveler Autopilot no longer inoperative",
+            "Century I Wingleveler Autopilot no longer unserviceable",
+            "Century I Wingleveler Autopilot no longer not working",
+            "Century I Wingleveler Autopilot operational",
+            "Century I Wingleveler Autopilot serviceable",
+        ] {
+            let operational_html = controller_html(operational_evidence);
+            let mut operational = installed("Century", "I", operational_evidence);
+            operational["avionics"][0]["types"] = serde_json::json!(["Autopilot"]);
+            validate_unbound_current_avionics_extraction(
+                &operational.to_string(),
+                CONTROLLER_URL,
+                &operational_html,
+            )
+            .expect("current working evidence must not be rejected as inoperative");
+        }
+
+        let removed_evidence = "Century I Wingleveler Autopilot removed (INOP)";
+        let removed_html = controller_html(removed_evidence);
+        let mut removed = installed("Century", "I", removed_evidence);
+        removed["avionics"][0]["types"] = serde_json::json!(["Autopilot"]);
+        removed["avionics"][0]["configuration_action"] = Value::String("removes".to_string());
+        removed["avionics"][0]["replaces"] = serde_json::json!({
+            "manufacturer": "Century", "model": "I", "types": ["Autopilot"]
+        });
+        validate_unbound_current_avionics_extraction(
+            &removed.to_string(),
+            CONTROLLER_URL,
+            &removed_html,
+        )
+        .expect("an independently explicit removal remains a supported action");
     }
 
     #[test]
