@@ -54,6 +54,7 @@ pub(crate) enum AvionicsValidationRule {
     ReplacementIdentityNotInEvidence,
     SuiteCapabilityNotExplicit,
     SuiteCapabilityCollision,
+    QuantityConfidenceTooHigh,
     QuantityProofAmbiguous,
     QuantityMismatch,
     QuantityEvidenceIncomplete,
@@ -94,6 +95,7 @@ impl AvionicsValidationRule {
             Self::ReplacementIdentityNotInEvidence => "replacement_identity_not_in_evidence",
             Self::SuiteCapabilityNotExplicit => "suite_capability_not_explicit",
             Self::SuiteCapabilityCollision => "suite_capability_collision",
+            Self::QuantityConfidenceTooHigh => "quantity_confidence_too_high",
             Self::QuantityProofAmbiguous => "quantity_proof_ambiguous",
             Self::QuantityMismatch => "quantity_mismatch",
             Self::QuantityEvidenceIncomplete => "quantity_evidence_incomplete",
@@ -116,6 +118,7 @@ impl AvionicsValidationRule {
             | Self::ReplacementIdentityNotInEvidence
             | Self::SuiteCapabilityNotExplicit
             | Self::SuiteCapabilityCollision
+            | Self::QuantityConfidenceTooHigh
             | Self::QuantityProofAmbiguous
             | Self::QuantityMismatch
             | Self::QuantityEvidenceIncomplete
@@ -190,11 +193,14 @@ impl AvionicsValidationRule {
             Self::SuiteCapabilityCollision => {
                 "integrated suite assigns a capability to a separate product"
             }
+            Self::QuantityConfidenceTooHigh => {
+                "quantity greater than one cannot have high source confidence"
+            }
             Self::QuantityProofAmbiguous => {
                 "ambiguous Controller quantity evidence cannot have high source confidence"
             }
             Self::QuantityMismatch => {
-                "occurrence duplicates an earlier normalized manufacturer/model identity, or quantity greater than one cannot have high source confidence"
+                "occurrence duplicates an earlier normalized manufacturer/model identity"
             }
             Self::QuantityEvidenceIncomplete => {
                 "source_evidence_text does not cover the complete bounded Controller quantity ambiguity"
@@ -402,33 +408,229 @@ pub(crate) fn validate_current_avionics_observations(
     validate_current_avionics_quantity_completeness(observations, source_url, rendered_html)
 }
 
-/// Apply the narrow Controller evidence-typography repair atomically. Quantity
-/// remains model-produced and is validated without mutation.
-pub(crate) fn recover_controller_avionics_extraction(
+/// Apply narrow, evidence-backed repairs to transient model output atomically.
+///
+/// Repairs may discard an unsupported manufacturer assertion, copy exact
+/// Controller evidence typography, or lower an exact Controller `Dual`
+/// quantity candidate from high to medium confidence. Product models,
+/// quantities, capabilities, actions, and evidence content remain
+/// model-produced.
+pub(crate) fn repair_listing_avionics_extraction(
     extracted_listing: &mut Value,
     source_url: &str,
     rendered_html: &str,
 ) -> Result<bool, AvionicsValidationFailure> {
     let original = extracted_listing.clone();
-    let recovery = (|| {
+    let repair = (|| {
+        let manufacturer_repaired =
+            null_unsupported_literal_manufacturers(extracted_listing, source_url, rendered_html)?;
         let evidence_recovered = apply_controller_avionics_evidence_typography(
             extracted_listing,
             source_url,
             rendered_html,
         )?;
-        if evidence_recovered {
+        let quantity_confidence_repaired = lower_exact_controller_dual_quantity_confidence(
+            extracted_listing,
+            source_url,
+            rendered_html,
+        )?;
+        let repaired = manufacturer_repaired || evidence_recovered || quantity_confidence_repaired;
+        if repaired {
             validate_unbound_current_avionics_extraction(
                 &extracted_listing.to_string(),
                 source_url,
                 rendered_html,
             )?;
         }
-        Ok(evidence_recovered)
+        Ok(repaired)
     })();
-    if recovery.is_err() {
+    if repair.is_err() {
         *extracted_listing = original;
     }
-    recovery
+    repair
+}
+
+/// Remove only a manufacturer assertion that has no literal occurrence in the
+/// occurrence evidence. The evidence must already be an admitted exact source
+/// span and must establish one exact, unqualified model. Canonical maker
+/// recovery belongs to later catalog resolution.
+fn null_unsupported_literal_manufacturers(
+    extracted_listing: &mut Value,
+    source_url: &str,
+    rendered_html: &str,
+) -> Result<bool, AvionicsValidationFailure> {
+    let evidence_units = listing_evidence_units(source_url, rendered_html).map_err(|_| {
+        AvionicsValidationFailure::global(AvionicsValidationRule::EvidenceSourceInvalid)
+    })?;
+    let Some(avionics) = extracted_listing.get("avionics").and_then(Value::as_array) else {
+        return parse_current_avionics_extraction_value(extracted_listing).map(|_| false);
+    };
+    let repairs = avionics
+        .iter()
+        .map(|occurrence| {
+            let Some(object) = occurrence.as_object() else {
+                return (false, false);
+            };
+            let evidence = object
+                .get("source_evidence_text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if !evidence_units.contains_exact_span(evidence) {
+                return (false, false);
+            }
+            let context = ListingEvidenceContext::from_cleaned_text(evidence);
+            (
+                raw_identity_has_unsupported_manufacturer(object, evidence, &context),
+                object
+                    .get("replaces")
+                    .and_then(Value::as_object)
+                    .is_some_and(|replacement| {
+                        raw_identity_has_unsupported_manufacturer(replacement, evidence, &context)
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !repairs
+        .iter()
+        .any(|(primary, replacement)| *primary || *replacement)
+    {
+        return Ok(false);
+    }
+
+    // Only now mutate the transient payload. A complete current-schema parse
+    // below proves that generic placeholders were the sole structural defect.
+    let avionics = extracted_listing
+        .get_mut("avionics")
+        .and_then(Value::as_array_mut)
+        .expect("the canonical parser requires a top-level avionics array");
+    for (index, (occurrence, (primary, replacement))) in
+        avionics.iter_mut().zip(repairs).enumerate()
+    {
+        if !primary && !replacement {
+            continue;
+        }
+        let object = occurrence.as_object_mut().ok_or_else(|| {
+            AvionicsValidationFailure::occurrence(
+                AvionicsValidationRule::OccurrenceNotObject,
+                index,
+                AvionicsValidationField::Occurrence,
+            )
+        })?;
+        if primary {
+            object.insert("manufacturer".to_string(), Value::Null);
+        }
+        if replacement {
+            object
+                .get_mut("replaces")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    AvionicsValidationFailure::occurrence(
+                        AvionicsValidationRule::MissingReplacementObject,
+                        index,
+                        AvionicsValidationField::Replaces,
+                    )
+                })?
+                .insert("manufacturer".to_string(), Value::Null);
+        }
+    }
+    parse_current_avionics_extraction_value(extracted_listing)?;
+    Ok(true)
+}
+
+fn raw_identity_has_unsupported_manufacturer(
+    identity: &serde_json::Map<String, Value>,
+    evidence: &str,
+    evidence_context: &ListingEvidenceContext,
+) -> bool {
+    let Some(manufacturer) = identity.get("manufacturer").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(model) = identity
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return false;
+    };
+    if evidence_context.unique_exact_model_slice(model).is_none() {
+        return false;
+    }
+    is_placeholder_manufacturer(manufacturer)
+        || (!manufacturer.trim().is_empty()
+            && normalized_identity_occurrence_ranges(evidence, manufacturer).is_empty())
+}
+
+/// Lower, but never raise, confidence for the one exact Controller count
+/// grammar that is safe to recognize mechanically. `Dual` must immediately
+/// scope the literal product identity and the model must already have returned
+/// quantity two. The quantity itself is never inferred or changed here.
+fn lower_exact_controller_dual_quantity_confidence(
+    extracted_listing: &mut Value,
+    source_url: &str,
+    rendered_html: &str,
+) -> Result<bool, AvionicsValidationFailure> {
+    let observations = parse_current_avionics_extraction_value(extracted_listing)?;
+    let Some(controller_field) = controller_avionics_evidence(source_url, rendered_html) else {
+        return Ok(false);
+    };
+    let evidence_units = listing_evidence_units(source_url, rendered_html).map_err(|_| {
+        AvionicsValidationFailure::global(AvionicsValidationRule::EvidenceSourceInvalid)
+    })?;
+    let repairs = observations
+        .iter()
+        .map(|observation| {
+            let evidence = observation
+                .source_evidence_text
+                .as_deref()
+                .expect("the canonical parser requires occurrence evidence")
+                .trim();
+            observation.quantity == 2
+                && observation.source_confidence.as_deref() == Some("high")
+                && evidence_units.contains_exact_span(evidence)
+                && controller_field_has_exact_evidence_line(&controller_field, evidence)
+                && exact_leading_dual_identity(
+                    evidence,
+                    observation.manufacturer.as_deref(),
+                    &observation.model,
+                )
+        })
+        .collect::<Vec<_>>();
+    if !repairs.iter().any(|repair| *repair) {
+        return Ok(false);
+    }
+
+    let avionics = extracted_listing
+        .get_mut("avionics")
+        .and_then(Value::as_array_mut)
+        .expect("the canonical parser requires a top-level avionics array");
+    for (occurrence, repair) in avionics.iter_mut().zip(repairs) {
+        if repair {
+            occurrence
+                .as_object_mut()
+                .expect("the canonical parser requires avionics objects")
+                .insert(
+                    "source_confidence".to_string(),
+                    Value::String("medium".to_string()),
+                );
+        }
+    }
+    Ok(true)
+}
+
+fn exact_leading_dual_identity(evidence: &str, manufacturer: Option<&str>, model: &str) -> bool {
+    let Some(after_dual) =
+        strip_ascii_case_prefix(evidence.trim(), "Dual").and_then(strip_required_whitespace_prefix)
+    else {
+        return false;
+    };
+    match manufacturer {
+        Some(manufacturer) => {
+            exact_normalized_identity_prefix_end(after_dual, manufacturer, model).is_some()
+        }
+        None => exact_normalized_identity_prefix_end(after_dual, "", model).is_some(),
+    }
 }
 
 /// Replace only typography-drifted occurrence evidence with an exact visible
@@ -965,9 +1167,9 @@ pub(crate) fn validate_current_avionics_quantity_completeness(
         }
         if observation.quantity > 1 && observation.source_confidence.as_deref() == Some("high") {
             return Err(AvionicsValidationFailure::occurrence(
-                AvionicsValidationRule::QuantityMismatch,
+                AvionicsValidationRule::QuantityConfidenceTooHigh,
                 index,
-                AvionicsValidationField::Quantity,
+                AvionicsValidationField::SourceConfidence,
             ));
         }
     }
@@ -1216,7 +1418,10 @@ fn quantity_marker_in_identity_item(
         let end = item_words.last().map_or(identity.end, |word| word.end);
         IdentityRange { start, end }
     };
-    if item_words.iter().any(|word| word.value == "dual")
+    if item_words
+        .windows(2)
+        .any(|words| words[0].value == "dual" && words[1].value != "axis")
+        || item_words.last().is_some_and(|word| word.value == "dual")
         || item_words
             .iter()
             .any(|word| decimal_quantity_is_multiplier(&word.value))
@@ -1976,18 +2181,17 @@ fn literal_manufacturer_or_null(value: &Value) -> bool {
     if value.is_null() {
         return true;
     }
-    value.as_str().map(str::trim).is_some_and(|value| {
-        let normalized = value
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .map(|character| character.to_ascii_lowercase())
-            .collect::<String>();
-        !value.is_empty()
-            && !matches!(
-                normalized.as_str(),
-                "unknown" | "none" | "na" | "notavailable" | "null"
-            )
-    })
+    value
+        .as_str()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty() && !is_placeholder_manufacturer(value))
+}
+
+fn is_placeholder_manufacturer(value: &str) -> bool {
+    matches!(
+        normalize_evidence_typography(value).as_str(),
+        "unknown" | "none" | "na" | "notavailable" | "null"
+    )
 }
 
 fn validate_capabilities(
@@ -2080,7 +2284,23 @@ mod tests {
         source_url: &str,
         rendered_html: &str,
     ) -> Result<bool, AvionicsValidationFailure> {
-        recover_controller_avionics_extraction(payload, source_url, rendered_html)
+        let original = payload.clone();
+        let recovery = (|| {
+            let recovered =
+                apply_controller_avionics_evidence_typography(payload, source_url, rendered_html)?;
+            if recovered {
+                validate_unbound_current_avionics_extraction(
+                    &payload.to_string(),
+                    source_url,
+                    rendered_html,
+                )?;
+            }
+            Ok(recovered)
+        })();
+        if recovery.is_err() {
+            *payload = original;
+        }
+        recovery
     }
 
     fn installed(manufacturer: &str, model: &str, evidence: &str) -> Value {
@@ -2175,6 +2395,162 @@ mod tests {
         assert_eq!(
             parsed[0].source_evidence_text.as_deref(),
             Some("WX500 Stormscope")
+        );
+    }
+
+    #[test]
+    fn repair_nulls_only_an_unsupported_literal_manufacturer() {
+        let html = controller_html("GMA-1347 Digital Audio Panel\nTerrain Avoidance System TAWS");
+        let mut payload = installed("Garmin", "GMA-1347", "GMA-1347 Digital Audio Panel");
+        payload["avionics"][0]["types"] = serde_json::json!(["Audio Panel"]);
+        let mut taws =
+            installed("Unknown", "TAWS", "Terrain Avoidance System TAWS")["avionics"][0].clone();
+        taws["types"] = serde_json::json!(["Terrain Awareness"]);
+        payload["avionics"].as_array_mut().unwrap().push(taws);
+        let mut expected = payload.clone();
+        expected["avionics"][0]["manufacturer"] = Value::Null;
+        expected["avionics"][1]["manufacturer"] = Value::Null;
+
+        assert!(repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap());
+        assert_eq!(payload, expected);
+
+        let explicit_html = controller_html("Garmin GMA-1347 Digital Audio Panel");
+        let mut explicit = installed("Garmin", "GMA-1347", "Garmin GMA-1347 Digital Audio Panel");
+        explicit["avionics"][0]["types"] = serde_json::json!(["Audio Panel"]);
+        let original = explicit.clone();
+        assert!(
+            !repair_listing_avionics_extraction(&mut explicit, CONTROLLER_URL, &explicit_html,)
+                .unwrap()
+        );
+        assert_eq!(explicit, original);
+    }
+
+    #[test]
+    fn repair_does_not_steal_a_shared_manufacturer_prefix() {
+        let html = "<html><body><p>Garmin GTN 750 &amp; 650</p></body></html>";
+        let mut payload = installed("Garmin", "650", "Garmin GTN 750 & 650");
+        payload["avionics"][0]["types"] = serde_json::json!(["GPS"]);
+        let original = payload.clone();
+
+        assert!(!repair_listing_avionics_extraction(&mut payload, GENERIC_URL, html).unwrap());
+        assert_eq!(payload, original);
+        assert_eq!(
+            validate_unbound_current_avionics_extraction(&payload.to_string(), GENERIC_URL, html,)
+                .unwrap_err()
+                .rule(),
+            AvionicsValidationRule::CandidateIdentityNotInEvidence
+        );
+    }
+
+    #[test]
+    fn repair_rolls_back_every_change_when_another_semantic_rule_fails() {
+        let html =
+            "<html><body><p>Terrain Avoidance System TAWS</p><p>Garmin G1000</p></body></html>";
+        let mut taws =
+            installed("Unknown", "TAWS", "Terrain Avoidance System TAWS")["avionics"][0].clone();
+        taws["types"] = serde_json::json!(["Terrain Awareness"]);
+        let mut invalid_suite = installed("Garmin", "G1000", "Garmin G1000")["avionics"][0].clone();
+        invalid_suite["types"] = serde_json::json!(["Integrated Flight Deck", "Autopilot"]);
+        let mut payload = serde_json::json!({"avionics": [taws, invalid_suite]});
+        let original = payload.clone();
+
+        let failure =
+            repair_listing_avionics_extraction(&mut payload, GENERIC_URL, html).unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::SuiteCapabilityNotExplicit
+        );
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn repair_rolls_back_mixed_object_and_non_object_arrays_without_panicking() {
+        let html = "<html><body><p>Terrain Avoidance System TAWS</p></body></html>";
+        let mut repairable =
+            installed("Unknown", "TAWS", "Terrain Avoidance System TAWS")["avionics"][0].clone();
+        repairable["types"] = serde_json::json!(["Terrain Awareness"]);
+
+        for avionics in [
+            serde_json::json!([repairable.clone(), "malformed"]),
+            serde_json::json!(["malformed", repairable.clone()]),
+        ] {
+            let mut payload = serde_json::json!({"avionics": avionics});
+            let original = payload.clone();
+            let failure =
+                repair_listing_avionics_extraction(&mut payload, GENERIC_URL, html).unwrap_err();
+            assert_eq!(failure.rule(), AvionicsValidationRule::OccurrenceNotObject);
+            assert_eq!(payload, original);
+        }
+    }
+
+    #[test]
+    fn repair_lowers_exact_dual_quantity_but_not_dual_axis_autopilot() {
+        let gdu_evidence = "Dual GDU-1040 PFD/MFD";
+        let kap_evidence = "KAP 140 Autopilot Dual Axis Autopilot coupled to the NAV/GPS";
+        let html = controller_html(&format!("{gdu_evidence}\n{kap_evidence}"));
+        let mut gdu = installed("Garmin", "GDU-1040", gdu_evidence)["avionics"][0].clone();
+        gdu["quantity"] = serde_json::json!(2);
+        let mut kap = installed("Garmin", "KAP 140", kap_evidence)["avionics"][0].clone();
+        kap["manufacturer"] = Value::Null;
+        kap["types"] = serde_json::json!(["Autopilot"]);
+        let mut payload = serde_json::json!({"avionics": [gdu, kap]});
+
+        assert!(repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap());
+        assert_eq!(payload["avionics"][0]["manufacturer"], Value::Null);
+        assert_eq!(payload["avionics"][0]["quantity"], 2);
+        assert_eq!(payload["avionics"][0]["source_confidence"], "medium");
+        assert_eq!(payload["avionics"][1]["quantity"], 1);
+        assert_eq!(payload["avionics"][1]["source_confidence"], "high");
+
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        validate_current_avionics_quantity_completeness(&observations, CONTROLLER_URL, &html)
+            .unwrap();
+    }
+
+    #[test]
+    fn repair_does_not_treat_dual_axis_as_a_product_count() {
+        let evidence = "Dual Axis KAP 140 Autopilot";
+        let html = controller_html(evidence);
+        let mut payload = installed("Garmin", "KAP 140", evidence);
+        payload["avionics"][0]["manufacturer"] = Value::Null;
+        payload["avionics"][0]["types"] = serde_json::json!(["Autopilot"]);
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        let original = payload.clone();
+
+        assert!(!repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap());
+        assert_eq!(payload, original);
+
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+        let failure =
+            validate_current_avionics_quantity_completeness(&observations, CONTROLLER_URL, &html)
+                .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::QuantityConfidenceTooHigh
+        );
+        assert_eq!(
+            failure.path().as_deref(),
+            Some("avionics[0].source_confidence")
+        );
+    }
+
+    #[test]
+    fn quantity_confidence_failure_points_to_confidence_not_quantity() {
+        let html = "<html><body><p>Garmin G5 installed</p></body></html>";
+        let mut payload = installed("Garmin", "G5", "Garmin G5 installed");
+        payload["avionics"][0]["quantity"] = serde_json::json!(2);
+        let observations = parse_current_avionics_extraction_value(&payload).unwrap();
+
+        let failure =
+            validate_current_avionics_quantity_completeness(&observations, GENERIC_URL, html)
+                .unwrap_err();
+        assert_eq!(
+            failure.rule(),
+            AvionicsValidationRule::QuantityConfidenceTooHigh
+        );
+        assert_eq!(
+            failure.path().as_deref(),
+            Some("avionics[0].source_confidence")
         );
     }
 
@@ -2379,9 +2755,7 @@ mod tests {
         let mut payload = installed("Garmin", "G5", "Garmin G5 HSI");
         let original = payload.clone();
 
-        assert!(
-            !recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap()
-        );
+        assert!(!repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap());
         assert_eq!(payload, original);
         assert!(validate_unbound_current_avionics_extraction(
             &payload.to_string(),
@@ -2588,8 +2962,7 @@ mod tests {
                 Some(source_evidence)
             );
             assert_eq!(
-                recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
-                    .unwrap(),
+                repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap(),
                 false
             );
             assert_eq!(payload, original);
@@ -2657,7 +3030,7 @@ Advisory System)";
             Some("GDL690ADatalink")
         );
         assert_eq!(
-            recover_controller_avionics_extraction(&mut payload, SUBMISSION_26_URL, &html).unwrap(),
+            repair_listing_avionics_extraction(&mut payload, SUBMISSION_26_URL, &html).unwrap(),
             false
         );
         assert_eq!(payload, original);
@@ -3188,8 +3561,8 @@ Advisory System)";
         });
         let original = payload.clone();
 
-        let error = recover_controller_avionics_extraction(&mut payload, CONTROLLER_URL, &html)
-            .unwrap_err();
+        let error =
+            repair_listing_avionics_extraction(&mut payload, CONTROLLER_URL, &html).unwrap_err();
 
         assert!(
             error.contains("ambiguous Controller quantity evidence"),
@@ -3289,12 +3662,9 @@ Advisory System)";
         let html = controller_html("Garmin GMA-1347\nGarmin GMA-1347");
         let mut repeated = installed("Garmin", "GMA 1347", "garmin gma1347");
         let original = repeated.clone();
-        assert!(recover_controller_avionics_evidence_typography(
-            &mut repeated,
-            CONTROLLER_URL,
-            &html,
-        )
-        .is_err());
+        let recovery =
+            recover_controller_avionics_evidence_typography(&mut repeated, CONTROLLER_URL, &html);
+        assert!(recovery.is_err());
         assert_eq!(repeated, original);
     }
 

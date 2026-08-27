@@ -296,29 +296,37 @@ newly extracted listing becomes the repair checkpoint after full listing and
 avionics validation. Only that parsed listing object is stored; provider
 response envelopes and research dossiers are not retained.
 
-Before a fresh listing extraction checkpoint is stored, a narrower
-publisher-specific repair may correct typography in avionics occurrence
-evidence. It runs only for one structurally valid Controller capture with one
-exact `Avionics/Radios` field, copies one unique bounded visible span from that
-field, and changes only `source_evidence_text`. The copied span must be exactly
-equal to the model's evidence locator after case and non-alphanumeric
-typography are removed, must contain every primary and replacement identity,
-and must pass the existing full-source suffix and ambiguity gates. Recovery is
-also allowed when generic visible-text cleanup accepts the locator but the
-bounded source retains one exact Controller line break. That narrow form is
-limited to an installed occurrence whose declared quantity equals the exact
-model count, with every continuation splitting the repeated model from one of
-its declared capabilities; competing line layouts fail closed. Already valid
-bounded evidence is never rewritten. Other line joins, distinct spellings,
-hidden text, variant suffixes, malformed fields, and non-Controller sources
-fail closed. The complete current extraction validator runs after a typography
-mutation; any failure restores the entire original payload before the
-checkpoint can be stored.
+Before a fresh listing extraction checkpoint is stored, one atomic transient
+repair pass handles a few evidence-backed model-output defects. For an admitted
+exact source span containing one unique exact model, it may set the
+manufacturer to `null` when the returned maker is absent from that occurrence's
+evidence or is a generic placeholder such as `Unknown`. This does not infer a
+maker, canonicalize an identity, or borrow a maker from a shared-prefix list;
+canonical maker resolution belongs to catalog matching. Primary and
+replacement identities are evaluated independently.
 
-Quantity remains explicitly model-produced and is never inferred or mutated
-locally. Every current extraction, regardless of publisher, must emit a
+For one structurally valid Controller capture with one exact `Avionics/Radios`
+field, the same pass may copy one unique bounded visible span into
+`source_evidence_text`. The copied span must be exactly equal to the model's
+evidence locator after case and non-alphanumeric typography are removed, must
+contain every primary and replacement identity, and must pass the existing
+full-source suffix and ambiguity gates. Recovery is also allowed when generic
+visible-text cleanup accepts the locator but the bounded source retains one
+exact Controller line break. That narrow form is limited to an installed
+occurrence whose declared quantity equals the exact model count, with every
+continuation splitting the repeated model from one of its declared
+capabilities; competing line layouts fail closed. Already valid bounded
+evidence is never rewritten. Other line joins, distinct spellings, hidden text,
+variant suffixes, malformed fields, and non-Controller sources fail closed.
+
+Quantity remains explicitly model-produced and is never inferred or changed
+locally. When an exact Controller evidence line starts with `Dual` immediately
+scoping the returned product identity, and the model already returned quantity
+two with high confidence, the repair lowers only `source_confidence` to medium.
+Negated, optional, contextual, trailing, and `Dual Axis` uses do not take this
+fast path. Every current extraction, regardless of publisher, must emit a
 normalized manufacturer/model identity only once. A quantity greater than one
-can never carry high source confidence; without a quantity signal, only one
+can never retain high source confidence; without a quantity signal, only one
 exact identity with quantity one is eligible for automatic admission.
 
 The Controller adapter treats punctuation-insensitive repeated model mentions
@@ -327,22 +335,21 @@ does not convert them into an expected physical count. This includes negated,
 optional, and contextual wording such as `Not Dual`, `Optional Dual`, or
 `dual screen`, lone ordinals, and the exact run-on shape with a unique
 left-bounded model, slash-delimited alphanumeric suffix, and terminal `(Dual)`
-in one evidence line. A high-confidence occurrence with any such ambiguity
-fails into the single avionics correction request. A corrected medium- or
-low-confidence candidate may checkpoint only when its exact
+in one evidence line. A high-confidence occurrence with any other such
+ambiguity fails into the single avionics correction request. A corrected
+medium- or low-confidence candidate may checkpoint only when its exact
 `source_evidence_text` covers the complete bounded ambiguity, including count
 qualifiers such as `units` or `each`; downstream reuse and valuation continue
-to require high source confidence, so it remains pending. A typography repair
-that exposes a quantity failure is rolled back atomically. Other publishers
-rely on the extraction prompt until they have an equally explicit
-authoritative equipment-field adapter.
+to require high source confidence, so it remains pending. Other publishers rely
+on the extraction prompt until they have an equally explicit authoritative
+equipment-field adapter.
 
-The same atomic Controller typography repair and complete current extraction
-validator run after an avionics-only correction. On success, only the transient
-`avionics` member is replaced; aircraft identity, visual recovery, price,
-hours, valuation facts, and all other primary values remain byte-for-value
-unchanged. On failure, the original transient extraction is restored and no
-checkpoint is written.
+The same unified atomic repair and complete current extraction validator run
+after an avionics-only correction. On success, only the transient `avionics`
+member is replaced; aircraft identity, visual recovery, price, hours, valuation
+facts, and all other primary values remain byte-for-value unchanged. If any
+repair or final validation fails, the complete transient payload is restored
+and no checkpoint is written.
 
 ## Evidence Retention And Reuse
 
