@@ -2283,6 +2283,9 @@ const LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE: &str = "\
 - For example, when one line names King KX-170B and the next contiguous line names King KX-170B #2, never return two KX-170B rows. Return one KX-170B occurrence with candidate quantity 2, medium or low confidence, and evidence covering both lines; otherwise omit it.\n\
 - Without quantity ambiguity, high source confidence is allowed only for one exact product identity with quantity one.\n";
 
+const LISTING_AVIONICS_OPERATIONAL_ELIGIBILITY_GUIDANCE: &str = "\
+- The current avionics array represents working current-configuration equipment. Omit a product when the listing explicitly marks the installed unit INOP, inoperative, non-operational, not working, or unserviceable. An inoperative unit is not an installed/replaces valuation contribution and INOP alone never means removes; use removes only for an independently explicit removal.\n";
+
 fn build_extraction_prompt(listing_text: &str) -> String {
     format!(
         "Extract one complete aircraft sale listing object from the listing text. Return one JSON object that satisfies the enforced response schema.\n\
@@ -2314,6 +2317,7 @@ Rules:\n\
 - avionics must come from the listing text and should include fixed installed avionics only.\n\
 {LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
 {LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE}\
+{LISTING_AVIONICS_OPERATIONAL_ELIGIBILITY_GUIDANCE}\
 - Each physical avionics product must appear once. Its types array may contain multiple independently supported atomic capabilities; do not emit duplicate product rows merely to represent GPS, transponder, navigation, communications, or other functions separately. Represent a combined NAV/COM unit with both NAV and COM, never a composite NAV/COM type. Use [Unknown] only when the listing gives no usable capability.\n\
 - Each types array must contain distinct capabilities. PFD and MFD both map to the single Flight Display capability; never emit Flight Display twice. Unknown must be the only member when used.\n\
 - An Integrated Flight Deck identity may establish that one core category. Every additional type on that suite row must be explicitly named in the same source_evidence_text, and a capability assigned to a separately extracted component must not also be assigned to the suite.\n\
@@ -2347,6 +2351,7 @@ Correction rules:\n\
 - Deterministic feedback identifies the first detected error, not necessarily the only error. Re-audit the complete replacement array before returning it: every primary and replacement identity, exact evidence span, normalized-product uniqueness, quantity/confidence pair, capability set, and configuration action must satisfy all rules even when feedback names only one row.\n\
 {LISTING_AVIONICS_LITERAL_IDENTITY_GUIDANCE}\
 {LISTING_AVIONICS_QUANTITY_AMBIGUITY_GUIDANCE}\
+{LISTING_AVIONICS_OPERATIONAL_ELIGIBILITY_GUIDANCE}\
 - Use only fixed installed avionics explicitly supported by the listing text.\n\
 - Emit each physical product exactly once with all and only its intrinsic capabilities and the supported installed quantity.\n\
 - Keep distinct products separate. Never assign an external autopilot, display, sensor, servo, indicator, or receiver capability to another product.\n\
@@ -4962,6 +4967,9 @@ mod tests {
                 "source_confidence medium or low, never high",
                 "King KX-170B #2",
                 "never return two KX-170B rows",
+                "represents working current-configuration equipment",
+                "Omit a product when the listing explicitly marks the installed unit INOP",
+                "INOP alone never means removes",
             ] {
                 assert!(prompt.contains(required), "missing {required:?}");
             }

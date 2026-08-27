@@ -201,7 +201,8 @@ mod tests {
     fn correction_feedback_includes_an_independent_duplicate_after_identity_failure() {
         let field = "King KX-170B Nav-Com w/ VOR, Localizer &amp; Glideslope\n\
 King KX-170B Nav-Com #2 w/ VOR &amp; Localizer\n\
-Uavionix Wingtip Beacons with ADS-B IN &amp; OUT";
+Uavionix Wingtip Beacons with ADS-B IN &amp; OUT\n\
+Century I Wingleveler Autopilot (INOP)";
         let html = controller_html(field);
         let mut payload = json!({
             "avionics": [
@@ -222,6 +223,12 @@ Uavionix Wingtip Beacons with ADS-B IN &amp; OUT";
                     "quantity": 1, "configuration_action": "installed", "replaces": null,
                     "source_evidence_text": "Uavionix Wingtip Beacons with ADS-B IN & OUT",
                     "source_confidence": "high"
+                },
+                {
+                    "manufacturer": "Century", "model": "I", "types": ["Autopilot"],
+                    "quantity": 1, "configuration_action": "installed", "replaces": null,
+                    "source_evidence_text": "Century I Wingleveler Autopilot (INOP)",
+                    "source_confidence": "high"
                 }
             ]
         });
@@ -234,5 +241,13 @@ Uavionix Wingtip Beacons with ADS-B IN &amp; OUT";
         assert!(feedback.contains("additional independent deterministic defect"));
         assert!(feedback.contains("duplicates an earlier normalized manufacturer/model identity"));
         assert!(feedback.contains("avionics[1].quantity"), "{feedback}");
+        assert!(
+            feedback.contains("explicitly marked inoperative"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("avionics[3].source_evidence_text"),
+            "{feedback}"
+        );
     }
 }

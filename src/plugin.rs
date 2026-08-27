@@ -3576,6 +3576,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicitly_inoperative_avionics_is_omitted_by_the_single_correction_request() {
+        let evidence = "Century I Wingleveler Autopilot (INOP)";
+        let primary = listing_extraction_with_avionics(json!([installed_avionics(
+            "Century",
+            "I",
+            &["Autopilot"],
+            1,
+            evidence,
+        )]));
+        let corrected = json!({"avionics": []});
+        let (endpoint, request_count, requests) =
+            extraction_sequence_endpoint(vec![primary.to_string(), corrected.to_string()]).await;
+        let extractor = crate::extract::GeminiListingExtractor::with_test_endpoint(endpoint);
+        let html = controller_avionics_html(evidence, "None");
+
+        let (preview, payload) =
+            extract_capture_to_current_checkpoint(CONTROLLER_ROLE_LISTING_URL, &html, &extractor)
+                .await
+                .unwrap();
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert_eq!(payload["avionics"], json!([]));
+        assert!(preview.parsed_listing.avionics.is_empty());
+        let requests = requests.lock().unwrap();
+        let correction_prompt = requests[1]["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(correction_prompt.contains("explicitly marked inoperative"));
+        assert!(correction_prompt.contains("Omit a product when the listing explicitly marks"));
+        assert!(correction_prompt.contains("INOP alone never means removes"));
+    }
+
+    #[tokio::test]
     async fn invalid_cross_field_avionics_uses_one_flash_correction_and_changes_only_avionics() {
         let primary_avionics = json!([installed_avionics(
             "Garmin",

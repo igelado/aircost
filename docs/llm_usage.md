@@ -592,6 +592,12 @@ The extractor returns:
 - registration and serial number when present
 - status
 - avionics candidates and explicit installed/replaces/removes actions
+- only working current-configuration avionics; extraction omits an installed
+  unit explicitly marked `INOP`/inoperative/non-operational/not working/
+  unserviceable because the current action graph would otherwise value it as a
+  working unit. Deterministic admission also fail-closes these phrases when
+  they are the source excerpt's terminal status. `INOP` alone never means
+  `removes`
 - source-backed restoration, damage/log, condition, conversion, and major
   modification facts
 
