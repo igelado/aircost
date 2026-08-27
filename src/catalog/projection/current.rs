@@ -9,9 +9,12 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Connection, PgConnection, SqliteConnection};
+use sqlx::{Acquire, Connection, PgConnection, Postgres, Sqlite, SqliteConnection, Transaction};
 
 use super::{canonical_row, ids, in_predicate, ProjectionRow, ROOT_TABLES};
+use crate::avionics::reuse::{
+    reuse_attestation_is_current_postgres, reuse_attestation_is_current_sqlite,
+};
 use crate::db::{AppDb, DatabaseBackend};
 
 const CURRENT_CATALOG_PROJECTION_DOMAIN: &[u8] = b"aircost:current-verified-catalog-projection\0";
@@ -108,10 +111,18 @@ impl CurrentCatalogProjection {
             DatabaseBackend::Sqlite(pool) => {
                 let mut connection = pool.acquire().await?;
                 let mut snapshot = connection.begin().await?;
-                let projection = {
+                let projection = async {
                     let mut reader = ProjectionReader::Sqlite(&mut snapshot);
-                    load_current(&mut reader).await
-                };
+                    let projection = load_current(&mut reader).await?;
+                    validate_sqlite_reuse_attestation_fingerprints(
+                        source,
+                        &mut snapshot,
+                        &projection,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(projection)
+                }
+                .await;
                 snapshot.rollback().await?;
                 projection
             }
@@ -120,10 +131,18 @@ impl CurrentCatalogProjection {
                 let mut snapshot = connection
                     .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                     .await?;
-                let projection = {
+                let projection = async {
                     let mut reader = ProjectionReader::Postgres(&mut snapshot);
-                    load_current(&mut reader).await
-                };
+                    let projection = load_current(&mut reader).await?;
+                    validate_postgres_reuse_attestation_fingerprints(
+                        source,
+                        &mut snapshot,
+                        &projection,
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>(projection)
+                }
+                .await;
                 snapshot.rollback().await?;
                 projection
             }
@@ -167,6 +186,58 @@ impl CurrentCatalogProjection {
         let reloaded = Self::load(source).await?;
         self.require_exact_match(reloaded, "reopened")
     }
+
+    fn reuse_attestation_model_ids(&self) -> Result<Vec<i64>> {
+        self.rows
+            .iter()
+            .filter(|row| row.table == "avionics_product_reuse_attestations")
+            .map(|row| row.integer("avionics_model_id"))
+            .collect()
+    }
+}
+
+async fn validate_sqlite_reuse_attestation_fingerprints(
+    source: &AppDb,
+    snapshot: &mut Transaction<'_, Sqlite>,
+    projection: &CurrentCatalogProjection,
+) -> Result<()> {
+    let mut stale_model_ids = Vec::new();
+    for avionics_model_id in projection.reuse_attestation_model_ids()? {
+        if !reuse_attestation_is_current_sqlite(source, snapshot, avionics_model_id).await? {
+            stale_model_ids.push(avionics_model_id);
+        }
+    }
+    reject_stale_reuse_attestation_fingerprints(stale_model_ids)
+}
+
+async fn validate_postgres_reuse_attestation_fingerprints(
+    source: &AppDb,
+    snapshot: &mut Transaction<'_, Postgres>,
+    projection: &CurrentCatalogProjection,
+) -> Result<()> {
+    let mut stale_model_ids = Vec::new();
+    for avionics_model_id in projection.reuse_attestation_model_ids()? {
+        if !reuse_attestation_is_current_postgres(source, snapshot, avionics_model_id).await? {
+            stale_model_ids.push(avionics_model_id);
+        }
+    }
+    reject_stale_reuse_attestation_fingerprints(stale_model_ids)
+}
+
+fn reject_stale_reuse_attestation_fingerprints(mut stale_model_ids: Vec<i64>) -> Result<()> {
+    if stale_model_ids.is_empty() {
+        return Ok(());
+    }
+    stale_model_ids.sort_unstable();
+    stale_model_ids.dedup();
+    bail!(
+        "source catalog contains stale avionics reuse-attestation fingerprints for model IDs: {}",
+        stale_model_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 async fn load_current(source: &mut ProjectionReader<'_>) -> Result<CurrentCatalogProjection> {
